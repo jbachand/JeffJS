@@ -1,0 +1,8 @@
+# Code owners for JeffJS.
+# https://docs.github.com/articles/about-code-owners
+#
+# Anything under .github/ — especially workflows that ship App Store builds —
+# requires owner review before merge. Combined with branch protection on main
+# (require_code_owner_reviews=true), this prevents stealth changes to CI.
+
+/.github/                @jbachand

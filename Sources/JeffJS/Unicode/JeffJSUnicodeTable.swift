@@ -1,0 +1,1614 @@
+// JeffJSUnicodeTable.swift
+// JeffJS - 1:1 Swift port of QuickJS JavaScript engine
+//
+// Unicode property data tables for ID_Start, ID_Continue, case conversion,
+// general category lookup, combining class, and composition/decomposition.
+// Data covers the full BMP (U+0000..U+FFFF) plus selected supplementary
+// ranges used by ECMAScript identifiers.
+//
+// Port of libunicode-table.h from QuickJS.
+// Copyright 2026 Jeff Bachand. All rights reserved.
+
+import Foundation
+
+// =============================================================================
+// MARK: - UnicodeRangeTable
+// =============================================================================
+
+/// A sorted table of (start, end) code-point ranges.  Supports O(log n)
+/// membership testing via binary search.  Mirrors the range table encoding
+/// used in QuickJS libunicode-table.h.
+struct UnicodeRangeTable {
+    /// Flattened array of range pairs: [start0, end0, start1, end1, ...].
+    /// Each pair is inclusive on both ends: start <= cp <= end.
+    let ranges: [UInt32]
+
+    /// Number of ranges (pairs).
+    var count: Int { ranges.count / 2 }
+
+    /// Returns `true` if `cp` falls within any range in the table.
+    func contains(_ cp: UInt32) -> Bool {
+        var lo = 0
+        var hi = count - 1
+        while lo <= hi {
+            let mid = (lo + hi) / 2
+            let start = ranges[mid * 2]
+            let end   = ranges[mid * 2 + 1]
+            if cp < start {
+                hi = mid - 1
+            } else if cp > end {
+                lo = mid + 1
+            } else {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+// =============================================================================
+// MARK: - UnicodeCategory
+// =============================================================================
+
+/// Unicode General Category values used by JeffJS.
+enum UnicodeCategory: UInt8 {
+    case Cn = 0   // Unassigned
+    case Lu = 1   // Uppercase Letter
+    case Ll = 2   // Lowercase Letter
+    case Lt = 3   // Titlecase Letter
+    case Lm = 4   // Modifier Letter
+    case Lo = 5   // Other Letter
+    case Mn = 6   // Nonspacing Mark
+    case Mc = 7   // Spacing Mark
+    case Me = 8   // Enclosing Mark
+    case Nd = 9   // Decimal Number
+    case Nl = 10  // Letter Number
+    case No = 11  // Other Number
+    case Zs = 12  // Space Separator
+    case Zl = 13  // Line Separator
+    case Zp = 14  // Paragraph Separator
+    case Cc = 15  // Control
+    case Cf = 16  // Format
+    case Cs = 17  // Surrogate
+    case Co = 18  // Private Use
+    case Pc = 19  // Connector Punctuation
+    case Pd = 20  // Dash Punctuation
+    case Ps = 21  // Open Punctuation
+    case Pe = 22  // Close Punctuation
+    case Pi = 23  // Initial Punctuation
+    case Pf = 24  // Final Punctuation
+    case Po = 25  // Other Punctuation
+    case Sm = 26  // Math Symbol
+    case Sc = 27  // Currency Symbol
+    case Sk = 28  // Modifier Symbol
+    case So = 29  // Other Symbol
+}
+
+// =============================================================================
+// MARK: - JeffJSUnicodeTable
+// =============================================================================
+
+/// Central repository for Unicode data tables consumed by JeffJSUnicode.
+struct JeffJSUnicodeTable {
+
+    // =========================================================================
+    // MARK: - ID_Start Table (ECMAScript IdentifierStart)
+    // =========================================================================
+
+    /// Unicode code-point ranges for the ID_Start property.
+    /// Characters in these ranges may begin a JavaScript identifier.
+    /// Covers Lu, Ll, Lt, Lm, Lo, Nl plus stability extensions.
+    /// Data derived from Unicode 15.1 DerivedCoreProperties.txt.
+    static let idStartTable = UnicodeRangeTable(ranges: [
+        // Basic Latin letters
+        0x0041, 0x005A,   // A-Z
+        0x0061, 0x007A,   // a-z
+        // Latin-1 Supplement
+        0x00AA, 0x00AA,   // feminine ordinal
+        0x00B5, 0x00B5,   // micro sign
+        0x00BA, 0x00BA,   // masculine ordinal
+        0x00C0, 0x00D6,   // Latin capitals with diacritics
+        0x00D8, 0x00F6,   // more Latin
+        0x00F8, 0x02C1,   // Latin Extended-A/B + IPA
+        0x02C6, 0x02D1,   // modifier letters
+        0x02E0, 0x02E4,   // modifier letters
+        0x02EC, 0x02EC,
+        0x02EE, 0x02EE,
+        // Combining Diacritical Marks (some used as letters)
+        0x0370, 0x0374,   // Greek
+        0x0376, 0x0377,
+        0x037A, 0x037D,
+        0x037F, 0x037F,
+        0x0386, 0x0386,
+        0x0388, 0x038A,
+        0x038C, 0x038C,
+        0x038E, 0x03A1,
+        0x03A3, 0x03F5,
+        0x03F7, 0x0481,
+        0x048A, 0x052F,   // Cyrillic
+        0x0531, 0x0556,   // Armenian
+        0x0559, 0x0559,
+        0x0560, 0x0588,
+        0x05D0, 0x05EA,   // Hebrew
+        0x05EF, 0x05F2,
+        0x0620, 0x064A,   // Arabic
+        0x066E, 0x066F,
+        0x0671, 0x06D3,
+        0x06D5, 0x06D5,
+        0x06E5, 0x06E6,
+        0x06EE, 0x06EF,
+        0x06FA, 0x06FC,
+        0x06FF, 0x06FF,
+        0x0710, 0x0710,   // Syriac
+        0x0712, 0x072F,
+        0x074D, 0x07A5,
+        0x07B1, 0x07B1,
+        0x07CA, 0x07EA,   // Thaana/NKo
+        0x07F4, 0x07F5,
+        0x07FA, 0x07FA,
+        0x0800, 0x0815,   // Samaritan
+        0x081A, 0x081A,
+        0x0824, 0x0824,
+        0x0828, 0x0828,
+        0x0840, 0x0858,   // Mandaic
+        0x0860, 0x086A,
+        0x0870, 0x0887,
+        0x0889, 0x088E,
+        0x08A0, 0x08C9,
+        0x0904, 0x0939,   // Devanagari
+        0x093D, 0x093D,
+        0x0950, 0x0950,
+        0x0958, 0x0961,
+        0x0971, 0x0980,
+        0x0985, 0x098C,   // Bengali
+        0x098F, 0x0990,
+        0x0993, 0x09A8,
+        0x09AA, 0x09B0,
+        0x09B2, 0x09B2,
+        0x09B6, 0x09B9,
+        0x09BD, 0x09BD,
+        0x09CE, 0x09CE,
+        0x09DC, 0x09DD,
+        0x09DF, 0x09E1,
+        0x09F0, 0x09F1,
+        0x09FC, 0x09FC,
+        0x0A05, 0x0A0A,   // Gurmukhi
+        0x0A0F, 0x0A10,
+        0x0A13, 0x0A28,
+        0x0A2A, 0x0A30,
+        0x0A32, 0x0A33,
+        0x0A35, 0x0A36,
+        0x0A38, 0x0A39,
+        0x0A59, 0x0A5C,
+        0x0A5E, 0x0A5E,
+        0x0A72, 0x0A74,
+        0x0A85, 0x0A8D,   // Gujarati
+        0x0A8F, 0x0A91,
+        0x0A93, 0x0AA8,
+        0x0AAA, 0x0AB0,
+        0x0AB2, 0x0AB3,
+        0x0AB5, 0x0AB9,
+        0x0ABD, 0x0ABD,
+        0x0AD0, 0x0AD0,
+        0x0AE0, 0x0AE1,
+        0x0AF9, 0x0AF9,
+        0x0B05, 0x0B0C,   // Oriya
+        0x0B0F, 0x0B10,
+        0x0B13, 0x0B28,
+        0x0B2A, 0x0B30,
+        0x0B32, 0x0B33,
+        0x0B35, 0x0B39,
+        0x0B3D, 0x0B3D,
+        0x0B5C, 0x0B5D,
+        0x0B5F, 0x0B61,
+        0x0B71, 0x0B71,
+        0x0B83, 0x0B83,   // Tamil
+        0x0B85, 0x0B8A,
+        0x0B8E, 0x0B90,
+        0x0B92, 0x0B95,
+        0x0B99, 0x0B9A,
+        0x0B9C, 0x0B9C,
+        0x0B9E, 0x0B9F,
+        0x0BA3, 0x0BA4,
+        0x0BA8, 0x0BAA,
+        0x0BAE, 0x0BB9,
+        0x0BD0, 0x0BD0,
+        0x0C05, 0x0C0C,   // Telugu
+        0x0C0E, 0x0C10,
+        0x0C12, 0x0C28,
+        0x0C2A, 0x0C39,
+        0x0C3D, 0x0C3D,
+        0x0C58, 0x0C5A,
+        0x0C5D, 0x0C5D,
+        0x0C60, 0x0C61,
+        0x0C80, 0x0C80,   // Kannada
+        0x0C85, 0x0C8C,
+        0x0C8E, 0x0C90,
+        0x0C92, 0x0CA8,
+        0x0CAA, 0x0CB3,
+        0x0CB5, 0x0CB9,
+        0x0CBD, 0x0CBD,
+        0x0CDD, 0x0CDE,
+        0x0CE0, 0x0CE1,
+        0x0CF1, 0x0CF2,
+        0x0D04, 0x0D0C,   // Malayalam
+        0x0D0E, 0x0D10,
+        0x0D12, 0x0D3A,
+        0x0D3D, 0x0D3D,
+        0x0D4E, 0x0D4E,
+        0x0D54, 0x0D56,
+        0x0D5F, 0x0D61,
+        0x0D7A, 0x0D7F,
+        0x0D85, 0x0D96,   // Sinhala
+        0x0D9A, 0x0DB1,
+        0x0DB3, 0x0DBB,
+        0x0DBD, 0x0DBD,
+        0x0DC0, 0x0DC6,
+        0x0E01, 0x0E30,   // Thai
+        0x0E32, 0x0E33,
+        0x0E40, 0x0E46,
+        0x0E81, 0x0E82,   // Lao
+        0x0E84, 0x0E84,
+        0x0E86, 0x0E8A,
+        0x0E8C, 0x0EA3,
+        0x0EA5, 0x0EA5,
+        0x0EA7, 0x0EB0,
+        0x0EB2, 0x0EB3,
+        0x0EBD, 0x0EBD,
+        0x0EC0, 0x0EC4,
+        0x0EC6, 0x0EC6,
+        0x0EDC, 0x0EDF,
+        0x0F00, 0x0F00,   // Tibetan
+        0x0F40, 0x0F47,
+        0x0F49, 0x0F6C,
+        0x0F88, 0x0F8C,
+        0x1000, 0x102A,   // Myanmar
+        0x103F, 0x103F,
+        0x1050, 0x1055,
+        0x105A, 0x105D,
+        0x1061, 0x1061,
+        0x1065, 0x1066,
+        0x106E, 0x1070,
+        0x1075, 0x1081,
+        0x108E, 0x108E,
+        0x10A0, 0x10C5,   // Georgian
+        0x10C7, 0x10C7,
+        0x10CD, 0x10CD,
+        0x10D0, 0x10FA,
+        0x10FC, 0x1248,
+        0x124A, 0x124D,   // Ethiopic
+        0x1250, 0x1256,
+        0x1258, 0x1258,
+        0x125A, 0x125D,
+        0x1260, 0x1288,
+        0x128A, 0x128D,
+        0x1290, 0x12B0,
+        0x12B2, 0x12B5,
+        0x12B8, 0x12BE,
+        0x12C0, 0x12C0,
+        0x12C2, 0x12C5,
+        0x12C8, 0x12D6,
+        0x12D8, 0x1310,
+        0x1312, 0x1315,
+        0x1318, 0x135A,
+        0x1380, 0x138F,
+        0x13A0, 0x13F5,   // Cherokee
+        0x13F8, 0x13FD,
+        0x1401, 0x166C,   // Unified Canadian Aboriginal Syllabics
+        0x166F, 0x167F,
+        0x1681, 0x169A,   // Ogham
+        0x16A0, 0x16EA,   // Runic
+        0x16F1, 0x16F8,
+        0x1700, 0x1711,   // Tagalog
+        0x171F, 0x1731,
+        0x1740, 0x1751,   // Buhid/Hanunoo
+        0x1760, 0x176C,
+        0x176E, 0x1770,
+        0x1780, 0x17B3,   // Khmer
+        0x17D7, 0x17D7,
+        0x17DC, 0x17DC,
+        0x1820, 0x1878,   // Mongolian
+        0x1880, 0x1884,
+        0x1887, 0x18A8,
+        0x18AA, 0x18AA,
+        0x18B0, 0x18F5,
+        0x1900, 0x191E,   // Limbu
+        0x1950, 0x196D,
+        0x1970, 0x1974,
+        0x1980, 0x19AB,   // New Tai Lue
+        0x19B0, 0x19C9,
+        0x1A00, 0x1A16,   // Buginese
+        0x1A20, 0x1A54,
+        0x1AA7, 0x1AA7,
+        0x1B05, 0x1B33,   // Balinese
+        0x1B45, 0x1B4C,
+        0x1B83, 0x1BA0,   // Sundanese
+        0x1BAE, 0x1BAF,
+        0x1BBA, 0x1BE5,
+        0x1C00, 0x1C23,   // Lepcha
+        0x1C4D, 0x1C4F,
+        0x1C5A, 0x1C7D,
+        0x1C80, 0x1C88,
+        0x1C90, 0x1CBA,
+        0x1CBD, 0x1CBF,
+        0x1CE9, 0x1CEC,
+        0x1CEE, 0x1CF3,
+        0x1CF5, 0x1CF6,
+        0x1CFA, 0x1CFA,
+        0x1D00, 0x1DBF,   // Phonetic Extensions
+        0x1E00, 0x1F15,   // Latin Extended Additional / Greek Extended
+        0x1F18, 0x1F1D,
+        0x1F20, 0x1F45,
+        0x1F48, 0x1F4D,
+        0x1F50, 0x1F57,
+        0x1F59, 0x1F59,
+        0x1F5B, 0x1F5B,
+        0x1F5D, 0x1F5D,
+        0x1F5F, 0x1F7D,
+        0x1F80, 0x1FB4,
+        0x1FB6, 0x1FBC,
+        0x1FBE, 0x1FBE,
+        0x1FC2, 0x1FC4,
+        0x1FC6, 0x1FCC,
+        0x1FD0, 0x1FD3,
+        0x1FD6, 0x1FDB,
+        0x1FE0, 0x1FEC,
+        0x1FF2, 0x1FF4,
+        0x1FF6, 0x1FFC,
+        0x2071, 0x2071,   // Superscript/Subscript
+        0x207F, 0x207F,
+        0x2090, 0x209C,
+        0x2102, 0x2102,   // Letterlike Symbols
+        0x2107, 0x2107,
+        0x210A, 0x2113,
+        0x2115, 0x2115,
+        0x2119, 0x211D,
+        0x2124, 0x2124,
+        0x2126, 0x2126,
+        0x2128, 0x2128,
+        0x212A, 0x212D,
+        0x212F, 0x2139,
+        0x213C, 0x213F,
+        0x2145, 0x2149,
+        0x214E, 0x214E,
+        0x2183, 0x2184,
+        0x2C00, 0x2CE4,   // Glagolitic / Latin Extended-C/D / Coptic
+        0x2CEB, 0x2CEE,
+        0x2CF2, 0x2CF3,
+        0x2D00, 0x2D25,
+        0x2D27, 0x2D27,
+        0x2D2D, 0x2D2D,
+        0x2D30, 0x2D67,   // Tifinagh
+        0x2D6F, 0x2D6F,
+        0x2D80, 0x2D96,
+        0x2DA0, 0x2DA6,
+        0x2DA8, 0x2DAE,
+        0x2DB0, 0x2DB6,
+        0x2DB8, 0x2DBE,
+        0x2DC0, 0x2DC6,
+        0x2DC8, 0x2DCE,
+        0x2DD0, 0x2DD6,
+        0x2DD8, 0x2DDE,
+        0x2E2F, 0x2E2F,
+        0x3005, 0x3006,   // CJK
+        0x3031, 0x3035,
+        0x303B, 0x303C,
+        0x3041, 0x3096,   // Hiragana
+        0x309D, 0x309F,
+        0x30A1, 0x30FA,   // Katakana
+        0x30FC, 0x30FF,
+        0x3105, 0x312F,   // Bopomofo
+        0x3131, 0x318E,   // Hangul Compatibility Jamo
+        0x31A0, 0x31BF,
+        0x31F0, 0x31FF,
+        0x3400, 0x4DBF,   // CJK Unified Ideographs Extension A
+        0x4E00, 0x9FFF,   // CJK Unified Ideographs
+        0xA000, 0xA48C,   // Yi
+        0xA4D0, 0xA4FD,
+        0xA500, 0xA60C,   // Vai
+        0xA610, 0xA61F,
+        0xA62A, 0xA62B,
+        0xA640, 0xA66E,   // Cyrillic Extended-B
+        0xA67F, 0xA69D,
+        0xA6A0, 0xA6E5,   // Bamum
+        0xA717, 0xA71F,
+        0xA722, 0xA788,   // Latin Extended-D
+        0xA78B, 0xA7CA,
+        0xA7D0, 0xA7D1,
+        0xA7D3, 0xA7D3,
+        0xA7D5, 0xA7D9,
+        0xA7F2, 0xA801,
+        0xA803, 0xA805,   // Syloti Nagri
+        0xA807, 0xA80A,
+        0xA80C, 0xA822,
+        0xA840, 0xA873,   // Phags-pa
+        0xA882, 0xA8B3,   // Saurashtra
+        0xA8F2, 0xA8F7,
+        0xA8FB, 0xA8FB,
+        0xA8FD, 0xA8FE,
+        0xA90A, 0xA925,   // Kayah Li
+        0xA930, 0xA946,   // Rejang
+        0xA960, 0xA97C,   // Hangul Jamo Extended-A
+        0xA984, 0xA9B2,   // Javanese
+        0xA9CF, 0xA9CF,
+        0xA9E0, 0xA9E4,
+        0xA9E6, 0xA9EF,
+        0xA9FA, 0xA9FE,
+        0xAA00, 0xAA28,   // Cham
+        0xAA40, 0xAA42,
+        0xAA44, 0xAA4B,
+        0xAA60, 0xAA76,
+        0xAA7A, 0xAA7A,
+        0xAA7E, 0xAAAF,
+        0xAAB1, 0xAAB1,
+        0xAAB5, 0xAAB6,
+        0xAAB9, 0xAABD,
+        0xAAC0, 0xAAC0,
+        0xAAC2, 0xAAC2,
+        0xAADB, 0xAADD,
+        0xAAE0, 0xAAEA,
+        0xAAF2, 0xAAF4,
+        0xAB01, 0xAB06,
+        0xAB09, 0xAB0E,
+        0xAB11, 0xAB16,
+        0xAB20, 0xAB26,
+        0xAB28, 0xAB2E,
+        0xAB30, 0xAB5A,
+        0xAB5C, 0xAB69,
+        0xAB70, 0xABE2,
+        0xAC00, 0xD7A3,   // Hangul Syllables
+        0xD7B0, 0xD7C6,
+        0xD7CB, 0xD7FB,
+        0xF900, 0xFA6D,   // CJK Compatibility Ideographs
+        0xFA70, 0xFAD9,
+        0xFB00, 0xFB06,   // Alphabetic Presentation Forms
+        0xFB13, 0xFB17,
+        0xFB1D, 0xFB1D,
+        0xFB1F, 0xFB28,
+        0xFB2A, 0xFB36,
+        0xFB38, 0xFB3C,
+        0xFB3E, 0xFB3E,
+        0xFB40, 0xFB41,
+        0xFB43, 0xFB44,
+        0xFB46, 0xFBB1,
+        0xFBD3, 0xFD3D,
+        0xFD50, 0xFD8F,
+        0xFD92, 0xFDC7,
+        0xFDF0, 0xFDFB,
+        0xFE70, 0xFE74,   // Arabic Presentation Forms-B
+        0xFE76, 0xFEFC,
+        0xFF21, 0xFF3A,   // Fullwidth Latin
+        0xFF41, 0xFF5A,
+        0xFF66, 0xFFBE,   // Halfwidth Katakana/Hangul
+        0xFFC2, 0xFFC7,
+        0xFFCA, 0xFFCF,
+        0xFFD2, 0xFFD7,
+        0xFFDA, 0xFFDC,
+        // Supplementary planes (selected ranges for common use)
+        0x10000, 0x1000B,   // Linear B Syllabary
+        0x1000D, 0x10026,
+        0x10028, 0x1003A,
+        0x1003C, 0x1003D,
+        0x1003F, 0x1004D,
+        0x10050, 0x1005D,
+        0x10080, 0x100FA,
+        0x10280, 0x1029C,   // Lycian
+        0x102A0, 0x102D0,   // Carian
+        0x10300, 0x1031F,   // Old Italic
+        0x1032D, 0x10340,
+        0x10342, 0x10349,
+        0x10350, 0x10375,   // Old Permic
+        0x10380, 0x1039D,   // Ugaritic
+        0x103A0, 0x103C3,   // Old Persian
+        0x103C8, 0x103CF,
+        0x10400, 0x1049D,   // Deseret / Shavian
+        0x104B0, 0x104D3,   // Osage
+        0x104D8, 0x104FB,
+        0x10500, 0x10527,   // Elbasan
+        0x10530, 0x10563,   // Caucasian Albanian
+        0x10570, 0x1057A,   // Vithkuqi
+        0x1057C, 0x1058A,
+        0x1058C, 0x10592,
+        0x10594, 0x10595,
+        0x10597, 0x105A1,
+        0x105A3, 0x105B1,
+        0x105B3, 0x105B9,
+        0x105BB, 0x105BC,
+        0x10600, 0x10736,   // Linear A
+        0x10740, 0x10755,
+        0x10760, 0x10767,
+        0x10780, 0x10785,
+        0x10787, 0x107B0,
+        0x107B2, 0x107BA,
+        0x10800, 0x10805,   // Cypriot
+        0x10808, 0x10808,
+        0x1080A, 0x10835,
+        0x10837, 0x10838,
+        0x1083C, 0x1083C,
+        0x1083F, 0x10855,
+        0x10860, 0x10876,
+        0x10880, 0x1089E,
+        0x108E0, 0x108F2,
+        0x108F4, 0x108F5,
+        0x10900, 0x10915,
+        0x10920, 0x10939,
+        0x10980, 0x109B7,
+        0x109BE, 0x109BF,
+        0x10A00, 0x10A00,
+        0x10A10, 0x10A13,
+        0x10A15, 0x10A17,
+        0x10A19, 0x10A35,
+        0x10A60, 0x10A7C,
+        0x10A80, 0x10A9C,
+        0x10AC0, 0x10AC7,
+        0x10AC9, 0x10AE4,
+        0x10B00, 0x10B35,
+        0x10B40, 0x10B55,
+        0x10B60, 0x10B72,
+        0x10B80, 0x10B91,
+        0x10C00, 0x10C48,
+        0x10C80, 0x10CB2,
+        0x10CC0, 0x10CF2,
+        0x10D00, 0x10D23,
+        0x10E80, 0x10EA9,
+        0x10EB0, 0x10EB1,
+        0x10F00, 0x10F1C,
+        0x10F27, 0x10F27,
+        0x10F30, 0x10F45,
+        0x10F70, 0x10F81,
+        0x10FB0, 0x10FC4,
+        0x10FE0, 0x10FF6,
+        0x11003, 0x11037,
+        0x11071, 0x11072,
+        0x11075, 0x11075,
+        0x11083, 0x110AF,
+        0x110D0, 0x110E8,
+        0x11103, 0x11126,
+        0x11144, 0x11144,
+        0x11147, 0x11147,
+        0x11150, 0x11172,
+        0x11176, 0x11176,
+        0x11183, 0x111B2,
+        0x111C1, 0x111C4,
+        0x111DA, 0x111DA,
+        0x111DC, 0x111DC,
+        0x11200, 0x11211,
+        0x11213, 0x1122B,
+        0x1123F, 0x11240,
+        0x11280, 0x11286,
+        0x11288, 0x11288,
+        0x1128A, 0x1128D,
+        0x1128F, 0x1129D,
+        0x1129F, 0x112A8,
+        0x112B0, 0x112DE,
+        0x11305, 0x1130C,
+        0x1130F, 0x11310,
+        0x11313, 0x11328,
+        0x1132A, 0x11330,
+        0x11332, 0x11333,
+        0x11335, 0x11339,
+        0x1133D, 0x1133D,
+        0x11350, 0x11350,
+        0x1135D, 0x11361,
+        0x11400, 0x11434,
+        0x11447, 0x1144A,
+        0x1145F, 0x11461,
+        0x11480, 0x114AF,
+        0x114C4, 0x114C5,
+        0x114C7, 0x114C7,
+        0x11580, 0x115AE,
+        0x115D8, 0x115DB,
+        0x11600, 0x1162F,
+        0x11644, 0x11644,
+        0x11680, 0x116AA,
+        0x116B8, 0x116B8,
+        0x11700, 0x1171A,
+        0x11740, 0x11746,
+        0x11800, 0x1182B,
+        0x118A0, 0x118DF,
+        0x118FF, 0x11906,
+        0x11909, 0x11909,
+        0x1190C, 0x11913,
+        0x11915, 0x11916,
+        0x11918, 0x1192F,
+        0x1193F, 0x1193F,
+        0x11941, 0x11941,
+        0x119A0, 0x119A7,
+        0x119AA, 0x119D0,
+        0x119E1, 0x119E1,
+        0x119E3, 0x119E3,
+        0x11A00, 0x11A00,
+        0x11A0B, 0x11A32,
+        0x11A3A, 0x11A3A,
+        0x11A50, 0x11A50,
+        0x11A5C, 0x11A89,
+        0x11A9D, 0x11A9D,
+        0x11AB0, 0x11AF8,
+        0x11C00, 0x11C08,
+        0x11C0A, 0x11C2E,
+        0x11C40, 0x11C40,
+        0x11C72, 0x11C8F,
+        0x11D00, 0x11D06,
+        0x11D08, 0x11D09,
+        0x11D0B, 0x11D30,
+        0x11D46, 0x11D46,
+        0x11D60, 0x11D65,
+        0x11D67, 0x11D68,
+        0x11D6A, 0x11D89,
+        0x11D98, 0x11D98,
+        0x11EE0, 0x11EF2,
+        0x11F02, 0x11F02,
+        0x11F04, 0x11F10,
+        0x11F12, 0x11F33,
+        0x11FB0, 0x11FB0,
+        0x12000, 0x12399,   // Cuneiform
+        0x12480, 0x12543,
+        0x12F90, 0x12FF0,
+        0x13000, 0x1342F,   // Egyptian Hieroglyphs
+        0x13441, 0x13446,
+        0x14400, 0x14646,   // Anatolian Hieroglyphs
+        0x16800, 0x16A38,   // Bamum Supplement
+        0x16A40, 0x16A5E,
+        0x16A70, 0x16ABE,
+        0x16AD0, 0x16AED,
+        0x16B00, 0x16B2F,
+        0x16B40, 0x16B43,
+        0x16B63, 0x16B77,
+        0x16B7D, 0x16B8F,
+        0x16E40, 0x16E7F,   // Medefaidrin
+        0x16F00, 0x16F4A,   // Miao
+        0x16F50, 0x16F50,
+        0x16F93, 0x16F9F,
+        0x16FE0, 0x16FE1,
+        0x16FE3, 0x16FE3,
+        0x17000, 0x187F7,   // Tangut
+        0x18800, 0x18CD5,
+        0x18D00, 0x18D08,
+        0x1AFF0, 0x1AFF3,
+        0x1AFF5, 0x1AFFB,
+        0x1AFFD, 0x1AFFE,
+        0x1B000, 0x1B122,
+        0x1B132, 0x1B132,
+        0x1B150, 0x1B152,
+        0x1B155, 0x1B155,
+        0x1B164, 0x1B167,
+        0x1B170, 0x1B2FB,
+        0x1BC00, 0x1BC6A,   // Duployan
+        0x1BC70, 0x1BC7C,
+        0x1BC80, 0x1BC88,
+        0x1BC90, 0x1BC99,
+        0x1D400, 0x1D454,   // Mathematical Alphanumeric Symbols
+        0x1D456, 0x1D49C,
+        0x1D49E, 0x1D49F,
+        0x1D4A2, 0x1D4A2,
+        0x1D4A5, 0x1D4A6,
+        0x1D4A9, 0x1D4AC,
+        0x1D4AE, 0x1D4B9,
+        0x1D4BB, 0x1D4BB,
+        0x1D4BD, 0x1D4C3,
+        0x1D4C5, 0x1D505,
+        0x1D507, 0x1D50A,
+        0x1D50D, 0x1D514,
+        0x1D516, 0x1D51C,
+        0x1D51E, 0x1D539,
+        0x1D53B, 0x1D53E,
+        0x1D540, 0x1D544,
+        0x1D546, 0x1D546,
+        0x1D54A, 0x1D550,
+        0x1D552, 0x1D6A5,
+        0x1D6A8, 0x1D6C0,
+        0x1D6C2, 0x1D6DA,
+        0x1D6DC, 0x1D6FA,
+        0x1D6FC, 0x1D714,
+        0x1D716, 0x1D734,
+        0x1D736, 0x1D74E,
+        0x1D750, 0x1D76E,
+        0x1D770, 0x1D788,
+        0x1D78A, 0x1D7A8,
+        0x1D7AA, 0x1D7C2,
+        0x1D7C4, 0x1D7CB,
+        0x1DF00, 0x1DF1E,
+        0x1DF25, 0x1DF2A,
+        0x1E030, 0x1E06D,
+        0x1E100, 0x1E12C,
+        0x1E137, 0x1E13D,
+        0x1E14E, 0x1E14E,
+        0x1E290, 0x1E2AD,
+        0x1E2C0, 0x1E2EB,
+        0x1E4D0, 0x1E4EB,
+        0x1E7E0, 0x1E7E6,
+        0x1E7E8, 0x1E7EB,
+        0x1E7ED, 0x1E7EE,
+        0x1E7F0, 0x1E7FE,
+        0x1E800, 0x1E8C4,
+        0x1E900, 0x1E943,
+        0x1E94B, 0x1E94B,
+        0x1EE00, 0x1EE03,   // Arabic Mathematical Alphabetic Symbols
+        0x1EE05, 0x1EE1F,
+        0x1EE21, 0x1EE22,
+        0x1EE24, 0x1EE24,
+        0x1EE27, 0x1EE27,
+        0x1EE29, 0x1EE32,
+        0x1EE34, 0x1EE37,
+        0x1EE39, 0x1EE39,
+        0x1EE3B, 0x1EE3B,
+        0x1EE42, 0x1EE42,
+        0x1EE47, 0x1EE47,
+        0x1EE49, 0x1EE49,
+        0x1EE4B, 0x1EE4B,
+        0x1EE4D, 0x1EE4F,
+        0x1EE51, 0x1EE52,
+        0x1EE54, 0x1EE54,
+        0x1EE57, 0x1EE57,
+        0x1EE59, 0x1EE59,
+        0x1EE5B, 0x1EE5B,
+        0x1EE5D, 0x1EE5D,
+        0x1EE5F, 0x1EE5F,
+        0x1EE61, 0x1EE62,
+        0x1EE64, 0x1EE64,
+        0x1EE67, 0x1EE6A,
+        0x1EE6C, 0x1EE72,
+        0x1EE74, 0x1EE77,
+        0x1EE79, 0x1EE7C,
+        0x1EE7E, 0x1EE7E,
+        0x1EE80, 0x1EE89,
+        0x1EE8B, 0x1EE9B,
+        0x1EEA1, 0x1EEA3,
+        0x1EEA5, 0x1EEA9,
+        0x1EEAB, 0x1EEBB,
+        0x20000, 0x2A6DF,   // CJK Unified Ideographs Extension B
+        0x2A700, 0x2B739,
+        0x2B740, 0x2B81D,
+        0x2B820, 0x2CEA1,
+        0x2CEB0, 0x2EBE0,
+        0x2F800, 0x2FA1D,   // CJK Compatibility Ideographs Supplement
+        0x30000, 0x3134A,
+        0x31350, 0x323AF,
+    ])
+
+    // =========================================================================
+    // MARK: - ID_Continue Table (ECMAScript IdentifierPart)
+    // =========================================================================
+
+    /// Additional ranges for ID_Continue beyond ID_Start.
+    /// Includes Mn, Mc, Nd, Pc categories.
+    /// The caller should check idStartTable first, then this table.
+    static let idContinueTable = UnicodeRangeTable(ranges: [
+        // ASCII digits
+        0x0030, 0x0039,   // 0-9
+        // Combining marks and digits from various scripts
+        0x0300, 0x036F,   // Combining Diacritical Marks
+        0x0483, 0x0487,   // Cyrillic combining marks
+        0x0591, 0x05BD,   // Hebrew points
+        0x05BF, 0x05BF,
+        0x05C1, 0x05C2,
+        0x05C4, 0x05C5,
+        0x05C7, 0x05C7,
+        0x0610, 0x061A,   // Arabic marks
+        0x064B, 0x0669,   // Arabic fathatan-sukun + digits
+        0x0670, 0x0670,
+        0x06D6, 0x06DC,
+        0x06DF, 0x06E4,
+        0x06E7, 0x06E8,
+        0x06EA, 0x06ED,
+        0x06F0, 0x06F9,   // Extended Arabic digits
+        0x0711, 0x0711,
+        0x0730, 0x074A,
+        0x07A6, 0x07B0,
+        0x07C0, 0x07C9,   // NKo digits
+        0x07EB, 0x07F3,
+        0x07FD, 0x07FD,
+        0x0816, 0x0819,
+        0x081B, 0x0823,
+        0x0825, 0x0827,
+        0x0829, 0x082D,
+        0x0859, 0x085B,
+        0x0898, 0x089F,
+        0x08CA, 0x08E1,
+        0x08E3, 0x0903,
+        0x093A, 0x093C,
+        0x093E, 0x094F,
+        0x0951, 0x0957,
+        0x0962, 0x0963,
+        0x0966, 0x096F,   // Devanagari digits
+        0x0981, 0x0983,
+        0x09BC, 0x09BC,
+        0x09BE, 0x09C4,
+        0x09C7, 0x09C8,
+        0x09CB, 0x09CD,
+        0x09D7, 0x09D7,
+        0x09E2, 0x09E3,
+        0x09E6, 0x09EF,   // Bengali digits
+        0x09FE, 0x09FE,
+        0x0A01, 0x0A03,
+        0x0A3C, 0x0A3C,
+        0x0A3E, 0x0A42,
+        0x0A47, 0x0A48,
+        0x0A4B, 0x0A4D,
+        0x0A51, 0x0A51,
+        0x0A66, 0x0A71,
+        0x0A75, 0x0A75,
+        0x0A81, 0x0A83,
+        0x0ABC, 0x0ABC,
+        0x0ABE, 0x0AC5,
+        0x0AC7, 0x0AC9,
+        0x0ACB, 0x0ACD,
+        0x0AE2, 0x0AE3,
+        0x0AE6, 0x0AEF,
+        0x0AFA, 0x0AFF,
+        0x0B01, 0x0B03,
+        0x0B3C, 0x0B3C,
+        0x0B3E, 0x0B44,
+        0x0B47, 0x0B48,
+        0x0B4B, 0x0B4D,
+        0x0B55, 0x0B57,
+        0x0B62, 0x0B63,
+        0x0B66, 0x0B6F,
+        0x0B82, 0x0B82,
+        0x0BBE, 0x0BC2,
+        0x0BC6, 0x0BC8,
+        0x0BCA, 0x0BCD,
+        0x0BD7, 0x0BD7,
+        0x0BE6, 0x0BEF,
+        0x0C00, 0x0C04,
+        0x0C3E, 0x0C44,
+        0x0C46, 0x0C48,
+        0x0C4A, 0x0C4D,
+        0x0C55, 0x0C56,
+        0x0C62, 0x0C63,
+        0x0C66, 0x0C6F,
+        0x0C81, 0x0C83,
+        0x0CBC, 0x0CBC,
+        0x0CBE, 0x0CC4,
+        0x0CC6, 0x0CC8,
+        0x0CCA, 0x0CCD,
+        0x0CD5, 0x0CD6,
+        0x0CE2, 0x0CE3,
+        0x0CE6, 0x0CEF,
+        0x0CF3, 0x0CF3,
+        0x0D00, 0x0D03,
+        0x0D3B, 0x0D3C,
+        0x0D3E, 0x0D44,
+        0x0D46, 0x0D48,
+        0x0D4A, 0x0D4D,
+        0x0D57, 0x0D57,
+        0x0D62, 0x0D63,
+        0x0D66, 0x0D6F,
+        0x0D81, 0x0D83,
+        0x0DCA, 0x0DCA,
+        0x0DCF, 0x0DD4,
+        0x0DD6, 0x0DD6,
+        0x0DD8, 0x0DDF,
+        0x0DE6, 0x0DEF,
+        0x0DF2, 0x0DF3,
+        0x0E31, 0x0E31,   // Thai vowels/marks
+        0x0E34, 0x0E3A,
+        0x0E47, 0x0E4E,
+        0x0E50, 0x0E59,   // Thai digits
+        0x0EB1, 0x0EB1,
+        0x0EB4, 0x0EBC,
+        0x0EC8, 0x0ECE,
+        0x0ED0, 0x0ED9,
+        0x0F18, 0x0F19,
+        0x0F20, 0x0F29,   // Tibetan digits
+        0x0F35, 0x0F35,
+        0x0F37, 0x0F37,
+        0x0F39, 0x0F39,
+        0x0F3E, 0x0F3F,
+        0x0F71, 0x0F84,
+        0x0F86, 0x0F87,
+        0x0F8D, 0x0F97,
+        0x0F99, 0x0FBC,
+        0x0FC6, 0x0FC6,
+        0x102B, 0x103E,   // Myanmar vowels/marks/digits
+        0x1040, 0x1049,
+        0x1056, 0x1059,
+        0x105E, 0x1060,
+        0x1062, 0x1064,
+        0x1067, 0x106D,
+        0x1071, 0x1074,
+        0x1082, 0x108D,
+        0x108F, 0x109D,
+        0x135D, 0x135F,
+        0x1712, 0x1715,
+        0x1732, 0x1734,
+        0x1752, 0x1753,
+        0x1772, 0x1773,
+        0x17B4, 0x17D3,
+        0x17DD, 0x17DD,
+        0x17E0, 0x17E9,
+        0x180B, 0x180D,
+        0x180F, 0x1819,
+        0x18A9, 0x18A9,
+        0x1920, 0x192B,
+        0x1930, 0x193B,
+        0x1946, 0x194F,
+        0x19D0, 0x19D9,
+        0x1A17, 0x1A1B,
+        0x1A55, 0x1A5E,
+        0x1A60, 0x1A7C,
+        0x1A7F, 0x1A89,
+        0x1A90, 0x1A99,
+        0x1AB0, 0x1ABD,
+        0x1ABF, 0x1ACE,
+        0x1B00, 0x1B04,
+        0x1B34, 0x1B44,
+        0x1B50, 0x1B59,
+        0x1B6B, 0x1B73,
+        0x1B80, 0x1B82,
+        0x1BA1, 0x1BAD,
+        0x1BB0, 0x1BB9,
+        0x1BE6, 0x1BF3,
+        0x1C24, 0x1C37,
+        0x1C40, 0x1C49,
+        0x1C50, 0x1C59,
+        0x1CD0, 0x1CD2,
+        0x1CD4, 0x1CE8,
+        0x1CED, 0x1CED,
+        0x1CF4, 0x1CF4,
+        0x1CF7, 0x1CF9,
+        0x1DC0, 0x1DFF,   // Combining Diacritical Marks Supplement
+        0x200C, 0x200D,   // ZWNJ + ZWJ (explicitly in spec)
+        0x203F, 0x2040,   // Undertie + Character Tie (Pc)
+        0x2054, 0x2054,   // Inverted Undertie (Pc)
+        0x20D0, 0x20DC,   // Combining marks for symbols
+        0x20E1, 0x20E1,
+        0x20E5, 0x20F0,
+        0x2CEF, 0x2CF1,
+        0x2D7F, 0x2D7F,
+        0x2DE0, 0x2DFF,
+        0xA620, 0xA629,
+        0xA66F, 0xA672,
+        0xA674, 0xA67D,
+        0xA69E, 0xA69F,
+        0xA6F0, 0xA6F1,
+        0xA802, 0xA802,
+        0xA806, 0xA806,
+        0xA80B, 0xA80B,
+        0xA823, 0xA827,
+        0xA82C, 0xA82C,
+        0xA880, 0xA881,
+        0xA8B4, 0xA8C5,
+        0xA8D0, 0xA8D9,
+        0xA8E0, 0xA8F1,
+        0xA8FF, 0xA909,
+        0xA926, 0xA92D,
+        0xA947, 0xA953,
+        0xA980, 0xA983,
+        0xA9B3, 0xA9C0,
+        0xA9D0, 0xA9D9,
+        0xA9E5, 0xA9E5,
+        0xA9F0, 0xA9F9,
+        0xAA29, 0xAA36,
+        0xAA43, 0xAA43,
+        0xAA4C, 0xAA4D,
+        0xAA50, 0xAA59,
+        0xAA7B, 0xAA7D,
+        0xAAB0, 0xAAB0,
+        0xAAB2, 0xAAB4,
+        0xAAB7, 0xAAB8,
+        0xAABE, 0xAABF,
+        0xAAC1, 0xAAC1,
+        0xAAEB, 0xAAEF,
+        0xAAF5, 0xAAF6,
+        0xABE3, 0xABEA,
+        0xABEC, 0xABED,
+        0xABF0, 0xABF9,
+        0xFB1E, 0xFB1E,
+        0xFE00, 0xFE0F,   // Variation Selectors
+        0xFE20, 0xFE2F,   // Combining Half Marks
+        0xFE33, 0xFE34,   // Pc
+        0xFE4D, 0xFE4F,   // Pc
+        0xFF10, 0xFF19,   // Fullwidth digits
+        0xFF3F, 0xFF3F,   // Fullwidth low line (Pc)
+        // Supplementary plane combining marks / digits
+        0x10376, 0x1037A,
+        0x104A0, 0x104A9,
+        0x10A01, 0x10A03,
+        0x10A05, 0x10A06,
+        0x10A0C, 0x10A0F,
+        0x10A38, 0x10A3A,
+        0x10A3F, 0x10A3F,
+        0x10AE5, 0x10AE6,
+        0x10D24, 0x10D27,
+        0x10D30, 0x10D39,
+        0x10EAB, 0x10EAC,
+        0x10EFD, 0x10EFF,
+        0x10F46, 0x10F50,
+        0x10F82, 0x10F85,
+        0x11000, 0x11002,
+        0x11038, 0x11046,
+        0x11066, 0x1106F,
+        0x11070, 0x11070,
+        0x11073, 0x11074,
+        0x1107F, 0x11082,
+        0x110B0, 0x110BA,
+        0x110C2, 0x110C2,
+        0x110F0, 0x110F9,
+        0x11100, 0x11102,
+        0x11127, 0x11134,
+        0x11136, 0x1113F,
+        0x11145, 0x11146,
+        0x11173, 0x11173,
+        0x11180, 0x11182,
+        0x111B3, 0x111C0,
+        0x111C9, 0x111CC,
+        0x111CE, 0x111D9,
+        0x1122C, 0x11237,
+        0x1123E, 0x1123E,
+        0x11241, 0x11241,
+        0x112DF, 0x112EA,
+        0x112F0, 0x112F9,
+        0x11300, 0x11303,
+        0x1133B, 0x1133C,
+        0x1133E, 0x11344,
+        0x11347, 0x11348,
+        0x1134B, 0x1134D,
+        0x11357, 0x11357,
+        0x11362, 0x11363,
+        0x11366, 0x1136C,
+        0x11370, 0x11374,
+        0x11435, 0x11446,
+        0x1145E, 0x1145E,
+        0x114B0, 0x114C3,
+        0x114D0, 0x114D9,
+        0x115AF, 0x115B5,
+        0x115B8, 0x115C0,
+        0x115DC, 0x115DD,
+        0x11630, 0x11640,
+        0x11650, 0x11659,
+        0x116AB, 0x116B7,
+        0x116C0, 0x116C9,
+        0x1171D, 0x1172B,
+        0x11730, 0x11739,
+        0x1182C, 0x1183A,
+        0x118E0, 0x118E9,
+        0x11930, 0x11935,
+        0x11937, 0x11938,
+        0x1193B, 0x1193E,
+        0x11940, 0x11940,
+        0x11942, 0x11943,
+        0x11950, 0x11959,
+        0x119D1, 0x119D7,
+        0x119DA, 0x119E0,
+        0x119E4, 0x119E4,
+        0x11A01, 0x11A0A,
+        0x11A33, 0x11A39,
+        0x11A3B, 0x11A3E,
+        0x11A47, 0x11A47,
+        0x11A51, 0x11A5B,
+        0x11A8A, 0x11A99,
+        0x11C2F, 0x11C36,
+        0x11C38, 0x11C3F,
+        0x11C50, 0x11C59,
+        0x11C92, 0x11CA7,
+        0x11CA9, 0x11CB6,
+        0x11D31, 0x11D36,
+        0x11D3A, 0x11D3A,
+        0x11D3C, 0x11D3D,
+        0x11D3F, 0x11D45,
+        0x11D47, 0x11D47,
+        0x11D50, 0x11D59,
+        0x11D8A, 0x11D8E,
+        0x11D90, 0x11D91,
+        0x11D93, 0x11D97,
+        0x11DA0, 0x11DA9,
+        0x11EF3, 0x11EF6,
+        0x11F00, 0x11F01,
+        0x11F03, 0x11F03,
+        0x11F34, 0x11F3A,
+        0x11F3E, 0x11F42,
+        0x11F50, 0x11F59,
+        0x13440, 0x13440,
+        0x13447, 0x13455,
+        0x16A60, 0x16A69,
+        0x16AC0, 0x16AC9,
+        0x16AF0, 0x16AF4,
+        0x16B30, 0x16B36,
+        0x16B50, 0x16B59,
+        0x16F4F, 0x16F4F,
+        0x16F51, 0x16F87,
+        0x16F8F, 0x16F92,
+        0x16FE4, 0x16FE4,
+        0x16FF0, 0x16FF1,
+        0x1BC9D, 0x1BC9E,
+        0x1CF00, 0x1CF2D,
+        0x1CF30, 0x1CF46,
+        0x1D165, 0x1D169,
+        0x1D16D, 0x1D172,
+        0x1D17B, 0x1D182,
+        0x1D185, 0x1D18B,
+        0x1D1AA, 0x1D1AD,
+        0x1D242, 0x1D244,
+        0x1D7CE, 0x1D7FF,  // Mathematical digits
+        0x1DA00, 0x1DA36,
+        0x1DA3B, 0x1DA6C,
+        0x1DA75, 0x1DA75,
+        0x1DA84, 0x1DA84,
+        0x1DA9B, 0x1DA9F,
+        0x1DAA1, 0x1DAAF,
+        0x1E000, 0x1E006,
+        0x1E008, 0x1E018,
+        0x1E01B, 0x1E021,
+        0x1E023, 0x1E024,
+        0x1E026, 0x1E02A,
+        0x1E08F, 0x1E08F,
+        0x1E130, 0x1E136,
+        0x1E140, 0x1E149,
+        0x1E2AE, 0x1E2AE,
+        0x1E2EC, 0x1E2F9,
+        0x1E4EC, 0x1E4F9,
+        0x1E8D0, 0x1E8D6,
+        0x1E944, 0x1E94A,
+        0x1E950, 0x1E959,
+        0x1FBF0, 0x1FBF9,
+        0xE0100, 0xE01EF,  // Variation Selectors Supplement
+    ])
+
+    // =========================================================================
+    // MARK: - Simple Case Conversion
+    // =========================================================================
+
+    /// Simple 1:1 lowercase mapping for code points outside ASCII.
+    /// Returns the input unchanged if no mapping exists.
+    static func simpleLowerCase(_ cp: UInt32) -> UInt32 {
+        // Latin Extended-A paired: even = upper, odd = lower (0x100..0x12F)
+        if cp >= 0x00C0 && cp <= 0x00D6 { return cp + 32 }
+        if cp >= 0x00D8 && cp <= 0x00DE { return cp + 32 }
+        if cp >= 0x0100 && cp <= 0x012F && cp & 1 == 0 { return cp + 1 }
+        if cp >= 0x0130 && cp == 0x0130 { return 0x0069 } // I with dot -> i
+        if cp >= 0x0132 && cp <= 0x0137 && cp & 1 == 0 { return cp + 1 }
+        if cp >= 0x0139 && cp <= 0x0148 && cp & 1 == 1 { return cp + 1 }
+        if cp >= 0x014A && cp <= 0x0177 && cp & 1 == 0 { return cp + 1 }
+        if cp == 0x0178 { return 0x00FF }
+        if cp >= 0x0179 && cp <= 0x017E && cp & 1 == 1 { return cp + 1 }
+        // Greek
+        if cp >= 0x0391 && cp <= 0x03A1 { return cp + 32 }
+        if cp >= 0x03A3 && cp <= 0x03A9 { return cp + 32 }
+        if cp == 0x0386 { return 0x03AC }
+        if cp == 0x0388 { return 0x03AD }
+        if cp == 0x0389 { return 0x03AE }
+        if cp == 0x038A { return 0x03AF }
+        if cp == 0x038C { return 0x03CC }
+        if cp == 0x038E { return 0x03CD }
+        if cp == 0x038F { return 0x03CE }
+        // Cyrillic
+        if cp >= 0x0410 && cp <= 0x042F { return cp + 32 }
+        if cp >= 0x0400 && cp <= 0x040F { return cp + 80 }
+        if cp >= 0x0460 && cp <= 0x0481 && cp & 1 == 0 { return cp + 1 }
+        if cp >= 0x048A && cp <= 0x04BF && cp & 1 == 0 { return cp + 1 }
+        if cp >= 0x04C1 && cp <= 0x04CE && cp & 1 == 1 { return cp + 1 }
+        if cp >= 0x04D0 && cp <= 0x04FF && cp & 1 == 0 { return cp + 1 }
+        // Armenian
+        if cp >= 0x0531 && cp <= 0x0556 { return cp + 48 }
+        // Georgian (Mkhedruli -> Mtavruli)
+        if cp >= 0x10A0 && cp <= 0x10C5 { return cp + 7264 }
+        if cp == 0x10C7 { return 0x2D27 }
+        if cp == 0x10CD { return 0x2D2D }
+        // Fullwidth Latin
+        if cp >= 0xFF21 && cp <= 0xFF3A { return cp + 32 }
+        // Mathematical bold/italic etc - pass through
+        return cp
+    }
+
+    /// Simple 1:1 uppercase mapping for code points outside ASCII.
+    static func simpleUpperCase(_ cp: UInt32) -> UInt32 {
+        if cp >= 0x00E0 && cp <= 0x00F6 { return cp - 32 }
+        if cp >= 0x00F8 && cp <= 0x00FE { return cp - 32 }
+        if cp == 0x00FF { return 0x0178 }
+        if cp >= 0x0100 && cp <= 0x012F && cp & 1 == 1 { return cp - 1 }
+        if cp == 0x0131 { return 0x0049 } // dotless i -> I
+        if cp >= 0x0132 && cp <= 0x0137 && cp & 1 == 1 { return cp - 1 }
+        if cp >= 0x0139 && cp <= 0x0148 && cp & 1 == 0 { return cp - 1 }
+        if cp >= 0x014A && cp <= 0x0177 && cp & 1 == 1 { return cp - 1 }
+        if cp >= 0x0179 && cp <= 0x017E && cp & 1 == 0 { return cp - 1 }
+        // Greek
+        if cp >= 0x03B1 && cp <= 0x03C1 { return cp - 32 }
+        if cp >= 0x03C3 && cp <= 0x03C9 { return cp - 32 }
+        if cp == 0x03AC { return 0x0386 }
+        if cp == 0x03AD { return 0x0388 }
+        if cp == 0x03AE { return 0x0389 }
+        if cp == 0x03AF { return 0x038A }
+        if cp == 0x03CC { return 0x038C }
+        if cp == 0x03CD { return 0x038E }
+        if cp == 0x03CE { return 0x038F }
+        if cp == 0x03C2 { return 0x03A3 } // final sigma -> SIGMA
+        // Cyrillic
+        if cp >= 0x0430 && cp <= 0x044F { return cp - 32 }
+        if cp >= 0x0450 && cp <= 0x045F { return cp - 80 }
+        if cp >= 0x0460 && cp <= 0x0481 && cp & 1 == 1 { return cp - 1 }
+        if cp >= 0x048A && cp <= 0x04BF && cp & 1 == 1 { return cp - 1 }
+        if cp >= 0x04C1 && cp <= 0x04CE && cp & 1 == 0 { return cp - 1 }
+        if cp >= 0x04D0 && cp <= 0x04FF && cp & 1 == 1 { return cp - 1 }
+        // Armenian
+        if cp >= 0x0561 && cp <= 0x0586 { return cp - 48 }
+        // Georgian
+        if cp >= 0x2D00 && cp <= 0x2D25 { return cp - 7264 }
+        if cp == 0x2D27 { return 0x10C7 }
+        if cp == 0x2D2D { return 0x10CD }
+        // Fullwidth Latin
+        if cp >= 0xFF41 && cp <= 0xFF5A { return cp - 32 }
+        return cp
+    }
+
+    // =========================================================================
+    // MARK: - Full Case Conversion (1-to-many)
+    // =========================================================================
+
+    /// Full lowercase mapping. Returns empty array if no special mapping
+    /// exists (caller should fall back to simpleLowerCase).
+    static func fullLowerCase(_ cp: UInt32) -> [UInt32] {
+        switch cp {
+        case 0x0130: return [0x0069, 0x0307]  // I with dot above -> i + combining dot
+        default: return []
+        }
+    }
+
+    /// Full uppercase mapping. Returns empty array if no special mapping exists.
+    static func fullUpperCase(_ cp: UInt32) -> [UInt32] {
+        switch cp {
+        case 0x00DF: return [0x0053, 0x0053]  // sharp s -> SS
+        case 0x0149: return [0x02BC, 0x004E]  // latin small n preceded by apostrophe
+        case 0x01F0: return [0x004A, 0x030C]  // j with caron
+        case 0x0390: return [0x0399, 0x0308, 0x0301]  // iota with dialytika+tonos
+        case 0x03B0: return [0x03A5, 0x0308, 0x0301]  // upsilon with dialytika+tonos
+        case 0x0587: return [0x0535, 0x0552]  // Armenian ech yiwn
+        case 0xFB00: return [0x0046, 0x0046]  // ff
+        case 0xFB01: return [0x0046, 0x0049]  // fi
+        case 0xFB02: return [0x0046, 0x004C]  // fl
+        case 0xFB03: return [0x0046, 0x0046, 0x0049]  // ffi
+        case 0xFB04: return [0x0046, 0x0046, 0x004C]  // ffl
+        case 0xFB05: return [0x0053, 0x0054]  // long st
+        case 0xFB06: return [0x0053, 0x0054]  // st
+        default: return []
+        }
+    }
+
+    // =========================================================================
+    // MARK: - General Category Lookup
+    // =========================================================================
+
+    /// Returns the Unicode general category for a code point.
+    /// Uses a compact range-based lookup covering BMP + common supplementary ranges.
+    static func getCategory(_ cp: UInt32) -> UnicodeCategory {
+        // ASCII fast path
+        if cp < 0x80 {
+            if cp >= 0x41 && cp <= 0x5A { return .Lu }
+            if cp >= 0x61 && cp <= 0x7A { return .Ll }
+            if cp >= 0x30 && cp <= 0x39 { return .Nd }
+            if cp == 0x20 { return .Zs }
+            if cp < 0x20 || cp == 0x7F { return .Cc }
+            // Punctuation / symbols
+            switch cp {
+            case 0x21...0x23, 0x25...0x27, 0x2A, 0x2C, 0x2E, 0x2F,
+                 0x3A, 0x3B, 0x3F, 0x40, 0x5C: return .Po
+            case 0x28: return .Ps
+            case 0x29: return .Pe
+            case 0x5B: return .Ps
+            case 0x5D: return .Pe
+            case 0x7B: return .Ps
+            case 0x7D: return .Pe
+            case 0x24: return .Sc
+            case 0x2B, 0x3C...0x3E, 0x7C, 0x7E: return .Sm
+            case 0x5E, 0x60: return .Sk
+            case 0x5F: return .Pc
+            case 0x2D: return .Pd
+            default: return .Cn
+            }
+        }
+        // Latin-1 Supplement
+        if cp >= 0x80 && cp <= 0xFF {
+            if cp >= 0x80 && cp <= 0x9F { return .Cc }
+            if cp == 0xA0 { return .Zs }
+            if cp == 0xAD { return .Cf }
+            if cp >= 0xC0 && cp <= 0xD6 { return .Lu }
+            if cp >= 0xD8 && cp <= 0xDE { return .Lu }
+            if cp >= 0xE0 && cp <= 0xF6 { return .Ll }
+            if cp >= 0xF8 && cp <= 0xFF { return .Ll }
+            if cp == 0xAA || cp == 0xBA { return .Lo }
+            if cp == 0xB5 { return .Ll }
+            if cp == 0xA2 || cp == 0xA3 || cp == 0xA4 || cp == 0xA5 { return .Sc }
+            if cp == 0xAB { return .Pi }
+            if cp == 0xBB { return .Pf }
+            if cp == 0xB1 || cp == 0xD7 || cp == 0xF7 || cp == 0xAC { return .Sm }
+            if cp == 0xA6 || cp == 0xA9 || cp == 0xAE || cp == 0xB0 || cp == 0xB6 { return .So }
+            if cp == 0xA8 || cp == 0xAF || cp == 0xB4 || cp == 0xB8 { return .Sk }
+            if cp == 0xB2 || cp == 0xB3 || cp == 0xB9 { return .No }
+            if cp == 0xBC || cp == 0xBD || cp == 0xBE { return .No }
+            if cp == 0xA7 || cp == 0xB7 || cp == 0xBF || cp == 0xA1 { return .Po }
+            return .So
+        }
+        // Combining diacritical marks
+        if cp >= 0x0300 && cp <= 0x036F { return .Mn }
+        // Greek
+        if cp >= 0x0391 && cp <= 0x03A1 { return .Lu }
+        if cp >= 0x03A3 && cp <= 0x03A9 { return .Lu }
+        if cp >= 0x03B1 && cp <= 0x03C1 { return .Ll }
+        if cp >= 0x03C3 && cp <= 0x03C9 { return .Ll }
+        // Cyrillic uppercase
+        if cp >= 0x0410 && cp <= 0x042F { return .Lu }
+        // Cyrillic lowercase
+        if cp >= 0x0430 && cp <= 0x044F { return .Ll }
+        // Arabic digits
+        if cp >= 0x0660 && cp <= 0x0669 { return .Nd }
+        // Devanagari digits
+        if cp >= 0x0966 && cp <= 0x096F { return .Nd }
+        // CJK Unified Ideographs
+        if cp >= 0x4E00 && cp <= 0x9FFF { return .Lo }
+        // Hangul Syllables
+        if cp >= 0xAC00 && cp <= 0xD7A3 { return .Lo }
+        // CJK Extension A
+        if cp >= 0x3400 && cp <= 0x4DBF { return .Lo }
+        // Hiragana
+        if cp >= 0x3041 && cp <= 0x3096 { return .Lo }
+        // Katakana
+        if cp >= 0x30A1 && cp <= 0x30FA { return .Lo }
+        // Surrogates
+        if cp >= 0xD800 && cp <= 0xDFFF { return .Cs }
+        // Private Use Area
+        if cp >= 0xE000 && cp <= 0xF8FF { return .Co }
+        // Format characters
+        if cp == 0x200B || cp == 0x200C || cp == 0x200D { return .Cf }
+        if cp == 0x2028 { return .Zl }
+        if cp == 0x2029 { return .Zp }
+        if cp == 0xFEFF { return .Cf }
+        if cp >= 0xFFF0 && cp <= 0xFFF8 { return .Cn }
+        if cp == 0xFFFE || cp == 0xFFFF { return .Cn }
+        // Supplementary Private Use Areas
+        if cp >= 0xF0000 && cp <= 0xFFFFF { return .Co }
+        if cp >= 0x100000 && cp <= 0x10FFFF { return .Co }
+        // Fallback: use Swift's Unicode.Scalar properties
+        if let scalar = Unicode.Scalar(cp) {
+            let props = scalar.properties
+            if props.isLowercase { return .Ll }
+            if props.isUppercase { return .Lu }
+            if props.generalCategory == .decimalNumber { return .Nd }
+            if props.generalCategory == .letterNumber { return .Nl }
+            if props.isAlphabetic { return .Lo }
+            if props.generalCategory == .nonspacingMark { return .Mn }
+            if props.generalCategory == .spacingMark { return .Mc }
+            if props.generalCategory == .enclosingMark { return .Me }
+            if props.generalCategory == .spaceSeparator { return .Zs }
+            if props.generalCategory == .format { return .Cf }
+            if props.generalCategory == .connectorPunctuation { return .Pc }
+        }
+        return .Cn
+    }
+
+    // =========================================================================
+    // MARK: - Combining Class
+    // =========================================================================
+
+    /// Returns the canonical combining class (CCC) for a code point.
+    /// Used by Unicode normalization (NFC/NFD).
+    static func getCombiningClass(_ cp: UInt32) -> UInt8 {
+        // Non-combining characters
+        if cp < 0x0300 { return 0 }
+        // Combining Diacritical Marks (0300-036F)
+        if cp >= 0x0300 && cp <= 0x0314 { return 230 } // above
+        if cp >= 0x0315 && cp <= 0x0315 { return 232 } // above right
+        if cp >= 0x0316 && cp <= 0x0319 { return 220 } // below
+        if cp == 0x031A { return 232 }
+        if cp >= 0x031B && cp <= 0x031B { return 216 }
+        if cp >= 0x031C && cp <= 0x0320 { return 220 }
+        if cp >= 0x0321 && cp <= 0x0322 { return 202 }
+        if cp >= 0x0323 && cp <= 0x0326 { return 220 }
+        if cp >= 0x0327 && cp <= 0x0328 { return 202 }
+        if cp >= 0x0329 && cp <= 0x0333 { return 220 }
+        if cp >= 0x0334 && cp <= 0x0338 { return 1 }   // overlay
+        if cp >= 0x0339 && cp <= 0x033C { return 220 }
+        if cp >= 0x033D && cp <= 0x0344 { return 230 }
+        if cp == 0x0345 { return 240 }  // iota subscript
+        if cp >= 0x0346 && cp <= 0x034E { return 230 }
+        if cp == 0x034F { return 0 }    // CGJ
+        if cp >= 0x0350 && cp <= 0x0352 { return 230 }
+        if cp >= 0x0353 && cp <= 0x0356 { return 220 }
+        if cp >= 0x0357 && cp <= 0x0357 { return 230 }
+        if cp == 0x0358 { return 232 }
+        if cp >= 0x0359 && cp <= 0x035A { return 220 }
+        if cp >= 0x035B && cp <= 0x035B { return 230 }
+        if cp == 0x035C { return 233 }
+        if cp == 0x035D || cp == 0x035E { return 234 }
+        if cp == 0x035F { return 233 }
+        if cp >= 0x0360 && cp <= 0x0361 { return 234 }
+        if cp == 0x0362 { return 233 }
+        if cp >= 0x0363 && cp <= 0x036F { return 230 }
+        // Hebrew points
+        if cp >= 0x0591 && cp <= 0x05BD { return 220 }
+        if cp == 0x05BF { return 230 }
+        if cp == 0x05C1 { return 24 }
+        if cp == 0x05C2 { return 25 }
+        if cp == 0x05C4 { return 230 }
+        if cp == 0x05C5 { return 220 }
+        if cp == 0x05C7 { return 18 }
+        // Arabic
+        if cp >= 0x064B && cp <= 0x065F { return 230 }
+        if cp == 0x0670 { return 35 }
+        // Fallback for other ranges
+        if let scalar = Unicode.Scalar(cp) {
+            return UInt8(scalar.properties.canonicalCombiningClass.rawValue)
+        }
+        return 0
+    }
+
+    // =========================================================================
+    // MARK: - NFD Decomposition
+    // =========================================================================
+
+    /// Returns the canonical (NFD) decomposition of a code point, or nil if
+    /// the code point is already in decomposed form.
+    static func decompose(_ cp: UInt32) -> [UInt32]? {
+        // Hangul algorithmic decomposition (LV or LVT syllables)
+        let sBase: UInt32 = 0xAC00
+        let lBase: UInt32 = 0x1100
+        let vBase: UInt32 = 0x1161
+        let tBase: UInt32 = 0x11A7
+        let tCount: UInt32 = 28
+        let nCount: UInt32 = 588  // vCount * tCount
+        let sCount: UInt32 = 11172
+
+        if cp >= sBase && cp < sBase + sCount {
+            let sIndex = cp - sBase
+            let l = lBase + sIndex / nCount
+            let v = vBase + (sIndex % nCount) / tCount
+            let t = tBase + sIndex % tCount
+            if t == tBase {
+                return [l, v]
+            } else {
+                return [l, v, t]
+            }
+        }
+
+        // Selected BMP decompositions (most common precomposed characters)
+        switch cp {
+        case 0x00C0: return [0x0041, 0x0300]  // A grave
+        case 0x00C1: return [0x0041, 0x0301]  // A acute
+        case 0x00C2: return [0x0041, 0x0302]  // A circumflex
+        case 0x00C3: return [0x0041, 0x0303]  // A tilde
+        case 0x00C4: return [0x0041, 0x0308]  // A diaeresis
+        case 0x00C5: return [0x0041, 0x030A]  // A ring
+        case 0x00C7: return [0x0043, 0x0327]  // C cedilla
+        case 0x00C8: return [0x0045, 0x0300]  // E grave
+        case 0x00C9: return [0x0045, 0x0301]  // E acute
+        case 0x00CA: return [0x0045, 0x0302]  // E circumflex
+        case 0x00CB: return [0x0045, 0x0308]  // E diaeresis
+        case 0x00CC: return [0x0049, 0x0300]  // I grave
+        case 0x00CD: return [0x0049, 0x0301]  // I acute
+        case 0x00CE: return [0x0049, 0x0302]  // I circumflex
+        case 0x00CF: return [0x0049, 0x0308]  // I diaeresis
+        case 0x00D1: return [0x004E, 0x0303]  // N tilde
+        case 0x00D2: return [0x004F, 0x0300]  // O grave
+        case 0x00D3: return [0x004F, 0x0301]  // O acute
+        case 0x00D4: return [0x004F, 0x0302]  // O circumflex
+        case 0x00D5: return [0x004F, 0x0303]  // O tilde
+        case 0x00D6: return [0x004F, 0x0308]  // O diaeresis
+        case 0x00D9: return [0x0055, 0x0300]  // U grave
+        case 0x00DA: return [0x0055, 0x0301]  // U acute
+        case 0x00DB: return [0x0055, 0x0302]  // U circumflex
+        case 0x00DC: return [0x0055, 0x0308]  // U diaeresis
+        case 0x00DD: return [0x0059, 0x0301]  // Y acute
+        case 0x00E0: return [0x0061, 0x0300]  // a grave
+        case 0x00E1: return [0x0061, 0x0301]  // a acute
+        case 0x00E2: return [0x0061, 0x0302]  // a circumflex
+        case 0x00E3: return [0x0061, 0x0303]  // a tilde
+        case 0x00E4: return [0x0061, 0x0308]  // a diaeresis
+        case 0x00E5: return [0x0061, 0x030A]  // a ring
+        case 0x00E7: return [0x0063, 0x0327]  // c cedilla
+        case 0x00E8: return [0x0065, 0x0300]  // e grave
+        case 0x00E9: return [0x0065, 0x0301]  // e acute
+        case 0x00EA: return [0x0065, 0x0302]  // e circumflex
+        case 0x00EB: return [0x0065, 0x0308]  // e diaeresis
+        case 0x00EC: return [0x0069, 0x0300]  // i grave
+        case 0x00ED: return [0x0069, 0x0301]  // i acute
+        case 0x00EE: return [0x0069, 0x0302]  // i circumflex
+        case 0x00EF: return [0x0069, 0x0308]  // i diaeresis
+        case 0x00F1: return [0x006E, 0x0303]  // n tilde
+        case 0x00F2: return [0x006F, 0x0300]  // o grave
+        case 0x00F3: return [0x006F, 0x0301]  // o acute
+        case 0x00F4: return [0x006F, 0x0302]  // o circumflex
+        case 0x00F5: return [0x006F, 0x0303]  // o tilde
+        case 0x00F6: return [0x006F, 0x0308]  // o diaeresis
+        case 0x00F9: return [0x0075, 0x0300]  // u grave
+        case 0x00FA: return [0x0075, 0x0301]  // u acute
+        case 0x00FB: return [0x0075, 0x0302]  // u circumflex
+        case 0x00FC: return [0x0075, 0x0308]  // u diaeresis
+        case 0x00FD: return [0x0079, 0x0301]  // y acute
+        case 0x00FF: return [0x0079, 0x0308]  // y diaeresis
+        default: return nil
+        }
+    }
+
+    // =========================================================================
+    // MARK: - NFC Composition
+    // =========================================================================
+
+    /// Attempts to compose a base code point with a combining code point
+    /// into a single precomposed code point (NFC composition).
+    /// Returns nil if no composition exists.
+    static func compose(_ base: UInt32, _ combining: UInt32) -> UInt32? {
+        // Hangul algorithmic composition
+        let lBase: UInt32 = 0x1100
+        let vBase: UInt32 = 0x1161
+        let tBase: UInt32 = 0x11A7
+        let sBase: UInt32 = 0xAC00
+        let lCount: UInt32 = 19
+        let vCount: UInt32 = 21
+        let tCount: UInt32 = 28
+        let nCount: UInt32 = vCount * tCount
+
+        // L + V -> LV
+        if base >= lBase && base < lBase + lCount &&
+           combining >= vBase && combining < vBase + vCount {
+            let l = base - lBase
+            let v = combining - vBase
+            return sBase + (l * nCount + v * tCount)
+        }
+
+        // LV + T -> LVT
+        if base >= sBase && base < sBase + lCount * nCount {
+            let sIndex = base - sBase
+            if sIndex % tCount == 0 &&
+               combining > tBase && combining < tBase + tCount {
+                return base + (combining - tBase)
+            }
+        }
+
+        // Common Latin compositions
+        switch (base, combining) {
+        case (0x0041, 0x0300): return 0x00C0
+        case (0x0041, 0x0301): return 0x00C1
+        case (0x0041, 0x0302): return 0x00C2
+        case (0x0041, 0x0303): return 0x00C3
+        case (0x0041, 0x0308): return 0x00C4
+        case (0x0041, 0x030A): return 0x00C5
+        case (0x0043, 0x0327): return 0x00C7
+        case (0x0045, 0x0300): return 0x00C8
+        case (0x0045, 0x0301): return 0x00C9
+        case (0x0045, 0x0302): return 0x00CA
+        case (0x0045, 0x0308): return 0x00CB
+        case (0x0049, 0x0300): return 0x00CC
+        case (0x0049, 0x0301): return 0x00CD
+        case (0x0049, 0x0302): return 0x00CE
+        case (0x0049, 0x0308): return 0x00CF
+        case (0x004E, 0x0303): return 0x00D1
+        case (0x004F, 0x0300): return 0x00D2
+        case (0x004F, 0x0301): return 0x00D3
+        case (0x004F, 0x0302): return 0x00D4
+        case (0x004F, 0x0303): return 0x00D5
+        case (0x004F, 0x0308): return 0x00D6
+        case (0x0055, 0x0300): return 0x00D9
+        case (0x0055, 0x0301): return 0x00DA
+        case (0x0055, 0x0302): return 0x00DB
+        case (0x0055, 0x0308): return 0x00DC
+        case (0x0059, 0x0301): return 0x00DD
+        case (0x0061, 0x0300): return 0x00E0
+        case (0x0061, 0x0301): return 0x00E1
+        case (0x0061, 0x0302): return 0x00E2
+        case (0x0061, 0x0303): return 0x00E3
+        case (0x0061, 0x0308): return 0x00E4
+        case (0x0061, 0x030A): return 0x00E5
+        case (0x0063, 0x0327): return 0x00E7
+        case (0x0065, 0x0300): return 0x00E8
+        case (0x0065, 0x0301): return 0x00E9
+        case (0x0065, 0x0302): return 0x00EA
+        case (0x0065, 0x0308): return 0x00EB
+        case (0x0069, 0x0300): return 0x00EC
+        case (0x0069, 0x0301): return 0x00ED
+        case (0x0069, 0x0302): return 0x00EE
+        case (0x0069, 0x0308): return 0x00EF
+        case (0x006E, 0x0303): return 0x00F1
+        case (0x006F, 0x0300): return 0x00F2
+        case (0x006F, 0x0301): return 0x00F3
+        case (0x006F, 0x0302): return 0x00F4
+        case (0x006F, 0x0303): return 0x00F5
+        case (0x006F, 0x0308): return 0x00F6
+        case (0x0075, 0x0300): return 0x00F9
+        case (0x0075, 0x0301): return 0x00FA
+        case (0x0075, 0x0302): return 0x00FB
+        case (0x0075, 0x0308): return 0x00FC
+        case (0x0079, 0x0301): return 0x00FD
+        case (0x0079, 0x0308): return 0x00FF
+        default: return nil
+        }
+    }
+}

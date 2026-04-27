@@ -1,0 +1,117 @@
+name: Submit for App Store Review
+
+# Manually triggered. Submits the latest TestFlight build (matching the
+# given version) for App Store review on the chosen platforms. Does NOT
+# build or upload — run TestFlight first and wait until processing
+# finishes (status "Ready to Submit") before invoking this workflow.
+#
+# Metadata, screenshots and pricing are managed in App Store Connect, not
+# here. We only flip the "submit for review" switch on the binary that's
+# already there.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Marketing version of the build to submit (must match the build already in TestFlight)."
+        required: true
+        type: string
+      platforms:
+        description: "Which platforms to submit."
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - ios
+          - macos
+          - visionos
+          - watchos
+
+jobs:
+  ios:
+    name: Submit iOS for review
+    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'ios' }}
+    runs-on: macos-15
+    environment: production
+    defaults:
+      run:
+        working-directory: JeffJSConsole
+    env:
+      VERSION: ${{ inputs.version }}
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_STORE_CONNECT_KEY_P8: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: JeffJSConsole
+      - run: bundle exec fastlane ios release
+
+  macos:
+    name: Submit macOS for review
+    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'macos' }}
+    runs-on: macos-15
+    environment: production
+    defaults:
+      run:
+        working-directory: JeffJSConsole
+    env:
+      VERSION: ${{ inputs.version }}
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_STORE_CONNECT_KEY_P8: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: JeffJSConsole
+      - run: bundle exec fastlane mac release
+
+  visionos:
+    name: Submit visionOS for review
+    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'visionos' }}
+    runs-on: macos-15
+    environment: production
+    defaults:
+      run:
+        working-directory: JeffJSConsole
+    env:
+      VERSION: ${{ inputs.version }}
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_STORE_CONNECT_KEY_P8: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: JeffJSConsole
+      - run: bundle exec fastlane ios release_visionos
+
+  watchos:
+    name: Submit watchOS for review
+    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'watchos' }}
+    runs-on: macos-15
+    environment: production
+    defaults:
+      run:
+        working-directory: JeffJSConsole
+    env:
+      VERSION: ${{ inputs.version }}
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_STORE_CONNECT_KEY_P8: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: JeffJSConsole
+      - run: bundle exec fastlane ios release_watchos

@@ -1,0 +1,11 @@
+team_id "3F45D8TQ28"
+
+# Per-platform app identifiers — bundle IDs differ between the Console
+# (iOS / iPadOS / macOS / visionOS) and the standalone Watch App.
+for_platform :ios do
+  app_identifier "ai.hudson.JeffJSConsole"
+end
+
+for_platform :mac do
+  app_identifier "ai.hudson.JeffJSConsole"
+end

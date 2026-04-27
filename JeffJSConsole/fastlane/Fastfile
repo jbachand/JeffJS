@@ -1,0 +1,207 @@
+# Fastfile — TestFlight + App Store pipelines for the JeffJS Console family.
+#
+# One scheme — `JeffJSConsole` — covers iOS, iPadOS, macOS and visionOS via
+# different `-destination` arguments. The watchOS app ships from the
+# separate `JeffJS Watch App` scheme. tvOS is not currently a target;
+# add a tvOS app target before invoking the (commented-out) tvOS lanes.
+#
+# Auth: App Store Connect API key (in CI). Locally you can `fastlane spaceauth`
+# or rely on a logged-in Xcode.
+#
+# Versioning: marketing version is read from $VERSION (required).
+# Build number is the current epoch (`date +%s`) so it is always strictly
+# increasing and never collides with a previous upload.
+
+default_platform(:ios)
+
+XCODEPROJ        = "JeffJSConsole.xcodeproj"
+CONSOLE_SCHEME   = "JeffJSConsole"
+WATCH_SCHEME     = "JeffJS Watch App"
+
+CONSOLE_BUNDLE_ID = "ai.hudson.JeffJSConsole"
+WATCH_BUNDLE_ID   = "ai.hudson.JeffJS"  # watchapp2-container parent identifier
+
+before_all do
+  setup_ci if is_ci
+  if ENV["APP_STORE_CONNECT_KEY_ID"]
+    app_store_connect_api_key(
+      key_id:                ENV["APP_STORE_CONNECT_KEY_ID"],
+      issuer_id:             ENV["APP_STORE_CONNECT_ISSUER_ID"],
+      key_content:           ENV["APP_STORE_CONNECT_KEY_P8"],
+      is_key_content_base64: true,
+      duration:              1200,
+      in_house:              false
+    )
+  end
+end
+
+# ---------- helpers ----------
+
+def require_version!
+  ENV["VERSION"] or UI.user_error!(
+    "VERSION env var required (e.g. VERSION=1.0.1 fastlane ios beta)"
+  )
+end
+
+def epoch_build_number
+  Time.now.to_i.to_s
+end
+
+def stamp_versions(version, build, target: nil)
+  increment_version_number_in_xcodeproj(
+    version_number: version,
+    xcodeproj:      XCODEPROJ,
+    target:         target
+  )
+  increment_build_number_in_xcodeproj(
+    build_number: build,
+    xcodeproj:    XCODEPROJ,
+    target:       target
+  )
+end
+
+# Build & archive for a specific Apple platform via -destination. We use
+# `build_app` (gym) so we get a proper .ipa/.pkg with App Store export.
+def archive(scheme:, platform:, output_dir:, export_method: "app-store",
+            export_options: {})
+  destinations = {
+    ios:      "generic/platform=iOS",
+    macos:    "generic/platform=macOS",
+    visionos: "generic/platform=visionOS",
+    watchos:  "generic/platform=watchOS",
+    tvos:     "generic/platform=tvOS"
+  }
+  build_app(
+    project:           XCODEPROJ,
+    scheme:            scheme,
+    configuration:     "Release",
+    destination:       destinations.fetch(platform),
+    export_method:     export_method,
+    output_directory:  output_dir,
+    output_name:       "#{scheme}-#{platform}",
+    clean:             true,
+    include_bitcode:   false,
+    include_symbols:   true,
+    skip_profile_detection: false,
+    export_options:    export_options,
+    xcargs:            "-allowProvisioningUpdates"
+  )
+end
+
+# Upload a freshly-archived build to TestFlight. We never auto-submit for
+# review here — that's what the `release` lane is for.
+def upload_beta(app_id:, app_platform: "ios")
+  upload_to_testflight(
+    api_key_path:                 nil,  # in-memory key from before_all
+    app_identifier:               app_id,
+    app_platform:                 app_platform,
+    skip_waiting_for_build_processing: true,
+    skip_submission:              true,
+    distribute_external:          false,
+    changelog:                    "Build #{ENV['VERSION']} (#{Time.now.utc.iso8601})"
+  )
+end
+
+# Submit the latest TestFlight build (matching $VERSION) to App Store review.
+def submit_for_review(app_id:, platform:)
+  upload_to_app_store(
+    app_identifier:                  app_id,
+    platform:                        platform,
+    app_version:                     ENV["VERSION"],
+    skip_metadata:                   true,
+    skip_screenshots:                true,
+    skip_binary_upload:              true,
+    submit_for_review:               true,
+    automatic_release:               true,
+    force:                           true,
+    precheck_include_in_app_purchases: false,
+    submission_information:          {
+      add_id_info_uses_idfa:               false,
+      export_compliance_uses_encryption:   false,
+      export_compliance_encryption_updated: false,
+      export_compliance_app_type:          nil,
+      export_compliance_is_exempt:         true,
+      content_rights_contains_third_party_content: false,
+      content_rights_has_rights:           true
+    }
+  )
+end
+
+# ---------- iOS / iPadOS ----------
+
+platform :ios do
+  desc "Build for iOS + iPadOS, upload to TestFlight"
+  lane :beta do
+    require_version!
+    stamp_versions(ENV["VERSION"], epoch_build_number)
+    archive(scheme: CONSOLE_SCHEME, platform: :ios, output_dir: "build/ios")
+    upload_beta(app_id: CONSOLE_BUNDLE_ID, app_platform: "ios")
+  end
+
+  desc "Submit the current TestFlight build for App Store review (iOS)"
+  lane :release do
+    require_version!
+    submit_for_review(app_id: CONSOLE_BUNDLE_ID, platform: "ios")
+  end
+
+  desc "Build for visionOS, upload to TestFlight"
+  lane :beta_visionos do
+    require_version!
+    stamp_versions(ENV["VERSION"], epoch_build_number)
+    archive(scheme: CONSOLE_SCHEME, platform: :visionos, output_dir: "build/visionos")
+    upload_beta(app_id: CONSOLE_BUNDLE_ID, app_platform: "xros")
+  end
+
+  desc "Submit visionOS build for App Store review"
+  lane :release_visionos do
+    require_version!
+    submit_for_review(app_id: CONSOLE_BUNDLE_ID, platform: "xros")
+  end
+
+  desc "Build for watchOS, upload to TestFlight"
+  lane :beta_watchos do
+    require_version!
+    stamp_versions(ENV["VERSION"], epoch_build_number, target: WATCH_SCHEME)
+    archive(scheme: WATCH_SCHEME, platform: :watchos, output_dir: "build/watchos")
+    upload_beta(app_id: WATCH_BUNDLE_ID, app_platform: "ios")
+  end
+
+  desc "Submit watchOS build for App Store review"
+  lane :release_watchos do
+    require_version!
+    submit_for_review(app_id: WATCH_BUNDLE_ID, platform: "ios")
+  end
+end
+
+# ---------- macOS ----------
+
+platform :mac do
+  desc "Build for macOS, upload to TestFlight"
+  lane :beta do
+    require_version!
+    stamp_versions(ENV["VERSION"], epoch_build_number)
+    archive(scheme: CONSOLE_SCHEME, platform: :macos, output_dir: "build/macos")
+    upload_beta(app_id: CONSOLE_BUNDLE_ID, app_platform: "osx")
+  end
+
+  desc "Submit macOS build for App Store review"
+  lane :release do
+    require_version!
+    submit_for_review(app_id: CONSOLE_BUNDLE_ID, platform: "osx")
+  end
+end
+
+# ---------- tvOS ----------
+# No tvOS target exists yet. To enable: add an `App (tvOS)` target to
+# JeffJSConsole.xcodeproj, then mirror the iOS lane below with
+# scheme: "JeffJSConsoleTV" (or whatever you call it) and
+# app_platform: "appletvos".
+#
+# platform :ios do
+#   lane :beta_tvos do
+#     require_version!
+#     stamp_versions(ENV["VERSION"], epoch_build_number, target: "JeffJSConsoleTV")
+#     archive(scheme: "JeffJSConsoleTV", platform: :tvos, output_dir: "build/tvos")
+#     upload_beta(app_id: "ai.hudson.JeffJSConsole.tv", app_platform: "appletvos")
+#   end
+# end

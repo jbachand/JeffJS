@@ -1,0 +1,6 @@
+/.build
+*.pyc
+/marketing
+.DS_Store
+.github/AppStoreListing.md
+/MarketingAssets/Icons
