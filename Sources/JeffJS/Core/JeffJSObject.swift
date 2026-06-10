@@ -42,6 +42,11 @@ struct JeffJSICEntry {
 }
 
 /// Reference-type IC table so interpreter can update entries in-place without COW copies.
+///
+/// Each cached shape is *retained* (Unmanaged.passRetained) for as long as its
+/// entry lives. Without the pin, a dead shape's address can be recycled by a
+/// new shape allocation and the pointer-identity check false-hits, reading
+/// property slots through the wrong layout (observed as flaky engine crashes).
 final class JeffJSInlineCache {
     static let size = 512
     static let mask = size - 1
@@ -54,6 +59,11 @@ final class JeffJSInlineCache {
     }
 
     deinit {
+        for entry in entries {
+            if let old = entry.shapePtr {
+                Unmanaged<JeffJSShape>.fromOpaque(old).release()
+            }
+        }
         entries.baseAddress?.deinitialize(count: Self.size)
         entries.baseAddress?.deallocate()
     }
@@ -66,8 +76,14 @@ final class JeffJSInlineCache {
     @inline(__always)
     func update(_ pc: Int, shape: JeffJSShape, propOffset: Int) {
         let idx = pc & Self.mask
+        // Retain the new shape before releasing the old one (handles re-caching
+        // the same shape without a transient zero refcount).
+        let newPtr = Unmanaged.passRetained(shape).toOpaque()
+        if let old = entries[idx].shapePtr {
+            Unmanaged<JeffJSShape>.fromOpaque(old).release()
+        }
         entries[idx] = JeffJSICEntry(
-            shapePtr: Unmanaged.passUnretained(shape).toOpaque(),
+            shapePtr: UnsafeRawPointer(newPtr),
             pc: pc,
             propOffset: propOffset
         )
@@ -733,54 +749,9 @@ final class JeffJSStackFrame {
 
     init() {}
 
-    // MARK: - Frame Pool
-
-    /// Pool of recycled stack frames to avoid malloc/free on every function call.
-    /// In tight loops (e.g., 50K calls to `add(a,b)`), this eliminates heap
-    /// allocation overhead entirely after the first few calls.
-    private static let maxPoolSize = 32
-    private static var pool: [JeffJSStackFrame] = {
-        var p = [JeffJSStackFrame]()
-        p.reserveCapacity(maxPoolSize)
-        return p
-    }()
-
-    /// Acquires a frame from the pool or allocates a new one.
-    @inline(__always)
-    static func acquire() -> JeffJSStackFrame {
-        if !pool.isEmpty {
-            return pool.removeLast()
-        }
-        return JeffJSStackFrame()
-    }
-
-    /// Returns a frame to the pool after clearing references to allow GC.
-    /// Only pools up to maxPoolSize frames; extras are dropped.
-    @inline(__always)
-    static func release(_ frame: JeffJSStackFrame) {
-        // Clear references so objects held by the frame can be GC'd
-        frame.prevFrame = nil
-        frame.curFunc = .undefined
-        frame.thisVal = .undefined
-        frame.newTarget = .undefined
-        frame.curPC = 0
-        frame.argCount = 0
-        frame.varCount = 0
-        frame.spBase = 0
-        frame.sp = 0
-        // Clear unsafe buffer fields (buf is managed by the interpreter, not freed here)
-        frame.buf = nil
-        frame.bufCapacity = 0
-        frame.bufVarBase = 0
-        frame.bufSpBase = 0
-        // Keep the arrays allocated but empty — the capacity stays for reuse
-        frame.argBuf.removeAll(keepingCapacity: true)
-        frame.varBuf.removeAll(keepingCapacity: true)
-        frame.liveVarRefs.removeAll(keepingCapacity: true)
-        if pool.count < maxPoolSize {
-            pool.append(frame)
-        }
-    }
+    // NOTE: The frame pool lives on JeffJSRuntime (acquireFrame/releaseFrame).
+    // It used to be a static here, but static-var mutation costs a TLS-backed
+    // exclusivity check per call and recycled frames across runtimes.
 }
 
 /// Shape property descriptor (one per own-property slot in the shape).
@@ -1057,40 +1028,55 @@ func jeffJS_createObject(ctx: JeffJSContext,
     return obj
 }
 
-/// Find an own property on `obj` by its atom key.
-/// Returns a tuple of the shape-property descriptor and the property storage
-/// entry, or `(nil, nil)` if not found.
+/// Find an own property on `obj` by its atom key and return its slot index,
+/// or -1 if absent.  Hash-table lookup only — every property writer maintains
+/// the shape hash (see `addShapeProperty` / `jeffJS_appendOwnProperty`), so no
+/// linear fallback is needed.  This is the hot-path primitive: it returns a
+/// plain Int, avoiding the `(JeffJSShapeProperty?, JeffJSProperty?)` tuple
+/// copies that dominate profiles when enums with payloads cross function
+/// boundaries.
 ///
 /// Mirrors `find_own_property` in QuickJS.
-func jeffJS_findOwnProperty(obj: JeffJSObject,
-                             atom: UInt32) -> (JeffJSShapeProperty?, JeffJSProperty?) {
-    guard let shape = obj.shape else { return (nil, nil) }
-
-    // Soft-recover shape/prop desync instead of crashing
-    if shape.prop.count != obj.prop.count && !obj.prop.isEmpty {
+@inline(__always)
+func jeffJS_findOwnPropertyIndex(obj: JeffJSObject, atom: UInt32) -> Int {
+    guard let shape = obj.shape else { return -1 }
+    guard let idx = findShapeProperty(shape, atom) else { return -1 }
+    // Soft-recover shape/prop desync: pad missing value slots so the caller
+    // can index obj.prop[idx] directly.
+    if idx >= obj.prop.count {
         while obj.prop.count < shape.prop.count {
             obj.prop.append(.value(.undefined))
         }
     }
+    return idx
+}
 
-    // Primary path: hash-table-based lookup (fast)
-    if let idx = findShapeProperty(shape, atom) {
-        let shapeProp = shape.prop[idx]
-        let prop = idx < obj.prop.count ? obj.prop[idx] : nil
-        return (shapeProp, prop)
-    }
+/// Find an own property on `obj` by its atom key.
+/// Returns a tuple of the shape-property descriptor and the property storage
+/// entry, or `(nil, nil)` if not found.
+///
+/// Compatibility wrapper around `jeffJS_findOwnPropertyIndex` for callers
+/// that want the descriptor pair; hot paths should use the index form.
+func jeffJS_findOwnProperty(obj: JeffJSObject,
+                             atom: UInt32) -> (JeffJSShapeProperty?, JeffJSProperty?) {
+    let idx = jeffJS_findOwnPropertyIndex(obj: obj, atom: atom)
+    guard idx >= 0, let shape = obj.shape else { return (nil, nil) }
+    let prop = idx < obj.prop.count ? obj.prop[idx] : nil
+    return (shape.prop[idx], prop)
+}
 
-    // Fallback: linear scan over the shape's prop array.
-    // This handles properties that may have been appended without updating
-    // the hash table (e.g. by legacy code paths).
-    for i in 0 ..< shape.prop.count {
-        if shape.prop[i].atom == atom {
-            let prop = i < obj.prop.count ? obj.prop[i] : nil
-            return (shape.prop[i], prop)
-        }
-    }
-
-    return (nil, nil)
+/// Append a brand-new own data property to `obj`, maintaining the shape hash
+/// table and propCount.  The caller must know the atom is not already present.
+/// Use this instead of appending to `shape.prop` directly — raw appends bypass
+/// the hash table and break `jeffJS_findOwnPropertyIndex`.
+func jeffJS_appendOwnProperty(_ ctx: JeffJSContext,
+                              _ obj: JeffJSObject,
+                              atom: UInt32,
+                              flags: JeffJSPropertyFlags,
+                              value: JeffJSValue) {
+    guard let shape = obj.shape else { return }
+    addShapeProperty(ctx, shape, atom: atom, flags: flags.rawValue)
+    obj.prop.append(.value(value))
 }
 
 /// Add a new own property to `obj`.
@@ -1213,33 +1199,19 @@ extension JeffJSObject {
 
     /// Lookup a property value by atom, returning `.undefined` if absent.
     func getOwnPropertyValue(atom: UInt32) -> JeffJSValue {
-        let (_, prop) = jeffJS_findOwnProperty(obj: self, atom: atom)
-        guard let prop = prop else { return .undefined }
-        switch prop {
-        case .value(let v):
-            return v
-        default:
-            return .undefined
-        }
+        let idx = jeffJS_findOwnPropertyIndex(obj: self, atom: atom)
+        guard idx >= 0, idx < prop.count else { return .undefined }
+        if case .value(let v) = prop[idx] { return v }
+        return .undefined
     }
 
     /// Set a property value by atom.  Returns `true` on success.
     @discardableResult
     func setOwnPropertyValue(atom: UInt32, value: JeffJSValue) -> Bool {
-        guard let shape = shape else { return false }
-        // Try hash-based lookup first, then fall back to linear scan
-        if let idx = findShapeProperty(shape, atom), idx < prop.count {
-            prop[idx] = .value(value)
-            return true
-        }
-        // Fallback: linear scan
-        for i in 0 ..< shape.prop.count {
-            if shape.prop[i].atom == atom, i < prop.count {
-                prop[i] = .value(value)
-                return true
-            }
-        }
-        return false
+        let idx = jeffJS_findOwnPropertyIndex(obj: self, atom: atom)
+        guard idx >= 0, idx < prop.count else { return false }
+        prop[idx] = .value(value)
+        return true
     }
 
     /// Number of elements for a fast array.

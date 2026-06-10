@@ -536,7 +536,14 @@ func freeGCObject(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
     // Only release the Unmanaged retain for types created via Unmanaged.passRetained
     switch header.gcObjType {
     case .jsObject, .bigInt, .functionBytecode:
-        Unmanaged.passUnretained(header).release()
+        if jeffJSZombiesEnabled {
+            // Zombie mode: keep the allocation alive and flag it so any later
+            // dup/free through a stale NaN-boxed pointer is caught with a stack.
+            if let obj = header as? JeffJSObject { obj.freeMark = true }
+            rt.zombieKeepAlive.append(header)
+        } else {
+            Unmanaged.passUnretained(header).release()
+        }
     default:
         break // shapes, varRefs — ARC managed by strong property references
     }
@@ -545,6 +552,13 @@ func freeGCObject(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
 /// Free a JSObject: release every property value, release the shape, then
 /// let ARC reclaim the Swift object.
 func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
+    // The global object must only ever be freed at context teardown. If this
+    // fires mid-run, some path over-released it; the stack identifies the
+    // culprit (this is the root of the shape-wipe corruption family).
+    if rt.protectedGlobals.contains(ObjectIdentifier(obj)) {
+        print("[GLOBAL-FREE] global object freed mid-run (rc=\(obj.refCount)) — stack:")
+        for sym in Thread.callStackSymbols.prefix(16) { print("    \(sym)") }
+    }
     // Capture and clear payload/properties FIRST, then free values.
     // This prevents re-entrant access to obj during cascading frees.
     let savedProps = obj.prop
@@ -605,8 +619,15 @@ func freeShape(_ rt: JeffJSRuntime, _ shape: JeffJSShape) {
     // Just nil the reference — ARC handles the release.
     shape.proto = nil
 
+    // Reset the bookkeeping along with the arrays. A freed shape can still be
+    // reached through stale references; stale propCount/propHashMask with
+    // empty arrays makes any later addShapeProperty index out of bounds.
     shape.prop.removeAll()
     shape.propHash.removeAll()
+    shape.propCount = 0
+    shape.propSize = 0
+    shape.deletedPropCount = 0
+    shape.propHashMask = 0
 
     rt.mallocState.mallocCount -= 1
 }
@@ -673,6 +694,10 @@ func clearGCState(_ rt: JeffJSRuntime) {
             shape.proto = nil
             shape.prop.removeAll()
             shape.propHash.removeAll()
+            shape.propCount = 0
+            shape.propSize = 0
+            shape.deletedPropCount = 0
+            shape.propHashMask = 0
             shape.shapeHashNext = nil
         }
     }

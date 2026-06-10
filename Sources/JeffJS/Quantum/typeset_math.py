@@ -42,11 +42,19 @@ KEEP_AS_CODE = {
 }
 
 
+CODE_EXTENSIONS = (
+    ".swift", ".py", ".sh", ".js", ".ts", ".rs", ".go",
+    ".c", ".h", ".cpp", ".hpp", ".rb", ".java", ".md",
+    ".sql", ".html", ".css", ".json", ".yaml", ".yml",
+    ".toml", ".txt", ".pdf",
+)
+
+
 def is_code_span(content: str) -> bool:
     """True if the span should remain as inline code (NOT math)."""
     if content in KEEP_AS_CODE:
         return True
-    if ".swift" in content:
+    if any(ext in content for ext in CODE_EXTENSIONS):
         return True
     if content.startswith("/Users/") or content.startswith("/tmp/"):
         return True

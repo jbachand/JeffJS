@@ -127,6 +127,17 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// the interrupt handler is called (if set) and the counter resets.
     var interruptCounter: Int
 
+    // MARK: - Interpreter Hot State
+    // Stored on the context (not as statics) so the dispatch loop avoids
+    // dynamic-exclusivity TLS checks that dominate profiles on static vars.
+
+    /// Native call depth across callFunction/callInternal (stack-overflow guard).
+    var callDepth: Int = 0
+    /// Last two property atoms read via get_field — used to enrich
+    /// "cannot read property of undefined" error messages.
+    var lastGetFieldAtom: UInt32 = 0
+    var prevGetFieldAtom: UInt32 = 0
+
     // MARK: - Loaded Modules
 
     /// Linked list of loaded ES modules for this context.
@@ -401,6 +412,11 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // Disable cascading frees during teardown. Individual refcount decrements
         // happen below; bulk deallocation is handled by runtime.free() → clearGCState().
         rt.initComplete = false
+
+        // Teardown is the one legitimate time to free the global object.
+        if let gObj = globalObj.toObject() {
+            rt.protectedGlobals.remove(ObjectIdentifier(gObj))
+        }
 
         // Free loaded modules
         loadedModules = ListHead()
@@ -987,8 +1003,8 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             }
         }
 
-        // Check own properties via shape
-        if jsObj.shape?.prop.contains(where: { $0.atom == atom }) == true {
+        // Check own properties via the shape hash table
+        if let shape = jsObj.shape, findShapeProperty(shape, atom) != nil {
             return true
         }
 
@@ -996,7 +1012,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // to match getPropertyInternal's fallback behavior)
         var proto = jsObj.proto
         while let p = proto {
-            if p.shape?.prop.contains(where: { $0.atom == atom }) == true {
+            if let shape = p.shape, findShapeProperty(shape, atom) != nil {
                 return true
             }
             proto = p.proto
@@ -2387,6 +2403,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         obj.prop = []
         globalObj = JeffJSValue.makeObject(obj)
         globalVarObj = globalObj.dupValue()
+        // Register as protected: freeObject reports loudly if the global
+        // object is ever over-released mid-run (UAF tripwire).
+        rt.protectedGlobals.insert(ObjectIdentifier(obj))
     }
 
     /// Adds methods to Object.prototype.
@@ -3768,7 +3787,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             if obj.isNullOrUndefined {
                 let atomStr = rt.atomToString(atom) ?? "?"
                 // Include the last variable/field that produced the undefined value
-                let prevAtom = JeffJSInterpreter.prevGetFieldAtom
+                let prevAtom = prevGetFieldAtom
                 let varHint = prevAtom > 0 ? (rt.atomToString(prevAtom) ?? "") : ""
                 let hint = varHint.isEmpty ? "" : " — '\(varHint).\(atomStr)' is undefined"
                 return throwTypeError(message: "Cannot read properties of \(obj.isNull ? "null" : "undefined") (reading '\(atomStr)')\(hint)")
@@ -3868,26 +3887,19 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             }
         }
 
-        // Invariant: shape.prop and obj.prop must stay in sync.
-        // Soft-recover shape/prop desync instead of crashing
-        if let shape = jsObj.shape, shape.prop.count != jsObj.prop.count, !jsObj.prop.isEmpty {
-            while jsObj.prop.count < shape.prop.count {
-                jsObj.prop.append(.value(.undefined))
-            }
-        }
-
-        // Check own properties via shape-based lookup
-        let (ownShapeProp, ownProp) = jeffJS_findOwnProperty(obj: jsObj, atom: atom)
-        if let ownShapeProp = ownShapeProp, let ownProp = ownProp {
-            if ownShapeProp.flags.contains(.getset) {
+        // Check own properties via shape-based lookup (index form avoids
+        // copying JeffJSProperty enums across the call boundary).
+        let ownIdx = jeffJS_findOwnPropertyIndex(obj: jsObj, atom: atom)
+        if ownIdx >= 0, let ownShape = jsObj.shape, ownIdx < jsObj.prop.count {
+            if ownShape.prop[ownIdx].flags.contains(.getset) {
                 // Accessor property — call the getter
-                if case .getset(let getter, _) = ownProp, let getterObj = getter {
+                if case .getset(let getter, _) = jsObj.prop[ownIdx], let getterObj = getter {
                     let getterVal = JeffJSValue.makeObject(getterObj)
                     return callFunction(getterVal, thisVal: receiver, args: [])
                 }
                 return .JS_UNDEFINED
             }
-            if case .value(let v) = ownProp {
+            if case .value(let v) = jsObj.prop[ownIdx] {
                 return v.dupValue()
             }
             return .JS_UNDEFINED
@@ -3930,16 +3942,16 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // Walk prototype chain (prototype is stored on the shape)
         var proto = jsObj.proto
         while let p = proto {
-            let (pShapeProp, pProp) = jeffJS_findOwnProperty(obj: p, atom: atom)
-            if let pShapeProp = pShapeProp, let pProp = pProp {
-                if pShapeProp.flags.contains(.getset) {
-                    if case .getset(let getter, _) = pProp, let getterObj = getter {
+            let pIdx = jeffJS_findOwnPropertyIndex(obj: p, atom: atom)
+            if pIdx >= 0, let pShape = p.shape, pIdx < p.prop.count {
+                if pShape.prop[pIdx].flags.contains(.getset) {
+                    if case .getset(let getter, _) = p.prop[pIdx], let getterObj = getter {
                         let getterVal = JeffJSValue.makeObject(getterObj)
                         return callFunction(getterVal, thisVal: receiver, args: [])
                     }
                     return .JS_UNDEFINED
                 }
-                if case .value(let v) = pProp {
+                if case .value(let v) = p.prop[pIdx] {
                     return v.dupValue()
                 }
                 return .JS_UNDEFINED
@@ -4009,13 +4021,13 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         if jsObj.fastArray || jsObj.classID == JeffJSClassID.array.rawValue {
             if rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom) {
                 if jsObj.setArrayElement(idx, value: value) {
-                    // Update length if needed
+                    // Update length if needed (single hash lookup)
                     let arrCount = jsObj.arrayCount
                     if arrCount > 0 {
                         let lengthAtom = JeffJSAtomID.JS_ATOM_length.rawValue
-                        let (lenShapeProp, _) = jeffJS_findOwnProperty(obj: jsObj, atom: lengthAtom)
-                        if lenShapeProp != nil {
-                            jsObj.setOwnPropertyValue(atom: lengthAtom, value: .newInt32(Int32(arrCount)))
+                        let lenIdx = jeffJS_findOwnPropertyIndex(obj: jsObj, atom: lengthAtom)
+                        if lenIdx >= 0, lenIdx < jsObj.prop.count {
+                            jsObj.prop[lenIdx] = .value(.newInt32(Int32(arrCount)))
                         }
                     }
                     return 1
@@ -4050,20 +4062,14 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             }
         }
 
-        // Invariant: shape.prop and obj.prop must stay in sync.
-        // Soft-recover shape/prop desync instead of crashing
-        if let shape = jsObj.shape, shape.prop.count != jsObj.prop.count, !jsObj.prop.isEmpty {
-            while jsObj.prop.count < shape.prop.count {
-                jsObj.prop.append(.value(.undefined))
-            }
-        }
-
-        // Check if property already exists via shape-based lookup
-        let (existingShapeProp, existingProp) = jeffJS_findOwnProperty(obj: jsObj, atom: atom)
-        if let existingShapeProp = existingShapeProp, let existingPropVal = existingProp {
-            if existingShapeProp.flags.contains(.getset) {
+        // Check if property already exists via shape-based lookup (index form:
+        // one hash probe, no JeffJSProperty enum copies)
+        let exIdx = jeffJS_findOwnPropertyIndex(obj: jsObj, atom: atom)
+        if exIdx >= 0, let exShape = jsObj.shape, exIdx < jsObj.prop.count {
+            let exFlags = exShape.prop[exIdx].flags
+            if exFlags.contains(.getset) {
                 // Accessor property — call the setter
-                if case .getset(_, let setter) = existingPropVal, let setterObj = setter {
+                if case .getset(_, let setter) = jsObj.prop[exIdx], let setterObj = setter {
                     let setterVal = JeffJSValue.makeObject(setterObj)
                     let result = callFunction(setterVal, thisVal: obj, args: [value])
                     if result.isException { return -1 }
@@ -4076,32 +4082,18 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 value.freeValue()
                 return -1
             }
-            if !existingShapeProp.flags.contains(.writable) {
+            if !exFlags.contains(.writable) {
                 if (flags & JS_PROP_THROW) != 0 {
                     _ = throwTypeError(message: "Cannot assign to read only property")
                 }
                 value.freeValue()
                 return -1
             }
-            // Update the value via shape index
-            if let shape = jsObj.shape {
-                // Try hash-based lookup first, fall back to linear scan
-                var foundIdx: Int? = findShapeProperty(shape, atom)
-                if foundIdx == nil {
-                    for i in 0 ..< shape.prop.count {
-                        if shape.prop[i].atom == atom {
-                            foundIdx = i
-                            break
-                        }
-                    }
-                }
-                if let idx = foundIdx, idx < jsObj.prop.count {
-                    let oldProp = jsObj.prop[idx]
-                    jsObj.prop[idx] = .value(value)
-                    if case .value(let oldVal) = oldProp {
-                        oldVal.freeValue()
-                    }
-                }
+            // Update the value in place
+            let oldProp = jsObj.prop[exIdx]
+            jsObj.prop[exIdx] = .value(value)
+            if case .value(let oldVal) = oldProp {
+                oldVal.freeValue()
             }
             return 1
         }
@@ -4109,11 +4101,11 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // Walk prototype chain for inherited accessor setters (ES spec 9.1.9 step 4)
         var setProto = jsObj.proto
         while let p = setProto {
-            let (pShapeProp, pProp) = jeffJS_findOwnProperty(obj: p, atom: atom)
-            if let pShapeProp = pShapeProp, let pPropVal = pProp {
-                if pShapeProp.flags.contains(.getset) {
+            let pIdx = jeffJS_findOwnPropertyIndex(obj: p, atom: atom)
+            if pIdx >= 0, let pShape = p.shape, pIdx < p.prop.count {
+                if pShape.prop[pIdx].flags.contains(.getset) {
                     // Inherited accessor — call its setter
-                    if case .getset(_, let setter) = pPropVal, let setterObj = setter {
+                    if case .getset(_, let setter) = p.prop[pIdx], let setterObj = setter {
                         let setterVal = JeffJSValue.makeObject(setterObj)
                         let result = callFunction(setterVal, thisVal: obj, args: [value])
                         if result.isException { return -1 }

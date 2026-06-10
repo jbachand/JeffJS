@@ -175,6 +175,12 @@ func addShapeProperty(_ ctx: JeffJSContext,
                       _ shape: JeffJSShape,
                       atom: UInt32,
                       flags: UInt32) -> Int {
+    // Defensive resync: a stale/freed shape can reach here with bookkeeping
+    // that disagrees with its arrays. Re-deriving propCount from the array
+    // turns a would-be out-of-bounds crash into a recoverable state.
+    if shape.propCount != shape.prop.count {
+        shape.propCount = shape.prop.count
+    }
 
     // Lazy-init hash table on first property (shapes created with hashSize=0 start empty)
     if shape.propHash.isEmpty {

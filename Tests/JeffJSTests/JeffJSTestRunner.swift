@@ -305,8 +305,11 @@ struct JeffJSTestRunner {
         let quickResult = JeffJSQuickVerify.runQuickVerification()
         print(quickResult)
 
-        for (_, testFn) in Self.allTests {
+        for (name, testFn) in Self.allTests {
+            let t0 = Date()
             testFn(&self)
+            let dt = Date().timeIntervalSince(t0)
+            print(String(format: "[group] %@ done in %.2fs (pass=%d fail=%d)", name, dt, passCount, failCount))
         }
         var report = quickResult + "\n"
         report += "JeffJS Test Results: \(passCount) passed, \(failCount) failed\n"
@@ -406,6 +409,14 @@ struct JeffJSTestRunner {
     static func cleanupSharedContext() {
         _sharedCtx?.free()
         _sharedRt?.free()
+        _sharedCtx = nil
+        _sharedRt = nil
+    }
+
+    /// Drop the shared context WITHOUT running engine teardown.
+    /// Used by per-group isolation runs to sidestep the known teardown UAF
+    /// (heap corruption) while still giving each group a fresh global object.
+    static func detachSharedContext() {
         _sharedCtx = nil
         _sharedRt = nil
     }

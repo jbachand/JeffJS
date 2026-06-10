@@ -88,9 +88,9 @@ extension JeffJSContext {
         // no need to write the static on every call.
 
         // Guard against stack overflow — C function callbacks can recurse back into callFunction
-        JeffJSInterpreter.currentCallDepth += 1
-        defer { JeffJSInterpreter.currentCallDepth -= 1 }
-        if JeffJSInterpreter.currentCallDepth > JeffJSInterpreter.maxCallDepth {
+        callDepth += 1
+        defer { callDepth -= 1 }
+        if callDepth > JeffJSInterpreter.maxCallDepth {
             return throwInternalError(message: "Maximum call stack size exceeded")
         }
 
@@ -816,10 +816,30 @@ extension JeffJSContext {
     /// object (including its prototype chain).  Only throw ReferenceError when
     /// the property does not exist at all.
     func getGlobalVar(atom: UInt32, throwRefError: Bool) -> JeffJSValue {
-        // Check existence first so that globals with an `undefined` value
-        // (e.g. `undefined` itself) are returned correctly.
-        if hasProperty(obj: globalObj, atom: atom) {
-            return getProperty(obj: globalObj, atom: atom)
+        // Fast path: plain data property on the global object itself.
+        // One hash probe; covers the overwhelming majority of global reads
+        // (top-level `var`s and builtins). Existence is established by the
+        // shape hit, so globals whose value *is* `undefined` work correctly.
+        if let gObj = globalObj.toObject() {
+            let idx = jeffJS_findOwnPropertyIndex(obj: gObj, atom: atom)
+            if idx >= 0 {
+                if let shape = gObj.shape, idx < gObj.prop.count,
+                   !shape.prop[idx].flags.contains(.getset),
+                   case .value(let v) = gObj.prop[idx] {
+                    return v.dupValue()
+                }
+                // Accessor or exotic slot — take the full path.
+                return getProperty(obj: globalObj, atom: atom)
+            }
+            // Not an own property: check the prototype chain before deciding
+            // between undefined and ReferenceError.
+            var proto = gObj.proto
+            while let p = proto {
+                if jeffJS_findOwnPropertyIndex(obj: p, atom: atom) >= 0 {
+                    return getProperty(obj: globalObj, atom: atom)
+                }
+                proto = p.proto
+            }
         }
         if throwRefError {
             let name = atomToSwiftString(atom)
@@ -831,6 +851,19 @@ extension JeffJSContext {
 
     /// Sets a global variable value.
     func putGlobalVar(atom: UInt32, val: JeffJSValue, flags: Int) -> Bool {
+        // Fast path: overwrite an existing writable data property in place.
+        if let gObj = globalObj.toObject(), let shape = gObj.shape {
+            let idx = jeffJS_findOwnPropertyIndex(obj: gObj, atom: atom)
+            if idx >= 0, idx < gObj.prop.count {
+                let f = shape.prop[idx].flags
+                if !f.contains(.getset), f.contains(.writable),
+                   case .value(let old) = gObj.prop[idx] {
+                    gObj.prop[idx] = .value(val)
+                    old.freeValue()
+                    return true
+                }
+            }
+        }
         return setProperty(obj: globalObj, atom: atom, value: val) >= 0
     }
 
@@ -1663,22 +1696,43 @@ private func readI32(_ bc: [UInt8], _ pos: Int) -> Int32 {
 /// assignment patterns (e.g., `a = b = c = 5`) where intermediate stores
 /// must keep the value on the stack for the next store.
 @inline(__always)
+/// 256-bit store-opcode membership mask, indexed by raw opcode byte.
+/// `isStoreOpcode` runs on EVERY put_loc/put_var execution (chained-assignment
+/// lookahead), so it must be a couple of bit ops — not an enum init + switch.
+private let jeffJS_storeOpcodeMask: (UInt64, UInt64, UInt64, UInt64) = {
+    var m: (UInt64, UInt64, UInt64, UInt64) = (0, 0, 0, 0)
+    let ops: [JeffJSOpcode] = [
+        .put_loc, .put_loc0, .put_loc1, .put_loc2, .put_loc3, .put_loc8,
+        .put_var,
+        .put_arg, .put_arg0, .put_arg1, .put_arg2, .put_arg3,
+        .put_var_ref,
+        .put_field, .put_array_el,
+    ]
+    for op in ops {
+        let v = Int(op.rawValue)
+        guard v < 256 else { continue }
+        let bit = UInt64(1) << UInt64(v & 63)
+        switch v >> 6 {
+        case 0: m.0 |= bit
+        case 1: m.1 |= bit
+        case 2: m.2 |= bit
+        default: m.3 |= bit
+        }
+    }
+    return m
+}()
+
+@inline(__always)
 private func isStoreOpcode(_ bc: [UInt8], _ pos: Int, _ bcLen: Int) -> Bool {
     guard pos < bcLen, pos < bc.count else { return false }
     let b = bc[pos]
-    // put_loc (3 bytes), put_loc0..3 (1 byte each), put_loc8 (2 bytes),
-    // put_var (5 bytes), put_arg (3 bytes), put_arg0..3 (1 byte each),
-    // put_var_ref (3 bytes)
-    guard let op = JeffJSOpcode(rawValue: UInt16(b)) else { return false }
-    switch op {
-    case .put_loc, .put_loc0, .put_loc1, .put_loc2, .put_loc3, .put_loc8,
-         .put_var,
-         .put_arg, .put_arg0, .put_arg1, .put_arg2, .put_arg3,
-         .put_var_ref,
-         .put_field, .put_array_el:
-        return true
-    default:
-        return false
+    let m = jeffJS_storeOpcodeMask
+    let bit = UInt64(b & 63)
+    switch b >> 6 {
+    case 0: return (m.0 >> bit) & 1 != 0
+    case 1: return (m.1 >> bit) & 1 != 0
+    case 2: return (m.2 >> bit) & 1 != 0
+    default: return (m.3 >> bit) & 1 != 0
     }
 }
 
@@ -1703,7 +1757,8 @@ private func executeFastTrace(
     sp: inout Int,
     ctx: JeffJSContext,
     cpool: [JeffJSValue],
-    stackLimit: Int
+    stackLimit: Int,
+    ic: JeffJSInlineCache?
 ) -> Int {
     // Validate parameters
     guard entryPC >= 0, exitPC <= bc.count, entryPC < exitPC,
@@ -1820,6 +1875,95 @@ private func executeFastTrace(
             if val.isUninitialized { return pc } // deopt: TDZ
             buf[sp] = val.dupValue(); sp += 1
             pc += 3
+
+        // =================================================================
+        // Global variable access (via the per-function inline cache)
+        // =================================================================
+
+        case .get_var, .get_var_undef:
+            guard let ic = ic, let gObj = ctx.globalObj.obj, let gShape = gObj.shape else {
+                return pc // deopt: no IC table yet
+            }
+            let entry = ic.lookup(pc)
+            if entry.pc == pc,
+               entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
+               entry.propOffset >= 0, entry.propOffset < gObj.prop.count,
+               case .value(let v) = gObj.prop[entry.propOffset] {
+                buf[sp] = v.dupValue(); sp += 1
+                pc += 5
+            } else {
+                return pc // deopt: IC miss — main loop refills the cache
+            }
+
+        case .put_var:
+            guard let ic = ic, let gObj = ctx.globalObj.obj, let gShape = gObj.shape else {
+                return pc // deopt
+            }
+            let entry = ic.lookup(pc)
+            if entry.pc == pc,
+               entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
+               entry.propOffset >= 0, entry.propOffset < gObj.prop.count,
+               entry.propOffset < gShape.prop.count,
+               gShape.prop[entry.propOffset].flags.contains(.writable),
+               !gShape.prop[entry.propOffset].flags.contains(.getset),
+               case .value(let old) = gObj.prop[entry.propOffset] {
+                let chained = isStoreOpcode(bc, pc + 5, bcLen)
+                let val = chained ? buf[sp - 1].dupValue() : { sp -= 1; return buf[sp] }()
+                gObj.asClass.prop[entry.propOffset] = .value(val)
+                old.freeValue()
+                pc += 5
+            } else {
+                return pc // deopt: IC miss
+            }
+
+        // =================================================================
+        // Array element access (dense int-indexed fast paths)
+        // =================================================================
+
+        case .get_array_el:
+            let key = buf[sp - 1]
+            let objV = buf[sp - 2]
+            guard key.isInt, let jsObj = objV.obj,
+                  jsObj.classID == JeffJSClassID.array.rawValue else {
+                return pc // deopt: non-array or non-int key
+            }
+            let idx = key.toInt32()
+            guard idx >= 0 else { return pc }
+            let uidx = UInt32(idx)
+            var element: JeffJSValue? = nil
+            if let storage = jsObj._fastArrayValues {
+                if uidx < storage.count, Int(uidx) < storage.values.count {
+                    element = storage.values[Int(uidx)]
+                }
+            } else if case .array(_, let vals, let count) = jsObj.payload {
+                if uidx < count, Int(uidx) < vals.count {
+                    element = vals[Int(uidx)]
+                }
+            }
+            guard let el = element else { return pc } // deopt: OOB/holes — slow path decides
+            sp -= 1
+            buf[sp - 1] = el.dupValue()
+            pc += 1
+
+        case .put_array_el:
+            let val = buf[sp - 1]
+            let key = buf[sp - 2]
+            let objV = buf[sp - 3]
+            guard key.isInt, let jsObj = objV.obj,
+                  jsObj.classID == JeffJSClassID.array.rawValue,
+                  let storage = jsObj._fastArrayValues else {
+                return pc // deopt: only the ref-type storage is safe to poke here
+            }
+            let idx = key.toInt32()
+            // In-bounds overwrite only — growth/length updates take the slow path.
+            guard idx >= 0, UInt32(idx) < storage.count, Int(idx) < storage.values.count else {
+                return pc
+            }
+            let old = storage.values[Int(idx)]
+            storage.values[Int(idx)] = val
+            old.freeValue()
+            sp -= 3
+            pc += 1
 
         // =================================================================
         // Argument access
@@ -2865,42 +3009,10 @@ struct JeffJSInterpreter {
     /// When false, all calls go through the recursive `callInternal` path.
     static var useInlineCalls = JeffJSConfig.useInlineCalls
 
-    // =========================================================================
-    // MARK: - Unsafe Buffer Pool
-    // =========================================================================
-
-    /// Pool of pre-allocated unsafe buffers to avoid malloc/free on every call.
-    /// Each entry is (pointer, capacity). Reused when capacity >= needed.
-    private static var bufPool: [(UnsafeMutablePointer<JeffJSValue>, Int)] = []
-    private static let bufPoolMax = JeffJSConfig.bufPoolMax
-
-    @inline(__always)
-    static func acquireBuf(size: Int) -> (UnsafeMutablePointer<JeffJSValue>, Int) {
-        if !bufPool.isEmpty {
-            let (ptr, cap) = bufPool.removeLast()
-            if cap >= size {
-                // Reuse — use update (not initialize) since memory is already initialized
-                for i in 0..<size { ptr[i] = .undefined }
-                return (ptr, cap)
-            }
-            // Too small — deallocate and allocate new
-            ptr.deinitialize(count: cap)
-            ptr.deallocate()
-        }
-        let ptr = UnsafeMutablePointer<JeffJSValue>.allocate(capacity: size)
-        ptr.initialize(repeating: .undefined, count: size)
-        return (ptr, size)
-    }
-
-    @inline(__always)
-    static func releaseBuf(_ ptr: UnsafeMutablePointer<JeffJSValue>, capacity: Int) {
-        if bufPool.count < bufPoolMax && capacity <= 512 {
-            bufPool.append((ptr, capacity))
-        } else {
-            ptr.deinitialize(count: capacity)
-            ptr.deallocate()
-        }
-    }
+    // NOTE: The interpreter value-buffer pool lives on JeffJSRuntime
+    // (acquireInterpBuf/releaseInterpBuf). It used to be a static here, but
+    // static-var mutation costs a TLS-backed exclusivity check per call and
+    // leaked buffers across runtimes.
 
     // =========================================================================
     // MARK: - Main Entry Point
@@ -2933,11 +3045,7 @@ struct JeffJSInterpreter {
     /// 200 levels ≈ 400KB which fits comfortably in a 2MB+ thread stack.
     /// Both callFunction and callInternal increment this counter.
     static let maxCallDepth = JeffJSConfig.maxCallDepth
-    static var currentCallDepth = 0
     static var traceOpcodes = JeffJSConfig.traceOpcodes
-    /// Last two property atoms accessed via get_field — used to enrich error messages.
-    static var lastGetFieldAtom: UInt32 = 0
-    static var prevGetFieldAtom: UInt32 = 0
 
     static func callInternal(
         ctx: JeffJSContext,
@@ -2950,10 +3058,12 @@ struct JeffJSInterpreter {
         resumeValue: JeffJSValue = .undefined,
         resumeCompletionType: Int = 0
     ) -> JeffJSValue {
-        // Guard against stack overflow from deep recursion
-        currentCallDepth += 1
-        defer { currentCallDepth -= 1 }
-        if currentCallDepth > maxCallDepth {
+        // Guard against stack overflow from deep recursion.
+        // Depth lives on the context: static-var read-modify-writes here cost a
+        // TLS-backed dynamic exclusivity check per call.
+        ctx.callDepth += 1
+        defer { ctx.callDepth -= 1 }
+        if ctx.callDepth > maxCallDepth {
             _ = ctx.throwInternalError(message: "Maximum call stack size exceeded")
             return .exception
         }
@@ -3008,8 +3118,15 @@ struct JeffJSInterpreter {
         var bc = fb.bytecode
         var bcLen = fb.bytecodeLen
 
+        // Hoist config/static reads out of the dispatch loop — each static-var
+        // access goes through a TLS-backed exclusivity check.
+        let traceOps = JeffJSInterpreter.traceOpcodes
+        let inlineCallsEnabled = JeffJSInterpreter.useInlineCalls
+        let traceHitThreshold = UInt8(JeffJSConfig.traceHitThreshold)
+        let rt = ctx.rt
+
         // Set up the call frame (pooled to avoid malloc/free per call)
-        var frame = JeffJSStackFrame.acquire()
+        var frame = rt.acquireFrame()
         frame.prevFrame = ctx.currentFrame
         frame.curFunc = funcObj
         // ES spec §10.2.1.2: For non-strict functions, coerce undefined/null this
@@ -3054,7 +3171,7 @@ struct JeffJSInterpreter {
         // Allocate contiguous unsafe buffer: [arg slots][var slots][value stack]
         let stackSlots = max(Int(fb.stackSize), 4) + 32
         let totalSlots = argSlots + varCount + stackSlots
-        var (buf, bufCapacity) = JeffJSInterpreter.acquireBuf(size: totalSlots)
+        var (buf, bufCapacity) = rt.acquireInterpBuf(size: totalSlots)
         var varBase = argSlots
         var spBase = argSlots + varCount
 
@@ -3143,7 +3260,7 @@ struct JeffJSInterpreter {
             case 1:
                 retVal = resumeValue
                 ctx.currentFrame = frame.prevFrame
-                JeffJSInterpreter.releaseBuf(buf, capacity: bufCapacity)
+                rt.releaseInterpBuf(buf, capacity: bufCapacity)
                 return retVal
             case 2:
                 // Throw: inject the exception and fall through to the dispatch
@@ -3188,7 +3305,7 @@ struct JeffJSInterpreter {
                             }
                             retVal = value
                             ctx.currentFrame = frame.prevFrame
-                            JeffJSInterpreter.releaseBuf(buf, capacity: bufCapacity)
+                            rt.releaseInterpBuf(buf, capacity: bufCapacity)
                             return retVal
                         }
                     }
@@ -3247,7 +3364,7 @@ struct JeffJSInterpreter {
             opcodeCount += 1
             #endif
 
-            if JeffJSInterpreter.traceOpcodes {
+            if traceOps {
                 var extra = ""
                 if op == .put_loc || op == .put_loc0 || op == .put_loc1 || op == .put_loc2 || op == .put_loc3
                     || op == .set_loc || op == .set_loc0 || op == .set_loc1 || op == .set_loc2 || op == .set_loc3
@@ -3573,7 +3690,7 @@ struct JeffJSInterpreter {
                 }
                 let funcVal = pop()
                 // Inline call fast path: regular bytecode function
-                if JeffJSInterpreter.useInlineCalls,
+                if inlineCallsEnabled,
                    let callObj = funcVal.obj,
                    case .bytecodeFunc(let fastFbOpt, let fastVarRefsOpt, _) = callObj.payload,
                    let fastFb = fastFbOpt, !fastFb.isGenerator, !fastFb.isAsyncFunc {
@@ -3599,7 +3716,7 @@ struct JeffJSInterpreter {
                     mFuncObj = funcVal
                     mFlags = 0
                     // New frame
-                    let newFrame = JeffJSStackFrame.acquire()
+                    let newFrame = rt.acquireFrame()
                     newFrame.prevFrame = ctx.currentFrame
                     newFrame.curFunc = funcVal
                     // ES spec: non-strict functions get globalObj as this for plain calls
@@ -3618,7 +3735,9 @@ struct JeffJSInterpreter {
                        let arrowThis = callObj.arrowThisVal {
                         newFrame.thisVal = arrowThis.dupValue()
                     } else if !frame.lastGetFieldReceiver.isUndefined {
-                        newFrame.thisVal = frame.lastGetFieldReceiver.dupValue()
+                        // Transfer the stash's reference to thisVal (no dup —
+                        // the stash owned one ref from get_field).
+                        newFrame.thisVal = frame.lastGetFieldReceiver
                         frame.lastGetFieldReceiver = .undefined  // clear after use
                     } else {
                         newFrame.thisVal = fastIsStrict ? .undefined : ctx.globalObj
@@ -3640,7 +3759,7 @@ struct JeffJSInterpreter {
                     // Allocate new contiguous buffer for callee
                     let newStackSlots = max(Int(fastFb.stackSize), 4) + 32
                     let newTotalSlots = newArgSlots + newVarCount + newStackSlots
-                    let (newBuf, newBufCap) = JeffJSInterpreter.acquireBuf(size: newTotalSlots)
+                    let (newBuf, newBufCap) = rt.acquireInterpBuf(size: newTotalSlots)
                     // Copy args into callee buf
                     for i in 0..<callArgs.count { newBuf[i] = callArgs[i] }
                     buf = newBuf
@@ -3669,6 +3788,8 @@ struct JeffJSInterpreter {
                     } else {
                         result = ctx.callFunction(funcVal, thisVal: slowThis, args: callArgs)
                     }
+                    // Drop the stash's reference (taken via dupValue in get_field)
+                    frame.lastGetFieldReceiver.freeValue()
                     frame.lastGetFieldReceiver = .undefined  // clear after use
                     if result.isException {
                         retVal = .exception
@@ -3793,7 +3914,7 @@ struct JeffJSInterpreter {
                 break dispatchLoop
 
             case .call_constructor:
-                JeffJSInterpreter.lastGetFieldAtom = 0
+                ctx.lastGetFieldAtom = 0
                 let argc = Int(readU16(bc, pc + 1))
                 var callArgs = [JeffJSValue](repeating: .undefined, count: argc)
                 for i in stride(from: argc - 1, through: 0, by: -1) { callArgs[i] = pop() }
@@ -3876,9 +3997,9 @@ struct JeffJSInterpreter {
                     }
                     // 2. Restore previous frame pointer and release callee frame
                     ctx.currentFrame = frame.prevFrame
-                    JeffJSStackFrame.release(frame)
+                    rt.releaseFrame(frame)
                     // 2b. Release callee's buf to pool
-                    JeffJSInterpreter.releaseBuf(buf, capacity: bufCapacity)
+                    rt.releaseInterpBuf(buf, capacity: bufCapacity)
                     // 3. Pop saved caller state
                     let saved = inlineCallStack.removeLast()
                     pc = saved.pc
@@ -3920,8 +4041,8 @@ struct JeffJSInterpreter {
                         }
                     }
                     ctx.currentFrame = frame.prevFrame
-                    JeffJSStackFrame.release(frame)
-                    JeffJSInterpreter.releaseBuf(buf, capacity: bufCapacity)
+                    rt.releaseFrame(frame)
+                    rt.releaseInterpBuf(buf, capacity: bufCapacity)
                     let saved = inlineCallStack.removeLast()
                     pc = saved.pc
                     sp = saved.sp
@@ -4107,12 +4228,34 @@ struct JeffJSInterpreter {
                 let nextIsTypeof = nextByte == UInt8(JeffJSOpcode.typeof_.rawValue & 0xFF)
                     || nextByte == UInt8(JeffJSOpcode.typeof_is_undefined.rawValue & 0xFF)
                     || nextByte == UInt8(JeffJSOpcode.typeof_is_function.rawValue & 0xFF)
+                // Global-var inline cache: top-level `var`s are properties of the
+                // global object, so a shape-matched (shape, slot) pair turns a
+                // hash lookup per read into a direct slot load.
+                if let gObj = ctx.globalObj.obj, let gShape = gObj.shape, let ic = fb.ic {
+                    let entry = ic.lookup(pc)
+                    if entry.pc == pc,
+                       entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
+                       entry.propOffset >= 0, entry.propOffset < gObj.prop.count,
+                       case .value(let v) = gObj.prop[entry.propOffset] {
+                        push(v.dupValue())
+                        pc += 5
+                        continue dispatchLoop
+                    }
+                }
                 let val = ctx.getGlobalVar(atom: atom, throwRefError: !nextIsTypeof)
                 if val.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
                 push(val)
+                // Cache plain data slots for the next read
+                if let gObj = ctx.globalObj.obj, let gShape = gObj.shape {
+                    if let idx = findShapeProperty(gShape, atom), idx < gObj.prop.count,
+                       !gShape.prop[idx].flags.contains(.getset),
+                       gShape.prop[idx].flags.contains(.writable) {
+                        fb.getIC().update(pc, shape: gShape, propOffset: idx)
+                    }
+                }
                 pc += 5
 
             case .put_var:
@@ -4120,10 +4263,33 @@ struct JeffJSInterpreter {
                 // Chained assignment: if next opcode is also a store, keep value on stack
                 let chainedPutVar = isStoreOpcode(bc, pc + 5, bcLen)
                 let val = chainedPutVar ? peek().dupValue() : pop()
+                // Global-var inline cache: shape-matched writable data slot
+                if let gObj = ctx.globalObj.obj, let gShape = gObj.shape, let ic = fb.ic {
+                    let entry = ic.lookup(pc)
+                    if entry.pc == pc,
+                       entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
+                       entry.propOffset >= 0, entry.propOffset < gObj.prop.count,
+                       entry.propOffset < gShape.prop.count,
+                       gShape.prop[entry.propOffset].flags.contains(.writable),
+                       !gShape.prop[entry.propOffset].flags.contains(.getset),
+                       case .value(let old) = gObj.prop[entry.propOffset] {
+                        gObj.asClass.prop[entry.propOffset] = .value(val)
+                        old.freeValue()
+                        pc += 5
+                        continue dispatchLoop
+                    }
+                }
                 let ok = ctx.putGlobalVar(atom: atom, val: val, flags: 0)
                 if !ok {
                     retVal = .exception
                     break dispatchLoop
+                }
+                if let gObj = ctx.globalObj.obj, let gShape = gObj.shape {
+                    if let idx = findShapeProperty(gShape, atom), idx < gObj.prop.count,
+                       !gShape.prop[idx].flags.contains(.getset),
+                       gShape.prop[idx].flags.contains(.writable) {
+                        fb.getIC().update(pc, shape: gShape, propOffset: idx)
+                    }
                 }
                 pc += 5
 
@@ -4213,12 +4379,15 @@ struct JeffJSInterpreter {
 
             case .get_field:
                 let atom = readU32(bc, pc + 1)
-                JeffJSInterpreter.prevGetFieldAtom = JeffJSInterpreter.lastGetFieldAtom
-                JeffJSInterpreter.lastGetFieldAtom = atom
+                ctx.prevGetFieldAtom = ctx.lastGetFieldAtom
+                ctx.lastGetFieldAtom = atom
                 let obj = pop()
                 // Save receiver for the next `call` opcode — when transformMethodCalls
                 // fails to convert get_field+call to get_field2+call_method (e.g. due
                 // to ternary/short-circuit args), `call` uses this as `this`.
+                // Free any stale stash first: a get_field whose result is never
+                // called would otherwise leak one receiver ref per execution.
+                frame.lastGetFieldReceiver.freeValue()
                 frame.lastGetFieldReceiver = obj.dupValue()
                 // Early check: property access on null/undefined with location info
                 if obj.isNullOrUndefined {
@@ -4483,6 +4652,28 @@ struct JeffJSInterpreter {
             case .get_array_el:
                 let key = pop()
                 let obj = pop()
+                // Dense-array int-index fast path: skip the atom round-trip
+                // (newAtomUInt32 + getPropertyInternal + freeAtom) per element.
+                if key.isInt, let jsObj = obj.obj,
+                   jsObj.classID == JeffJSClassID.array.rawValue {
+                    let idx = key.toInt32()
+                    if idx >= 0 {
+                        let uidx = UInt32(idx)
+                        if let storage = jsObj._fastArrayValues {
+                            if uidx < storage.count, Int(uidx) < storage.values.count {
+                                push(storage.values[Int(uidx)].dupValue())
+                                pc += 1
+                                continue dispatchLoop
+                            }
+                        } else if case .array(_, let vals, let count) = jsObj.payload {
+                            if uidx < count, Int(uidx) < vals.count {
+                                push(vals[Int(uidx)].dupValue())
+                                pc += 1
+                                continue dispatchLoop
+                            }
+                        }
+                    }
+                }
                 let val = ctx.getPropertyValue(obj: obj, prop: key)
                 if val.isException {
                     retVal = .exception
@@ -4494,6 +4685,26 @@ struct JeffJSInterpreter {
             case .get_array_el2:
                 let key = pop()
                 let obj = peek()
+                if key.isInt, let jsObj = obj.obj,
+                   jsObj.classID == JeffJSClassID.array.rawValue {
+                    let idx = key.toInt32()
+                    if idx >= 0 {
+                        let uidx = UInt32(idx)
+                        if let storage = jsObj._fastArrayValues {
+                            if uidx < storage.count, Int(uidx) < storage.values.count {
+                                push(storage.values[Int(uidx)].dupValue())
+                                pc += 1
+                                continue dispatchLoop
+                            }
+                        } else if case .array(_, let vals, let count) = jsObj.payload {
+                            if uidx < count, Int(uidx) < vals.count {
+                                push(vals[Int(uidx)].dupValue())
+                                pc += 1
+                                continue dispatchLoop
+                            }
+                        }
+                    }
+                }
                 let val = ctx.getPropertyValue(obj: obj, prop: key)
                 if val.isException {
                     retVal = .exception
@@ -4506,6 +4717,20 @@ struct JeffJSInterpreter {
                 let val = pop()
                 let key = pop()
                 let obj = pop()
+                // Dense-array in-bounds overwrite fast path. Growth, holes and
+                // length updates take the full setPropertyValue path.
+                if key.isInt, let jsObj = obj.obj,
+                   jsObj.classID == JeffJSClassID.array.rawValue,
+                   let storage = jsObj._fastArrayValues {
+                    let idx = key.toInt32()
+                    if idx >= 0, UInt32(idx) < storage.count, Int(idx) < storage.values.count {
+                        let old = storage.values[Int(idx)]
+                        storage.values[Int(idx)] = val
+                        old.freeValue()
+                        pc += 1
+                        continue dispatchLoop
+                    }
+                }
                 let ok = ctx.setPropertyValue(obj: obj, prop: key, val: val)
                 if !ok {
                     retVal = .exception
@@ -4824,12 +5049,12 @@ struct JeffJSInterpreter {
                 let idx = Int(readU16(bc, pc + 1))
                 if idx < varRefs.count, let vr = varRefs[idx] {
                     let val = vr.isDetached ? vr.value.dupValue() : vr.pvalue.dupValue()
-                    if JeffJSInterpreter.traceOpcodes {
+                    if traceOps {
                         print("[VAR_REF] get idx=\(idx) isDetached=\(vr.isDetached) isArg=\(vr.isArg) varIdx=\(vr.varIdx) val.bits=0x\(String(val.bits, radix: 16)) frame=\(vr.parentFrame != nil)")
                     }
                     push(val)
                 } else {
-                    if JeffJSInterpreter.traceOpcodes {
+                    if traceOps {
                         print("[VAR_REF] get idx=\(idx) OUT OF RANGE (count=\(varRefs.count))")
                     }
                     push(.undefined)
@@ -4862,12 +5087,12 @@ struct JeffJSInterpreter {
             case .get_var_ref0:
                 if varRefs.count > 0, let vr = varRefs[0] {
                     let val = vr.isDetached ? vr.value.dupValue() : vr.pvalue.dupValue()
-                    if JeffJSInterpreter.traceOpcodes {
+                    if traceOps {
                         print("[VAR_REF0] isDetached=\(vr.isDetached) isArg=\(vr.isArg) varIdx=\(vr.varIdx) val.bits=0x\(String(val.bits, radix: 16))/\(val.toInt32()) frame=\(vr.parentFrame != nil)")
                     }
                     push(val)
                 } else {
-                    if JeffJSInterpreter.traceOpcodes { print("[VAR_REF0] empty varRefs") }
+                    if traceOps { print("[VAR_REF0] empty varRefs") }
                     push(.undefined)
                 }
                 pc += 1
@@ -5055,14 +5280,15 @@ struct JeffJSInterpreter {
                                 entryPC: traceInfo.entryPC, exitPC: traceInfo.exitPC,
                                 buf: buf, varBase: varBase, sp: &sp, ctx: ctx,
                                 cpool: fb.cpool,
-                                stackLimit: bufCapacity
+                                stackLimit: bufCapacity,
+                                ic: fb.ic
                             )
                             if resumePC == -1 { retVal = .exception; break dispatchLoop }
                             pc = resumePC
                             continue dispatchLoop
                         } else {
                             traceInfo.hitCount &+= 1
-                            if traceInfo.hitCount >= UInt8(JeffJSConfig.traceHitThreshold) { traceInfo.isActive = true }
+                            if traceInfo.hitCount >= traceHitThreshold { traceInfo.isActive = true }
                         }
                     }
                 }
@@ -5121,14 +5347,15 @@ struct JeffJSInterpreter {
                                 entryPC: traceInfo.entryPC, exitPC: traceInfo.exitPC,
                                 buf: buf, varBase: varBase, sp: &sp, ctx: ctx,
                                 cpool: fb.cpool,
-                                stackLimit: bufCapacity
+                                stackLimit: bufCapacity,
+                                ic: fb.ic
                             )
                             if resumePC == -1 { retVal = .exception; break dispatchLoop }
                             pc = resumePC
                             continue dispatchLoop
                         } else {
                             traceInfo.hitCount &+= 1
-                            if traceInfo.hitCount >= UInt8(JeffJSConfig.traceHitThreshold) { traceInfo.isActive = true }
+                            if traceInfo.hitCount >= traceHitThreshold { traceInfo.isActive = true }
                         }
                     }
                 }
@@ -5151,14 +5378,15 @@ struct JeffJSInterpreter {
                                 entryPC: traceInfo.entryPC, exitPC: traceInfo.exitPC,
                                 buf: buf, varBase: varBase, sp: &sp, ctx: ctx,
                                 cpool: fb.cpool,
-                                stackLimit: bufCapacity
+                                stackLimit: bufCapacity,
+                                ic: fb.ic
                             )
                             if resumePC == -1 { retVal = .exception; break dispatchLoop }
                             pc = resumePC
                             continue dispatchLoop
                         } else {
                             traceInfo.hitCount &+= 1
-                            if traceInfo.hitCount >= UInt8(JeffJSConfig.traceHitThreshold) { traceInfo.isActive = true }
+                            if traceInfo.hitCount >= traceHitThreshold { traceInfo.isActive = true }
                         }
                     }
                 }
@@ -5397,7 +5625,7 @@ struct JeffJSInterpreter {
                 let method = peekAt(0 + offset)  // top of iter state
                 let iter   = peekAt(2 + offset)  // bottom of iter state
                 // Call method (next) with iter as this.
-                if JeffJSInterpreter.traceOpcodes {
+                if traceOps {
                     print("[FOR-OF-NEXT] method.isFunction=\(method.isFunction) method.isUndefined=\(method.isUndefined) iter.isObject=\(iter.isObject)")
                     if let iterObj = iter.toObject() {
                         print("[FOR-OF-NEXT] iter has _target: \(ctx.getPropertyStr(obj: iter, name: "_target").isObject)")
@@ -5422,7 +5650,7 @@ struct JeffJSInterpreter {
                 // Extract .done and .value from the iterator result
                 let forOfDoneVal = ctx.getPropertyStr(obj: forOfResult, name: "done")
                 let forOfDone = JeffJSTypeConvert.toBool(forOfDoneVal)
-                if JeffJSInterpreter.traceOpcodes {
+                if traceOps {
                     let v = ctx.getPropertyStr(obj: forOfResult, name: "value")
                     print("[FOR-OF] result.isObject=\(forOfResult.isObject) done=\(forOfDone) doneVal.bits=0x\(String(forOfDoneVal.bits, radix: 16)) value=\(ctx.toSwiftString(v) ?? "nil")")
                     if let obj = forOfResult.toObject() {
@@ -6687,7 +6915,7 @@ struct JeffJSInterpreter {
                     // Only print stack delta warnings when opcode tracing is on.
                     // Many false positives from control flow (catch/gosub/ret) and
                     // exception paths that unwind the stack non-linearly.
-                    if actualDelta != expectedDelta && !isChainedStore && JeffJSInterpreter.traceOpcodes {
+                    if actualDelta != expectedDelta && !isChainedStore && traceOps {
                         print("[JeffJS-STACK] \(op): expected sp delta \(expectedDelta) but got \(actualDelta) at pc=\(pcBefore)")
                     }
                 }
@@ -6746,8 +6974,8 @@ struct JeffJSInterpreter {
                         }
                     }
                     ctx.currentFrame = frame.prevFrame
-                    JeffJSStackFrame.release(frame)
-                    JeffJSInterpreter.releaseBuf(buf, capacity: bufCapacity)
+                    rt.releaseFrame(frame)
+                    rt.releaseInterpBuf(buf, capacity: bufCapacity)
                     // Restore caller state
                     let saved = inlineCallStack.removeLast()
                     pc = saved.pc
@@ -6833,11 +7061,11 @@ struct JeffJSInterpreter {
         ctx.currentFrame = frame.prevFrame
 
         // Release the contiguous buffer to pool
-        JeffJSInterpreter.releaseBuf(buf, capacity: bufCapacity)
+        rt.releaseInterpBuf(buf, capacity: bufCapacity)
 
         // Return frame to pool for reuse (only if no live closures reference it,
         // since closures have already been detached above and copied their values)
-        JeffJSStackFrame.release(frame)
+        rt.releaseFrame(frame)
 
         return retVal
     }

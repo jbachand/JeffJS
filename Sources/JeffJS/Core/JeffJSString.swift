@@ -35,6 +35,10 @@ final class JeffJSString {
 
     var refCount: Int
 
+    /// UAF tripwire: set when the string's JS refcount hit zero in zombie mode
+    /// (JEFFJS_ZOMBIES=1). Any later dup/free on it is an over-release bug.
+    var freeMark: Bool = false
+
     // -- Length (max 2^31 - 1) ------------------------------------------------
 
     private(set) var len: Int
@@ -137,6 +141,8 @@ final class JeffJSString {
 final class JeffJSStringRope {
 
     var refCount: Int
+    /// UAF tripwire (zombie mode) — see JeffJSString.freeMark.
+    var freeMark: Bool = false
     var len: Int
     var isWideChar: Bool
     var depth: UInt8
@@ -745,6 +751,9 @@ final class JeffJSStringBuffer {
     /// Reference count for when the buffer is stored directly in a JeffJSValue
     /// as an accumulator (Phase 4 string concat optimization).
     var refCount: Int
+
+    /// UAF tripwire (zombie mode) — see JeffJSString.freeMark.
+    var freeMark: Bool = false
 
     /// The owning context (retained weakly to avoid cycles).
     private weak var ctx: (any JeffJSContextProtocol)?

@@ -380,6 +380,7 @@ struct JeffJSValue {
         switch tag {
         case Self._objectTag:
             let obj = unsafeBitCast(ptr, to: JeffJSObject.self)
+            if obj.freeMark { JeffJSZombieDebug.reportTouch("DUP", obj) }
             obj.refCount += 1
             JeffJSGCObjectHeader.trackDup(obj)
         case Self._bigIntTag:
@@ -389,9 +390,16 @@ struct JeffJSValue {
         case Self._stringTag, Self._symbolTag:
             // String subtypes — need as? chain (3 possible classes)
             let ref = Unmanaged<AnyObject>.fromOpaque(ptr).takeUnretainedValue()
-            if let s = ref as? JeffJSString { s.refCount += 1 }
-            else if let r = ref as? JeffJSStringRope { r.refCount += 1 }
-            else if let b = ref as? JeffJSStringBuffer { b.refCount += 1 }
+            if let s = ref as? JeffJSString {
+                if s.freeMark { JeffJSZombieDebug.reportString("DUP", "JeffJSString rc=\(s.refCount)") }
+                s.refCount += 1
+            } else if let r = ref as? JeffJSStringRope {
+                if r.freeMark { JeffJSZombieDebug.reportString("DUP", "JeffJSStringRope rc=\(r.refCount)") }
+                r.refCount += 1
+            } else if let b = ref as? JeffJSStringBuffer {
+                if b.freeMark { JeffJSZombieDebug.reportString("DUP", "JeffJSStringBuffer rc=\(b.refCount)") }
+                b.refCount += 1
+            }
         case Self._moduleTag:
             unsafeBitCast(ptr, to: JeffJSGCObjectHeader.self).refCount += 1
         default: break
@@ -407,6 +415,9 @@ struct JeffJSValue {
         // During context init (intrinsicsAdded == false), only decrement —
         // init objects are context-scoped and freed by context.free().
         if let hdr = toGCObjectHeader() {
+            if jeffJSZombiesEnabled, let obj = hdr as? JeffJSObject, obj.freeMark {
+                JeffJSZombieDebug.reportTouch("FREE", obj)
+            }
             JeffJSGCObjectHeader.trackFree(hdr)
             guard hdr.refCount > 0 else { return }
             if let rt = hdr.ownerRuntime ?? JeffJSGCObjectHeader.activeRuntime {
@@ -434,21 +445,43 @@ struct JeffJSValue {
         case Self._stringTag, Self._symbolTag:
             let ref = Unmanaged<AnyObject>.fromOpaque(ptr).takeUnretainedValue()
             if let s = ref as? JeffJSString {
+                if s.freeMark { JeffJSZombieDebug.reportString("FREE", "JeffJSString rc=\(s.refCount)") }
                 guard s.refCount > 0 else { return }
                 s.refCount -= 1
-                if s.refCount == 0 { Unmanaged.passUnretained(s).release() }
+                if s.refCount == 0 {
+                    if jeffJSZombiesEnabled {
+                        s.freeMark = true
+                        JeffJSZombieDebug.stringKeepAlive.append(s)
+                    } else {
+                        Unmanaged.passUnretained(s).release()
+                    }
+                }
             } else if let r = ref as? JeffJSStringRope {
+                if r.freeMark { JeffJSZombieDebug.reportString("FREE", "JeffJSStringRope rc=\(r.refCount)") }
                 guard r.refCount > 0 else { return }
                 r.refCount -= 1
                 if r.refCount == 0 {
                     r.left.freeValue()
                     r.right.freeValue()
-                    Unmanaged.passUnretained(r).release()
+                    if jeffJSZombiesEnabled {
+                        r.freeMark = true
+                        JeffJSZombieDebug.stringKeepAlive.append(r)
+                    } else {
+                        Unmanaged.passUnretained(r).release()
+                    }
                 }
             } else if let b = ref as? JeffJSStringBuffer {
+                if b.freeMark { JeffJSZombieDebug.reportString("FREE", "JeffJSStringBuffer rc=\(b.refCount)") }
                 guard b.refCount > 0 else { return }
                 b.refCount -= 1
-                if b.refCount == 0 { Unmanaged.passUnretained(b).release() }
+                if b.refCount == 0 {
+                    if jeffJSZombiesEnabled {
+                        b.freeMark = true
+                        JeffJSZombieDebug.stringKeepAlive.append(b)
+                    } else {
+                        Unmanaged.passUnretained(b).release()
+                    }
+                }
             }
         default: break
         }

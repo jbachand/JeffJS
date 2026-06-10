@@ -563,27 +563,29 @@ struct JeffJSPerfTests {
         report += "JeffJS Performance Benchmarks\n"
         report += "================================================\n"
 
-        let benchmarks: [(String, Double)] = [
-            benchStringHash(),
-            benchStringHashShort(),
-            benchStringCompare(),
-            benchStringCompareMismatch(),
-            benchStringConcat(),
-            benchValueTypeCheck(),
-            benchValueExtract(),
-            benchSameTag(),
-            benchInlineCache(),
-            benchArithmetic(),
-            benchJSONParse(),
-            benchArrayPush(),
-            benchGC(),
-            benchGCLarge(),
-            benchRegexGlobal(),
-            benchRegexCharClass(),
-            benchAtomLookup(),
+        // Run + print incrementally so a crash mid-suite doesn't lose all results.
+        let benchmarks: [() -> (name: String, microseconds: Double)] = [
+            benchStringHash,
+            benchStringHashShort,
+            benchStringCompare,
+            benchStringCompareMismatch,
+            benchStringConcat,
+            benchValueTypeCheck,
+            benchValueExtract,
+            benchSameTag,
+            benchInlineCache,
+            benchArithmetic,
+            benchJSONParse,
+            benchArrayPush,
+            benchGC,
+            benchGCLarge,
+            benchRegexGlobal,
+            benchRegexCharClass,
+            benchAtomLookup,
         ]
 
-        for (name, us) in benchmarks {
+        for bench in benchmarks {
+            let (name, us) = bench()
             let usStr: String
             if us >= 1_000_000 {
                 usStr = String(format: "%.1f s", us / 1_000_000)
@@ -592,6 +594,7 @@ struct JeffJSPerfTests {
             } else {
                 usStr = String(format: "%.0f us", us)
             }
+            print("  [bench] \(name): \(usStr)")
             report += "  \(name): \(usStr)\n"
         }
 

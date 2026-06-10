@@ -377,6 +377,92 @@ final class JeffJSRuntime {
     /// Linked list of weak references for cleanup during GC.
     var weakrefList: ListHead
 
+    // MARK: - Per-Runtime Interpreter Pools
+    // Instance state (not statics): static-var access in the dispatch loop
+    // costs a TLS-backed exclusivity check per touch, and per-runtime pools
+    // also can't leak buffers across runtimes.
+
+    /// Pool of recycled stack frames (avoids a heap alloc per JS call).
+    var framePool: [JeffJSStackFrame] = []
+
+    /// JEFFJS_ZOMBIES=1 keep-alive list: freed JS objects retained here so
+    /// use-after-free touches are detectable (see JeffJSZombieDebug).
+    var zombieKeepAlive: [JeffJSGCObjectHeader] = []
+
+    /// Identities of objects that must never be freed mid-run (global objects).
+    /// freeObject consults this to catch over-releases of load-bearing objects.
+    var protectedGlobals: Set<ObjectIdentifier> = []
+
+    /// Pool of interpreter value buffers: (pointer, capacity) pairs.
+    var interpBufPool: [(UnsafeMutablePointer<JeffJSValue>, Int)] = []
+
+    @inline(__always)
+    func acquireFrame() -> JeffJSStackFrame {
+        if let frame = framePool.popLast() { return frame }
+        return JeffJSStackFrame()
+    }
+
+    @inline(__always)
+    func releaseFrame(_ frame: JeffJSStackFrame) {
+        frame.prevFrame = nil
+        frame.curFunc = .undefined
+        frame.thisVal = .undefined
+        frame.newTarget = .undefined
+        frame.curPC = 0
+        frame.argCount = 0
+        frame.varCount = 0
+        frame.spBase = 0
+        frame.sp = 0
+        // Drop any receiver stashed by get_field that no call consumed
+        frame.lastGetFieldReceiver.freeValue()
+        frame.lastGetFieldReceiver = .undefined
+        frame.buf = nil
+        frame.bufCapacity = 0
+        frame.bufVarBase = 0
+        frame.bufSpBase = 0
+        frame.argBuf.removeAll(keepingCapacity: true)
+        frame.varBuf.removeAll(keepingCapacity: true)
+        frame.liveVarRefs.removeAll(keepingCapacity: true)
+        if framePool.count < 32 {
+            framePool.append(frame)
+        }
+    }
+
+    @inline(__always)
+    func acquireInterpBuf(size: Int) -> (UnsafeMutablePointer<JeffJSValue>, Int) {
+        if let (ptr, cap) = interpBufPool.popLast() {
+            if cap >= size {
+                for i in 0..<size { ptr[i] = .undefined }
+                return (ptr, cap)
+            }
+            ptr.deinitialize(count: cap)
+            ptr.deallocate()
+        }
+        let ptr = UnsafeMutablePointer<JeffJSValue>.allocate(capacity: size)
+        ptr.initialize(repeating: .undefined, count: size)
+        return (ptr, size)
+    }
+
+    @inline(__always)
+    func releaseInterpBuf(_ ptr: UnsafeMutablePointer<JeffJSValue>, capacity: Int) {
+        if interpBufPool.count < JeffJSConfig.bufPoolMax && capacity <= 512 {
+            interpBufPool.append((ptr, capacity))
+        } else {
+            ptr.deinitialize(count: capacity)
+            ptr.deallocate()
+        }
+    }
+
+    /// Drain the interpreter buffer pool (called from free()).
+    func drainInterpPools() {
+        for (ptr, cap) in interpBufPool {
+            ptr.deinitialize(count: cap)
+            ptr.deallocate()
+        }
+        interpBufPool.removeAll()
+        framePool.removeAll()
+    }
+
     // MARK: - Per-Runtime GC Tracking (replaces module-level globals)
 
     /// All GC-tracked object headers for this runtime.
@@ -583,6 +669,9 @@ final class JeffJSRuntime {
     /// This must be called after all contexts have been freed.
     /// After calling free(), the runtime must not be used.
     func free() {
+        // Return pooled interpreter buffers/frames to the allocator
+        drainInterpPools()
+
         // Clear bytecode cache
         bytecodeCache.clear()
 

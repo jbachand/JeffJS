@@ -321,35 +321,24 @@ func js_regexp_exec(
     resultArray.fastArray = true
 
     // Set `length` property so array.length works.
-    let lengthProp = JeffJSShapeProperty(
-        atom: JeffJSAtomID.JS_ATOM_length.rawValue,
-        flags: [.writable]
-    )
-    resultArray.shape?.prop.append(lengthProp)
-    resultArray.prop.append(.value(JeffJSValue.newInt32(Int32(arrayValues.count))))
+    jeffJS_appendOwnProperty(ctx, resultArray,
+                             atom: JeffJSAtomID.JS_ATOM_length.rawValue,
+                             flags: [.writable],
+                             value: JeffJSValue.newInt32(Int32(arrayValues.count)))
 
     // Set `index` property.
-    let indexProp = JeffJSShapeProperty(
-        atom: JeffJSAtomID.JS_ATOM_index.rawValue,
-        flags: [.writable, .enumerable, .configurable]
-    )
-    resultArray.shape?.prop.append(indexProp)
-    resultArray.prop.append(.value(JeffJSValue.newInt32(Int32(matchStart))))
+    jeffJS_appendOwnProperty(ctx, resultArray,
+                             atom: JeffJSAtomID.JS_ATOM_index.rawValue,
+                             flags: [.writable, .enumerable, .configurable],
+                             value: JeffJSValue.newInt32(Int32(matchStart)))
 
     // Set `input` property.
-    let inputProp = JeffJSShapeProperty(
-        atom: JeffJSAtomID.JS_ATOM_input.rawValue,
-        flags: [.writable, .enumerable, .configurable]
-    )
-    resultArray.shape?.prop.append(inputProp)
-    resultArray.prop.append(.value(JeffJSValue.makeString(inputStr.retain())))
+    jeffJS_appendOwnProperty(ctx, resultArray,
+                             atom: JeffJSAtomID.JS_ATOM_input.rawValue,
+                             flags: [.writable, .enumerable, .configurable],
+                             value: JeffJSValue.makeString(inputStr.retain()))
 
     // Set `groups` property — populate from named capture groups if present.
-    let groupsProp = JeffJSShapeProperty(
-        atom: JeffJSAtomID.JS_ATOM_groups.rawValue,
-        flags: [.writable, .enumerable, .configurable]
-    )
-    resultArray.shape?.prop.append(groupsProp)
     var groupsVal: JeffJSValue = .undefined
     if case .regexp(_, let bytecodeStr) = obj.payload,
        let bc = bytecodeStr,
@@ -375,18 +364,18 @@ func js_regexp_exec(
             groupsVal = groupsObj
         }
     }
-    resultArray.prop.append(.value(groupsVal))
+    jeffJS_appendOwnProperty(ctx, resultArray,
+                             atom: JeffJSAtomID.JS_ATOM_groups.rawValue,
+                             flags: [.writable, .enumerable, .configurable],
+                             value: groupsVal)
 
     // Set `indices` property (if 'd' flag).
     if hasIndices {
-        let indicesProp = JeffJSShapeProperty(
-            atom: JeffJSAtomID.JS_ATOM_indices.rawValue,
-            flags: [.writable, .enumerable, .configurable]
-        )
-        resultArray.shape?.prop.append(indicesProp)
-
         let indicesArray = js_regexp_buildIndicesArray(ctx: ctx, captures: captures)
-        resultArray.prop.append(.value(JeffJSValue.makeObject(indicesArray)))
+        jeffJS_appendOwnProperty(ctx, resultArray,
+                                 atom: JeffJSAtomID.JS_ATOM_indices.rawValue,
+                                 flags: [.writable, .enumerable, .configurable],
+                                 value: JeffJSValue.makeObject(indicesArray))
     }
 
     // Update lastIndex.
@@ -951,12 +940,10 @@ func js_regexp_Symbol_matchAll(
 
     // Set lastIndex from the original.
     let origLastIndex = js_regexp_getLastIndex(obj)
-    let liProp = JeffJSShapeProperty(
-        atom: JeffJSAtomID.JS_ATOM_lastIndex.rawValue,
-        flags: [.writable]
-    )
-    regexpCopy.shape?.prop.append(liProp)
-    regexpCopy.prop.append(.value(JeffJSValue.newInt32(Int32(origLastIndex))))
+    jeffJS_appendOwnProperty(ctx, regexpCopy,
+                             atom: JeffJSAtomID.JS_ATOM_lastIndex.rawValue,
+                             flags: [.writable],
+                             value: JeffJSValue.newInt32(Int32(origLastIndex)))
 
     // Create the iterator object.
     let iterData = JSRegExpStringIteratorData(
@@ -1830,20 +1817,16 @@ private func js_createIteratorResult(
                                    classID: UInt16(JeffJSClassID.object.rawValue))
 
     // Set `value` property.
-    let valueProp = JeffJSShapeProperty(
-        atom: JeffJSAtomID.JS_ATOM_value.rawValue,
-        flags: [.writable, .enumerable, .configurable]
-    )
-    obj.shape?.prop.append(valueProp)
-    obj.prop.append(.value(value.dupValue()))
+    jeffJS_appendOwnProperty(ctx, obj,
+                             atom: JeffJSAtomID.JS_ATOM_value.rawValue,
+                             flags: [.writable, .enumerable, .configurable],
+                             value: value.dupValue())
 
     // Set `done` property.
-    let doneProp = JeffJSShapeProperty(
-        atom: JeffJSAtomID.JS_ATOM_done.rawValue,
-        flags: [.writable, .enumerable, .configurable]
-    )
-    obj.shape?.prop.append(doneProp)
-    obj.prop.append(.value(JeffJSValue.newBool(done)))
+    jeffJS_appendOwnProperty(ctx, obj,
+                             atom: JeffJSAtomID.JS_ATOM_done.rawValue,
+                             flags: [.writable, .enumerable, .configurable],
+                             value: JeffJSValue.newBool(done))
 
     return JeffJSValue.makeObject(obj)
 }

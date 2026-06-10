@@ -1193,11 +1193,19 @@ final class JeffJSParser {
 
     /// Returns true if an opcode is "transparent" for tail-position completion
     /// value analysis -- i.e., it doesn't produce or consume the completion value.
+    ///
+    /// `.ret` is deliberately NOT transparent: walking backward through `ret`
+    /// enters a finally body, and a finally body's statement values are never
+    /// the script completion (the completion sits BELOW the gosub return
+    /// address). Patching a drop inside a finally leaves a stray value that
+    /// `ret` then pops as its return address — pc jumps to a bogus offset and
+    /// the gosub/ret cycle never terminates. The legitimate completion drop
+    /// before `gosub` is still reached via the end-label's jump-source walk.
     private func isTailTransparentOp(_ op: JeffJSOpcode) -> Bool {
         switch op {
         case .label_, .goto_, .if_false, .if_true,
              .nip_catch, .leave_scope, .enter_scope,
-             .gosub, .ret, .return_undef, .return_async, .nop,
+             .gosub, .return_undef, .return_async, .nop,
              .close_loc, .line_num:
             return true
         default:
@@ -3918,6 +3926,14 @@ final class JeffJSParser {
                         let scopeLevel = readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4)
                         parseAssignExpr()
                         emitBinaryOp(forAssignOp: assignOp)
+                        // Keep the expression value on the stack (matching the
+                        // field/array compound paths and plain assignment).
+                        // Without this dup, the statement-level `drop` pops one
+                        // entry too many; that is silently absorbed when the
+                        // stack is empty, but inside finally blocks it consumed
+                        // the gosub return address and `ret` then jumped to a
+                        // bogus pc (stack corruption, UAF crashes downstream).
+                        emitOp(.dup)
                         emitScopePutVar(atom, scopeLevel: Int(scopeLevel))
                     } else {
                         // Fallback
