@@ -425,6 +425,7 @@ struct JeffJSTestRunner {
 
     /// Evaluate JS code and check the result is the expected Int32.
     mutating func evalCheck(_ ctx: JeffJSContext, _ code: String, expectInt: Int32) {
+        JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException {
@@ -443,6 +444,7 @@ struct JeffJSTestRunner {
 
     /// Evaluate JS code and check the result converts to the expected Double.
     mutating func evalCheckDouble(_ ctx: JeffJSContext, _ code: String, expect: Double, tolerance: Double = 1e-10) {
+        JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException {
@@ -467,6 +469,7 @@ struct JeffJSTestRunner {
 
     /// Evaluate JS code and check the result is the expected Bool.
     mutating func evalCheckBool(_ ctx: JeffJSContext, _ code: String, expect: Bool) {
+        JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException {
@@ -481,6 +484,7 @@ struct JeffJSTestRunner {
 
     /// Evaluate JS code and check the result is the expected String.
     mutating func evalCheckStr(_ ctx: JeffJSContext, _ code: String, expect: String) {
+        JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException {
@@ -498,6 +502,7 @@ struct JeffJSTestRunner {
 
     /// Evaluate JS code and check that it throws an exception.
     mutating func evalCheckException(_ ctx: JeffJSContext, _ code: String) {
+        JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         assert(result.isException, "\(code) => expected exception, got non-exception")
@@ -506,6 +511,7 @@ struct JeffJSTestRunner {
 
     /// Evaluate JS code and check that the result is undefined.
     mutating func evalCheckUndefined(_ ctx: JeffJSContext, _ code: String) {
+        JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException {
@@ -518,6 +524,7 @@ struct JeffJSTestRunner {
 
     /// Evaluate JS code and check that the result is null.
     mutating func evalCheckNull(_ ctx: JeffJSContext, _ code: String) {
+        JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException {
@@ -531,6 +538,7 @@ struct JeffJSTestRunner {
     /// Evaluate JS code and accept any of the given integer values (or exception).
     /// Used for tests where the engine's current behavior differs from spec.
     mutating func evalCheckAnyInt(_ ctx: JeffJSContext, _ code: String, accept values: [Int32]) {
+        JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException {
@@ -551,6 +559,7 @@ struct JeffJSTestRunner {
     /// Used for tests where the engine's current behavior is known-broken
     /// and we just want to verify it doesn't crash.
     mutating func evalCheckAcceptAny(_ ctx: JeffJSContext, _ code: String) {
+        JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException { _ = ctx.getException() }
@@ -559,6 +568,7 @@ struct JeffJSTestRunner {
 
     /// Evaluate JS code and accept any of the given string values (or exception).
     mutating func evalCheckAnyStr(_ ctx: JeffJSContext, _ code: String, accept values: [String]) {
+        JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException {
@@ -591,7 +601,8 @@ extension JeffJSTestRunner {
             _ = ctx.eval(input: code, filename: "<bench>", evalFlags: 0)
 
             let start = CFAbsoluteTimeGetCurrent()
-            let result = ctx.eval(input: code, filename: "<bench>", evalFlags: 0)
+            JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
+        let result = ctx.eval(input: code, filename: "<bench>", evalFlags: 0)
             let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
             defer { result.freeValue() }
 
@@ -8419,7 +8430,7 @@ extension JeffJSTestRunner {
         function assert(v, msg) { if (v !== true) throw new Test262Error(msg || 'assert failed: ' + v); }
         assert.sameValue = function(a, b, msg) { if (a !== b && !(a !== a && b !== b)) throw new Test262Error(msg || 'Expected ' + String(b) + ' but got ' + String(a)); };
         assert.notSameValue = function(a, b, msg) { if (a === b || (a !== a && b !== b)) throw new Test262Error(msg || 'Expected not ' + String(b)); };
-        assert.throws = function(E, fn, msg) { try { fn(); throw new Test262Error(msg || 'Expected ' + (E && E.name || E) + ' to be thrown'); } catch(e) { if (e instanceof Test262Error) throw e; if (!(e instanceof E)) throw new Test262Error(msg || 'Wrong error type: ' + e); } };
+        assert.throws = function(E, fn, msg) { var threw = false, err; try { fn(); } catch(e) { threw = true; err = e; } if (!threw) throw new Test262Error(msg || 'Expected ' + (E && E.name || E) + ' to be thrown'); if (!(err instanceof E)) throw new Test262Error(msg || 'Wrong error type: ' + err); };
         """
 
     /// Evaluate a test262 snippet with the assert shim prepended.

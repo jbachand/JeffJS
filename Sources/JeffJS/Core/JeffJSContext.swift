@@ -127,6 +127,11 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// the interrupt handler is called (if set) and the counter resets.
     var interruptCounter: Int
 
+    /// Set when the interrupt handler requested termination. While true,
+    /// exception unwinding must NOT enter catch handlers (interrupts are
+    /// uncatchable, like QuickJS). Cleared at the start of each eval.
+    var interruptTerminated: Bool = false
+
     // MARK: - Interpreter Hot State
     // Stored on the context (not as statics) so the dispatch loop avoids
     // dynamic-exclusivity TLS checks that dominate profiles on static vars.
@@ -169,8 +174,14 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     private var nextAsyncStateID: Int = 1
 
     /// The async function's resolve/reject, threaded through callFunction → callInternal → await_.
+    /// `.uninitialized` is the lazy marker: "inside an async function whose
+    /// result-promise capability hasn't been needed yet" — await_ creates the
+    /// capability on first suspension, so non-suspending async calls never
+    /// allocate a promise + resolver pair up front.
     var _asyncResolve: JeffJSValue = .undefined
     var _asyncReject: JeffJSValue = .undefined
+    /// The lazily-created result promise (set together with resolve/reject).
+    var _asyncCapPromise: JeffJSValue = .undefined
     /// Set to true by the await_ opcode when it suspends.
     var _asyncSuspended: Bool = false
 
@@ -743,6 +754,22 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         return setPropertyInternal(obj: obj, atom: atom, value: value, flags: JS_PROP_THROW)
     }
 
+    /// Property write honoring strict/sloppy semantics: in sloppy mode a
+    /// failed write (non-writable, non-extensible target) fails SILENTLY
+    /// (returns 0) instead of throwing. Used by the interpreter's put_field /
+    /// put_array_el paths with the executing function's strictness.
+    @discardableResult
+    func setPropertyChecked(obj: JeffJSValue, atom: UInt32, value: JeffJSValue,
+                            strict: Bool) -> Int {
+        let r = setPropertyInternal(obj: obj, atom: atom, value: value,
+                                    flags: strict ? JS_PROP_THROW : 0)
+        if r < 0 && !strict && rt.currentException.isNull {
+            // Sloppy-mode silent failure (no pending exception): not an error.
+            return 0
+        }
+        return r
+    }
+
     /// Gets a property from an object using an integer index.
     /// Mirrors `JS_GetPropertyUint32()` from QuickJS.
     ///
@@ -1003,6 +1030,11 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             }
         }
 
+        // Lazy function prototype counts as present
+        if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
+            return true
+        }
+
         // Check own properties via the shape hash table
         if let shape = jsObj.shape, findShapeProperty(shape, atom) != nil {
             return true
@@ -1032,6 +1064,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// - Returns: The property descriptor, or nil if not found.
     func getOwnProperty(obj: JeffJSValue, atom: UInt32) -> JeffJSProperty? {
         guard let jsObj = obj.toObject() else { return nil }
+        if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
+            materializeFunctionPrototype(jsObj)
+        }
         let (_, prop) = jeffJS_findOwnProperty(obj: jsObj, atom: atom)
         return prop
     }
@@ -2264,6 +2299,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// Checks the bytecode cache first — if the same source was compiled before,
     /// reuses the compiled bytecode (skipping tokenize + parse + compile entirely).
     private func nativeEvalPipeline(input: String, filename: String, evalFlags: Int) -> JeffJSValue {
+        // Each top-level eval starts with a clean interrupt-termination state;
+        // a stale flag from an aborted prior eval must not poison this one.
+        interruptTerminated = false
         let isModule = (evalFlags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE
 
         // ---- Bytecode cache lookup ----
@@ -2371,6 +2409,8 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             varRefs: [],
             homeObject: nil
         )
+        funcObj.fbFast = fb
+        funcObj.varRefsFast = []
         let funcVal = JeffJSValue.makeObject(funcObj)
         let result = JeffJSInterpreter.callInternal(
             ctx: self,
@@ -3885,6 +3925,13 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                     }
                 }
             }
+        }
+
+        // Lazily materialize `F.prototype = { constructor: F }` for plain
+        // function closures (creation deferred at closure time — most
+        // closures never have their prototype read).
+        if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
+            materializeFunctionPrototype(jsObj)
         }
 
         // Check own properties via shape-based lookup (index form avoids

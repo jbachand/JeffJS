@@ -153,6 +153,14 @@ class JeffJSFunctionDefCompiler {
     var usesArguments: Bool = false
     var isGlobalVar: Bool = false
 
+    // -- Deferred `arguments` prologue --
+    // Building the mapped-arguments object dominated the per-call cost
+    // (~80% of callInternal time) even for functions that never mention
+    // `arguments`. The binding is defined up front, but the special_object
+    // bytecode is inserted at this offset only if the body referenced it.
+    var argumentsProloguePos: Int = -1
+    var argumentsPrologueScope: Int = 0
+
     // -- Debug line/column info --
     var pc2lineBuf: DynBuf = DynBuf()
     var pc2colBuf: DynBuf = DynBuf()
@@ -3080,6 +3088,9 @@ struct JeffJSCompiler {
 
         // Mode and flags
         fb.jsModeFlags = UInt8(fd.jsMode)
+        // Base-class call-path caches (avoid per-call downcasts in callInternal)
+        fb.isStrictMode = (fd.jsMode & JS_MODE_STRICT) != 0
+        fb.selfRefVarIdx = fd.funcNameVarIdx
         fb.hasPrototype = fd.hasPrototype
         fb.hasSimpleParameterList = fd.hasSimpleParameterList
         fb.isDerivedClassConstructor = fd.isDerivedClassConstructor
@@ -3113,6 +3124,7 @@ struct JeffJSCompiler {
 
         // Closure variables
         fb.closureVars = fd.closureVar
+        fb.closureVarsList = fd.closureVar  // base-class mirror (no downcast in createClosure)
         fb.closureVarCount = UInt16(fd.closureVar.count)
         fb.closureVarCountInt = fd.closureVar.count
         fb.varRefCountValue = UInt16(fd.closureVar.count)

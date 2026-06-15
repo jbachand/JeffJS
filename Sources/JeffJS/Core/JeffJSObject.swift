@@ -113,6 +113,36 @@ class JeffJSFunctionBytecode {
     var refCount: Int = 1
     var bytecodeLen: Int = 0
     var bytecode: [UInt8] = []
+
+    /// Stable raw copy of `bytecode`, materialized lazily on first execution
+    /// (when bytecode is final and immutable). The interpreter reads opcodes and
+    /// operands through this pointer to avoid Swift Array bounds checks — the
+    /// largest remaining per-opcode cost. Owned by this FB; freed in deinit, so
+    /// the pointer is valid for the FB's entire lifetime (the FB is retained for
+    /// the duration of any call that executes it).
+    private var _bcBuffer: UnsafeMutableBufferPointer<UInt8>? = nil
+
+    /// Raw pointer to the function's bytecode. Materializes `_bcBuffer` on first
+    /// access. Must only be taken after `bytecode` is finalized (i.e. at execution
+    /// time) — never mutate `bytecode` after this is called.
+    var bytecodePtr: UnsafePointer<UInt8> {
+        if let b = _bcBuffer, let base = b.baseAddress {
+            return UnsafePointer(base)
+        }
+        let n = bytecode.count
+        let buf = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: max(n, 1))
+        if n > 0 {
+            _ = buf.initialize(from: bytecode)
+        } else {
+            buf[0] = 0
+        }
+        _bcBuffer = buf
+        return UnsafePointer(buf.baseAddress!)
+    }
+
+    deinit {
+        _bcBuffer?.deallocate()
+    }
     var fileName: JeffJSString?
     var lineNum: Int = 0
     var colNum: Int = 0
@@ -136,6 +166,16 @@ class JeffJSFunctionBytecode {
     var hasDebug: Bool = false
     var backtrace: Bool = false
     var readOnly: Bool = false
+
+    // Call-path caches: callInternal used to discover these via
+    // `as? JeffJSFunctionBytecodeCompiled` — two dynamic casts per call.
+    /// True when compiled in strict mode (JS_MODE_STRICT).
+    var isStrictMode: Bool = false
+    /// Local var index of a named function expression's self-binding, -1 if none.
+    var selfRefVarIdx: Int = -1
+    /// Closure-variable metadata (also on the Compiled subclass; mirrored here
+    /// so createClosure avoids a downcast per closure creation).
+    var closureVarsList: [JeffJSClosureVar] = []
 
     // MARK: - Inline Cache
 
@@ -269,15 +309,28 @@ class JeffJSGCObjectHeader {
     var refCount: Int
     var gcObjType: JSGCObjectTypeEnum
     var mark: Bool
-    var link: ListNode
+
+    /// Intrusive position in the runtime's GC tracking lists, so removal is
+    /// an O(1) swap-remove instead of a linear scan (removeGCObject was 98%
+    /// of promise-chain time). Encoding: >= 0 → index in rt.gcObjects;
+    /// -1 → not tracked; <= -2 → index (-2 - value) in rt.gcTmpObjects.
+    var gcListIndex: Int = -1
     /// Back-pointer to the owning runtime so the zero-arg freeValue() can
     /// actually free the object when refCount hits 0.
-    weak var ownerRuntime: JeffJSRuntime?
+    ///
+    /// Strong, not weak: a weak reference here forced a side-table entry on
+    /// EVERY GC object (formWeakReference per creation, weakLoadStrong per
+    /// read, and slow-path retain/release on the runtime forever after).
+    /// The runtime↔object cycle is broken explicitly by clearGCState()
+    /// during runtime.free(), which nils this field on all tracked headers.
+    var ownerRuntime: JeffJSRuntime?
 
     /// The currently active runtime. Set by JeffJSContext during init and eval
     /// so that newly created objects automatically know their owning runtime.
     /// nonisolated(unsafe) because JeffJS is single-threaded per runtime.
-    nonisolated(unsafe) static weak var activeRuntime: JeffJSRuntime?
+    /// Strong for the same side-table reason; runtime.free() clears it when
+    /// it points at the runtime being freed.
+    nonisolated(unsafe) static var activeRuntime: JeffJSRuntime?
 
     init(refCount: Int = 1,
          gcObjType: JSGCObjectTypeEnum = .jsObject,
@@ -285,7 +338,6 @@ class JeffJSGCObjectHeader {
         self.refCount = refCount
         self.gcObjType = gcObjType
         self.mark = mark
-        self.link = ListNode()
         self.ownerRuntime = JeffJSGCObjectHeader.activeRuntime
     }
 
@@ -717,7 +769,10 @@ final class JeffJSBigInt: JeffJSGCObjectHeader {
 /// Call-stack frame.
 /// Uses a class (not struct) because it self-references via `prevFrame`.
 final class JeffJSStackFrame {
-    weak var prevFrame: JeffJSStackFrame? = nil
+    /// Caller's frame. Strong, not weak: frames form a linear chain that
+    /// releaseFrame explicitly breaks, and weak-reference side-table traffic
+    /// (formWeakReference/weakLoadStrong) showed up per call in profiles.
+    var prevFrame: JeffJSStackFrame? = nil
     var curFunc: JeffJSValue          = .undefined
     var thisVal: JeffJSValue          = .undefined
     var newTarget: JeffJSValue        = .undefined
@@ -732,6 +787,11 @@ final class JeffJSStackFrame {
     /// when `call` is used instead of `call_method` (transformMethodCalls
     /// can't handle ternary/complex args in method calls).
     var lastGetFieldReceiver: JeffJSValue = .undefined
+    /// Bytecode pc of the get_field that stashed lastGetFieldReceiver.
+    /// The stash is only valid for a call opcode IMMEDIATELY following that
+    /// get_field — stale stashes (e.g. `throw obj.m` then a later `e()`)
+    /// must not leak `obj` in as `this`.
+    var lastGetFieldPC: Int = -1
 
     /// Contiguous unsafe buffer used by the interpreter's dispatch loop.
     /// Layout: [arg slots][var slots][value stack --->]
@@ -896,6 +956,13 @@ final class JeffJSObject: JeffJSGCObjectHeader {
 
     var payload: JeffJSObjectPayload    = .opaque(nil)
 
+    // -- Denormalized .bytecodeFunc payload (call-path fast fields) -----------
+    // Pattern-matching `case .bytecodeFunc(...) = payload` copies the enum
+    // (retaining the FB and the varRefs array) on every JS call. The hot call
+    // path reads these instead; they are kept in sync at every payload write.
+    var fbFast: JeffJSFunctionBytecode? = nil
+    var varRefsFast: [JeffJSVarRef?]    = []
+
     // -- Fast array storage (reference-type bypass for COW avoidance) --------
     // When non-nil, this is the authoritative backing store for the array.
     // Used by the interpreter's Array.prototype.push fast path to avoid
@@ -909,6 +976,12 @@ final class JeffJSObject: JeffJSGCObjectHeader {
     // `this` value is stored here so that `push_this` inside the arrow
     // function returns the lexical `this` instead of the call-site `this`.
     var arrowThisVal: JeffJSValue? = nil
+
+    // -- Lazy function prototype ----------------------------------------------
+    // Plain function closures defer building `F.prototype = { constructor: F }`
+    // (an object + shape + two property defines per closure) until the first
+    // read of `.prototype`. Mirrors QuickJS's JS_PROP_AUTOINIT.
+    var needsLazyPrototype: Bool = false
 
     // -- Associated storage (moved from objc_setAssociatedObject) ----------
     var storedProto: JeffJSObject? = nil
@@ -1454,6 +1527,16 @@ struct JeffJSObj {
     @inline(__always) var payload: JeffJSObjectPayload {
         get { _obj.payload }
         nonmutating set { _obj.payload = newValue }
+    }
+
+    @inline(__always) var fbFast: JeffJSFunctionBytecode? {
+        get { _obj.fbFast }
+        nonmutating set { _obj.fbFast = newValue }
+    }
+
+    @inline(__always) var varRefsFast: [JeffJSVarRef?] {
+        get { _obj.varRefsFast }
+        nonmutating set { _obj.varRefsFast = newValue }
     }
 
     @inline(__always) var _fastArrayValues: JeffJSFastArrayStorage? {

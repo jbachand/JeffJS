@@ -498,7 +498,7 @@ func js_finrec_unregister(
 ///
 /// Mirrors QuickJS `js_weakref_check` / cleanup scheduling.
 func js_finrec_scheduleCleanup(
-    rt: JeffJSRuntime,
+    ctx: JeffJSContext,
     registryObj: JeffJSObject,
     data: JSFinalizationRegistryData
 ) {
@@ -508,16 +508,12 @@ func js_finrec_scheduleCleanup(
     data.cleanupJobPending = true
 
     // Enqueue a job that calls the cleanup callback for each dead entry.
-    let job = JeffJSJobEntry()
-    job.jobFunc = { (ctx: JeffJSContext, argc: Int, args: [JeffJSValue]) -> JeffJSValue in
-        js_finrec_runCleanup(ctx: ctx, registryObj: registryObj, data: data)
+    // (The old version poked rt.jobList.next directly, which corrupted the
+    // list sentinel; the flat queue makes this a plain enqueue.)
+    ctx.rt.enqueueJob(ctx: ctx, jobFunc: { jobCtx, _, _ in
+        js_finrec_runCleanup(ctx: jobCtx, registryObj: registryObj, data: data)
         return .undefined
-    }
-    job.args = []
-
-    // Insert into the runtime's job queue.
-    // (In QuickJS this uses list_add_tail; we append to the runtime's job array.)
-    rt.jobList.next = job.link
+    }, args: [])
 }
 
 /// Execute pending cleanup callbacks for a FinalizationRegistry.

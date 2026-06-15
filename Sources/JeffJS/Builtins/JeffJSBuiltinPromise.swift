@@ -25,22 +25,26 @@ struct JeffJSPromiseReaction {
     /// The handler closure. May be JS_UNDEFINED for default pass-through.
     var handler: JeffJSValue
 
-    /// The resolve function of the dependent promise capability.
-    var resolveFunc: JeffJSValue
-
-    /// The reject function of the dependent promise capability.
-    var rejectFunc: JeffJSValue
+    /// The dependent promise to settle with the handler's outcome (duped;
+    /// .undefined when there is none). Settled NATIVELY via resolvePromise/
+    /// rejectPromise — the old design allocated a (resolve, reject) function
+    /// pair per reaction (and a second unused pair per .then).
+    var resultPromise: JeffJSValue
 
     /// True if this is a fulfill reaction; false if reject.
     var isFulfill: Bool
 
+    /// Optional native continuation (value, isRejection). When set, the
+    /// reaction job calls this directly — no JS handler objects, no result-
+    /// promise resolution. Used by the await_ opcode to resume async
+    /// functions without allocating two C-function objects per suspension.
+    var nativeContinuation: ((JeffJSContext, JeffJSValue, Bool) -> Void)? = nil
+
     init(handler: JeffJSValue = .undefined,
-         resolveFunc: JeffJSValue = .undefined,
-         rejectFunc: JeffJSValue = .undefined,
+         resultPromise: JeffJSValue = .undefined,
          isFulfill: Bool = true) {
         self.handler = handler
-        self.resolveFunc = resolveFunc
-        self.rejectFunc = rejectFunc
+        self.resultPromise = resultPromise
         self.isFulfill = isFulfill
     }
 }
@@ -703,28 +707,22 @@ struct JeffJSBuiltinPromise {
         let onFulfilled = args.count >= 1 ? args[0] : JeffJSValue.undefined
         let onRejected = args.count >= 2 ? args[1] : JeffJSValue.undefined
 
-        // Get the constructor for species
-        let ctor = ctx.getPropertyStr(obj: this, name: "constructor")
-        let ctorToUse = ctor.isUndefined ? ctx.getPropertyStr(
-            obj: ctx.globalObject, name: "Promise") : ctor
-
-        guard let cap = newPromiseCapability(ctx: ctx, ctor: ctorToUse) else {
-            ctx.freeValue(ctor)
-            return .exception
-        }
-        ctx.freeValue(ctor)
+        // Bare result promise, settled natively by the reaction job.
+        // (The old path looked up the species constructor, then built a
+        // capability whose ctor argument was ignored anyway and whose
+        // resolver pair was never called — 3 objects + 2 property lookups
+        // per .then for nothing.)
+        let resultPromise = createPromiseObject(ctx: ctx)
+        if resultPromise.isException { return resultPromise }
 
         let result = performPromiseThen(ctx: ctx, promise: this,
                                          onFulfilled: onFulfilled, onRejected: onRejected,
-                                         resultPromise: cap.promise)
-
-        ctx.freeValue(cap.resolve)
-        ctx.freeValue(cap.reject)
+                                         resultPromise: resultPromise)
 
         if result.isException { return result }
         ctx.freeValue(result)
 
-        return cap.promise
+        return resultPromise
     }
 
     /// Promise.prototype.catch(onRejected)
@@ -831,7 +829,8 @@ struct JeffJSBuiltinPromise {
     @discardableResult
     static func performPromiseThen(ctx: JeffJSContext, promise: JeffJSValue,
                                     onFulfilled: JeffJSValue, onRejected: JeffJSValue,
-                                    resultPromise: JeffJSValue?) -> JeffJSValue {
+                                    resultPromise: JeffJSValue?,
+                                    nativeContinuation: ((JeffJSContext, JeffJSValue, Bool) -> Void)? = nil) -> JeffJSValue {
         guard let promiseObj = promise.toObject(),
               promiseObj.classID == JSClassID.JS_CLASS_PROMISE.rawValue else {
             return ctx.throwTypeError("not a promise")
@@ -839,38 +838,23 @@ struct JeffJSBuiltinPromise {
 
         let promiseData = getPromiseData(promiseObj)
 
-        // Get the result promise's resolve/reject functions (if any)
-        var capResolve = JeffJSValue.undefined
-        var capReject = JeffJSValue.undefined
+        let resultPromiseVal = resultPromise ?? .undefined
 
-        if let resultPromise = resultPromise, let resultObj = resultPromise.toObject() {
-            let resultData = getPromiseData(resultObj)
-            // The resolve/reject for the result promise are created
-            // by the caller (newPromiseCapability). We extract them from
-            // the resolving functions that were created with the promise.
-            let (rf, rj) = createResolvingFunctions(ctx: ctx, promise: resultPromise)
-            capResolve = rf
-            capReject = rj
-            _ = resultData // suppress warning
-        }
-
-        // Create the reaction records
-        let fulfillReaction = JeffJSPromiseReaction(
+        // Create the reaction records. The result promise is settled natively
+        // when the reaction job runs — no resolver-function pair per reaction.
+        var fulfillReaction = JeffJSPromiseReaction(
             handler: ctx.isFunction(onFulfilled) ? onFulfilled.dupValue() : .undefined,
-            resolveFunc: capResolve.dupValue(),
-            rejectFunc: capReject.dupValue(),
+            resultPromise: resultPromiseVal.dupValue(),
             isFulfill: true
         )
+        fulfillReaction.nativeContinuation = nativeContinuation
 
-        let rejectReaction = JeffJSPromiseReaction(
+        var rejectReaction = JeffJSPromiseReaction(
             handler: ctx.isFunction(onRejected) ? onRejected.dupValue() : .undefined,
-            resolveFunc: capResolve.dupValue(),
-            rejectFunc: capReject.dupValue(),
+            resultPromise: resultPromiseVal.dupValue(),
             isFulfill: false
         )
-
-        ctx.freeValue(capResolve)
-        ctx.freeValue(capReject)
+        rejectReaction.nativeContinuation = nativeContinuation
 
         switch promiseData.promiseState {
         case .pending:
@@ -1062,18 +1046,13 @@ struct JeffJSBuiltinPromise {
                 let myData = getPromiseData(promiseObj)
                 guard myData.promiseState == .pending else { return }
 
-                let (resolveFunc, rejectFunc) = createResolvingFunctions(
-                    ctx: ctx, promise: promise)
-
                 let fulfillReaction = JeffJSPromiseReaction(
                     handler: .undefined,
-                    resolveFunc: resolveFunc,
-                    rejectFunc: rejectFunc,
+                    resultPromise: promise.dupValue(),
                     isFulfill: true)
                 let rejectReaction = JeffJSPromiseReaction(
                     handler: .undefined,
-                    resolveFunc: resolveFunc.dupValue(),
-                    rejectFunc: rejectFunc.dupValue(),
+                    resultPromise: promise.dupValue(),
                     isFulfill: false)
 
                 promiseData.promiseFulfillReactions.append(fulfillReaction)
@@ -1112,9 +1091,21 @@ struct JeffJSBuiltinPromise {
     private static func enqueueReactionJob(ctx: JeffJSContext,
                                             reaction: JeffJSPromiseReaction,
                                             argument: JeffJSValue) {
+        // Native continuation (await resumption): one microtask, no JS handler
+        // objects, no result-promise plumbing.
+        if let native = reaction.nativeContinuation {
+            let isRejection = !reaction.isFulfill
+            let nativeArg = argument.dupValue()
+            ctx.rt.enqueueJob(ctx: ctx, jobFunc: { jobCtx, _, _ in
+                native(jobCtx, nativeArg, isRejection)
+                nativeArg.freeValue()
+                return JeffJSValue.undefined
+            }, args: [])
+            return
+        }
+
         let handler = reaction.handler
-        let resolveFunc = reaction.resolveFunc
-        let rejectFunc = reaction.rejectFunc
+        let resultPromise = reaction.resultPromise
         let isFulfill = reaction.isFulfill
         let argDup = argument.dupValue()
 
@@ -1140,16 +1131,12 @@ struct JeffJSBuiltinPromise {
                 }
             }
 
-            // Resolve or reject the result promise
-            if rejected {
-                if !rejectFunc.isUndefined {
-                    let _ = jobCtx.callFunction(func_: rejectFunc, this: .undefined,
-                                                args: [handlerResult])
-                }
-            } else {
-                if !resolveFunc.isUndefined {
-                    let _ = jobCtx.callFunction(func_: resolveFunc, this: .undefined,
-                                                args: [handlerResult])
+            // Settle the result promise natively (no resolver functions)
+            if !resultPromise.isUndefined {
+                if rejected {
+                    rejectPromise(ctx: jobCtx, promise: resultPromise, reason: handlerResult)
+                } else {
+                    resolvePromise(ctx: jobCtx, promise: resultPromise, resolution: handlerResult)
                 }
             }
 
@@ -1193,6 +1180,26 @@ struct JeffJSBuiltinPromise {
     }
 
     // MARK: - Promise Object Creation
+
+    /// Create a promise already settled with `value` — no capability, no
+    /// resolver functions, no reactions, no microtasks. Used for async
+    /// functions that complete without suspending (the common case).
+    /// NOTE: callers must route thenable values through a real resolver
+    /// instead (settling directly would skip thenable adoption).
+    static func makeSettledPromise(ctx: JeffJSContext, value: JeffJSValue,
+                                   fulfilled: Bool) -> JeffJSValue {
+        let promiseVal = createPromiseObject(ctx: ctx)
+        guard let obj = promiseVal.toObject(),
+              case .promiseData(let data) = obj.payload else {
+            return promiseVal
+        }
+        data.promiseState = fulfilled ? .fulfilled : .rejected
+        data.promiseResult = value.dupValue()
+        if !fulfilled {
+            hostPromiseRejectionTracker(ctx: ctx, promise: promiseVal, isHandled: false)
+        }
+        return promiseVal
+    }
 
     /// Create a new bare Promise object with pending state.
     /// Uses newObjectClass so the promise gets a proper shape (needed for

@@ -498,8 +498,66 @@ final class JeffJSParser {
         return idx
     }
 
+    /// Insert the deferred mapped-arguments prologue at the position recorded
+    /// in parseFunctionBody, when the body (or a nested arrow / eval call)
+    /// referenced `arguments`. Encodes:
+    ///   special_object(1); scope_put_var_init(arguments, scope)
+    /// and shifts the recorded body-start / hoisted-decl ranges accordingly.
+    func insertDeferredArgumentsPrologue() {
+        guard fd.argumentsProloguePos >= 0, fd.usesArguments else {
+            fd.argumentsProloguePos = -1
+            return
+        }
+        let pos = fd.argumentsProloguePos
+        fd.argumentsProloguePos = -1
+
+        var prefix = [UInt8]()
+        // special_object(1) — narrow opcode + u8 kind (mapped arguments)
+        prefix.append(UInt8(truncatingIfNeeded: JeffJSOpcode.special_object.rawValue))
+        prefix.append(1)
+        // scope_put_var_init(argumentsAtom, scope) — wide opcode (>= 256)
+        prefix.append(0)
+        prefix.append(UInt8(truncatingIfNeeded: JeffJSOpcode.scope_put_var_init.rawValue - 256))
+        let atom = JSPredefinedAtom.arguments_.rawValue
+        prefix.append(UInt8(truncatingIfNeeded: atom))
+        prefix.append(UInt8(truncatingIfNeeded: atom >> 8))
+        prefix.append(UInt8(truncatingIfNeeded: atom >> 16))
+        prefix.append(UInt8(truncatingIfNeeded: atom >> 24))
+        let scope = UInt16(fd.argumentsPrologueScope)
+        prefix.append(UInt8(truncatingIfNeeded: scope))
+        prefix.append(UInt8(truncatingIfNeeded: scope >> 8))
+
+        fd.byteCode.buf.insert(contentsOf: prefix, at: pos)
+        fd.byteCode.len += prefix.count
+
+        // Shift recorded byte offsets at/after the insertion point
+        if fd.bodyBytecodeStart >= pos {
+            fd.bodyBytecodeStart += prefix.count
+        }
+        fd.hoistedFuncDeclRanges = fd.hoistedFuncDeclRanges.map {
+            ($0.0 >= pos ? $0.0 + prefix.count : $0.0,
+             $0.1 >= pos ? $0.1 + prefix.count : $0.1)
+        }
+    }
+
+    /// Mark the innermost non-arrow function as needing its `arguments`
+    /// object when the identifier `arguments` (or `eval`, which can reach it
+    /// dynamically) is referenced. Arrows don't own a binding, so the flag
+    /// propagates up through them to the owning function.
+    private func noteArgumentsUse(_ atom: JSAtom) {
+        guard atom == JSPredefinedAtom.arguments_.rawValue
+            || atom == JSPredefinedAtom.eval_.rawValue else { return }
+        var cur: JeffJSFunctionDefCompiler? = fd
+        while let f = cur {
+            f.usesArguments = true
+            if f.argumentsAllowed { break }
+            cur = f.parent
+        }
+    }
+
     /// Emit a scope_get_var opcode (to be resolved by the compiler later).
     func emitScopeGetVar(_ atom: JSAtom, scopeLevel: Int) {
+        noteArgumentsUse(atom)
         emitOp(.scope_get_var)
         emitAtom(atom)
         emitU16(UInt16(scopeLevel))
@@ -507,6 +565,7 @@ final class JeffJSParser {
 
     /// Emit a scope_put_var opcode.
     func emitScopePutVar(_ atom: JSAtom, scopeLevel: Int) {
+        noteArgumentsUse(atom)
         emitOp(.scope_put_var)
         emitAtom(atom)
         emitU16(UInt16(scopeLevel))
@@ -2011,6 +2070,21 @@ final class JeffJSParser {
 
         // Parse catch clause
         emitLabel(catchLabel)
+        let hasCatchClause = tok == JSTokenType.TOK_CATCH.rawValue
+        if !hasCatchClause {
+            // try/finally WITHOUT catch: the exception path lands here with the
+            // exception value on the stack. Run the finally body via gosub
+            // (its retaddr sits above the exception), then RETHROW.
+            //
+            // Previously control fell straight into the shared finally body,
+            // whose normal-path `ret` then popped the EXCEPTION VALUE as its
+            // return address — pc teleported (e.g. to pc=1), the program
+            // re-executed, and the VM stack grew by two slots per cycle until
+            // it overflowed into the heap. This was the engine's
+            // longest-standing source of memory corruption.
+            emitGosub(finallyLabel)
+            emitOp(.throw_)
+        }
         if tok == JSTokenType.TOK_CATCH.rawValue {
             next() // consume 'catch'
 
@@ -2787,18 +2861,19 @@ final class JeffJSParser {
             s.templateNestLevel = curTemplateNest
         }
 
-        // -- Define `arguments` object for non-arrow functions --
-        // Non-arrow functions should have an `arguments` variable that
-        // provides access to all passed arguments.
+        // -- Define `arguments` binding for non-arrow functions --
+        // The variable must exist before the body parses (so identifier
+        // resolution binds to it), but the mapped-arguments OBJECT is built
+        // only if the body actually references `arguments` (or calls eval).
+        // Building it unconditionally dominated the cost of every JS call.
+        // The special_object bytecode is inserted at this offset after body
+        // parsing — see the `usesArguments` block below.
         if fd.argumentsAllowed {
             let argumentsAtom = JSPredefinedAtom.arguments_.rawValue
             fd.hasArguments = true
-            let argVarIdx = defineVar(argumentsAtom)
-            // special_object(1) = mapped arguments object
-            emitOp(.special_object)
-            emitU8(1) // mappedArguments
-            emitScopePutVarInit(argumentsAtom, scopeLevel: fd.curScope)
-            _ = argVarIdx
+            _ = defineVar(argumentsAtom)
+            fd.argumentsProloguePos = fd.byteCode.len
+            fd.argumentsPrologueScope = fd.curScope
         }
 
         // Mark body start for function declaration hoisting
@@ -2807,6 +2882,11 @@ final class JeffJSParser {
         while tok != 0x7D && tok != JSTokenType.TOK_EOF.rawValue && !shouldAbort {
             parseSourceElement()
         }
+
+        // Insert the deferred `arguments` prologue if the body referenced it.
+        // Safe pre-resolveLabels: label addresses are re-derived by rescanning
+        // the bytecode (same mechanism as the hoisted define_var prefix).
+        insertDeferredArgumentsPrologue()
 
         // Implicit return undefined — use return_async for async functions
         let fnIsAsync = fd.funcKind == JSFunctionKindEnum.JS_FUNC_ASYNC.rawValue ||

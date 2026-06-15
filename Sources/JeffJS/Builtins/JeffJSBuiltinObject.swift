@@ -182,6 +182,12 @@ extension JeffJSContext {
         let atom: UInt32
         if key.isString, let s = key.stringValue {
             atom = rt.findAtom(s.toSwiftString())
+        } else if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
+            // Symbol keys map to atoms via their description, matching the
+            // engine-wide convention (getPropertyValue/setPropertyValue).
+            // Well-known symbols (e.g. Symbol.toStringTag) resolve to their
+            // predefined atoms this way.
+            atom = rt.findAtom(symStr.toSwiftString())
         } else if let str = toSwiftString(key) {
             atom = rt.findAtom(str)
         } else {
@@ -271,6 +277,21 @@ extension JeffJSContext {
         var intKeys: [(UInt32, JeffJSValue)] = []  // (numeric index, string value)
         var stringKeys: [JeffJSValue] = []
         var symbolKeys: [JeffJSValue] = []
+
+        // 0. String exotic objects expose their characters as enumerable
+        //    index own-properties (ES §10.4.3) — Object.assign/keys on a
+        //    String wrapper must see them.
+        if wantStrings, jsObj.classID == JSClassID.JS_CLASS_STRING.rawValue {
+            let pv = jsObj.primitiveValue
+            if pv.isString, let s = pv.stringValue {
+                for i in 0 ..< s.len {
+                    intKeys.append((UInt32(i), newStringValue(String(i))))
+                }
+                if !enumOnly {
+                    stringKeys.append(newStringValue("length"))
+                }
+            }
+        }
 
         // 1. Integer-indexed array elements (from fast-array payload).
         //    These are always enumerable and already in ascending order.
@@ -380,20 +401,40 @@ extension JeffJSContext {
         return call(nextFn, this: iter, args: [])
     }
 
-    /// Freeze/seal integrity levels.
+    /// Freeze/seal integrity levels (ES SetIntegrityLevel):
+    /// seal   → preventExtensions + all own props non-configurable
+    /// freeze → seal + all own data props non-writable
+    /// Flags are updated in place on the shape; the put_field/put_var inline
+    /// caches re-check `.writable` on every hit, so they respect this.
     func setIntegrityLevel(_ obj: JeffJSValue, level: JeffJSIntegrityLevel) -> JeffJSValue {
         guard let jsObj = obj.toObject() else {
             return throwTypeError(message: "not an object")
         }
         jsObj.extensible = false
-        // For a full implementation, would also make properties non-configurable (seal)
-        // and non-writable (freeze).
+        if let shape = jsObj.shape {
+            for i in 0 ..< shape.prop.count where shape.prop[i].atom != 0 {
+                shape.prop[i].flags.remove(.configurable)
+                if level == .frozen && !shape.prop[i].flags.contains(.getset) {
+                    shape.prop[i].flags.remove(.writable)
+                }
+            }
+        }
         return obj
     }
 
     func testIntegrityLevel(_ obj: JeffJSValue, level: JeffJSIntegrityLevel) -> Bool {
         guard let jsObj = obj.toObject() else { return true }
-        return !jsObj.extensible
+        if jsObj.extensible { return false }
+        if let shape = jsObj.shape {
+            for sp in shape.prop where sp.atom != 0 {
+                if sp.flags.contains(.configurable) { return false }
+                if level == .frozen && !sp.flags.contains(.getset)
+                    && sp.flags.contains(.writable) {
+                    return false
+                }
+            }
+        }
+        return true
     }
 
 }
@@ -1056,7 +1097,9 @@ struct JeffJSBuiltinObject {
         if tag.isException { return tag }
 
         if tag.isString {
-            let tagStr = ctx.jsValueToString(tag)
+            // jsValueToString is Optional — interpolating it directly produced
+            // "[object Optional(\"Module\")]".
+            let tagStr = ctx.jsValueToString(tag) ?? "Object"
             return ctx.newString("[object \(tagStr)]")
         }
 

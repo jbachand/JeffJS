@@ -28,6 +28,7 @@ final class EngineTests: XCTestCase {
             for (name, fn) in JeffJSTestRunner.allTests {
                 var runner = JeffJSTestRunner()
                 let t0 = Date()
+                JeffJSStackDiag.currentLabel = name
                 fn(&runner)
                 // Drop the shared context WITHOUT freeing it: per-group isolation
                 // without the runtime-teardown path (a known pre-existing UAF —
@@ -56,6 +57,37 @@ final class EngineTests: XCTestCase {
 
     /// Tight repro for the exception-path heap corruption: hammer
     /// try/catch/finally + throw on one context.
+    /// Bisect the ErrorHandling sequence: find which preceding eval arms the
+    /// catch-cycle in the nested-rethrow test (JEFFJS_TRACE_LAST=1 to trace
+    /// only the final eval).
+    func testErrorHandlingSequence() {
+        setvbuf(stdout, nil, _IONBF, 0)
+        if ProcessInfo.processInfo.environment["JEFFJS_TRACE_LAST"] == "1" {
+            JeffJSInterpreter.traceOpcodes = true   // before runtime creation
+        }
+        let rt = JeffJSRuntime()
+        let ctx = rt.newContext()
+        JeffJSInterpreter.traceOpcodes = false
+        let preceding = [
+            "var r = 0; try { throw 42; } catch(e) { r = e; } r",
+        ]
+        for (i, code) in preceding.enumerated() {
+            let r = ctx.eval(input: code, filename: "<seq\(i)>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+            print("[seq] \(i) => \(r.isException ? "exception" : "ok") overflows=\(JeffJSStackDiag.overflowCount)")
+            if r.isException { _ = ctx.getException() }
+            r.freeValue()
+        }
+        if ProcessInfo.processInfo.environment["JEFFJS_TRACE_LAST"] == "1" {
+            JeffJSInterpreter.traceOpcodes = true
+            // rebuild cfg: runtime caches the flag — use a fresh dispatch read
+        }
+        let nested = "var r = 0; try { try { throw 1; } finally { r = 99; } } catch(e) {} r"
+        let r = ctx.eval(input: nested, filename: "<nested>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+        print("[seq] nested => \(r.isException ? "exception" : String(r.toInt32())) overflows=\(JeffJSStackDiag.overflowCount)")
+        ctx.free()
+        rt.free()
+    }
+
     /// Teardown stress: context/runtime create→eval→free cycles. The crash
     /// pattern implicates teardown (perf suite + per-group-context runs crash;
     /// long-lived shared contexts go further).
@@ -82,15 +114,21 @@ final class EngineTests: XCTestCase {
         let done = expectation(description: "suspect")
         let thread = Thread {
             var runner = JeffJSTestRunner()
-            let wanted = ["ES262CriticalSubset", "ErrorHandling", "TypeConversion",
+            let wanted: [String]
+            if let groups = ProcessInfo.processInfo.environment["JEFFJS_GROUPS"] {
+                wanted = groups.split(separator: ",").map(String.init)
+            } else {
+                wanted = ["ES262CriticalSubset", "ErrorHandling", "TypeConversion",
                           "Destructuring", "Spread", "Math", "Date", "Globals", "EdgeCases"]
+            }
             if ProcessInfo.processInfo.environment["JEFFJS_TRACE_SUSPECT"] == "1" {
                 JeffJSInterpreter.traceOpcodes = true
             }
             for (name, fn) in JeffJSTestRunner.allTests where wanted.contains(name) {
                 let p0 = runner.passCount, f0 = runner.failCount
+                let o0 = JeffJSStackDiag.overflowCount
                 fn(&runner)
-                print("[suspect] \(name): +\(runner.passCount - p0) pass, +\(runner.failCount - f0) fail")
+                print("[suspect] \(name): +\(runner.passCount - p0) pass, +\(runner.failCount - f0) fail, +\(JeffJSStackDiag.overflowCount - o0) overflows")
             }
             done.fulfill()
         }
@@ -132,9 +170,11 @@ final class EngineTests: XCTestCase {
             throw XCTSkip("Set JEFFJS_TRACE_SNIPPET to an expression to trace")
         }
         setvbuf(stdout, nil, _IONBF, 0)
+        // Must be set BEFORE the runtime is created: the dispatch loop reads
+        // the runtime's cached copy (rt.cfgTraceOpcodes), captured at init.
+        JeffJSInterpreter.traceOpcodes = true
         let rt = JeffJSRuntime()
         let ctx = rt.newContext()
-        JeffJSInterpreter.traceOpcodes = true
         let r = ctx.eval(input: code, filename: "<t>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         JeffJSInterpreter.traceOpcodes = false
         print("[trace] result: \(r.isException ? "exception" : String(r.toInt32()))")
@@ -237,6 +277,14 @@ final class EngineTests: XCTestCase {
             code = "var o={a:1,b:2,c:3,d:4};var s=0;for(var i=0;i<50000;i++){s+=o.a+o.b+o.c+o.d;}s"
         case "push":
             code = "var a=[];for(var i=0;i<50000;i++)a.push(i);a.length"
+        case "call":
+            code = "function add(a,b){return a+b;} var s=0; for(var i=0;i<50000;i++){ s=add(s,1); } s"
+        case "closures":
+            code = "function make(x){return function(){return x+1;};} var s=0; for(var i=0;i<10000;i++){ s+=make(i)(); } s"
+        case "fib":
+            code = "function fib(n){ if(n<=1) return n; return fib(n-1)+fib(n-2); } fib(22)"
+        case "chain":
+            code = "var p=Promise.resolve(0); for(var i=0;i<5000;i++){ p=p.then(function(v){return v+1;}); } 1"
         default:
             code = "var sum=0;for(var i=0;i<100000;i++){sum+=i*2+1;}sum"
         }

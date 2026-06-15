@@ -46,7 +46,7 @@ CODE_EXTENSIONS = (
     ".swift", ".py", ".sh", ".js", ".ts", ".rs", ".go",
     ".c", ".h", ".cpp", ".hpp", ".rb", ".java", ".md",
     ".sql", ".html", ".css", ".json", ".yaml", ".yml",
-    ".toml", ".txt", ".pdf",
+    ".toml", ".txt", ".pdf", ".npz", ".log",
 )
 
 

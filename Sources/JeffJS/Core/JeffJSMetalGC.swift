@@ -247,8 +247,10 @@ final class JeffJSMetalGC {
 
         for (i, hdr) in rt.gcObjects.enumerated() {
             if deadIndexSet.contains(i) {
+                hdr.gcListIndex = -1
                 deadHeaders.append(hdr)
             } else {
+                hdr.gcListIndex = remaining.count
                 remaining.append(hdr)
             }
         }

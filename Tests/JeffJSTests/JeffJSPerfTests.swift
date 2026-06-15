@@ -467,6 +467,34 @@ struct JeffJSPerfTests {
             var m = s.match(/\\d+/g);
             m ? m.length : 0
         """),
+        ("PromiseChain 5K", """
+            var p = Promise.resolve(0);
+            for (var i = 0; i < 5000; i++) {
+                p = p.then(function(v) { return v + 1; });
+            }
+            var out = -1;
+            p.then(function(v) { out = v; });
+            out
+        """),
+        ("AsyncAwait 5K", """
+            async function step(x) { return x + 1; }
+            async function run() {
+                var s = 0;
+                for (var i = 0; i < 5000; i++) {
+                    s = await step(s);
+                }
+                return s;
+            }
+            var out = -1;
+            run().then(function(v) { out = v; });
+            out
+        """),
+        ("AsyncNoAwait 10K", """
+            async function f(x) { return x + 1; }
+            var s = 0;
+            for (var i = 0; i < 10000; i++) { f(i); }
+            s
+        """),
     ]
 
     /// Run a single JS snippet through JeffJS, return time in microseconds.

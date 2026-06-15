@@ -54,6 +54,22 @@ let package = Package(
             ],
             resources: [
                 .process("Resources"),
+            ],
+            swiftSettings: [
+                // Disable Swift's DYNAMIC exclusivity-enforcement in release builds.
+                // Profiling showed these runtime checks (SwiftTLSContext::get +
+                // beginAccess + AccessSet::insert) were the single largest cost in
+                // the interpreter — ~30% of a pure arithmetic loop, and 1.5–2.3x
+                // overall. The engine is single-threaded per runtime, so the checks
+                // guard against an aliasing class of bug that cannot occur here;
+                // STATIC (compile-time) exclusivity remains on. Correctness is
+                // gated by the full conformance suite (EngineTests/testConformance).
+                //
+                // Tradeoff: `unsafeFlags` makes this target ineligible as a *remote*
+                // SwiftPM dependency (it's fine for local builds and the bundled
+                // apps). Remove this block to restore remote-dependency eligibility
+                // at a 1.5–2.3x speed cost.
+                .unsafeFlags(["-enforce-exclusivity=unchecked"], .when(configuration: .release)),
             ]
         ),
         .testTarget(

@@ -59,6 +59,7 @@ private let JS_GC_OBJ_COST = JeffJSConfig.gcObjectCost
 /// Append `header` to the runtime's main GC object list.
 /// Called every time a new GC-managed object is created.
 func addGCObject(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
+    header.gcListIndex = rt.gcObjects.count
     rt.gcObjects.append(header)
     header.mark = JeffJSGCMark.white
     header.ownerRuntime = rt
@@ -68,15 +69,55 @@ func addGCObject(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
 }
 
 /// Remove `header` from whichever GC tracking list it is on.
+/// O(1) via the intrusive gcListIndex + swap-remove (list order is
+/// irrelevant to the collector, which always iterates the whole array).
 func removeGCObject(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
+    let li = header.gcListIndex
+    if li >= 0 {
+        if li < rt.gcObjects.count, rt.gcObjects[li] === header {
+            let last = rt.gcObjects.count - 1
+            if li != last {
+                let moved = rt.gcObjects[last]
+                rt.gcObjects[li] = moved
+                moved.gcListIndex = li
+            }
+            rt.gcObjects.removeLast()
+            header.gcListIndex = -1
+            rt.mallocState.mallocSize -= JS_GC_OBJ_COST
+            rt.mallocState.mallocCount -= 1
+            return
+        }
+    } else if li <= -2 {
+        let ti = -2 - li
+        if ti < rt.gcTmpObjects.count, rt.gcTmpObjects[ti] === header {
+            let last = rt.gcTmpObjects.count - 1
+            if ti != last {
+                let moved = rt.gcTmpObjects[last]
+                rt.gcTmpObjects[ti] = moved
+                moved.gcListIndex = -2 - ti
+            }
+            rt.gcTmpObjects.removeLast()
+            header.gcListIndex = -1
+            return
+        }
+    } else {
+        // Not tracked — nothing to do.
+        return
+    }
+    // Defensive fallback: index out of sync (should not happen) — restore
+    // correctness with a linear scan rather than corrupting the lists.
     if let idx = rt.gcObjects.firstIndex(where: { $0 === header }) {
         rt.gcObjects.remove(at: idx)
+        for i in idx ..< rt.gcObjects.count { rt.gcObjects[i].gcListIndex = i }
+        header.gcListIndex = -1
         rt.mallocState.mallocSize -= JS_GC_OBJ_COST
         rt.mallocState.mallocCount -= 1
         return
     }
     if let idx = rt.gcTmpObjects.firstIndex(where: { $0 === header }) {
         rt.gcTmpObjects.remove(at: idx)
+        for i in idx ..< rt.gcTmpObjects.count { rt.gcTmpObjects[i].gcListIndex = -2 - i }
+        header.gcListIndex = -1
     }
 }
 
@@ -132,9 +173,9 @@ func freeValueRT(_ rt: JeffJSRuntime, _ v: JeffJSValue) {
                 freeGCObjectChildren(rt, hdr)
                 toRelease.append(hdr)
 
-                // Drain deferred zero-ref objects iteratively
-                while !rt.gcZeroRefCountObjects.isEmpty {
-                    let deferred = rt.gcZeroRefCountObjects.removeFirst()
+                // Drain deferred zero-ref objects iteratively (popLast: O(1)
+                // per item; removeFirst shifted the whole array each time)
+                while let deferred = rt.gcZeroRefCountObjects.popLast() {
                     if deferred.refCount == 0 {
                         freeGCObjectChildren(rt, deferred)
                         toRelease.append(deferred)
@@ -145,7 +186,12 @@ func freeValueRT(_ rt: JeffJSRuntime, _ v: JeffJSValue) {
                 // Phase 2: Release ARC retains (may deallocate objects).
                 // Safe because all child references have been nil'd out.
                 for obj in toRelease {
-                    Unmanaged.passUnretained(obj).release()
+                    if jeffJSZombiesEnabled {
+                        if let o = obj as? JeffJSObject { o.freeMark = true }
+                        rt.zombieKeepAlive.append(obj)
+                    } else {
+                        Unmanaged.passUnretained(obj).release()
+                    }
                 }
             }
         }
@@ -302,13 +348,16 @@ func gcScanIncrefChild(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
 /// Any object still marked white after scanning is part of an unreachable
 /// cycle — move it to the temporary list and then free everything on that list.
 private func gcFreeCycles(_ rt: JeffJSRuntime) {
-    // Move white objects to tmp list, keep black objects
+    // Move white objects to tmp list, keep black objects.
+    // Maintain the intrusive gcListIndex on both lists.
     rt.gcTmpObjects.removeAll()
     var remaining: [JeffJSGCObjectHeader] = []
     for hdr in rt.gcObjects {
         if hdr.mark == JeffJSGCMark.white {
+            hdr.gcListIndex = -2 - rt.gcTmpObjects.count
             rt.gcTmpObjects.append(hdr)
         } else {
+            hdr.gcListIndex = remaining.count
             remaining.append(hdr)
         }
     }
@@ -316,9 +365,10 @@ private func gcFreeCycles(_ rt: JeffJSRuntime) {
 
     // Free everything on the tmp list.
     // We must be careful: freeing an object might remove other objects from the
-    // tmp list via child decrements that hit zero.
-    while !rt.gcTmpObjects.isEmpty {
-        let hdr = rt.gcTmpObjects.removeFirst()
+    // tmp list via child decrements that hit zero. Consume from the END
+    // (popLast is O(1); removeFirst shifted the whole array per object).
+    while let hdr = rt.gcTmpObjects.popLast() {
+        hdr.gcListIndex = -1
         // Set refcount to 1 so that freeGCObject does not try to re-enqueue.
         hdr.refCount = 1
         freeGCObject(rt, hdr)
@@ -456,13 +506,11 @@ func markObject(_ rt: JeffJSRuntime,
         if let child = pd.promiseResult.toGCObjectHeader() { markFunc(rt, child) }
         for reaction in pd.promiseFulfillReactions {
             if let child = reaction.handler.toGCObjectHeader() { markFunc(rt, child) }
-            if let child = reaction.resolveFunc.toGCObjectHeader() { markFunc(rt, child) }
-            if let child = reaction.rejectFunc.toGCObjectHeader() { markFunc(rt, child) }
+            if let child = reaction.resultPromise.toGCObjectHeader() { markFunc(rt, child) }
         }
         for reaction in pd.promiseRejectReactions {
             if let child = reaction.handler.toGCObjectHeader() { markFunc(rt, child) }
-            if let child = reaction.resolveFunc.toGCObjectHeader() { markFunc(rt, child) }
-            if let child = reaction.rejectFunc.toGCObjectHeader() { markFunc(rt, child) }
+            if let child = reaction.resultPromise.toGCObjectHeader() { markFunc(rt, child) }
         }
     default:
         break  // cFunc, regexp, mapState, asyncFunctionData, etc.
@@ -565,6 +613,8 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     let savedPayload = obj.payload
     obj.prop = []
     obj.payload = .opaque(nil)
+    obj.fbFast = nil
+    obj.varRefsFast = []
 
     // Release each property value.
     for propEntry in savedProps {
@@ -636,8 +686,7 @@ func freeShape(_ rt: JeffJSRuntime, _ shape: JeffJSShape) {
 /// cycle.  Those objects were deferred because freeing inside the collector
 /// could mutate the object graph while we are iterating it.
 func freeZeroRefcount(_ rt: JeffJSRuntime) {
-    while !rt.gcZeroRefCountObjects.isEmpty {
-        let hdr = rt.gcZeroRefCountObjects.removeFirst()
+    while let hdr = rt.gcZeroRefCountObjects.popLast() {
         if hdr.refCount == 0 {
             freeGCObject(rt, hdr)
         }
@@ -681,6 +730,7 @@ private func pruneWeakRefs(_ rt: JeffJSRuntime) {
 func clearGCState(_ rt: JeffJSRuntime) {
     // Break reference cycles on all tracked objects so ARC can deallocate them.
     for hdr in rt.gcObjects {
+        hdr.gcListIndex = -1
         hdr.ownerRuntime = nil
         if hdr.gcObjType == .jsObject || hdr.gcObjType == .functionBytecode {
             let obj = unsafeBitCast(hdr, to: JeffJSObject.self)
@@ -688,6 +738,8 @@ func clearGCState(_ rt: JeffJSRuntime) {
             obj.shape = nil
             obj.proto = nil
             obj.payload = .opaque(nil)
+            obj.fbFast = nil
+            obj.varRefsFast = []
         }
         if hdr.gcObjType == .shape {
             let shape = unsafeBitCast(hdr, to: JeffJSShape.self)
@@ -702,6 +754,7 @@ func clearGCState(_ rt: JeffJSRuntime) {
         }
     }
     for hdr in rt.gcTmpObjects {
+        hdr.gcListIndex = -1
         hdr.ownerRuntime = nil
         if hdr.gcObjType == .jsObject || hdr.gcObjType == .functionBytecode {
             let obj = unsafeBitCast(hdr, to: JeffJSObject.self)
@@ -709,6 +762,8 @@ func clearGCState(_ rt: JeffJSRuntime) {
             obj.shape = nil
             obj.proto = nil
             obj.payload = .opaque(nil)
+            obj.fbFast = nil
+            obj.varRefsFast = []
         }
     }
     rt.gcObjects.removeAll()

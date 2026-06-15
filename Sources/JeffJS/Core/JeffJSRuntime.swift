@@ -153,20 +153,9 @@ struct JeffJSExoticMethods {
     init() {}
 }
 
-// MARK: - JeffJSJobEntry
-
-/// Mirrors QuickJS `JSJobEntry`. Represents a pending microtask/job in the queue.
-/// Jobs include promise reactions, async function continuations, etc.
-class JeffJSJobEntry {
-    var link: ListHead = ListHead()
-    var ctx: JeffJSContext?
-    /// The job function to execute.
-    var jobFunc: ((JeffJSContext, Int, [JeffJSValue]) -> JeffJSValue)?
-    /// Arguments to pass to the job function.
-    var args: [JeffJSValue] = []
-
-    init() {}
-}
+// NOTE: The microtask queue is a flat FIFO of JeffJSRuntime.JeffJSJob values
+// (see executePendingJobs). The old JeffJSJobEntry class + intrusive list
+// cost two allocations per job and linear scans per dequeue.
 
 // NOTE: JeffJSStackFrame is now defined in JeffJSObject.swift.
 // The duplicate definition that was here has been removed.
@@ -382,6 +371,13 @@ final class JeffJSRuntime {
     // costs a TLS-backed exclusivity check per touch, and per-runtime pools
     // also can't leak buffers across runtimes.
 
+    /// Config flags cached as plain stored properties. Static-let reads cost a
+    /// swift_once-guarded accessor + TLS exclusivity check; callInternal reads
+    /// these once per call, so they must be single loads.
+    let cfgTraceOpcodes = JeffJSInterpreter.traceOpcodes
+    let cfgUseInlineCalls = JeffJSInterpreter.useInlineCalls
+    let cfgTraceHitThreshold = UInt8(JeffJSConfig.traceHitThreshold)
+
     /// Pool of recycled stack frames (avoids a heap alloc per JS call).
     var framePool: [JeffJSStackFrame] = []
 
@@ -416,6 +412,7 @@ final class JeffJSRuntime {
         // Drop any receiver stashed by get_field that no call consumed
         frame.lastGetFieldReceiver.freeValue()
         frame.lastGetFieldReceiver = .undefined
+        frame.lastGetFieldPC = -1
         frame.buf = nil
         frame.bufCapacity = 0
         frame.bufVarBase = 0
@@ -428,17 +425,24 @@ final class JeffJSRuntime {
         }
     }
 
+    /// Acquire an interpreter value buffer. Only `initializedPrefix` slots are
+    /// guaranteed to be .undefined (args+vars region); the value-stack region
+    /// is always written before it is read, so clearing it per call is wasted
+    /// work. Pass `initializedPrefix: size` for fully-cleared buffers.
     @inline(__always)
-    func acquireInterpBuf(size: Int) -> (UnsafeMutablePointer<JeffJSValue>, Int) {
+    func acquireInterpBuf(size: Int, initializedPrefix: Int? = nil) -> (UnsafeMutablePointer<JeffJSValue>, Int) {
+        let clearCount = min(initializedPrefix ?? size, size)
         if let (ptr, cap) = interpBufPool.popLast() {
             if cap >= size {
-                for i in 0..<size { ptr[i] = .undefined }
+                for i in 0..<clearCount { ptr[i] = .undefined }
                 return (ptr, cap)
             }
             ptr.deinitialize(count: cap)
             ptr.deallocate()
         }
         let ptr = UnsafeMutablePointer<JeffJSValue>.allocate(capacity: size)
+        // Fresh allocations fully initialize: JeffJSValue is POD (raw bits), but
+        // the pool's release/deinitialize bookkeeping assumes `capacity` valid slots.
         ptr.initialize(repeating: .undefined, count: size)
         return (ptr, size)
     }
@@ -516,8 +520,10 @@ final class JeffJSRuntime {
 
     // MARK: - Job Queue (Microtask Queue)
 
-    /// Linked list of pending jobs (promise reactions, etc.).
-    var jobList: ListHead
+    /// Flat FIFO of pending microtasks with a head cursor (O(1) dequeue).
+    /// Slots are nil'd as they are consumed so captures release promptly.
+    var jobQueue: [JeffJSJob?] = []
+    var jobQueueHead: Int = 0
 
     // MARK: - Module Loader
 
@@ -623,8 +629,7 @@ final class JeffJSRuntime {
         hostPromiseRejectionTracker = nil
         hostPromiseRejectionTrackerOpaque = nil
 
-        // Job queue
-        jobList = ListHead()
+        // Job queue: flat FIFO fields have default initializers
 
         // Module loader
         moduleNormalizeFunc = nil
@@ -669,6 +674,12 @@ final class JeffJSRuntime {
     /// This must be called after all contexts have been freed.
     /// After calling free(), the runtime must not be used.
     func free() {
+        // Drop the strong active-runtime reference if it points at us
+        // (per-object ownerRuntime back-pointers are nil'd in clearGCState).
+        if JeffJSGCObjectHeader.activeRuntime === self {
+            JeffJSGCObjectHeader.activeRuntime = nil
+        }
+
         // Return pooled interpreter buffers/frames to the allocator
         drainInterpPools()
 
@@ -823,45 +834,40 @@ final class JeffJSRuntime {
         var jobsExecuted = 0
         let maxJobs = JeffJSConfig.maxJobsPerDrain
 
-        while !listEmpty(jobList) && jobsExecuted < maxJobs {
-            guard let firstNode = jobList.next else { break }
+        // Flat FIFO with a head cursor: O(1) dequeue, no linear scans
+        // (the old list+array pairing scanned both per job — quadratic on
+        // bursts). Reentrant drains are safe by construction: an inner drain
+        // advances the shared head; the outer loop continues after it.
+        while jobQueueHead < jobQueue.count && jobsExecuted < maxJobs {
+            let job = jobQueue[jobQueueHead]
+            // Clear the consumed slot so captured values release promptly.
+            jobQueue[jobQueueHead] = nil
+            jobQueueHead += 1
 
-            // Find the job entry that owns this node
-            guard let jobEntry = findJobEntry(for: firstNode) else {
-                // Remove orphan node
-                removeFromList(firstNode)
-                break
+            guard let job = job else { continue }
+
+            let result = job.jobFunc(job.ctx, job.args.count, job.args)
+
+            // Free duped argument values
+            for arg in job.args {
+                arg.freeValue()
             }
 
-            // Remove from queue before execution
-            removeFromList(firstNode)
-
-            // Remove from jobEntries array to prevent unbounded growth.
-            // Without this, every job ever enqueued stays in the array,
-            // making the O(n) findJobEntry lookup progressively slower.
-            if let idx = jobEntries.firstIndex(where: { $0 === jobEntry }) {
-                jobEntries.remove(at: idx)
+            if result.isException {
+                // Clear the exception so subsequent jobs are not affected.
+                // Per spec, microtask failures must not block other microtasks.
+                let exc = job.ctx.getException()
+                exc.freeValue()
+            } else {
+                result.freeValue()
             }
+            jobsExecuted += 1
+        }
 
-            if let ctx = jobEntry.ctx, let jobFunc = jobEntry.jobFunc {
-                let result = jobFunc(ctx, jobEntry.args.count, jobEntry.args)
-
-                // Free argument values
-                for arg in jobEntry.args {
-                    arg.freeValue()
-                }
-
-                if result.isException {
-                    // Clear the exception so subsequent jobs are not affected.
-                    // Per spec, microtask failures must not block other microtasks.
-                    let exc = ctx.getException()
-                    exc.freeValue()
-                    jobsExecuted += 1
-                } else {
-                    result.freeValue()
-                    jobsExecuted += 1
-                }
-            }
+        // Compact once fully drained (keep capacity for the next burst)
+        if jobQueueHead >= jobQueue.count {
+            jobQueue.removeAll(keepingCapacity: true)
+            jobQueueHead = 0
         }
 
         return jobsExecuted
@@ -870,7 +876,7 @@ final class JeffJSRuntime {
     /// Returns true if there are pending jobs in the microtask queue.
     /// Mirrors `JS_IsJobPending()` from QuickJS.
     func isJobPending() -> Bool {
-        return !listEmpty(jobList)
+        return jobQueueHead < jobQueue.count
     }
 
     /// Enqueues a job (microtask) for later execution.
@@ -885,13 +891,8 @@ final class JeffJSRuntime {
         jobFunc: @escaping (JeffJSContext, Int, [JeffJSValue]) -> JeffJSValue,
         args: [JeffJSValue]
     ) {
-        let entry = JeffJSJobEntry()
-        entry.ctx = ctx
-        entry.jobFunc = jobFunc
-        // Dup all argument values to prevent premature release
-        entry.args = args.map { $0.dupValue() }
-        appendToList(&jobList, node: entry.link)
-        jobEntries.append(entry)
+        jobQueue.append(JeffJSJob(ctx: ctx, jobFunc: jobFunc,
+                                  args: args.map { $0.dupValue() }))
     }
 
     // MARK: - Memory Management
@@ -1310,36 +1311,24 @@ final class JeffJSRuntime {
 
     // MARK: - Private Job Queue Helpers
 
-    /// Storage for job entries (prevents ARC release before execution).
-    private var jobEntries: [JeffJSJobEntry] = []
+    /// One queued microtask. Value type — no per-job class or list node.
+    struct JeffJSJob {
+        let ctx: JeffJSContext
+        let jobFunc: (JeffJSContext, Int, [JeffJSValue]) -> JeffJSValue
+        let args: [JeffJSValue]
+    }
 
     /// Frees all pending jobs in the queue.
     private func freeJobQueue() {
-        // Free duped argument values from any remaining jobs (#5)
-        for entry in jobEntries {
-            for arg in entry.args {
-                arg.freeValue()
+        while jobQueueHead < jobQueue.count {
+            if let job = jobQueue[jobQueueHead] {
+                for arg in job.args {
+                    arg.freeValue()
+                }
             }
-            entry.args.removeAll()
+            jobQueueHead += 1
         }
-        jobEntries.removeAll()
-        jobList = ListHead()
-    }
-
-    /// Finds the JeffJSJobEntry that owns the given ListNode.
-    private func findJobEntry(for node: ListHead) -> JeffJSJobEntry? {
-        return jobEntries.first { $0.link === node }
-    }
-
-    // MARK: - Private List Helpers
-
-    /// Appends a node to the end of a list (uses ListHead circular sentinel).
-    private func appendToList(_ list: inout ListHead, node: ListHead) {
-        listAddTail(node, list)
-    }
-
-    /// Removes a node from its list.
-    private func removeFromList(_ node: ListHead) {
-        listDel(node)
+        jobQueue.removeAll()
+        jobQueueHead = 0
     }
 }

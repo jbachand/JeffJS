@@ -112,6 +112,12 @@ extension JeffJSContext {
             }
             return throwTypeError(message: "\(desc) is not a function\(hint)")
         }
+        // Hot path: plain bytecode function — skip the payload-enum matches
+        // below (each one copies the payload, retaining FB + varRefs array).
+        if let fastFB = obj.fbFast, !fastFB.isGenerator, !fastFB.isAsyncFunc {
+            return JeffJSInterpreter.callInternal(ctx: self, funcObj: funcVal,
+                                                  thisVal: thisVal, args: args)
+        }
         // Bound function path: unwrap and recurse with bound this/args
         if case .boundFunction(let bound) = obj.payload {
             var fullArgs = bound.argv
@@ -200,40 +206,59 @@ extension JeffJSContext {
         // resume later. Otherwise, we resolve/reject immediately.
         if case .bytecodeFunc(let fbOpt, _, _) = obj.payload,
            let fb = fbOpt, fb.isAsyncFunc {
-            guard let cap = JeffJSBuiltinPromise.newPromiseCapability(ctx: self, ctor: .undefined) else {
-                return JeffJSBuiltinPromise.resolve(ctx: self, this: .undefined, args: [.undefined])
-            }
-
-            // Thread resolve/reject through the context so await_ can access them
+            // Lazy capability: most async calls complete without suspending,
+            // so the result-promise + resolver pair is only built if await_
+            // actually suspends (it sees the `.uninitialized` marker). A
+            // non-suspending call returns a directly-settled promise — no
+            // resolver functions, no reactions, no microtask drain.
             let prevResolve = _asyncResolve
             let prevReject = _asyncReject
+            let prevCapPromise = _asyncCapPromise
             let prevSuspended = _asyncSuspended
-            _asyncResolve = cap.resolve
-            _asyncReject = cap.reject
+            _asyncResolve = .uninitialized
+            _asyncReject = .uninitialized
+            _asyncCapPromise = .undefined
             _asyncSuspended = false
 
             let result = JeffJSInterpreter.callInternal(ctx: self, funcObj: funcVal,
                                                          thisVal: thisVal, args: args, flags: 0)
 
             let suspended = _asyncSuspended
+            let capPromise = _asyncCapPromise
             // Restore previous async state (for nested async calls)
             _asyncResolve = prevResolve
             _asyncReject = prevReject
+            _asyncCapPromise = prevCapPromise
             _asyncSuspended = prevSuspended
 
             if suspended {
-                // Function suspended at await — return the pending Promise.
-                // It will be resolved later when the awaited Promise settles.
-                return cap.promise
+                // Function suspended at await — return the pending Promise
+                // created lazily by await_. Resolved when the awaited Promise
+                // settles (via the stored capability in AsyncSavedEntry).
+                return capPromise
             }
             if result.isException {
                 let err = getException()
-                _ = call(cap.reject, this: .undefined, args: [err])
-            } else {
-                _ = call(cap.resolve, this: .undefined, args: [result])
+                let rejected = JeffJSBuiltinPromise.makeSettledPromise(
+                    ctx: self, value: err, fulfilled: false)
+                err.freeValue()
+                return rejected
             }
-            _ = rt.executePendingJobs()
-            return cap.promise
+            if result.isObject {
+                // The return value may be a promise/thenable, which the result
+                // promise must ADOPT (not fulfill with). Use a real resolver.
+                guard let cap = JeffJSBuiltinPromise.newPromiseCapability(ctx: self, ctor: .undefined) else {
+                    return JeffJSBuiltinPromise.makeSettledPromise(ctx: self, value: result, fulfilled: true)
+                }
+                _ = call(cap.resolve, this: .undefined, args: [result])
+                result.freeValue()
+                _ = rt.executePendingJobs()
+                return cap.promise
+            }
+            let fulfilled = JeffJSBuiltinPromise.makeSettledPromise(
+                ctx: self, value: result, fulfilled: true)
+            result.freeValue()
+            return fulfilled
         }
 
         // Callable proxy path: delegate to the proxy apply trap handler
@@ -432,9 +457,10 @@ extension JeffJSContext {
 
         // Build the child's var_ref array from its closureVars metadata.
         var childVarRefs: [JeffJSVarRef?] = []
-        if let compiled = innerFB as? JeffJSFunctionBytecodeCompiled {
-            childVarRefs.reserveCapacity(compiled.closureVars.count)
-            for cv in compiled.closureVars {
+        if !innerFB.closureVarsList.isEmpty {
+            let closureVars = innerFB.closureVarsList
+            childVarRefs.reserveCapacity(closureVars.count)
+            for cv in closureVars {
                 if cv.isLocal {
                     // The closure var references the parent's own local/arg slot.
                     // Check if we already have a live var_ref for this exact slot
@@ -470,6 +496,8 @@ extension JeffJSContext {
         }
 
         obj.payload = .bytecodeFunc(functionBytecode: innerFB, varRefs: childVarRefs, homeObject: nil)
+        obj.fbFast = innerFB
+        obj.varRefsFast = childVarRefs
 
         // Arrow functions capture the enclosing function's `this` value
         // so that `push_this` inside the arrow returns the lexical `this`.
@@ -496,17 +524,34 @@ extension JeffJSContext {
 
         let funcVal = JeffJSValue.makeObject(obj)
 
-        // For regular (non-arrow, non-generator, non-async) functions, set up
-        // F.prototype = { constructor: F } so prototype-based OOP works.
-        // Arrow functions don't have .prototype. Generators/async have different setup.
+        // For regular (non-arrow, non-generator, non-async) functions,
+        // F.prototype = { constructor: F } is built LAZILY on first access
+        // (see materializeFunctionPrototype). Building it eagerly cost an
+        // object + shape + two property defines per closure — most closures
+        // are never used as constructors.
         if !innerFB.isGenerator && !innerFB.isAsyncFunc && !innerFB.isArrow {
-            let protoObj = newObject()
-            _ = setPropertyStr(obj: protoObj, name: "constructor", value: funcVal.dupValue())
-            _ = setPropertyStr(obj: funcVal, name: "prototype", value: protoObj)
+            obj.needsLazyPrototype = true
             obj.isConstructor = true
         }
 
         return funcVal
+    }
+
+    /// Materialize the default `F.prototype = { constructor: F }` pair for a
+    /// function whose prototype creation was deferred at closure time.
+    /// Self-guarding: if an own `prototype` was defined in the meantime
+    /// (class setup, explicit `F.prototype = x`), it is left untouched.
+    func materializeFunctionPrototype(_ funcObj: JeffJSObject) {
+        funcObj.needsLazyPrototype = false
+        if jeffJS_findOwnPropertyIndex(obj: funcObj,
+                                       atom: JeffJSAtomID.JS_ATOM_prototype.rawValue) >= 0 {
+            return
+        }
+        let funcVal = JeffJSValue.mkPtr(tag: .object, ptr: funcObj)
+        defer { funcVal.freeValue() }
+        let protoObj = newObject()
+        _ = setPropertyStr(obj: protoObj, name: "constructor", value: funcVal.dupValue())
+        _ = setPropertyStr(obj: funcVal, name: "prototype", value: protoObj)
     }
 
     // MARK: - Atom Helpers
@@ -1580,7 +1625,17 @@ extension JeffJSContext {
     /// Checks if execution should be interrupted.
     func checkInterrupt() -> Bool {
         if let handler = rt.interruptHandler {
-            return handler(rt)
+            if handler(rt) {
+                // Interrupts are UNCATCHABLE termination: mark the context so
+                // exception unwinding skips catch handlers entirely. Without
+                // this, the interrupt "exception" (a null currentException)
+                // was caught by user try/catch, the handler fired again at its
+                // next check, and the cycle grew the VM stack by a
+                // [catchOffset, null] pair per iteration until it overflowed —
+                // the source of the long-standing heap corruption.
+                interruptTerminated = true
+                return true
+            }
         }
         return false
     }
@@ -1649,36 +1704,40 @@ extension JeffJSContext {
 // MARK: - Bytecode Reading Helpers
 // =============================================================================
 
+// Bytecode is read through a raw `UnsafePointer<UInt8>` into a stable,
+// FB-owned buffer (JeffJSFunctionBytecode.bytecodePtr). This removes the
+// per-read Array bounds checks that were ~24% of a pure dispatch loop after
+// exclusivity enforcement was disabled. Operand presence is guaranteed by the
+// compiler (well-formed bytecode), the same invariant the opcode bitcast
+// relies on; the dispatch loop still bounds the program counter via `pc < bcLen`.
+
 /// Read a UInt8 from bytecode at the given offset.
 @inline(__always)
-private func readU8(_ bc: [UInt8], _ pos: Int) -> UInt8 {
-    guard pos < bc.count else { return 0 }
+private func readU8(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> UInt8 {
     return bc[pos]
 }
 
 /// Read a signed Int8 from bytecode.
 @inline(__always)
-private func readI8(_ bc: [UInt8], _ pos: Int) -> Int8 {
-    return Int8(bitPattern: readU8(bc, pos))
+private func readI8(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> Int8 {
+    return Int8(bitPattern: bc[pos])
 }
 
 /// Read a little-endian UInt16 from bytecode.
 @inline(__always)
-private func readU16(_ bc: [UInt8], _ pos: Int) -> UInt16 {
-    guard pos + 1 < bc.count else { return 0 }
+private func readU16(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> UInt16 {
     return UInt16(bc[pos]) | (UInt16(bc[pos + 1]) << 8)
 }
 
 /// Read a little-endian Int16 from bytecode.
 @inline(__always)
-private func readI16(_ bc: [UInt8], _ pos: Int) -> Int16 {
+private func readI16(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> Int16 {
     return Int16(bitPattern: readU16(bc, pos))
 }
 
 /// Read a little-endian UInt32 from bytecode.
 @inline(__always)
-private func readU32(_ bc: [UInt8], _ pos: Int) -> UInt32 {
-    guard pos + 3 < bc.count else { return 0 }
+private func readU32(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> UInt32 {
     return UInt32(bc[pos]) |
            (UInt32(bc[pos + 1]) << 8) |
            (UInt32(bc[pos + 2]) << 16) |
@@ -1687,7 +1746,7 @@ private func readU32(_ bc: [UInt8], _ pos: Int) -> UInt32 {
 
 /// Read a little-endian Int32 from bytecode.
 @inline(__always)
-private func readI32(_ bc: [UInt8], _ pos: Int) -> Int32 {
+private func readI32(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> Int32 {
     return Int32(bitPattern: readU32(bc, pos))
 }
 
@@ -1723,8 +1782,8 @@ private let jeffJS_storeOpcodeMask: (UInt64, UInt64, UInt64, UInt64) = {
 }()
 
 @inline(__always)
-private func isStoreOpcode(_ bc: [UInt8], _ pos: Int, _ bcLen: Int) -> Bool {
-    guard pos < bcLen, pos < bc.count else { return false }
+private func isStoreOpcode(_ bc: UnsafePointer<UInt8>, _ pos: Int, _ bcLen: Int) -> Bool {
+    guard pos < bcLen else { return false }
     let b = bc[pos]
     let m = jeffJS_storeOpcodeMask
     let bit = UInt64(b & 63)
@@ -1748,7 +1807,7 @@ private func isStoreOpcode(_ bc: [UInt8], _ pos: Int, _ bcLen: Int) -> Bool {
 ///   - On interrupt/exception: returns -1 (caller should set retVal = .exception)
 @inline(never)
 private func executeFastTrace(
-    bc: [UInt8],
+    bc: UnsafePointer<UInt8>,
     bcLen: Int,
     entryPC: Int,
     exitPC: Int,
@@ -1761,7 +1820,7 @@ private func executeFastTrace(
     ic: JeffJSInlineCache?
 ) -> Int {
     // Validate parameters
-    guard entryPC >= 0, exitPC <= bc.count, entryPC < exitPC,
+    guard entryPC >= 0, exitPC <= bcLen, entryPC < exitPC,
           sp >= 0, sp < stackLimit, stackLimit > 0 else {
         return entryPC
     }
@@ -1921,6 +1980,7 @@ private func executeFastTrace(
         // =================================================================
 
         case .get_array_el:
+            guard sp >= 2 else { return pc } // deopt: stack too shallow
             let key = buf[sp - 1]
             let objV = buf[sp - 2]
             guard key.isInt, let jsObj = objV.obj,
@@ -1946,6 +2006,7 @@ private func executeFastTrace(
             pc += 1
 
         case .put_array_el:
+            guard sp >= 3 else { return pc } // deopt: stack too shallow
             let val = buf[sp - 1]
             let key = buf[sp - 2]
             let objV = buf[sp - 3]
@@ -2996,7 +3057,7 @@ struct JeffJSInterpreter {
         var bufCapacity: Int
         var varBase: Int
         var spBase: Int
-        var bc: [UInt8]
+        var bc: UnsafePointer<UInt8>
         var bcLen: Int
         var fb: JeffJSFunctionBytecode
         var frame: JeffJSStackFrame
@@ -3079,51 +3140,67 @@ struct JeffJSInterpreter {
             return .exception
         }
 
-        // Extract bytecode — or dispatch to callFunction for C functions
-        // that were accidentally routed here (e.g., via Promise reaction jobs)
-        if case .cFunc(_, let cFunction, _, _, let magic) = obj.payload {
-            switch cFunction {
-            case .generic(let fn): return fn(ctx, thisVal, args)
-            case .genericMagic(let fn): return fn(ctx, thisVal, args, Int(magic))
-            case .constructor(let fn): return fn(ctx, thisVal, args)
-            case .constructorOrFunc(let fn): return fn(ctx, thisVal, args, false)
-            case .getter(let fn): return fn(ctx, thisVal)
-            case .setter(let fn): return fn(ctx, thisVal, args.first ?? .undefined)
-            case .getterMagic(let fn): return fn(ctx, thisVal, Int(magic))
-            case .setterMagic(let fn): return fn(ctx, thisVal, args.first ?? .undefined, Int(magic))
-            case .fFloat64(let fn): return .newFloat64(fn(args.first?.toFloat64() ?? .nan))
-            case .fFloat64_2(let fn): return .newFloat64(fn(args.first?.toFloat64() ?? .nan, (args.count > 1 ? args[1] : .undefined).toFloat64()))
-            case .iteratorNext(let fn): return fn(ctx, thisVal, args, nil, Int(magic))
+        // Hot path: a plain bytecode function. The denormalized fbFast field
+        // avoids pattern-matching the payload enum, which copies it (retaining
+        // the FB and the varRefs array) on every call.
+        let fb0: JeffJSFunctionBytecode
+        let varRefsOpt: [JeffJSVarRef?]
+        if let fastFB = obj.fbFast {
+            fb0 = fastFB
+            varRefsOpt = obj.varRefsFast
+        } else {
+            // Cold paths: C functions (e.g. via Promise reaction jobs), bound
+            // functions, callable proxies, or payload-only bytecode functions.
+            if case .cFunc(_, let cFunction, _, _, let magic) = obj.payload {
+                switch cFunction {
+                case .generic(let fn): return fn(ctx, thisVal, args)
+                case .genericMagic(let fn): return fn(ctx, thisVal, args, Int(magic))
+                case .constructor(let fn): return fn(ctx, thisVal, args)
+                case .constructorOrFunc(let fn): return fn(ctx, thisVal, args, false)
+                case .getter(let fn): return fn(ctx, thisVal)
+                case .setter(let fn): return fn(ctx, thisVal, args.first ?? .undefined)
+                case .getterMagic(let fn): return fn(ctx, thisVal, Int(magic))
+                case .setterMagic(let fn): return fn(ctx, thisVal, args.first ?? .undefined, Int(magic))
+                case .fFloat64(let fn): return .newFloat64(fn(args.first?.toFloat64() ?? .nan))
+                case .fFloat64_2(let fn): return .newFloat64(fn(args.first?.toFloat64() ?? .nan, (args.count > 1 ? args[1] : .undefined).toFloat64()))
+                case .iteratorNext(let fn): return fn(ctx, thisVal, args, nil, Int(magic))
+                }
             }
-        }
-        // Bound function: unwrap and delegate to callFunction which handles
-        // the full bound-function chain (bound args, bound this, etc.)
-        if case .boundFunction(let bound) = obj.payload {
-            var fullArgs = bound.argv
-            fullArgs.append(contentsOf: args)
-            let boundThis = bound.thisVal.isUndefined ? thisVal : bound.thisVal
-            return ctx.callFunction(bound.funcObj, thisVal: boundThis, args: fullArgs)
-        }
-        // Callable proxy: delegate to the proxy apply trap handler
-        if case .proxyData = obj.payload {
-            return js_proxy_apply(ctx, obj._obj, thisVal, args)
-        }
-        guard case .bytecodeFunc(let fbOpt, let varRefsOpt, _) = obj.payload,
-              let fb0 = fbOpt else {
-            _ = ctx.throwTypeError(message: "not a bytecode function")
-            return .exception
+            // Bound function: unwrap and delegate to callFunction which handles
+            // the full bound-function chain (bound args, bound this, etc.)
+            if case .boundFunction(let bound) = obj.payload {
+                var fullArgs = bound.argv
+                fullArgs.append(contentsOf: args)
+                let boundThis = bound.thisVal.isUndefined ? thisVal : bound.thisVal
+                return ctx.callFunction(bound.funcObj, thisVal: boundThis, args: fullArgs)
+            }
+            // Callable proxy: delegate to the proxy apply trap handler
+            if case .proxyData = obj.payload {
+                return js_proxy_apply(ctx, obj._obj, thisVal, args)
+            }
+            guard case .bytecodeFunc(let fbOpt, let varRefs, _) = obj.payload,
+                  let fbFromPayload = fbOpt else {
+                _ = ctx.throwTypeError(message: "not a bytecode function")
+                return .exception
+            }
+            // Backfill the fast fields for the next call
+            obj.fbFast = fbFromPayload
+            obj.varRefsFast = varRefs
+            fb0 = fbFromPayload
+            varRefsOpt = varRefs
         }
 
         var fb = fb0  // mutable so inline calls can swap callee's bytecode in
-        var bc = fb.bytecode
+        var bc = fb.bytecodePtr
         var bcLen = fb.bytecodeLen
 
-        // Hoist config/static reads out of the dispatch loop — each static-var
-        // access goes through a TLS-backed exclusivity check.
-        let traceOps = JeffJSInterpreter.traceOpcodes
-        let inlineCallsEnabled = JeffJSInterpreter.useInlineCalls
-        let traceHitThreshold = UInt8(JeffJSConfig.traceHitThreshold)
+        // Hoist config reads out of the dispatch loop. These come from the
+        // runtime's cached copies — plain stored-property loads — because even
+        // one static-let accessor per call shows up at 250k calls/sec.
         let rt = ctx.rt
+        let traceOps = rt.cfgTraceOpcodes
+        let inlineCallsEnabled = rt.cfgUseInlineCalls
+        let traceHitThreshold = rt.cfgTraceHitThreshold
 
         // Set up the call frame (pooled to avoid malloc/free per call)
         var frame = rt.acquireFrame()
@@ -3132,12 +3209,7 @@ struct JeffJSInterpreter {
         // ES spec §10.2.1.2: For non-strict functions, coerce undefined/null this
         // to the global object. Strict mode functions receive this as-is.
         let isConstructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0
-        let isStrict: Bool = {
-            if let compiled = fb0 as? JeffJSFunctionBytecodeCompiled {
-                return (compiled.jsModeFlags & UInt8(JS_MODE_STRICT)) != 0
-            }
-            return false
-        }()
+        let isStrict = fb0.isStrictMode
         if !isConstructor && !isStrict {
             if thisVal.isUndefined || thisVal.isNull {
                 frame.thisVal = ctx.globalObj
@@ -3153,25 +3225,31 @@ struct JeffJSInterpreter {
             frame.thisVal = arrowThis.dupValue()
         }
         frame.argCount = args.count
+        // No padding append: `buf` carries the undefined-padded arg slots, and
+        // every argBuf consumer (varRef pvalue, detach, syncBufToFrame) bounds-
+        // checks or prefers buf. The old pad forced a COW grow per call, and it
+        // also made `arguments.length` over-report.
         frame.argBuf = args
 
-        // Initialize local variables
+        // Initialize local variables. Append into the pooled frame's array
+        // (released with keepingCapacity) instead of assigning a fresh array —
+        // steady-state this is allocation-free.
         let varCount = Int(fb.varCount)
-        frame.varBuf = [JeffJSValue](repeating: .undefined, count: varCount)
+        if varCount > 0 {
+            frame.varBuf.append(contentsOf: repeatElement(.undefined, count: varCount))
+        }
         frame.varCount = varCount
 
-        // Copy arguments to arg slots, padding with undefined
         let argSlots = max(Int(fb.argCount), args.count)
-        if frame.argBuf.count < Int(fb.argCount) {
-            frame.argBuf.append(contentsOf:
-                [JeffJSValue](repeating: .undefined,
-                              count: Int(fb.argCount) - frame.argBuf.count))
-        }
 
-        // Allocate contiguous unsafe buffer: [arg slots][var slots][value stack]
+        // Allocate contiguous unsafe buffer: [arg slots][var slots][value stack].
+        // Only the args+vars prefix needs .undefined initialization — the value-
+        // stack region is always written before it is read (push before pop;
+        // unwind and exit cleanup only touch [spBase, sp)).
         let stackSlots = max(Int(fb.stackSize), 4) + 32
         let totalSlots = argSlots + varCount + stackSlots
-        var (buf, bufCapacity) = rt.acquireInterpBuf(size: totalSlots)
+        var (buf, bufCapacity) = rt.acquireInterpBuf(size: totalSlots,
+                                                     initializedPrefix: argSlots + varCount)
         var varBase = argSlots
         var spBase = argSlots + varCount
 
@@ -3189,9 +3267,8 @@ struct JeffJSInterpreter {
 
         // Named function expression self-reference: initialize the local variable
         // that holds the function's own name binding (ES spec §15.2.4).
-        if let compiled = fb0 as? JeffJSFunctionBytecodeCompiled,
-           compiled.funcNameVarIdx >= 0 {
-            buf[varBase + compiled.funcNameVarIdx] = funcObj.dupValue()
+        if fb0.selfRefVarIdx >= 0 {
+            buf[varBase + fb0.selfRefVarIdx] = funcObj.dupValue()
         }
 
         // Push frame
@@ -3208,9 +3285,10 @@ struct JeffJSInterpreter {
         // Closure variable references
         var varRefs: [JeffJSVarRef?] = varRefsOpt
 
-        // Inline call stack for non-recursive function calls
+        // Inline call stack for non-recursive function calls.
+        // Lazy: the empty array literal is allocation-free; reserveCapacity here
+        // forced a ~3KB malloc on EVERY call even with inline calls disabled.
         var inlineCallStack: [InlineCallFrame] = []
-        inlineCallStack.reserveCapacity(16)
 
         // ---- Sync helpers: copy between buf and frame arrays ----
 
@@ -3320,6 +3398,16 @@ struct JeffJSInterpreter {
         // Safety guards for sp underflow: if bytecode is malformed, return
         // .undefined rather than reading into arg/var slots.
         @inline(__always) func push(_ val: JeffJSValue) {
+            if sp >= bufCapacity {
+                // VM stack overflow — a push/pop imbalance (compiler stack-effect
+                // bug) or stackSize underestimate. Report once with enough
+                // context to identify the bytecode, and drop the write instead
+                // of scribbling the heap behind the buffer.
+                JeffJSStackDiag.reportOverflow(ctx: ctx, fb: fb, pc: pc, sp: sp,
+                                               spBase: spBase, capacity: bufCapacity, bc: bc,
+                                               bcLen: bcLen, buf: buf)
+                return
+            }
             buf[sp] = val
             sp += 1
         }
@@ -3354,11 +3442,21 @@ struct JeffJSInterpreter {
         // generator.throw() resume), skip straight to exception handling.
         if !retVal.isException {
         dispatchLoop: while pc < bcLen {
-            // Fast opcode decode: force-unwrap since the compiler guarantees
-            // only valid opcodes in final bytecode. Wide opcodes (rawValue >= 256)
-            // are encoded as a 0x00 prefix byte which maps to .invalid; we
-            // handle them in the .invalid case below (cold path).
+            // Fast opcode decode. The synthesized `init(rawValue:)?` for this
+            // 272-case enum compiled to a validating lookup that cost ~6% of a
+            // pure dispatch loop. A no-payload enum's in-memory value IS its
+            // declaration index (== auto-assigned rawValue), and every narrow
+            // byte (0-255) is a valid case (<272), so a raw bitcast is sound.
+            // Wide opcodes use the 0x00 (.invalid) prefix, handled below.
+            // DEBUG cross-checks the bitcast against the safe initializer so any
+            // future enum-layout drift is caught immediately.
+            #if DEBUG
             let op = JeffJSOpcode(rawValue: UInt16(bc[pc]))!
+            assert(op == unsafeBitCast(UInt16(bc[pc]), to: JeffJSOpcode.self),
+                   "JeffJSOpcode layout drift: bitcast decode no longer valid")
+            #else
+            let op = unsafeBitCast(UInt16(bc[pc]), to: JeffJSOpcode.self)
+            #endif
 
             #if DEBUG
             opcodeCount += 1
@@ -3470,12 +3568,11 @@ struct JeffJSInterpreter {
 
             case .fclosure:
                 let idx = Int(readU32(bc, pc + 1))
-                // Sync buf → frame so JeffJSVarRef.pvalue sees current values
-                syncBufToFrame()
+                // No buf↔frame sync needed: createClosure only builds VarRefs
+                // pointing at the parent frame, and VarRef.pvalue reads through
+                // frame.buf (always current) in preference to the frame arrays.
                 let closureVal = ctx.createClosure(fb: fb, cpoolIdx: idx, varRefs: varRefs,
                                                     parentFrame: frame)
-                // Sync back in case closure creation modified frame arrays
-                syncFrameToBuf()
                 push(closureVal)
                 pc += 5
 
@@ -3710,7 +3807,7 @@ struct JeffJSInterpreter {
                         funcObj: mFuncObj, flags: mFlags))
                     // Set up callee state
                     fb = fastFb
-                    bc = fastFb.bytecode
+                    bc = fastFb.bytecodePtr
                     bcLen = fastFb.bytecodeLen
                     varRefs = fastVarRefsOpt
                     mFuncObj = funcVal
@@ -3720,12 +3817,7 @@ struct JeffJSInterpreter {
                     newFrame.prevFrame = ctx.currentFrame
                     newFrame.curFunc = funcVal
                     // ES spec: non-strict functions get globalObj as this for plain calls
-                    let fastIsStrict: Bool = {
-                        if let c = fastFb as? JeffJSFunctionBytecodeCompiled {
-                            return (c.jsModeFlags & UInt8(JS_MODE_STRICT)) != 0
-                        }
-                        return false
-                    }()
+                    let fastIsStrict = fastFb.isStrictMode
                     // Determine `this` for the call:
                     // 1. If arrow function: use captured lexical this
                     // 2. If get_field receiver available: use it (method call that
@@ -3734,32 +3826,32 @@ struct JeffJSInterpreter {
                     if fastFb.isArrow, let callObj = funcVal.obj,
                        let arrowThis = callObj.arrowThisVal {
                         newFrame.thisVal = arrowThis.dupValue()
-                    } else if !frame.lastGetFieldReceiver.isUndefined {
+                    } else if !frame.lastGetFieldReceiver.isUndefined,
+                              frame.lastGetFieldPC >= 0, pc == frame.lastGetFieldPC + 5 {
                         // Transfer the stash's reference to thisVal (no dup —
                         // the stash owned one ref from get_field).
                         newFrame.thisVal = frame.lastGetFieldReceiver
                         frame.lastGetFieldReceiver = .undefined  // clear after use
+                        frame.lastGetFieldPC = -1
                     } else {
                         newFrame.thisVal = fastIsStrict ? .undefined : ctx.globalObj
                     }
                     newFrame.argCount = callArgs.count
-                    newFrame.argBuf = callArgs
+                    newFrame.argBuf = callArgs   // no pad: buf carries padded slots
                     let newVarCount = Int(fastFb.varCount)
-                    newFrame.varBuf = [JeffJSValue](repeating: .undefined, count: newVarCount)
+                    if newVarCount > 0 {
+                        newFrame.varBuf.append(contentsOf: repeatElement(.undefined, count: newVarCount))
+                    }
                     newFrame.varCount = newVarCount
                     let newArgSlots = max(Int(fastFb.argCount), callArgs.count)
-                    if newFrame.argBuf.count < Int(fastFb.argCount) {
-                        newFrame.argBuf.append(contentsOf:
-                            [JeffJSValue](repeating: .undefined,
-                                          count: Int(fastFb.argCount) - newFrame.argBuf.count))
-                    }
                     frame = newFrame
                     ctx.currentFrame = frame
                     frame.spBase = 0
                     // Allocate new contiguous buffer for callee
                     let newStackSlots = max(Int(fastFb.stackSize), 4) + 32
                     let newTotalSlots = newArgSlots + newVarCount + newStackSlots
-                    let (newBuf, newBufCap) = rt.acquireInterpBuf(size: newTotalSlots)
+                    let (newBuf, newBufCap) = rt.acquireInterpBuf(size: newTotalSlots,
+                                                                  initializedPrefix: newArgSlots + newVarCount)
                     // Copy args into callee buf
                     for i in 0..<callArgs.count { newBuf[i] = callArgs[i] }
                     buf = newBuf
@@ -3778,11 +3870,16 @@ struct JeffJSInterpreter {
                     // Slow path: bound functions, C functions, generators, async, etc.
                     // Use lastGetFieldReceiver as `this` if available (method call
                     // that transformMethodCalls couldn't convert to call_method).
-                    let slowThis = frame.lastGetFieldReceiver.isUndefined ? JeffJSValue.undefined : frame.lastGetFieldReceiver
+                    let stashValid = !frame.lastGetFieldReceiver.isUndefined
+                        && frame.lastGetFieldPC >= 0 && pc == frame.lastGetFieldPC + 5
+                    let slowThis = stashValid ? frame.lastGetFieldReceiver : JeffJSValue.undefined
                     let result: JeffJSValue
                     if let callObj = funcVal.obj,
-                       case .bytecodeFunc(let fbOpt2, _, _) = callObj.payload,
-                       let fastFb2 = fbOpt2, !fastFb2.isGenerator, !fastFb2.isAsyncFunc {
+                       let fastFb2 = callObj.fbFast, !fastFb2.isGenerator, !fastFb2.isAsyncFunc {
+                        // fbFast avoids copying the payload enum per call;
+                        // nil falls through to callFunction, which routes
+                        // every callee kind (and backfills fbFast via
+                        // callInternal for plain bytecode functions).
                         result = JeffJSInterpreter.callInternal(ctx: ctx, funcObj: funcVal,
                                                                 thisVal: slowThis, args: callArgs, flags: 0)
                     } else {
@@ -3791,6 +3888,7 @@ struct JeffJSInterpreter {
                     // Drop the stash's reference (taken via dupValue in get_field)
                     frame.lastGetFieldReceiver.freeValue()
                     frame.lastGetFieldReceiver = .undefined  // clear after use
+                    frame.lastGetFieldPC = -1
                     if result.isException {
                         retVal = .exception
                         break dispatchLoop
@@ -3981,16 +4079,12 @@ struct JeffJSInterpreter {
                 if !inlineCallStack.isEmpty {
                     // ── Inline return: restore caller's frame ──
                     // 1. Sync buf → frame and detach live var-refs
-                    syncBufToFrame()
-                    for vr in frame.liveVarRefs {
-                        if !vr.isDetached {
-                            if vr.isArg {
-                                let ai = Int(vr.varIdx)
-                                vr.value = ai < frame.argBuf.count ? frame.argBuf[ai].dupValue() : .undefined
-                            } else {
-                                let vi = Int(vr.varIdx)
-                                vr.value = vi < frame.varBuf.count ? frame.varBuf[vi].dupValue() : .undefined
-                            }
+                    if !frame.liveVarRefs.isEmpty {
+                        syncBufToFrame()
+                        for vr in frame.liveVarRefs where !vr.isDetached {
+                            // pvalue prefers frame.buf, which holds padded arg
+                            // slots that argBuf (un-padded) does not.
+                            vr.value = vr.pvalue.dupValue()
                             vr.isDetached = true
                             vr.parentFrame = nil
                         }
@@ -4026,16 +4120,12 @@ struct JeffJSInterpreter {
             case .return_undef:
                 if !inlineCallStack.isEmpty {
                     // ── Inline return undefined: restore caller's frame ──
-                    syncBufToFrame()
-                    for vr in frame.liveVarRefs {
-                        if !vr.isDetached {
-                            if vr.isArg {
-                                let ai = Int(vr.varIdx)
-                                vr.value = ai < frame.argBuf.count ? frame.argBuf[ai].dupValue() : .undefined
-                            } else {
-                                let vi = Int(vr.varIdx)
-                                vr.value = vi < frame.varBuf.count ? frame.varBuf[vi].dupValue() : .undefined
-                            }
+                    if !frame.liveVarRefs.isEmpty {
+                        syncBufToFrame()
+                        for vr in frame.liveVarRefs where !vr.isDetached {
+                            // pvalue prefers frame.buf, which holds padded arg
+                            // slots that argBuf (un-padded) does not.
+                            vr.value = vr.pvalue.dupValue()
                             vr.isDetached = true
                             vr.parentFrame = nil
                         }
@@ -4389,6 +4479,7 @@ struct JeffJSInterpreter {
                 // called would otherwise leak one receiver ref per execution.
                 frame.lastGetFieldReceiver.freeValue()
                 frame.lastGetFieldReceiver = obj.dupValue()
+                frame.lastGetFieldPC = pc
                 // Early check: property access on null/undefined with location info
                 if obj.isNullOrUndefined {
                     let propName = ctx.rt.atomToString(atom) ?? "?"
@@ -4602,8 +4693,10 @@ struct JeffJSInterpreter {
                             }
                         }
                     }
-                    // IC miss: full path + cache update
-                    let ok = ctx.setProperty(obj: obj, atom: atom, value: val)
+                    // IC miss: full path + cache update (sloppy writes to
+                    // non-writable/frozen targets fail silently per spec)
+                    let ok = ctx.setPropertyChecked(obj: obj, atom: atom, value: val,
+                                                    strict: fb.isStrictMode)
                     if ok < 0 { retVal = .exception; break dispatchLoop }
                     // Re-read shape after setProperty — it may have transitioned
                     if let curShape = jsObj.shape,
@@ -4611,7 +4704,8 @@ struct JeffJSInterpreter {
                         fb.getIC().update(pc, shape: curShape, propOffset: propIdx)
                     }
                 } else {
-                    let ok = ctx.setProperty(obj: obj, atom: atom, value: val)
+                    let ok = ctx.setPropertyChecked(obj: obj, atom: atom, value: val,
+                                                    strict: fb.isStrictMode)
                     if ok < 0 { retVal = .exception; break dispatchLoop }
                 }
                 pc += 5
@@ -5962,7 +6056,9 @@ struct JeffJSInterpreter {
 
                     switch promData.promiseState {
                     case .fulfilled:
-                        push(promData.promiseResult)
+                        // Dup: the promise owns its result; the VM stack takes
+                        // its own reference (a borrowed push here over-freed).
+                        push(promData.promiseResult.dupValue())
                         pc += 1
                     case .rejected:
                         ctx.throwValue(promData.promiseResult.dupValue())
@@ -5970,12 +6066,25 @@ struct JeffJSInterpreter {
                         break dispatchLoop
                     case .pending:
                         // Promise still pending (async I/O). Suspend the async
-                        // function and register .then() to resume when settled.
+                        // function and register a continuation to resume later.
                         guard !ctx._asyncResolve.isUndefined else {
                             // Not inside an async function — fallback
                             push(.undefined)
                             pc += 1
                             break
+                        }
+                        // Lazily create this async function's result promise.
+                        // Non-suspending async calls (the common case) never
+                        // pay for a capability + resolver pair.
+                        if ctx._asyncResolve.isUninitialized {
+                            guard let cap = JeffJSBuiltinPromise.newPromiseCapability(ctx: ctx, ctor: .undefined) else {
+                                push(.undefined)
+                                pc += 1
+                                break
+                            }
+                            ctx._asyncResolve = cap.resolve
+                            ctx._asyncReject = cap.reject
+                            ctx._asyncCapPromise = cap.promise
                         }
                         // Capture stack, vars, args from buf
                         var stackSnap = [JeffJSValue]()
@@ -5997,22 +6106,15 @@ struct JeffJSInterpreter {
                             resolve: ctx._asyncResolve.dupValue(),
                             reject: ctx._asyncReject.dupValue()))
 
-                        // Create C-function callbacks for .then(onFulfilled, onRejected)
-                        let onFulfilled = ctx.newCFunction({ [stateID] ctx, _, args in
-                            let v = args.first ?? .undefined
-                            ctx.resumeAsyncFunction(stateID: stateID, value: v, isRejection: false)
-                            return JeffJSValue.undefined
-                        }, name: "asyncResume", length: 1)
-                        let onRejected = ctx.newCFunction({ [stateID] ctx, _, args in
-                            let v = args.first ?? .undefined
-                            ctx.resumeAsyncFunction(stateID: stateID, value: v, isRejection: true)
-                            return JeffJSValue.undefined
-                        }, name: "asyncReject", length: 1)
-
+                        // Native continuation: no JS function objects per await.
                         JeffJSBuiltinPromise.performPromiseThen(
                             ctx: ctx, promise: val,
-                            onFulfilled: onFulfilled, onRejected: onRejected,
-                            resultPromise: nil)
+                            onFulfilled: .undefined, onRejected: .undefined,
+                            resultPromise: nil,
+                            nativeContinuation: { [stateID] ctx, value, isRejection in
+                                ctx.resumeAsyncFunction(stateID: stateID, value: value,
+                                                        isRejection: isRejection)
+                            })
 
                         ctx._asyncSuspended = true
                         retVal = .undefined
@@ -6038,7 +6140,8 @@ struct JeffJSInterpreter {
                        case .promiseData(let tpData) = tpObj.payload {
                         switch tpData.promiseState {
                         case .fulfilled:
-                            push(tpData.promiseResult)
+                            // Dup: the promise owns its result (borrowed push over-freed)
+                            push(tpData.promiseResult.dupValue())
                         case .rejected:
                             ctx.throwValue(tpData.promiseResult.dupValue())
                             retVal = .exception
@@ -6940,6 +7043,15 @@ struct JeffJSInterpreter {
         // -----------------------------------------------------------------
         if retVal.isException {
             var handlerFound = false
+            // Interrupt-requested termination is uncatchable: unwind the whole
+            // stack (freeing values) without entering any catch handler.
+            if ctx.interruptTerminated {
+                while sp > spBase {
+                    sp -= 1
+                    buf[sp].freeValue()
+                }
+                break exceptionRetry
+            }
             // Scan current frame's stack for catch handler
             while sp > spBase {
                 sp -= 1
@@ -6959,16 +7071,12 @@ struct JeffJSInterpreter {
             if !handlerFound {
                 while !inlineCallStack.isEmpty {
                     // Run frame epilogue for current (callee) frame
-                    syncBufToFrame()
-                    for vr in frame.liveVarRefs {
-                        if !vr.isDetached {
-                            if vr.isArg {
-                                let ai = Int(vr.varIdx)
-                                vr.value = ai < frame.argBuf.count ? frame.argBuf[ai].dupValue() : .undefined
-                            } else {
-                                let vi = Int(vr.varIdx)
-                                vr.value = vi < frame.varBuf.count ? frame.varBuf[vi].dupValue() : .undefined
-                            }
+                    if !frame.liveVarRefs.isEmpty {
+                        syncBufToFrame()
+                        for vr in frame.liveVarRefs where !vr.isDetached {
+                            // pvalue prefers frame.buf, which holds padded arg
+                            // slots that argBuf (un-padded) does not.
+                            vr.value = vr.pvalue.dupValue()
                             vr.isDetached = true
                             vr.parentFrame = nil
                         }
@@ -6991,8 +7099,9 @@ struct JeffJSInterpreter {
                     varRefs = saved.varRefs
                     mFuncObj = saved.funcObj
                     mFlags = saved.flags
-                    // Scan caller's stack for catch handler
-                    while sp > spBase {
+                    // Scan caller's stack for catch handler (skipped entirely
+                    // for uncatchable interrupt termination)
+                    while !ctx.interruptTerminated && sp > spBase {
                         sp -= 1
                         let entry = buf[sp]
                         if entry.isCatchOffset {
@@ -7036,22 +7145,18 @@ struct JeffJSInterpreter {
             buf[sp].freeValue()
         }
 
-        // Sync buf → frame for var-ref detach (they read frame.argBuf/varBuf)
-        syncBufToFrame()
-
         // Detach any remaining live var-refs that still point at this frame.
         // This handles `var`-scoped captured variables whose lifetime equals
         // the entire function -- the compiler does not emit `close_loc` for
         // them, so we must detach here before the frame goes away.
-        for vr in frame.liveVarRefs {
-            if !vr.isDetached {
-                if vr.isArg {
-                    let ai = Int(vr.varIdx)
-                    vr.value = ai < frame.argBuf.count ? frame.argBuf[ai].dupValue() : .undefined
-                } else {
-                    let vi = Int(vr.varIdx)
-                    vr.value = vi < frame.varBuf.count ? frame.varBuf[vi].dupValue() : .undefined
-                }
+        // Skipped entirely for the common case (no captures): the sync loops
+        // and detach walk cost real time at 250k calls/sec.
+        if !frame.liveVarRefs.isEmpty {
+            syncBufToFrame()
+            for vr in frame.liveVarRefs where !vr.isDetached {
+                // pvalue prefers frame.buf (still set here), which holds the
+                // padded arg slots that the un-padded argBuf does not.
+                vr.value = vr.pvalue.dupValue()
                 vr.isDetached = true
                 vr.parentFrame = nil
             }
