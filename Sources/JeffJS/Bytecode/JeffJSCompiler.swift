@@ -644,8 +644,12 @@ struct JeffJSCompiler {
                         // close_loc stripping: any variable whose name some
                         // descendant references may be captured. A close_loc
                         // for an uncaptured slot is a no-op at run time.
-                        if fd.vars[varIdx].isCaptured || keepAllCloseLoc
-                            || descendantNames.contains(fd.vars[varIdx].varName) {
+                        // Only lexical bindings get a fresh binding per block
+                        // entry; a `var` declared in the block is function
+                        // scoped and must keep one shared binding.
+                        if fd.vars[varIdx].isCaptured
+                            || (fd.vars[varIdx].isLexical
+                                && (keepAllCloseLoc || descendantNames.contains(fd.vars[varIdx].varName))) {
                             // Emit close_loc(varIdx): opcode(1 byte) + u16(2 bytes)
                             closeLocBytes.append(UInt8(truncatingIfNeeded: JeffJSOpcode.close_loc.rawValue))
                             closeLocBytes.append(UInt8(varIdx & 0xFF))
