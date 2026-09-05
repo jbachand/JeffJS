@@ -29,15 +29,29 @@ enum JeffJSStringStorage {
 /// Port of QuickJS `JSString`.
 /// Characters are stored either as Latin-1 (`str8`) or UTF-16 (`str16`).
 /// Strings double as atom entries when `atomType != 0`.
-final class JeffJSString {
+/// Common base of the three string representations so refcount traffic
+/// (dup/free) needs one unchecked cast instead of an `as?` chain with
+/// unknown-object retain/release on every string dup.
+class JeffJSStringBase {
+    var refCount: Int
+    /// UAF tripwire (zombie mode).
+    var freeMark: Bool = false
+    /// Representation tag so callers can `unsafeDowncast` instead of running
+    /// an `as?` chain (three dynamic casts per string touch before).
+    static let kindFlat: UInt8 = 0
+    static let kindRope: UInt8 = 1
+    static let kindBuffer: UInt8 = 2
+    let kind: UInt8
+    init(refCount: Int, kind: UInt8) { self.refCount = refCount; self.kind = kind }
+}
+
+final class JeffJSString: JeffJSStringBase {
 
     // -- Reference counting --------------------------------------------------
 
-    var refCount: Int
 
     /// UAF tripwire: set when the string's JS refcount hit zero in zombie mode
     /// (JEFFJS_ZOMBIES=1). Any later dup/free on it is an over-release bug.
-    var freeMark: Bool = false
 
     // -- Length (max 2^31 - 1) ------------------------------------------------
 
@@ -113,12 +127,12 @@ final class JeffJSString {
          atomType: UInt8 = 0,
          hashNext: UInt32 = 0,
          storage: JeffJSStringStorage = .str8([])) {
-        self.refCount = refCount
         self.len = len
         self.isWideChar = isWideChar
         self._hashAndAtomType = (hash & 0x3FFF_FFFF) | (UInt32(atomType & 0x3) << 30)
         self.hashNext = hashNext
         self.storage = storage
+        super.init(refCount: refCount, kind: JeffJSStringBase.kindFlat)
     }
 
     // -- Retain / Release ----------------------------------------------------
@@ -138,11 +152,9 @@ final class JeffJSString {
 
 /// Port of QuickJS rope node used by `js_concat_string`.
 /// A rope postpones flattening until the string content is actually needed.
-final class JeffJSStringRope {
+final class JeffJSStringRope: JeffJSStringBase {
 
-    var refCount: Int
     /// UAF tripwire (zombie mode) — see JeffJSString.freeMark.
-    var freeMark: Bool = false
     var len: Int
     var isWideChar: Bool
     var depth: UInt8
@@ -156,12 +168,12 @@ final class JeffJSStringRope {
          depth: UInt8 = 0,
          left: JeffJSValue = .undefined,
          right: JeffJSValue = .undefined) {
-        self.refCount = refCount
         self.len = len
         self.isWideChar = isWideChar
         self.depth = depth
         self.left = left
         self.right = right
+        super.init(refCount: refCount, kind: JeffJSStringBase.kindRope)
     }
 
     @discardableResult
@@ -518,27 +530,29 @@ private let kMaxRopeDepth: UInt8 = 32
 func jeffJS_concatStrings(s1: JeffJSValue, s2: JeffJSValue) -> JeffJSValue {
     // Phase 4 fast path: left operand is already a buffer accumulator.
     // Append right operand directly — amortized O(1).
-    if let buf = s1.heapRef as? JeffJSStringBuffer {
-        buf.concatValue(s2)
+    if let sb = s1.stringBase, sb.kind == JeffJSStringBase.kindBuffer {
+        unsafeDowncast(sb, to: JeffJSStringBuffer.self).concatValue(s2)
         return s1.dupValue()  // caller may free s1; return owned copy
     }
 
-    // Resolve both operands to flat strings for length checks.
-    // Note: stringValue flattens ropes, but for buffer operands we handled above.
-    guard let str1 = s1.stringValue, let str2 = s2.stringValue else {
+    // Lengths/widths WITHOUT flattening: `stringValue` flattens ropes, which
+    // made every `s += x` on a growing string O(n) (quadratic loops).
+    guard let (len1, wide1) = jeffJS_stringLenWide(s1),
+          let (len2, wide2) = jeffJS_stringLenWide(s2) else {
         return .makeException()
     }
 
     // Degenerate cases — return owned copy so caller can safely free inputs
-    if str1.len == 0 { return s2.dupValue() }
-    if str2.len == 0 { return s1.dupValue() }
+    if len1 == 0 { return s2.dupValue() }
+    if len2 == 0 { return s1.dupValue() }
 
-    let totalLen = str1.len + str2.len
+    let totalLen = len1 + len2
     guard totalLen <= 0x7FFF_FFFF else { return .makeException() }
 
-    // For short strings just flatten immediately.
+    // For short results just flatten both (cheap at this size) and copy.
     let shortThreshold = 256
     if totalLen <= shortThreshold {
+        guard let str1 = s1.stringValue, let str2 = s2.stringValue else { return .makeException() }
         return JeffJSValue.makeString(jeffJS_flatConcatStrings(str1, str2))
     }
 
@@ -556,7 +570,7 @@ func jeffJS_concatStrings(s1: JeffJSValue, s2: JeffJSValue) -> JeffJSValue {
         return JeffJSValue.mkPtr(tag: .string, ptr: buf)
     }
 
-    let wide = str1.isWideChar || str2.isWideChar
+    let wide = wide1 || wide2
     let rope = JeffJSStringRope(refCount: 1,
                                 len: totalLen,
                                 isWideChar: wide,
@@ -568,10 +582,24 @@ func jeffJS_concatStrings(s1: JeffJSValue, s2: JeffJSValue) -> JeffJSValue {
     return JeffJSValue.mkPtr(tag: .string, ptr: rope)
 }
 
+/// Length and wide-char flag of a string value of any representation,
+/// without flattening ropes or buffers.
+private func jeffJS_stringLenWide(_ v: JeffJSValue) -> (Int, Bool)? {
+    guard let sb = v.stringBase else { return nil }
+    switch sb.kind {
+    case JeffJSStringBase.kindFlat:
+        let s = unsafeDowncast(sb, to: JeffJSString.self); return (s.len, s.isWideChar)
+    case JeffJSStringBase.kindRope:
+        let r = unsafeDowncast(sb, to: JeffJSStringRope.self); return (r.len, r.isWideChar)
+    default:
+        let b = unsafeDowncast(sb, to: JeffJSStringBuffer.self); return (b.size, b.isWideChar)
+    }
+}
+
 /// Compute the depth of a value that might be a rope.
 private func ropeDepth(_ v: JeffJSValue) -> UInt8 {
-    if let rope = v.heapRef as? JeffJSStringRope {
-        return rope.depth
+    if let sb = v.stringBase, sb.kind == JeffJSStringBase.kindRope {
+        return unsafeDowncast(sb, to: JeffJSStringRope.self).depth
     }
     return 0
 }
@@ -746,14 +774,12 @@ private func flattenInto8(_ buf: inout [UInt8], _ offset: inout Int, _ val: Jeff
 // MARK: - StringBuffer (port of QuickJS StringBuffer)
 
 /// Growable string builder matching the QuickJS `StringBuffer` API.
-final class JeffJSStringBuffer {
+final class JeffJSStringBuffer: JeffJSStringBase {
 
     /// Reference count for when the buffer is stored directly in a JeffJSValue
     /// as an accumulator (Phase 4 string concat optimization).
-    var refCount: Int
 
     /// UAF tripwire (zombie mode) — see JeffJSString.freeMark.
-    var freeMark: Bool = false
 
     /// The owning context (retained weakly to avoid cycles).
     private weak var ctx: (any JeffJSContextProtocol)?
@@ -787,7 +813,6 @@ final class JeffJSStringBuffer {
     // -- Lifecycle -----------------------------------------------------------
 
     init(ctx: (any JeffJSContextProtocol)? = nil) {
-        self.refCount = 1
         self.ctx = ctx
         self.buf8 = [UInt8]()
         self.buf8.reserveCapacity(JeffJSStringBuffer.kInitialCapacity)
@@ -795,6 +820,7 @@ final class JeffJSStringBuffer {
         self.size = 0
         self.isWideChar = false
         self.hasError = false
+        super.init(refCount: 1, kind: JeffJSStringBase.kindBuffer)
     }
 
     // -- Capacity ------------------------------------------------------------
@@ -933,20 +959,11 @@ final class JeffJSStringBuffer {
     /// Append the string content of a JeffJSValue (flat string, rope, or buffer).
     /// Used by `jeffJS_concatStrings` to append the right operand into this buffer.
     func concatValue(_ val: JeffJSValue) {
-        guard !hasError else { return }
-        if let ref = val.heapRef {
-            if let str = ref as? JeffJSString {
-                concat(str)
-                return
-            }
-            if let rope = ref as? JeffJSStringRope {
-                concatRope(rope)
-                return
-            }
-            if let buf = ref as? JeffJSStringBuffer {
-                concatBuffer(buf)
-                return
-            }
+        guard !hasError, let sb = val.stringBase else { return }
+        switch sb.kind {
+        case JeffJSStringBase.kindFlat:   concat(unsafeDowncast(sb, to: JeffJSString.self))
+        case JeffJSStringBase.kindRope:   concatRope(unsafeDowncast(sb, to: JeffJSStringRope.self))
+        default:                          concatBuffer(unsafeDowncast(sb, to: JeffJSStringBuffer.self))
         }
     }
 

@@ -120,6 +120,11 @@ func createShape(_ ctx: JeffJSContext,
 /// properties but its own storage.  The clone is **not** inserted into the
 /// runtime shape hash table.
 func cloneShape(_ ctx: JeffJSContext, _ shape: JeffJSShape) -> JeffJSShape {
+    return cloneShapeRT(ctx.rt, shape)
+}
+
+/// `cloneShape` for callers that only have the runtime (object proto setter).
+func cloneShapeRT(_ rt: JeffJSRuntime, _ shape: JeffJSShape) -> JeffJSShape {
     let s = JeffJSShape()
     s.proto = shape.proto
     s.propSize = shape.propSize
@@ -136,8 +141,92 @@ func cloneShape(_ ctx: JeffJSContext, _ shape: JeffJSShape) -> JeffJSShape {
     // Deep-copy hash table
     s.propHash = shape.propHash
 
-    addGCObject(ctx.rt, s)
+    addGCObject(rt, s)
     return s
+}
+
+// MARK: - Shape sharing (hidden-class transitions)
+//
+// Objects start on a hashed "root" shape for their prototype and move along
+// hashed transition shapes as properties are added, so every `{a, b}` literal
+// (and every instance built by the same constructor) shares one shape. That
+// is what lets the interpreter's inline caches hit across objects and turns
+// object creation into one allocation instead of a shape + two arrays each.
+//
+// Ownership: `shape.refCount` counts the objects currently on the shape.
+// Hashed shapes stay alive in the runtime table even at zero owners (bounded
+// by `shapes.maxHashed`); unhashed (private) shapes are freed at zero.
+// Any in-place mutation other than appending a property (delete, flag
+// change, prototype change) must go through `prepareShapeUpdate`, which gives
+// the object a private copy first. Mirrors QuickJS `find_hashed_shape_proto`
+// / `find_hashed_shape_prop` / `js_shape_prepare_update`.
+
+/// Find the hashed empty shape for `proto`.
+func findHashedShapeProto(_ rt: JeffJSRuntime, _ proto: JeffJSObject?) -> JeffJSShape? {
+    guard rt.shapeHashSize > 0 else { return nil }
+    let h = shapeInitialHash(proto)
+    var cur = rt.shapeHash[Int(h & UInt32(rt.shapeHashSize - 1))]
+    while let s = cur {
+        if s.hash == h, s.proto === proto, s.propCount == 0, s.deletedPropCount == 0 {
+            return s
+        }
+        cur = s.shapeHashNext
+    }
+    return nil
+}
+
+/// The shape a new empty object with prototype `proto` should start on.
+/// Returns a shape with one owner reference accounted for the caller.
+func jeffJS_rootShape(_ ctx: JeffJSContext, proto: JeffJSObject?) -> JeffJSShape {
+    let rt = ctx.rt
+    if let s = findHashedShapeProto(rt, proto) {
+        s.refCount += 1
+        return s
+    }
+    let s = createShape(ctx, proto: proto, hashSize: 0, propSize: 0)   // refCount 1
+    if rt.shapeHashCount < JeffJSRuntime.maxHashedShapes {
+        insertHashedShape(rt, s)
+    }
+    return s
+}
+
+/// Drop one owner reference from `shape`. Private shapes are freed at zero;
+/// hashed shapes remain cached in the transition table.
+func jeffJS_leaveShape(_ rt: JeffJSRuntime, _ shape: JeffJSShape) {
+    guard shape.refCount > 0 else { return }
+    shape.refCount -= 1
+    if shape.refCount == 0 && !shape.isHashed {
+        freeGCObjectChildren(rt, shape)
+    }
+}
+
+/// Append property `atom`/`flags` to `obj`'s shape and return its slot index.
+/// On a hashed (shared) shape this follows or creates a hashed transition;
+/// on a private shape it appends in place.
+@discardableResult
+func jeffJS_objectAddShapeProperty(_ ctx: JeffJSContext,
+                                   _ obj: JeffJSObject,
+                                   atom: UInt32,
+                                   flags: UInt32) -> Int {
+    guard let shape = obj.shape else { return -1 }
+    guard shape.isHashed else {
+        return addShapeProperty(ctx, shape, atom: atom, flags: flags)
+    }
+    let rt = ctx.rt
+    if let next = findHashedShape(rt, shape, atom: atom, propFlags: flags) {
+        next.refCount += 1
+        obj.shape = next
+        jeffJS_leaveShape(rt, shape)
+        return next.propCount - 1
+    }
+    let ns = cloneShape(ctx, shape)                       // private copy, refCount 1
+    let idx = addShapeProperty(ctx, ns, atom: atom, flags: flags)
+    if rt.shapeHashCount < JeffJSRuntime.maxHashedShapes {
+        insertHashedShape(rt, ns)                         // becomes the shared transition
+    }
+    obj.shape = ns
+    jeffJS_leaveShape(rt, shape)
+    return idx
 }
 
 // MARK: - Property lookup
@@ -282,8 +371,8 @@ func compactProperties(_ ctx: JeffJSContext, _ obj: JeffJSObject) {
             var sp = shape.prop[i]
             sp.hashNext = JeffJSShape.noNext  // will be rebuilt
             newProps.append(sp)
-            if i < obj.prop.count {
-                newValues.append(obj.prop[i])
+            if i < obj.propValues.count {
+                newValues.append(obj.propEntry(at: i))
             }
         }
     }
@@ -292,7 +381,7 @@ func compactProperties(_ ctx: JeffJSContext, _ obj: JeffJSObject) {
     shape.propCount = liveCount
     shape.propSize = liveCount
     shape.deletedPropCount = 0
-    obj.prop = newValues
+    obj.replaceProps(newValues)
 
     // Rebuild hash table
     let hashSize = nextPowerOfTwo(liveCount)
@@ -469,19 +558,18 @@ func resizeShapeHash(_ rt: JeffJSRuntime, newBits: Int) {
 /// If the shape's reference count is > 1 (shared by multiple objects) it is
 /// cloned so each object gets its own copy.
 func prepareShapeUpdate(_ ctx: JeffJSContext, _ obj: JeffJSObject) {
+    prepareShapeUpdateRT(ctx.rt, obj)
+}
+
+func prepareShapeUpdateRT(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     guard let shape = obj.shape else { return }
-
-    // Un-hash if necessary
-    if shape.isHashed {
-        removeHashedShape(ctx.rt, shape)
-    }
-
-    // Clone if shared
-    if shape.refCount > 1 {
-        let newShape = cloneShape(ctx, shape)
-        shape.refCount -= 1
+    // A hashed shape is shared by definition (other objects may sit on it or
+    // reach it through transitions); a private shape with several owners is
+    // shared too. Either way this object gets its own unhashed copy.
+    if shape.isHashed || shape.refCount > 1 {
+        let newShape = cloneShapeRT(rt, shape)   // refCount 1, unhashed
         obj.shape = newShape
-        newShape.refCount = 1
+        jeffJS_leaveShape(rt, shape)
     }
 }
 

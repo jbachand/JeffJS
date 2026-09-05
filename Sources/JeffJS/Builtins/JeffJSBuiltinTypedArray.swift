@@ -1355,14 +1355,14 @@ func jeffJS_addGetterProperty(
         magic: 0
     )
     // Give the getter a shape so property lookup works
-    getterObj.shape = createShape(ctx, proto: nil, hashSize: 0, propSize: 0)
-    getterObj.prop = []
+    getterObj.shape = jeffJS_rootShape(ctx, proto: nil)
+    getterObj.clearProps()
 
     let atom = ctx.rt.findAtom(name)
     jeffJS_addProperty(ctx: ctx, obj: proto, atom: atom, flags: [.configurable, .getset])
-    let propIdx = proto.prop.count - 1
+    let propIdx = proto.propValues.count - 1
     if propIdx >= 0 {
-        proto.prop[propIdx] = .getset(getter: getterObj, setter: nil)
+        proto.setPropEntry(at: propIdx, .getset(getter: getterObj, setter: nil))
     }
     ctx.rt.freeAtom(atom)
 }

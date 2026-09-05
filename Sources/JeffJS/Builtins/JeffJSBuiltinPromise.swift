@@ -69,6 +69,15 @@ private final class ResolvingFunctionsData {
 
     init(promiseObj: JeffJSObject?) {
         self.promiseObj = promiseObj
+        // A JS reference too: a pending promise whose only holders are its
+        // resolving functions (e.g. a temporary `p.then(...)` receiver) must
+        // keep its reaction list until resolve/reject runs. Released when the
+        // last resolving function lets go of this record.
+        if let o = promiseObj { o.refCount += 1 }
+    }
+
+    deinit {
+        if let o = promiseObj { JeffJSValue.makeObjectRecycled(o).freeValue() }
     }
 }
 
@@ -85,6 +94,16 @@ private final class PromiseAllData {
     var index: Int = 0
 
     init() {}
+
+    /// Owned references: the duped resolve/reject functions (used by the
+    /// element closures after the combinator has returned) and the collected
+    /// values/errors (each element closure stores an owned reference).
+    deinit {
+        resolveFunc.freeValue()
+        rejectFunc.freeValue()
+        for v in values { v.freeValue() }
+        for e in errors { e.freeValue() }
+    }
 }
 
 // MARK: - JeffJSBuiltinPromise
@@ -372,8 +391,8 @@ struct JeffJSBuiltinPromise {
             ctx.freeValue(resultsArray)
         }
 
-        ctx.freeValue(allData.resolveFunc)
-        ctx.freeValue(allData.rejectFunc)
+        // allData keeps its resolveFunc/rejectFunc references: the element
+        // closures call them from later microtasks (PromiseAllData.deinit).
         ctx.freeValue(cap.resolve)
         ctx.freeValue(cap.reject)
 
@@ -473,8 +492,8 @@ struct JeffJSBuiltinPromise {
             ctx.freeValue(resultsArray)
         }
 
-        ctx.freeValue(allData.resolveFunc)
-        ctx.freeValue(allData.rejectFunc)
+        // allData keeps its resolveFunc/rejectFunc references: the element
+        // closures call them from later microtasks (PromiseAllData.deinit).
         ctx.freeValue(cap.resolve)
         ctx.freeValue(cap.reject)
 
@@ -576,8 +595,8 @@ struct JeffJSBuiltinPromise {
             ctx.freeValue(aggError)
         }
 
-        ctx.freeValue(allData.resolveFunc)
-        ctx.freeValue(allData.rejectFunc)
+        // allData keeps its resolveFunc/rejectFunc references: the element
+        // closures call them from later microtasks (PromiseAllData.deinit).
         ctx.freeValue(cap.resolve)
         ctx.freeValue(cap.reject)
 

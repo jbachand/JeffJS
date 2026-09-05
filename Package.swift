@@ -72,6 +72,14 @@ let package = Package(
                 .unsafeFlags(["-enforce-exclusivity=unchecked"], .when(configuration: .release)),
             ]
         ),
+        .executableTarget(
+            name: "jeffjs-cli",
+            dependencies: ["JeffJS"],
+            path: "Sources/jeffjs-cli",
+            swiftSettings: [
+                .unsafeFlags(["-enforce-exclusivity=unchecked"], .when(configuration: .release)),
+            ]
+        ),
         .testTarget(
             name: "JeffJSTests",
             dependencies: ["JeffJS"]

@@ -1464,8 +1464,8 @@ private func js_regexp_compile(
 /// Mirrors QuickJS fast-path `lastIndex` access.
 private func js_regexp_getLastIndex(_ obj: JeffJSObject) -> Int {
     // Try the fast path: first property.
-    if !obj.prop.isEmpty {
-        if case .value(let v) = obj.prop[0] {
+    if !obj.propValues.isEmpty {
+        if case .value(let v) = obj.propEntry(at: 0) {
             if v.isInt {
                 return Int(v.toInt32())
             } else if v.isFloat64 {
@@ -1481,10 +1481,10 @@ private func js_regexp_getLastIndex(_ obj: JeffJSObject) -> Int {
 /// Uses the fast path (property index 0).
 private func js_regexp_setLastIndex(_ obj: JeffJSObject, value: Int) {
     let v = JeffJSValue.newInt32(Int32(value))
-    if !obj.prop.isEmpty {
-        obj.prop[0] = .value(v)
+    if !obj.propValues.isEmpty {
+        obj.setPropEntry(at: 0, .value(v))
     } else {
-        obj.prop.append(.value(v))
+        obj.appendProp(.value(v))
     }
 }
 

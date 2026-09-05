@@ -66,6 +66,10 @@ struct JeffJSRelocEntry {
 struct JeffJSScopeDef {
     var parent: Int = -1             // parent scope index (-1 = none)
     var first: Int = -1              // first variable in scope
+    /// True for the single scope that wraps a `switch` body. Case jumps can
+    /// land after a `let` declaration without executing it, so lexical
+    /// variables declared directly in this scope keep their TDZ checks.
+    var isSwitch: Bool = false
 }
 
 /// Bytecode variable definition in the final function bytecode.
@@ -136,6 +140,13 @@ class JeffJSFunctionDefCompiler {
     // -- Scopes --
     var scopes: [JeffJSScopeDef] = [JeffJSScopeDef()]  // scope 0 = function body scope
     var curScope: Int = 0
+
+    // --- TDZ elimination state (set by resolveVariables) ---
+    /// Bytecode position of the scope_* opcode currently being resolved.
+    var resolvePos: Int = 0
+    /// varIdx -> position of its single scope_put_var_init; -1 if the
+    /// variable is initialised at more than one place (keep checks).
+    var tdzInitPos: [Int: Int] = [:]
 
     // -- Labels --
     var labels: [JeffJSLabelSlot] = []
@@ -344,6 +355,52 @@ struct JeffJSCompiler {
             }
         }
 
+        // Conservative capture analysis for close_loc stripping. Child
+        // functions are compiled (and mark `isCaptured` on our vars) only
+        // AFTER this pass, so at this point `isCaptured` is not yet known.
+        // The parser therefore emits per-iteration close_loc for EVERY
+        // lexical loop variable, which costs a frame sync + closeLexicalVar
+        // per iteration and blocks the fast-trace path. QuickJS strips
+        // close_loc for non-captured variables in resolve_variables; we do
+        // the same using a name-based over-approximation: a variable may
+        // be captured only if some descendant function references its
+        // name through a scope_* opcode (or uses eval). Keeping too many
+        // close_locs is safe (it is the previous behaviour); dropping a
+        // needed one is not, hence the over-approximation.
+        let (descendantNames, descendantsMayEval) = collectDescendantNameRefs(fd)
+        let keepAllCloseLoc = descendantsMayEval || fd.hasEval || fd.isDirectOrIndirectEval
+
+        // TDZ elimination pre-pass: record where each lexical local is
+        // initialised (scope_put_var_init). A direct get/put that sits after
+        // that point in the bytecode, in a non-switch scope, cannot observe
+        // the uninitialised state, so resolvedLocalAccess emits the plain
+        // get_loc/put_loc instead of the _check forms. The _check forms
+        // blocked every get_loc/put_loc peephole for `let` variables.
+        fd.tdzInitPos = [:]
+        do {
+            var scanPos = 0
+            while scanPos < fd.byteCode.len && scanPos < fd.byteCode.buf.count {
+                guard let (scanOp, scanWidth) = readOpcodeFromBuf(fd.byteCode.buf, scanPos) else { scanPos += 1; continue }
+                let scanInfo = jeffJSGetOpcodeInfo(scanOp)
+                let scanSize = max(Int(scanInfo.size) + (scanWidth - 1), 1)
+                if scanOp == .scope_put_var_init, scanPos + scanWidth + 6 <= fd.byteCode.buf.count {
+                    let a = readU32(fd.byteCode.buf, scanPos + scanWidth)
+                    let lvl = Int(readU16(fd.byteCode.buf, scanPos + scanWidth + 4))
+                    if let (vi, vd) = findLocalVar(fd: fd, name: a, scopeLevel: lvl), vd.isLexical {
+                        fd.tdzInitPos[vi] = fd.tdzInitPos[vi] == nil ? scanPos : -1
+                    }
+                } else if scanOp == .put_loc_check_init, scanPos + scanWidth + 2 <= fd.byteCode.buf.count {
+                    // The parser emits this form directly for `let`/`const`
+                    // declarations with an initializer.
+                    let vi = Int(readU16(fd.byteCode.buf, scanPos + scanWidth))
+                    if vi < fd.vars.count, fd.vars[vi].isLexical {
+                        fd.tdzInitPos[vi] = fd.tdzInitPos[vi] == nil ? scanPos : -1
+                    }
+                }
+                scanPos += scanSize
+            }
+        }
+
         var pos = 0
         // NOTE: We read from fd.byteCode.buf / fd.byteCode.len directly
         // (not a snapshot) because leave_scope handling may insert bytes
@@ -361,6 +418,7 @@ struct JeffJSCompiler {
             let instrSize = max(Int(info.size) + (opWidth - 1), 1)
             // Operands start after the opcode byte(s)
             let operandBase = pos + opWidth
+            fd.resolvePos = pos
 
             switch op {
 
@@ -501,6 +559,18 @@ struct JeffJSCompiler {
                                    atom: atom, accessType: .inPrivate)
 
             // -----------------------------------------------------------------
+            // close_loc -- drop it when the variable cannot be captured.
+            // See the capture analysis at the top of this pass.
+            // -----------------------------------------------------------------
+            case .close_loc:
+                let clIdx = Int(readU16(fd.byteCode.buf, operandBase))
+                if !keepAllCloseLoc, clIdx < fd.vars.count,
+                   !fd.vars[clIdx].isCaptured,
+                   !descendantNames.contains(fd.vars[clIdx].varName) {
+                    nopOut(fd: fd, pos: pos, size: instrSize)
+                }
+
+            // -----------------------------------------------------------------
             // enter_scope -- emit set_loc_uninitialized for each lexical
             // variable in this scope so TDZ is enforced from scope entry.
             //
@@ -567,7 +637,15 @@ struct JeffJSCompiler {
                 if scopeIdx >= 0 && scopeIdx < fd.scopes.count {
                     var varIdx = fd.scopes[scopeIdx].first
                     while varIdx >= 0 && varIdx < fd.vars.count {
-                        if fd.vars[varIdx].isCaptured {
+                        // `isCaptured` is set by the child functions, which are
+                        // compiled after this pass (see createFunction), so a
+                        // block variable captured by a closure is not marked
+                        // yet. Use the same over-approximation as the
+                        // close_loc stripping: any variable whose name some
+                        // descendant references may be captured. A close_loc
+                        // for an uncaptured slot is a no-op at run time.
+                        if fd.vars[varIdx].isCaptured || keepAllCloseLoc
+                            || descendantNames.contains(fd.vars[varIdx].varName) {
                             // Emit close_loc(varIdx): opcode(1 byte) + u16(2 bytes)
                             closeLocBytes.append(UInt8(truncatingIfNeeded: JeffJSOpcode.close_loc.rawValue))
                             closeLocBytes.append(UInt8(varIdx & 0xFF))
@@ -939,6 +1017,22 @@ struct JeffJSCompiler {
         return nil
     }
 
+    /// True when a direct access to lexical local `localIdx` at the current
+    /// resolve position can never observe the TDZ (uninitialised) state:
+    /// the function has no eval, the variable has exactly one initialisation
+    /// point that precedes the access in bytecode order, and its scope is not
+    /// a switch body (case jumps may bypass the declaration).
+    private static func tdzProvablyInitialized(fd: JeffJSFunctionDefCompiler,
+                                               localIdx: Int,
+                                               varDef: JeffJSVarDef) -> Bool {
+        if fd.hasEval || fd.isDirectOrIndirectEval { return false }
+        guard let initPos = fd.tdzInitPos[localIdx], initPos >= 0 else { return false }
+        guard fd.resolvePos > initPos else { return false }
+        let scopeIdx = varDef.scopeLevel
+        if scopeIdx >= 0, scopeIdx < fd.scopes.count, fd.scopes[scopeIdx].isSwitch { return false }
+        return true
+    }
+
     /// Produce the resolved opcode + index for a local variable access.
     private static func resolvedLocalAccess(
         fd: JeffJSFunctionDefCompiler,
@@ -948,20 +1042,20 @@ struct JeffJSCompiler {
     ) -> (opcode: JeffJSOpcode, varIdx: Int) {
         switch accessType {
         case .get, .getUndef:
-            if varDef.isLexical && varDef.isConst {
-                return (.get_loc_check, localIdx)
-            }
-            if varDef.isLexical {
+            if varDef.isLexical && !tdzProvablyInitialized(fd: fd, localIdx: localIdx, varDef: varDef) {
                 return (.get_loc_check, localIdx)
             }
             return (.get_loc, localIdx)
 
         case .put:
             if varDef.isConst {
-                // Assignment to const -- will be a runtime error
-                return (.put_loc_check, localIdx)
+                // Assignment to const: resolved at compile time into an
+                // unconditional throw_error (QuickJS does the same), so
+                // put_loc_check stays a pure TDZ check with no per-store
+                // const lookup in the interpreter.
+                return (.throw_error, localIdx)
             }
-            if varDef.isLexical {
+            if varDef.isLexical && !tdzProvablyInitialized(fd: fd, localIdx: localIdx, varDef: varDef) {
                 return (.put_loc_check, localIdx)
             }
             return (.put_loc, localIdx)
@@ -1023,7 +1117,9 @@ struct JeffJSCompiler {
 
         case .put:
             if isConst {
-                return (.put_var_ref_check, closureIdx)
+                // Compile-time TypeError (see resolvedLocalAccess): keeps the
+                // runtime put_var_ref_check free of a per-store const lookup.
+                return (.throw_error, closureIdx)
             }
             if isLexical {
                 return (.put_var_ref_check, closureIdx)
@@ -1114,6 +1210,13 @@ struct JeffJSCompiler {
             writeU16(&fd.byteCode.buf, pos + 5, UInt16(varIdx))
             padWithNops(&fd.byteCode.buf, from: pos + newSize, count: origSize - newSize)
 
+        case .atom_u8:
+            // throw_error(atom, type): compile-time resolved assignment to a
+            // const binding. The atom is the variable name.
+            writeU32(&fd.byteCode.buf, pos + 1, atom)
+            fd.byteCode.buf[pos + 5] = ThrowErrorType.constAssign.rawValue
+            padWithNops(&fd.byteCode.buf, from: pos + newSize, count: origSize - newSize)
+
         case .none, .none_int:
             // push_false, push_this, etc. -- single byte
             padWithNops(&fd.byteCode.buf, from: pos + newSize, count: origSize - newSize)
@@ -1187,8 +1290,31 @@ struct JeffJSCompiler {
     @discardableResult
     static func resolveLabels(ctx: JeffJSContext,
                                fd: JeffJSFunctionDefCompiler) -> Bool {
-        let srcBuf = fd.byteCode.buf
-        let srcLen = fd.byteCode.len
+        // Compact NOP padding first. resolveVariables rewrites 7-byte scope_*
+        // opcodes into 3-byte get_loc/put_loc forms padded with NOPs, and the
+        // peephole window below reads the *next* instruction by byte offset,
+        // so with padding in place none of the multi-instruction fusions
+        // (inc_loc, set_loc, add_loc, ...) ever matched for resolved locals.
+        // Jumps are still label-based at this stage, so removing bytes is safe.
+        var srcBuf: [UInt8] = []
+        srcBuf.reserveCapacity(fd.byteCode.len)
+        do {
+            let raw = fd.byteCode.buf
+            let rawLen = min(fd.byteCode.len, raw.count)
+            var p = 0
+            while p < rawLen {
+                guard let (cop, cwidth) = readOpcodeFromBuf(raw, p) else {
+                    srcBuf.append(raw[p]); p += 1; continue
+                }
+                let csize = max(Int(jeffJSGetOpcodeInfo(cop).size) + (cwidth - 1), 1)
+                if cop != .nop {
+                    let end = min(p + csize, rawLen)
+                    srcBuf.append(contentsOf: raw[p ..< end])
+                }
+                p += csize
+            }
+        }
+        let srcLen = srcBuf.count
         var bc = DynBuf()
         var pos = 0
 
@@ -1252,6 +1378,85 @@ struct JeffJSCompiler {
             let nextOp: JeffJSOpcode? = (nextPos < srcLen && nextPos < srcBuf.count)
                 ? JeffJSOpcode(rawValue: UInt16(srcBuf[nextPos])) : nil
 
+            // ------------------------------------------------------------------
+            // Superinstructions: fused compare / arithmetic on locals and small
+            // immediates (one dispatch instead of three), `push_0 or` ->
+            // to_int32, `push_const op` -> arith_const8, `dup put_loc drop` ->
+            // put_loc. Must run before the pairwise fusions below.
+            // ------------------------------------------------------------------
+            if op == .get_loc || op == .push_i32 || op == .push_const || op == .dup, let n = nextOp {
+                let nextSize = Int(jeffJSGetOpcodeInfo(n).size)
+                let thirdPos = nextPos + nextSize
+                let thirdOp: JeffJSOpcode? = thirdPos < srcLen ? JeffJSOpcode(rawValue: UInt16(srcBuf[thirdPos])) : nil
+                if op == .get_loc, n == .push_i32, let t = thirdOp {
+                    let a = Int(readU16(srcBuf, pos + 1))
+                    let k = Int32(bitPattern: readU32(srcBuf, nextPos + 1))
+                    if a < 256, k >= -128, k <= 127 {
+                        if let cmp = fusedCmpSubOp(t) {
+                            bc.putOpcode(JeffJSOpcode.cmp_loc_i8.rawValue)
+                            bc.putU8(cmp); bc.putU8(UInt8(a)); bc.putU8(UInt8(bitPattern: Int8(k)))
+                            pos = thirdPos + 1
+                            continue
+                        }
+                        if let ar = fusedArithSubOp(t) {
+                            bc.putOpcode(JeffJSOpcode.arith_loc_i8.rawValue)
+                            bc.putU8(ar); bc.putU8(UInt8(a)); bc.putU8(UInt8(bitPattern: Int8(k)))
+                            pos = thirdPos + 1
+                            continue
+                        }
+                    }
+                }
+                if op == .get_loc, n == .get_loc, let t = thirdOp {
+                    let a = Int(readU16(srcBuf, pos + 1))
+                    let b = Int(readU16(srcBuf, nextPos + 1))
+                    if a < 256, b < 256 {
+                        if let cmp = fusedCmpSubOp(t) {
+                            bc.putOpcode(JeffJSOpcode.cmp_loc_loc.rawValue)
+                            bc.putU8(cmp); bc.putU8(UInt8(a)); bc.putU8(UInt8(b))
+                            pos = thirdPos + 1
+                            continue
+                        }
+                        if let ar = fusedArithSubOp(t) {
+                            bc.putOpcode(JeffJSOpcode.arith_loc_loc.rawValue)
+                            bc.putU8(ar); bc.putU8(UInt8(a)); bc.putU8(UInt8(b))
+                            pos = thirdPos + 1
+                            continue
+                        }
+                    }
+                }
+                if op == .push_i32, n == .or, readU32(srcBuf, pos + 1) == 0 {
+                    bc.putOpcode(JeffJSOpcode.to_int32.rawValue)
+                    pos = nextPos + 1
+                    continue
+                }
+                if op == .push_const, let ar = fusedArithSubOp(n) {
+                    let k = readU32(srcBuf, pos + 1)
+                    if k < 256 {
+                        bc.putOpcode(JeffJSOpcode.arith_const8.rawValue)
+                        bc.putU8(ar); bc.putU8(UInt8(k))
+                        pos = nextPos + 1
+                        continue
+                    }
+                }
+                // dup perm3 put_field(atom) drop -> put_field(atom): the
+                // assignment-expression value plumbing of a statement `o.p = v;`
+                if op == .dup, n == .perm3, thirdOp == .put_field {
+                    let fourthPos = thirdPos + 5
+                    if fourthPos < srcLen, JeffJSOpcode(rawValue: UInt16(srcBuf[fourthPos])) == .drop {
+                        bc.putOpcode(JeffJSOpcode.put_field.rawValue)
+                        bc.putU32(readU32(srcBuf, thirdPos + 1))
+                        pos = fourthPos + 1
+                        continue
+                    }
+                }
+                if op == .dup, n == .put_loc, thirdOp == .drop {
+                    let locIdx = readU16(srcBuf, nextPos + 1)
+                    putShortCode(bc: &bc, op: .put_loc, idx: Int(locIdx))
+                    pos = thirdPos + 1
+                    continue
+                }
+            }
+
             // Optimization 1: push_i32(val) neg -> push_i32(-val)
             // Skip when val == 0: negating 0 must produce -0.0 (IEEE 754),
             // which push_i32(0) cannot represent.  This matters for
@@ -1291,12 +1496,14 @@ struct JeffJSCompiler {
             }
 
             // Optimization 4: push + drop -> nothing
-            if isPushOpcode(op), nextOp == .drop {
-                let pushInfo = jeffJSGetOpcodeInfo(op)
-                if pushInfo.nPop == 0 && pushInfo.nPush == 1 {
-                    pos = nextPos + 1  // skip both
-                    continue
-                }
+            // Only for pushes that can neither throw nor have side effects.
+            // `get_var` (ReferenceError), get_loc_check / get_var_ref_check
+            // (TDZ) and property reads must stay: `try { undeclared; }` relies
+            // on the throw. This was masked before NOP compaction because the
+            // resolved get_var was always followed by NOP padding, not drop.
+            if nextOp == .drop, Self.pureNoThrowPushOpcodes.contains(op) {
+                pos = nextPos + 1  // skip both
+                continue
             }
 
             // Optimization 5: push_null + strict_eq -> is_null
@@ -1344,6 +1551,15 @@ struct JeffJSCompiler {
                 let vrIdx = readU16(srcBuf, nextPos + 1)
                 putShortCode(bc: &bc, op: .set_var_ref, idx: Int(vrIdx))
                 pos = nextPos + 3
+                continue
+            }
+
+            // Optimization 8d: set_loc(n) + drop -> put_loc(n)
+            // (store-without-pop followed by a pop is a plain pop-and-store)
+            if op == .set_loc, nextOp == .drop {
+                let locIdx = readU16(srcBuf, pos + 1)
+                putShortCode(bc: &bc, op: .put_loc, idx: Int(locIdx))
+                pos = nextPos + 1
                 continue
             }
 
@@ -1671,8 +1887,12 @@ struct JeffJSCompiler {
                 }
             }
 
-            // Fusion 7: get_loc(n) + call(argc) -> get_loc8_call(n, argc)
-            if op == .get_loc, nextOp == .call {
+            // Fusion 7: get_loc(n) + call(0) -> get_loc8_call(n, 0)
+            // Only valid for argc == 0: with arguments, the local loaded right
+            // before `call` is the LAST ARGUMENT, not the callee (the callee
+            // was pushed before the arguments). The handler treats the local
+            // as the callee, so fusing argc > 0 called the wrong value.
+            if op == .get_loc, nextOp == .call, readU16(srcBuf, nextPos + 1) == 0 {
                 let locIdx = readU16(srcBuf, pos + 1)
                 if locIdx < 256 {
                     let argc = readU16(srcBuf, nextPos + 1)
@@ -1701,7 +1921,10 @@ struct JeffJSCompiler {
                 let thirdPos = nextPos + 5  // get_field is 5 bytes
                 if thirdPos < srcLen {
                     let thirdOp = JeffJSOpcode(rawValue: UInt16(srcBuf[thirdPos]))
-                    if thirdOp == .call {
+                    // Same argc == 0 restriction as Fusion 7: with arguments
+                    // the args sit between get_field and call, so this
+                    // pattern can only be a zero-argument call.
+                    if thirdOp == .call, readU16(srcBuf, thirdPos + 1) == 0 {
                         let locIdx = readU16(srcBuf, pos + 1)
                         if locIdx < 256 {
                             let atom = readU32(srcBuf, nextPos + 1)
@@ -3149,6 +3372,15 @@ struct JeffJSCompiler {
         // Trace block fusion: identify hot loop candidates for the fast mini-interpreter
         JeffJSCompiler.fuseBasicBlocks(fb)
 
+        // Debug aid: JEFFJS_DUMP=1 prints the final bytecode of every
+        // compiled function (after all passes) to stdout.
+        if ProcessInfo.processInfo.environment["JEFFJS_DUMP"] != nil {
+            print(dumpFunctionBytecode(fb: fb))
+            if let blocks = fb.traceBlocks, !blocks.isEmpty {
+                print("  traceBlocks: \(blocks.map { "\($0.key)->\($0.value.exitPC)\($0.value.hasCalls ? "c" : "")" }.sorted()) lean=\(fb.traceLean)")
+            }
+        }
+
         return fb
     }
 
@@ -3487,7 +3719,7 @@ struct JeffJSCompiler {
     /// Only loops whose bodies contain exclusively these opcodes are traced.
     private static let traceEligibleOpcodes: Set<JeffJSOpcode> = [
         // Push values
-        .push_i32, .push_const, .push_0, .push_1, .push_minus1,
+        .push_i32, .push_const, .push_const8, .push_0, .push_1, .push_minus1,
         .push_2, .push_3, .push_4, .push_5, .push_6, .push_7,
         .push_i8, .push_i16, .push_false, .push_true, .push_null, .undefined,
 
@@ -3495,7 +3727,10 @@ struct JeffJSCompiler {
         .get_loc, .get_loc0, .get_loc1, .get_loc2, .get_loc3, .get_loc8,
         .put_loc, .put_loc0, .put_loc1, .put_loc2, .put_loc3, .put_loc8,
         .set_loc, .set_loc0, .set_loc1, .set_loc2, .set_loc3, .set_loc8,
-        .get_loc_check, .get_loc_checkthis,
+        .get_loc_check, .get_loc_checkthis, .put_loc_check,
+        .set_loc_uninitialized, .put_loc_check_init,
+        // Object/array literals (IC transition path only; misses deopt)
+        .object, .define_field, .array_from,
 
         // Argument access
         .get_arg, .get_arg0, .get_arg1, .get_arg2, .get_arg3,
@@ -3505,6 +3740,7 @@ struct JeffJSCompiler {
 
         // Arithmetic
         .add, .sub, .mul, .div, .mod, .neg, .inc, .dec, .post_inc, .post_dec, .plus,
+        .inc_loc, .dec_loc, .add_loc,
 
         // Comparison
         .lt, .lte, .gt, .gte, .eq, .neq, .strict_eq, .strict_neq,
@@ -3518,11 +3754,108 @@ struct JeffJSCompiler {
         // Control flow (branches + jumps — handled within the trace)
         .if_true, .if_false, .goto_, .if_true8, .if_false8, .goto8, .goto16,
 
+        // Property access (IC hit paths only; misses deopt)
+        .get_field, .get_field2, .put_field, .get_loc8_get_field, .get_arg0_get_field, .get_length,
+        // Calls / returns (inline bytecode callees only; the rest deopts)
+        .push_this, .call, .call0, .call1, .call2, .call3, .call_method, .get_loc8_call,
+        .return_, .return_undef,
+
+        // Closure variables
+        .get_var_ref, .get_var_ref_check, .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3,
+        .put_var_ref, .put_var_ref_check, .put_var_ref_check_init,
+        .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3,
+        .set_var_ref, .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3,
+
+        // Array elements and globals (fast paths only; misses deopt)
+        .get_array_el, .put_array_el, .get_var, .get_var_undef, .put_var,
+
         // Fused short forms (arithmetic + locals only)
         .get_loc8_add, .get_loc8_get_loc8, .push_i32_put_loc8,
+        .cmp_loc_i8, .cmp_loc_loc, .arith_loc_loc, .arith_loc_i8, .to_int32, .arith_const8,
 
         // NOP (skip harmlessly)
         .nop,
+    ]
+
+    /// Pushes that cannot throw or observe state: safe to delete when the
+    /// value is immediately dropped.
+    private static let pureNoThrowPushOpcodes: Set<JeffJSOpcode> = [
+        .push_i32, .push_i8, .push_i16, .push_const, .push_const8,
+        .push_0, .push_1, .push_2, .push_3, .push_4, .push_5, .push_6, .push_7, .push_minus1,
+        .push_true, .push_false, .push_null, .undefined, .push_atom_value,
+        .get_loc, .get_arg, .push_this, .fclosure, .fclosure8,
+    ]
+
+    /// Collect the set of identifier atoms referenced through scope_* opcodes
+    /// by all descendant functions of `fd` (transitively), plus whether any
+    /// descendant uses eval. Used by resolveVariables to decide which
+    /// close_loc opcodes can be dropped before `isCaptured` is known.
+    static func collectDescendantNameRefs(_ fd: JeffJSFunctionDefCompiler) -> (Set<JSAtom>, Bool) {
+        var names = Set<JSAtom>()
+        var mayEval = false
+        var stack = fd.childFunctions
+        while let child = stack.popLast() {
+            stack.append(contentsOf: child.childFunctions)
+            if child.hasEval || child.isDirectOrIndirectEval { mayEval = true }
+            let buf = child.byteCode.buf
+            let len = min(child.byteCode.len, buf.count)
+            var pos = 0
+            while pos < len {
+                guard let (op, opWidth) = readOpcodeFromBuf(buf, pos) else { pos += 1; continue }
+                let info = jeffJSGetOpcodeInfo(op)
+                let instrSize = max(Int(info.size) + (opWidth - 1), 1)
+                switch op {
+                case .scope_get_var, .scope_put_var, .scope_delete_var, .scope_make_ref,
+                     .scope_get_ref, .scope_put_var_init,
+                     .scope_get_private_field, .scope_put_private_field, .scope_in_private_field:
+                    if pos + opWidth + 4 <= buf.count {
+                        names.insert(readU32(buf, pos + opWidth))
+                    }
+                default:
+                    break
+                }
+                pos += instrSize
+            }
+        }
+        return (names, mayEval)
+    }
+
+    /// Sub-opcode for the fused compare superinstructions (see the interpreter).
+    private static func fusedCmpSubOp(_ op: JeffJSOpcode) -> UInt8? {
+        switch op {
+        case .lt: return 0
+        case .lte: return 1
+        case .gt: return 2
+        case .gte: return 3
+        case .eq: return 4
+        case .neq: return 5
+        case .strict_eq: return 6
+        case .strict_neq: return 7
+        default: return nil
+        }
+    }
+
+    /// Sub-opcode for the fused arithmetic superinstructions.
+    private static func fusedArithSubOp(_ op: JeffJSOpcode) -> UInt8? {
+        switch op {
+        case .add: return 0
+        case .sub: return 1
+        case .mul: return 2
+        case .and: return 3
+        case .or: return 4
+        case .xor: return 5
+        default: return nil
+        }
+    }
+
+    /// Opcodes only the call-capable trace variant implements.
+    private static let traceCallVariantOpcodes: Set<JeffJSOpcode> = [
+        .push_this, .call, .call0, .call1, .call2, .call3, .call_method, .get_loc8_call,
+        .return_, .return_undef,
+        .get_var_ref, .get_var_ref_check, .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3,
+        .put_var_ref, .put_var_ref_check, .put_var_ref_check_init,
+        .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3,
+        .set_var_ref, .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3,
     ]
 
     /// Analyze final bytecode for hot loop candidates and populate trace blocks.
@@ -3586,6 +3919,30 @@ struct JeffJSCompiler {
                     }
                 }
 
+            // Bottom-tested loops (for/while) end with a conditional backward
+            // branch: those are loop back-edges too.
+            case .if_true, .if_false:
+                guard pc + opWidth + 3 < bc.count else { break }
+                let raw = readU32(bc, pc + opWidth)
+                let offset = Int(Int32(bitPattern: raw))
+                if offset < 0 {
+                    let target = pc + instrSize + offset
+                    if target >= 0 {
+                        candidates.append(Candidate(entryPC: target, exitPC: pc + instrSize))
+                    }
+                }
+
+            case .if_true8, .if_false8:
+                guard pc + opWidth < bc.count else { break }
+                let raw = bc[pc + opWidth]
+                let offset = Int(Int8(bitPattern: raw))
+                if offset < 0 {
+                    let target = pc + instrSize + offset
+                    if target >= 0 {
+                        candidates.append(Candidate(entryPC: target, exitPC: pc + instrSize))
+                    }
+                }
+
             default:
                 break
             }
@@ -3595,14 +3952,34 @@ struct JeffJSCompiler {
 
         guard !candidates.isEmpty else { return }
 
-        // Phase 2: Check eligibility for each candidate — all opcodes in
+        // Phase 2: Merge overlapping candidates into loop regions. A `for`
+        // loop is laid out as header / body / update with TWO backward
+        // jumps (body -> update, update -> header) whose ranges overlap;
+        // treating them as separate traces made every iteration bounce
+        // between two fragments and the main interpreter. One region per
+        // connected set of overlapping ranges keeps the whole loop inside
+        // the trace. Each backward-jump target still gets its own entry so
+        // the dispatching goto can start the trace at its own target.
+        struct Region { var start: Int; var end: Int; var targets: [Int] }
+        var regions: [Region] = []
+        for c in candidates.sorted(by: { $0.entryPC < $1.entryPC }) {
+            if var last = regions.last, c.entryPC < last.end {
+                last.end = max(last.end, c.exitPC)
+                last.targets.append(c.entryPC)
+                regions[regions.count - 1] = last
+            } else {
+                regions.append(Region(start: c.entryPC, end: c.exitPC, targets: [c.entryPC]))
+            }
+        }
+
+        // Phase 3: Check eligibility for each region — all opcodes in
         // [entryPC, exitPC) must be in the traceEligibleOpcodes set.
         var traceBlocks: [Int: TraceBlockInfo] = [:]
 
-        for candidate in candidates {
-            let entryPC = candidate.entryPC
-            let exitPC = candidate.exitPC
-            guard entryPC >= 0, exitPC <= len, entryPC < exitPC else { continue }
+        // Registers a trace block for every target of [entryPC, exitPC) when
+        // the whole range is trace-eligible. Returns false when it is not.
+        func tryRegion(_ entryPC: Int, _ exitPC: Int, _ targets: [Int]) -> Bool {
+            guard entryPC >= 0, exitPC <= len, entryPC < exitPC else { return false }
 
             var eligible = true
             var checkPC = entryPC
@@ -3621,13 +3998,49 @@ struct JeffJSCompiler {
             }
 
             // The walk must end exactly at exitPC for valid trace boundaries
-            if eligible && checkPC == exitPC {
-                traceBlocks[entryPC] = TraceBlockInfo(entryPC: entryPC, exitPC: exitPC)
+            guard eligible && checkPC == exitPC else { return false }
+            // Does the region need the call-capable trace variant?
+            var hasCalls = false
+            var scanPC = entryPC
+            while scanPC < exitPC && scanPC < bc.count {
+                guard let (sop, swidth) = readOpcodeFromBuf(bc, scanPC) else { break }
+                if traceCallVariantOpcodes.contains(sop) { hasCalls = true; break }
+                scanPC += max(Int(jeffJSGetOpcodeInfo(sop).size) + (swidth - 1), 1)
+            }
+            for target in targets {
+                let info = TraceBlockInfo(entryPC: entryPC, exitPC: exitPC, startPC: target)
+                info.hasCalls = hasCalls
+                traceBlocks[target] = info
+            }
+            return true
+        }
+
+        for region in regions {
+            if !tryRegion(region.start, region.end, region.targets), region.targets.count > 1 {
+                // An ineligible merged region (an outer loop with an
+                // unsupported opcode) must not take its inner loops down with
+                // it: register the eligible inner loops on their own.
+                for cand in candidates where cand.entryPC >= region.start && cand.exitPC <= region.end {
+                    _ = tryRegion(cand.entryPC, cand.exitPC, [cand.entryPC])
+                }
             }
         }
 
         if !traceBlocks.isEmpty {
             fb.traceBlocks = traceBlocks
+            // Lean-variant candidate: has a loop and no opcode anywhere that
+            // needs the call-capable variant.
+            var needsFat = false
+            var scanPC = 0
+            while scanPC < len && scanPC < bc.count {
+                guard let (sop, swidth) = readOpcodeFromBuf(bc, scanPC) else { break }
+                // Returns are fine: the lean variant hands the final `return`
+                // back to its caller (once per call); everything else in the
+                // call-variant set (calls, this, closure vars) disqualifies.
+                if sop != .return_, sop != .return_undef, traceCallVariantOpcodes.contains(sop) { needsFat = true; break }
+                scanPC += max(Int(jeffJSGetOpcodeInfo(sop).size) + (swidth - 1), 1)
+            }
+            fb.traceLean = !needsFat && !fb.isGenerator && !fb.isAsyncFunc
         }
     }
 }

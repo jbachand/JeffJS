@@ -147,6 +147,49 @@ func freeValue(_ rt: JeffJSRuntime, _ v: JeffJSValue) {
 /// name collision with the freeValueRT() instance method on JeffJSValue.
 func _freeValueRTImpl(_ rt: JeffJSRuntime, _ v: JeffJSValue) { freeValueRT(rt, v) }
 
+/// Free a GC-tracked object whose refcount the caller has ALREADY decremented
+/// to zero. Defers during a GC phase / recursive free chain, otherwise runs the
+/// two-phase free (process children, then batch-release ARC retains). Shared by
+/// `freeValueRT` and `JeffJSValue.freeValueSlow` so the zero-refcount path has a
+/// single implementation.
+func freeGCObjectAtZeroRefcount(_ rt: JeffJSRuntime, _ hdr: JeffJSGCObjectHeader) {
+    if rt.gcPhase != .JS_GC_PHASE_NONE || rt.inFreeChain {
+        // GC is running or we're inside a recursive free chain — defer.
+        rt.gcZeroRefCountObjects.append(hdr)
+        return
+    }
+    // Two-phase free: first process all children (decrement their refcounts,
+    // collect more zero-ref objects), then release ARC retains in a batch. This
+    // prevents use-after-free when cyclic objects reference each other.
+    rt.inFreeChain = true
+    var toRelease: [JeffJSGCObjectHeader] = []
+
+    // Phase 1: Process children (freeObject/freeShape/etc nil out refs)
+    freeGCObjectChildren(rt, hdr)
+    toRelease.append(hdr)
+
+    // Drain deferred zero-ref objects iteratively (popLast: O(1) per item;
+    // removeFirst shifted the whole array each time)
+    while let deferred = rt.gcZeroRefCountObjects.popLast() {
+        if deferred.refCount == 0 {
+            freeGCObjectChildren(rt, deferred)
+            toRelease.append(deferred)
+        }
+    }
+    rt.inFreeChain = false
+
+    // Phase 2: Release ARC retains (may deallocate objects).
+    // Safe because all child references have been nil'd out.
+    for obj in toRelease {
+        if jeffJSZombiesEnabled {
+            if let o = obj as? JeffJSObject { o.freeMark = true }
+            rt.zombieKeepAlive.append(obj)
+        } else {
+            Unmanaged.passUnretained(obj).release()
+        }
+    }
+}
+
 /// Internal free.  Decrements the ref count of a heap value and, if it
 /// reaches zero, either frees it immediately (outside of GC) or enqueues
 /// it on the zero-refcount list (during GC).
@@ -154,46 +197,9 @@ func freeValueRT(_ rt: JeffJSRuntime, _ v: JeffJSValue) {
     // GC-tracked objects (JeffJSObject, JeffJSShape, JeffJSVarRef, JeffJSBigInt)
     if let hdr = v.toGCObjectHeader() {
         guard hdr.refCount > 0 else { return } // already freed or being freed
-
         hdr.refCount -= 1
-
         if hdr.refCount == 0 {
-            if rt.gcPhase != .JS_GC_PHASE_NONE || rt.inFreeChain {
-                // GC is running or we're inside a recursive free chain — defer.
-                rt.gcZeroRefCountObjects.append(hdr)
-            } else {
-                // Two-phase free: first process all children (decrement their
-                // refcounts, collect more zero-ref objects), then release ARC
-                // retains in a batch. This prevents use-after-free when cyclic
-                // objects reference each other.
-                rt.inFreeChain = true
-                var toRelease: [JeffJSGCObjectHeader] = []
-
-                // Phase 1: Process children (freeObject/freeShape/etc nil out refs)
-                freeGCObjectChildren(rt, hdr)
-                toRelease.append(hdr)
-
-                // Drain deferred zero-ref objects iteratively (popLast: O(1)
-                // per item; removeFirst shifted the whole array each time)
-                while let deferred = rt.gcZeroRefCountObjects.popLast() {
-                    if deferred.refCount == 0 {
-                        freeGCObjectChildren(rt, deferred)
-                        toRelease.append(deferred)
-                    }
-                }
-                rt.inFreeChain = false
-
-                // Phase 2: Release ARC retains (may deallocate objects).
-                // Safe because all child references have been nil'd out.
-                for obj in toRelease {
-                    if jeffJSZombiesEnabled {
-                        if let o = obj as? JeffJSObject { o.freeMark = true }
-                        rt.zombieKeepAlive.append(obj)
-                    } else {
-                        Unmanaged.passUnretained(obj).release()
-                    }
-                }
-            }
+            freeGCObjectAtZeroRefcount(rt, hdr)
         }
         return
     }
@@ -453,20 +459,20 @@ func markObject(_ rt: JeffJSRuntime,
         markFunc(rt, proto)
     }
 
-    // 3. Property values
-    for propEntry in obj.prop {
-        switch propEntry {
-        case .value(let val):
-            if let child = val.toGCObjectHeader() {
-                markFunc(rt, child)
+    // 3. Property values (split storage: data values + rare-case boxes)
+    for i in 0..<obj.propValues.count {
+        if let e = obj.extra(at: i) {
+            switch e.kind {
+            case .getset:
+                if let g = e.getter { markFunc(rt, g) }
+                if let s = e.setter { markFunc(rt, s) }
+            case .varRef:
+                if let vr = e.varRef { markFunc(rt, vr) }
+            case .autoInit:
+                break
             }
-        case .getset(let getter, let setter):
-            if let g = getter { markFunc(rt, g) }
-            if let s = setter { markFunc(rt, s) }
-        case .varRef(let vr):
-            markFunc(rt, vr)
-        case .autoInit:
-            break
+        } else if let child = obj.propValues[i].toGCObjectHeader() {
+            markFunc(rt, child)
         }
     }
 
@@ -603,41 +609,57 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     // The global object must only ever be freed at context teardown. If this
     // fires mid-run, some path over-released it; the stack identifies the
     // culprit (this is the root of the shape-wipe corruption family).
-    if rt.protectedGlobals.contains(ObjectIdentifier(obj)) {
+    if obj.isProtectedGlobal {
         print("[GLOBAL-FREE] global object freed mid-run (rc=\(obj.refCount)) — stack:")
         for sym in Thread.callStackSymbols.prefix(16) { print("    \(sym)") }
     }
     // Capture and clear payload/properties FIRST, then free values.
     // This prevents re-entrant access to obj during cascading frees.
-    let savedProps = obj.prop
+    let savedValues = obj.propValues          // moved out: freed below
+    let savedExtra = obj.propExtra
     let savedPayload = obj.payload
-    obj.prop = []
+    obj.propValues = JeffJSPropStorage()
+    obj.propExtra = []
     obj.payload = .opaque(nil)
     obj.fbFast = nil
     obj.varRefsFast = []
 
-    // Release each property value.
-    for propEntry in savedProps {
-        switch propEntry {
-        case .value(let val):
-            freeValue(rt, val)
-        case .getset(_, _):
-            break  // ARC handles getter/setter object refs
-        case .varRef(let vr):
-            if vr.isDetached {
+    // Release each property value. Data values are manually refcounted;
+    // getset/autoInit refs are released by ARC when `savedExtra` drops at the
+    // end of scope; a detached varRef's captured value is freed explicitly.
+    for i in 0..<savedValues.count {
+        // propExtra is lazily allocated: empty means every slot is plain data.
+        if i < savedExtra.count, let e = savedExtra[i] {
+            if e.kind == .varRef, let vr = e.varRef, vr.isDetached {
                 freeValue(rt, vr.value)
                 vr.value = .undefined
             }
-        case .autoInit:
-            break
+        } else {
+            freeValue(rt, savedValues[i])
         }
     }
+    savedValues.deallocateStorage()
 
     // Payload was already cleared to .opaque(nil) above.
     // The saved payload's Swift class references (JeffJSFunctionBytecode,
     // arrays, etc.) will be released by ARC when savedPayload goes out of scope.
     // Explicit cpool/varRef/element freeing is deferred until the full
     // QuickJS refcount discipline is implemented in all operator functions.
+    // Arrays own their element references: release them from whichever
+    // storage is authoritative (the ref-type store when materialised, else
+    // the enum payload; the two hold the same elements, so never both).
+    if let storage = obj._fastArrayValues {
+        obj._fastArrayValues = nil
+        let n = Int(storage.count)
+        var i = 0
+        while i < n && i < storage.values.count { freeValue(rt, storage.values[i]); i += 1 }
+        storage.values.removeAll()
+        storage.count = 0
+    } else if case .array(_, let vals, let count) = savedPayload {
+        let n = Int(count)
+        var i = 0
+        while i < n && i < vals.count { freeValue(rt, vals[i]); i += 1 }
+    }
     _ = savedPayload  // ensure ARC release happens
 
     // Release shape — nil first (ARC -1), then process children if refCount=0.
@@ -645,7 +667,7 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     if let shape = obj.shape {
         obj.shape = nil  // ARC releases our strong ref
         shape.refCount -= 1
-        if shape.refCount == 0 {
+        if shape.refCount == 0 && !shape.isHashed {   // hashed shapes stay cached
             freeGCObjectChildren(rt, shape)
             // No Unmanaged.release — shapes are ARC-managed.
             // ARC will deallocate when all strong refs (gcObjects, other obj.shape) go away.
@@ -653,7 +675,7 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     }
 
     // Invalidate any weak references pointing at this object.
-    weakrefFree(rt, obj)
+    if !rt.gcWeakRefMap.isEmpty { weakrefFree(rt, obj) }
 
     rt.mallocState.mallocCount -= 1
 }
@@ -734,7 +756,8 @@ func clearGCState(_ rt: JeffJSRuntime) {
         hdr.ownerRuntime = nil
         if hdr.gcObjType == .jsObject || hdr.gcObjType == .functionBytecode {
             let obj = unsafeBitCast(hdr, to: JeffJSObject.self)
-            obj.prop.removeAll()
+            obj.propValues.removeAll()
+            obj.propExtra.removeAll()
             obj.shape = nil
             obj.proto = nil
             obj.payload = .opaque(nil)
@@ -758,7 +781,8 @@ func clearGCState(_ rt: JeffJSRuntime) {
         hdr.ownerRuntime = nil
         if hdr.gcObjType == .jsObject || hdr.gcObjType == .functionBytecode {
             let obj = unsafeBitCast(hdr, to: JeffJSObject.self)
-            obj.prop.removeAll()
+            obj.propValues.removeAll()
+            obj.propExtra.removeAll()
             obj.shape = nil
             obj.proto = nil
             obj.payload = .opaque(nil)

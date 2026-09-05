@@ -34,6 +34,7 @@ struct JeffJSBuiltinArray {
         let pushAtom = ctx.rt.findAtom("push")
         let pushVal = ctx.getProperty(obj: arrayProto, atom: pushAtom)
         ctx.arrayProtoPushObj = pushVal.toObject()
+        ctx.arrayProtoPushVal = pushVal
         ctx.rt.freeAtom(pushAtom)
         ctx.setPropertyFunc(obj: arrayProto, name: "pop", fn: pop, length: 0)
         ctx.setPropertyFunc(obj: arrayProto, name: "shift", fn: shift, length: 0)
@@ -697,7 +698,7 @@ struct JeffJSBuiltinArray {
 
         var i = k
         while i < final_ {
-            ctx.setPropertyByIndex(obj: obj, index: UInt32(i), value: value)
+            ctx.setPropertyByIndex(obj: obj, index: UInt32(i), value: value.dupValue())   // the setter takes ownership
             i += 1
         }
 

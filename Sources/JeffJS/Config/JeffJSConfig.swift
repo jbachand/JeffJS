@@ -63,7 +63,7 @@ enum JeffJSConfig {
 
     // MARK: - Trace Blocks
 
-    static let traceHitThreshold   = int("trace.hitThreshold",         default: 16)
+    static let traceHitThreshold   = int("trace.hitThreshold",         default: 2)
 
     // MARK: - Stack / Memory
 
@@ -88,6 +88,8 @@ enum JeffJSConfig {
     // MARK: - Shapes
 
     static let shapesHashBits      = int("shapes.hashBits",           default: 4)
+    /// Max shared (hashed) shapes kept alive in the transition table.
+    static let shapesMaxHashed     = int("shapes.maxHashed",          default: 16384)
 
     // MARK: - Strings / Ropes
 

@@ -320,15 +320,25 @@ struct JeffJSValue {
 
     @inline(__always)
     var stringValue: JeffJSString? {
-        guard (bits & Self._tagMask) == Self._stringTag else { return nil }
-        guard let ref = _heapRef else { return nil }
-        // Fast path: already a flat string
-        if let str = ref as? JeffJSString { return str }
-        // Rope: flatten to a contiguous JeffJSString
-        if let rope = ref as? JeffJSStringRope { return jeffJS_flattenRope(rope) }
-        // Phase 4: buffer accumulator — materialise to flat string
-        if let buf = ref as? JeffJSStringBuffer { return buf.toJeffJSString() }
-        return nil
+        guard let sb = stringBase else { return nil }
+        switch sb.kind {
+        case JeffJSStringBase.kindFlat:
+            return unsafeDowncast(sb, to: JeffJSString.self)
+        case JeffJSStringBase.kindRope:
+            // Rope: flatten to a contiguous JeffJSString
+            return jeffJS_flattenRope(unsafeDowncast(sb, to: JeffJSStringRope.self))
+        default:
+            // Buffer accumulator — materialise to flat string
+            return unsafeDowncast(sb, to: JeffJSStringBuffer.self).toJeffJSString()
+        }
+    }
+
+    /// The string payload as its shared base class: a tag check and a bit
+    /// cast, no dynamic casts. nil for non-string values.
+    @inline(__always)
+    var stringBase: JeffJSStringBase? {
+        guard (bits & Self._tagMask) == Self._stringTag, let ptr = _rawPtr else { return nil }
+        return unsafeBitCast(ptr, to: JeffJSStringBase.self)
     }
 
     @inline(__always)
@@ -371,11 +381,68 @@ struct JeffJSValue {
     // MARK: - Reference Counting
     // ================================================================
 
+    /// Retain a value. The non-heap fast path (int/float/bool/null/undefined)
+    /// is a single tag check and inlines fully into hot loops; only heap values
+    /// pay an out-of-line call. Keeping this wrapper tiny is what lets
+    /// `@inline(__always)` actually take — the full body below is too large to
+    /// inline, so without the split every int dup paid a real function call.
     @inline(__always)
     @discardableResult
     func dupValue() -> JeffJSValue {
-        guard _isHeapTag else { return self }
-        guard let ptr = _rawPtr else { return self }
+        if _isHeapTag { dupValueHeap() }
+        return self
+    }
+
+    /// Inline object fast path for the trace interpreters: a plain object's
+    /// refcount bump/drop without the out-of-line call. Falls back to the
+    /// generic paths for strings, debug modes and the zero transition.
+    @inline(__always)
+    @discardableResult
+    func dupValueFast() -> JeffJSValue {
+        if (bits & Self._tagMask) == Self._objectTag, !jeffJS_refDebugMode,
+           let p = UnsafeRawPointer(bitPattern: UInt(bits & Self._ptrMask)) {
+            Unmanaged<JeffJSObject>.fromOpaque(p)._withUnsafeGuaranteedRef { $0.refCount += 1 }
+            return self
+        }
+        if _isHeapTag { dupValueHeap() }
+        return self
+    }
+
+    @inline(__always)
+    func freeValueFast() {
+        if (bits & Self._tagMask) == Self._objectTag, !jeffJS_refDebugMode,
+           let p = UnsafeRawPointer(bitPattern: UInt(bits & Self._ptrMask)) {
+            let alive = Unmanaged<JeffJSObject>.fromOpaque(p)._withUnsafeGuaranteedRef { o -> Bool in
+                if o.refCount > 1 { o.refCount -= 1; return true }
+                return false
+            }
+            if alive { return }
+            if jeffJS_recycleObject(p) { return }
+            freeValueSlow()
+            return
+        }
+        if _isHeapTag { freeValueHeap() }
+    }
+
+    /// Out-of-line heap dup. Plain objects (the common case) bump the manual
+    /// refcount through an unretained reference: materialising a strong Swift
+    /// reference (as the generic path does) costs a swift_retain/release pair
+    /// per dup, which dominated property-access and call profiles. Kept out
+    /// of line so the inlined wrapper stays a single tag test.
+    @inline(never)
+    private func dupValueHeap() {
+        if (bits & Self._tagMask) == Self._objectTag,
+           !JeffJSGCObjectHeader.trackRefcounts, !jeffJSZombiesEnabled,
+           let ptr = _rawPtr {
+            Unmanaged<JeffJSObject>.fromOpaque(ptr)._withUnsafeGuaranteedRef { $0.refCount += 1 }
+            return
+        }
+        dupValueSlow()
+    }
+
+    @inline(never)
+    private func dupValueSlow() {
+        guard let ptr = _rawPtr else { return }
         let tag = bits & Self._tagMask
         switch tag {
         case Self._objectTag:
@@ -387,8 +454,12 @@ struct JeffJSValue {
             unsafeBitCast(ptr, to: JeffJSBigInt.self).refCount += 1
         case Self._fbTag:
             unsafeBitCast(ptr, to: JeffJSFunctionBytecode.self).refCount += 1
-        case Self._stringTag, Self._symbolTag:
-            // String subtypes — need as? chain (3 possible classes)
+        case Self._stringTag:
+            // All string representations share JeffJSStringBase: one cast.
+            let sb = unsafeBitCast(ptr, to: JeffJSStringBase.self)
+            if sb.freeMark { JeffJSZombieDebug.reportString("DUP", "string rc=\(sb.refCount)") }
+            sb.refCount += 1
+        case Self._symbolTag:
             let ref = Unmanaged<AnyObject>.fromOpaque(ptr).takeUnretainedValue()
             if let s = ref as? JeffJSString {
                 if s.freeMark { JeffJSZombieDebug.reportString("DUP", "JeffJSString rc=\(s.refCount)") }
@@ -404,13 +475,36 @@ struct JeffJSValue {
             unsafeBitCast(ptr, to: JeffJSGCObjectHeader.self).refCount += 1
         default: break
         }
-        return self
     }
 
+    /// Release a value. As with `dupValue`, the non-heap fast path is a single
+    /// tag check that inlines; heap values take the out-of-line slow path.
     @inline(__always)
     func freeValue() {
         guard _isHeapTag else { return }
+        freeValueHeap()
+    }
 
+    /// Out-of-line heap free. Objects that stay alive after the decrement
+    /// (the common case) are handled without a strong reference; the zero
+    /// transition and every other heap type take the generic slow path.
+    @inline(never)
+    private func freeValueHeap() {
+        if (bits & Self._tagMask) == Self._objectTag,
+           !JeffJSGCObjectHeader.trackRefcounts, !jeffJSZombiesEnabled,
+           let ptr = _rawPtr {
+            let stillAlive = Unmanaged<JeffJSObject>.fromOpaque(ptr)._withUnsafeGuaranteedRef { o -> Bool in
+                if o.refCount > 1 { o.refCount -= 1; return true }
+                return false
+            }
+            if stillAlive { return }
+            if jeffJS_recycleObject(ptr) { return }
+        }
+        freeValueSlow()
+    }
+
+    @inline(never)
+    func freeValueSlow() {
         // GC-tracked objects: decrement refcount, free when it hits 0.
         // During context init (intrinsicsAdded == false), only decrement —
         // init objects are context-scoped and freed by context.free().
@@ -418,17 +512,21 @@ struct JeffJSValue {
             if jeffJSZombiesEnabled, let obj = hdr as? JeffJSObject, obj.freeMark {
                 JeffJSZombieDebug.reportTouch("FREE", obj)
             }
-            JeffJSGCObjectHeader.trackFree(hdr)
+            if JeffJSGCObjectHeader.trackRefcounts { JeffJSGCObjectHeader.trackFree(hdr) }
             guard hdr.refCount > 0 else { return }
-            if let rt = hdr.ownerRuntime ?? JeffJSGCObjectHeader.activeRuntime {
-                // Check if any context on this runtime has finished init
-                if rt.initComplete {
-                    _freeValueRTImpl(rt, self)
-                } else {
-                    hdr.refCount -= 1
+            // Decrement inline. Only when the count actually reaches zero do we
+            // resolve the owning runtime (binding `ownerRuntime` retains the
+            // runtime — pure ARC churn on every release of a still-live object)
+            // and run the free machinery. The common "decrement a live object"
+            // case is now just a single store.
+            hdr.refCount -= 1
+            if hdr.refCount == 0 {
+                if let rt = hdr.ownerRuntime ?? JeffJSGCObjectHeader.activeRuntime,
+                   rt.initComplete {
+                    freeGCObjectAtZeroRefcount(rt, hdr)
                 }
-            } else {
-                hdr.refCount -= 1
+                // During init: leave the dead object for context.free() to
+                // reclaim, matching the prior behavior.
             }
             return
         }
@@ -442,7 +540,25 @@ struct JeffJSValue {
             guard fb.refCount > 0 else { return }
             fb.refCount -= 1
             if fb.refCount == 0 { _freeFBSlow(fb) }
-        case Self._stringTag, Self._symbolTag:
+        case Self._stringTag:
+            let sb = unsafeBitCast(ptr, to: JeffJSStringBase.self)
+            if sb.freeMark { JeffJSZombieDebug.reportString("FREE", "string rc=\(sb.refCount)") }
+            guard sb.refCount > 0 else { return }
+            sb.refCount -= 1
+            if sb.refCount == 0 {
+                if sb.kind == JeffJSStringBase.kindRope {
+                    let r = unsafeDowncast(sb, to: JeffJSStringRope.self)
+                    r.left.freeValue()
+                    r.right.freeValue()
+                }
+                if jeffJSZombiesEnabled {
+                    sb.freeMark = true
+                    JeffJSZombieDebug.stringKeepAlive.append(sb)
+                } else {
+                    Unmanaged.passUnretained(sb).release()
+                }
+            }
+        case Self._symbolTag:
             let ref = Unmanaged<AnyObject>.fromOpaque(ptr).takeUnretainedValue()
             if let s = ref as? JeffJSString {
                 if s.freeMark { JeffJSZombieDebug.reportString("FREE", "JeffJSString rc=\(s.refCount)") }
@@ -510,6 +626,14 @@ struct JeffJSValue {
     static func makeObject(_ obj: JeffJSObject) -> JeffJSValue {
         JeffJSGCObjectHeader.trackCreate(obj)
         let raw = Unmanaged.passRetained(obj).toOpaque()
+        return JeffJSValue(bits: _objectTag | UInt64(UInt(bitPattern: raw)))
+    }
+
+    /// Value for an object taken from the recycle pool: it still carries the
+    /// Swift retain of its original makeObject, so no new retain here.
+    @inline(__always)
+    static func makeObjectRecycled(_ obj: JeffJSObject) -> JeffJSValue {
+        let raw = Unmanaged.passUnretained(obj).toOpaque()
         return JeffJSValue(bits: _objectTag | UInt64(UInt(bitPattern: raw)))
     }
 

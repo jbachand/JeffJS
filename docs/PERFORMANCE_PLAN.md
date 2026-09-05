@@ -1,0 +1,207 @@
+# JeffJS Performance Plan
+
+Goal: bring the interpreter to JavaScriptCore-interpreter (LLInt) speed on every
+Apple platform, then optionally beyond it on macOS. Started 2026-09-04.
+
+## Baseline (2026-09-04, Apple Silicon, release build)
+
+Times in milliseconds for `bench/kernels.js`. `jsc` is the system binary at
+`/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc`.
+The LLInt column (`--useJIT=false`) is also roughly what JavaScriptCore delivers
+inside third-party iOS apps, which cannot JIT.
+
+| kernel            | JeffJS | jsc LLInt | jsc baseline JIT | jsc full JIT |
+|-------------------|-------:|----------:|-----------------:|-------------:|
+| int-loop (20M)    |   1754 |       153 |               56 |            6 |
+| float-loop (10M)  |    926 |       135 |              114 |           23 |
+| calls (5M)        |   1294 |       129 |               29 |            3 |
+| prop-get-set (5M) |    998 |       101 |               25 |            2 |
+| method-call (3M)  |   1350 |       157 |               31 |            4 |
+| alloc-objs (1M)   |    699 |        39 |               11 |            1 |
+| array-push (2M)   |    823 |        74 |               34 |           16 |
+| string-concat     |     65 |         4 |                2 |            1 |
+| closure (3M)      |    740 |        82 |               19 |            5 |
+| fib(25)           |     44 |         6 |              1.5 |            1 |
+
+JeffJS is 7-19x behind LLInt and roughly 8x behind C QuickJS. Closing the gap
+to LLInt is the target on iOS/watchOS/tvOS/visionOS, where writable+executable
+memory is unavailable to third-party apps, so no JIT of any kind is possible.
+
+## Root causes found by profiling the int loop (`sample`)
+
+1. `for (let i ...)` emits `close_loc` on every iteration even when nothing
+   captures the variable. It costs a full buf->frame sync plus
+   `closeLexicalVar`, and it is not trace-eligible, so `executeFastTrace`
+   never ran for the most common loop shape. C QuickJS only emits it when the
+   variable is captured.
+2. `put_loc_check` does `fb as? JeffJSFunctionBytecodeCompiled` per store to
+   check const assignment. QuickJS resolves this at compile time.
+3. `frame.varBuf` / `frame.argBuf` are Swift arrays: copy-on-write uniqueness
+   and bounds checks on every touch, plus periodic `syncBufToFrame` copies.
+4. The dispatch loop is one ~7,300-line function; hot opcodes are starved of
+   registers.
+5. `JeffJSEnvironment.onConsoleMessage` never fires from a plain CLI process.
+
+## Phases
+
+Each phase is measured with `bench/run.sh` and gated by `swift test`
+(conformance suite).
+
+| # | Phase | Expected effect | Status |
+|---|-------|-----------------|--------|
+| 1 | Benchmark harness: `jeffjs-cli` executable target, `bench/kernels.js`, `bench/run.sh` comparing against jsc. Fix console callback. | measurement | done |
+| 2 | Compiler fixes: emit `close_loc` only for captured loop vars; const-assignment check at compile time (no dynamic cast); widen trace eligibility. | 3-5x on loops | done (2x measured) |
+| 3 | Frame/stack rewrite: one contiguous unsafe value stack for args, locals, operands (QuickJS layout). No Swift arrays in frames, no sync copies, no overflow-reporting push in release. Toggle: `interp.uncheckedStack` in `JeffJSConfig.plist`. | 2-3x everywhere | partial: shared stack, lazy frame arrays; frame objects still pooled classes |
+| 4 | Calls: inline fast path for `call_method` and constructors, args passed in place on the shared stack, no per-call frame object. | 2-3x calls | partial: call/call_method/zero-arg fused calls inline; constructors not yet |
+| 5 | Objects: property values in one tail-allocated buffer; `put_field` IC; prototype-chain IC; precomputed shapes for literals/`new`; object free list; trim per-alloc GC bookkeeping. | 2-4x objects | partial: shared shapes, ARC-free IC hits; define_field IC and free list pending |
+| 6 | Quickening: rewrite bytecode in place on first execution with fused instructions and embedded cache slots (LLInt style). Split cold opcodes out of the dispatch function. | 1.5-2x | not started |
+| 7 | macOS-only JIT (optional, after 2-6): ARM64 emitter + `pthread_jit_write_protect_np`, needs `com.apple.security.cs.allow-jit`. Portable fallback: closure compilation. | large, Mac only | not started |
+
+Expected end state after phases 2-6: loop and call kernels within 1-2x of jsc
+LLInt, matching what C QuickJS achieves.
+
+## Progress log
+
+- 2026-09-04: baseline measured, plan written.
+- 2026-09-04: Phase 1 done. `jeffjs-cli` target, `bench/kernels.js`, `bench/run.sh`, `JEFFJS_DUMP=1` bytecode dump. Console callback works; the earlier failure was the kernel script preferring a `print` global that JeffJS defines.
+- 2026-09-04: Phase 2 part 1. close_loc stripped for non-captured loop vars (name-based conservative analysis over descendant functions); const assignment resolved to throw_error at compile time; put_loc_check trace-eligible; overlapping loop candidates merged into one trace region with per-target start pc. int-loop 1754 -> 932 ms, float-loop 926 -> 638 ms. Conformance unchanged (1705 pass / 1 pre-existing fail: allLoaded18).
+- 2026-09-04: Phase 2 part 2. TDZ elimination for provably-initialised lexical locals (get_loc_check/put_loc_check -> get_loc/put_loc; switch-body scopes excluded); NOP compaction before the peephole pass, which made every multi-instruction peephole and fusion live for the first time. Three latent bugs surfaced and were fixed: `get_loc8_call` fused argc>0 calls (callee/arg confusion), `get_loc8_add` had operands reversed (string concat order), and push+drop deleted throwing `get_var` loads. `JeffJSBytecodeCache.rt` was `weak`, which put every runtime retain/release on the slow side-table path; now unowned(unsafe). int-loop 892, float 524, prop-get-set 633, alloc-objs 523, array-push 340, closure 602 ms.
+- 2026-09-04: Phase 3 + 4 (first cut). Frame arrays (argBuf/varBuf) no longer filled per call; they are materialised on demand by syncBufToFrame() for the arguments object and generator save/restore. Inline call path uses fbFast/varRefsFast instead of pattern-matching the payload enum. InlineCallFrame holds fb/frame unowned(unsafe). Shared value stack: an inline callee's frame is carved out of the caller's buffer at the first argument slot (no allocation, no arg copy); `bufOwned` tracks the rare fallback to a pooled buffer; interp buffers are now 8192 slots. call_method got the same inline fast path through a shared enterInlineFrame() helper. calls 1023 -> 820, method-call 1072 -> 780, fib25 45 -> 37 ms. Conformance 1706/0.
+- 2026-09-04: Phase 3/4 second cut. Inline call stack moved to a per-runtime unsafe stack of trivially-copyable frames (caller varRefs re-derived from funcObj on pop). `get_loc8_call` (fused zero-arg call) now takes the inline path; it used to force every closure call through callFunction. calls 767, closure 479, fib25 32 ms.
+- 2026-09-04: Phase 5 first cut. Shared hidden-class shapes: objects start on a hashed root shape per prototype and follow hashed transitions on property add (`jeffJS_rootShape`, `jeffJS_objectAddShapeProperty`); delete / flag change / freeze / prototype change copy the shape first (`prepareShapeUpdate`); hashed shapes stay cached (cap `shapes.maxHashed`). Inline caches now hit across objects of the same shape. IC hit paths compare an unretained `shapeIdentity` and read a raw `icEntries` pointer (no ARC); `writable` cached in the entry. Object dup/free go through unretained refs (`_withUnsafeGuaranteedRef`). alloc-objs 510 -> 330, prop-get-set 631 -> 407, method-call 767 -> 625 ms. Conformance 1706/0.
+
+- 2026-09-05: Round 2. Trace: `inc_loc`/`dec_loc`/`add_loc`, `push_const8`, float arithmetic + comparisons, property opcodes (IC hits only), arrays/globals now eligible, `perm3/4/5` and `get_loc_checkthis` implemented (they were eligible but missing, so any loop containing them deopted every iteration); no per-op range/stack checks; boolean branch fast path. Main loop: int fast paths for bitwise ops. Calls: frame pool is a free list of immortal frames (`rt.allFrames`) with unowned(unsafe) `prevFrame`/`currentFrame`; varRefs array only copied for functions with closure vars. Objects: `define_field` transition IC, cached root shape for `{}`, `propExtra` allocated lazily (one array per object instead of two). Tried and reverted: unowned(unsafe) locals for `fb`/`frame` inside callInternal (5-6% slower everywhere, presumably codegen). int-loop 869 -> 585, float 532 -> 356, calls 742 -> 478, prop-get-set 404 -> 339, method-call 618 -> 446, alloc 324 -> 198, closure 473 -> 337, fib25 32 -> 24 ms.
+
+- 2026-09-05: Round 2, second half. Prototype-chain inline cache (depth 1: receiver shape + holder object + holder shape, all retained by the entry) in the four get_field forms and their trace counterparts: method-call 446 -> 385. `get_length` uses the IC with an atom-based fallback instead of re-interning "length" per execution: array-push 300 -> 230. Strings carry a `kind` tag on the shared base class so concat/flatten/free use `unsafeDowncast` instead of `as?` chains; trace `add` concatenates strings in place: string-concat 37 -> 23. Frame release resets only fields the next acquire does not overwrite; `JeffJSVarRef.parentFrame` unowned(unsafe).
+
+- 2026-09-05: Round 3 (QuickJS parity push), part 1. Instruments (`xctrace record --template 'Time Profiler'`, exported with `xctrace export --xpath ... time-profile`, aggregated by `/tmp/jjbench/tp.py`) replaces `sample`. Note: Instruments shows inlined helpers as separate frames, so "push #1 ()" in a profile is not evidence of a call. Done: push/pop/peek rewritten to direct buffer ops in the dispatch loop (no measurable change; they were already inlined), compile-time const check for closure-variable stores (removed a dynamic cast per store: closure 338 -> 302), `hasLiveVarRefs`/`varRefsLoaded` flags instead of Array.isEmpty, direct slot pointers for closure variables (`JeffJSVarRef.slot`), unowned(unsafe) `frame` local (calls 465 -> 419, method 383 -> 345, fib 22.7 -> 19.6), debug flags as stored globals. Measured twice and rejected: unowned(unsafe) `fb` local (10-15% slower on calls).
+
+- 2026-09-05: Round 3, part 2 — the big one. Every nested function inside callInternal that captured the hot locals (`pc`, `sp`, `buf`, `fb`, `frame`, ...) was removed: push/pop/peek/peekAt call sites rewritten to direct buffer ops and the helpers deleted, syncBufToFrame/syncFrameToBuf moved to file scope with parameters, and enterInlineFrame expanded textually at its three call sites. Captured `var`s cannot live in registers; with the captures gone the compiler keeps them in registers across the dispatch loop. calls 448 -> 375, method-call 371 -> 316, closure 285 -> 236, fib25 20.4 -> 18.4, alloc 209 -> 192, array-push 242 -> 225 ms. Rule for this file: no nested functions or closures may capture interpreter locals.
+
+- 2026-09-05: Round 3, part 3. Fast trace can now run calls and returns: a `HotState` struct hands the full interpreter state to the trace and back, so it can enter inline callees (call / call_method / get_loc8_call), return from them, and deopt from anywhere. Also added: push_this, closure-variable ops, the Array.prototype.push fast path, float operands for bitwise ops (the int-loop kernel overflows to double and used to deopt on `|0` every iteration), a progress-aware deopt guard that disables blocks that keep bailing out, and a raw-byte test instead of enum `==` per opcode (the bigger function stopped inlining the generic `==`: 15% of a loop). The call-capable variant is ~10% slower per opcode, so the compiler flags blocks that need it (`TraceBlockInfo.hasCalls`) and the lean variant (`executeFastTraceLean`) handles the rest. calls 357 -> 323, method-call 304 -> 271, closure 232 -> 222.
+
+- 2026-09-05: Round 3, part 4. Rarely-used values demoted from trace locals to the handoff struct (stack spills 486 -> 361); `.invalid` handled as a switch case instead of a per-opcode compare; interrupt counter kept in a register inside both trace variants; `set_loc + drop -> put_loc` peephole.
+
+- 2026-09-05: Round 4 ("close the last 2x"). Loop layout: `for`/`while` are now bottom-tested (condition and update parsed into side buffers and appended after the body): one conditional back-edge per iteration instead of three jumps; conditional backward branches are trace entry points. Superinstructions: the six `with_*` opcodes moved to the wide range (they run through the 0x00-prefix path) to free single-byte numbers for `cmp_loc_i8`, `cmp_loc_loc`, `arith_loc_loc`, `arith_loc_i8` (add/sub/mul/and/or/xor), `to_int32`, `arith_const8`, emitted by peepholes on `get_loc push_i8 <op>`, `get_loc get_loc <op>`, `push_0 or`, `push_const <op>`; plus `dup perm3 put_field drop -> put_field` and `dup put_loc drop -> put_loc`. The int loop went from 13 opcodes per iteration to 5. Fused compares branch directly when `if_true8/if_false8` follows (runtime lookahead, no compiler change). Trace: unowned bytecode reference inside the trace (a win there, unlike in the main loop), unmanaged var-ref mirror (`JeffJSObject.varRefsRaw`) so closure-variable access has no ARC, trace entry at function entry and at inline calls (fib went 17.5 -> 11.3 ms: it has no loop, so it never traced before), warm-up threshold 2, and per-function lean/fat variant selection (`fb.traceLean`). Fixed along the way: `super(...)` in derived constructors emitted one `drop` too many (stack one below base; hidden for years by a guarded pop), the main loop's pops are guarded again (`jeffJS_pop`, reports once and disables the trace for that function), and the trace's `drop`/`return` deopt on underflow.
+
+## Round 5 plan: beating QuickJS (2026-09-05)
+
+QuickJS is a C interpreter with computed-goto dispatch; on pure arithmetic loops both engines sit at the interpreter floor and JeffJS is already at parity. The rest of the gap is in places where QuickJS is architecturally weak and a Swift engine can do better, so the plan is to attack those rather than the dispatch:
+
+| # | item | why it wins | kernels |
+|---|---|---|---|
+| 1 | Trace coverage: inner loops of an ineligible outer loop (region merge drops them), `object`/`define_field`/`array_from`/TDZ-slot opcodes in the trace, `push` on arrays without an IC | the alloc and array-push kernels currently never enter a trace at all (profiled: main loop 40%, guarded pops 7%) | alloc, array-push |
+| 2 | ARC-free hot paths: unmanaged object access in the trace's property and call ops, unmanaged `fbFast` mirror, frame acquire without retain, raw IC pointer in the lean trace, store-opcode mask as a literal | retain/release pairs are 15-18% of the calls, closure, fib and property profiles | calls, closure, fib, prop, method |
+| 3 | Raw property storage (`propValues` as an unsafe buffer): no bounds check, uniqueness check or end-mutation call per property read/write | QuickJS does a hash lookup per access; a two-load IC hit beats it | prop, method, alloc |
+| 4 | Plain-object creation fast path (cached proto and root shape, initial slot capacity 4, no class-table lookup) and an object recycle pool | QuickJS mallocs every object; the profile shows malloc/free at 21% and array regrowth at 5% | alloc |
+| 5 | Double fast paths in the fused arithmetic ops | float loop is 1.35x | float |
+| 6 | Frame-less inline calls: no frame object acquire/release per call, smaller saved-state record | call bookkeeping is ~25% of the calls kernel | calls, fib, closure, method |
+
+### Round 5 progress log
+
+- Trace coverage: an outer loop with an unsupported opcode no longer removes its inner loops from tracing (the merged region falls back to the eligible inner candidates); `object`, `define_field` (transition-cache hit), `array_from` (empty literal), `set_loc_uninitialized` and `put_loc_check_init` run in both traces; `arr.push` on an array receiver pushes the cached `Array.prototype.push` without an inline cache so the trace's push fast path applies.
+- Raw property storage: `JeffJSObject.propValues` is a (pointer, count, capacity) triple (`JeffJSPropStorage`), freed in `deinit`; `freeObject` moves it out before releasing the values. `propExtra.count` is mirrored in `propExtraCount`. Inline-cache hits run inside one guaranteed-reference scope (`jeffJS_icRead`/`jeffJS_icWrite`/`jeffJS_icDefine` in JeffJSPropStorage.swift): no retain/release per field access.
+- Object recycle pool (JeffJSObjectPool.swift): plain objects with only data slots are reset and parked on `rt.objectPool` when their refcount reaches zero; `newObjectClass` pops from it. `JEFFJS_NO_POOL=1` disables it. Alloc kernel 182 -> 92 ms (QuickJS 91).
+- Correctness bugs found by the pool (recycling turns a dangling reference into a live one, where before it hit dead-but-intact memory):
+  1. `set_loc_uninitialized` (block re-entry in loops) overwrote the slot without releasing the previous binding: every `let`/`const` inside a loop body leaked one value per iteration (the alloc kernel peaked at 3.7 GB; now 18 MB).
+  2. Closures created in a loop body all saw the last iteration's block-scoped binding (`for (...) { const o = ...; fns.push(() => o) }` gave 2,2,2 for 0,1,2): `createFunction` resolves the parent before compiling its children, so `isCaptured` is never set when the parent's `leave_scope` is expanded into `close_loc`. The expansion now uses the descendant-name over-approximation already used for close_loc stripping. `for-of`/`for-in` loop variables had no per-iteration `close_loc` at all; the continue label now sits before one.
+  3. `Promise.all`/`allSettled`/`any` released their copy of the capability's resolve/reject functions when the combinator returned, while the element closures call them from later microtasks (use-after-free; `allSettled` results silently never arrived). `PromiseAllData` now owns those references and its collected values, released in `deinit`.
+- `put_field` inline-cache hits (main loop and traces) now release the overwritten slot value and the receiver reference, as QuickJS does; the trace's array push fast path releases the callee and receiver references.
+- Zombie mode (`JEFFJS_ZOMBIES=1`) additionally reports calls to freed function objects (`[ZOMBIE-CALL]`), which is what located bug 3.
+
+- Call path without ARC: `fbFastU` (unmanaged mirror of `fbFast`), `acquireFrameU`/`releaseFrameU` with an unmanaged free list (`nextFree`) and a `bufArraysLive` flag instead of two array-count loads per return, the lean trace takes the raw IC pointer (`icEntries`) instead of the cache object (a retain/release pair per property op), the store-opcode mask is a bootstrap-filled stored global (no swift_once per `isStoreOpcode`), and `dupValueFast`/`freeValueFast` inline the plain-object refcount bump for the traces' hot release sites. Calls 220 -> 190 ms, prop 235 -> 181, method 185 -> 170, closure 127 -> 106, fib 11.5 -> 9.5.
+- Ownership audit (memory leaks measured with a per-operation scan, `/tmp/jjbench/leaks`, peak RSS at 1M iterations; 17 MB is the floor). Fixed: inline returns now release the callee's variable slots and the caller's function/receiver/argument slots (`InlineCallFrame.spTop`; heap arguments leaked one reference per call: 728 MB -> 19 MB); detached var-refs are dropped from `frame.liveVarRefs` (closure creation in a loop was quadratic: 40k iterations took 6.3 s, now 0.05 s); string-plus-number leaked the number's string (`jsAdd`); the fused `get_loc8_add` leaked its operands; the generic (non-inline) call sites release the callee and receiver after the call and the arguments when the callee is bytecode; `iterator_close` releases the iterator state and `iteratorClose` its `return` function; `for_of_next` releases the `{value, done}` object; the activation epilogue releases the variable slots of non-generator frames; `put_field` misses (every `this.x = v` that adds a property in a constructor) release the receiver; `put_array_el` releases the receiver; the main loop's array literal releases the parser's sentinel object; dying arrays release their elements (both storages); `JeffJSVarRef.deinit` releases the detached value; array element overwrite releases the old element (both storages); `arr.length = n` and `pop`/`shift` truncate the fast storage and release the dropped elements; `Array.prototype.fill` and `Function.prototype.bind` take their own references (they stored borrowed arguments).
+- Convention now documented and enforced by the zombie stress set (`/tmp/jjbench/zs`, one script per array-storing builtin): the interpreter owns every stack value; `callFunction` borrows func/this/args; builtins that store an argument must dup it. Arguments are released after C-function calls only once every storing builtin dups (today: `push`, `unshift`, `splice`, `concat`, `Object.assign`, `defineProperty`, `Map.set`, ... hand a borrowed argument to an ownership-taking setter, so those calls still leak their arguments; callbacks passed to `map`/`forEach`/`JSON` leak the same way).
+- Still leaking (per-iteration): property reads on string primitives allocate a wrapper that is never released (`str_meth`, 140 B/iter); `JSON.parse`/`stringify` temporaries (650 B/iter); closures passed to C builtins (see above).
+
+## Current standing (2026-09-05, end of round 5)
+
+| kernel | round 4 | now | QuickJS | now vs QuickJS |
+|---|---:|---:|---:|---:|
+| int-loop | 317 | 314 | 314 | 1.00x |
+| float-loop | 239 | 237 | 177 | 1.34x |
+| calls | 225 | 206 | 146 | 1.41x |
+| prop-get-set | 261 | 177 | 138 | 1.28x |
+| method-call | 201 | 177 | 125 | 1.41x |
+| alloc-objs | 180 | 86 | 90 | 0.96x |
+| array-push | 182 | 149 | 108 | 1.38x |
+| string-concat | 18 | 17.7 | 10.3 | 1.71x |
+| closure | 128 | 112 | 69 | 1.62x |
+| fib25 | 11.6 | 10.0 | 5.1 | 1.97x |
+
+Conformance 1706/0. The ownership fixes cost the call kernels about 7% against the interim best (calls 190, method 170, fib 9.5): every inline return now releases the callee's slots and the caller's function/receiver/argument slots, which is required for correctness (heap arguments leaked one reference per call before). Peak memory of the alloc kernel went from 3.7 GB to 18 MB over the round.
+
+### What would beat QuickJS on the remaining kernels
+
+1. Calls/fib/closure (1.4-2x): a frame-less inline call. The `JeffJSStackFrame` object is still acquired and released per call (13 stores plus the free-list link); QuickJS keeps its frame on the C stack. Materialise the frame object only when something observes it (closures, `arguments`, exceptions, generators), and keep the 14-field `InlineCallFrame` record as the only per-call state.
+2. Constructors and `this.x = v`: `put_field` has no transition cache, so every property added in a constructor is an inline-cache miss through `setPropertyChecked` (the `new_class` scan spends most of its time there). Reuse the `define_field` transition cache for adds.
+3. Property access (1.28x): the remaining cost is the cache entry load (56 bytes, 7 fields) and the `extra` check; a two-field entry (shape, slot) for own data properties plus a separate proto entry table would shorten the hit path to compare, load, load.
+4. Strings (1.7x): string-plus-number goes through `toString` + `concatStrings` with two temporaries; a direct int-to-rope append, and the primitive wrapper allocation on `"str".method()` (also the last known per-iteration leak) need a String.prototype lookup that never boxes.
+5. Float loop (1.34x): the fused arithmetic ops decode both operands through the generic numeric path; a double-only fast path in `arith_loc_loc`/`arith_const8` when both tags are float.
+6. Arguments after C-function calls are still leaked (see the convention note above); making every storing builtin dup its stored arguments would let the call sites release arguments unconditionally.
+
+## Current standing (2026-09-05, end of round 4)
+
+| kernel | baseline | round 3 | now | QuickJS | now vs QuickJS |
+|---|---:|---:|---:|---:|---:|
+| int-loop | 1754 | 602 | 317 | 318 | 1.00x |
+| float-loop | 926 | 369 | 239 | 177 | 1.35x |
+| calls | 1294 | 319 | 225 | 148 | 1.53x |
+| prop-get-set | 998 | 341 | 261 | 141 | 1.85x |
+| method-call | 1350 | 270 | 201 | 127 | 1.58x |
+| alloc-objs | 699 | 197 | 180 | 91 | 1.98x |
+| array-push | 823 | 254 | 182 | 110 | 1.65x |
+| string-concat | 65 | 23 | 18 | 10.5 | 1.72x |
+| closure | 740 | 220 | 128 | 70 | 1.84x |
+| fib25 | 44 | 18.6 | 11.6 | 5.1 | 2.27x |
+
+Known latent bugs surfaced by the guarded pop (reported once per run on stderr, harmless because the pop returns undefined and the function is kept out of the traces): a `return` at pc 32/149 and a `put_loc1` at pc 28 in three anonymous test functions pop from an empty stack — compiler stack-effect bugs in some try/finally or completion-value path; and `with` statements do not resolve identifiers against the object (reads throw ReferenceError; the conformance tests wrap them in try/catch). Both predate this work.
+
+Remaining gap, and what would close it: property access (1.85x) is the per-access inline-cache path (about 15 loads and several branches vs QuickJS's shape compare + slot load); allocation (2x) is `JeffJSObject` size (~26 fields) plus the value array; fib/calls (1.5-2.3x) are frame bookkeeping (frame object acquire/release, 13-field call record) and one retain/release pair on frame acquire/release. QuickJS keeps its frame on the C stack with ~8 stores; matching that needs a frame-less inline call design where the JeffJSStackFrame object is materialised only when something observes it (closures, arguments, exceptions).
+
+## Current standing (2026-09-05, end of round 3)
+
+| kernel | baseline | day 1 | round 2 | now | jsc LLInt |
+|---|---:|---:|---:|---:|---:|
+| int-loop | 1754 | 877 | 585 | 602 | 148 |
+| float-loop | 926 | 528 | 362 | 369 | 128 |
+| calls | 1294 | 757 | 470 | 319 | 127 |
+| prop-get-set | 998 | 407 | 335 | 341 | 99 |
+| method-call | 1350 | 626 | 386 | 270 | 154 |
+| alloc-objs | 699 | 330 | 205 | 197 | 37 |
+| array-push | 823 | 311 | 230 | 254 | 72 |
+| string-concat | 65 | 32 | 23 | 23 | 3.5 |
+| closure | 740 | 482 | 331 | 220 | 79 |
+| fib25 | 44 | 33 | 24 | 18.6 | 6.3 |
+
+### Versus C QuickJS (2026-09-05 end of round 3, qjs 2026-06-04 from Homebrew, same kernels)
+
+| kernel | JeffJS | QuickJS | ratio |
+|---|---:|---:|---:|
+| int-loop | 602 | 320 | 1.9x |
+| float-loop | 369 | 175 | 2.1x |
+| calls | 319 | 147 | 2.2x |
+| prop-get-set | 341 | 139 | 2.4x |
+| method-call | 270 | 127 | 2.1x |
+| alloc-objs | 197 | 92 | 2.2x |
+| array-push | 254 | 110 | 2.3x |
+| string-concat | 23 | 11 | 2.1x |
+| closure | 220 | 70 | 3.2x |
+| fib25 | 18.6 | 5.2 | 3.6x |
+
+Round 3 took calls from 3.3x to 2.2x and method calls from 3.1x to 2.1x. Everything except closures and recursion now sits at 1.9-2.4x of C QuickJS. The remaining gap is per-opcode dispatch cost (the lean trace runs ~2.3 ns/op vs ~1.2 for QuickJS's computed-goto loop) plus, for closures and recursion, the retain/release on the bytecode object and the var-ref array per call.
+
+### Next (to reach parity)
+
+1. Superinstructions for loops: `get_loc + push_i8 + lt` -> `lt_loc_i8`, `get_loc8_get_loc8 + add` -> `add_loc_loc`, `push_0 + or` -> `to_int32`, `get_loc + call` with args. Each fusion needs a compiler peephole, the opcode table, and handlers in the main loop AND both trace variants. The narrow opcode space (0-255) is full: move compile-time-only opcodes (scope_*, label_, enter/leave_scope) to the wide range first to free slots; wide opcodes deopt the trace. Expected: 30-40% on tight loops.
+2. Calls: the bytecode object reference is retained/released three times per call (`fbFast` binding, `fb = ...` on entry and on return). unowned(unsafe) locals were measured slower three times; the remaining option is Unmanaged fields in the frame record with explicit `_withUnsafeGuaranteedRef` reads (closures must not capture interpreter locals).
+3. Closures: `varRefs[idx]` retains the var-ref per access and the array per call; an `Unmanaged` element array cached on the function object would remove both.
+4. Objects: `JeffJSObject` has ~26 stored properties; allocation is 2.2x QuickJS mostly from object size and the two arrays.
+
+Measurement trap: `swift test` rebuilds every product in the package with testing enabled, which leaves a slower `jeffjs-cli` binary in `.build/release` (call-heavy kernels 15-25% worse). Always run `swift build -c release --product jeffjs-cli` (which `bench/run.sh` does) before timing.
+
+Known flaky conformance test: `allLoaded18` (Promise.all + executePendingJobs) fails intermittently in every build including the pre-change baseline; likely hash-seed-dependent job ordering, unrelated to this work.
+
+Profiling note: `sample` stopped producing output on 2026-09-05 (hangs or exits silently even by pid); the round-2 targets were chosen by reading bytecode dumps (`JEFFJS_DUMP=1`) and reasoning about the paths instead.
+
+Next up, in order of expected payoff: object allocation (JeffJSObject has ~26 stored properties incl. closures; move rare fields to a side object, or pool objects), trace-native fused arithmetic on locals (`get_loc8_get_loc8 + add` -> one op), constructor calls on the inline path, define_field transition IC for object literals, frame objects (immortal pooled frames with unowned links to remove per-call ARC), superinstructions / cold-opcode split in the dispatch loop (phase 6).

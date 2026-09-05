@@ -1445,19 +1445,27 @@ final class JeffJSParser {
         let breakLabel = newLabel()
         let continueLabel = newLabel()
 
-        emitLabel(continueLabel)
-        emitLabel(loopLabel)
-
+        // Bottom-tested (see parseForClassic): goto test; body: ...;
+        // test: cond; if_true body.
+        let saved = fd.byteCode
+        fd.byteCode = DynBuf()
         parseExpression()
+        let condCode = fd.byteCode
+        fd.byteCode = saved
         expect(0x29) // ')'
 
-        emitIfFalse(breakLabel)
+        let testLabel = newLabel()
+        emitGoto(testLabel)
+        emitLabel(loopLabel)
 
         pushBlockEnv(breakLabel: breakLabel, continueLabel: continueLabel)
         parseStatement()
         popBlockEnv()
 
-        emitGoto(loopLabel)
+        emitLabel(continueLabel)
+        emitLabel(testLabel)
+        appendCode(condCode)
+        emitIfTrue(loopLabel)
         emitLabel(breakLabel)
     }
 
@@ -1739,49 +1747,80 @@ final class JeffJSParser {
     private func parseForClassic(loopLabel: Int, breakLabel: Int,
                                   continueLabel: Int, hasInit: Bool,
                                   loopScopeIdx: Int = -1, isLexical: Bool = false) {
-        // Condition
-        emitLabel(loopLabel)
+        // Bottom-tested layout — one conditional branch per iteration instead
+        // of if_false + goto body + goto cont + goto test:
+        //          [goto test]                (only when there is a condition)
+        //   body:  <statement>
+        //   cont:  [close_loc ...] update ; drop
+        //   test:  cond ; if_true body        (goto body when no condition)
+        //   break:
+        // The condition and update are parsed in source order into side
+        // buffers and appended after the body. Nothing in expression parsing
+        // records absolute byte positions (labels are pseudo-ops resolved
+        // later), so the splice is safe.
+        var condCode: DynBuf? = nil
         if tok != 0x3B {
+            let saved = fd.byteCode
+            fd.byteCode = DynBuf()
             parseExpression()
-            emitIfFalse(breakLabel)
+            condCode = fd.byteCode
+            fd.byteCode = saved
         }
         expect(0x3B) // ';'
 
-        // Update expression -- we jump past it on first iteration
-        let updateLabel = newLabel()
-        emitGoto(updateLabel) // skip update on first pass -- NO: jump to body
-
-        emitLabel(continueLabel)
-        // Per-iteration let scope: emit close_loc for lexical variables
-        // BEFORE the update expression. This detaches any closures created
-        // in the body so they capture the current iteration's value.
-        if isLexical && loopScopeIdx >= 0 && loopScopeIdx < fd.scopes.count {
-            var varIdx = fd.scopes[loopScopeIdx].first
-            while varIdx >= 0 && varIdx < fd.vars.count {
-                let v = fd.vars[varIdx]
-                if v.isLexical {
-                    emitOp(.close_loc)
-                    emitU16(UInt16(varIdx))
+        // Update section (with the per-iteration close_loc for lexical loop
+        // variables, emitted BEFORE the update so closures created in the
+        // body capture the current iteration's value).
+        let updateCode: DynBuf
+        do {
+            let saved = fd.byteCode
+            fd.byteCode = DynBuf()
+            if isLexical && loopScopeIdx >= 0 && loopScopeIdx < fd.scopes.count {
+                var varIdx = fd.scopes[loopScopeIdx].first
+                while varIdx >= 0 && varIdx < fd.vars.count {
+                    let v = fd.vars[varIdx]
+                    if v.isLexical {
+                        emitOp(.close_loc)
+                        emitU16(UInt16(varIdx))
+                    }
+                    varIdx = v.scopeNext
                 }
-                varIdx = v.scopeNext
             }
+            if tok != 0x29 { // ')'
+                parseExpression()
+                emitOp(.drop)
+            }
+            updateCode = fd.byteCode
+            fd.byteCode = saved
         }
-        if tok != 0x29 { // ')'
-            parseExpression()
-            emitOp(.drop)
-        }
-        emitGoto(loopLabel)
-
-        // Body
-        emitLabel(updateLabel)
         expect(0x29) // ')'
 
+        let testLabel = newLabel()
+        if condCode != nil { emitGoto(testLabel) }
+
+        // Body
+        emitLabel(loopLabel)
         pushBlockEnv(breakLabel: breakLabel, continueLabel: continueLabel)
         parseStatement()
         popBlockEnv()
 
-        emitGoto(continueLabel)
+        emitLabel(continueLabel)
+        appendCode(updateCode)
+        emitLabel(testLabel)
+        if let cc = condCode {
+            appendCode(cc)
+            emitIfTrue(loopLabel)
+        } else {
+            emitGoto(loopLabel)
+        }
         emitLabel(breakLabel)
+    }
+
+    /// Append bytecode parsed into a side buffer (see parseForClassic).
+    private func appendCode(_ code: DynBuf) {
+        if code.len > 0 {
+            fd.byteCode.putBytes(code.buf[0 ..< code.len])
+        }
     }
 
     /// Parse for-in loop body.
@@ -1800,7 +1839,6 @@ final class JeffJSParser {
         let doneLabel = newLabel()
 
         emitLabel(loopLabel)
-        emitLabel(continueLabel)
 
         // Get next key: for_in_next peeks the iterator and pushes [value, done].
         // Stack after: [iter, value, done]
@@ -1824,6 +1862,12 @@ final class JeffJSParser {
         parseStatement()
         popBlockEnv()
 
+        // Per-iteration binding (see parseForOf).
+        emitLabel(continueLabel)
+        if varIdx >= 0 {
+            emitOp(.close_loc)
+            emitU16(UInt16(varIdx))
+        }
         emitGoto(loopLabel)
 
         // Done exit: for_in_next pushed [value, done]. if_true popped done,
@@ -1857,7 +1901,6 @@ final class JeffJSParser {
         let doneLabel = newLabel()
 
         emitLabel(loopLabel)
-        emitLabel(continueLabel)
 
         // Get next value: for_of_next extracts {value, done} from the
         // iterator result and pushes [iter, obj, method, value, done].
@@ -1878,6 +1921,15 @@ final class JeffJSParser {
         parseStatement()
         popBlockEnv()
 
+        // Per-iteration binding: detach closures that captured this
+        // iteration's loop variable before the next value is stored.
+        // `continue` lands here too. resolveVariables drops the close_loc
+        // when no descendant references the name.
+        emitLabel(continueLabel)
+        if varIdx >= 0 {
+            emitOp(.close_loc)
+            emitU16(UInt16(varIdx))
+        }
         emitGoto(loopLabel)
 
         // Done exit: for_of_next pushed [iter, obj, method, value, done].
@@ -1905,6 +1957,7 @@ final class JeffJSParser {
 
         let breakLabel = newLabel()
         let scopeIdx = pushScope()
+        if scopeIdx >= 0 && scopeIdx < fd.scopes.count { fd.scopes[scopeIdx].isSwitch = true }
         pushBlockEnv(breakLabel: breakLabel, continueLabel: -1)
 
         // Interleaved single-pass switch compilation with fall-through support.
@@ -4538,9 +4591,12 @@ final class JeffJSParser {
                     // with the derived constructor's `this` as the receiver.
                     // Stack: ..., this, parentCtor, arg0, ..., argN
                     emitCallMethod(argc)
-                    // The result is the return value of the parent constructor.
-                    // Typically undefined, so drop it.
+                    // Drop the parent constructor's return value and leave
+                    // `this` as the value of the `super(...)` expression (ES
+                    // semantics). The enclosing statement drops that; emitting
+                    // only the drop here left the stack one below its base.
                     emitOp(.drop)
+                    emitOp(.push_this)
                 } else if hasSpread {
                     // The .apply opcode expects stack: [thisObj, funcVal, argsArray].
                     // For plain function calls the parser only has [funcVal, argsArray]

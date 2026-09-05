@@ -648,7 +648,13 @@ final class JeffJSBytecodeCache {
     private(set) var diskHitCount: Int = 0
 
     /// Runtime for atom remapping during deserialization.
-    weak var rt: JeffJSRuntime?
+    ///
+    /// unowned(unsafe), not weak: a weak reference to the runtime forces a
+    /// side-table entry on it, after which EVERY retain/release of the runtime
+    /// (one pair per interpreter call for `ctx.rt`, one per GC object
+    /// creation for `ownerRuntime`) takes the slow path. The cache is owned by
+    /// the runtime, so it can never outlive it.
+    unowned(unsafe) var rt: JeffJSRuntime?
 
     // MARK: - Disk Cache
 
@@ -662,7 +668,7 @@ final class JeffJSBytecodeCache {
     ///   - JeffJSCompiler.swift (resolveLabels, resolveVariables, peephole)
     ///   - JeffJSOpcodes.swift (opcode additions/changes)
     ///   - JeffJSInterpreter.swift (only if opcode semantics change)
-    static let compilerVersion: UInt64 = 1  // 2026-04-03: initial after try-finally + postfix++ fixes
+    static let compilerVersion: UInt64 = 2  // 2026-09-05: opcode renumbering (with_* evicted to wide; fused superinstructions)
 
     /// Lazily-initialized disk cache directory.
     /// Automatically clears cached .jfbc files when the app binary changes (new build).

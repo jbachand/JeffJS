@@ -665,8 +665,8 @@ func jeffJS_defineBuiltinFunc(ctx: JeffJSContext, obj: JeffJSObject,
     let flags: JeffJSPropertyFlags = [.writable, .configurable]
     jeffJS_addProperty(ctx: ctx, obj: obj, atom: atom, flags: flags)
     // Set the value in the slot that jeffJS_addProperty just appended.
-    if !obj.prop.isEmpty {
-        obj.prop[obj.prop.count - 1] = .value(funcVal)
+    if !obj.propValues.isEmpty {
+        obj.setPropEntry(at: obj.propValues.count - 1, .value(funcVal))
     }
     ctx.rt.freeAtom(atom)
 }
@@ -679,8 +679,8 @@ func jeffJS_setPropertyStr(ctx: JeffJSContext, obj: JeffJSObject,
     let flags: JeffJSPropertyFlags = [.writable, .configurable]
     jeffJS_addProperty(ctx: ctx, obj: obj, atom: atom, flags: flags)
     // Set the value in the slot that jeffJS_addProperty just appended.
-    if !obj.prop.isEmpty {
-        obj.prop[obj.prop.count - 1] = .value(value)
+    if !obj.propValues.isEmpty {
+        obj.setPropEntry(at: obj.propValues.count - 1, .value(value))
     }
     ctx.rt.freeAtom(atom)
 }

@@ -1101,10 +1101,11 @@ extension JeffJSContext {
 
     func getPropertyUInt32(obj: JeffJSValue, index: UInt32) -> JeffJSValue {
         guard let jsObj = obj.toObject() else { return .undefined }
-        if case .array(_, let vals, let count) = jsObj.payload {
-            if index < count && Int(index) < vals.count {
-                return vals[Int(index)]
-            }
+        if jsObj.classID == JeffJSClassID.array.rawValue {
+            // Authoritative storage (the enum payload is stale once the
+            // ref-type store exists); owned reference like every getter.
+            let v = jsObj.getArrayElement(index)
+            if !v.isUndefined { return v.dupValue() }
         }
         // Fall back to string-keyed lookup
         return getPropertyStr(obj: obj, name: String(index))

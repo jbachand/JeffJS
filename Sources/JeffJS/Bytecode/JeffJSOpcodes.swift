@@ -263,12 +263,12 @@ enum JeffJSOpcode: UInt16, CaseIterable {
     // ---------------------------------------------------------------
     // with statement variable access
     // ---------------------------------------------------------------
-    case with_get_var            // with_get_var(atom, label, u8)
-    case with_put_var            // with_put_var(atom, label, u8)
-    case with_delete_var         // with_delete_var(atom, label, u8)
-    case with_make_ref           // with_make_ref(atom, label, u8)
-    case with_get_ref            // with_get_ref(atom, label, u8)
-    case with_get_ref_undef      // with_get_ref_undef(atom, label, u8)
+    case cmp_loc_i8              // cmp_loc_i8(cmp:u8, loc8, i8) - push (local <cmp> imm)   [fused get_loc push_i8 <cmp>]
+    case cmp_loc_loc             // cmp_loc_loc(cmp:u8, loc8, loc8) - push (a <cmp> b)   [fused get_loc get_loc <cmp>]
+    case arith_loc_loc           // arith_loc_loc(op:u8, loc8, loc8) - push (a op b)   [fused get_loc get_loc add|sub|mul]
+    case arith_loc_i8            // arith_loc_i8(op:u8, loc8, i8) - push (local op imm)
+    case to_int32                // to_int32 - TOS = ToInt32(TOS)   [fused push_0 or]
+    case arith_const8            // arith_const8(op:u8, const8) - TOS = TOS op cpool[k]
 
     // ---------------------------------------------------------------
     // Reference construction
@@ -477,6 +477,15 @@ enum JeffJSOpcode: UInt16, CaseIterable {
     case get_field_opt_chain     // optional chaining get field (atom)
     case get_array_el_opt_chain  // optional chaining get element
     case line_num                // line_num(u32 line, u32 col) - source map info
+    // Evicted from the single-byte range to make room for the fused
+    // superinstructions above (rare `with` statement; executed through the
+    // wide-prefix path in the interpreter).
+    case with_get_var            // with_get_var(atom, label, u8)
+    case with_put_var            // with_put_var(atom, label, u8)
+    case with_delete_var         // with_delete_var(atom, label, u8)
+    case with_make_ref           // with_make_ref(atom, label, u8)
+    case with_get_ref            // with_get_ref(atom, label, u8)
+    case with_get_ref_undef      // with_get_ref_undef(atom, label, u8)
 }
 
 // MARK: - Opcode Info Table
@@ -878,22 +887,22 @@ let jeffJSOpcodeInfo: [OpcodeInfo] = [
 
     // with_get_var: get variable through with scope
     // size=10: 1 opcode + 4 bytes atom + 4 bytes label + 1 byte u8
-    OpcodeInfo(name: "with_get_var",     size: 10, nPop: 1, nPush: 1,  format: .atom_label_u8),
+    OpcodeInfo(name: "cmp_loc_i8",       size: 4, nPop: 0,  nPush: 1,  format: .u8),
+    OpcodeInfo(name: "cmp_loc_loc",      size: 4, nPop: 0,  nPush: 1,  format: .u8),
+    OpcodeInfo(name: "arith_loc_loc",    size: 4, nPop: 0,  nPush: 1,  format: .u8),
+    OpcodeInfo(name: "arith_loc_i8",     size: 4, nPop: 0,  nPush: 1,  format: .u8),
+    OpcodeInfo(name: "to_int32",         size: 1, nPop: 1,  nPush: 1,  format: .none),
+    OpcodeInfo(name: "arith_const8",     size: 3, nPop: 1,  nPush: 1,  format: .u8),
 
     // with_put_var
-    OpcodeInfo(name: "with_put_var",     size: 10, nPop: 2, nPush: 1,  format: .atom_label_u8),
 
     // with_delete_var
-    OpcodeInfo(name: "with_delete_var",  size: 10, nPop: 1, nPush: 1,  format: .atom_label_u8),
 
     // with_make_ref
-    OpcodeInfo(name: "with_make_ref",    size: 10, nPop: 1, nPush: 2,  format: .atom_label_u8),
 
     // with_get_ref
-    OpcodeInfo(name: "with_get_ref",     size: 10, nPop: 1, nPush: 2,  format: .atom_label_u8),
 
     // with_get_ref_undef
-    OpcodeInfo(name: "with_get_ref_undef", size: 10, nPop: 1, nPush: 2, format: .atom_label_u8),
 
     // ---------------------------------------------------------------
     // Reference construction
@@ -1239,6 +1248,12 @@ let jeffJSOpcodeInfo: [OpcodeInfo] = [
     // line_num: source line and column for debugging
     // size=9: 1 opcode + 4 bytes line (u32) + 4 bytes col (u32)
     OpcodeInfo(name: "line_num",         size: 9, nPop: 0,  nPush: 0,  format: .u32),
+    OpcodeInfo(name: "with_get_var",     size: 10, nPop: 1, nPush: 1,  format: .atom_label_u8),
+    OpcodeInfo(name: "with_put_var",     size: 10, nPop: 2, nPush: 1,  format: .atom_label_u8),
+    OpcodeInfo(name: "with_delete_var",  size: 10, nPop: 1, nPush: 1,  format: .atom_label_u8),
+    OpcodeInfo(name: "with_make_ref",    size: 10, nPop: 1, nPush: 2,  format: .atom_label_u8),
+    OpcodeInfo(name: "with_get_ref",     size: 10, nPop: 1, nPush: 2,  format: .atom_label_u8),
+    OpcodeInfo(name: "with_get_ref_undef", size: 10, nPop: 1, nPush: 2, format: .atom_label_u8),
 ]
 
 // MARK: - Opcode Lookup Helpers

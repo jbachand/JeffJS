@@ -15,7 +15,7 @@
 	<key>optimize.shortOpcodes</key>
 	<true/>
 	<key>optimize.useInlineCalls</key>
-	<false/>
+	<true/>
 	<key>cache.bytecodeEnabled</key>
 	<false/>
 	<key>cache.bytecodePrefixes</key>
@@ -25,7 +25,7 @@
 	<key>cache.bytecodeMaxSize</key>
 	<integer>1000000</integer>
 	<key>trace.hitThreshold</key>
-	<integer>16</integer>
+	<integer>2</integer>
 	<key>stack.maxCallDepth</key>
 	<integer>200</integer>
 	<key>stack.maxLocalVars</key>
@@ -50,6 +50,8 @@
 	<integer>1024</integer>
 	<key>shapes.hashBits</key>
 	<integer>4</integer>
+	<key>shapes.maxHashed</key>
+	<integer>16384</integer>
 	<key>strings.ropeShortLen</key>
 	<integer>512</integer>
 	<key>strings.ropeShort2Len</key>

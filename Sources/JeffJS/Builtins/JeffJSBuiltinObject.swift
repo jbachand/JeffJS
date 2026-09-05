@@ -45,8 +45,8 @@ extension JeffJSContext {
         obj.classID = JSClassID.JS_CLASS_OBJECT.rawValue
         obj.extensible = true
         let protoObj = proto.toObject()
-        // Always create a shape so property operations work correctly.
-        obj.shape = JeffJSShape()
+        // Start on the shared root shape for this prototype.
+        obj.shape = jeffJS_rootShape(self, proto: protoObj)
         // obj.proto is the single source of truth; its setter auto-syncs shape.proto.
         obj.proto = protoObj
         return JeffJSValue.makeObject(obj)
@@ -411,6 +411,7 @@ extension JeffJSContext {
             return throwTypeError(message: "not an object")
         }
         jsObj.extensible = false
+        prepareShapeUpdate(self, jsObj)   // flags are per-object: unshare first
         if let shape = jsObj.shape {
             for i in 0 ..< shape.prop.count where shape.prop[i].atom != 0 {
                 shape.prop[i].flags.remove(.configurable)

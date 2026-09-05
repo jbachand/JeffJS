@@ -13,6 +13,168 @@
 
 import Foundation
 
+/// Numeric value of an int or float64 JeffJSValue (trace arithmetic).
+@inline(__always)
+func jeffJS_traceNum(_ v: JeffJSValue) -> Double {
+    v.isInt ? Double(v.toInt32()) : v.toFloat64()
+}
+
+/// ToInt32 for an int or float64 value (trace bitwise ops on float operands).
+@inline(__always)
+func jeffJS_traceToInt32(_ v: JeffJSValue) -> Int32 {
+    v.isInt ? v.toInt32() : JeffJSTypeConvert.doubleToInt32(v.toFloat64())
+}
+
+// MARK: - Fused compare / arithmetic superinstructions
+// Sub-opcode byte: compare 0 lt, 1 lte, 2 gt, 3 gte, 4 eq, 5 neq, 6 strict_eq,
+// 7 strict_neq; arithmetic 0 add, 1 sub, 2 mul. Emitted by the compiler
+// peepholes (get_loc push_i8 <op>, get_loc get_loc <op>, push_const <op>).
+
+@inline(__always)
+func jeffJS_cmpInt(_ cmp: UInt8, _ x: Int32, _ y: Int32) -> Bool {
+    switch cmp {
+    case 0: return x < y
+    case 1: return x <= y
+    case 2: return x > y
+    case 3: return x >= y
+    case 4, 6: return x == y
+    default: return x != y
+    }
+}
+
+@inline(__always)
+func jeffJS_cmpDouble(_ cmp: UInt8, _ x: Double, _ y: Double) -> Bool {
+    switch cmp {
+    case 0: return x < y
+    case 1: return x <= y
+    case 2: return x > y
+    case 3: return x >= y
+    case 4, 6: return x == y
+    default: return x != y
+    }
+}
+
+/// Generic (non-numeric) fused compare, mirroring the main loop's slow paths.
+/// Consumes both values. nil on exception.
+@inline(never)
+func jeffJS_cmpGeneric(_ ctx: JeffJSContext, _ cmp: UInt8, _ lhs: JeffJSValue, _ rhs: JeffJSValue) -> Bool? {
+    defer { lhs.freeValue(); rhs.freeValue() }
+    switch cmp {
+    case 0:
+        let (c, ok) = JeffJSOperators.jsCompare(ctx: ctx, lhs: lhs, rhs: rhs); return ok ? (c < 0) : nil
+    case 1:
+        let (c, ok) = JeffJSOperators.jsCompare(ctx: ctx, lhs: rhs, rhs: lhs); return ok ? (c == 0) : nil
+    case 2:
+        let (c, ok) = JeffJSOperators.jsCompare(ctx: ctx, lhs: rhs, rhs: lhs); return ok ? (c < 0) : nil
+    case 3:
+        let (c, ok) = JeffJSOperators.jsCompare(ctx: ctx, lhs: lhs, rhs: rhs); return ok ? (c == 0) : nil
+    case 4:
+        let (r, ok) = JeffJSOperators.jsEq(ctx: ctx, lhs: lhs, rhs: rhs); return ok ? r : nil
+    case 5:
+        let (r, ok) = JeffJSOperators.jsEq(ctx: ctx, lhs: lhs, rhs: rhs); return ok ? !r : nil
+    case 6:
+        return JeffJSOperators.jsStrictEq(lhs: lhs, rhs: rhs)
+    default:
+        return !JeffJSOperators.jsStrictEq(lhs: lhs, rhs: rhs)
+    }
+}
+
+/// Int32 arithmetic with the same overflow-to-double rules as add/sub/mul.
+@inline(__always)
+func jeffJS_arithInt(_ ar: UInt8, _ x: Int32, _ y: Int32) -> JeffJSValue {
+    switch ar {
+    case 0:
+        let (r, o) = x.addingReportingOverflow(y)
+        return o ? .newFloat64(Double(x) + Double(y)) : .newInt32(r)
+    case 1:
+        let (r, o) = x.subtractingReportingOverflow(y)
+        return o ? .newFloat64(Double(x) - Double(y)) : .newInt32(r)
+    case 2:
+        let a = Int64(x), b = Int64(y)
+        let r = a * b
+        if r >= Int64(Int32.min) && r <= Int64(Int32.max) && !(r == 0 && (a < 0 || b < 0)) {
+            return .newInt32(Int32(r))
+        }
+        return .newFloat64(Double(a) * Double(b))
+    case 3: return .newInt32(x & y)
+    case 4: return .newInt32(x | y)
+    default: return .newInt32(x ^ y)
+    }
+}
+
+/// Numeric (double operand) result of a fused arithmetic op. Sub-ops 3-5 are
+/// the bitwise and/or/xor and produce an int32 like the plain opcodes do.
+@inline(__always)
+func jeffJS_arithNumeric(_ ar: UInt8, _ x: Double, _ y: Double) -> JeffJSValue {
+    switch ar {
+    case 0: return .newFloat64(x + y)
+    case 1: return .newFloat64(x - y)
+    case 2: return .newFloat64(x * y)
+    case 3: return .newInt32(JeffJSTypeConvert.doubleToInt32(x) & JeffJSTypeConvert.doubleToInt32(y))
+    case 4: return .newInt32(JeffJSTypeConvert.doubleToInt32(x) | JeffJSTypeConvert.doubleToInt32(y))
+    default: return .newInt32(JeffJSTypeConvert.doubleToInt32(x) ^ JeffJSTypeConvert.doubleToInt32(y))
+    }
+}
+
+/// Generic fused arithmetic (strings, objects, ...); consumes both values.
+/// nil on exception.
+@inline(never)
+func jeffJS_arithGeneric(_ ctx: JeffJSContext, _ ar: UInt8, _ lhs: JeffJSValue, _ rhs: JeffJSValue) -> JeffJSValue? {
+    if ar == 0 {
+        let r = JeffJSOperators.jsAdd(ctx: ctx, lhs: lhs, rhs: rhs)
+        lhs.freeValue(); rhs.freeValue()
+        return r.isException ? nil : r
+    }
+    let (a, ok1) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lhs)
+    let (b, ok2) = JeffJSTypeConvert.toNumber(ctx: ctx, val: rhs)
+    lhs.freeValue(); rhs.freeValue()
+    if !ok1 || !ok2 { return nil }
+    return jeffJS_arithNumeric(ar, a, b)
+}
+
+/// Guarded pop for the main dispatch loop (the fallback interpreter): a
+/// bytecode sequence that pops more than it pushed returns undefined and is
+/// reported once instead of reading below the value buffer. File-scope so it
+/// captures none of the interpreter's locals (which would pin them to memory).
+@inline(__always)
+func jeffJS_pop(_ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: inout Int, _ spBase: Int,
+                _ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int) -> JeffJSValue {
+    if sp <= spBase {
+        jeffJS_reportStackUnderflow(ctx, fb, pc, sp, spBase)
+        return .undefined
+    }
+    sp -= 1
+    return buf[sp]
+}
+
+nonisolated(unsafe) var jeffJS_underflowReports = 0
+
+@inline(never)
+func jeffJS_reportStackUnderflow(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int, _ sp: Int, _ spBase: Int) {
+    // The traces have no per-pop guards: keep this function out of them.
+    fb.traceEntryEnabled = false
+    if let blocks = fb.traceBlocks { for b in blocks.values { b.isActive = false; b.disabled = true } }
+    guard jeffJS_underflowReports < 8 else { return }
+    jeffJS_underflowReports += 1
+    let opName: String
+    if pc >= 0, pc < fb.bytecodeLen {
+        let raw = fb.bytecode[pc]
+        opName = raw == 0 && pc + 1 < fb.bytecodeLen ? "wide:\(fb.bytecode[pc + 1])" : (jeffJSGetOpcodeInfo(raw)?.name ?? "?\(raw)")
+    } else { opName = "?" }
+    let fname = ctx.rt.atomToString((fb as? JeffJSFunctionBytecodeCompiled)?.funcNameAtom ?? 0) ?? "<anon>"
+    FileHandle.standardError.write("[JeffJS] VM stack underflow: op=\(opName) pc=\(pc) sp=\(sp) spBase=\(spBase) in \(fname)\n".data(using: .utf8)!)
+}
+
+/// Branch-condition fast path: comparison opcodes push exact JS_TRUE/JS_FALSE
+/// bit patterns, so most `if_false`/`if_true` conditions never need the
+/// generic ToBoolean.
+@inline(__always)
+func jeffJS_fastToBool(_ v: JeffJSValue) -> Bool {
+    if v.bits == JeffJSValue.JS_TRUE.bits { return true }
+    if v.bits == JeffJSValue.JS_FALSE.bits { return false }
+    return JeffJSTypeConvert.toBool(v)
+}
+
 // =============================================================================
 // MARK: - JeffJSContext API Bridge Helpers
 // =============================================================================
@@ -84,6 +246,9 @@ extension JeffJSContext {
     /// Calls a JS function with the given this-value and arguments.
     /// Dispatches to C-function path or bytecode interpreter path.
     func callFunction(_ funcVal: JeffJSValue, thisVal: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        if jeffJSZombiesEnabled, let zo = funcVal.obj, zo.asClass.freeMark {
+            JeffJSZombieDebug.reportTouch("CALL", zo.asClass)   // calling a dead function: an under-retained reference
+        }
         // activeRuntime is already set by JeffJSContext.init or eval() —
         // no need to write the static on every call.
 
@@ -479,7 +644,18 @@ extension JeffJSContext {
                             varIdx: UInt16(cv.varIdx),
                             parentFrame: parentFrame
                         )
+                        // Direct slot pointer (see JeffJSVarRef.slot). Generator /
+                        // async frames re-acquire their buffer on resume, so they
+                        // keep the frame-based lookup.
+                        if !fb.isGenerator, !fb.isAsyncFunc, let b = parentFrame.buf {
+                            if cv.isArg {
+                                if cv.varIdx < parentFrame.bufVarBase { vr.slot = b + cv.varIdx }
+                            } else {
+                                vr.slot = b + parentFrame.bufVarBase + cv.varIdx
+                            }
+                        }
                         parentFrame.liveVarRefs.append(vr)
+                        parentFrame.hasLiveVarRefs = true
                         childVarRefs.append(vr)
                     }
                 } else {
@@ -517,7 +693,7 @@ extension JeffJSContext {
 
         // Ensure shape exists — use zero-alloc initial shape
         if obj.shape == nil {
-            obj.shape = createShape(self, proto: closureProto, hashSize: 0, propSize: 0)
+            obj.shape = jeffJS_rootShape(self, proto: closureProto)
         }
         // Set proto after shape (proto may already be synced via shape)
         obj.proto = closureProto
@@ -868,10 +1044,10 @@ extension JeffJSContext {
         if let gObj = globalObj.toObject() {
             let idx = jeffJS_findOwnPropertyIndex(obj: gObj, atom: atom)
             if idx >= 0 {
-                if let shape = gObj.shape, idx < gObj.prop.count,
+                if let shape = gObj.shape, idx < gObj.propCount,
                    !shape.prop[idx].flags.contains(.getset),
-                   case .value(let v) = gObj.prop[idx] {
-                    return v.dupValue()
+                   gObj.extra(at: idx) == nil {
+                    return gObj.dataValue(at: idx).dupValue()
                 }
                 // Accessor or exotic slot — take the full path.
                 return getProperty(obj: globalObj, atom: atom)
@@ -899,11 +1075,12 @@ extension JeffJSContext {
         // Fast path: overwrite an existing writable data property in place.
         if let gObj = globalObj.toObject(), let shape = gObj.shape {
             let idx = jeffJS_findOwnPropertyIndex(obj: gObj, atom: atom)
-            if idx >= 0, idx < gObj.prop.count {
+            if idx >= 0, idx < gObj.propCount {
                 let f = shape.prop[idx].flags
                 if !f.contains(.getset), f.contains(.writable),
-                   case .value(let old) = gObj.prop[idx] {
-                    gObj.prop[idx] = .value(val)
+                   gObj.extra(at: idx) == nil {
+                    let old = gObj.propValues[idx]
+                    gObj.propValues[idx] = val
                     old.freeValue()
                     return true
                 }
@@ -1243,8 +1420,8 @@ extension JeffJSContext {
             if excludedAtoms.contains(atom) { continue }
             // Only copy enumerable properties
             if !shapeProp.flags.contains(.enumerable) { continue }
-            guard i < srcObj.prop.count else { continue }
-            let propEntry = srcObj.prop[i]
+            guard i < srcObj.propCount else { continue }
+            let propEntry = srcObj.propEntry(at: i)
             if case .value(let val) = propEntry {
                 _ = setProperty(obj: target, atom: atom, value: val.dupValue())
             }
@@ -1369,16 +1546,35 @@ extension JeffJSContext {
     /// var-ref's own `value` storage so the closure keeps working after the
     /// parent frame is gone.
     func closeLexicalVar(frame: JeffJSStackFrame, idx: Int) {
-        guard idx < frame.varBuf.count else { return }
-        let val = frame.varBuf[idx]
-        // Detach every live var-ref that targets this local slot.
-        for vr in frame.liveVarRefs {
+        let val: JeffJSValue
+        if let b = frame.buf {
+            guard idx < frame.varCount else { return }
+            val = b[frame.bufVarBase + idx]
+        } else {
+            guard idx < frame.varBuf.count else { return }
+            val = frame.varBuf[idx]
+        }
+        // Detach every live var-ref that targets this local slot, and drop
+        // detached refs from the list: it used to grow by one per closure
+        // created in a loop and was scanned on every close_loc (quadratic).
+        var i = 0
+        var n = frame.liveVarRefs.count
+        while i < n {
+            let vr = frame.liveVarRefs[i]
             if !vr.isDetached && !vr.isArg && Int(vr.varIdx) == idx {
                 vr.value = val.dupValue()
                 vr.isDetached = true
-                vr.parentFrame = nil
+                vr.parentFrame = nil; vr.slot = nil
+            }
+            if vr.isDetached {
+                n -= 1
+                if i != n { frame.liveVarRefs.swapAt(i, n) }
+            } else {
+                i += 1
             }
         }
+        if n < frame.liveVarRefs.count { frame.liveVarRefs.removeLast(frame.liveVarRefs.count - n) }
+        if n == 0 { frame.hasLiveVarRefs = false }
     }
 
     /// Converts a value to a property key (string or symbol).
@@ -1588,7 +1784,7 @@ extension JeffJSContext {
     /// Checks if an iterator result is done.
     func iteratorCheckDone(result: JeffJSValue) -> Bool {
         let done = getPropertyStr(obj: result, name: "done")
-        return JeffJSTypeConvert.toBool(done)
+        return jeffJS_fastToBool(done)
     }
 
     /// Gets the value from an iterator result.
@@ -1600,8 +1796,10 @@ extension JeffJSContext {
     func iteratorClose(iter: JeffJSValue, isThrow: Bool) {
         let returnFn = getPropertyStr(obj: iter, name: "return")
         if returnFn.isFunction {
-            _ = callFunction(returnFn, thisVal: iter, args: [])
+            let r = callFunction(returnFn, thisVal: iter, args: [])
+            r.freeValue()
         }
+        returnFn.freeValue()
     }
 
     /// Calls a specific method on an iterator.
@@ -1754,11 +1952,25 @@ private func readI32(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> Int32 {
 /// opcode that pops a value from the stack.  Used to detect chained
 /// assignment patterns (e.g., `a = b = c = 5`) where intermediate stores
 /// must keep the value on the stack for the next store.
-@inline(__always)
 /// 256-bit store-opcode membership mask, indexed by raw opcode byte.
 /// `isStoreOpcode` runs on EVERY put_loc/put_var execution (chained-assignment
 /// lookahead), so it must be a couple of bit ops — not an enum init + switch.
-private let jeffJS_storeOpcodeMask: (UInt64, UInt64, UInt64, UInt64) = {
+/// True for a plain bytecode function: its frame borrows the caller's
+/// argument references only for the duration of the call, so the caller
+/// may release them afterwards. Generators and async functions keep their
+/// frame (and those references) alive across suspensions.
+@inline(__always)
+func jeffJS_isPlainBytecodeCallee(_ v: JeffJSValue) -> Bool {
+    guard let o = v.obj, let fb = o.fbFast else { return false }
+    return !fb.isGenerator && !fb.isAsyncFunc
+}
+
+/// Filled once at runtime bootstrap (jeffJS_computeStoreOpcodeMask): a
+/// stored global is a plain load, a lazily-initialised `let` costs a
+/// swift_once-guarded addressor call on every isStoreOpcode.
+nonisolated(unsafe) var jeffJS_storeOpcodeMask: (UInt64, UInt64, UInt64, UInt64) = (0, 0, 0, 0)
+
+func jeffJS_computeStoreOpcodeMask() {
     var m: (UInt64, UInt64, UInt64, UInt64) = (0, 0, 0, 0)
     let ops: [JeffJSOpcode] = [
         .put_loc, .put_loc0, .put_loc1, .put_loc2, .put_loc3, .put_loc8,
@@ -1778,8 +1990,8 @@ private let jeffJS_storeOpcodeMask: (UInt64, UInt64, UInt64, UInt64) = {
         default: m.3 |= bit
         }
     }
-    return m
-}()
+    jeffJS_storeOpcodeMask = m
+}
 
 @inline(__always)
 private func isStoreOpcode(_ bc: UnsafePointer<UInt8>, _ pos: Int, _ bcLen: Int) -> Bool {
@@ -1795,6 +2007,22 @@ private func isStoreOpcode(_ bc: UnsafePointer<UInt8>, _ pos: Int, _ bcLen: Int)
     }
 }
 
+/// True if `b` is one of the plain-call opcodes (call, call0…call3) that read
+/// `frame.lastGetFieldReceiver` as the method `this`. Used by get_field to
+/// decide whether to stash the receiver: the call consumer requires the call to
+/// sit exactly 5 bytes after the get_field (pc == lastGetFieldPC + 5), so only a
+/// directly-following call needs the stash. `call_method`/`call_constructor`
+/// take their receiver from the stack instead and are intentionally excluded.
+/// All five opcodes are < 256, so a single-byte compare is exact.
+@inline(__always)
+private func isCallOpcodeByte(_ b: UInt8) -> Bool {
+    b == UInt8(truncatingIfNeeded: JeffJSOpcode.call.rawValue)
+        || b == UInt8(truncatingIfNeeded: JeffJSOpcode.call0.rawValue)
+        || b == UInt8(truncatingIfNeeded: JeffJSOpcode.call1.rawValue)
+        || b == UInt8(truncatingIfNeeded: JeffJSOpcode.call2.rawValue)
+        || b == UInt8(truncatingIfNeeded: JeffJSOpcode.call3.rawValue)
+}
+
 // =============================================================================
 // MARK: - Fast Trace Mini-Interpreter
 // =============================================================================
@@ -1807,37 +2035,179 @@ private func isStoreOpcode(_ bc: UnsafePointer<UInt8>, _ pos: Int, _ bcLen: Int)
 ///   - On interrupt/exception: returns -1 (caller should set retVal = .exception)
 @inline(never)
 private func executeFastTrace(
-    bc: UnsafePointer<UInt8>,
-    bcLen: Int,
-    entryPC: Int,
-    exitPC: Int,
-    buf: UnsafeMutablePointer<JeffJSValue>,
-    varBase: Int,
-    sp: inout Int,
+    state: inout JeffJSInterpreter.HotState,
+    startPC: Int,
     ctx: JeffJSContext,
-    cpool: [JeffJSValue],
-    stackLimit: Int,
-    ic: JeffJSInlineCache?
+    rt: JeffJSRuntime,
+    inlineBase: Int
 ) -> Int {
-    // Validate parameters
-    guard entryPC >= 0, exitPC <= bcLen, entryPC < exitPC,
-          sp >= 0, sp < stackLimit, stackLimit > 0 else {
-        return entryPC
-    }
-    var pc = entryPC
+    // Unpack the per-opcode state into locals (registers). Values that only
+    // calls/returns touch (capacity, stack base, function object, flags,
+    // ownership bits) stay in `state`: as locals they pushed this function
+    // into ~500 stack spills. Everything is written back at the single exit.
+    var pc = startPC
+    var sp = state.sp
+    var buf = state.buf
+    var varBase = state.varBase
+    var bc = state.bc
+    var bcLen = state.bcLen
+    unowned(unsafe) var fb: JeffJSFunctionBytecode = state.fb   // no retain/release per call entry/return
+    unowned(unsafe) var frame: JeffJSStackFrame = state.frame
+    var varRefsRaw = state.varRefsRaw
+    var varRefsRawCount = state.varRefsRawCount
+    guard pc >= 0, pc < bcLen, sp >= 0, sp < state.bufCapacity else { return startPC }
+    var resume = startPC
+    var opsRun = 0   // progress measure for the main loop's deopt guard
+    var interrupt = ctx.interruptCounter   // kept in a register; written back at exit
 
-    traceLoop: while pc >= entryPC && pc < exitPC {
-        // Guard against stack overflow/underflow
-        if sp >= stackLimit - 8 || sp < 0 { return pc }
-        guard let op = JeffJSOpcode(rawValue: UInt16(bc[pc])) else {
-            return pc // deopt: unknown opcode byte
-        }
+    traceLoop: while true {
+        #if DEBUG
+        assert(pc >= 0 && pc < bcLen && sp >= 0 && sp < state.bufCapacity, "fast trace out of bounds")
+        #endif
+        // Same raw decode as the main loop: every narrow byte is a valid
+        // case; the 0x00 wide prefix decodes to .invalid and deopts below.
+        // Raw byte test for the 0x00 wide-opcode prefix: an enum `==` here
+        // compiled to an out-of-line generic call (15% of a pure loop).
+        let opByte = bc[pc]
+        opsRun &+= 1
+        // Byte 0 is the wide-opcode prefix: it decodes to .invalid, whose
+        // case below deopts (no separate compare per opcode).
+        let op = unsafeBitCast(UInt16(opByte), to: JeffJSOpcode.self)
 
         switch op {
+        case .invalid:
+            resume = pc; break traceLoop
 
         // =================================================================
         // Push values
         // =================================================================
+
+        case .cmp_loc_i8:
+            let cmp = bc[pc + 1]
+            let cond: Bool
+            let a = buf[varBase + Int(bc[pc + 2])]
+            let k = Int32(Int8(bitPattern: bc[pc + 3]))
+            if a.isInt {
+                cond = jeffJS_cmpInt(cmp, a.toInt32(), k)
+            } else if a.isNumber {
+                cond = jeffJS_cmpDouble(cmp, a.toFloat64(), Double(k))
+            } else { resume = pc; break traceLoop }
+            // Fused branch: when if_true8 / if_false8 follows, branch here
+            // instead of pushing a bool for the next dispatch to pop.
+            let nb = bc[pc + 4]
+            if nb == UInt8(truncatingIfNeeded: JeffJSOpcode.if_true8.rawValue)
+                || nb == UInt8(truncatingIfNeeded: JeffJSOpcode.if_false8.rawValue) {
+                let take = nb == UInt8(truncatingIfNeeded: JeffJSOpcode.if_true8.rawValue) ? cond : !cond
+                if take {
+                    let offset = Int(Int8(bitPattern: bc[pc + 5]))
+                    let target = pc + 6 + offset
+                    if target < 0 || target >= bcLen { resume = target; break traceLoop }
+                    if offset < 0 {
+                        interrupt -= 1
+                        if interrupt <= 0 {
+                            interrupt = JS_INTERRUPT_COUNTER_INIT
+                            ctx.interruptCounter = interrupt
+                            if ctx.checkInterrupt() { resume = -1; break traceLoop }
+                        }
+                    }
+                    pc = target
+                } else {
+                    pc += 6
+                }
+            } else {
+                buf[sp] = cond ? .JS_TRUE : .JS_FALSE; sp += 1
+                pc += 4
+            }
+
+        case .cmp_loc_loc:
+            let cmp = bc[pc + 1]
+            let cond: Bool
+            let a = buf[varBase + Int(bc[pc + 2])]
+            let b = buf[varBase + Int(bc[pc + 3])]
+            if a.isInt && b.isInt {
+                cond = jeffJS_cmpInt(cmp, a.toInt32(), b.toInt32())
+            } else if a.isNumber && b.isNumber {
+                cond = jeffJS_cmpDouble(cmp, jeffJS_traceNum(a), jeffJS_traceNum(b))
+            } else { resume = pc; break traceLoop }
+            // Fused branch: when if_true8 / if_false8 follows, branch here
+            // instead of pushing a bool for the next dispatch to pop.
+            let nb = bc[pc + 4]
+            if nb == UInt8(truncatingIfNeeded: JeffJSOpcode.if_true8.rawValue)
+                || nb == UInt8(truncatingIfNeeded: JeffJSOpcode.if_false8.rawValue) {
+                let take = nb == UInt8(truncatingIfNeeded: JeffJSOpcode.if_true8.rawValue) ? cond : !cond
+                if take {
+                    let offset = Int(Int8(bitPattern: bc[pc + 5]))
+                    let target = pc + 6 + offset
+                    if target < 0 || target >= bcLen { resume = target; break traceLoop }
+                    if offset < 0 {
+                        interrupt -= 1
+                        if interrupt <= 0 {
+                            interrupt = JS_INTERRUPT_COUNTER_INIT
+                            ctx.interruptCounter = interrupt
+                            if ctx.checkInterrupt() { resume = -1; break traceLoop }
+                        }
+                    }
+                    pc = target
+                } else {
+                    pc += 6
+                }
+            } else {
+                buf[sp] = cond ? .JS_TRUE : .JS_FALSE; sp += 1
+                pc += 4
+            }
+
+        case .arith_loc_loc:
+            let ar = bc[pc + 1]
+            let a = buf[varBase + Int(bc[pc + 2])]
+            let b = buf[varBase + Int(bc[pc + 3])]
+            if a.isInt && b.isInt {
+                buf[sp] = jeffJS_arithInt(ar, a.toInt32(), b.toInt32()); sp += 1
+            } else if a.isNumber && b.isNumber {
+                buf[sp] = jeffJS_arithNumeric(ar, jeffJS_traceNum(a), jeffJS_traceNum(b)); sp += 1
+            } else if ar == 0 && a.isString && b.isString {
+                let r = jeffJS_concatStrings(s1: a, s2: b)
+                if r.isException { resume = pc; break traceLoop }
+                buf[sp] = r; sp += 1
+            } else { resume = pc; break traceLoop }
+            pc += 4
+
+        case .arith_loc_i8:
+            let ar = bc[pc + 1]
+            let a = buf[varBase + Int(bc[pc + 2])]
+            let k = Int32(Int8(bitPattern: bc[pc + 3]))
+            if a.isInt {
+                buf[sp] = jeffJS_arithInt(ar, a.toInt32(), k); sp += 1
+            } else if a.isNumber {
+                buf[sp] = jeffJS_arithNumeric(ar, a.toFloat64(), Double(k)); sp += 1
+            } else { resume = pc; break traceLoop }
+            pc += 4
+
+        case .to_int32:
+            let v = buf[sp - 1]
+            if v.isInt {
+            } else if v.isNumber {
+                buf[sp - 1] = .newInt32(JeffJSTypeConvert.doubleToInt32(v.toFloat64()))
+            } else { resume = pc; break traceLoop }
+            pc += 1
+
+        case .arith_const8:
+            let ar = bc[pc + 1]
+            let k = Int(bc[pc + 2])
+            guard k < fb.cpool.count else { resume = pc; break traceLoop }
+            let c = fb.cpool[k]
+            let v = buf[sp - 1]
+            if v.isInt && c.isInt {
+                buf[sp - 1] = jeffJS_arithInt(ar, v.toInt32(), c.toInt32())
+            } else if v.isNumber && c.isNumber {
+                buf[sp - 1] = jeffJS_arithNumeric(ar, jeffJS_traceNum(v), jeffJS_traceNum(c))
+            } else if ar == 0 && v.isString && c.isString {
+                // `s += "lit"`: rope/buffer append, TOS is consumed
+                let r = jeffJS_concatStrings(s1: v, s2: c)
+                if r.isException { resume = pc; break traceLoop }
+                v.freeValue()
+                buf[sp - 1] = r
+            } else { resume = pc; break traceLoop }
+            pc += 3
 
         case .push_i32:
             let val = readI32(bc, pc + 1)
@@ -1866,13 +2236,19 @@ private func executeFastTrace(
 
         case .push_const:
             let idx = Int(readU32(bc, pc + 1))
-            if idx < cpool.count {
-                buf[sp] = cpool[idx].dupValue()
+            if idx < fb.cpool.count {
+                buf[sp] = fb.cpool[idx].dupValue()
             } else {
                 buf[sp] = .undefined
             }
             sp += 1
             pc += 5
+
+        case .push_const8:
+            let idx = Int(bc[pc + 1])
+            buf[sp] = idx < fb.cpool.count ? fb.cpool[idx].dupValue() : .undefined
+            sp += 1
+            pc += 2
 
         case .push_true:  buf[sp] = .JS_TRUE; sp += 1; pc += 1
         case .push_false: buf[sp] = .JS_FALSE; sp += 1; pc += 1
@@ -1928,10 +2304,19 @@ private func executeFastTrace(
             buf[varBase + idx] = buf[sp - 1]
             pc += 3
 
+        case .put_loc_check:
+            // Pure TDZ check (const assignment is a compile-time throw_error).
+            let idx = Int(readU16(bc, pc + 1))
+            let current = buf[varBase + idx]
+            if current.isUninitialized { resume = pc; break traceLoop } // deopt: main loop throws
+            sp -= 1; buf[varBase + idx] = buf[sp]
+            current.freeValue()
+            pc += 3
+
         case .get_loc_check:
             let idx = Int(readU16(bc, pc + 1))
             let val = buf[varBase + idx]
-            if val.isUninitialized { return pc } // deopt: TDZ
+            if val.isUninitialized { resume = pc; break traceLoop } // deopt: TDZ
             buf[sp] = val.dupValue(); sp += 1
             pc += 3
 
@@ -1939,40 +2324,590 @@ private func executeFastTrace(
         // Global variable access (via the per-function inline cache)
         // =================================================================
 
-        case .get_var, .get_var_undef:
-            guard let ic = ic, let gObj = ctx.globalObj.obj, let gShape = gObj.shape else {
-                return pc // deopt: no IC table yet
+        // Property access with inline-cache hits only; any miss deopts to the
+        // main loop, which performs the full lookup and refills the cache so
+        // the next iteration hits here. Mirrors the main-loop hit paths
+        // exactly (including their reference-handling).
+        // ------------------------------------------------------------------
+        // Calls and returns (inline frames carved from the caller's buffer,
+        // exactly as the main loop does). Anything the main loop would send
+        // through callFunction deopts instead.
+        // ------------------------------------------------------------------
+        case .push_this:
+            buf[sp] = frame.thisVal.dupValue(); sp += 1
+            pc += 1
+
+        case .call, .call0, .call1, .call2, .call3:
+            let argc: Int
+            let instrSize: Int
+            switch op {
+            case .call: argc = Int(readU16(bc, pc + 1)); instrSize = 3
+            case .call0: argc = 0; instrSize = 1
+            case .call1: argc = 1; instrSize = 1
+            case .call2: argc = 2; instrSize = 1
+            default: argc = 3; instrSize = 1
             }
-            let entry = ic.lookup(pc)
-            if entry.pc == pc,
-               entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
-               entry.propOffset >= 0, entry.propOffset < gObj.prop.count,
-               case .value(let v) = gObj.prop[entry.propOffset] {
-                buf[sp] = v.dupValue(); sp += 1
+            let calleeSlot = sp - argc - 1
+            guard calleeSlot >= state.spBase,
+                  let callObj = buf[calleeSlot].obj,
+                  let fbU = callObj.fbFastU,
+                  rt.inlineStackTop - inlineBase <= 10000 else { resume = pc; break traceLoop }
+            unowned(unsafe) let fastFb: JeffJSFunctionBytecode = fbU.takeUnretainedValue()
+            if fastFb.isGenerator || fastFb.isAsyncFunc { resume = pc; break traceLoop }
+            let funcVal = buf[calleeSlot]
+            let restoreSp = calleeSlot
+            let thisVal: JeffJSValue = .undefined
+            do {
+                let argStart = calleeSlot + 1
+                let newVarCount = Int(fastFb.varCount)
+                let fbArgCount = Int(fastFb.argCount); let newArgSlots = fbArgCount > argc ? fbArgCount : argc
+                let fbStack = Int(fastFb.stackSize); let newStackSlots = (fbStack > 4 ? fbStack : 4) + 32
+                if argStart + newArgSlots + newVarCount + newStackSlots > state.bufCapacity { resume = pc; break traceLoop }
+                rt.inlinePush(JeffJSInterpreter.InlineCallFrame(
+                    pc: pc + instrSize, sp: restoreSp, spTop: sp,
+                    buf: buf, bufCapacity: state.bufCapacity,
+                    varBase: varBase, spBase: state.spBase,
+                    bc: bc, bcLen: bcLen, fb: fb,
+                    frame: frame,
+                    funcObj: state.funcObj, flags: state.flags, bufOwned: state.bufOwned))
+                fb = fastFb
+                bc = fastFb.bcPtrFast ?? fastFb.bytecodePtr
+                bcLen = fastFb.bytecodeLen
+                varRefsRaw = callObj.varRefsRaw
+                varRefsRawCount = callObj.varRefsRawCount
+                state.funcObj = funcVal
+                state.flags = 0
+                unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
+                newFrame.prevFrame = ctx.currentFrame
+                newFrame.curFunc = funcVal
+                if fastFb.isArrow, let arrowThis = callObj.arrowThisVal {
+                    newFrame.thisVal = arrowThis.dupValue()
+                } else if !fastFb.isStrictMode && thisVal.isNullOrUndefined {
+                    newFrame.thisVal = ctx.globalObj
+                } else {
+                    newFrame.thisVal = thisVal
+                }
+                newFrame.argCount = argc
+                newFrame.varCount = newVarCount
+                let newBuf = buf + argStart
+                let prefix = newArgSlots + newVarCount
+                let pad = prefix - argc
+                if pad > 0 {   // straight-line stores; a loop became a memset call
+                    newBuf[argc] = .undefined
+                    if pad > 1 { newBuf[argc + 1] = .undefined }
+                    if pad > 2 { newBuf[argc + 2] = .undefined }
+                    if pad > 3 {
+                        var i = argc + 3
+                        while i < prefix { newBuf[i] = .undefined; i += 1 }
+                    }
+                }
+                state.bufOwned = false
+                frame = newFrame
+                ctx.currentFrame = frame
+                frame.spBase = 0
+                state.bufCapacity = state.bufCapacity - argStart
+                buf = newBuf
+                varBase = newArgSlots
+                state.spBase = newArgSlots + newVarCount
+                sp = state.spBase
+                if fastFb.selfRefVarIdx >= 0 {
+                    buf[varBase + fastFb.selfRefVarIdx] = funcVal.dupValue()
+                }
+                frame.buf = buf
+                frame.bufCapacity = state.bufCapacity
+                frame.bufVarBase = varBase
+                frame.bufSpBase = state.spBase
+                pc = 0
+                if fastFb.traceLean {
+                    // Call-free callee with a loop: lean runs it and returns at
+                    // its `return`, which this trace then executes.
+                    let r = executeFastTraceLean(bc: bc, bcLen: bcLen, entryPC: 0, exitPC: bcLen, startPC: 0,
+                                                 buf: buf, varBase: varBase, sp: &sp, ctx: ctx, cpool: fastFb.cpool,
+                                                 stackLimit: state.bufCapacity, icEntries: fastFb.icEntries)
+                    if r == -1 { resume = -1; break traceLoop }
+                    opsRun &+= 64
+                    pc = r
+                }
+            }
+
+        case .call_method:
+            let argc = Int(readU16(bc, pc + 1))
+            // Array.prototype.push fast path (mirrors the main loop) so
+            // `arr.push(x)` loops stay in the trace.
+            if argc == 1, sp >= state.spBase + 3,
+               let pushObj = ctx.arrayProtoPushObj,
+               let funcObj = buf[sp - 2].obj, funcObj === pushObj,
+               let arrObj = buf[sp - 3].obj,
+               arrObj.classID == JeffJSClassID.array.rawValue,
+               arrObj.propCount > 0,
+               let shape = arrObj.shape, shape.prop.count > 0,
+               shape.prop[0].atom == JeffJSAtomID.JS_ATOM_length.rawValue {
+                let newCount = arrObj.asClass.fastArrayPush(buf[sp - 1])
+                if newCount > 0 {
+                    arrObj.asClass.setPropEntry(at: 0, .value(.newInt32(Int32(newCount))))
+                    buf[sp - 2].freeValue(); buf[sp - 3].freeValue()   // callee and receiver refs
+                    sp -= 3
+                    buf[sp] = .newInt32(Int32(newCount)); sp += 1
+                    pc += 3
+                    continue traceLoop
+                }
+            }
+            let instrSize = 3
+            let calleeSlot = sp - argc - 1
+            let thisSlot = calleeSlot - 1
+            guard thisSlot >= state.spBase,
+                  let callObj = buf[calleeSlot].obj,
+                  let fbU = callObj.fbFastU,
+                  rt.inlineStackTop - inlineBase <= 10000 else { resume = pc; break traceLoop }
+            unowned(unsafe) let fastFb: JeffJSFunctionBytecode = fbU.takeUnretainedValue()
+            if fastFb.isGenerator || fastFb.isAsyncFunc { resume = pc; break traceLoop }
+            let funcVal = buf[calleeSlot]
+            let restoreSp = thisSlot
+            let thisVal = buf[thisSlot]
+            do {
+                let argStart = calleeSlot + 1
+                let newVarCount = Int(fastFb.varCount)
+                let fbArgCount = Int(fastFb.argCount); let newArgSlots = fbArgCount > argc ? fbArgCount : argc
+                let fbStack = Int(fastFb.stackSize); let newStackSlots = (fbStack > 4 ? fbStack : 4) + 32
+                if argStart + newArgSlots + newVarCount + newStackSlots > state.bufCapacity { resume = pc; break traceLoop }
+                rt.inlinePush(JeffJSInterpreter.InlineCallFrame(
+                    pc: pc + instrSize, sp: restoreSp, spTop: sp,
+                    buf: buf, bufCapacity: state.bufCapacity,
+                    varBase: varBase, spBase: state.spBase,
+                    bc: bc, bcLen: bcLen, fb: fb,
+                    frame: frame,
+                    funcObj: state.funcObj, flags: state.flags, bufOwned: state.bufOwned))
+                fb = fastFb
+                bc = fastFb.bcPtrFast ?? fastFb.bytecodePtr
+                bcLen = fastFb.bytecodeLen
+                varRefsRaw = callObj.varRefsRaw
+                varRefsRawCount = callObj.varRefsRawCount
+                state.funcObj = funcVal
+                state.flags = 0
+                unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
+                newFrame.prevFrame = ctx.currentFrame
+                newFrame.curFunc = funcVal
+                if fastFb.isArrow, let arrowThis = callObj.arrowThisVal {
+                    newFrame.thisVal = arrowThis.dupValue()
+                } else if !fastFb.isStrictMode && thisVal.isNullOrUndefined {
+                    newFrame.thisVal = ctx.globalObj
+                } else {
+                    newFrame.thisVal = thisVal
+                }
+                newFrame.argCount = argc
+                newFrame.varCount = newVarCount
+                let newBuf = buf + argStart
+                let prefix = newArgSlots + newVarCount
+                let pad = prefix - argc
+                if pad > 0 {   // straight-line stores; a loop became a memset call
+                    newBuf[argc] = .undefined
+                    if pad > 1 { newBuf[argc + 1] = .undefined }
+                    if pad > 2 { newBuf[argc + 2] = .undefined }
+                    if pad > 3 {
+                        var i = argc + 3
+                        while i < prefix { newBuf[i] = .undefined; i += 1 }
+                    }
+                }
+                state.bufOwned = false
+                frame = newFrame
+                ctx.currentFrame = frame
+                frame.spBase = 0
+                state.bufCapacity = state.bufCapacity - argStart
+                buf = newBuf
+                varBase = newArgSlots
+                state.spBase = newArgSlots + newVarCount
+                sp = state.spBase
+                if fastFb.selfRefVarIdx >= 0 {
+                    buf[varBase + fastFb.selfRefVarIdx] = funcVal.dupValue()
+                }
+                frame.buf = buf
+                frame.bufCapacity = state.bufCapacity
+                frame.bufVarBase = varBase
+                frame.bufSpBase = state.spBase
+                pc = 0
+                if fastFb.traceLean {
+                    // Call-free callee with a loop: lean runs it and returns at
+                    // its `return`, which this trace then executes.
+                    let r = executeFastTraceLean(bc: bc, bcLen: bcLen, entryPC: 0, exitPC: bcLen, startPC: 0,
+                                                 buf: buf, varBase: varBase, sp: &sp, ctx: ctx, cpool: fastFb.cpool,
+                                                 stackLimit: state.bufCapacity, icEntries: fastFb.icEntries)
+                    if r == -1 { resume = -1; break traceLoop }
+                    opsRun &+= 64
+                    pc = r
+                }
+            }
+
+        case .get_loc8_call:
+            let locIdx = Int(bc[pc + 1])
+            let argc = Int(readU16(bc, pc + 2))
+            let instrSize = 4
+            guard argc == 0,
+                  let callObj = buf[varBase + locIdx].obj,
+                  let fbU = callObj.fbFastU,
+                  rt.inlineStackTop - inlineBase <= 10000 else { resume = pc; break traceLoop }
+            unowned(unsafe) let fastFb: JeffJSFunctionBytecode = fbU.takeUnretainedValue()
+            if fastFb.isGenerator || fastFb.isAsyncFunc { resume = pc; break traceLoop }
+            // Fit check before pushing the callee (a deopt must leave the
+            // stack exactly as the main loop expects for this opcode).
+            do {
+                let a = Int(fastFb.argCount); let st = Int(fastFb.stackSize)
+                if sp + 1 + a + Int(fastFb.varCount) + (st > 4 ? st : 4) + 32 > state.bufCapacity { resume = pc; break traceLoop }
+            }
+            let funcVal = buf[varBase + locIdx].dupValue()
+            let calleeSlot = sp
+            buf[sp] = funcVal; sp += 1
+            let restoreSp = calleeSlot
+            let thisVal: JeffJSValue = .undefined
+            do {
+                let argStart = calleeSlot + 1
+                let newVarCount = Int(fastFb.varCount)
+                let fbArgCount = Int(fastFb.argCount); let newArgSlots = fbArgCount > argc ? fbArgCount : argc
+                let fbStack = Int(fastFb.stackSize); let newStackSlots = (fbStack > 4 ? fbStack : 4) + 32
+                if argStart + newArgSlots + newVarCount + newStackSlots > state.bufCapacity { resume = pc; break traceLoop }
+                rt.inlinePush(JeffJSInterpreter.InlineCallFrame(
+                    pc: pc + instrSize, sp: restoreSp, spTop: sp,
+                    buf: buf, bufCapacity: state.bufCapacity,
+                    varBase: varBase, spBase: state.spBase,
+                    bc: bc, bcLen: bcLen, fb: fb,
+                    frame: frame,
+                    funcObj: state.funcObj, flags: state.flags, bufOwned: state.bufOwned))
+                fb = fastFb
+                bc = fastFb.bcPtrFast ?? fastFb.bytecodePtr
+                bcLen = fastFb.bytecodeLen
+                varRefsRaw = callObj.varRefsRaw
+                varRefsRawCount = callObj.varRefsRawCount
+                state.funcObj = funcVal
+                state.flags = 0
+                unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
+                newFrame.prevFrame = ctx.currentFrame
+                newFrame.curFunc = funcVal
+                if fastFb.isArrow, let arrowThis = callObj.arrowThisVal {
+                    newFrame.thisVal = arrowThis.dupValue()
+                } else if !fastFb.isStrictMode && thisVal.isNullOrUndefined {
+                    newFrame.thisVal = ctx.globalObj
+                } else {
+                    newFrame.thisVal = thisVal
+                }
+                newFrame.argCount = argc
+                newFrame.varCount = newVarCount
+                let newBuf = buf + argStart
+                let prefix = newArgSlots + newVarCount
+                let pad = prefix - argc
+                if pad > 0 {   // straight-line stores; a loop became a memset call
+                    newBuf[argc] = .undefined
+                    if pad > 1 { newBuf[argc + 1] = .undefined }
+                    if pad > 2 { newBuf[argc + 2] = .undefined }
+                    if pad > 3 {
+                        var i = argc + 3
+                        while i < prefix { newBuf[i] = .undefined; i += 1 }
+                    }
+                }
+                state.bufOwned = false
+                frame = newFrame
+                ctx.currentFrame = frame
+                frame.spBase = 0
+                state.bufCapacity = state.bufCapacity - argStart
+                buf = newBuf
+                varBase = newArgSlots
+                state.spBase = newArgSlots + newVarCount
+                sp = state.spBase
+                if fastFb.selfRefVarIdx >= 0 {
+                    buf[varBase + fastFb.selfRefVarIdx] = funcVal.dupValue()
+                }
+                frame.buf = buf
+                frame.bufCapacity = state.bufCapacity
+                frame.bufVarBase = varBase
+                frame.bufSpBase = state.spBase
+                pc = 0
+                if fastFb.traceLean {
+                    // Call-free callee with a loop: lean runs it and returns at
+                    // its `return`, which this trace then executes.
+                    let r = executeFastTraceLean(bc: bc, bcLen: bcLen, entryPC: 0, exitPC: bcLen, startPC: 0,
+                                                 buf: buf, varBase: varBase, sp: &sp, ctx: ctx, cpool: fastFb.cpool,
+                                                 stackLimit: state.bufCapacity, icEntries: fastFb.icEntries)
+                    if r == -1 { resume = -1; break traceLoop }
+                    opsRun &+= 64
+                    pc = r
+                }
+            }
+
+        case .return_, .return_undef:
+            // Only inline returns; the activation's final return and frames
+            // with live closure references go to the main loop.
+            guard rt.inlineStackTop != inlineBase, !frame.hasLiveVarRefs else { resume = pc; break traceLoop }
+            let returnValue: JeffJSValue
+            switch op {   // enum `==` would be an out-of-line call here
+            case .return_undef: returnValue = .undefined
+            default:
+                if sp <= state.spBase { resume = pc; break traceLoop }
+                sp -= 1; returnValue = buf[sp]
+            }
+            // Release the callee's variable slots (its args live in the
+            // caller's stack, released below), like QuickJS frees var_buf at
+            // function exit and the caller frees func/this/args after the call.
+            do { var i = varBase; let n = state.spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
+            ctx.currentFrame = frame.prevFrame
+            rt.releaseFrameU(Unmanaged.passUnretained(frame))
+            if state.bufOwned { rt.releaseInterpBuf(buf, capacity: state.bufCapacity) }
+            let saved = rt.inlinePop()
+            do { var p = saved.sp; let e = saved.spTop; while p < e { saved.buf[p].freeValueFast(); p += 1 } }
+            pc = saved.pc; sp = saved.sp
+            buf = saved.buf; state.bufCapacity = saved.bufCapacity
+            varBase = saved.varBase; state.spBase = saved.spBase
+            bc = saved.bc; bcLen = saved.bcLen
+            fb = saved.fb; frame = saved.frame
+            state.funcObj = saved.funcObj; state.flags = saved.flags; state.bufOwned = saved.bufOwned
+            if let fo = saved.funcObj.obj {
+                varRefsRaw = fo.varRefsRaw; varRefsRawCount = fo.varRefsRawCount
+            } else {
+                varRefsRaw = nil; varRefsRawCount = 0
+            }
+            buf[sp] = returnValue; sp += 1
+
+        // ------------------------------------------------------------------
+        // Closure variables through the unmanaged mirror (no ARC); TDZ and
+        // missing refs deopt to the main loop.
+        // ------------------------------------------------------------------
+        case .get_var_ref:
+            let idx = Int(readU16(bc, pc + 1))
+            guard idx < varRefsRawCount, let u = varRefsRaw![idx] else { resume = pc; break traceLoop }
+            let val = u._withUnsafeGuaranteedRef { $0.isDetached ? $0.value : $0.pvalue }
+            buf[sp] = val.dupValue(); sp += 1
+            pc += 3
+
+        case .get_var_ref_check:
+            let idx = Int(readU16(bc, pc + 1))
+            guard idx < varRefsRawCount, let u = varRefsRaw![idx] else { resume = pc; break traceLoop }
+            let val = u._withUnsafeGuaranteedRef { $0.isDetached ? $0.value : $0.pvalue }
+            if val.isUninitialized { resume = pc; break traceLoop }
+            buf[sp] = val.dupValue(); sp += 1
+            pc += 3
+
+        case .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3:
+            let idx = Int(opByte) - Int(UInt8(truncatingIfNeeded: JeffJSOpcode.get_var_ref0.rawValue))
+            guard idx < varRefsRawCount, let u = varRefsRaw![idx] else { resume = pc; break traceLoop }
+            let val = u._withUnsafeGuaranteedRef { $0.isDetached ? $0.value : $0.pvalue }
+            buf[sp] = val.dupValue(); sp += 1
+            pc += 1
+
+        case .put_var_ref:
+            let idx = Int(readU16(bc, pc + 1))
+            guard idx < varRefsRawCount, let u = varRefsRaw![idx] else { resume = pc; break traceLoop }
+            let v: JeffJSValue
+            if isStoreOpcode(bc, pc + 3, bcLen) { v = buf[sp - 1].dupValue() } else { sp -= 1; v = buf[sp] }
+            u._withUnsafeGuaranteedRef { vr in if vr.isDetached { vr.value = v } else { vr.pvalue = v } }
+            pc += 3
+
+        case .put_var_ref_check:
+            let idx = Int(readU16(bc, pc + 1))
+            guard idx < varRefsRawCount, let u = varRefsRaw![idx] else { resume = pc; break traceLoop }
+            if u._withUnsafeGuaranteedRef({ $0.isDetached ? $0.value : $0.pvalue }).isUninitialized { resume = pc; break traceLoop }
+            let v: JeffJSValue
+            if isStoreOpcode(bc, pc + 3, bcLen) { v = buf[sp - 1].dupValue() } else { sp -= 1; v = buf[sp] }
+            u._withUnsafeGuaranteedRef { vr in if vr.isDetached { vr.value = v } else { vr.pvalue = v } }
+            pc += 3
+
+        case .put_var_ref_check_init:
+            let idx = Int(readU16(bc, pc + 1))
+            guard idx < varRefsRawCount, let u = varRefsRaw![idx] else { resume = pc; break traceLoop }
+            sp -= 1; let v = buf[sp]
+            u._withUnsafeGuaranteedRef { vr in if vr.isDetached { vr.value = v } else { vr.pvalue = v } }
+            pc += 3
+
+        case .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3:
+            let idx = Int(opByte) - Int(UInt8(truncatingIfNeeded: JeffJSOpcode.put_var_ref0.rawValue))
+            guard idx < varRefsRawCount, let u = varRefsRaw![idx] else { resume = pc; break traceLoop }
+            sp -= 1; let v = buf[sp]
+            u._withUnsafeGuaranteedRef { vr in if vr.isDetached { vr.value = v } else { vr.pvalue = v } }
+            pc += 1
+
+        case .set_var_ref:
+            let idx = Int(readU16(bc, pc + 1))
+            guard idx < varRefsRawCount, let u = varRefsRaw![idx] else { resume = pc; break traceLoop }
+            let v = buf[sp - 1].dupValue()
+            u._withUnsafeGuaranteedRef { vr in if vr.isDetached { vr.value = v } else { vr.pvalue = v } }
+            pc += 3
+
+        case .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3:
+            let idx = Int(opByte) - Int(UInt8(truncatingIfNeeded: JeffJSOpcode.set_var_ref0.rawValue))
+            guard idx < varRefsRawCount, let u = varRefsRaw![idx] else { resume = pc; break traceLoop }
+            let v = buf[sp - 1].dupValue()
+            u._withUnsafeGuaranteedRef { vr in if vr.isDetached { vr.value = v } else { vr.pvalue = v } }
+            pc += 1
+
+        // ------------------------------------------------------------------
+        // Object / array literals and TDZ slots (object-building loops).
+        // ------------------------------------------------------------------
+        case .object:
+            buf[sp] = ctx.newPlainObject(); sp += 1
+            pc += 1
+
+        case .set_loc_uninitialized:
+            let idx = Int(readU16(bc, pc + 1))
+            let oldTDZ = buf[varBase + idx]
+            buf[varBase + idx] = .uninitialized
+            oldTDZ.freeValue()
+            pc += 3
+
+        case .put_loc_check_init:
+            if sp <= state.spBase { resume = pc; break traceLoop }
+            let idx = Int(readU16(bc, pc + 1))
+            let old = buf[varBase + idx]
+            sp -= 1; buf[varBase + idx] = buf[sp]
+            old.freeValue()
+            pc += 3
+
+        case .define_field:
+            // Transition IC hit only (mirrors the main loop's fast path).
+            guard sp >= state.spBase + 2, let ents = fb.icEntries else { resume = pc; break traceLoop }
+            let obj = buf[sp - 2]
+            guard let jsObj = obj.obj else { resume = pc; break traceLoop }
+            let entry = ents[pc & JeffJSInlineCache.mask]
+            guard entry.pc == pc, jeffJS_icDefine(jsObj._ptr, entry, buf[sp - 1], rt) else { resume = pc; break traceLoop }
+            sp -= 1   // the value ref moved into the new slot
+            pc += 5
+
+        case .array_from:
+            // Empty literal `[]` only; the parser's orphan `object` sentinel
+            // below it is dropped like the main loop does.
+            guard readU16(bc, pc + 1) == 0, sp > state.spBase else { resume = pc; break traceLoop }
+            let below = buf[sp - 1]
+            guard let bo = below.obj, bo.classID == JeffJSClassID.object.rawValue, bo.propCount == 0 else { resume = pc; break traceLoop }
+            below.freeValue()
+            buf[sp - 1] = ctx.newArray()
+            pc += 3
+
+        case .get_field:
+            // A directly-following plain call takes its `this` from a stash
+            // that only the main loop maintains: let it handle that pair.
+            if pc + 5 < bcLen, isCallOpcodeByte(bc[pc + 5]) { resume = pc; break traceLoop }
+            guard let ents = fb.icEntries else { resume = pc; break traceLoop }
+            let obj = buf[sp - 1]
+            guard let jsObj = obj.obj else { resume = pc; break traceLoop }
+            let entry = ents[pc & JeffJSInlineCache.mask]
+            var icHit: JeffJSValue? = nil
+            if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
+            if let hv = icHit {
+                buf[sp - 1] = hv.dupValueFast()
+                obj.freeValueFast()
                 pc += 5
             } else {
-                return pc // deopt: IC miss — main loop refills the cache
+                resume = pc; break traceLoop // deopt: IC miss
+            }
+
+        case .get_field2:
+            guard let ents = fb.icEntries else { resume = pc; break traceLoop }
+            let obj = buf[sp - 1]
+            guard let jsObj = obj.obj else { resume = pc; break traceLoop }
+            let entry = ents[pc & JeffJSInlineCache.mask]
+            var icHit: JeffJSValue? = nil
+            if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
+            if icHit == nil, jsObj.classID == JeffJSClassID.array.rawValue,
+               readU32(bc, pc + 1) == JSPredefinedAtom.push.rawValue, ctx.arrayProtoPushObj != nil {
+                // `arr.push`: exotic receivers never fill the IC; the
+                // call_method fast path below consumes this borrowed value.
+                icHit = ctx.arrayProtoPushVal
+            }
+            if let hv = icHit {
+                buf[sp] = hv.dupValueFast(); sp += 1
+                pc += 5
+            } else {
+                resume = pc; break traceLoop
+            }
+
+        case .put_field:
+            guard let ents = fb.icEntries else { resume = pc; break traceLoop }
+            let val = buf[sp - 1]
+            let obj = buf[sp - 2]
+            guard let jsObj = obj.obj else { resume = pc; break traceLoop }
+            let entry = ents[pc & JeffJSInlineCache.mask]
+            if entry.pc == pc, jeffJS_icWrite(jsObj._ptr, entry, val) {
+                obj.freeValueFast()   // the popped receiver ref (QuickJS: JS_FreeValue(sp[-2]))
+                sp -= 2
+                pc += 5
+            } else {
+                resume = pc; break traceLoop
+            }
+
+        case .get_loc8_get_field:
+            guard let ents = fb.icEntries else { resume = pc; break traceLoop }
+            let obj = buf[varBase + Int(bc[pc + 1])]
+            guard let jsObj = obj.obj else { resume = pc; break traceLoop }
+            let entry = ents[pc & JeffJSInlineCache.mask]
+            var icHit: JeffJSValue? = nil
+            if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
+            if let hv = icHit {
+                buf[sp] = hv.dupValueFast(); sp += 1
+                pc += 6
+            } else {
+                resume = pc; break traceLoop
+            }
+
+        case .get_arg0_get_field:
+            guard let ents = fb.icEntries else { resume = pc; break traceLoop }
+            let obj = buf[0]
+            guard let jsObj = obj.obj else { resume = pc; break traceLoop }
+            let entry = ents[pc & JeffJSInlineCache.mask]
+            var icHit: JeffJSValue? = nil
+            if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
+            if let hv = icHit {
+                buf[sp] = hv.dupValueFast(); sp += 1
+                pc += 5
+            } else {
+                resume = pc; break traceLoop
+            }
+
+        case .get_length:
+            guard let ents = fb.icEntries else { resume = pc; break traceLoop }
+            let obj = buf[sp - 1]
+            guard let jsObj = obj.obj, let sid = jsObj.shapeIdentity else { resume = pc; break traceLoop }
+            let entry = ents[pc & JeffJSInlineCache.mask]
+            if entry.pc == pc, entry.shapePtr == sid, entry.holderPtr == nil,
+               entry.propOffset >= 0, entry.propOffset < jsObj.propCount,
+               jsObj.extra(at: entry.propOffset) == nil {
+                buf[sp - 1] = jsObj.dataValue(at: entry.propOffset).dupValue()
+                obj.freeValueFast()
+                pc += 1
+            } else {
+                resume = pc; break traceLoop // deopt
+            }
+
+        case .get_var, .get_var_undef:
+            guard let ents = fb.icEntries, let gObj = ctx.globalObj.obj, let gShape = gObj.shape else {
+                resume = pc; break traceLoop // deopt: no IC table yet
+            }
+            let entry = ents[pc & JeffJSInlineCache.mask]
+            if entry.pc == pc,
+               entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
+               entry.propOffset >= 0, entry.propOffset < gObj.propCount,
+               gObj.extra(at: entry.propOffset) == nil {
+                buf[sp] = gObj.dataValue(at: entry.propOffset).dupValue(); sp += 1
+                pc += 5
+            } else {
+                resume = pc; break traceLoop // deopt: IC miss — main loop refills the cache
             }
 
         case .put_var:
-            guard let ic = ic, let gObj = ctx.globalObj.obj, let gShape = gObj.shape else {
-                return pc // deopt
+            guard let ents = fb.icEntries, let gObj = ctx.globalObj.obj, let gShape = gObj.shape else {
+                resume = pc; break traceLoop // deopt
             }
-            let entry = ic.lookup(pc)
+            let entry = ents[pc & JeffJSInlineCache.mask]
             if entry.pc == pc,
                entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
-               entry.propOffset >= 0, entry.propOffset < gObj.prop.count,
+               entry.propOffset >= 0, entry.propOffset < gObj.propCount,
                entry.propOffset < gShape.prop.count,
                gShape.prop[entry.propOffset].flags.contains(.writable),
                !gShape.prop[entry.propOffset].flags.contains(.getset),
-               case .value(let old) = gObj.prop[entry.propOffset] {
+               gObj.extra(at: entry.propOffset) == nil {
                 let chained = isStoreOpcode(bc, pc + 5, bcLen)
-                let val = chained ? buf[sp - 1].dupValue() : { sp -= 1; return buf[sp] }()
-                gObj.asClass.prop[entry.propOffset] = .value(val)
+                let val: JeffJSValue
+                if chained { val = buf[sp - 1].dupValue() } else { sp -= 1; val = buf[sp] }
+                let old = gObj.dataValue(at: entry.propOffset)
+                gObj.asClass.propValues[entry.propOffset] = val
                 old.freeValue()
                 pc += 5
             } else {
-                return pc // deopt: IC miss
+                resume = pc; break traceLoop // deopt: IC miss
             }
 
         // =================================================================
@@ -1980,15 +2915,15 @@ private func executeFastTrace(
         // =================================================================
 
         case .get_array_el:
-            guard sp >= 2 else { return pc } // deopt: stack too shallow
+            guard sp >= 2 else { resume = pc; break traceLoop } // deopt: stack too shallow
             let key = buf[sp - 1]
             let objV = buf[sp - 2]
             guard key.isInt, let jsObj = objV.obj,
                   jsObj.classID == JeffJSClassID.array.rawValue else {
-                return pc // deopt: non-array or non-int key
+                resume = pc; break traceLoop // deopt: non-array or non-int key
             }
             let idx = key.toInt32()
-            guard idx >= 0 else { return pc }
+            guard idx >= 0 else { resume = pc; break traceLoop }
             let uidx = UInt32(idx)
             var element: JeffJSValue? = nil
             if let storage = jsObj._fastArrayValues {
@@ -2000,25 +2935,25 @@ private func executeFastTrace(
                     element = vals[Int(uidx)]
                 }
             }
-            guard let el = element else { return pc } // deopt: OOB/holes — slow path decides
+            guard let el = element else { resume = pc; break traceLoop } // deopt: OOB/holes — slow path decides
             sp -= 1
             buf[sp - 1] = el.dupValue()
             pc += 1
 
         case .put_array_el:
-            guard sp >= 3 else { return pc } // deopt: stack too shallow
+            guard sp >= 3 else { resume = pc; break traceLoop } // deopt: stack too shallow
             let val = buf[sp - 1]
             let key = buf[sp - 2]
             let objV = buf[sp - 3]
             guard key.isInt, let jsObj = objV.obj,
                   jsObj.classID == JeffJSClassID.array.rawValue,
                   let storage = jsObj._fastArrayValues else {
-                return pc // deopt: only the ref-type storage is safe to poke here
+                resume = pc; break traceLoop // deopt: only the ref-type storage is safe to poke here
             }
             let idx = key.toInt32()
             // In-bounds overwrite only — growth/length updates take the slow path.
             guard idx >= 0, UInt32(idx) < storage.count, Int(idx) < storage.values.count else {
-                return pc
+                resume = pc; break traceLoop
             }
             let old = storage.values[Int(idx)]
             storage.values[Int(idx)] = val
@@ -2049,6 +2984,7 @@ private func executeFastTrace(
             pc += 1
 
         case .drop:
+            if sp <= state.spBase { resume = pc; break traceLoop }   // underflow: let the guarded main loop report it
             sp -= 1
             pc += 1
 
@@ -2059,6 +2995,31 @@ private func executeFastTrace(
         case .nip1:
             buf[sp - 3] = buf[sp - 2]; buf[sp - 2] = buf[sp - 1]; sp -= 1
             pc += 1
+
+        case .perm3:
+            // [a, b, c] -> [c, a, b]
+            let c = buf[sp - 1], b = buf[sp - 2], a = buf[sp - 3]
+            buf[sp - 3] = c; buf[sp - 2] = a; buf[sp - 1] = b
+            pc += 1
+
+        case .perm4:
+            // [a, b, c, d] -> [d, a, b, c]
+            let d = buf[sp - 1], c = buf[sp - 2], b = buf[sp - 3], a = buf[sp - 4]
+            buf[sp - 4] = d; buf[sp - 3] = a; buf[sp - 2] = b; buf[sp - 1] = c
+            pc += 1
+
+        case .perm5:
+            // [a, b, c, d, e] -> [e, a, b, c, d]
+            let e = buf[sp - 1], d = buf[sp - 2], c = buf[sp - 3], b = buf[sp - 4], a = buf[sp - 5]
+            buf[sp - 5] = e; buf[sp - 4] = a; buf[sp - 3] = b; buf[sp - 2] = c; buf[sp - 1] = d
+            pc += 1
+
+        case .get_loc_checkthis:
+            let idx = Int(readU16(bc, pc + 1))
+            let val = buf[varBase + idx]
+            if val.isUninitialized { resume = pc; break traceLoop } // deopt: main loop throws
+            buf[sp] = val.dupValue(); sp += 1
+            pc += 3
 
         case .swap:
             let tmp = buf[sp - 1]; buf[sp - 1] = buf[sp - 2]; buf[sp - 2] = tmp
@@ -2076,8 +3037,22 @@ private func executeFastTrace(
                 sp -= 1
                 buf[sp - 1] = overflow ? .newFloat64(Double(a) + Double(b)) : .newInt32(r)
                 pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                // Mixed/float operands: plain double arithmetic keeps float
+                // loops inside the trace instead of deopting every op.
+                sp -= 1
+                buf[sp - 1] = .newFloat64(jeffJS_traceNum(lhs) + jeffJS_traceNum(rhs))
+                pc += 1
+            } else if lhs.isString && rhs.isString {
+                // String concat stays in the trace (rope/buffer append).
+                let r = jeffJS_concatStrings(s1: lhs, s2: rhs)
+                if r.isException { resume = pc; break traceLoop } // deopt: main loop rethrows
+                lhs.freeValue(); rhs.freeValue()
+                sp -= 1
+                buf[sp - 1] = r
+                pc += 1
             } else {
-                return pc // deopt: non-int add (strings, objects, etc.)
+                resume = pc; break traceLoop // deopt: non-numeric, non-string operands
             }
 
         case .sub:
@@ -2087,8 +3062,14 @@ private func executeFastTrace(
                 sp -= 1
                 buf[sp - 1] = overflow ? .newFloat64(Double(lhs.toInt32()) - Double(rhs.toInt32())) : .newInt32(r)
                 pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                // Mixed/float operands: plain double arithmetic keeps float
+                // loops inside the trace instead of deopting every op.
+                sp -= 1
+                buf[sp - 1] = .newFloat64(jeffJS_traceNum(lhs) - jeffJS_traceNum(rhs))
+                pc += 1
             } else {
-                return pc // deopt
+                resume = pc; break traceLoop // deopt: non-numeric operands
             }
 
         case .mul:
@@ -2103,8 +3084,14 @@ private func executeFastTrace(
                     buf[sp - 1] = .newFloat64(Double(a) * Double(b))
                 }
                 pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                // Mixed/float operands: plain double arithmetic keeps float
+                // loops inside the trace instead of deopting every op.
+                sp -= 1
+                buf[sp - 1] = .newFloat64(jeffJS_traceNum(lhs) * jeffJS_traceNum(rhs))
+                pc += 1
             } else {
-                return pc // deopt
+                resume = pc; break traceLoop // deopt: non-numeric operands
             }
 
         case .div:
@@ -2112,7 +3099,7 @@ private func executeFastTrace(
             if lhs.isInt && rhs.isInt {
                 let a = lhs.toInt32(), b = rhs.toInt32()
                 if b == 0 || (a == Int32.min && b == -1) {
-                    return pc // deopt: div by zero or overflow
+                    resume = pc; break traceLoop // deopt: div by zero or overflow
                 }
                 let r = a / b
                 sp -= 1
@@ -2122,8 +3109,14 @@ private func executeFastTrace(
                     buf[sp - 1] = .newFloat64(Double(a) / Double(b))
                 }
                 pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                // Mixed/float operands: plain double arithmetic keeps float
+                // loops inside the trace instead of deopting every op.
+                sp -= 1
+                buf[sp - 1] = .newFloat64(jeffJS_traceNum(lhs) / jeffJS_traceNum(rhs))
+                pc += 1
             } else {
-                return pc // deopt
+                resume = pc; break traceLoop // deopt: non-numeric operands
             }
 
         case .mod:
@@ -2131,7 +3124,7 @@ private func executeFastTrace(
             if lhs.isInt && rhs.isInt {
                 let a = lhs.toInt32(), b = rhs.toInt32()
                 if b == 0 || (a == Int32.min && b == -1) {
-                    return pc // deopt
+                    resume = pc; break traceLoop // deopt
                 }
                 let r = a % b
                 sp -= 1
@@ -2142,18 +3135,18 @@ private func executeFastTrace(
                 }
                 pc += 1
             } else {
-                return pc // deopt
+                resume = pc; break traceLoop // deopt
             }
 
         case .neg:
             let val = buf[sp - 1]
             if val.isInt {
                 let v = val.toInt32()
-                if v == 0 || v == Int32.min { return pc } // deopt: -0 or overflow
+                if v == 0 || v == Int32.min { resume = pc; break traceLoop } // deopt: -0 or overflow
                 buf[sp - 1] = .newInt32(-v)
                 pc += 1
             } else {
-                return pc // deopt
+                resume = pc; break traceLoop // deopt
             }
 
         case .inc:
@@ -2167,7 +3160,7 @@ private func executeFastTrace(
                 }
                 pc += 1
             } else {
-                return pc // deopt
+                resume = pc; break traceLoop // deopt
             }
 
         case .dec:
@@ -2181,7 +3174,40 @@ private func executeFastTrace(
                 }
                 pc += 1
             } else {
-                return pc // deopt
+                resume = pc; break traceLoop // deopt
+            }
+
+        case .inc_loc:
+            let idx = Int(bc[pc + 1])
+            let val = buf[varBase + idx]
+            if val.isInt && val.toInt32() != Int32.max {
+                buf[varBase + idx] = .newInt32(val.toInt32() + 1)
+                pc += 2
+            } else {
+                resume = pc; break traceLoop // deopt
+            }
+
+        case .dec_loc:
+            let idx = Int(bc[pc + 1])
+            let val = buf[varBase + idx]
+            if val.isInt && val.toInt32() != Int32.min {
+                buf[varBase + idx] = .newInt32(val.toInt32() - 1)
+                pc += 2
+            } else {
+                resume = pc; break traceLoop // deopt
+            }
+
+        case .add_loc:
+            let idx = Int(bc[pc + 1])
+            let addend = readI32(bc, pc + 2)
+            let val = buf[varBase + idx]
+            if val.isInt {
+                let (r, overflow) = val.toInt32().addingReportingOverflow(addend)
+                if overflow { resume = pc; break traceLoop } // deopt: main loop widens to double
+                buf[varBase + idx] = .newInt32(r)
+                pc += 6
+            } else {
+                resume = pc; break traceLoop // deopt
             }
 
         case .post_inc:
@@ -2197,7 +3223,7 @@ private func executeFastTrace(
                 sp += 1
                 pc += 1
             } else {
-                return pc // deopt
+                resume = pc; break traceLoop // deopt
             }
 
         case .post_dec:
@@ -2212,7 +3238,7 @@ private func executeFastTrace(
                 sp += 1
                 pc += 1
             } else {
-                return pc // deopt
+                resume = pc; break traceLoop // deopt
             }
 
         case .plus:
@@ -2220,7 +3246,7 @@ private func executeFastTrace(
             if val.isInt {
                 pc += 1 // int stays as-is
             } else {
-                return pc // deopt
+                resume = pc; break traceLoop // deopt
             }
 
         // =================================================================
@@ -2233,7 +3259,11 @@ private func executeFastTrace(
                 sp -= 1
                 buf[sp - 1] = lhs.toInt32() < rhs.toInt32() ? .JS_TRUE : .JS_FALSE
                 pc += 1
-            } else { return pc }
+            } else if lhs.isNumber && rhs.isNumber {
+                sp -= 1
+                buf[sp - 1] = jeffJS_traceNum(lhs) < jeffJS_traceNum(rhs) ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else { resume = pc; break traceLoop }
 
         case .lte:
             let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
@@ -2241,7 +3271,11 @@ private func executeFastTrace(
                 sp -= 1
                 buf[sp - 1] = lhs.toInt32() <= rhs.toInt32() ? .JS_TRUE : .JS_FALSE
                 pc += 1
-            } else { return pc }
+            } else if lhs.isNumber && rhs.isNumber {
+                sp -= 1
+                buf[sp - 1] = jeffJS_traceNum(lhs) <= jeffJS_traceNum(rhs) ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else { resume = pc; break traceLoop }
 
         case .gt:
             let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
@@ -2249,7 +3283,11 @@ private func executeFastTrace(
                 sp -= 1
                 buf[sp - 1] = lhs.toInt32() > rhs.toInt32() ? .JS_TRUE : .JS_FALSE
                 pc += 1
-            } else { return pc }
+            } else if lhs.isNumber && rhs.isNumber {
+                sp -= 1
+                buf[sp - 1] = jeffJS_traceNum(lhs) > jeffJS_traceNum(rhs) ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else { resume = pc; break traceLoop }
 
         case .gte:
             let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
@@ -2257,7 +3295,11 @@ private func executeFastTrace(
                 sp -= 1
                 buf[sp - 1] = lhs.toInt32() >= rhs.toInt32() ? .JS_TRUE : .JS_FALSE
                 pc += 1
-            } else { return pc }
+            } else if lhs.isNumber && rhs.isNumber {
+                sp -= 1
+                buf[sp - 1] = jeffJS_traceNum(lhs) >= jeffJS_traceNum(rhs) ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else { resume = pc; break traceLoop }
 
         case .eq:
             let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
@@ -2265,7 +3307,11 @@ private func executeFastTrace(
                 sp -= 1
                 buf[sp - 1] = lhs.toInt32() == rhs.toInt32() ? .JS_TRUE : .JS_FALSE
                 pc += 1
-            } else { return pc }
+            } else if lhs.isNumber && rhs.isNumber {
+                sp -= 1
+                buf[sp - 1] = jeffJS_traceNum(lhs) == jeffJS_traceNum(rhs) ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else { resume = pc; break traceLoop }
 
         case .neq:
             let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
@@ -2273,7 +3319,11 @@ private func executeFastTrace(
                 sp -= 1
                 buf[sp - 1] = lhs.toInt32() != rhs.toInt32() ? .JS_TRUE : .JS_FALSE
                 pc += 1
-            } else { return pc }
+            } else if lhs.isNumber && rhs.isNumber {
+                sp -= 1
+                buf[sp - 1] = jeffJS_traceNum(lhs) != jeffJS_traceNum(rhs) ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else { resume = pc; break traceLoop }
 
         case .strict_eq:
             let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
@@ -2281,7 +3331,11 @@ private func executeFastTrace(
                 sp -= 1
                 buf[sp - 1] = lhs.toInt32() == rhs.toInt32() ? .JS_TRUE : .JS_FALSE
                 pc += 1
-            } else { return pc }
+            } else if lhs.isNumber && rhs.isNumber {
+                sp -= 1
+                buf[sp - 1] = jeffJS_traceNum(lhs) == jeffJS_traceNum(rhs) ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else { resume = pc; break traceLoop }
 
         case .strict_neq:
             let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
@@ -2289,7 +3343,11 @@ private func executeFastTrace(
                 sp -= 1
                 buf[sp - 1] = lhs.toInt32() != rhs.toInt32() ? .JS_TRUE : .JS_FALSE
                 pc += 1
-            } else { return pc }
+            } else if lhs.isNumber && rhs.isNumber {
+                sp -= 1
+                buf[sp - 1] = jeffJS_traceNum(lhs) != jeffJS_traceNum(rhs) ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else { resume = pc; break traceLoop }
 
         // =================================================================
         // Bitwise (inline int fast paths)
@@ -2301,7 +3359,13 @@ private func executeFastTrace(
                 sp -= 1
                 buf[sp - 1] = .newInt32(lhs.toInt32() << (rhs.toInt32() & 0x1F))
                 pc += 1
-            } else { return pc }
+            } else if lhs.isNumber && rhs.isNumber {
+                // Float operand (e.g. after an int32 overflow): ToInt32 inline.
+                let a = jeffJS_traceToInt32(lhs), b = jeffJS_traceToInt32(rhs)
+                sp -= 1
+                buf[sp - 1] = .newInt32(a << (b & 0x1F))
+                pc += 1
+            } else { resume = pc; break traceLoop }
 
         case .sar:
             let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
@@ -2309,7 +3373,13 @@ private func executeFastTrace(
                 sp -= 1
                 buf[sp - 1] = .newInt32(lhs.toInt32() >> (rhs.toInt32() & 0x1F))
                 pc += 1
-            } else { return pc }
+            } else if lhs.isNumber && rhs.isNumber {
+                // Float operand (e.g. after an int32 overflow): ToInt32 inline.
+                let a = jeffJS_traceToInt32(lhs), b = jeffJS_traceToInt32(rhs)
+                sp -= 1
+                buf[sp - 1] = .newInt32(a >> (b & 0x1F))
+                pc += 1
+            } else { resume = pc; break traceLoop }
 
         case .shr:
             let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
@@ -2319,7 +3389,12 @@ private func executeFastTrace(
                 sp -= 1
                 buf[sp - 1] = .newUInt32(result)
                 pc += 1
-            } else { return pc }
+            } else if lhs.isNumber && rhs.isNumber {
+                let a = UInt32(bitPattern: jeffJS_traceToInt32(lhs)), b = jeffJS_traceToInt32(rhs)
+                sp -= 1
+                buf[sp - 1] = .newUInt32(a >> UInt32(b & 0x1F))
+                pc += 1
+            } else { resume = pc; break traceLoop }
 
         case .and:
             let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
@@ -2327,7 +3402,13 @@ private func executeFastTrace(
                 sp -= 1
                 buf[sp - 1] = .newInt32(lhs.toInt32() & rhs.toInt32())
                 pc += 1
-            } else { return pc }
+            } else if lhs.isNumber && rhs.isNumber {
+                // Float operand (e.g. after an int32 overflow): ToInt32 inline.
+                let a = jeffJS_traceToInt32(lhs), b = jeffJS_traceToInt32(rhs)
+                sp -= 1
+                buf[sp - 1] = .newInt32(a & b)
+                pc += 1
+            } else { resume = pc; break traceLoop }
 
         case .or:
             let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
@@ -2335,7 +3416,13 @@ private func executeFastTrace(
                 sp -= 1
                 buf[sp - 1] = .newInt32(lhs.toInt32() | rhs.toInt32())
                 pc += 1
-            } else { return pc }
+            } else if lhs.isNumber && rhs.isNumber {
+                // Float operand (e.g. after an int32 overflow): ToInt32 inline.
+                let a = jeffJS_traceToInt32(lhs), b = jeffJS_traceToInt32(rhs)
+                sp -= 1
+                buf[sp - 1] = .newInt32(a | b)
+                pc += 1
+            } else { resume = pc; break traceLoop }
 
         case .xor:
             let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
@@ -2343,14 +3430,20 @@ private func executeFastTrace(
                 sp -= 1
                 buf[sp - 1] = .newInt32(lhs.toInt32() ^ rhs.toInt32())
                 pc += 1
-            } else { return pc }
+            } else if lhs.isNumber && rhs.isNumber {
+                // Float operand (e.g. after an int32 overflow): ToInt32 inline.
+                let a = jeffJS_traceToInt32(lhs), b = jeffJS_traceToInt32(rhs)
+                sp -= 1
+                buf[sp - 1] = .newInt32(a ^ b)
+                pc += 1
+            } else { resume = pc; break traceLoop }
 
         case .not:
             let val = buf[sp - 1]
             if val.isInt {
                 buf[sp - 1] = .newInt32(~val.toInt32())
                 pc += 1
-            } else { return pc }
+            } else { resume = pc; break traceLoop }
 
         // =================================================================
         // Boolean / type
@@ -2358,11 +3451,11 @@ private func executeFastTrace(
 
         case .lnot:
             let val = buf[sp - 1]
-            buf[sp - 1] = JeffJSTypeConvert.toBool(val) ? .JS_FALSE : .JS_TRUE
+            buf[sp - 1] = jeffJS_fastToBool(val) ? .JS_FALSE : .JS_TRUE
             pc += 1
 
         case .typeof_:
-            return pc // deopt: needs string allocation
+            resume = pc; break traceLoop // deopt: needs string allocation
 
         // =================================================================
         // Control flow
@@ -2372,10 +3465,18 @@ private func executeFastTrace(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI32(bc, pc + 1))
-            if !JeffJSTypeConvert.toBool(cond) {
+            if !jeffJS_fastToBool(cond) {
                 let target = pc + 5 + offset
-                if target < entryPC || target >= exitPC {
-                    return target // loop exit
+                if target < 0 || target >= bcLen {
+                    resume = target; break traceLoop // loop exit
+                }
+                if offset < 0 {   // loop back-edge: interrupt check
+                    interrupt -= 1
+                    if interrupt <= 0 {
+                        interrupt = JS_INTERRUPT_COUNTER_INIT
+                        ctx.interruptCounter = interrupt
+                        if ctx.checkInterrupt() { resume = -1; break traceLoop }
+                    }
                 }
                 pc = target
             } else {
@@ -2386,10 +3487,18 @@ private func executeFastTrace(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI32(bc, pc + 1))
-            if JeffJSTypeConvert.toBool(cond) {
+            if jeffJS_fastToBool(cond) {
                 let target = pc + 5 + offset
-                if target < entryPC || target >= exitPC {
-                    return target // loop exit
+                if target < 0 || target >= bcLen {
+                    resume = target; break traceLoop // loop exit
+                }
+                if offset < 0 {   // loop back-edge: interrupt check
+                    interrupt -= 1
+                    if interrupt <= 0 {
+                        interrupt = JS_INTERRUPT_COUNTER_INIT
+                        ctx.interruptCounter = interrupt
+                        if ctx.checkInterrupt() { resume = -1; break traceLoop }
+                    }
                 }
                 pc = target
             } else {
@@ -2400,10 +3509,18 @@ private func executeFastTrace(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI8(bc, pc + 1))
-            if !JeffJSTypeConvert.toBool(cond) {
+            if !jeffJS_fastToBool(cond) {
                 let target = pc + 2 + offset
-                if target < entryPC || target >= exitPC {
-                    return target
+                if target < 0 || target >= bcLen {
+                    resume = target; break traceLoop
+                }
+                if offset < 0 {   // loop back-edge: interrupt check
+                    interrupt -= 1
+                    if interrupt <= 0 {
+                        interrupt = JS_INTERRUPT_COUNTER_INIT
+                        ctx.interruptCounter = interrupt
+                        if ctx.checkInterrupt() { resume = -1; break traceLoop }
+                    }
                 }
                 pc = target
             } else {
@@ -2414,10 +3531,18 @@ private func executeFastTrace(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI8(bc, pc + 1))
-            if JeffJSTypeConvert.toBool(cond) {
+            if jeffJS_fastToBool(cond) {
                 let target = pc + 2 + offset
-                if target < entryPC || target >= exitPC {
-                    return target
+                if target < 0 || target >= bcLen {
+                    resume = target; break traceLoop
+                }
+                if offset < 0 {   // loop back-edge: interrupt check
+                    interrupt -= 1
+                    if interrupt <= 0 {
+                        interrupt = JS_INTERRUPT_COUNTER_INIT
+                        ctx.interruptCounter = interrupt
+                        if ctx.checkInterrupt() { resume = -1; break traceLoop }
+                    }
                 }
                 pc = target
             } else {
@@ -2427,56 +3552,58 @@ private func executeFastTrace(
         case .goto_:
             let offset = Int(readI32(bc, pc + 1))
             let target = pc + 5 + offset
-            if target == entryPC {
-                // Loop-back: interrupt check then continue trace
-                ctx.interruptCounter -= 1
-                if ctx.interruptCounter <= 0 {
-                    ctx.interruptCounter = JS_INTERRUPT_COUNTER_INIT
-                    if ctx.checkInterrupt() { return -1 }
+            if offset < 0 {
+                // Loop-back (any backward jump inside the merged region):
+                // interrupt check, then continue the trace at the target.
+                interrupt -= 1
+                if interrupt <= 0 {
+                    interrupt = JS_INTERRUPT_COUNTER_INIT
+                    ctx.interruptCounter = interrupt
+                    if ctx.checkInterrupt() { resume = -1; break traceLoop }
                 }
-                pc = entryPC
-                continue traceLoop
             }
-            if target >= entryPC && target < exitPC {
+            if target >= 0 && target < bcLen {
                 pc = target
             } else {
-                return target // jump outside trace
+                resume = target; break traceLoop // jump outside trace
             }
 
         case .goto8:
             let offset = Int(readI8(bc, pc + 1))
             let target = pc + 2 + offset
-            if target == entryPC {
-                ctx.interruptCounter -= 1
-                if ctx.interruptCounter <= 0 {
-                    ctx.interruptCounter = JS_INTERRUPT_COUNTER_INIT
-                    if ctx.checkInterrupt() { return -1 }
+            if offset < 0 {
+                // Loop-back (any backward jump inside the merged region):
+                // interrupt check, then continue the trace at the target.
+                interrupt -= 1
+                if interrupt <= 0 {
+                    interrupt = JS_INTERRUPT_COUNTER_INIT
+                    ctx.interruptCounter = interrupt
+                    if ctx.checkInterrupt() { resume = -1; break traceLoop }
                 }
-                pc = entryPC
-                continue traceLoop
             }
-            if target >= entryPC && target < exitPC {
+            if target >= 0 && target < bcLen {
                 pc = target
             } else {
-                return target
+                resume = target; break traceLoop // jump outside trace
             }
 
         case .goto16:
             let offset = Int(readI16(bc, pc + 1))
             let target = pc + 3 + offset
-            if target == entryPC {
-                ctx.interruptCounter -= 1
-                if ctx.interruptCounter <= 0 {
-                    ctx.interruptCounter = JS_INTERRUPT_COUNTER_INIT
-                    if ctx.checkInterrupt() { return -1 }
+            if offset < 0 {
+                // Loop-back (any backward jump inside the merged region):
+                // interrupt check, then continue the trace at the target.
+                interrupt -= 1
+                if interrupt <= 0 {
+                    interrupt = JS_INTERRUPT_COUNTER_INIT
+                    ctx.interruptCounter = interrupt
+                    if ctx.checkInterrupt() { resume = -1; break traceLoop }
                 }
-                pc = entryPC
-                continue traceLoop
             }
-            if target >= entryPC && target < exitPC {
+            if target >= 0 && target < bcLen {
                 pc = target
             } else {
-                return target
+                resume = target; break traceLoop // jump outside trace
             }
 
         // =================================================================
@@ -2492,15 +3619,15 @@ private func executeFastTrace(
 
         case .get_loc8_add:
             let locIdx = Int(bc[pc + 1])
-            let lhs = buf[varBase + locIdx]
-            let rhs = buf[sp - 1]
+            let lhs = buf[sp - 1]              // value pushed before get_loc
+            let rhs = buf[varBase + locIdx]    // the local
             if lhs.isInt && rhs.isInt {
                 let a = lhs.toInt32(), b = rhs.toInt32()
                 let (r, overflow) = a.addingReportingOverflow(b)
                 buf[sp - 1] = overflow ? .newFloat64(Double(a) + Double(b)) : .newInt32(r)
                 pc += 2
             } else {
-                return pc // deopt
+                resume = pc; break traceLoop // deopt
             }
 
         case .push_i32_put_loc8:
@@ -2521,12 +3648,1230 @@ private func executeFastTrace(
         // =================================================================
 
         default:
-            return pc
+            resume = pc; break traceLoop
+        }
+    }
+    // Single exit: publish the (possibly changed) interpreter state.
+    state.sp = sp
+    state.buf = buf
+    state.varBase = varBase
+    state.bc = bc
+    state.bcLen = bcLen
+    state.fb = fb
+    state.frame = frame
+    state.varRefsRaw = varRefsRaw
+    state.varRefsRawCount = varRefsRawCount
+    state.opsRun = opsRun
+    ctx.interruptCounter = interrupt
+    return resume
+}
+
+// =============================================================================
+// MARK: - Lean fast trace (loops without calls / closure variables)
+//
+// Same opcode coverage as executeFastTrace minus calls, returns, push_this and
+// closure-variable access. Kept separate on purpose: the call-capable variant
+// carries ~15 extra live values and measured ~10% slower per opcode, which
+// outweighs its benefit on loops that never call. The compiler marks each
+// trace block with `hasCalls`; the main loop picks the variant.
+// =============================================================================
+private func executeFastTraceLean(
+    bc: UnsafePointer<UInt8>,
+    bcLen: Int,
+    entryPC: Int,
+    exitPC: Int,
+    startPC: Int,
+    buf: UnsafeMutablePointer<JeffJSValue>,
+    varBase: Int,
+    sp: inout Int,
+    ctx: JeffJSContext,
+    cpool: [JeffJSValue],
+    stackLimit: Int,
+    icEntries: UnsafeMutablePointer<JeffJSICEntry>?
+) -> Int {
+    // Validate parameters
+    guard entryPC >= 0, exitPC <= bcLen, entryPC < exitPC,
+          startPC >= entryPC, startPC < exitPC,
+          sp >= 0, sp < stackLimit, stackLimit > 0 else {
+        return startPC
+    }
+    var pc = startPC
+    var interrupt = ctx.interruptCounter   // register copy; written back on every exit
+
+    // No per-op range or stack checks: every jump handler returns to the
+    // main loop when its target leaves [entryPC, exitPC); straight-line
+    // advances cannot leave the region (it ends with a backward jump); and
+    // the compiler-computed stackSize (+32 slack) bounds sp. DEBUG asserts.
+    traceLoop: while true {
+        #if DEBUG
+        assert(pc >= entryPC && pc < exitPC && sp >= 0 && sp < stackLimit,
+               "fast trace left its region or overflowed")
+        #endif
+        // Same raw decode as the main loop: every narrow byte is a valid
+        // case; the 0x00 wide prefix decodes to .invalid and deopts below.
+        let opByte = bc[pc]
+        // Byte 0 (wide-opcode prefix) decodes to .invalid, which deopts below.
+        let op = unsafeBitCast(UInt16(opByte), to: JeffJSOpcode.self)
+
+        switch op {
+        case .invalid:
+            ctx.interruptCounter = interrupt; return pc
+
+        // =================================================================
+        // Push values
+        // =================================================================
+
+        case .cmp_loc_i8:
+            let cmp = bc[pc + 1]
+            let cond: Bool
+            let a = buf[varBase + Int(bc[pc + 2])]
+            let k = Int32(Int8(bitPattern: bc[pc + 3]))
+            if a.isInt {
+                cond = jeffJS_cmpInt(cmp, a.toInt32(), k)
+            } else if a.isNumber {
+                cond = jeffJS_cmpDouble(cmp, a.toFloat64(), Double(k))
+            } else { ctx.interruptCounter = interrupt; return pc }
+            // Fused branch: when if_true8 / if_false8 follows, branch here
+            // instead of pushing a bool for the next dispatch to pop.
+            let nb = bc[pc + 4]
+            if nb == UInt8(truncatingIfNeeded: JeffJSOpcode.if_true8.rawValue)
+                || nb == UInt8(truncatingIfNeeded: JeffJSOpcode.if_false8.rawValue) {
+                let take = nb == UInt8(truncatingIfNeeded: JeffJSOpcode.if_true8.rawValue) ? cond : !cond
+                if take {
+                    let offset = Int(Int8(bitPattern: bc[pc + 5]))
+                    let target = pc + 6 + offset
+                    if target < 0 || target >= bcLen { ctx.interruptCounter = interrupt; return target }
+                    if offset < 0 {
+                        interrupt -= 1
+                        if interrupt <= 0 {
+                            interrupt = JS_INTERRUPT_COUNTER_INIT
+                            ctx.interruptCounter = interrupt
+                            if ctx.checkInterrupt() { ctx.interruptCounter = interrupt; return -1 }
+                        }
+                    }
+                    pc = target
+                } else {
+                    pc += 6
+                }
+            } else {
+                buf[sp] = cond ? .JS_TRUE : .JS_FALSE; sp += 1
+                pc += 4
+            }
+
+        case .cmp_loc_loc:
+            let cmp = bc[pc + 1]
+            let cond: Bool
+            let a = buf[varBase + Int(bc[pc + 2])]
+            let b = buf[varBase + Int(bc[pc + 3])]
+            if a.isInt && b.isInt {
+                cond = jeffJS_cmpInt(cmp, a.toInt32(), b.toInt32())
+            } else if a.isNumber && b.isNumber {
+                cond = jeffJS_cmpDouble(cmp, jeffJS_traceNum(a), jeffJS_traceNum(b))
+            } else { ctx.interruptCounter = interrupt; return pc }
+            // Fused branch: when if_true8 / if_false8 follows, branch here
+            // instead of pushing a bool for the next dispatch to pop.
+            let nb = bc[pc + 4]
+            if nb == UInt8(truncatingIfNeeded: JeffJSOpcode.if_true8.rawValue)
+                || nb == UInt8(truncatingIfNeeded: JeffJSOpcode.if_false8.rawValue) {
+                let take = nb == UInt8(truncatingIfNeeded: JeffJSOpcode.if_true8.rawValue) ? cond : !cond
+                if take {
+                    let offset = Int(Int8(bitPattern: bc[pc + 5]))
+                    let target = pc + 6 + offset
+                    if target < 0 || target >= bcLen { ctx.interruptCounter = interrupt; return target }
+                    if offset < 0 {
+                        interrupt -= 1
+                        if interrupt <= 0 {
+                            interrupt = JS_INTERRUPT_COUNTER_INIT
+                            ctx.interruptCounter = interrupt
+                            if ctx.checkInterrupt() { ctx.interruptCounter = interrupt; return -1 }
+                        }
+                    }
+                    pc = target
+                } else {
+                    pc += 6
+                }
+            } else {
+                buf[sp] = cond ? .JS_TRUE : .JS_FALSE; sp += 1
+                pc += 4
+            }
+
+        case .arith_loc_loc:
+            let ar = bc[pc + 1]
+            let a = buf[varBase + Int(bc[pc + 2])]
+            let b = buf[varBase + Int(bc[pc + 3])]
+            if a.isInt && b.isInt {
+                buf[sp] = jeffJS_arithInt(ar, a.toInt32(), b.toInt32()); sp += 1
+            } else if a.isNumber && b.isNumber {
+                buf[sp] = jeffJS_arithNumeric(ar, jeffJS_traceNum(a), jeffJS_traceNum(b)); sp += 1
+            } else if ar == 0 && a.isString && b.isString {
+                let r = jeffJS_concatStrings(s1: a, s2: b)
+                if r.isException { ctx.interruptCounter = interrupt; return pc }
+                buf[sp] = r; sp += 1
+            } else { ctx.interruptCounter = interrupt; return pc }
+            pc += 4
+
+        case .arith_loc_i8:
+            let ar = bc[pc + 1]
+            let a = buf[varBase + Int(bc[pc + 2])]
+            let k = Int32(Int8(bitPattern: bc[pc + 3]))
+            if a.isInt {
+                buf[sp] = jeffJS_arithInt(ar, a.toInt32(), k); sp += 1
+            } else if a.isNumber {
+                buf[sp] = jeffJS_arithNumeric(ar, a.toFloat64(), Double(k)); sp += 1
+            } else { ctx.interruptCounter = interrupt; return pc }
+            pc += 4
+
+        case .to_int32:
+            let v = buf[sp - 1]
+            if v.isInt {
+            } else if v.isNumber {
+                buf[sp - 1] = .newInt32(JeffJSTypeConvert.doubleToInt32(v.toFloat64()))
+            } else { ctx.interruptCounter = interrupt; return pc }
+            pc += 1
+
+        case .arith_const8:
+            let ar = bc[pc + 1]
+            let k = Int(bc[pc + 2])
+            guard k < cpool.count else { ctx.interruptCounter = interrupt; return pc }
+            let c = cpool[k]
+            let v = buf[sp - 1]
+            if v.isInt && c.isInt {
+                buf[sp - 1] = jeffJS_arithInt(ar, v.toInt32(), c.toInt32())
+            } else if v.isNumber && c.isNumber {
+                buf[sp - 1] = jeffJS_arithNumeric(ar, jeffJS_traceNum(v), jeffJS_traceNum(c))
+            } else if ar == 0 && v.isString && c.isString {
+                // `s += "lit"`: rope/buffer append, TOS is consumed
+                let r = jeffJS_concatStrings(s1: v, s2: c)
+                if r.isException { ctx.interruptCounter = interrupt; return pc }
+                v.freeValue()
+                buf[sp - 1] = r
+            } else { ctx.interruptCounter = interrupt; return pc }
+            pc += 3
+
+        case .push_i32:
+            let val = readI32(bc, pc + 1)
+            buf[sp] = .newInt32(val); sp += 1
+            pc += 5
+
+        case .push_0:  buf[sp] = .newInt32(0); sp += 1; pc += 1
+        case .push_1:  buf[sp] = .newInt32(1); sp += 1; pc += 1
+        case .push_minus1: buf[sp] = .newInt32(-1); sp += 1; pc += 1
+        case .push_2:  buf[sp] = .newInt32(2); sp += 1; pc += 1
+        case .push_3:  buf[sp] = .newInt32(3); sp += 1; pc += 1
+        case .push_4:  buf[sp] = .newInt32(4); sp += 1; pc += 1
+        case .push_5:  buf[sp] = .newInt32(5); sp += 1; pc += 1
+        case .push_6:  buf[sp] = .newInt32(6); sp += 1; pc += 1
+        case .push_7:  buf[sp] = .newInt32(7); sp += 1; pc += 1
+
+        case .push_i8:
+            let val = Int32(readI8(bc, pc + 1))
+            buf[sp] = .newInt32(val); sp += 1
+            pc += 2
+
+        case .push_i16:
+            let val = Int32(readI16(bc, pc + 1))
+            buf[sp] = .newInt32(val); sp += 1
+            pc += 3
+
+        case .push_const:
+            let idx = Int(readU32(bc, pc + 1))
+            if idx < cpool.count {
+                buf[sp] = cpool[idx].dupValue()
+            } else {
+                buf[sp] = .undefined
+            }
+            sp += 1
+            pc += 5
+
+        case .push_const8:
+            let idx = Int(bc[pc + 1])
+            buf[sp] = idx < cpool.count ? cpool[idx].dupValue() : .undefined
+            sp += 1
+            pc += 2
+
+        case .push_true:  buf[sp] = .JS_TRUE; sp += 1; pc += 1
+        case .push_false: buf[sp] = .JS_FALSE; sp += 1; pc += 1
+        case .push_null:  buf[sp] = .null; sp += 1; pc += 1
+        case .undefined:  buf[sp] = .undefined; sp += 1; pc += 1
+
+        // =================================================================
+        // Local access (varBase-relative)
+        // =================================================================
+
+        case .get_loc0: buf[sp] = buf[varBase].dupValue(); sp += 1; pc += 1
+        case .get_loc1: buf[sp] = buf[varBase + 1].dupValue(); sp += 1; pc += 1
+        case .get_loc2: buf[sp] = buf[varBase + 2].dupValue(); sp += 1; pc += 1
+        case .get_loc3: buf[sp] = buf[varBase + 3].dupValue(); sp += 1; pc += 1
+
+        case .get_loc8:
+            let idx = Int(bc[pc + 1])
+            buf[sp] = buf[varBase + idx].dupValue(); sp += 1
+            pc += 2
+
+        case .get_loc:
+            let idx = Int(readU16(bc, pc + 1))
+            buf[sp] = buf[varBase + idx].dupValue(); sp += 1
+            pc += 3
+
+        case .put_loc0: sp -= 1; buf[varBase] = buf[sp]; pc += 1
+        case .put_loc1: sp -= 1; buf[varBase + 1] = buf[sp]; pc += 1
+        case .put_loc2: sp -= 1; buf[varBase + 2] = buf[sp]; pc += 1
+        case .put_loc3: sp -= 1; buf[varBase + 3] = buf[sp]; pc += 1
+
+        case .put_loc8:
+            let idx = Int(bc[pc + 1])
+            sp -= 1; buf[varBase + idx] = buf[sp]
+            pc += 2
+
+        case .put_loc:
+            let idx = Int(readU16(bc, pc + 1))
+            sp -= 1; buf[varBase + idx] = buf[sp]
+            pc += 3
+
+        case .set_loc0: buf[varBase] = buf[sp - 1]; pc += 1
+        case .set_loc1: buf[varBase + 1] = buf[sp - 1]; pc += 1
+        case .set_loc2: buf[varBase + 2] = buf[sp - 1]; pc += 1
+        case .set_loc3: buf[varBase + 3] = buf[sp - 1]; pc += 1
+
+        case .set_loc8:
+            let idx = Int(bc[pc + 1])
+            buf[varBase + idx] = buf[sp - 1]
+            pc += 2
+
+        case .set_loc:
+            let idx = Int(readU16(bc, pc + 1))
+            buf[varBase + idx] = buf[sp - 1]
+            pc += 3
+
+        case .put_loc_check:
+            // Pure TDZ check (const assignment is a compile-time throw_error).
+            let idx = Int(readU16(bc, pc + 1))
+            let current = buf[varBase + idx]
+            if current.isUninitialized { ctx.interruptCounter = interrupt; return pc } // deopt: main loop throws
+            sp -= 1; buf[varBase + idx] = buf[sp]
+            current.freeValue()
+            pc += 3
+
+        case .get_loc_check:
+            let idx = Int(readU16(bc, pc + 1))
+            let val = buf[varBase + idx]
+            if val.isUninitialized { ctx.interruptCounter = interrupt; return pc } // deopt: TDZ
+            buf[sp] = val.dupValue(); sp += 1
+            pc += 3
+
+        // =================================================================
+        // Global variable access (via the per-function inline cache)
+        // =================================================================
+
+        // Property access with inline-cache hits only; any miss deopts to the
+        // main loop, which performs the full lookup and refills the cache so
+        // the next iteration hits here. Mirrors the main-loop hit paths
+        // exactly (including their reference-handling).
+        // ------------------------------------------------------------------
+        // Object / array literals and TDZ slots (object-building loops).
+        // ------------------------------------------------------------------
+        case .object:
+            buf[sp] = ctx.newPlainObject(); sp += 1
+            pc += 1
+
+        case .set_loc_uninitialized:
+            let idx = Int(readU16(bc, pc + 1))
+            let oldTDZ = buf[varBase + idx]
+            buf[varBase + idx] = .uninitialized
+            oldTDZ.freeValue()
+            pc += 3
+
+        case .put_loc_check_init:
+            if sp <= varBase { ctx.interruptCounter = interrupt; return pc }
+            let idx = Int(readU16(bc, pc + 1))
+            let old = buf[varBase + idx]
+            sp -= 1; buf[varBase + idx] = buf[sp]
+            old.freeValue()
+            pc += 3
+
+        case .define_field:
+            // Transition IC hit only (mirrors the main loop's fast path).
+            guard sp >= varBase + 2, let ents = icEntries else { ctx.interruptCounter = interrupt; return pc }
+            let obj = buf[sp - 2]
+            guard let jsObj = obj.obj else { ctx.interruptCounter = interrupt; return pc }
+            let entry = ents[pc & JeffJSInlineCache.mask]
+            guard entry.pc == pc, jeffJS_icDefine(jsObj._ptr, entry, buf[sp - 1], ctx.rt) else { ctx.interruptCounter = interrupt; return pc }
+            sp -= 1   // the value ref moved into the new slot
+            pc += 5
+
+        case .array_from:
+            // Empty literal `[]` only; the parser's orphan `object` sentinel
+            // below it is dropped like the main loop does.
+            guard readU16(bc, pc + 1) == 0, sp > varBase else { ctx.interruptCounter = interrupt; return pc }
+            let below = buf[sp - 1]
+            guard let bo = below.obj, bo.classID == JeffJSClassID.object.rawValue, bo.propCount == 0 else { ctx.interruptCounter = interrupt; return pc }
+            below.freeValue()
+            buf[sp - 1] = ctx.newArray()
+            pc += 3
+
+        case .get_field:
+            guard let ents = icEntries else { ctx.interruptCounter = interrupt; return pc }
+            let obj = buf[sp - 1]
+            guard let jsObj = obj.obj else { ctx.interruptCounter = interrupt; return pc }
+            let entry = ents[pc & JeffJSInlineCache.mask]
+            var icHit: JeffJSValue? = nil
+            if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
+            if let hv = icHit {
+                buf[sp - 1] = hv.dupValueFast()
+                obj.freeValueFast()
+                pc += 5
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt: IC miss
+            }
+
+        case .get_field2:
+            guard let ents = icEntries else { ctx.interruptCounter = interrupt; return pc }
+            let obj = buf[sp - 1]
+            guard let jsObj = obj.obj else { ctx.interruptCounter = interrupt; return pc }
+            let entry = ents[pc & JeffJSInlineCache.mask]
+            var icHit: JeffJSValue? = nil
+            if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
+            if let hv = icHit {
+                buf[sp] = hv.dupValueFast(); sp += 1
+                pc += 5
+            } else {
+                ctx.interruptCounter = interrupt; return pc
+            }
+
+        case .put_field:
+            guard let ents = icEntries else { ctx.interruptCounter = interrupt; return pc }
+            let val = buf[sp - 1]
+            let obj = buf[sp - 2]
+            guard let jsObj = obj.obj else { ctx.interruptCounter = interrupt; return pc }
+            let entry = ents[pc & JeffJSInlineCache.mask]
+            if entry.pc == pc, jeffJS_icWrite(jsObj._ptr, entry, val) {
+                obj.freeValueFast()   // the popped receiver ref (QuickJS: JS_FreeValue(sp[-2]))
+                sp -= 2
+                pc += 5
+            } else {
+                ctx.interruptCounter = interrupt; return pc
+            }
+
+        case .get_loc8_get_field:
+            guard let ents = icEntries else { ctx.interruptCounter = interrupt; return pc }
+            let obj = buf[varBase + Int(bc[pc + 1])]
+            guard let jsObj = obj.obj else { ctx.interruptCounter = interrupt; return pc }
+            let entry = ents[pc & JeffJSInlineCache.mask]
+            var icHit: JeffJSValue? = nil
+            if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
+            if let hv = icHit {
+                buf[sp] = hv.dupValueFast(); sp += 1
+                pc += 6
+            } else {
+                ctx.interruptCounter = interrupt; return pc
+            }
+
+        case .get_arg0_get_field:
+            guard let ents = icEntries else { ctx.interruptCounter = interrupt; return pc }
+            let obj = buf[0]
+            guard let jsObj = obj.obj else { ctx.interruptCounter = interrupt; return pc }
+            let entry = ents[pc & JeffJSInlineCache.mask]
+            var icHit: JeffJSValue? = nil
+            if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
+            if let hv = icHit {
+                buf[sp] = hv.dupValueFast(); sp += 1
+                pc += 5
+            } else {
+                ctx.interruptCounter = interrupt; return pc
+            }
+
+        case .get_length:
+            guard let ents = icEntries else { ctx.interruptCounter = interrupt; return pc }
+            let obj = buf[sp - 1]
+            guard let jsObj = obj.obj, let sid = jsObj.shapeIdentity else { ctx.interruptCounter = interrupt; return pc }
+            let entry = ents[pc & JeffJSInlineCache.mask]
+            if entry.pc == pc, entry.shapePtr == sid, entry.holderPtr == nil,
+               entry.propOffset >= 0, entry.propOffset < jsObj.propCount,
+               jsObj.extra(at: entry.propOffset) == nil {
+                buf[sp - 1] = jsObj.dataValue(at: entry.propOffset).dupValue()
+                obj.freeValueFast()
+                pc += 1
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt
+            }
+
+        case .get_var, .get_var_undef:
+            guard let ents = icEntries, let gObj = ctx.globalObj.obj, let gShape = gObj.shape else {
+                ctx.interruptCounter = interrupt; return pc // deopt: no IC table yet
+            }
+            let entry = ents[pc & JeffJSInlineCache.mask]
+            if entry.pc == pc,
+               entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
+               entry.propOffset >= 0, entry.propOffset < gObj.propCount,
+               gObj.extra(at: entry.propOffset) == nil {
+                buf[sp] = gObj.dataValue(at: entry.propOffset).dupValue(); sp += 1
+                pc += 5
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt: IC miss — main loop refills the cache
+            }
+
+        case .put_var:
+            guard let ents = icEntries, let gObj = ctx.globalObj.obj, let gShape = gObj.shape else {
+                ctx.interruptCounter = interrupt; return pc // deopt
+            }
+            let entry = ents[pc & JeffJSInlineCache.mask]
+            if entry.pc == pc,
+               entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
+               entry.propOffset >= 0, entry.propOffset < gObj.propCount,
+               entry.propOffset < gShape.prop.count,
+               gShape.prop[entry.propOffset].flags.contains(.writable),
+               !gShape.prop[entry.propOffset].flags.contains(.getset),
+               gObj.extra(at: entry.propOffset) == nil {
+                let chained = isStoreOpcode(bc, pc + 5, bcLen)
+                let val: JeffJSValue
+                if chained { val = buf[sp - 1].dupValue() } else { sp -= 1; val = buf[sp] }
+                let old = gObj.dataValue(at: entry.propOffset)
+                gObj.asClass.propValues[entry.propOffset] = val
+                old.freeValue()
+                pc += 5
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt: IC miss
+            }
+
+        // =================================================================
+        // Array element access (dense int-indexed fast paths)
+        // =================================================================
+
+        case .get_array_el:
+            guard sp >= 2 else { ctx.interruptCounter = interrupt; return pc } // deopt: stack too shallow
+            let key = buf[sp - 1]
+            let objV = buf[sp - 2]
+            guard key.isInt, let jsObj = objV.obj,
+                  jsObj.classID == JeffJSClassID.array.rawValue else {
+                ctx.interruptCounter = interrupt; return pc // deopt: non-array or non-int key
+            }
+            let idx = key.toInt32()
+            guard idx >= 0 else { ctx.interruptCounter = interrupt; return pc }
+            let uidx = UInt32(idx)
+            var element: JeffJSValue? = nil
+            if let storage = jsObj._fastArrayValues {
+                if uidx < storage.count, Int(uidx) < storage.values.count {
+                    element = storage.values[Int(uidx)]
+                }
+            } else if case .array(_, let vals, let count) = jsObj.payload {
+                if uidx < count, Int(uidx) < vals.count {
+                    element = vals[Int(uidx)]
+                }
+            }
+            guard let el = element else { ctx.interruptCounter = interrupt; return pc } // deopt: OOB/holes — slow path decides
+            sp -= 1
+            buf[sp - 1] = el.dupValue()
+            pc += 1
+
+        case .put_array_el:
+            guard sp >= 3 else { ctx.interruptCounter = interrupt; return pc } // deopt: stack too shallow
+            let val = buf[sp - 1]
+            let key = buf[sp - 2]
+            let objV = buf[sp - 3]
+            guard key.isInt, let jsObj = objV.obj,
+                  jsObj.classID == JeffJSClassID.array.rawValue,
+                  let storage = jsObj._fastArrayValues else {
+                ctx.interruptCounter = interrupt; return pc // deopt: only the ref-type storage is safe to poke here
+            }
+            let idx = key.toInt32()
+            // In-bounds overwrite only — growth/length updates take the slow path.
+            guard idx >= 0, UInt32(idx) < storage.count, Int(idx) < storage.values.count else {
+                ctx.interruptCounter = interrupt; return pc
+            }
+            let old = storage.values[Int(idx)]
+            storage.values[Int(idx)] = val
+            old.freeValue()
+            sp -= 3
+            pc += 1
+
+        // =================================================================
+        // Argument access
+        // =================================================================
+
+        case .get_arg0: buf[sp] = buf[0].dupValue(); sp += 1; pc += 1
+        case .get_arg1: buf[sp] = buf[1].dupValue(); sp += 1; pc += 1
+        case .get_arg2: buf[sp] = buf[2].dupValue(); sp += 1; pc += 1
+        case .get_arg3: buf[sp] = buf[3].dupValue(); sp += 1; pc += 1
+
+        case .get_arg:
+            let idx = Int(readU16(bc, pc + 1))
+            buf[sp] = buf[idx].dupValue(); sp += 1
+            pc += 3
+
+        // =================================================================
+        // Stack manipulation
+        // =================================================================
+
+        case .dup:
+            buf[sp] = buf[sp - 1].dupValue(); sp += 1
+            pc += 1
+
+        case .drop:
+            if sp <= varBase { ctx.interruptCounter = interrupt; return pc }   // underflow: let the guarded main loop report it
+            sp -= 1
+            pc += 1
+
+        case .nip:
+            buf[sp - 2] = buf[sp - 1]; sp -= 1
+            pc += 1
+
+        case .nip1:
+            buf[sp - 3] = buf[sp - 2]; buf[sp - 2] = buf[sp - 1]; sp -= 1
+            pc += 1
+
+        case .perm3:
+            // [a, b, c] -> [c, a, b]
+            let c = buf[sp - 1], b = buf[sp - 2], a = buf[sp - 3]
+            buf[sp - 3] = c; buf[sp - 2] = a; buf[sp - 1] = b
+            pc += 1
+
+        case .perm4:
+            // [a, b, c, d] -> [d, a, b, c]
+            let d = buf[sp - 1], c = buf[sp - 2], b = buf[sp - 3], a = buf[sp - 4]
+            buf[sp - 4] = d; buf[sp - 3] = a; buf[sp - 2] = b; buf[sp - 1] = c
+            pc += 1
+
+        case .perm5:
+            // [a, b, c, d, e] -> [e, a, b, c, d]
+            let e = buf[sp - 1], d = buf[sp - 2], c = buf[sp - 3], b = buf[sp - 4], a = buf[sp - 5]
+            buf[sp - 5] = e; buf[sp - 4] = a; buf[sp - 3] = b; buf[sp - 2] = c; buf[sp - 1] = d
+            pc += 1
+
+        case .get_loc_checkthis:
+            let idx = Int(readU16(bc, pc + 1))
+            let val = buf[varBase + idx]
+            if val.isUninitialized { ctx.interruptCounter = interrupt; return pc } // deopt: main loop throws
+            buf[sp] = val.dupValue(); sp += 1
+            pc += 3
+
+        case .swap:
+            let tmp = buf[sp - 1]; buf[sp - 1] = buf[sp - 2]; buf[sp - 2] = tmp
+            pc += 1
+
+        // =================================================================
+        // Arithmetic (inline int fast paths)
+        // =================================================================
+
+        case .add:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                let a = lhs.toInt32(), b = rhs.toInt32()
+                let (r, overflow) = a.addingReportingOverflow(b)
+                sp -= 1
+                buf[sp - 1] = overflow ? .newFloat64(Double(a) + Double(b)) : .newInt32(r)
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                // Mixed/float operands: plain double arithmetic keeps float
+                // loops inside the trace instead of deopting every op.
+                sp -= 1
+                buf[sp - 1] = .newFloat64(jeffJS_traceNum(lhs) + jeffJS_traceNum(rhs))
+                pc += 1
+            } else if lhs.isString && rhs.isString {
+                // String concat stays in the trace (rope/buffer append).
+                let r = jeffJS_concatStrings(s1: lhs, s2: rhs)
+                if r.isException { ctx.interruptCounter = interrupt; return pc } // deopt: main loop rethrows
+                lhs.freeValue(); rhs.freeValue()
+                sp -= 1
+                buf[sp - 1] = r
+                pc += 1
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt: non-numeric, non-string operands
+            }
+
+        case .sub:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                let (r, overflow) = lhs.toInt32().subtractingReportingOverflow(rhs.toInt32())
+                sp -= 1
+                buf[sp - 1] = overflow ? .newFloat64(Double(lhs.toInt32()) - Double(rhs.toInt32())) : .newInt32(r)
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                // Mixed/float operands: plain double arithmetic keeps float
+                // loops inside the trace instead of deopting every op.
+                sp -= 1
+                buf[sp - 1] = .newFloat64(jeffJS_traceNum(lhs) - jeffJS_traceNum(rhs))
+                pc += 1
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt: non-numeric operands
+            }
+
+        case .mul:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                let a = Int64(lhs.toInt32()), b = Int64(rhs.toInt32())
+                let r = a * b
+                sp -= 1
+                if r >= Int64(Int32.min) && r <= Int64(Int32.max) && !(r == 0 && (a < 0 || b < 0)) {
+                    buf[sp - 1] = .newInt32(Int32(r))
+                } else {
+                    buf[sp - 1] = .newFloat64(Double(a) * Double(b))
+                }
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                // Mixed/float operands: plain double arithmetic keeps float
+                // loops inside the trace instead of deopting every op.
+                sp -= 1
+                buf[sp - 1] = .newFloat64(jeffJS_traceNum(lhs) * jeffJS_traceNum(rhs))
+                pc += 1
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt: non-numeric operands
+            }
+
+        case .div:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                let a = lhs.toInt32(), b = rhs.toInt32()
+                if b == 0 || (a == Int32.min && b == -1) {
+                    ctx.interruptCounter = interrupt; return pc // deopt: div by zero or overflow
+                }
+                let r = a / b
+                sp -= 1
+                if r * b == a && !(r == 0 && a < 0) {
+                    buf[sp - 1] = .newInt32(r)
+                } else {
+                    buf[sp - 1] = .newFloat64(Double(a) / Double(b))
+                }
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                // Mixed/float operands: plain double arithmetic keeps float
+                // loops inside the trace instead of deopting every op.
+                sp -= 1
+                buf[sp - 1] = .newFloat64(jeffJS_traceNum(lhs) / jeffJS_traceNum(rhs))
+                pc += 1
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt: non-numeric operands
+            }
+
+        case .mod:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                let a = lhs.toInt32(), b = rhs.toInt32()
+                if b == 0 || (a == Int32.min && b == -1) {
+                    ctx.interruptCounter = interrupt; return pc // deopt
+                }
+                let r = a % b
+                sp -= 1
+                if r != 0 || a >= 0 {
+                    buf[sp - 1] = .newInt32(r)
+                } else {
+                    buf[sp - 1] = .newFloat64(Double(a).truncatingRemainder(dividingBy: Double(b)))
+                }
+                pc += 1
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt
+            }
+
+        case .neg:
+            let val = buf[sp - 1]
+            if val.isInt {
+                let v = val.toInt32()
+                if v == 0 || v == Int32.min { ctx.interruptCounter = interrupt; return pc } // deopt: -0 or overflow
+                buf[sp - 1] = .newInt32(-v)
+                pc += 1
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt
+            }
+
+        case .inc:
+            let val = buf[sp - 1]
+            if val.isInt {
+                let v = val.toInt32()
+                if v == Int32.max {
+                    buf[sp - 1] = .newFloat64(Double(v) + 1)
+                } else {
+                    buf[sp - 1] = .newInt32(v + 1)
+                }
+                pc += 1
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt
+            }
+
+        case .dec:
+            let val = buf[sp - 1]
+            if val.isInt {
+                let v = val.toInt32()
+                if v == Int32.min {
+                    buf[sp - 1] = .newFloat64(Double(v) - 1)
+                } else {
+                    buf[sp - 1] = .newInt32(v - 1)
+                }
+                pc += 1
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt
+            }
+
+        case .inc_loc:
+            let idx = Int(bc[pc + 1])
+            let val = buf[varBase + idx]
+            if val.isInt && val.toInt32() != Int32.max {
+                buf[varBase + idx] = .newInt32(val.toInt32() + 1)
+                pc += 2
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt
+            }
+
+        case .dec_loc:
+            let idx = Int(bc[pc + 1])
+            let val = buf[varBase + idx]
+            if val.isInt && val.toInt32() != Int32.min {
+                buf[varBase + idx] = .newInt32(val.toInt32() - 1)
+                pc += 2
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt
+            }
+
+        case .add_loc:
+            let idx = Int(bc[pc + 1])
+            let addend = readI32(bc, pc + 2)
+            let val = buf[varBase + idx]
+            if val.isInt {
+                let (r, overflow) = val.toInt32().addingReportingOverflow(addend)
+                if overflow { ctx.interruptCounter = interrupt; return pc } // deopt: main loop widens to double
+                buf[varBase + idx] = .newInt32(r)
+                pc += 6
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt
+            }
+
+        case .post_inc:
+            let val = buf[sp - 1]
+            if val.isInt {
+                let v = val.toInt32()
+                // original stays at sp-1, push incremented
+                if v == Int32.max {
+                    buf[sp] = .newFloat64(Double(v) + 1)
+                } else {
+                    buf[sp] = .newInt32(v + 1)
+                }
+                sp += 1
+                pc += 1
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt
+            }
+
+        case .post_dec:
+            let val = buf[sp - 1]
+            if val.isInt {
+                let v = val.toInt32()
+                if v == Int32.min {
+                    buf[sp] = .newFloat64(Double(v) - 1)
+                } else {
+                    buf[sp] = .newInt32(v - 1)
+                }
+                sp += 1
+                pc += 1
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt
+            }
+
+        case .plus:
+            let val = buf[sp - 1]
+            if val.isInt {
+                pc += 1 // int stays as-is
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt
+            }
+
+        // =================================================================
+        // Comparison (inline int fast paths)
+        // =================================================================
+
+        case .lt:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                sp -= 1
+                buf[sp - 1] = lhs.toInt32() < rhs.toInt32() ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                sp -= 1
+                buf[sp - 1] = jeffJS_traceNum(lhs) < jeffJS_traceNum(rhs) ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else { ctx.interruptCounter = interrupt; return pc }
+
+        case .lte:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                sp -= 1
+                buf[sp - 1] = lhs.toInt32() <= rhs.toInt32() ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                sp -= 1
+                buf[sp - 1] = jeffJS_traceNum(lhs) <= jeffJS_traceNum(rhs) ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else { ctx.interruptCounter = interrupt; return pc }
+
+        case .gt:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                sp -= 1
+                buf[sp - 1] = lhs.toInt32() > rhs.toInt32() ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                sp -= 1
+                buf[sp - 1] = jeffJS_traceNum(lhs) > jeffJS_traceNum(rhs) ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else { ctx.interruptCounter = interrupt; return pc }
+
+        case .gte:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                sp -= 1
+                buf[sp - 1] = lhs.toInt32() >= rhs.toInt32() ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                sp -= 1
+                buf[sp - 1] = jeffJS_traceNum(lhs) >= jeffJS_traceNum(rhs) ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else { ctx.interruptCounter = interrupt; return pc }
+
+        case .eq:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                sp -= 1
+                buf[sp - 1] = lhs.toInt32() == rhs.toInt32() ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                sp -= 1
+                buf[sp - 1] = jeffJS_traceNum(lhs) == jeffJS_traceNum(rhs) ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else { ctx.interruptCounter = interrupt; return pc }
+
+        case .neq:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                sp -= 1
+                buf[sp - 1] = lhs.toInt32() != rhs.toInt32() ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                sp -= 1
+                buf[sp - 1] = jeffJS_traceNum(lhs) != jeffJS_traceNum(rhs) ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else { ctx.interruptCounter = interrupt; return pc }
+
+        case .strict_eq:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                sp -= 1
+                buf[sp - 1] = lhs.toInt32() == rhs.toInt32() ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                sp -= 1
+                buf[sp - 1] = jeffJS_traceNum(lhs) == jeffJS_traceNum(rhs) ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else { ctx.interruptCounter = interrupt; return pc }
+
+        case .strict_neq:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                sp -= 1
+                buf[sp - 1] = lhs.toInt32() != rhs.toInt32() ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                sp -= 1
+                buf[sp - 1] = jeffJS_traceNum(lhs) != jeffJS_traceNum(rhs) ? .JS_TRUE : .JS_FALSE
+                pc += 1
+            } else { ctx.interruptCounter = interrupt; return pc }
+
+        // =================================================================
+        // Bitwise (inline int fast paths)
+        // =================================================================
+
+        case .shl:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                sp -= 1
+                buf[sp - 1] = .newInt32(lhs.toInt32() << (rhs.toInt32() & 0x1F))
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                let a = jeffJS_traceToInt32(lhs), b = jeffJS_traceToInt32(rhs)
+                sp -= 1
+                buf[sp - 1] = .newInt32(a << (b & 0x1F))
+                pc += 1
+            } else { ctx.interruptCounter = interrupt; return pc }
+
+        case .sar:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                sp -= 1
+                buf[sp - 1] = .newInt32(lhs.toInt32() >> (rhs.toInt32() & 0x1F))
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                let a = jeffJS_traceToInt32(lhs), b = jeffJS_traceToInt32(rhs)
+                sp -= 1
+                buf[sp - 1] = .newInt32(a >> (b & 0x1F))
+                pc += 1
+            } else { ctx.interruptCounter = interrupt; return pc }
+
+        case .shr:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                let ua = UInt32(bitPattern: lhs.toInt32())
+                let result = ua >> (UInt32(rhs.toInt32() & 0x1F))
+                sp -= 1
+                buf[sp - 1] = .newUInt32(result)
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                let a = UInt32(bitPattern: jeffJS_traceToInt32(lhs)), b = jeffJS_traceToInt32(rhs)
+                sp -= 1
+                buf[sp - 1] = .newUInt32(a >> UInt32(b & 0x1F))
+                pc += 1
+            } else { ctx.interruptCounter = interrupt; return pc }
+
+        case .and:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                sp -= 1
+                buf[sp - 1] = .newInt32(lhs.toInt32() & rhs.toInt32())
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                let a = jeffJS_traceToInt32(lhs), b = jeffJS_traceToInt32(rhs)
+                sp -= 1
+                buf[sp - 1] = .newInt32(a & b)
+                pc += 1
+            } else { ctx.interruptCounter = interrupt; return pc }
+
+        case .or:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                sp -= 1
+                buf[sp - 1] = .newInt32(lhs.toInt32() | rhs.toInt32())
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                let a = jeffJS_traceToInt32(lhs), b = jeffJS_traceToInt32(rhs)
+                sp -= 1
+                buf[sp - 1] = .newInt32(a | b)
+                pc += 1
+            } else { ctx.interruptCounter = interrupt; return pc }
+
+        case .xor:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            if lhs.isInt && rhs.isInt {
+                sp -= 1
+                buf[sp - 1] = .newInt32(lhs.toInt32() ^ rhs.toInt32())
+                pc += 1
+            } else if lhs.isNumber && rhs.isNumber {
+                let a = jeffJS_traceToInt32(lhs), b = jeffJS_traceToInt32(rhs)
+                sp -= 1
+                buf[sp - 1] = .newInt32(a ^ b)
+                pc += 1
+            } else { ctx.interruptCounter = interrupt; return pc }
+
+        case .not:
+            let val = buf[sp - 1]
+            if val.isInt {
+                buf[sp - 1] = .newInt32(~val.toInt32())
+                pc += 1
+            } else { ctx.interruptCounter = interrupt; return pc }
+
+        // =================================================================
+        // Boolean / type
+        // =================================================================
+
+        case .lnot:
+            let val = buf[sp - 1]
+            buf[sp - 1] = jeffJS_fastToBool(val) ? .JS_FALSE : .JS_TRUE
+            pc += 1
+
+        case .typeof_:
+            ctx.interruptCounter = interrupt; return pc // deopt: needs string allocation
+
+        // =================================================================
+        // Control flow
+        // =================================================================
+
+        case .if_false:
+            sp -= 1
+            let cond = buf[sp]
+            let offset = Int(readI32(bc, pc + 1))
+            if !jeffJS_fastToBool(cond) {
+                let target = pc + 5 + offset
+                if target < entryPC || target >= exitPC {
+                    ctx.interruptCounter = interrupt; return target // loop exit
+                }
+                if offset < 0 {   // loop back-edge: interrupt check
+                    interrupt -= 1
+                    if interrupt <= 0 {
+                        interrupt = JS_INTERRUPT_COUNTER_INIT
+                        ctx.interruptCounter = interrupt
+                        if ctx.checkInterrupt() { ctx.interruptCounter = interrupt; return -1 }
+                    }
+                }
+                pc = target
+            } else {
+                pc += 5
+            }
+
+        case .if_true:
+            sp -= 1
+            let cond = buf[sp]
+            let offset = Int(readI32(bc, pc + 1))
+            if jeffJS_fastToBool(cond) {
+                let target = pc + 5 + offset
+                if target < entryPC || target >= exitPC {
+                    ctx.interruptCounter = interrupt; return target // loop exit
+                }
+                if offset < 0 {   // loop back-edge: interrupt check
+                    interrupt -= 1
+                    if interrupt <= 0 {
+                        interrupt = JS_INTERRUPT_COUNTER_INIT
+                        ctx.interruptCounter = interrupt
+                        if ctx.checkInterrupt() { ctx.interruptCounter = interrupt; return -1 }
+                    }
+                }
+                pc = target
+            } else {
+                pc += 5
+            }
+
+        case .if_false8:
+            sp -= 1
+            let cond = buf[sp]
+            let offset = Int(readI8(bc, pc + 1))
+            if !jeffJS_fastToBool(cond) {
+                let target = pc + 2 + offset
+                if target < entryPC || target >= exitPC {
+                    ctx.interruptCounter = interrupt; return target
+                }
+                if offset < 0 {   // loop back-edge: interrupt check
+                    interrupt -= 1
+                    if interrupt <= 0 {
+                        interrupt = JS_INTERRUPT_COUNTER_INIT
+                        ctx.interruptCounter = interrupt
+                        if ctx.checkInterrupt() { ctx.interruptCounter = interrupt; return -1 }
+                    }
+                }
+                pc = target
+            } else {
+                pc += 2
+            }
+
+        case .if_true8:
+            sp -= 1
+            let cond = buf[sp]
+            let offset = Int(readI8(bc, pc + 1))
+            if jeffJS_fastToBool(cond) {
+                let target = pc + 2 + offset
+                if target < entryPC || target >= exitPC {
+                    ctx.interruptCounter = interrupt; return target
+                }
+                if offset < 0 {   // loop back-edge: interrupt check
+                    interrupt -= 1
+                    if interrupt <= 0 {
+                        interrupt = JS_INTERRUPT_COUNTER_INIT
+                        ctx.interruptCounter = interrupt
+                        if ctx.checkInterrupt() { ctx.interruptCounter = interrupt; return -1 }
+                    }
+                }
+                pc = target
+            } else {
+                pc += 2
+            }
+
+        case .goto_:
+            let offset = Int(readI32(bc, pc + 1))
+            let target = pc + 5 + offset
+            if offset < 0 {
+                // Loop-back (any backward jump inside the merged region):
+                // interrupt check, then continue the trace at the target.
+                interrupt -= 1
+                if interrupt <= 0 {
+                    interrupt = JS_INTERRUPT_COUNTER_INIT
+                    ctx.interruptCounter = interrupt
+                    if ctx.checkInterrupt() { ctx.interruptCounter = interrupt; return -1 }
+                }
+            }
+            if target >= entryPC && target < exitPC {
+                pc = target
+            } else {
+                ctx.interruptCounter = interrupt; return target // jump outside trace
+            }
+
+        case .goto8:
+            let offset = Int(readI8(bc, pc + 1))
+            let target = pc + 2 + offset
+            if offset < 0 {
+                // Loop-back (any backward jump inside the merged region):
+                // interrupt check, then continue the trace at the target.
+                interrupt -= 1
+                if interrupt <= 0 {
+                    interrupt = JS_INTERRUPT_COUNTER_INIT
+                    ctx.interruptCounter = interrupt
+                    if ctx.checkInterrupt() { ctx.interruptCounter = interrupt; return -1 }
+                }
+            }
+            if target >= entryPC && target < exitPC {
+                pc = target
+            } else {
+                ctx.interruptCounter = interrupt; return target // jump outside trace
+            }
+
+        case .goto16:
+            let offset = Int(readI16(bc, pc + 1))
+            let target = pc + 3 + offset
+            if offset < 0 {
+                // Loop-back (any backward jump inside the merged region):
+                // interrupt check, then continue the trace at the target.
+                interrupt -= 1
+                if interrupt <= 0 {
+                    interrupt = JS_INTERRUPT_COUNTER_INIT
+                    ctx.interruptCounter = interrupt
+                    if ctx.checkInterrupt() { ctx.interruptCounter = interrupt; return -1 }
+                }
+            }
+            if target >= entryPC && target < exitPC {
+                pc = target
+            } else {
+                ctx.interruptCounter = interrupt; return target // jump outside trace
+            }
+
+        // =================================================================
+        // Fused short forms
+        // =================================================================
+
+        case .get_loc8_get_loc8:
+            let idxA = Int(bc[pc + 1])
+            let idxB = Int(bc[pc + 2])
+            buf[sp] = buf[varBase + idxA].dupValue(); sp += 1
+            buf[sp] = buf[varBase + idxB].dupValue(); sp += 1
+            pc += 3
+
+        case .get_loc8_add:
+            let locIdx = Int(bc[pc + 1])
+            let lhs = buf[sp - 1]              // value pushed before get_loc
+            let rhs = buf[varBase + locIdx]    // the local
+            if lhs.isInt && rhs.isInt {
+                let a = lhs.toInt32(), b = rhs.toInt32()
+                let (r, overflow) = a.addingReportingOverflow(b)
+                buf[sp - 1] = overflow ? .newFloat64(Double(a) + Double(b)) : .newInt32(r)
+                pc += 2
+            } else {
+                ctx.interruptCounter = interrupt; return pc // deopt
+            }
+
+        case .push_i32_put_loc8:
+            let val = readI32(bc, pc + 1)
+            let locIdx = Int(bc[pc + 5])
+            buf[varBase + locIdx] = .newInt32(val)
+            pc += 6
+
+        // =================================================================
+        // NOP
+        // =================================================================
+
+        case .nop:
+            pc += 1
+
+        // =================================================================
+        // Default: deopt to main interpreter
+        // =================================================================
+
+        default:
+            ctx.interruptCounter = interrupt; return pc
         }
     }
 
     // Fell through the trace boundary — return current pc for main interpreter
-    return pc
+    ctx.interruptCounter = interrupt; return pc
 }
 
 // =============================================================================
@@ -2752,11 +5097,15 @@ struct JeffJSOperators {
         }
         // Fast path: either is string
         if lhs.isString || rhs.isString {
+            // toString returns owned strings (a dup, or a fresh number/bool
+            // string); concatStrings borrows its inputs.
             let ls = JeffJSTypeConvert.toString(ctx: ctx, val: lhs)
             if ls.isException { return .exception }
             let rs = JeffJSTypeConvert.toString(ctx: ctx, val: rhs)
-            if rs.isException { return .exception }
-            return ctx.concatStrings(ls, rs)
+            if rs.isException { ls.freeValue(); return .exception }
+            let r = ctx.concatStrings(ls, rs)
+            ls.freeValue(); rs.freeValue()
+            return r
         }
         // General case: ToPrimitive
         let lp = JeffJSTypeConvert.toPrimitive(ctx: ctx, val: lhs, hint: HINT_NONE)
@@ -2767,8 +5116,10 @@ struct JeffJSOperators {
             let ls = JeffJSTypeConvert.toString(ctx: ctx, val: lp)
             if ls.isException { return .exception }
             let rs = JeffJSTypeConvert.toString(ctx: ctx, val: rp)
-            if rs.isException { return .exception }
-            return ctx.concatStrings(ls, rs)
+            if rs.isException { ls.freeValue(); return .exception }
+            let r = ctx.concatStrings(ls, rs)
+            ls.freeValue(); rs.freeValue()
+            return r
         }
         let (a, ok1) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lp)
         if !ok1 { return .exception }
@@ -2931,7 +5282,7 @@ struct JeffJSOperators {
             if !method.isUndefined && !method.isNull {
                 let result = ctx.callFunction(method, thisVal: target, args: [val])
                 if result.isException { return .exception }
-                return .newBool(JeffJSTypeConvert.toBool(result))
+                return .newBool(jeffJS_fastToBool(result))
             }
         }
         // OrdinaryHasInstance
@@ -3050,8 +5401,9 @@ struct JeffJSInterpreter {
     /// Saved caller state for inline (non-recursive) function calls.
     /// Instead of recursively calling `callInternal()` for every JS function
     /// call, we save the caller's state here and swap in the callee's state.
-    struct InlineCallFrame {
-        var pc: Int
+    /// Interpreter state handed to / back from the fast trace so it can run
+    /// calls and returns (and deopt from inside a callee).
+    struct HotState {
         var sp: Int
         var buf: UnsafeMutablePointer<JeffJSValue>
         var bufCapacity: Int
@@ -3059,11 +5411,44 @@ struct JeffJSInterpreter {
         var spBase: Int
         var bc: UnsafePointer<UInt8>
         var bcLen: Int
-        var fb: JeffJSFunctionBytecode
-        var frame: JeffJSStackFrame
-        var varRefs: [JeffJSVarRef?]
+        unowned(unsafe) var fb: JeffJSFunctionBytecode
+        unowned(unsafe) var frame: JeffJSStackFrame
         var funcObj: JeffJSValue
         var flags: Int
+        var bufOwned: Bool
+        var varRefsLoaded: Bool
+        /// Unmanaged mirror of the current function's varRefs (see
+        /// JeffJSObject.varRefsRaw); the trace never touches the array.
+        var varRefsRaw: UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>?
+        var varRefsRawCount: Int
+        /// Opcodes executed by the last trace run (set by the trace).
+        var opsRun: Int = 0
+    }
+
+    struct InlineCallFrame {
+        var pc: Int
+        var sp: Int
+        /// Caller's sp at the call: [sp, spTop) holds the callee/receiver/args
+        /// the caller owns and releases at the inline return.
+        var spTop: Int
+        var buf: UnsafeMutablePointer<JeffJSValue>
+        var bufCapacity: Int
+        var varBase: Int
+        var spBase: Int
+        var bc: UnsafePointer<UInt8>
+        var bcLen: Int
+        // unowned(unsafe): the caller frame stays alive through the callee
+        // frame's prevFrame chain, and its bytecode through frame.curFunc, so
+        // these saved pointers never dangle. Strong references here cost a
+        // retain/release pair per field per call.
+        unowned(unsafe) var fb: JeffJSFunctionBytecode
+        unowned(unsafe) var frame: JeffJSStackFrame
+        // No varRefs field: the caller's varRefs are re-derived on pop from
+        // funcObj (varRefsFast). Keeping the struct free of refcounted fields
+        // makes push/pop plain stores on the runtime's unsafe inline stack.
+        var funcObj: JeffJSValue
+        var flags: Int
+        var bufOwned: Bool
     }
 
     /// Toggle to enable/disable inline calls for debugging.
@@ -3190,6 +5575,11 @@ struct JeffJSInterpreter {
             varRefsOpt = varRefs
         }
 
+        // NOTE: keep this a strong `var`. unowned(unsafe) here was measured
+        // slower on call-heavy code three times (before and after the nested
+        // function captures were removed): the compiler then copies (retains)
+        // the reference around member accesses instead of relying on the
+        // variable's own ownership.
         var fb = fb0  // mutable so inline calls can swap callee's bytecode in
         var bc = fb.bytecodePtr
         var bcLen = fb.bytecodeLen
@@ -3203,7 +5593,7 @@ struct JeffJSInterpreter {
         let traceHitThreshold = rt.cfgTraceHitThreshold
 
         // Set up the call frame (pooled to avoid malloc/free per call)
-        var frame = rt.acquireFrame()
+        unowned(unsafe) var frame: JeffJSStackFrame = rt.acquireFrame()   // frames are immortal (rt.allFrames)
         frame.prevFrame = ctx.currentFrame
         frame.curFunc = funcObj
         // ES spec §10.2.1.2: For non-strict functions, coerce undefined/null this
@@ -3230,14 +5620,14 @@ struct JeffJSInterpreter {
         // checks or prefers buf. The old pad forced a COW grow per call, and it
         // also made `arguments.length` over-report.
         frame.argBuf = args
+        frame.bufArraysLive = true
 
         // Initialize local variables. Append into the pooled frame's array
         // (released with keepingCapacity) instead of assigning a fresh array —
         // steady-state this is allocation-free.
+        // varBuf is materialised lazily by jeffJS_syncBufToFrame(frame, buf, varBase) when a consumer
+        // needs it; the unsafe buffer below is the authoritative storage.
         let varCount = Int(fb.varCount)
-        if varCount > 0 {
-            frame.varBuf.append(contentsOf: repeatElement(.undefined, count: varCount))
-        }
         frame.varCount = varCount
 
         let argSlots = max(Int(fb.argCount), args.count)
@@ -3250,6 +5640,10 @@ struct JeffJSInterpreter {
         let totalSlots = argSlots + varCount + stackSlots
         var (buf, bufCapacity) = rt.acquireInterpBuf(size: totalSlots,
                                                      initializedPrefix: argSlots + varCount)
+        // True when `buf` was acquired from the pool by this frame and must be
+        // released on exit. Inline callees normally carve their frame out of
+        // the caller's buffer (bufOwned = false) — no allocation, no arg copy.
+        var bufOwned = true
         var varBase = argSlots
         var spBase = argSlots + varCount
 
@@ -3284,41 +5678,39 @@ struct JeffJSInterpreter {
 
         // Closure variable references
         var varRefs: [JeffJSVarRef?] = varRefsOpt
+        // Tracks whether `varRefs` holds a non-empty array so the inline call
+        // paths can skip the (out-of-line) isEmpty check per call/return.
+        var varRefsLoaded = !varRefsOpt.isEmpty
 
         // Inline call stack for non-recursive function calls.
         // Lazy: the empty array literal is allocation-free; reserveCapacity here
         // forced a ~3KB malloc on EVERY call even with inline calls disabled.
-        var inlineCallStack: [InlineCallFrame] = []
+        // Inline call frames live on the runtime's unsafe stack; this
+        // activation owns the region above `inlineBase`.
+        let inlineBase = rt.inlineStackTop
 
         // ---- Sync helpers: copy between buf and frame arrays ----
 
         /// Sync buf → frame.argBuf/varBuf so JeffJSVarRef.pvalue sees current values.
         /// Called before closure creation, close_loc, and var_ref detach.
-        @inline(__always) func syncBufToFrame() {
-            for i in 0..<frame.argBuf.count {
-                if i < varBase { frame.argBuf[i] = buf[i] }
-            }
-            for i in 0..<frame.varBuf.count {
-                frame.varBuf[i] = buf[varBase + i]
-            }
-        }
 
         /// Sync frame.argBuf/varBuf → buf after external code may have modified them
         /// (e.g. JeffJSVarRef.pvalue setter, generator restore).
-        @inline(__always) func syncFrameToBuf() {
-            for i in 0..<frame.argBuf.count {
-                if i < varBase { buf[i] = frame.argBuf[i] }
-            }
-            for i in 0..<frame.varBuf.count {
-                buf[varBase + i] = frame.varBuf[i]
-            }
-        }
+
+        /// Enter an inline call frame for a plain bytecode function.
+        /// Stack before: buf[calleeSlot] = funcVal, buf[calleeSlot+1 ..< +argc] = args.
+        /// `restoreSp` is the caller's sp after the call (before the result push).
+        /// The callee frame is carved out of the caller's buffer starting at the
+        /// first arg slot when it fits: no allocation and no argument copy. The
+        /// caller's stack values above restoreSp become the callee's arg slots
+        /// (their refs move, exactly as the old copy-based path did).
 
         // ---- Generator resumption: restore saved state ----
         if let saved = resumeState {
             pc = saved.pc
             // Restore varBuf/argBuf from saved state
             frame.varBuf = saved.varBuf
+            frame.bufArraysLive = true
             frame.varCount = saved.varBuf.count
             frame.argBuf = saved.argBuf
             frame.argCount = saved.argBuf.count
@@ -3332,13 +5724,13 @@ struct JeffJSInterpreter {
             sp = spBase + saved.sp
 
             // Sync restored frame arrays into buf
-            syncFrameToBuf()
+            jeffJS_syncFrameToBuf(frame, buf, varBase)
 
             switch resumeCompletionType {
             case 1:
                 retVal = resumeValue
                 ctx.currentFrame = frame.prevFrame
-                rt.releaseInterpBuf(buf, capacity: bufCapacity)
+                if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
                 return retVal
             case 2:
                 // Throw: inject the exception and fall through to the dispatch
@@ -3365,7 +5757,7 @@ struct JeffJSInterpreter {
                             // More values — yield this one and re-suspend.
                             if let genObj = generatorObject.toObject(),
                                case .generatorData(let genData) = genObj.payload {
-                                syncBufToFrame()
+                                jeffJS_syncBufToFrame(frame, buf, varBase)
                                 let stackCount = sp - spBase
                                 var savedStack = [JeffJSValue](repeating: .undefined, count: stackCount)
                                 for i in 0..<stackCount { savedStack[i] = buf[spBase + i] }
@@ -3383,7 +5775,7 @@ struct JeffJSInterpreter {
                             }
                             retVal = value
                             ctx.currentFrame = frame.prevFrame
-                            rt.releaseInterpBuf(buf, capacity: bufCapacity)
+                            if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
                             return retVal
                         }
                     }
@@ -3397,37 +5789,9 @@ struct JeffJSInterpreter {
         // Helper closures for stack operations using the contiguous buffer.
         // Safety guards for sp underflow: if bytecode is malformed, return
         // .undefined rather than reading into arg/var slots.
-        @inline(__always) func push(_ val: JeffJSValue) {
-            if sp >= bufCapacity {
-                // VM stack overflow — a push/pop imbalance (compiler stack-effect
-                // bug) or stackSize underestimate. Report once with enough
-                // context to identify the bytecode, and drop the write instead
-                // of scribbling the heap behind the buffer.
-                JeffJSStackDiag.reportOverflow(ctx: ctx, fb: fb, pc: pc, sp: sp,
-                                               spBase: spBase, capacity: bufCapacity, bc: bc,
-                                               bcLen: bcLen, buf: buf)
-                return
-            }
-            buf[sp] = val
-            sp += 1
-        }
 
-        @inline(__always) func pop() -> JeffJSValue {
-            guard sp > spBase else { return .undefined }
-            sp -= 1
-            return buf[sp]
-        }
 
-        @inline(__always) func peek() -> JeffJSValue {
-            guard sp > spBase else { return .undefined }
-            return buf[sp - 1]
-        }
 
-        @inline(__always) func peekAt(_ offset: Int) -> JeffJSValue {
-            let idx = sp - 1 - offset
-            guard idx >= spBase else { return .undefined }
-            return buf[idx]
-        }
 
         // =====================================================================
         // MARK: Dispatch Loop
@@ -3438,6 +5802,32 @@ struct JeffJSInterpreter {
         #endif
 
         exceptionRetry: while true {
+        // Fast-trace entry at activation start (and at catch handlers after an
+        // exception): the trace is the primary interpreter; this loop is the
+        // fallback for whatever it cannot run.
+        if !retVal.isException, resumeState == nil, fb.traceLean, pc < bcLen {
+            let r = executeFastTraceLean(bc: bc, bcLen: bcLen, entryPC: 0, exitPC: bcLen, startPC: pc,
+                                         buf: buf, varBase: varBase, sp: &sp, ctx: ctx, cpool: fb.cpool,
+                                         stackLimit: bufCapacity, icEntries: fb.icEntries)
+            if r == -1 { retVal = .exception } else { pc = r }
+        }
+        if !retVal.isException, resumeState == nil, fb.traceEntryEnabled, !fb.traceLean,
+           !fb.isGenerator, !fb.isAsyncFunc, pc < bcLen {
+            let fbIdBefore = ObjectIdentifier(fb)
+            var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
+            let resumePC = executeFastTrace(state: &hot, startPC: pc, ctx: ctx, rt: rt, inlineBase: inlineBase)
+            sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
+            bc = hot.bc; bcLen = hot.bcLen; fb = hot.fb; frame = hot.frame
+            mFuncObj = hot.funcObj; mFlags = hot.flags; bufOwned = hot.bufOwned
+            if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
+            // Entry deopt accounting: an early exit still inside this function
+            // means the trace could not run it; stop trying after a while.
+            if hot.opsRun < 16, ObjectIdentifier(fb) == fbIdBefore {
+                fb.traceEntryDeopts &+= 1
+                if fb.traceEntryDeopts >= 100 { fb.traceEntryEnabled = false }
+            }
+            if resumePC == -1 { retVal = .exception } else { pc = resumePC }
+        }
         // If an exception was injected before the dispatch loop (e.g.,
         // generator.throw() resume), skip straight to exception handling.
         if !retVal.isException {
@@ -3517,27 +5907,85 @@ struct JeffJSInterpreter {
                             continue dispatchLoop
                         case .get_field_opt_chain:
                             let atom = readU32(bc, pc + 2)
-                            let obj = pop()
+                            let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                             if obj.isUndefined || obj.isNull {
-                                push(.undefined)
+                                buf[sp] = .undefined; sp += 1
                             } else {
                                 let val = ctx.getProperty(obj: obj, atom: atom)
                                 if val.isException { retVal = .exception; break dispatchLoop }
-                                push(val)
+                                buf[sp] = val; sp += 1
                             }
                             pc += 2 + 4
                             continue dispatchLoop
                         case .get_array_el_opt_chain:
-                            let key = pop()
-                            let obj = pop()
+                            let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                            let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                             if obj.isUndefined || obj.isNull {
-                                push(.undefined)
+                                buf[sp] = .undefined; sp += 1
                             } else {
                                 let val = ctx.getPropertyValue(obj: obj, prop: key)
                                 if val.isException { retVal = .exception; break dispatchLoop }
-                                push(val)
+                                buf[sp] = val; sp += 1
                             }
                             pc += 2
+                            continue dispatchLoop
+                        case .with_get_var, .with_put_var, .with_delete_var,
+                             .with_make_ref, .with_get_ref, .with_get_ref_undef:
+                            // Evicted to the wide range (see JeffJSOpcode). Skip
+                            // the prefix byte; the handler's operand offsets are
+                            // relative to the opcode byte.
+                            pc += 1
+                            let op = wideOp
+                let atom = readU32(bc, pc + 1)
+                let label = readI32(bc, pc + 5)
+                let withFlags = Int(readU8(bc, pc + 9))
+                let obj = buf[sp - 1]
+                let hasProp = ctx.hasProperty(obj: obj, atom: atom)
+                if hasProp {
+                    switch op {
+                    case .with_get_var:
+                        // nPop=1, nPush=1: replace the with_obj on TOS with the property value
+                        let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) // remove with object
+                        let val = ctx.getProperty(obj: obj, atom: atom)
+                        buf[sp] = val; sp += 1
+                    case .with_get_ref, .with_get_ref_undef:
+                        // nPop=1, nPush=2: replace with_obj with (obj, propKey) reference pair
+                        let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) // remove with object
+                        buf[sp] = obj.dupValue(); sp += 1
+                        let propKey = ctx.atomToString(atom)
+                        buf[sp] = propKey; sp += 1
+                    case .with_put_var:
+                        // nPop=2, nPush=0: pop val and with_obj, set property
+                        // Note: in QuickJS the table says nPush=1 but the code does sp -= 2.
+                        // The with_obj is TOS, val is below it.
+                        let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) // with object
+                        let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) // value to assign
+                        let _ = ctx.setProperty(obj: obj, atom: atom, value: val)
+                    case .with_delete_var:
+                        // nPop=1, nPush=1: replace with_obj with delete result bool
+                        let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) // remove with object
+                        let ok = ctx.deleteProperty(obj: obj, atom: atom)
+                        buf[sp] = .newBool(ok); sp += 1
+                    case .with_make_ref:
+                        // nPop=1, nPush=2: replace with_obj with (obj, propKey) reference
+                        let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) // remove with object
+                        buf[sp] = obj.dupValue(); sp += 1
+                        let propKey = ctx.atomToString(atom)
+                        buf[sp] = propKey; sp += 1
+                    default: break
+                    }
+                    pc += 10
+                } else {
+                    // Fall through to non-with access: jump past the with_xxx
+                    // instruction. The label is a relative offset from the
+                    // end of this 10-byte instruction.
+                    let _ = withFlags
+                    pc += 10 + Int(label)
+                }
+
+            // -----------------------------------------------------------------
+            // Reference Construction
+            // -----------------------------------------------------------------
                             continue dispatchLoop
                         default:
                             break  // fall through to error below
@@ -3552,17 +6000,113 @@ struct JeffJSInterpreter {
             // Push Values
             // -----------------------------------------------------------------
 
+            case .with_get_var, .with_put_var, .with_delete_var,
+                 .with_make_ref, .with_get_ref, .with_get_ref_undef:
+                // Wide opcodes: they only ever arrive through the 0x00 prefix
+                // (handled in `.invalid`), never as a raw dispatch value.
+                _ = ctx.throwInternalError(message: "wide opcode dispatched directly at pc=\(pc)")
+                retVal = .exception
+                break dispatchLoop
+
+            // -----------------------------------------------------------------
+            // Fused superinstructions (see JeffJSCompiler peepholes)
+            // -----------------------------------------------------------------
+            case .cmp_loc_i8:
+                let cmp = bc[pc + 1]
+                let a = buf[varBase + Int(bc[pc + 2])]
+                let k = Int32(Int8(bitPattern: bc[pc + 3]))
+                if a.isInt {
+                    buf[sp] = .newBool(jeffJS_cmpInt(cmp, a.toInt32(), k)); sp += 1
+                } else if a.isNumber {
+                    buf[sp] = .newBool(jeffJS_cmpDouble(cmp, a.toFloat64(), Double(k))); sp += 1
+                } else {
+                    guard let r = jeffJS_cmpGeneric(ctx, cmp, a.dupValue(), .newInt32(k)) else { retVal = .exception; break dispatchLoop }
+                    buf[sp] = .newBool(r); sp += 1
+                }
+                pc += 4
+
+            case .cmp_loc_loc:
+                let cmp = bc[pc + 1]
+                let a = buf[varBase + Int(bc[pc + 2])]
+                let b = buf[varBase + Int(bc[pc + 3])]
+                if a.isInt && b.isInt {
+                    buf[sp] = .newBool(jeffJS_cmpInt(cmp, a.toInt32(), b.toInt32())); sp += 1
+                } else if a.isNumber && b.isNumber {
+                    buf[sp] = .newBool(jeffJS_cmpDouble(cmp, jeffJS_traceNum(a), jeffJS_traceNum(b))); sp += 1
+                } else {
+                    guard let r = jeffJS_cmpGeneric(ctx, cmp, a.dupValue(), b.dupValue()) else { retVal = .exception; break dispatchLoop }
+                    buf[sp] = .newBool(r); sp += 1
+                }
+                pc += 4
+
+            case .arith_loc_loc:
+                let ar = bc[pc + 1]
+                let a = buf[varBase + Int(bc[pc + 2])]
+                let b = buf[varBase + Int(bc[pc + 3])]
+                if a.isInt && b.isInt {
+                    buf[sp] = jeffJS_arithInt(ar, a.toInt32(), b.toInt32()); sp += 1
+                } else if a.isNumber && b.isNumber {
+                    buf[sp] = jeffJS_arithNumeric(ar, jeffJS_traceNum(a), jeffJS_traceNum(b)); sp += 1
+                } else {
+                    guard let r = jeffJS_arithGeneric(ctx, ar, a.dupValue(), b.dupValue()) else { retVal = .exception; break dispatchLoop }
+                    buf[sp] = r; sp += 1
+                }
+                pc += 4
+
+            case .arith_loc_i8:
+                let ar = bc[pc + 1]
+                let a = buf[varBase + Int(bc[pc + 2])]
+                let k = Int32(Int8(bitPattern: bc[pc + 3]))
+                if a.isInt {
+                    buf[sp] = jeffJS_arithInt(ar, a.toInt32(), k); sp += 1
+                } else if a.isNumber {
+                    buf[sp] = jeffJS_arithNumeric(ar, a.toFloat64(), Double(k)); sp += 1
+                } else {
+                    guard let r = jeffJS_arithGeneric(ctx, ar, a.dupValue(), .newInt32(k)) else { retVal = .exception; break dispatchLoop }
+                    buf[sp] = r; sp += 1
+                }
+                pc += 4
+
+            case .to_int32:
+                let v = buf[sp - 1]
+                if v.isInt {
+                    // already an int32
+                } else if v.isNumber {
+                    buf[sp - 1] = .newInt32(JeffJSTypeConvert.doubleToInt32(v.toFloat64()))
+                } else {
+                    let (i, ok) = JeffJSTypeConvert.toInt32(ctx: ctx, val: v)
+                    v.freeValue()
+                    if !ok { retVal = .exception; break dispatchLoop }
+                    buf[sp - 1] = .newInt32(i)
+                }
+                pc += 1
+
+            case .arith_const8:
+                let ar = bc[pc + 1]
+                let k = Int(bc[pc + 2])
+                let c: JeffJSValue = k < fb.cpool.count ? fb.cpool[k] : .undefined
+                let v = buf[sp - 1]
+                if v.isInt && c.isInt {
+                    buf[sp - 1] = jeffJS_arithInt(ar, v.toInt32(), c.toInt32())
+                } else if v.isNumber && c.isNumber {
+                    buf[sp - 1] = jeffJS_arithNumeric(ar, jeffJS_traceNum(v), jeffJS_traceNum(c))
+                } else {
+                    guard let r = jeffJS_arithGeneric(ctx, ar, v, c.dupValue()) else { retVal = .exception; break dispatchLoop }
+                    buf[sp - 1] = r
+                }
+                pc += 3
+
             case .push_i32:
                 let val = readI32(bc, pc + 1)
-                push(.newInt32(val))
+                buf[sp] = .newInt32(val); sp += 1
                 pc += 5
 
             case .push_const:
                 let idx = Int(readU32(bc, pc + 1))
                 if idx < fb.cpool.count {
-                    push(fb.cpool[idx].dupValue())
+                    buf[sp] = fb.cpool[idx].dupValue(); sp += 1
                 } else {
-                    push(.undefined)
+                    buf[sp] = .undefined; sp += 1
                 }
                 pc += 5
 
@@ -3573,44 +6117,44 @@ struct JeffJSInterpreter {
                 // frame.buf (always current) in preference to the frame arrays.
                 let closureVal = ctx.createClosure(fb: fb, cpoolIdx: idx, varRefs: varRefs,
                                                     parentFrame: frame)
-                push(closureVal)
+                buf[sp] = closureVal; sp += 1
                 pc += 5
 
             case .push_atom_value:
                 let atom = readU32(bc, pc + 1)
                 let str = ctx.atomToString(atom)
-                push(str)
+                buf[sp] = str; sp += 1
                 pc += 5
 
             case .private_symbol:
                 let atom = readU32(bc, pc + 1)
                 let sym = ctx.newSymbolFromAtom(atom, isPrivate: true)
-                push(sym)
+                buf[sp] = sym; sp += 1
                 pc += 5
 
             case .undefined:
-                push(.undefined)
+                buf[sp] = .undefined; sp += 1
                 pc += 1
 
             case .push_false:
-                push(.newBool(false))
+                buf[sp] = .newBool(false); sp += 1
                 pc += 1
 
             case .push_true:
-                push(.newBool(true))
+                buf[sp] = .newBool(true); sp += 1
                 pc += 1
 
             case .object:
                 let obj = ctx.newPlainObject()
-                push(obj)
+                buf[sp] = obj; sp += 1
                 pc += 1
 
             case .special_object:
                 let kind = readU8(bc, pc + 1)
                 // Sync buf → frame since newSpecialObject reads frame.argBuf
-                syncBufToFrame()
+                jeffJS_syncBufToFrame(frame, buf, varBase)
                 let obj = ctx.newSpecialObject(kind: kind, frame: frame)
-                push(obj)
+                buf[sp] = obj; sp += 1
                 pc += 2
 
             case .rest:
@@ -3619,7 +6163,7 @@ struct JeffJSInterpreter {
                 var restSrcArgs = [JeffJSValue](repeating: .undefined, count: varBase)
                 for i in 0..<varBase { restSrcArgs[i] = buf[i] }
                 let restArr = ctx.createRestArray(args: restSrcArgs, fromIndex: argIdx)
-                push(restArr)
+                buf[sp] = restArr; sp += 1
                 pc += 3
 
             // -----------------------------------------------------------------
@@ -3627,120 +6171,120 @@ struct JeffJSInterpreter {
             // -----------------------------------------------------------------
 
             case .drop:
-                let dropped = pop()
+                let dropped = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 dropped.freeValue()
                 pc += 1
 
             case .nip:
-                let top = pop()
-                let discarded = pop()
+                let top = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let discarded = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 discarded.freeValue()
-                push(top)
+                buf[sp] = top; sp += 1
                 pc += 1
 
             case .nip1:
-                let a = pop(); let b = pop(); let discarded = pop()
+                let a = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let b = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let discarded = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 discarded.freeValue()
-                push(b); push(a)
+                buf[sp] = b; sp += 1; buf[sp] = a; sp += 1
                 pc += 1
 
             case .dup:
-                let val = peek()
-                push(val.dupValue())
+                let val = buf[sp - 1]
+                buf[sp] = val.dupValue(); sp += 1
                 pc += 1
 
             case .dup1:
                 // Duplicate the element below the top: a b -> a b a
-                let a = peekAt(1)
-                push(a.dupValue())
+                let a = buf[sp - 2]
+                buf[sp] = a.dupValue(); sp += 1
                 pc += 1
 
             case .dup2:
-                let b = peekAt(0)
-                let a = peekAt(1)
-                push(a.dupValue())
-                push(b.dupValue())
+                let b = buf[sp - 1]
+                let a = buf[sp - 2]
+                buf[sp] = a.dupValue(); sp += 1
+                buf[sp] = b.dupValue(); sp += 1
                 pc += 1
 
             case .dup3:
-                let c = peekAt(0)
-                let b = peekAt(1)
-                let a = peekAt(2)
-                push(a.dupValue())
-                push(b.dupValue())
-                push(c.dupValue())
+                let c = buf[sp - 1]
+                let b = buf[sp - 2]
+                let a = buf[sp - 3]
+                buf[sp] = a.dupValue(); sp += 1
+                buf[sp] = b.dupValue(); sp += 1
+                buf[sp] = c.dupValue(); sp += 1
                 pc += 1
 
             case .insert2:
                 // QuickJS: a b -> b a b (insert copy of TOS below top 2)
                 // nPop=2, nPush=3
-                let b = pop()
-                let a = pop()
-                push(b); push(a); push(b.dupValue())
+                let b = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let a = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                buf[sp] = b; sp += 1; buf[sp] = a; sp += 1; buf[sp] = b.dupValue(); sp += 1
                 pc += 1
 
             case .insert3:
                 // QuickJS: a b c -> c a b c (insert copy of TOS below top 3)
                 // nPop=3, nPush=4
-                let c = pop()
-                let b = pop(); let a = pop()
-                push(c); push(a); push(b); push(c.dupValue())
+                let c = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let b = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let a = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                buf[sp] = c; sp += 1; buf[sp] = a; sp += 1; buf[sp] = b; sp += 1; buf[sp] = c.dupValue(); sp += 1
                 pc += 1
 
             case .insert4:
                 // QuickJS: a b c d -> d a b c d (insert copy of TOS below top 4)
                 // nPop=4, nPush=5
-                let d = pop()
-                let c = pop(); let b = pop(); let a = pop()
-                push(d); push(a); push(b); push(c); push(d.dupValue())
+                let d = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let c = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let b = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let a = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                buf[sp] = d; sp += 1; buf[sp] = a; sp += 1; buf[sp] = b; sp += 1; buf[sp] = c; sp += 1; buf[sp] = d.dupValue(); sp += 1
                 pc += 1
 
             case .perm3:
-                let c = pop(); let b = pop(); let a = pop()
-                push(c); push(a); push(b)
+                let c = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let b = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let a = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                buf[sp] = c; sp += 1; buf[sp] = a; sp += 1; buf[sp] = b; sp += 1
                 pc += 1
 
             case .perm4:
-                let d = pop(); let c = pop(); let b = pop(); let a = pop()
-                push(d); push(a); push(b); push(c)
+                let d = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let c = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let b = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let a = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                buf[sp] = d; sp += 1; buf[sp] = a; sp += 1; buf[sp] = b; sp += 1; buf[sp] = c; sp += 1
                 pc += 1
 
             case .perm5:
-                let e = pop(); let d = pop(); let c = pop(); let b = pop(); let a = pop()
-                push(e); push(a); push(b); push(c); push(d)
+                let e = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let d = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let c = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let b = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let a = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                buf[sp] = e; sp += 1; buf[sp] = a; sp += 1; buf[sp] = b; sp += 1; buf[sp] = c; sp += 1; buf[sp] = d; sp += 1
                 pc += 1
 
             case .swap:
-                let a = pop(); let b = pop()
-                push(a); push(b)
+                let a = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let b = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                buf[sp] = a; sp += 1; buf[sp] = b; sp += 1
                 pc += 1
 
             case .swap2:
                 // Swap top 2 pairs: a b c d -> c d a b
-                let d = pop(); let c = pop(); let b = pop(); let a = pop()
-                push(c); push(d); push(a); push(b)
+                let d = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let c = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let b = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let a = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                buf[sp] = c; sp += 1; buf[sp] = d; sp += 1; buf[sp] = a; sp += 1; buf[sp] = b; sp += 1
                 pc += 1
 
             case .rot3l:
-                let c = pop(); let b = pop(); let a = pop()
-                push(b); push(c); push(a)
+                let c = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let b = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let a = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                buf[sp] = b; sp += 1; buf[sp] = c; sp += 1; buf[sp] = a; sp += 1
                 pc += 1
 
             case .rot3r:
                 // Rotate 3 right: a b c -> c a b
-                let c = pop(); let b = pop(); let a = pop()
-                push(c); push(a); push(b)
+                let c = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let b = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let a = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                buf[sp] = c; sp += 1; buf[sp] = a; sp += 1; buf[sp] = b; sp += 1
                 pc += 1
 
             case .rot4l:
-                let d = pop(); let c = pop(); let b = pop(); let a = pop()
-                push(b); push(c); push(d); push(a)
+                let d = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let c = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let b = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let a = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                buf[sp] = b; sp += 1; buf[sp] = c; sp += 1; buf[sp] = d; sp += 1; buf[sp] = a; sp += 1
                 pc += 1
 
             case .rot5l:
                 // Rotate 5 left: a b c d e -> b c d e a
-                let e = pop(); let d = pop(); let c = pop(); let b = pop(); let a = pop()
-                push(b); push(c); push(d); push(e); push(a)
+                let e = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let d = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let c = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let b = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let a = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                buf[sp] = b; sp += 1; buf[sp] = c; sp += 1; buf[sp] = d; sp += 1; buf[sp] = e; sp += 1; buf[sp] = a; sp += 1
                 pc += 1
 
             // -----------------------------------------------------------------
@@ -3766,114 +6310,189 @@ struct JeffJSInterpreter {
                 case .call3: argc = 3; instrSize = 1
                 default: argc = 0; instrSize = 1
                 }
-                // Build args with minimal allocation for common cases
-                let callArgs: [JeffJSValue]
-                switch argc {
-                case 0:
-                    callArgs = []
-                case 1:
-                    let a0 = pop()
-                    callArgs = [a0]
-                case 2:
-                    let a1 = pop(); let a0 = pop()
-                    callArgs = [a0, a1]
-                case 3:
-                    let a2 = pop(); let a1 = pop(); let a0 = pop()
-                    callArgs = [a0, a1, a2]
-                default:
-                    var tmp = [JeffJSValue](repeating: .undefined, count: argc)
-                    for i in stride(from: argc - 1, through: 0, by: -1) { tmp[i] = pop() }
-                    callArgs = tmp
-                }
-                let funcVal = pop()
+                // Peek the callee WITHOUT popping. Stack layout is
+                // [..., funcVal, arg0 … arg(argc-1)] with sp just past the last
+                // arg, so funcVal sits at sp-argc-1. Peeking lets the inline fast
+                // path move args straight from this buffer into the callee's,
+                // skipping the per-call [JeffJSValue] args-array allocation that
+                // dominated function-call cost. The slow path below pops normally.
+                let calleeSlot = sp - argc - 1
+                let funcVal: JeffJSValue = calleeSlot >= spBase ? buf[calleeSlot] : .undefined
                 // Inline call fast path: regular bytecode function
-                if inlineCallsEnabled,
+                // fbFast/varRefsFast are denormalised copies of the payload
+                // fields: pattern-matching the payload enum copies it (retaining
+                // the FB and the varRefs array) on every call. nil fbFast
+                // (never called before) takes the slow path, which backfills it.
+                if inlineCallsEnabled, calleeSlot >= spBase,
                    let callObj = funcVal.obj,
-                   case .bytecodeFunc(let fastFbOpt, let fastVarRefsOpt, _) = callObj.payload,
-                   let fastFb = fastFbOpt, !fastFb.isGenerator, !fastFb.isAsyncFunc {
-                    // Depth guard
-                    if inlineCallStack.count > 10000 {
+                   let fastFb = callObj.fbFast, !fastFb.isGenerator, !fastFb.isAsyncFunc {
+                    let fastVarRefsOpt = callObj.varRefsFast
+                    // Depth guard (checked before any state mutation; on overflow
+                    // args+funcVal stay on the caller stack and unwind normally).
+                    if rt.inlineStackTop - inlineBase > 10000 {
                         _ = ctx.throwInternalError(message: "Maximum call stack size exceeded")
                         retVal = .exception
                         break dispatchLoop
                     }
-                    // Save caller state
-                    inlineCallStack.append(InlineCallFrame(
-                        pc: pc + instrSize, sp: sp,
-                        buf: buf, bufCapacity: bufCapacity,
-                        varBase: varBase, spBase: spBase,
-                        bc: bc, bcLen: bcLen, fb: fb,
-                        frame: frame, varRefs: varRefs,
-                        funcObj: mFuncObj, flags: mFlags))
-                    // Set up callee state
-                    fb = fastFb
-                    bc = fastFb.bytecodePtr
-                    bcLen = fastFb.bytecodeLen
-                    varRefs = fastVarRefsOpt
-                    mFuncObj = funcVal
-                    mFlags = 0
-                    // New frame
-                    let newFrame = rt.acquireFrame()
-                    newFrame.prevFrame = ctx.currentFrame
-                    newFrame.curFunc = funcVal
-                    // ES spec: non-strict functions get globalObj as this for plain calls
-                    let fastIsStrict = fastFb.isStrictMode
-                    // Determine `this` for the call:
-                    // 1. If arrow function: use captured lexical this
-                    // 2. If get_field receiver available: use it (method call that
-                    //    transformMethodCalls failed to convert to call_method)
-                    // 3. Otherwise: globalObj (non-strict) or undefined (strict)
-                    if fastFb.isArrow, let callObj = funcVal.obj,
-                       let arrowThis = callObj.arrowThisVal {
-                        newFrame.thisVal = arrowThis.dupValue()
-                    } else if !frame.lastGetFieldReceiver.isUndefined,
-                              frame.lastGetFieldPC >= 0, pc == frame.lastGetFieldPC + 5 {
-                        // Transfer the stash's reference to thisVal (no dup —
-                        // the stash owned one ref from get_field).
-                        newFrame.thisVal = frame.lastGetFieldReceiver
-                        frame.lastGetFieldReceiver = .undefined  // clear after use
+                    // `this`: a get_field receiver stash consumed only by the
+                    // directly-following call (arrow callees ignore it, so
+                    // leave the stash alone for them).
+                    var callThis: JeffJSValue = .undefined
+                    if !fastFb.isArrow,
+                       !frame.lastGetFieldReceiver.isUndefined,
+                       frame.lastGetFieldPC >= 0, pc == frame.lastGetFieldPC + 5 {
+                        callThis = frame.lastGetFieldReceiver   // move the stash's ref
+                        frame.lastGetFieldReceiver = .undefined
                         frame.lastGetFieldPC = -1
-                    } else {
-                        newFrame.thisVal = fastIsStrict ? .undefined : ctx.globalObj
                     }
-                    newFrame.argCount = callArgs.count
-                    newFrame.argBuf = callArgs   // no pad: buf carries padded slots
-                    let newVarCount = Int(fastFb.varCount)
-                    if newVarCount > 0 {
-                        newFrame.varBuf.append(contentsOf: repeatElement(.undefined, count: newVarCount))
+                    do { // inline call (expanded; no nested-function capture of hot locals)
+                        let e_fastFb = fastFb
+                        let e_callObj = callObj
+                        let e_funcVal = funcVal
+                        let e_argc = argc
+                        let e_calleeSlot = calleeSlot
+                        let e_restoreSp = calleeSlot
+                        let e_thisVal = callThis
+                        let e_instrSize = instrSize
+                        let argStart = e_calleeSlot + 1
+                        rt.inlinePush(InlineCallFrame(
+                            pc: pc + e_instrSize, sp: e_restoreSp, spTop: sp,
+                            buf: buf, bufCapacity: bufCapacity,
+                            varBase: varBase, spBase: spBase,
+                            bc: bc, bcLen: bcLen, fb: fb,
+                            frame: frame,
+                            funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned))
+                        fb = e_fastFb
+                        bc = e_fastFb.bcPtrFast ?? e_fastFb.bytecodePtr
+                        bcLen = e_fastFb.bytecodeLen
+                        // Only functions with closure variables need their varRefs
+                        // array (a retain/release pair per assignment otherwise).
+                        if e_fastFb.closureVarCount > 0 {
+                            varRefs = e_callObj.varRefsFast
+                            varRefsLoaded = true
+                        } else if varRefsLoaded {
+                            varRefs = []
+                            varRefsLoaded = false
+                        }
+                        mFuncObj = e_funcVal
+                        mFlags = 0
+                        unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
+                        newFrame.prevFrame = ctx.currentFrame
+                        newFrame.curFunc = e_funcVal
+                        if e_fastFb.isArrow, let arrowThis = e_callObj.arrowThisVal {
+                            newFrame.thisVal = arrowThis.dupValue()
+                        } else if !e_fastFb.isStrictMode && e_thisVal.isNullOrUndefined {
+                            // ES §10.2.1.2: sloppy callees see the global object.
+                            newFrame.thisVal = ctx.globalObj
+                        } else {
+                            newFrame.thisVal = e_thisVal
+                        }
+                        newFrame.argCount = e_argc
+                        let newVarCount = Int(e_fastFb.varCount)
+                        newFrame.varCount = newVarCount
+                        let fbArgCount = Int(e_fastFb.argCount); let newArgSlots = fbArgCount > e_argc ? fbArgCount : e_argc
+                        let fbStack = Int(e_fastFb.stackSize); let newStackSlots = (fbStack > 4 ? fbStack : 4) + 32
+                        let newTotalSlots = newArgSlots + newVarCount + newStackSlots
+                        let newBuf: UnsafeMutablePointer<JeffJSValue>
+                        let newBufCap: Int
+                        if argStart + newTotalSlots <= bufCapacity {
+                            newBuf = buf + argStart
+                            newBufCap = bufCapacity - argStart
+                            // Args are already in place; pad missing args + locals.
+                            // Straight-line stores for the common small counts: the loop
+                            // form was turned into a memset_pattern16 call per call.
+                            let prefix = newArgSlots + newVarCount
+                            let pad = prefix - e_argc
+                            if pad > 0 {
+                                newBuf[e_argc] = .undefined
+                                if pad > 1 { newBuf[e_argc + 1] = .undefined }
+                                if pad > 2 { newBuf[e_argc + 2] = .undefined }
+                                if pad > 3 {
+                                    var i = e_argc + 3
+                                    while i < prefix { newBuf[i] = .undefined; i += 1 }
+                                }
+                            }
+                            bufOwned = false
+                        } else {
+                            (newBuf, newBufCap) = rt.acquireInterpBuf(size: newTotalSlots,
+                                                                      initializedPrefix: newArgSlots + newVarCount)
+                            for i in 0..<e_argc { newBuf[i] = buf[argStart + i] }
+                            bufOwned = true
+                        }
+                        frame = newFrame
+                        ctx.currentFrame = frame
+                        frame.spBase = 0
+                        buf = newBuf
+                        bufCapacity = newBufCap
+                        varBase = newArgSlots
+                        spBase = newArgSlots + newVarCount
+                        sp = spBase
+                        // Named function expression self-reference (ES §15.2.4).
+                        if e_fastFb.selfRefVarIdx >= 0 {
+                            buf[varBase + e_fastFb.selfRefVarIdx] = e_funcVal.dupValue()
+                        }
+                        frame.buf = buf
+                        frame.bufCapacity = bufCapacity
+                        frame.bufVarBase = varBase
+                        frame.bufSpBase = spBase
+                        pc = 0
                     }
-                    newFrame.varCount = newVarCount
-                    let newArgSlots = max(Int(fastFb.argCount), callArgs.count)
-                    frame = newFrame
-                    ctx.currentFrame = frame
-                    frame.spBase = 0
-                    // Allocate new contiguous buffer for callee
-                    let newStackSlots = max(Int(fastFb.stackSize), 4) + 32
-                    let newTotalSlots = newArgSlots + newVarCount + newStackSlots
-                    let (newBuf, newBufCap) = rt.acquireInterpBuf(size: newTotalSlots,
-                                                                  initializedPrefix: newArgSlots + newVarCount)
-                    // Copy args into callee buf
-                    for i in 0..<callArgs.count { newBuf[i] = callArgs[i] }
-                    buf = newBuf
-                    bufCapacity = newBufCap
-                    varBase = newArgSlots
-                    spBase = newArgSlots + newVarCount
-                    sp = spBase
-                    // Store buf info on frame
-                    frame.buf = buf
-                    frame.bufCapacity = bufCapacity
-                    frame.bufVarBase = varBase
-                    frame.bufSpBase = spBase
-                    pc = 0
+                    // Run the callee in the fast trace from its first instruction.
+                    if fb.traceLean {
+                        let r = executeFastTraceLean(bc: bc, bcLen: bcLen, entryPC: 0, exitPC: bcLen, startPC: pc,
+                                                     buf: buf, varBase: varBase, sp: &sp, ctx: ctx, cpool: fb.cpool,
+                                                     stackLimit: bufCapacity, icEntries: fb.icEntries)
+                        if r == -1 { retVal = .exception; break dispatchLoop }
+                        pc = r
+                        continue dispatchLoop
+                    }
+                    if fb.traceEntryEnabled {
+                        let fbIdBefore = ObjectIdentifier(fb)
+                        var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
+                        let resumePC = executeFastTrace(state: &hot, startPC: pc, ctx: ctx, rt: rt, inlineBase: inlineBase)
+                        sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
+                        bc = hot.bc; bcLen = hot.bcLen; fb = hot.fb; frame = hot.frame
+                        mFuncObj = hot.funcObj; mFlags = hot.flags; bufOwned = hot.bufOwned
+                        if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
+                        // Entry deopt accounting: an early exit still inside this function
+                        // means the trace could not run it; stop trying after a while.
+                        if hot.opsRun < 16, ObjectIdentifier(fb) == fbIdBefore {
+                            fb.traceEntryDeopts &+= 1
+                            if fb.traceEntryDeopts >= 100 { fb.traceEntryEnabled = false }
+                        }
+                        if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                        pc = resumePC
+                    }
                     continue dispatchLoop
                 } else {
-                    // Slow path: bound functions, C functions, generators, async, etc.
+                    // Slow path: bound functions, C functions, generators, async,
+                    // etc. Now build the args array and pop funcVal + args.
+                    let callArgs: [JeffJSValue]
+                    switch argc {
+                    case 0:
+                        callArgs = []
+                    case 1:
+                        let a0 = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                        callArgs = [a0]
+                    case 2:
+                        let a1 = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let a0 = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                        callArgs = [a0, a1]
+                    case 3:
+                        let a2 = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let a1 = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let a0 = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                        callArgs = [a0, a1, a2]
+                    default:
+                        var tmp = [JeffJSValue](repeating: .undefined, count: argc)
+                        for i in stride(from: argc - 1, through: 0, by: -1) { tmp[i] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
+                        callArgs = tmp
+                    }
+                    let funcVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                     // Use lastGetFieldReceiver as `this` if available (method call
                     // that transformMethodCalls couldn't convert to call_method).
                     let stashValid = !frame.lastGetFieldReceiver.isUndefined
                         && frame.lastGetFieldPC >= 0 && pc == frame.lastGetFieldPC + 5
                     let slowThis = stashValid ? frame.lastGetFieldReceiver : JeffJSValue.undefined
                     let result: JeffJSValue
+                    var calleeIsBytecode = false
                     if let callObj = funcVal.obj,
                        let fastFb2 = callObj.fbFast, !fastFb2.isGenerator, !fastFb2.isAsyncFunc {
                         // fbFast avoids copying the payload enum per call;
@@ -3882,6 +6501,7 @@ struct JeffJSInterpreter {
                         // callInternal for plain bytecode functions).
                         result = JeffJSInterpreter.callInternal(ctx: ctx, funcObj: funcVal,
                                                                 thisVal: slowThis, args: callArgs, flags: 0)
+                        calleeIsBytecode = true
                     } else {
                         result = ctx.callFunction(funcVal, thisVal: slowThis, args: callArgs)
                     }
@@ -3889,11 +6509,16 @@ struct JeffJSInterpreter {
                     frame.lastGetFieldReceiver.freeValue()
                     frame.lastGetFieldReceiver = .undefined  // clear after use
                     frame.lastGetFieldPC = -1
+                    // The call borrows: release the popped callee, and the args
+                    // for bytecode callees (C functions may store an arg
+                    // without a dup; those keep the old leak for now).
+                    funcVal.freeValue()
+                    if calleeIsBytecode { for a in callArgs { a.freeValue() } }
                     if result.isException {
                         retVal = .exception
                         break dispatchLoop
                     }
-                    push(result)
+                    buf[sp] = result; sp += 1
                     pc += instrSize
                 }
 
@@ -3915,7 +6540,7 @@ struct JeffJSInterpreter {
                    funcObj === pushObj,
                    let arrObj = buf[sp - 3].obj,
                    arrObj.classID == JeffJSClassID.array.rawValue,
-                   arrObj.prop.count > 0,
+                   arrObj.propCount > 0,
                    let shape = arrObj.shape,
                    shape.prop.count > 0,
                    shape.prop[0].atom == JeffJSAtomID.JS_ATOM_length.rawValue
@@ -3923,47 +6548,185 @@ struct JeffJSInterpreter {
                     let newCount = arrObj.asClass.fastArrayPush(buf[sp - 1])
                     if newCount > 0 {
                         // Update the length property in-place (prop[0] == "length").
-                        arrObj.asClass.prop[0] = .value(.newInt32(Int32(newCount)))
+                        arrObj.asClass.setPropEntry(at: 0, .value(.newInt32(Int32(newCount))))
                         // Pop arg, funcVal, thisObj; push new length
                         sp -= 3
-                        push(.newInt32(Int32(newCount)))
+                        buf[sp] = .newInt32(Int32(newCount)); sp += 1
                         pc += 3
                         continue dispatchLoop
                     }
                 }
                 // ── General call_method path ────────────────────────────
                 // Build args with minimal allocation for common cases
+                // Inline fast path: plain bytecode method. Stack layout is
+                // [..., this, funcVal, arg0 … arg(argc-1)]; the callee frame
+                // starts at the first arg slot and `this` is moved from the
+                // stack into the callee frame.
+                let cmCalleeSlot = sp - argc - 1
+                let cmThisSlot = cmCalleeSlot - 1
+                if inlineCallsEnabled, cmThisSlot >= spBase,
+                   let cmCallObj = buf[cmCalleeSlot].obj,
+                   let cmFastFb = cmCallObj.fbFast, !cmFastFb.isGenerator, !cmFastFb.isAsyncFunc {
+                    if rt.inlineStackTop - inlineBase > 10000 {
+                        _ = ctx.throwInternalError(message: "Maximum call stack size exceeded")
+                        retVal = .exception
+                        break dispatchLoop
+                    }
+                    do { // inline call (expanded; no nested-function capture of hot locals)
+                        let e_fastFb = cmFastFb
+                        let e_callObj = cmCallObj
+                        let e_funcVal = buf[cmCalleeSlot]
+                        let e_argc = argc
+                        let e_calleeSlot = cmCalleeSlot
+                        let e_restoreSp = cmThisSlot
+                        let e_thisVal = buf[cmThisSlot]
+                        let e_instrSize = 3
+                        let argStart = e_calleeSlot + 1
+                        rt.inlinePush(InlineCallFrame(
+                            pc: pc + e_instrSize, sp: e_restoreSp, spTop: sp,
+                            buf: buf, bufCapacity: bufCapacity,
+                            varBase: varBase, spBase: spBase,
+                            bc: bc, bcLen: bcLen, fb: fb,
+                            frame: frame,
+                            funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned))
+                        fb = e_fastFb
+                        bc = e_fastFb.bcPtrFast ?? e_fastFb.bytecodePtr
+                        bcLen = e_fastFb.bytecodeLen
+                        // Only functions with closure variables need their varRefs
+                        // array (a retain/release pair per assignment otherwise).
+                        if e_fastFb.closureVarCount > 0 {
+                            varRefs = e_callObj.varRefsFast
+                            varRefsLoaded = true
+                        } else if varRefsLoaded {
+                            varRefs = []
+                            varRefsLoaded = false
+                        }
+                        mFuncObj = e_funcVal
+                        mFlags = 0
+                        unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
+                        newFrame.prevFrame = ctx.currentFrame
+                        newFrame.curFunc = e_funcVal
+                        if e_fastFb.isArrow, let arrowThis = e_callObj.arrowThisVal {
+                            newFrame.thisVal = arrowThis.dupValue()
+                        } else if !e_fastFb.isStrictMode && e_thisVal.isNullOrUndefined {
+                            // ES §10.2.1.2: sloppy callees see the global object.
+                            newFrame.thisVal = ctx.globalObj
+                        } else {
+                            newFrame.thisVal = e_thisVal
+                        }
+                        newFrame.argCount = e_argc
+                        let newVarCount = Int(e_fastFb.varCount)
+                        newFrame.varCount = newVarCount
+                        let fbArgCount = Int(e_fastFb.argCount); let newArgSlots = fbArgCount > e_argc ? fbArgCount : e_argc
+                        let fbStack = Int(e_fastFb.stackSize); let newStackSlots = (fbStack > 4 ? fbStack : 4) + 32
+                        let newTotalSlots = newArgSlots + newVarCount + newStackSlots
+                        let newBuf: UnsafeMutablePointer<JeffJSValue>
+                        let newBufCap: Int
+                        if argStart + newTotalSlots <= bufCapacity {
+                            newBuf = buf + argStart
+                            newBufCap = bufCapacity - argStart
+                            // Args are already in place; pad missing args + locals.
+                            // Straight-line stores for the common small counts: the loop
+                            // form was turned into a memset_pattern16 call per call.
+                            let prefix = newArgSlots + newVarCount
+                            let pad = prefix - e_argc
+                            if pad > 0 {
+                                newBuf[e_argc] = .undefined
+                                if pad > 1 { newBuf[e_argc + 1] = .undefined }
+                                if pad > 2 { newBuf[e_argc + 2] = .undefined }
+                                if pad > 3 {
+                                    var i = e_argc + 3
+                                    while i < prefix { newBuf[i] = .undefined; i += 1 }
+                                }
+                            }
+                            bufOwned = false
+                        } else {
+                            (newBuf, newBufCap) = rt.acquireInterpBuf(size: newTotalSlots,
+                                                                      initializedPrefix: newArgSlots + newVarCount)
+                            for i in 0..<e_argc { newBuf[i] = buf[argStart + i] }
+                            bufOwned = true
+                        }
+                        frame = newFrame
+                        ctx.currentFrame = frame
+                        frame.spBase = 0
+                        buf = newBuf
+                        bufCapacity = newBufCap
+                        varBase = newArgSlots
+                        spBase = newArgSlots + newVarCount
+                        sp = spBase
+                        // Named function expression self-reference (ES §15.2.4).
+                        if e_fastFb.selfRefVarIdx >= 0 {
+                            buf[varBase + e_fastFb.selfRefVarIdx] = e_funcVal.dupValue()
+                        }
+                        frame.buf = buf
+                        frame.bufCapacity = bufCapacity
+                        frame.bufVarBase = varBase
+                        frame.bufSpBase = spBase
+                        pc = 0
+                    }
+                    // Run the callee in the fast trace from its first instruction.
+                    if fb.traceLean {
+                        let r = executeFastTraceLean(bc: bc, bcLen: bcLen, entryPC: 0, exitPC: bcLen, startPC: pc,
+                                                     buf: buf, varBase: varBase, sp: &sp, ctx: ctx, cpool: fb.cpool,
+                                                     stackLimit: bufCapacity, icEntries: fb.icEntries)
+                        if r == -1 { retVal = .exception; break dispatchLoop }
+                        pc = r
+                        continue dispatchLoop
+                    }
+                    if fb.traceEntryEnabled {
+                        let fbIdBefore = ObjectIdentifier(fb)
+                        var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
+                        let resumePC = executeFastTrace(state: &hot, startPC: pc, ctx: ctx, rt: rt, inlineBase: inlineBase)
+                        sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
+                        bc = hot.bc; bcLen = hot.bcLen; fb = hot.fb; frame = hot.frame
+                        mFuncObj = hot.funcObj; mFlags = hot.flags; bufOwned = hot.bufOwned
+                        if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
+                        // Entry deopt accounting: an early exit still inside this function
+                        // means the trace could not run it; stop trying after a while.
+                        if hot.opsRun < 16, ObjectIdentifier(fb) == fbIdBefore {
+                            fb.traceEntryDeopts &+= 1
+                            if fb.traceEntryDeopts >= 100 { fb.traceEntryEnabled = false }
+                        }
+                        if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                        pc = resumePC
+                    }
+                    continue dispatchLoop
+                }
                 let cmArgs: [JeffJSValue]
                 switch argc {
                 case 0:
                     cmArgs = []
                 case 1:
-                    let a0 = pop()
+                    let a0 = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                     cmArgs = [a0]
                 case 2:
-                    let a1 = pop(); let a0 = pop()
+                    let a1 = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let a0 = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                     cmArgs = [a0, a1]
                 default:
                     var tmp = [JeffJSValue](repeating: .undefined, count: argc)
-                    for i in stride(from: argc - 1, through: 0, by: -1) { tmp[i] = pop() }
+                    for i in stride(from: argc - 1, through: 0, by: -1) { tmp[i] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
                     cmArgs = tmp
                 }
-                let cmFuncVal = pop()
-                let cmThisObj = pop()
+                let cmFuncVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let cmThisObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let cmResult: JeffJSValue
+                var cmBytecode = false
                 if let cmCallObj = cmFuncVal.obj,
                    case .bytecodeFunc(let cmFbOpt2, _, _) = cmCallObj.payload,
                    let cmFastFb2 = cmFbOpt2, !cmFastFb2.isGenerator, !cmFastFb2.isAsyncFunc {
                     cmResult = JeffJSInterpreter.callInternal(ctx: ctx, funcObj: cmFuncVal,
                                                               thisVal: cmThisObj, args: cmArgs, flags: 0)
+                    cmBytecode = true
                 } else {
                     cmResult = ctx.callFunction(cmFuncVal, thisVal: cmThisObj, args: cmArgs)
                 }
+                cmFuncVal.freeValue(); cmThisObj.freeValue()
+                if cmBytecode { for a in cmArgs { a.freeValue() } }
                 if cmResult.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(cmResult)
+                buf[sp] = cmResult; sp += 1
                 pc += 3
 
             case .tail_call:
@@ -3973,20 +6736,52 @@ struct JeffJSInterpreter {
                 case 0:
                     tcArgs = []
                 case 1:
-                    let a0 = pop()
+                    let a0 = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                     tcArgs = [a0]
                 case 2:
-                    let a1 = pop(); let a0 = pop()
+                    let a1 = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let a0 = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                     tcArgs = [a0, a1]
                 default:
                     var tmp = [JeffJSValue](repeating: .undefined, count: tcArgc)
-                    for i in stride(from: tcArgc - 1, through: 0, by: -1) { tmp[i] = pop() }
+                    for i in stride(from: tcArgc - 1, through: 0, by: -1) { tmp[i] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
                     tcArgs = tmp
                 }
-                let tcFuncVal = pop()
+                let tcFuncVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let tcBytecode = jeffJS_isPlainBytecodeCallee(tcFuncVal)
+                if rt.inlineStackTop == inlineBase {
+                    ctx.currentFrame = frame.prevFrame
+                    retVal = ctx.callFunction(tcFuncVal, thisVal: .undefined, args: tcArgs)
+                    tcFuncVal.freeValue()
+                    if tcBytecode { for a in tcArgs { a.freeValue() } }
+                    break dispatchLoop
+                }
+                // Inside an inline frame: `break dispatchLoop` would return from
+                // the whole callInternal and abandon the caller's continuation
+                // (the bug behind `return f()` inside an inline-called function).
+                // Treat as call + inline-return: compute the result, unwind this
+                // inline frame, and resume the caller — mirroring return_.
+                let tcResult = ctx.callFunction(tcFuncVal, thisVal: .undefined, args: tcArgs)
+                tcFuncVal.freeValue()
+                if tcBytecode { for a in tcArgs { a.freeValue() } }
+                if tcResult.isException { retVal = .exception; break dispatchLoop }
+                if frame.hasLiveVarRefs {
+                    jeffJS_syncBufToFrame(frame, buf, varBase)
+                    for vr in frame.liveVarRefs where !vr.isDetached {
+                        vr.value = vr.pvalue.dupValue(); vr.isDetached = true; vr.parentFrame = nil; vr.slot = nil
+                    }
+                }
                 ctx.currentFrame = frame.prevFrame
-                retVal = ctx.callFunction(tcFuncVal, thisVal: .undefined, args: tcArgs)
-                break dispatchLoop
+                rt.releaseFrame(frame)
+                if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
+                let tcSaved = rt.inlinePop()
+                pc = tcSaved.pc; sp = tcSaved.sp
+                buf = tcSaved.buf; bufCapacity = tcSaved.bufCapacity
+                varBase = tcSaved.varBase; spBase = tcSaved.spBase
+                bc = tcSaved.bc; bcLen = tcSaved.bcLen
+                fb = tcSaved.fb; frame = tcSaved.frame; if tcSaved.fb.closureVarCount > 0 { varRefs = tcSaved.funcObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
+                mFuncObj = tcSaved.funcObj; mFlags = tcSaved.flags; bufOwned = tcSaved.bufOwned
+                buf[sp] = tcResult; sp += 1
+                continue dispatchLoop
 
             case .tail_call_method:
                 let tcmArgc = Int(readU16(bc, pc + 1))
@@ -3995,107 +6790,149 @@ struct JeffJSInterpreter {
                 case 0:
                     tcmArgs = []
                 case 1:
-                    let a0 = pop()
+                    let a0 = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                     tcmArgs = [a0]
                 case 2:
-                    let a1 = pop(); let a0 = pop()
+                    let a1 = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let a0 = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                     tcmArgs = [a0, a1]
                 default:
                     var tmp = [JeffJSValue](repeating: .undefined, count: tcmArgc)
-                    for i in stride(from: tcmArgc - 1, through: 0, by: -1) { tmp[i] = pop() }
+                    for i in stride(from: tcmArgc - 1, through: 0, by: -1) { tmp[i] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
                     tcmArgs = tmp
                 }
-                let tcmFuncVal = pop()
-                let tcmThisObj = pop()
+                let tcmFuncVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let tcmThisObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let tcmBytecode = jeffJS_isPlainBytecodeCallee(tcmFuncVal)
+                if rt.inlineStackTop == inlineBase {
+                    ctx.currentFrame = frame.prevFrame
+                    retVal = ctx.callFunction(tcmFuncVal, thisVal: tcmThisObj, args: tcmArgs)
+                    tcmFuncVal.freeValue(); tcmThisObj.freeValue()
+                    if tcmBytecode { for a in tcmArgs { a.freeValue() } }
+                    break dispatchLoop
+                }
+                // Inside an inline frame: treat as call + inline-return (see
+                // tail_call above for why `break dispatchLoop` is wrong here).
+                let tcmResult = ctx.callFunction(tcmFuncVal, thisVal: tcmThisObj, args: tcmArgs)
+                tcmFuncVal.freeValue(); tcmThisObj.freeValue()
+                if tcmBytecode { for a in tcmArgs { a.freeValue() } }
+                if tcmResult.isException { retVal = .exception; break dispatchLoop }
+                if frame.hasLiveVarRefs {
+                    jeffJS_syncBufToFrame(frame, buf, varBase)
+                    for vr in frame.liveVarRefs where !vr.isDetached {
+                        vr.value = vr.pvalue.dupValue(); vr.isDetached = true; vr.parentFrame = nil; vr.slot = nil
+                    }
+                }
                 ctx.currentFrame = frame.prevFrame
-                retVal = ctx.callFunction(tcmFuncVal, thisVal: tcmThisObj, args: tcmArgs)
-                break dispatchLoop
+                rt.releaseFrame(frame)
+                if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
+                let tcmSaved = rt.inlinePop()
+                pc = tcmSaved.pc; sp = tcmSaved.sp
+                buf = tcmSaved.buf; bufCapacity = tcmSaved.bufCapacity
+                varBase = tcmSaved.varBase; spBase = tcmSaved.spBase
+                bc = tcmSaved.bc; bcLen = tcmSaved.bcLen
+                fb = tcmSaved.fb; frame = tcmSaved.frame; if tcmSaved.fb.closureVarCount > 0 { varRefs = tcmSaved.funcObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
+                mFuncObj = tcmSaved.funcObj; mFlags = tcmSaved.flags; bufOwned = tcmSaved.bufOwned
+                buf[sp] = tcmResult; sp += 1
+                continue dispatchLoop
 
             case .call_constructor:
                 ctx.lastGetFieldAtom = 0
                 let argc = Int(readU16(bc, pc + 1))
                 var callArgs = [JeffJSValue](repeating: .undefined, count: argc)
-                for i in stride(from: argc - 1, through: 0, by: -1) { callArgs[i] = pop() }
-                let newTarget = pop()
-                let funcVal = pop()
+                for i in stride(from: argc - 1, through: 0, by: -1) { callArgs[i] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
+                let newTarget = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let funcVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let ctorBytecode = jeffJS_isPlainBytecodeCallee(funcVal)
                 let result = ctx.callConstructor(funcVal, newTarget: newTarget, args: callArgs)
+                funcVal.freeValue(); newTarget.freeValue()
+                if ctorBytecode { for a in callArgs { a.freeValue() } }
                 if result.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(result)
+                buf[sp] = result; sp += 1
                 pc += 3
 
             case .array_from:
                 let count = Int(readU16(bc, pc + 1))
                 var items = [JeffJSValue]()
-                for _ in 0..<count { items.insert(pop(), at: 0) }
+                for _ in 0..<count { sp -= 1; items.insert(buf[sp], at: 0) }
                 // The parser emits an orphaned OP_object before every
                 // array literal.  Pop it so the stack stays balanced.
                 // Only pop if it looks like the parser's empty sentinel
                 // (a plain object with no properties).
                 if sp > 0 {
-                    let below = peek()
+                    let below = buf[sp - 1]
                     if below.isObject, let obj = below.toObject(),
                        obj.classID == JeffJSClassID.object.rawValue,
-                       obj.prop.isEmpty {
-                        let _ = pop()
+                       obj.propValues.isEmpty {
+                        jeffJS_pop(buf, &sp, spBase, ctx, fb, pc).freeValue()   // the sentinel object
                     }
                 }
-                let arr = ctx.newArrayFrom(items)
-                push(arr)
+                let arr = ctx.newArrayFrom(items)   // takes the popped references
+                buf[sp] = arr; sp += 1
                 pc += 3
 
             case .apply:
                 let _ = readU16(bc, pc + 1)
-                let argsArray = pop()
-                let funcVal = pop()
-                let thisObj = pop()
-                let callArgs = ctx.arrayToArgs(argsArray)
+                let argsArray = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let funcVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let thisObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let callArgs = ctx.arrayToArgs(argsArray)   // owned copies
+                let applyBytecode = jeffJS_isPlainBytecodeCallee(funcVal)
                 let result = ctx.callFunction(funcVal, thisVal: thisObj, args: callArgs)
+                argsArray.freeValue(); funcVal.freeValue(); thisObj.freeValue()
+                if applyBytecode { for a in callArgs { a.freeValue() } }
                 if result.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(result)
+                buf[sp] = result; sp += 1
                 pc += 3
 
             case .apply_constructor:
                 let _ = readU16(bc, pc + 1)
-                let argsArray = pop()
-                let newTarget = pop()
-                let funcVal = pop()
-                let callArgs = ctx.arrayToArgs(argsArray)
+                let argsArray = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let newTarget = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let funcVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let callArgs = ctx.arrayToArgs(argsArray)   // owned copies
+                let applyCtorBytecode = jeffJS_isPlainBytecodeCallee(funcVal)
                 let result = ctx.callConstructor(funcVal, newTarget: newTarget, args: callArgs)
+                argsArray.freeValue(); funcVal.freeValue(); newTarget.freeValue()
+                if applyCtorBytecode { for a in callArgs { a.freeValue() } }
                 if result.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(result)
+                buf[sp] = result; sp += 1
                 pc += 3
 
             case .return_:
-                let returnValue = pop()
-                if !inlineCallStack.isEmpty {
+                let returnValue = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                if rt.inlineStackTop != inlineBase {
                     // ── Inline return: restore caller's frame ──
                     // 1. Sync buf → frame and detach live var-refs
-                    if !frame.liveVarRefs.isEmpty {
-                        syncBufToFrame()
+                    if frame.hasLiveVarRefs {
+                        jeffJS_syncBufToFrame(frame, buf, varBase)
                         for vr in frame.liveVarRefs where !vr.isDetached {
                             // pvalue prefers frame.buf, which holds padded arg
                             // slots that argBuf (un-padded) does not.
                             vr.value = vr.pvalue.dupValue()
                             vr.isDetached = true
-                            vr.parentFrame = nil
+                            vr.parentFrame = nil; vr.slot = nil
                         }
                     }
                     // 2. Restore previous frame pointer and release callee frame
+                    // 1b. Release the callee's variable slots; the caller's
+                    // func/this/args slots are released after the pop.
+                    do { var i = varBase; let n = spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
                     ctx.currentFrame = frame.prevFrame
                     rt.releaseFrame(frame)
                     // 2b. Release callee's buf to pool
-                    rt.releaseInterpBuf(buf, capacity: bufCapacity)
+                    if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
                     // 3. Pop saved caller state
-                    let saved = inlineCallStack.removeLast()
+                    let saved = rt.inlinePop()
+                    do { var p = saved.sp; let e = saved.spTop; while p < e { saved.buf[p].freeValueFast(); p += 1 } }
                     pc = saved.pc
                     sp = saved.sp
                     buf = saved.buf
@@ -4106,11 +6943,11 @@ struct JeffJSInterpreter {
                     bcLen = saved.bcLen
                     fb = saved.fb
                     frame = saved.frame
-                    varRefs = saved.varRefs
+                    if saved.fb.closureVarCount > 0 { varRefs = saved.funcObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
                     mFuncObj = saved.funcObj
-                    mFlags = saved.flags
+                    mFlags = saved.flags; bufOwned = saved.bufOwned
                     // 4. Push return value onto caller's stack
-                    push(returnValue)
+                    buf[sp] = returnValue; sp += 1
                     continue dispatchLoop
                 } else {
                     retVal = returnValue
@@ -4118,22 +6955,24 @@ struct JeffJSInterpreter {
                 }
 
             case .return_undef:
-                if !inlineCallStack.isEmpty {
+                if rt.inlineStackTop != inlineBase {
                     // ── Inline return undefined: restore caller's frame ──
-                    if !frame.liveVarRefs.isEmpty {
-                        syncBufToFrame()
+                    if frame.hasLiveVarRefs {
+                        jeffJS_syncBufToFrame(frame, buf, varBase)
                         for vr in frame.liveVarRefs where !vr.isDetached {
                             // pvalue prefers frame.buf, which holds padded arg
                             // slots that argBuf (un-padded) does not.
                             vr.value = vr.pvalue.dupValue()
                             vr.isDetached = true
-                            vr.parentFrame = nil
+                            vr.parentFrame = nil; vr.slot = nil
                         }
                     }
+                    do { var i = varBase; let n = spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
                     ctx.currentFrame = frame.prevFrame
                     rt.releaseFrame(frame)
-                    rt.releaseInterpBuf(buf, capacity: bufCapacity)
-                    let saved = inlineCallStack.removeLast()
+                    if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
+                    let saved = rt.inlinePop()
+                    do { var p = saved.sp; let e = saved.spTop; while p < e { saved.buf[p].freeValueFast(); p += 1 } }
                     pc = saved.pc
                     sp = saved.sp
                     buf = saved.buf
@@ -4144,10 +6983,10 @@ struct JeffJSInterpreter {
                     bcLen = saved.bcLen
                     fb = saved.fb
                     frame = saved.frame
-                    varRefs = saved.varRefs
+                    if saved.fb.closureVarCount > 0 { varRefs = saved.funcObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
                     mFuncObj = saved.funcObj
-                    mFlags = saved.flags
-                    push(.undefined)
+                    mFlags = saved.flags; bufOwned = saved.bufOwned
+                    buf[sp] = .undefined; sp += 1
                     continue dispatchLoop
                 } else {
                     retVal = .undefined
@@ -4155,11 +6994,11 @@ struct JeffJSInterpreter {
                 }
 
             case .check_ctor_return:
-                let val = peek()
+                let val = buf[sp - 1]
                 if val.isObject {
-                    push(.newBool(true))
+                    buf[sp] = .newBool(true); sp += 1
                 } else if val.isUndefined {
-                    push(.newBool(false))
+                    buf[sp] = .newBool(false); sp += 1
                 } else {
                     _ = ctx.throwTypeError(message: "derived constructor must return object or undefined")
                     retVal = .exception
@@ -4179,7 +7018,7 @@ struct JeffJSInterpreter {
                 // Create a new empty object using the constructor's .prototype property
                 // as its [[Prototype]]. In QuickJS this reads new.target's .prototype,
                 // creates a new object with that proto, and pushes it as `this`.
-                let ctorFunc = peek() // the constructor function is on the stack
+                let ctorFunc = buf[sp - 1] // the constructor function is on the stack
                 let protoVal = ctx.getProperty(obj: ctorFunc,
                                                 atom: JeffJSAtomID.JS_ATOM_prototype.rawValue)
                 let newObj: JeffJSValue
@@ -4189,12 +7028,12 @@ struct JeffJSInterpreter {
                     // If .prototype is not an object, use the default Object.prototype
                     newObj = ctx.newObject()
                 }
-                push(newObj)
+                buf[sp] = newObj; sp += 1
                 pc += 1
 
             case .check_brand:
-                let brand = peekAt(0)
-                let obj = peekAt(1)
+                let brand = buf[sp - 1]
+                let obj = buf[sp - 2]
                 if !ctx.checkBrand(obj: obj, brand: brand) {
                     _ = ctx.throwTypeError(message: "private member access denied")
                     retVal = .exception
@@ -4203,13 +7042,13 @@ struct JeffJSInterpreter {
                 pc += 1
 
             case .add_brand:
-                let brand = pop()
-                let obj = pop()
+                let brand = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 ctx.addBrand(obj: obj, brand: brand)
                 pc += 1
 
             case .return_async:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 // Return the actual value so callFunction can wrap it in
                 // Promise.resolve(). Previously this returned .undefined,
                 // discarding the async function's return value.
@@ -4217,7 +7056,7 @@ struct JeffJSInterpreter {
                 break dispatchLoop
 
             case .throw_:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 ctx.throwValue(val)
                 retVal = .exception
                 break dispatchLoop
@@ -4225,7 +7064,9 @@ struct JeffJSInterpreter {
             case .throw_error:
                 let atom = readU32(bc, pc + 1)
                 let errType = readU8(bc, pc + 5)
-                let msg = ctx.atomToSwiftString(atom)
+                let msg = errType == ThrowErrorType.constAssign.rawValue
+                    ? "Assignment to constant variable."
+                    : ctx.atomToSwiftString(atom)
                 ctx.throwErrorFromType(errType: Int(errType), msg: msg)
                 retVal = .exception
                 break dispatchLoop
@@ -4234,36 +7075,36 @@ struct JeffJSInterpreter {
                 let argc = Int(readU16(bc, pc + 1))
                 let scope = Int(readU16(bc, pc + 3))
                 var evalArgs = [JeffJSValue]()
-                for _ in 0..<argc { evalArgs.insert(pop(), at: 0) }
+                for _ in 0..<argc { sp -= 1; evalArgs.insert(buf[sp], at: 0) }
                 let result = ctx.evalDirect(args: evalArgs, scope: scope, frame: frame)
                 if result.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(result)
+                buf[sp] = result; sp += 1
                 pc += 5
 
             case .apply_eval:
                 let argc = Int(readU16(bc, pc + 1))
                 var evalArgs = [JeffJSValue]()
-                for _ in 0..<argc { evalArgs.insert(pop(), at: 0) }
+                for _ in 0..<argc { sp -= 1; evalArgs.insert(buf[sp], at: 0) }
                 let result = ctx.evalDirect(args: evalArgs, scope: 0, frame: frame)
                 if result.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(result)
+                buf[sp] = result; sp += 1
                 pc += 3
 
             case .regexp:
-                let flagsVal = pop()
-                let patternVal = pop()
+                let flagsVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let patternVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let result = ctx.newRegExp(pattern: patternVal, flags: flagsVal)
                 if result.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(result)
+                buf[sp] = result; sp += 1
                 pc += 1
 
             case .get_super:
@@ -4271,24 +7112,24 @@ struct JeffJSInterpreter {
                 // Pop a value from the stack to keep the nPop=1 balance,
                 // but always resolve the parent constructor from
                 // frame.curFunc.__proto__ (the class inheritance chain).
-                let _ = pop()   // discard the dummy value
+                let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)   // discard the dummy value
                 let result = ctx.getSuperConstructor(obj: frame.curFunc)
                 if result.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(result)
+                buf[sp] = result; sp += 1
                 pc += 1
 
             case .import_:
                 let _ = readU8(bc, pc + 1)
-                let specifier = pop()
+                let specifier = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let result = ctx.dynamicImport(specifier: specifier)
                 if result.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(result)
+                buf[sp] = result; sp += 1
                 pc += 2
 
             // -----------------------------------------------------------------
@@ -4298,13 +7139,13 @@ struct JeffJSInterpreter {
             case .check_var:
                 let atom = readU32(bc, pc + 1)
                 let exists = ctx.checkGlobalVar(atom: atom)
-                push(.newBool(exists))
+                buf[sp] = .newBool(exists); sp += 1
                 pc += 5
 
             case .get_var_undef:
                 let atom = readU32(bc, pc + 1)
                 let val = ctx.getGlobalVar(atom: atom, throwRefError: false)
-                push(val)
+                buf[sp] = val; sp += 1
                 pc += 5
 
             case .get_var:
@@ -4325,9 +7166,9 @@ struct JeffJSInterpreter {
                     let entry = ic.lookup(pc)
                     if entry.pc == pc,
                        entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
-                       entry.propOffset >= 0, entry.propOffset < gObj.prop.count,
-                       case .value(let v) = gObj.prop[entry.propOffset] {
-                        push(v.dupValue())
+                       entry.propOffset >= 0, entry.propOffset < gObj.propCount,
+                       gObj.extra(at: entry.propOffset) == nil {
+                        buf[sp] = gObj.dataValue(at: entry.propOffset).dupValue(); sp += 1
                         pc += 5
                         continue dispatchLoop
                     }
@@ -4337,10 +7178,10 @@ struct JeffJSInterpreter {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(val)
+                buf[sp] = val; sp += 1
                 // Cache plain data slots for the next read
                 if let gObj = ctx.globalObj.obj, let gShape = gObj.shape {
-                    if let idx = findShapeProperty(gShape, atom), idx < gObj.prop.count,
+                    if let idx = findShapeProperty(gShape, atom), idx < gObj.propCount,
                        !gShape.prop[idx].flags.contains(.getset),
                        gShape.prop[idx].flags.contains(.writable) {
                         fb.getIC().update(pc, shape: gShape, propOffset: idx)
@@ -4352,18 +7193,20 @@ struct JeffJSInterpreter {
                 let atom = readU32(bc, pc + 1)
                 // Chained assignment: if next opcode is also a store, keep value on stack
                 let chainedPutVar = isStoreOpcode(bc, pc + 5, bcLen)
-                let val = chainedPutVar ? peek().dupValue() : pop()
+                let val: JeffJSValue
+                if chainedPutVar { val = buf[sp - 1].dupValue() } else { val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
                 // Global-var inline cache: shape-matched writable data slot
                 if let gObj = ctx.globalObj.obj, let gShape = gObj.shape, let ic = fb.ic {
                     let entry = ic.lookup(pc)
                     if entry.pc == pc,
                        entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
-                       entry.propOffset >= 0, entry.propOffset < gObj.prop.count,
+                       entry.propOffset >= 0, entry.propOffset < gObj.propCount,
                        entry.propOffset < gShape.prop.count,
                        gShape.prop[entry.propOffset].flags.contains(.writable),
                        !gShape.prop[entry.propOffset].flags.contains(.getset),
-                       case .value(let old) = gObj.prop[entry.propOffset] {
-                        gObj.asClass.prop[entry.propOffset] = .value(val)
+                       gObj.extra(at: entry.propOffset) == nil {
+                        let old = gObj.dataValue(at: entry.propOffset)
+                        gObj.asClass.propValues[entry.propOffset] = val
                         old.freeValue()
                         pc += 5
                         continue dispatchLoop
@@ -4375,7 +7218,7 @@ struct JeffJSInterpreter {
                     break dispatchLoop
                 }
                 if let gObj = ctx.globalObj.obj, let gShape = gObj.shape {
-                    if let idx = findShapeProperty(gShape, atom), idx < gObj.prop.count,
+                    if let idx = findShapeProperty(gShape, atom), idx < gObj.propCount,
                        !gShape.prop[idx].flags.contains(.getset),
                        gShape.prop[idx].flags.contains(.writable) {
                         fb.getIC().update(pc, shape: gShape, propOffset: idx)
@@ -4385,7 +7228,7 @@ struct JeffJSInterpreter {
 
             case .put_var_init:
                 let atom = readU32(bc, pc + 1)
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let ok = ctx.putGlobalVar(atom: atom, val: val, flags: JS_PROP_CONFIGURABLE)
                 if !ok {
                     retVal = .exception
@@ -4395,8 +7238,8 @@ struct JeffJSInterpreter {
 
             case .put_var_strict:
                 let atom = readU32(bc, pc + 1)
-                let val = pop()
-                let _ = pop() // ref object (unused in global mode)
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) // ref object (unused in global mode)
                 let ok = ctx.putGlobalVar(atom: atom, val: val, flags: JS_PROP_HAS_VALUE | JS_PROP_THROW)
                 if !ok {
                     retVal = .exception
@@ -4405,22 +7248,22 @@ struct JeffJSInterpreter {
                 pc += 5
 
             case .get_ref_value:
-                let prop = pop()
-                let obj = pop()
+                let prop = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let val = ctx.getPropertyValue(obj: obj, prop: prop)
                 if val.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(obj)
-                push(prop)
-                push(val)
+                buf[sp] = obj; sp += 1
+                buf[sp] = prop; sp += 1
+                buf[sp] = val; sp += 1
                 pc += 1
 
             case .put_ref_value:
-                let val = pop()
-                let prop = pop()
-                let obj = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let prop = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let ok = ctx.setPropertyValue(obj: obj, prop: prop, val: val)
                 if !ok {
                     retVal = .exception
@@ -4455,7 +7298,7 @@ struct JeffJSInterpreter {
             case .define_func:
                 let atom = readU32(bc, pc + 1)
                 let defFlags = Int(readU8(bc, pc + 5))
-                let funcVal = pop()
+                let funcVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let ok = ctx.defineGlobalFunc(atom: atom, val: funcVal, flags: defFlags)
                 if !ok {
                     retVal = .exception
@@ -4471,15 +7314,19 @@ struct JeffJSInterpreter {
                 let atom = readU32(bc, pc + 1)
                 ctx.prevGetFieldAtom = ctx.lastGetFieldAtom
                 ctx.lastGetFieldAtom = atom
-                let obj = pop()
-                // Save receiver for the next `call` opcode — when transformMethodCalls
-                // fails to convert get_field+call to get_field2+call_method (e.g. due
-                // to ternary/short-circuit args), `call` uses this as `this`.
-                // Free any stale stash first: a get_field whose result is never
-                // called would otherwise leak one receiver ref per execution.
-                frame.lastGetFieldReceiver.freeValue()
-                frame.lastGetFieldReceiver = obj.dupValue()
-                frame.lastGetFieldPC = pc
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                // The popped receiver owns one reference (from the get_var/get_loc
+                // that pushed it). It is disposed of exactly once at each exit below:
+                //  • a plain call directly follows — `call`/`call0…3` read the receiver
+                //    as `this` when pc == lastGetFieldPC + 5 (the transformMethodCalls
+                //    fallback for method calls it couldn't fuse into call_method):
+                //    MOVE the ref into the stash; the call consumes it.
+                //  • otherwise (the common plain property read): FREE it.
+                // Previously every get_field unconditionally stashed (a receiver
+                // dup + free on EVERY read) and leaked the popped ref. Gating on an
+                // actually-following call removes that churn from hot read loops and
+                // balances the reference.
+                let nextIsCall = (pc + 5) < bcLen && isCallOpcodeByte(bc[pc + 5])
                 // Early check: property access on null/undefined with location info
                 if obj.isNullOrUndefined {
                     let propName = ctx.rt.atomToString(atom) ?? "?"
@@ -4506,15 +7353,28 @@ struct JeffJSInterpreter {
                     retVal = .exception; break dispatchLoop
                 }
                 // Inline cache fast path: shape-matched direct property read
-                if let jsObj = obj.obj, let shape = jsObj.shape {
-                    let ic = fb.ic
-                    if let ic = ic {
-                        let entry = ic.lookup(pc)
-                        if entry.pc == pc,
-                           entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(shape).toOpaque()),
-                           entry.propOffset >= 0, entry.propOffset < jsObj.prop.count {
-                            if case .value(let v) = jsObj.prop[entry.propOffset] {
-                                push(v.dupValue())
+                if let jsObj = obj.obj, jsObj.shapeIdentity != nil {
+                    if let ents = fb.icEntries {
+                        let entry = ents[pc & JeffJSInlineCache.mask]
+                        var icHit: JeffJSValue? = nil
+                        if entry.pc == pc, entry.shapePtr == jsObj.shapeIdentity {
+                            if entry.holderPtr != nil {
+                                icHit = jeffJS_icProtoHit(entry)     // prototype method/field
+                            } else if entry.propOffset >= 0, entry.propOffset < jsObj.propCount,
+                                      jsObj.extra(at: entry.propOffset) == nil {
+                                icHit = jsObj.dataValue(at: entry.propOffset)
+                            }
+                        }
+                        if let hv = icHit {
+                            do {
+                                buf[sp] = hv.dupValue(); sp += 1
+                                if nextIsCall {
+                                    frame.lastGetFieldReceiver.freeValue()
+                                    frame.lastGetFieldReceiver = obj   // move popped ref into stash
+                                    frame.lastGetFieldPC = pc
+                                } else {
+                                    obj.freeValue()
+                                }
                                 pc += 5
                                 continue dispatchLoop
                             }
@@ -4522,21 +7382,42 @@ struct JeffJSInterpreter {
                     }
                     // IC miss: full lookup + cache update
                     let val = ctx.getProperty(obj: obj, atom: atom)
-                    if val.isException { retVal = .exception; break dispatchLoop }
-                    push(val)
-                    if let propIdx = findShapeProperty(shape, atom) {
-                        fb.getIC().update(pc, shape: shape, propOffset: propIdx)
+                    if val.isException { obj.freeValue(); retVal = .exception; break dispatchLoop }
+                    buf[sp] = val; sp += 1
+                    if let shape = jsObj.shape {
+                        if let propIdx = findShapeProperty(shape, atom) {
+                            fb.getIC().update(pc, shape: shape, propOffset: propIdx)
+                        } else if let holder = jsObj.proto, let hs = holder.shape,
+                                  let hIdx = findShapeProperty(hs, atom),
+                                  hIdx < holder.propValues.count, holder.extra(at: hIdx) == nil {
+                            fb.getIC().updateProto(pc, receiverShape: shape, holder: holder,
+                                                   holderShape: hs, propOffset: hIdx)
+                        }
+                    }
+                    if nextIsCall {
+                        frame.lastGetFieldReceiver.freeValue()
+                        frame.lastGetFieldReceiver = obj   // move popped ref into stash
+                        frame.lastGetFieldPC = pc
+                    } else {
+                        obj.freeValue()
                     }
                 } else {
                     let val = ctx.getProperty(obj: obj, atom: atom)
-                    if val.isException { retVal = .exception; break dispatchLoop }
-                    push(val)
+                    if val.isException { obj.freeValue(); retVal = .exception; break dispatchLoop }
+                    buf[sp] = val; sp += 1
+                    if nextIsCall {
+                        frame.lastGetFieldReceiver.freeValue()
+                        frame.lastGetFieldReceiver = obj   // move popped ref into stash
+                        frame.lastGetFieldPC = pc
+                    } else {
+                        obj.freeValue()
+                    }
                 }
                 pc += 5
 
             case .get_field2:
                 let atom = readU32(bc, pc + 1)
-                let obj = peek()
+                let obj = buf[sp - 1]
                 // ── Array.prototype.push super-instruction ──────────────
                 // Fuses get_field2("push") + <arg> + call_method(1) into
                 // a single dispatch. Avoids prototype lookup, function
@@ -4551,6 +7432,7 @@ struct JeffJSInterpreter {
                         let nextByte = bc[nextPc]
                         var argVal: JeffJSValue? = nil
                         var argSize = 0
+                        var argOwned = false   // get_var yields an owned value; locals are peeked
                         // Helper: convert opcode enum to UInt8 for bytecode comparison
                         let _getLoc   = UInt8(truncatingIfNeeded: JeffJSOpcode.get_loc.rawValue)
                         let _getLoc8  = UInt8(truncatingIfNeeded: JeffJSOpcode.get_loc8.rawValue)
@@ -4591,6 +7473,7 @@ struct JeffJSInterpreter {
                             if !v.isException {
                                 argVal = v
                                 argSize = 5
+                                argOwned = true
                             }
                         } else if nextByte == _pushI32, nextPc + 4 < bcLen {
                             let val = Int32(bitPattern: readU32(bc, nextPc + 1))
@@ -4618,16 +7501,16 @@ struct JeffJSInterpreter {
                                readU16(bc, cmPc + 1) == 1 {
                                 // All conditions met — do the push inline.
                                 // prop[0] check for length property
-                                if jsObj.prop.count > 0,
+                                if jsObj.propCount > 0,
                                    let shape = jsObj.shape,
                                    shape.prop.count > 0,
                                    shape.prop[0].atom == JeffJSAtomID.JS_ATOM_length.rawValue {
-                                    let newCount = jsObj.asClass.fastArrayPush(arg)
+                                    let newCount = jsObj.asClass.fastArrayPush(argOwned ? arg : arg.dupValue())
                                     if newCount > 0 {
-                                        jsObj.asClass.prop[0] = .value(.newInt32(Int32(newCount)))
+                                        jsObj.asClass.setPropEntry(at: 0, .value(.newInt32(Int32(newCount))))
                                         // Pop the array (from peek) and push the new length
-                                        let _ = pop()
-                                        push(.newInt32(Int32(newCount)))
+                                        jeffJS_pop(buf, &sp, spBase, ctx, fb, pc).freeValue()   // the array ref
+                                        buf[sp] = .newInt32(Int32(newCount)); sp += 1
                                         pc = cmPc + 3  // skip past call_method(1)
                                         continue dispatchLoop
                                     }
@@ -4637,20 +7520,26 @@ struct JeffJSInterpreter {
                     }
                     // Fallback: just resolve push function quickly
                     let pushVal = JeffJSValue.makeObject(ctx.arrayProtoPushObj!)
-                    push(pushVal.dupValue())
+                    buf[sp] = pushVal.dupValue(); sp += 1
                     pc += 5
                     continue dispatchLoop
                 }
                 // Inline cache fast path
-                if let jsObj = obj.obj, let shape = jsObj.shape {
-                    let ic = fb.ic
-                    if let ic = ic {
-                        let entry = ic.lookup(pc)
-                        if entry.pc == pc,
-                           entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(shape).toOpaque()),
-                           entry.propOffset >= 0, entry.propOffset < jsObj.prop.count {
-                            if case .value(let v) = jsObj.prop[entry.propOffset] {
-                                push(v.dupValue())
+                if let jsObj = obj.obj, jsObj.shapeIdentity != nil {
+                    if let ents = fb.icEntries {
+                        let entry = ents[pc & JeffJSInlineCache.mask]
+                        var icHit: JeffJSValue? = nil
+                        if entry.pc == pc, entry.shapePtr == jsObj.shapeIdentity {
+                            if entry.holderPtr != nil {
+                                icHit = jeffJS_icProtoHit(entry)     // prototype method/field
+                            } else if entry.propOffset >= 0, entry.propOffset < jsObj.propCount,
+                                      jsObj.extra(at: entry.propOffset) == nil {
+                                icHit = jsObj.dataValue(at: entry.propOffset)
+                            }
+                        }
+                        if let hv = icHit {
+                            do {
+                                buf[sp] = hv.dupValue(); sp += 1
                                 pc += 5
                                 continue dispatchLoop
                             }
@@ -4659,35 +7548,39 @@ struct JeffJSInterpreter {
                     // IC miss: full lookup + cache update
                     let val = ctx.getProperty(obj: obj, atom: atom)
                     if val.isException { retVal = .exception; break dispatchLoop }
-                    push(val)
-                    if let propIdx = findShapeProperty(shape, atom) {
-                        fb.getIC().update(pc, shape: shape, propOffset: propIdx)
+                    buf[sp] = val; sp += 1
+                    if let shape = jsObj.shape {
+                        if let propIdx = findShapeProperty(shape, atom) {
+                            fb.getIC().update(pc, shape: shape, propOffset: propIdx)
+                        } else if let holder = jsObj.proto, let hs = holder.shape,
+                                  let hIdx = findShapeProperty(hs, atom),
+                                  hIdx < holder.propValues.count, holder.extra(at: hIdx) == nil {
+                            fb.getIC().updateProto(pc, receiverShape: shape, holder: holder,
+                                                   holderShape: hs, propOffset: hIdx)
+                        }
                     }
                 } else {
                     let val = ctx.getProperty(obj: obj, atom: atom)
                     if val.isException { retVal = .exception; break dispatchLoop }
-                    push(val)
+                    buf[sp] = val; sp += 1
                 }
                 pc += 5
 
             case .put_field:
                 let atom = readU32(bc, pc + 1)
-                let val = pop()
-                let obj = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 // Inline cache fast path: shape-matched direct property write
-                if let jsObj = obj.obj, let shape = jsObj.shape {
-                    let ic = fb.ic
-                    if let ic = ic {
-                        let entry = ic.lookup(pc)
+                if let jsObj = obj.obj, jsObj.shapeIdentity != nil {
+                    if let ents = fb.icEntries {
+                        let entry = ents[pc & JeffJSInlineCache.mask]
                         if entry.pc == pc,
-                           entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(shape).toOpaque()),
-                           entry.propOffset >= 0, entry.propOffset < jsObj.prop.count {
-                            // Must verify writable flag — defineProperty can change flags in-place
-                            // on the same shape, so shape identity alone isn't sufficient.
-                            if case .value = jsObj.prop[entry.propOffset],
-                               entry.propOffset < shape.prop.count,
-                               shape.prop[entry.propOffset].flags.contains(.writable) {
-                                jsObj.asClass.prop[entry.propOffset] = .value(val)
+                           entry.shapePtr == jsObj.shapeIdentity,
+                           entry.propOffset >= 0, entry.propOffset < jsObj.propCount {
+                            // `writable` is cached in the entry: flag changes now copy
+                            // the shape (prepareShapeUpdate), so identity covers it.
+                            if jeffJS_icWrite(jsObj._ptr, entry, val) {
+                                obj.freeValue()   // the popped receiver ref (QuickJS: JS_FreeValue(sp[-2]))
                                 pc += 5
                                 continue dispatchLoop
                             }
@@ -4697,34 +7590,39 @@ struct JeffJSInterpreter {
                     // non-writable/frozen targets fail silently per spec)
                     let ok = ctx.setPropertyChecked(obj: obj, atom: atom, value: val,
                                                     strict: fb.isStrictMode)
-                    if ok < 0 { retVal = .exception; break dispatchLoop }
-                    // Re-read shape after setProperty — it may have transitioned
+                    if ok < 0 { obj.freeValue(); retVal = .exception; break dispatchLoop }
+                    // Re-read shape after setProperty — it may have transitioned.
+                    // Never cache `arr.length = n`: the slot write would skip
+                    // the element truncation in setPropertyInternal.
                     if let curShape = jsObj.shape,
-                       let propIdx = findShapeProperty(curShape, atom) {
+                       let propIdx = findShapeProperty(curShape, atom),
+                       !(jsObj.classID == JeffJSClassID.array.rawValue && atom == JeffJSAtomID.JS_ATOM_length.rawValue) {
                         fb.getIC().update(pc, shape: curShape, propOffset: propIdx)
                     }
+                    obj.freeValue()   // the popped receiver ref (every `this.x = v` that adds a property lands here)
                 } else {
                     let ok = ctx.setPropertyChecked(obj: obj, atom: atom, value: val,
                                                     strict: fb.isStrictMode)
+                    obj.freeValue()
                     if ok < 0 { retVal = .exception; break dispatchLoop }
                 }
                 pc += 5
 
             case .get_private_field:
-                let field = pop()
-                let obj = pop()
+                let field = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let val = ctx.getPrivateField(obj: obj, field: field)
                 if val.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(val)
+                buf[sp] = val; sp += 1
                 pc += 1
 
             case .put_private_field:
-                let val = pop()
-                let field = pop()
-                let obj = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let field = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let ok = ctx.putPrivateField(obj: obj, field: field, val: val)
                 if !ok {
                     retVal = .exception
@@ -4733,9 +7631,9 @@ struct JeffJSInterpreter {
                 pc += 1
 
             case .define_private_field:
-                let val = pop()
-                let field = pop()
-                let obj = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let field = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 ctx.definePrivateField(obj: obj, field: field, val: val)
                 pc += 1
 
@@ -4744,8 +7642,8 @@ struct JeffJSInterpreter {
             // -----------------------------------------------------------------
 
             case .get_array_el:
-                let key = pop()
-                let obj = pop()
+                let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 // Dense-array int-index fast path: skip the atom round-trip
                 // (newAtomUInt32 + getPropertyInternal + freeAtom) per element.
                 if key.isInt, let jsObj = obj.obj,
@@ -4755,13 +7653,13 @@ struct JeffJSInterpreter {
                         let uidx = UInt32(idx)
                         if let storage = jsObj._fastArrayValues {
                             if uidx < storage.count, Int(uidx) < storage.values.count {
-                                push(storage.values[Int(uidx)].dupValue())
+                                buf[sp] = storage.values[Int(uidx)].dupValue(); sp += 1
                                 pc += 1
                                 continue dispatchLoop
                             }
                         } else if case .array(_, let vals, let count) = jsObj.payload {
                             if uidx < count, Int(uidx) < vals.count {
-                                push(vals[Int(uidx)].dupValue())
+                                buf[sp] = vals[Int(uidx)].dupValue(); sp += 1
                                 pc += 1
                                 continue dispatchLoop
                             }
@@ -4773,12 +7671,12 @@ struct JeffJSInterpreter {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(val)
+                buf[sp] = val; sp += 1
                 pc += 1
 
             case .get_array_el2:
-                let key = pop()
-                let obj = peek()
+                let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = buf[sp - 1]
                 if key.isInt, let jsObj = obj.obj,
                    jsObj.classID == JeffJSClassID.array.rawValue {
                     let idx = key.toInt32()
@@ -4786,13 +7684,13 @@ struct JeffJSInterpreter {
                         let uidx = UInt32(idx)
                         if let storage = jsObj._fastArrayValues {
                             if uidx < storage.count, Int(uidx) < storage.values.count {
-                                push(storage.values[Int(uidx)].dupValue())
+                                buf[sp] = storage.values[Int(uidx)].dupValue(); sp += 1
                                 pc += 1
                                 continue dispatchLoop
                             }
                         } else if case .array(_, let vals, let count) = jsObj.payload {
                             if uidx < count, Int(uidx) < vals.count {
-                                push(vals[Int(uidx)].dupValue())
+                                buf[sp] = vals[Int(uidx)].dupValue(); sp += 1
                                 pc += 1
                                 continue dispatchLoop
                             }
@@ -4804,13 +7702,13 @@ struct JeffJSInterpreter {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(val)
+                buf[sp] = val; sp += 1
                 pc += 1
 
             case .put_array_el:
-                let val = pop()
-                let key = pop()
-                let obj = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 // Dense-array in-bounds overwrite fast path. Growth, holes and
                 // length updates take the full setPropertyValue path.
                 if key.isInt, let jsObj = obj.obj,
@@ -4821,11 +7719,13 @@ struct JeffJSInterpreter {
                         let old = storage.values[Int(idx)]
                         storage.values[Int(idx)] = val
                         old.freeValue()
+                        obj.freeValue()   // the popped receiver ref
                         pc += 1
                         continue dispatchLoop
                     }
                 }
                 let ok = ctx.setPropertyValue(obj: obj, prop: key, val: val)
+                obj.freeValue()
                 if !ok {
                     retVal = .exception
                     break dispatchLoop
@@ -4837,22 +7737,22 @@ struct JeffJSInterpreter {
             // -----------------------------------------------------------------
 
             case .get_super_value:
-                let key = pop()
-                let obj = pop()
-                let thisObj = pop()
+                let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let thisObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let val = ctx.getSuperProperty(thisObj: thisObj, obj: obj, key: key)
                 if val.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(val)
+                buf[sp] = val; sp += 1
                 pc += 1
 
             case .put_super_value:
-                let val = pop()
-                let key = pop()
-                let obj = pop()
-                let thisObj = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let thisObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let ok = ctx.putSuperProperty(thisObj: thisObj, obj: obj, key: key, val: val)
                 if !ok {
                     retVal = .exception
@@ -4866,30 +7766,52 @@ struct JeffJSInterpreter {
 
             case .define_field:
                 let atom = readU32(bc, pc + 1)
-                let val = pop()
-                let obj = peek()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = buf[sp - 1]
+                // Transition IC: an object on the same starting shape at this
+                // pc moves straight to the cached successor shape and appends
+                // its value slot, skipping the own-property lookup, the
+                // transition-table search and defineProperty. This is the
+                // object-literal fast path (`{a: .., b: ..}`).
+                if let jsObj = obj.obj, let ents = fb.icEntries {
+                    let entry = ents[pc & JeffJSInlineCache.mask]
+                    if entry.pc == pc, jeffJS_icDefine(jsObj._ptr, entry, val, rt) {
+                        pc += 5
+                        continue dispatchLoop
+                    }
+                }
+                let beforeShape = obj.obj?.shape
+                let beforeCount = obj.obj?.propCount ?? -1
                 let ok = ctx.defineField(obj: obj, atom: atom, val: val)
                 if !ok {
                     retVal = .exception
                     break dispatchLoop
                 }
+                // Record the transition this define_field just performed.
+                if let jsObj = obj.obj, let before = beforeShape, before.isHashed,
+                   let after = jsObj.shape, after.isHashed, after !== before,
+                   jsObj.propCount == beforeCount + 1, after.propCount == beforeCount + 1,
+                   after.prop[after.propCount - 1].atom == atom,
+                   jsObj.extra(at: after.propCount - 1) == nil {
+                    fb.getIC().updateTransition(pc, from: before, to: after)
+                }
                 pc += 5
 
             case .set_name:
                 let atom = readU32(bc, pc + 1)
-                let val = peek()
+                let val = buf[sp - 1]
                 ctx.setFunctionName(val, atom: atom)
                 pc += 5
 
             case .set_name_computed:
-                let key = pop()
-                let val = peek()
+                let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let val = buf[sp - 1]
                 ctx.setFunctionNameComputed(val, key: key)
                 pc += 1
 
             case .set_proto:
-                let proto = pop()
-                let obj = peek()
+                let proto = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = buf[sp - 1]
                 let ok = ctx.setPrototypeOf(obj: obj, proto: proto)
                 if !ok {
                     retVal = .exception
@@ -4898,30 +7820,31 @@ struct JeffJSInterpreter {
                 pc += 1
 
             case .set_home_object:
-                let homeObj = peekAt(0)
-                let funcVal = peekAt(1)
+                let homeObj = buf[sp - 1]
+                let funcVal = buf[sp - 2]
                 ctx.setHomeObject(funcVal: funcVal, homeObj: homeObj)
                 pc += 1
 
             case .define_array_el:
-                let val = pop()
-                let idx = pop()
-                let obj = peek()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let idx = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = buf[sp - 1]
                 let nextIdx = ctx.defineArrayElement(obj: obj, idx: idx, val: val)
-                push(nextIdx)
+                buf[sp] = nextIdx; sp += 1
                 pc += 1
 
             case .append:
-                let val = pop()
-                let obj = peekAt(0)
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = buf[sp - 1]
                 ctx.appendToArray(obj: obj, val: val)
                 pc += 1
 
             case .copy_data_properties:
                 let mask = Int(readU8(bc, pc + 1))
-                let excludeList = (mask > 0) ? pop() : .undefined
-                let source = pop()
-                let target = peek()
+                let excludeList: JeffJSValue
+                if mask > 0 { excludeList = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) } else { excludeList = .undefined }
+                let source = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let target = buf[sp - 1]
                 let ok = ctx.copyDataProperties(target: target, source: source,
                                                  excludeList: excludeList)
                 if !ok {
@@ -4933,8 +7856,8 @@ struct JeffJSInterpreter {
             case .define_method:
                 let atom = readU32(bc, pc + 1)
                 let methodFlags = Int(readU8(bc, pc + 5))
-                let funcVal = pop()
-                let obj = peek()
+                let funcVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = buf[sp - 1]
                 let ok = ctx.defineMethod(obj: obj, atom: atom, funcVal: funcVal,
                                            flags: methodFlags)
                 if !ok {
@@ -4945,9 +7868,9 @@ struct JeffJSInterpreter {
 
             case .define_method_computed:
                 let methodFlags = Int(readU8(bc, pc + 1))
-                let funcVal = pop()
-                let key = pop()
-                let obj = peek()
+                let funcVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = buf[sp - 1]
                 let ok = ctx.defineMethodComputed(obj: obj, key: key, funcVal: funcVal,
                                                    flags: methodFlags)
                 if !ok {
@@ -4959,25 +7882,25 @@ struct JeffJSInterpreter {
             case .define_class:
                 let atom = readU32(bc, pc + 1)
                 let classFlags = Int(readU8(bc, pc + 5))
-                let heritage = pop()
-                let ctorFunc = pop()
+                let heritage = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let ctorFunc = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let (ctor, proto) = ctx.defineClass(atom: atom, flags: classFlags,
                                                       heritage: heritage, ctorFunc: ctorFunc)
                 if ctor.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(ctor)
-                push(proto)
+                buf[sp] = ctor; sp += 1
+                buf[sp] = proto; sp += 1
                 pc += 6
 
             case .define_class_computed:
                 // QuickJS: ctor heritage key -> ctor proto key
                 // nPop=3, nPush=3: the computed key is preserved on top.
                 let classFlags = Int(readU8(bc, pc + 1))
-                let key = pop()
-                let heritage = pop()
-                let ctorFunc = pop()
+                let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let heritage = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let ctorFunc = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let (ctor, proto) = ctx.defineClassComputed(key: key, flags: classFlags,
                                                              heritage: heritage,
                                                              ctorFunc: ctorFunc)
@@ -4985,9 +7908,9 @@ struct JeffJSInterpreter {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(ctor)
-                push(proto)
-                push(key)
+                buf[sp] = ctor; sp += 1
+                buf[sp] = proto; sp += 1
+                buf[sp] = key; sp += 1
                 pc += 2
 
             // -----------------------------------------------------------------
@@ -4996,7 +7919,7 @@ struct JeffJSInterpreter {
 
             case .get_loc:
                 let idx = Int(readU16(bc, pc + 1))
-                push(buf[varBase + idx].dupValue())
+                buf[sp] = buf[varBase + idx].dupValue(); sp += 1
                 pc += 3
 
             case .put_loc:
@@ -5004,9 +7927,9 @@ struct JeffJSInterpreter {
                 let oldPutLoc = buf[varBase + idx]
                 // Chained assignment: if next opcode is also a store, keep value on stack
                 if isStoreOpcode(bc, pc + 3, bcLen) {
-                    buf[varBase + idx] = peek().dupValue()
+                    buf[varBase + idx] = buf[sp - 1].dupValue()
                 } else {
-                    buf[varBase + idx] = pop()
+                    buf[varBase + idx] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 }
                 oldPutLoc.freeValue()
                 pc += 3
@@ -5014,23 +7937,23 @@ struct JeffJSInterpreter {
             case .set_loc:
                 let idx = Int(readU16(bc, pc + 1))
                 let oldSetLoc = buf[varBase + idx]
-                buf[varBase + idx] = peek().dupValue()
+                buf[varBase + idx] = buf[sp - 1].dupValue()
                 oldSetLoc.freeValue()
                 pc += 3
 
             // Short local access
             case .get_loc8:
                 let idx = Int(readU8(bc, pc + 1))
-                push(buf[varBase + idx].dupValue())
+                buf[sp] = buf[varBase + idx].dupValue(); sp += 1
                 pc += 2
 
             case .put_loc8:
                 let idx = Int(readU8(bc, pc + 1))
                 let oldPutLoc8 = buf[varBase + idx]
                 if isStoreOpcode(bc, pc + 2, bcLen) {
-                    buf[varBase + idx] = peek().dupValue()
+                    buf[varBase + idx] = buf[sp - 1].dupValue()
                 } else {
-                    buf[varBase + idx] = pop()
+                    buf[varBase + idx] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 }
                 oldPutLoc8.freeValue()
                 pc += 2
@@ -5038,32 +7961,32 @@ struct JeffJSInterpreter {
             case .set_loc8:
                 let idx = Int(readU8(bc, pc + 1))
                 let oldSetLoc8 = buf[varBase + idx]
-                buf[varBase + idx] = peek().dupValue()
+                buf[varBase + idx] = buf[sp - 1].dupValue()
                 oldSetLoc8.freeValue()
                 pc += 2
 
-            case .get_loc0: push(buf[varBase].dupValue()); pc += 1
-            case .get_loc1: push(buf[varBase + 1].dupValue()); pc += 1
-            case .get_loc2: push(buf[varBase + 2].dupValue()); pc += 1
-            case .get_loc3: push(buf[varBase + 3].dupValue()); pc += 1
+            case .get_loc0: buf[sp] = buf[varBase].dupValue(); sp += 1; pc += 1
+            case .get_loc1: buf[sp] = buf[varBase + 1].dupValue(); sp += 1; pc += 1
+            case .get_loc2: buf[sp] = buf[varBase + 2].dupValue(); sp += 1; pc += 1
+            case .get_loc3: buf[sp] = buf[varBase + 3].dupValue(); sp += 1; pc += 1
 
             case .put_loc0:
-                do { let old = buf[varBase]; if isStoreOpcode(bc, pc + 1, bcLen) { buf[varBase] = peek().dupValue() } else { buf[varBase] = pop() }; old.freeValue() }
+                do { let old = buf[varBase]; if isStoreOpcode(bc, pc + 1, bcLen) { buf[varBase] = buf[sp - 1].dupValue() } else { buf[varBase] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; old.freeValue() }
                 pc += 1
             case .put_loc1:
-                do { let old = buf[varBase + 1]; if isStoreOpcode(bc, pc + 1, bcLen) { buf[varBase + 1] = peek().dupValue() } else { buf[varBase + 1] = pop() }; old.freeValue() }
+                do { let old = buf[varBase + 1]; if isStoreOpcode(bc, pc + 1, bcLen) { buf[varBase + 1] = buf[sp - 1].dupValue() } else { buf[varBase + 1] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; old.freeValue() }
                 pc += 1
             case .put_loc2:
-                do { let old = buf[varBase + 2]; if isStoreOpcode(bc, pc + 1, bcLen) { buf[varBase + 2] = peek().dupValue() } else { buf[varBase + 2] = pop() }; old.freeValue() }
+                do { let old = buf[varBase + 2]; if isStoreOpcode(bc, pc + 1, bcLen) { buf[varBase + 2] = buf[sp - 1].dupValue() } else { buf[varBase + 2] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; old.freeValue() }
                 pc += 1
             case .put_loc3:
-                do { let old = buf[varBase + 3]; if isStoreOpcode(bc, pc + 1, bcLen) { buf[varBase + 3] = peek().dupValue() } else { buf[varBase + 3] = pop() }; old.freeValue() }
+                do { let old = buf[varBase + 3]; if isStoreOpcode(bc, pc + 1, bcLen) { buf[varBase + 3] = buf[sp - 1].dupValue() } else { buf[varBase + 3] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; old.freeValue() }
                 pc += 1
 
-            case .set_loc0: do { let old = buf[varBase]; buf[varBase] = peek().dupValue(); old.freeValue() }; pc += 1
-            case .set_loc1: do { let old = buf[varBase + 1]; buf[varBase + 1] = peek().dupValue(); old.freeValue() }; pc += 1
-            case .set_loc2: do { let old = buf[varBase + 2]; buf[varBase + 2] = peek().dupValue(); old.freeValue() }; pc += 1
-            case .set_loc3: do { let old = buf[varBase + 3]; buf[varBase + 3] = peek().dupValue(); old.freeValue() }; pc += 1
+            case .set_loc0: do { let old = buf[varBase]; buf[varBase] = buf[sp - 1].dupValue(); old.freeValue() }; pc += 1
+            case .set_loc1: do { let old = buf[varBase + 1]; buf[varBase + 1] = buf[sp - 1].dupValue(); old.freeValue() }; pc += 1
+            case .set_loc2: do { let old = buf[varBase + 2]; buf[varBase + 2] = buf[sp - 1].dupValue(); old.freeValue() }; pc += 1
+            case .set_loc3: do { let old = buf[varBase + 3]; buf[varBase + 3] = buf[sp - 1].dupValue(); old.freeValue() }; pc += 1
 
             // -----------------------------------------------------------------
             // Argument Access
@@ -5072,19 +7995,19 @@ struct JeffJSInterpreter {
             case .get_arg:
                 let idx = Int(readU16(bc, pc + 1))
                 if idx < varBase {
-                    push(buf[idx].dupValue())
+                    buf[sp] = buf[idx].dupValue(); sp += 1
                 } else {
-                    push(.undefined)
+                    buf[sp] = .undefined; sp += 1
                 }
                 pc += 3
 
             case .put_arg:
                 let idx = Int(readU16(bc, pc + 1))
                 if isStoreOpcode(bc, pc + 3, bcLen) {
-                    let val = peek().dupValue()
+                    let val = buf[sp - 1].dupValue()
                     if idx < varBase { buf[idx] = val }
                 } else {
-                    let val = pop()
+                    let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                     if idx < varBase { buf[idx] = val }
                 }
                 pc += 3
@@ -5092,48 +8015,48 @@ struct JeffJSInterpreter {
             case .set_arg:
                 let idx = Int(readU16(bc, pc + 1))
                 if idx < varBase {
-                    buf[idx] = peek().dupValue()
+                    buf[idx] = buf[sp - 1].dupValue()
                 }
                 pc += 3
 
-            case .get_arg0: push(varBase > 0 ? buf[0].dupValue() : .undefined); pc += 1
-            case .get_arg1: push(varBase > 1 ? buf[1].dupValue() : .undefined); pc += 1
-            case .get_arg2: push(varBase > 2 ? buf[2].dupValue() : .undefined); pc += 1
-            case .get_arg3: push(varBase > 3 ? buf[3].dupValue() : .undefined); pc += 1
+            case .get_arg0: buf[sp] = varBase > 0 ? buf[0].dupValue() : .undefined; sp += 1; pc += 1
+            case .get_arg1: buf[sp] = varBase > 1 ? buf[1].dupValue() : .undefined; sp += 1; pc += 1
+            case .get_arg2: buf[sp] = varBase > 2 ? buf[2].dupValue() : .undefined; sp += 1; pc += 1
+            case .get_arg3: buf[sp] = varBase > 3 ? buf[3].dupValue() : .undefined; sp += 1; pc += 1
 
             case .put_arg0:
                 if isStoreOpcode(bc, pc + 1, bcLen) {
-                    if varBase > 0 { buf[0] = peek().dupValue() }
+                    if varBase > 0 { buf[0] = buf[sp - 1].dupValue() }
                 } else {
-                    if varBase > 0 { buf[0] = pop() } else { let _ = pop() }
+                    if varBase > 0 { buf[0] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
                 }
                 pc += 1
             case .put_arg1:
                 if isStoreOpcode(bc, pc + 1, bcLen) {
-                    if varBase > 1 { buf[1] = peek().dupValue() }
+                    if varBase > 1 { buf[1] = buf[sp - 1].dupValue() }
                 } else {
-                    if varBase > 1 { buf[1] = pop() } else { let _ = pop() }
+                    if varBase > 1 { buf[1] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
                 }
                 pc += 1
             case .put_arg2:
                 if isStoreOpcode(bc, pc + 1, bcLen) {
-                    if varBase > 2 { buf[2] = peek().dupValue() }
+                    if varBase > 2 { buf[2] = buf[sp - 1].dupValue() }
                 } else {
-                    if varBase > 2 { buf[2] = pop() } else { let _ = pop() }
+                    if varBase > 2 { buf[2] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
                 }
                 pc += 1
             case .put_arg3:
                 if isStoreOpcode(bc, pc + 1, bcLen) {
-                    if varBase > 3 { buf[3] = peek().dupValue() }
+                    if varBase > 3 { buf[3] = buf[sp - 1].dupValue() }
                 } else {
-                    if varBase > 3 { buf[3] = pop() } else { let _ = pop() }
+                    if varBase > 3 { buf[3] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
                 }
                 pc += 1
 
-            case .set_arg0: if varBase > 0 { buf[0] = peek().dupValue() }; pc += 1
-            case .set_arg1: if varBase > 1 { buf[1] = peek().dupValue() }; pc += 1
-            case .set_arg2: if varBase > 2 { buf[2] = peek().dupValue() }; pc += 1
-            case .set_arg3: if varBase > 3 { buf[3] = peek().dupValue() }; pc += 1
+            case .set_arg0: if varBase > 0 { buf[0] = buf[sp - 1].dupValue() }; pc += 1
+            case .set_arg1: if varBase > 1 { buf[1] = buf[sp - 1].dupValue() }; pc += 1
+            case .set_arg2: if varBase > 2 { buf[2] = buf[sp - 1].dupValue() }; pc += 1
+            case .set_arg3: if varBase > 3 { buf[3] = buf[sp - 1].dupValue() }; pc += 1
 
             // -----------------------------------------------------------------
             // Closure Variable Access
@@ -5146,24 +8069,24 @@ struct JeffJSInterpreter {
                     if traceOps {
                         print("[VAR_REF] get idx=\(idx) isDetached=\(vr.isDetached) isArg=\(vr.isArg) varIdx=\(vr.varIdx) val.bits=0x\(String(val.bits, radix: 16)) frame=\(vr.parentFrame != nil)")
                     }
-                    push(val)
+                    buf[sp] = val; sp += 1
                 } else {
                     if traceOps {
                         print("[VAR_REF] get idx=\(idx) OUT OF RANGE (count=\(varRefs.count))")
                     }
-                    push(.undefined)
+                    buf[sp] = .undefined; sp += 1
                 }
                 pc += 3
 
             case .put_var_ref:
                 let idx = Int(readU16(bc, pc + 1))
                 if isStoreOpcode(bc, pc + 3, bcLen) {
-                    let val = peek().dupValue()
+                    let val = buf[sp - 1].dupValue()
                     if idx < varRefs.count, let vr = varRefs[idx] {
                         if vr.isDetached { vr.value = val } else { vr.pvalue = val }
                     }
                 } else {
-                    let val = pop()
+                    let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                     if idx < varRefs.count, let vr = varRefs[idx] {
                         if vr.isDetached { vr.value = val } else { vr.pvalue = val }
                     }
@@ -5173,7 +8096,7 @@ struct JeffJSInterpreter {
             case .set_var_ref:
                 let idx = Int(readU16(bc, pc + 1))
                 if idx < varRefs.count, let vr = varRefs[idx] {
-                    let val = peek().dupValue()
+                    let val = buf[sp - 1].dupValue()
                     if vr.isDetached { vr.value = val } else { vr.pvalue = val }
                 }
                 pc += 3
@@ -5184,33 +8107,37 @@ struct JeffJSInterpreter {
                     if traceOps {
                         print("[VAR_REF0] isDetached=\(vr.isDetached) isArg=\(vr.isArg) varIdx=\(vr.varIdx) val.bits=0x\(String(val.bits, radix: 16))/\(val.toInt32()) frame=\(vr.parentFrame != nil)")
                     }
-                    push(val)
+                    buf[sp] = val; sp += 1
                 } else {
                     if traceOps { print("[VAR_REF0] empty varRefs") }
-                    push(.undefined)
+                    buf[sp] = .undefined; sp += 1
                 }
                 pc += 1
-            case .get_var_ref1: if varRefs.count > 1, let vr = varRefs[1] { push(vr.isDetached ? vr.value.dupValue() : vr.pvalue.dupValue()) } else { push(.undefined) }; pc += 1
-            case .get_var_ref2: if varRefs.count > 2, let vr = varRefs[2] { push(vr.isDetached ? vr.value.dupValue() : vr.pvalue.dupValue()) } else { push(.undefined) }; pc += 1
-            case .get_var_ref3: if varRefs.count > 3, let vr = varRefs[3] { push(vr.isDetached ? vr.value.dupValue() : vr.pvalue.dupValue()) } else { push(.undefined) }; pc += 1
+            case .get_var_ref1: if varRefs.count > 1, let vr = varRefs[1] { buf[sp] = vr.isDetached ? vr.value.dupValue() : vr.pvalue.dupValue(); sp += 1 } else { buf[sp] = .undefined; sp += 1 }; pc += 1
+            case .get_var_ref2: if varRefs.count > 2, let vr = varRefs[2] { buf[sp] = vr.isDetached ? vr.value.dupValue() : vr.pvalue.dupValue(); sp += 1 } else { buf[sp] = .undefined; sp += 1 }; pc += 1
+            case .get_var_ref3: if varRefs.count > 3, let vr = varRefs[3] { buf[sp] = vr.isDetached ? vr.value.dupValue() : vr.pvalue.dupValue(); sp += 1 } else { buf[sp] = .undefined; sp += 1 }; pc += 1
 
-            case .put_var_ref0: if varRefs.count > 0, let vr = varRefs[0] { let v = pop(); if vr.isDetached { vr.value = v } else { vr.pvalue = v } } else { let _ = pop() }; pc += 1
-            case .put_var_ref1: if varRefs.count > 1, let vr = varRefs[1] { let v = pop(); if vr.isDetached { vr.value = v } else { vr.pvalue = v } } else { let _ = pop() }; pc += 1
-            case .put_var_ref2: if varRefs.count > 2, let vr = varRefs[2] { let v = pop(); if vr.isDetached { vr.value = v } else { vr.pvalue = v } } else { let _ = pop() }; pc += 1
-            case .put_var_ref3: if varRefs.count > 3, let vr = varRefs[3] { let v = pop(); if vr.isDetached { vr.value = v } else { vr.pvalue = v } } else { let _ = pop() }; pc += 1
+            case .put_var_ref0: if varRefs.count > 0, let vr = varRefs[0] { let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); if vr.isDetached { vr.value = v } else { vr.pvalue = v } } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
+            case .put_var_ref1: if varRefs.count > 1, let vr = varRefs[1] { let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); if vr.isDetached { vr.value = v } else { vr.pvalue = v } } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
+            case .put_var_ref2: if varRefs.count > 2, let vr = varRefs[2] { let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); if vr.isDetached { vr.value = v } else { vr.pvalue = v } } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
+            case .put_var_ref3: if varRefs.count > 3, let vr = varRefs[3] { let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); if vr.isDetached { vr.value = v } else { vr.pvalue = v } } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
 
-            case .set_var_ref0: if varRefs.count > 0, let vr = varRefs[0] { let v = peek().dupValue(); if vr.isDetached { vr.value = v } else { vr.pvalue = v } }; pc += 1
-            case .set_var_ref1: if varRefs.count > 1, let vr = varRefs[1] { let v = peek().dupValue(); if vr.isDetached { vr.value = v } else { vr.pvalue = v } }; pc += 1
-            case .set_var_ref2: if varRefs.count > 2, let vr = varRefs[2] { let v = peek().dupValue(); if vr.isDetached { vr.value = v } else { vr.pvalue = v } }; pc += 1
-            case .set_var_ref3: if varRefs.count > 3, let vr = varRefs[3] { let v = peek().dupValue(); if vr.isDetached { vr.value = v } else { vr.pvalue = v } }; pc += 1
+            case .set_var_ref0: if varRefs.count > 0, let vr = varRefs[0] { let v = buf[sp - 1].dupValue(); if vr.isDetached { vr.value = v } else { vr.pvalue = v } }; pc += 1
+            case .set_var_ref1: if varRefs.count > 1, let vr = varRefs[1] { let v = buf[sp - 1].dupValue(); if vr.isDetached { vr.value = v } else { vr.pvalue = v } }; pc += 1
+            case .set_var_ref2: if varRefs.count > 2, let vr = varRefs[2] { let v = buf[sp - 1].dupValue(); if vr.isDetached { vr.value = v } else { vr.pvalue = v } }; pc += 1
+            case .set_var_ref3: if varRefs.count > 3, let vr = varRefs[3] { let v = buf[sp - 1].dupValue(); if vr.isDetached { vr.value = v } else { vr.pvalue = v } }; pc += 1
 
             // -----------------------------------------------------------------
             // TDZ (Temporal Dead Zone) Operations
             // -----------------------------------------------------------------
 
             case .set_loc_uninitialized:
+                // Block re-entry (loop bodies): the previous iteration's
+                // binding is released here, like QuickJS's set_value.
                 let idx = Int(readU16(bc, pc + 1))
+                let oldTDZ = buf[varBase + idx]
                 buf[varBase + idx] = .uninitialized
+                oldTDZ.freeValue()
                 pc += 3
 
             case .get_loc_check:
@@ -5221,7 +8148,7 @@ struct JeffJSInterpreter {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(val.dupValue())
+                buf[sp] = val.dupValue(); sp += 1
                 pc += 3
 
             case .put_loc_check:
@@ -5232,22 +8159,16 @@ struct JeffJSInterpreter {
                     retVal = .exception
                     break dispatchLoop
                 }
-                if let compiled = fb0 as? JeffJSFunctionBytecodeCompiled,
-                   idx < compiled.vardefs.count,
-                   compiled.vardefs[idx].isConst {
-                    _ = pop()
-                    _ = ctx.throwTypeError(message: "Assignment to constant variable.")
-                    retVal = .exception
-                    break dispatchLoop
-                }
-                buf[varBase + idx] = pop()
+                // Const assignment is resolved to throw_error at compile time
+                // (resolvedLocalAccess), so no per-store const lookup here.
+                buf[varBase + idx] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 current.freeValue()
                 pc += 3
 
             case .put_loc_check_init:
                 let idx = Int(readU16(bc, pc + 1))
                 let oldCheckInit = buf[varBase + idx]
-                buf[varBase + idx] = pop()
+                buf[varBase + idx] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 oldCheckInit.freeValue()
                 pc += 3
 
@@ -5259,7 +8180,7 @@ struct JeffJSInterpreter {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(val.dupValue())
+                buf[sp] = val.dupValue(); sp += 1
                 pc += 3
 
             case .get_var_ref_check:
@@ -5271,26 +8192,19 @@ struct JeffJSInterpreter {
                         retVal = .exception
                         break dispatchLoop
                     }
-                    push(val.dupValue())
+                    buf[sp] = val.dupValue(); sp += 1
                 } else {
-                    push(.undefined)
+                    buf[sp] = .undefined; sp += 1
                 }
                 pc += 3
 
             case .put_var_ref_check:
                 let idx = Int(readU16(bc, pc + 1))
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if idx < varRefs.count, let vr = varRefs[idx] {
                     let current = vr.isDetached ? vr.value : vr.pvalue
                     if current.isUninitialized {
                         _ = ctx.throwReferenceError(message: "Cannot access variable before initialization")
-                        retVal = .exception
-                        break dispatchLoop
-                    }
-                    if let compiled = fb0 as? JeffJSFunctionBytecodeCompiled,
-                       idx < compiled.closureVars.count,
-                       compiled.closureVars[idx].isConst {
-                        _ = ctx.throwTypeError(message: "Assignment to constant variable.")
                         retVal = .exception
                         break dispatchLoop
                     }
@@ -5300,7 +8214,7 @@ struct JeffJSInterpreter {
 
             case .put_var_ref_check_init:
                 let idx = Int(readU16(bc, pc + 1))
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if idx < varRefs.count, let vr = varRefs[idx] {
                     if vr.isDetached { vr.value = val } else { vr.pvalue = val }
                 }
@@ -5312,8 +8226,7 @@ struct JeffJSInterpreter {
 
             case .close_loc:
                 let idx = Int(readU16(bc, pc + 1))
-                // Sync buf → frame so closeLexicalVar sees current var values
-                syncBufToFrame()
+                // closeLexicalVar reads the live slot from frame.buf directly.
                 ctx.closeLexicalVar(frame: frame, idx: idx)
                 pc += 3
 
@@ -5322,9 +8235,9 @@ struct JeffJSInterpreter {
             // -----------------------------------------------------------------
 
             case .if_false:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let offset = readI32(bc, pc + 1)
-                let condResult = !JeffJSTypeConvert.toBool(val)
+                let condResult = !jeffJS_fastToBool(val)
                 val.freeValue()
                 if condResult {
                     pc += 5 + Int(offset)
@@ -5334,15 +8247,61 @@ struct JeffJSInterpreter {
                             ctx.interruptCounter = JS_INTERRUPT_COUNTER_INIT
                             if ctx.checkInterrupt() { retVal = .exception; break dispatchLoop }
                         }
+                    // Trace block dispatch for hot loops
+                    if let traceInfo = fb.traceBlocks?[pc] {
+                        if traceInfo.isActive {
+                            if !traceInfo.hasCalls {
+                                let resumePC = executeFastTraceLean(
+                                    bc: bc, bcLen: bcLen,
+                                    entryPC: traceInfo.entryPC, exitPC: traceInfo.exitPC,
+                                    startPC: traceInfo.startPC,
+                                    buf: buf, varBase: varBase, sp: &sp, ctx: ctx,
+                                    cpool: fb.cpool, stackLimit: bufCapacity, icEntries: fb.icEntries)
+                                if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                                pc = resumePC
+                                continue dispatchLoop
+                            }
+                                let fbIdBefore = ObjectIdentifier(fb)
+                                var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
+                                let resumePC = executeFastTrace(state: &hot, startPC: traceInfo.startPC, ctx: ctx, rt: rt, inlineBase: inlineBase)
+                                sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
+                                bc = hot.bc; bcLen = hot.bcLen; fb = hot.fb; frame = hot.frame
+                                mFuncObj = hot.funcObj; mFlags = hot.flags; bufOwned = hot.bufOwned
+                                if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
+                                if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                                if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
+                                    FileHandle.standardError.write("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun)\n".data(using: .utf8)!)
+                                }
+                                // A block that keeps deopting (unsupported op in the
+                                // body or in a callee) costs a state handoff per
+                                // iteration: switch it off after 200 in a row.
+                                // Only runs that made little progress count: a trace
+                                // that executes most of the body before deopting is
+                                // still a net win over the main loop.
+                                if hot.opsRun < 16,
+                                   ObjectIdentifier(fb) != fbIdBefore
+                                    || (resumePC >= traceInfo.entryPC && resumePC < traceInfo.exitPC) {
+                                    traceInfo.deoptCount &+= 1
+                                    if traceInfo.deoptCount >= 200 { traceInfo.isActive = false; traceInfo.disabled = true }
+                                } else {
+                                    traceInfo.deoptCount = 0
+                                }
+                            pc = resumePC
+                            continue dispatchLoop
+                        } else {
+                            traceInfo.hitCount &+= 1
+                            if traceInfo.hitCount >= traceHitThreshold, !traceInfo.disabled { traceInfo.isActive = true }
+                        }
+                    }
                     }
                 } else {
                     pc += 5
                 }
 
             case .if_true:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let offset = readI32(bc, pc + 1)
-                let condResult2 = JeffJSTypeConvert.toBool(val)
+                let condResult2 = jeffJS_fastToBool(val)
                 val.freeValue()
                 if condResult2 {
                     pc += 5 + Int(offset)
@@ -5352,6 +8311,52 @@ struct JeffJSInterpreter {
                             ctx.interruptCounter = JS_INTERRUPT_COUNTER_INIT
                             if ctx.checkInterrupt() { retVal = .exception; break dispatchLoop }
                         }
+                    // Trace block dispatch for hot loops
+                    if let traceInfo = fb.traceBlocks?[pc] {
+                        if traceInfo.isActive {
+                            if !traceInfo.hasCalls {
+                                let resumePC = executeFastTraceLean(
+                                    bc: bc, bcLen: bcLen,
+                                    entryPC: traceInfo.entryPC, exitPC: traceInfo.exitPC,
+                                    startPC: traceInfo.startPC,
+                                    buf: buf, varBase: varBase, sp: &sp, ctx: ctx,
+                                    cpool: fb.cpool, stackLimit: bufCapacity, icEntries: fb.icEntries)
+                                if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                                pc = resumePC
+                                continue dispatchLoop
+                            }
+                                let fbIdBefore = ObjectIdentifier(fb)
+                                var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
+                                let resumePC = executeFastTrace(state: &hot, startPC: traceInfo.startPC, ctx: ctx, rt: rt, inlineBase: inlineBase)
+                                sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
+                                bc = hot.bc; bcLen = hot.bcLen; fb = hot.fb; frame = hot.frame
+                                mFuncObj = hot.funcObj; mFlags = hot.flags; bufOwned = hot.bufOwned
+                                if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
+                                if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                                if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
+                                    FileHandle.standardError.write("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun)\n".data(using: .utf8)!)
+                                }
+                                // A block that keeps deopting (unsupported op in the
+                                // body or in a callee) costs a state handoff per
+                                // iteration: switch it off after 200 in a row.
+                                // Only runs that made little progress count: a trace
+                                // that executes most of the body before deopting is
+                                // still a net win over the main loop.
+                                if hot.opsRun < 16,
+                                   ObjectIdentifier(fb) != fbIdBefore
+                                    || (resumePC >= traceInfo.entryPC && resumePC < traceInfo.exitPC) {
+                                    traceInfo.deoptCount &+= 1
+                                    if traceInfo.deoptCount >= 200 { traceInfo.isActive = false; traceInfo.disabled = true }
+                                } else {
+                                    traceInfo.deoptCount = 0
+                                }
+                            pc = resumePC
+                            continue dispatchLoop
+                        } else {
+                            traceInfo.hitCount &+= 1
+                            if traceInfo.hitCount >= traceHitThreshold, !traceInfo.disabled { traceInfo.isActive = true }
+                        }
+                    }
                     }
                 } else {
                     pc += 5
@@ -5369,29 +8374,56 @@ struct JeffJSInterpreter {
                     // Trace block dispatch for hot loops
                     if let traceInfo = fb.traceBlocks?[gotoTarget] {
                         if traceInfo.isActive {
-                            let resumePC = executeFastTrace(
-                                bc: bc, bcLen: bcLen,
-                                entryPC: traceInfo.entryPC, exitPC: traceInfo.exitPC,
-                                buf: buf, varBase: varBase, sp: &sp, ctx: ctx,
-                                cpool: fb.cpool,
-                                stackLimit: bufCapacity,
-                                ic: fb.ic
-                            )
-                            if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                            if !traceInfo.hasCalls {
+                                let resumePC = executeFastTraceLean(
+                                    bc: bc, bcLen: bcLen,
+                                    entryPC: traceInfo.entryPC, exitPC: traceInfo.exitPC,
+                                    startPC: traceInfo.startPC,
+                                    buf: buf, varBase: varBase, sp: &sp, ctx: ctx,
+                                    cpool: fb.cpool, stackLimit: bufCapacity, icEntries: fb.icEntries)
+                                if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                                pc = resumePC
+                                continue dispatchLoop
+                            }
+                                let fbIdBefore = ObjectIdentifier(fb)
+                                var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
+                                let resumePC = executeFastTrace(state: &hot, startPC: traceInfo.startPC, ctx: ctx, rt: rt, inlineBase: inlineBase)
+                                sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
+                                bc = hot.bc; bcLen = hot.bcLen; fb = hot.fb; frame = hot.frame
+                                mFuncObj = hot.funcObj; mFlags = hot.flags; bufOwned = hot.bufOwned
+                                if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
+                                if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                                if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
+                                    FileHandle.standardError.write("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun)\n".data(using: .utf8)!)
+                                }
+                                // A block that keeps deopting (unsupported op in the
+                                // body or in a callee) costs a state handoff per
+                                // iteration: switch it off after 200 in a row.
+                                // Only runs that made little progress count: a trace
+                                // that executes most of the body before deopting is
+                                // still a net win over the main loop.
+                                if hot.opsRun < 16,
+                                   ObjectIdentifier(fb) != fbIdBefore
+                                    || (resumePC >= traceInfo.entryPC && resumePC < traceInfo.exitPC) {
+                                    traceInfo.deoptCount &+= 1
+                                    if traceInfo.deoptCount >= 200 { traceInfo.isActive = false; traceInfo.disabled = true }
+                                } else {
+                                    traceInfo.deoptCount = 0
+                                }
                             pc = resumePC
                             continue dispatchLoop
                         } else {
                             traceInfo.hitCount &+= 1
-                            if traceInfo.hitCount >= traceHitThreshold { traceInfo.isActive = true }
+                            if traceInfo.hitCount >= traceHitThreshold, !traceInfo.disabled { traceInfo.isActive = true }
                         }
                     }
                 }
                 pc = gotoTarget
 
             case .if_false8:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let offset = Int(readI8(bc, pc + 1))
-                let condResult8f = !JeffJSTypeConvert.toBool(val)
+                let condResult8f = !jeffJS_fastToBool(val)
                 val.freeValue()
                 if condResult8f {
                     pc += 2 + offset
@@ -5401,15 +8433,61 @@ struct JeffJSInterpreter {
                             ctx.interruptCounter = JS_INTERRUPT_COUNTER_INIT
                             if ctx.checkInterrupt() { retVal = .exception; break dispatchLoop }
                         }
+                    // Trace block dispatch for hot loops
+                    if let traceInfo = fb.traceBlocks?[pc] {
+                        if traceInfo.isActive {
+                            if !traceInfo.hasCalls {
+                                let resumePC = executeFastTraceLean(
+                                    bc: bc, bcLen: bcLen,
+                                    entryPC: traceInfo.entryPC, exitPC: traceInfo.exitPC,
+                                    startPC: traceInfo.startPC,
+                                    buf: buf, varBase: varBase, sp: &sp, ctx: ctx,
+                                    cpool: fb.cpool, stackLimit: bufCapacity, icEntries: fb.icEntries)
+                                if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                                pc = resumePC
+                                continue dispatchLoop
+                            }
+                                let fbIdBefore = ObjectIdentifier(fb)
+                                var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
+                                let resumePC = executeFastTrace(state: &hot, startPC: traceInfo.startPC, ctx: ctx, rt: rt, inlineBase: inlineBase)
+                                sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
+                                bc = hot.bc; bcLen = hot.bcLen; fb = hot.fb; frame = hot.frame
+                                mFuncObj = hot.funcObj; mFlags = hot.flags; bufOwned = hot.bufOwned
+                                if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
+                                if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                                if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
+                                    FileHandle.standardError.write("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun)\n".data(using: .utf8)!)
+                                }
+                                // A block that keeps deopting (unsupported op in the
+                                // body or in a callee) costs a state handoff per
+                                // iteration: switch it off after 200 in a row.
+                                // Only runs that made little progress count: a trace
+                                // that executes most of the body before deopting is
+                                // still a net win over the main loop.
+                                if hot.opsRun < 16,
+                                   ObjectIdentifier(fb) != fbIdBefore
+                                    || (resumePC >= traceInfo.entryPC && resumePC < traceInfo.exitPC) {
+                                    traceInfo.deoptCount &+= 1
+                                    if traceInfo.deoptCount >= 200 { traceInfo.isActive = false; traceInfo.disabled = true }
+                                } else {
+                                    traceInfo.deoptCount = 0
+                                }
+                            pc = resumePC
+                            continue dispatchLoop
+                        } else {
+                            traceInfo.hitCount &+= 1
+                            if traceInfo.hitCount >= traceHitThreshold, !traceInfo.disabled { traceInfo.isActive = true }
+                        }
+                    }
                     }
                 } else {
                     pc += 2
                 }
 
             case .if_true8:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let offset = Int(readI8(bc, pc + 1))
-                let condResult8t = JeffJSTypeConvert.toBool(val)
+                let condResult8t = jeffJS_fastToBool(val)
                 val.freeValue()
                 if condResult8t {
                     pc += 2 + offset
@@ -5419,6 +8497,52 @@ struct JeffJSInterpreter {
                             ctx.interruptCounter = JS_INTERRUPT_COUNTER_INIT
                             if ctx.checkInterrupt() { retVal = .exception; break dispatchLoop }
                         }
+                    // Trace block dispatch for hot loops
+                    if let traceInfo = fb.traceBlocks?[pc] {
+                        if traceInfo.isActive {
+                            if !traceInfo.hasCalls {
+                                let resumePC = executeFastTraceLean(
+                                    bc: bc, bcLen: bcLen,
+                                    entryPC: traceInfo.entryPC, exitPC: traceInfo.exitPC,
+                                    startPC: traceInfo.startPC,
+                                    buf: buf, varBase: varBase, sp: &sp, ctx: ctx,
+                                    cpool: fb.cpool, stackLimit: bufCapacity, icEntries: fb.icEntries)
+                                if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                                pc = resumePC
+                                continue dispatchLoop
+                            }
+                                let fbIdBefore = ObjectIdentifier(fb)
+                                var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
+                                let resumePC = executeFastTrace(state: &hot, startPC: traceInfo.startPC, ctx: ctx, rt: rt, inlineBase: inlineBase)
+                                sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
+                                bc = hot.bc; bcLen = hot.bcLen; fb = hot.fb; frame = hot.frame
+                                mFuncObj = hot.funcObj; mFlags = hot.flags; bufOwned = hot.bufOwned
+                                if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
+                                if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                                if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
+                                    FileHandle.standardError.write("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun)\n".data(using: .utf8)!)
+                                }
+                                // A block that keeps deopting (unsupported op in the
+                                // body or in a callee) costs a state handoff per
+                                // iteration: switch it off after 200 in a row.
+                                // Only runs that made little progress count: a trace
+                                // that executes most of the body before deopting is
+                                // still a net win over the main loop.
+                                if hot.opsRun < 16,
+                                   ObjectIdentifier(fb) != fbIdBefore
+                                    || (resumePC >= traceInfo.entryPC && resumePC < traceInfo.exitPC) {
+                                    traceInfo.deoptCount &+= 1
+                                    if traceInfo.deoptCount >= 200 { traceInfo.isActive = false; traceInfo.disabled = true }
+                                } else {
+                                    traceInfo.deoptCount = 0
+                                }
+                            pc = resumePC
+                            continue dispatchLoop
+                        } else {
+                            traceInfo.hitCount &+= 1
+                            if traceInfo.hitCount >= traceHitThreshold, !traceInfo.disabled { traceInfo.isActive = true }
+                        }
+                    }
                     }
                 } else {
                     pc += 2
@@ -5436,20 +8560,47 @@ struct JeffJSInterpreter {
                     // Trace block dispatch for hot loops
                     if let traceInfo = fb.traceBlocks?[goto8Target] {
                         if traceInfo.isActive {
-                            let resumePC = executeFastTrace(
-                                bc: bc, bcLen: bcLen,
-                                entryPC: traceInfo.entryPC, exitPC: traceInfo.exitPC,
-                                buf: buf, varBase: varBase, sp: &sp, ctx: ctx,
-                                cpool: fb.cpool,
-                                stackLimit: bufCapacity,
-                                ic: fb.ic
-                            )
-                            if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                            if !traceInfo.hasCalls {
+                                let resumePC = executeFastTraceLean(
+                                    bc: bc, bcLen: bcLen,
+                                    entryPC: traceInfo.entryPC, exitPC: traceInfo.exitPC,
+                                    startPC: traceInfo.startPC,
+                                    buf: buf, varBase: varBase, sp: &sp, ctx: ctx,
+                                    cpool: fb.cpool, stackLimit: bufCapacity, icEntries: fb.icEntries)
+                                if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                                pc = resumePC
+                                continue dispatchLoop
+                            }
+                                let fbIdBefore = ObjectIdentifier(fb)
+                                var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
+                                let resumePC = executeFastTrace(state: &hot, startPC: traceInfo.startPC, ctx: ctx, rt: rt, inlineBase: inlineBase)
+                                sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
+                                bc = hot.bc; bcLen = hot.bcLen; fb = hot.fb; frame = hot.frame
+                                mFuncObj = hot.funcObj; mFlags = hot.flags; bufOwned = hot.bufOwned
+                                if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
+                                if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                                if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
+                                    FileHandle.standardError.write("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun)\n".data(using: .utf8)!)
+                                }
+                                // A block that keeps deopting (unsupported op in the
+                                // body or in a callee) costs a state handoff per
+                                // iteration: switch it off after 200 in a row.
+                                // Only runs that made little progress count: a trace
+                                // that executes most of the body before deopting is
+                                // still a net win over the main loop.
+                                if hot.opsRun < 16,
+                                   ObjectIdentifier(fb) != fbIdBefore
+                                    || (resumePC >= traceInfo.entryPC && resumePC < traceInfo.exitPC) {
+                                    traceInfo.deoptCount &+= 1
+                                    if traceInfo.deoptCount >= 200 { traceInfo.isActive = false; traceInfo.disabled = true }
+                                } else {
+                                    traceInfo.deoptCount = 0
+                                }
                             pc = resumePC
                             continue dispatchLoop
                         } else {
                             traceInfo.hitCount &+= 1
-                            if traceInfo.hitCount >= traceHitThreshold { traceInfo.isActive = true }
+                            if traceInfo.hitCount >= traceHitThreshold, !traceInfo.disabled { traceInfo.isActive = true }
                         }
                     }
                 }
@@ -5467,20 +8618,47 @@ struct JeffJSInterpreter {
                     // Trace block dispatch for hot loops
                     if let traceInfo = fb.traceBlocks?[goto16Target] {
                         if traceInfo.isActive {
-                            let resumePC = executeFastTrace(
-                                bc: bc, bcLen: bcLen,
-                                entryPC: traceInfo.entryPC, exitPC: traceInfo.exitPC,
-                                buf: buf, varBase: varBase, sp: &sp, ctx: ctx,
-                                cpool: fb.cpool,
-                                stackLimit: bufCapacity,
-                                ic: fb.ic
-                            )
-                            if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                            if !traceInfo.hasCalls {
+                                let resumePC = executeFastTraceLean(
+                                    bc: bc, bcLen: bcLen,
+                                    entryPC: traceInfo.entryPC, exitPC: traceInfo.exitPC,
+                                    startPC: traceInfo.startPC,
+                                    buf: buf, varBase: varBase, sp: &sp, ctx: ctx,
+                                    cpool: fb.cpool, stackLimit: bufCapacity, icEntries: fb.icEntries)
+                                if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                                pc = resumePC
+                                continue dispatchLoop
+                            }
+                                let fbIdBefore = ObjectIdentifier(fb)
+                                var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
+                                let resumePC = executeFastTrace(state: &hot, startPC: traceInfo.startPC, ctx: ctx, rt: rt, inlineBase: inlineBase)
+                                sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
+                                bc = hot.bc; bcLen = hot.bcLen; fb = hot.fb; frame = hot.frame
+                                mFuncObj = hot.funcObj; mFlags = hot.flags; bufOwned = hot.bufOwned
+                                if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
+                                if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                                if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
+                                    FileHandle.standardError.write("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun)\n".data(using: .utf8)!)
+                                }
+                                // A block that keeps deopting (unsupported op in the
+                                // body or in a callee) costs a state handoff per
+                                // iteration: switch it off after 200 in a row.
+                                // Only runs that made little progress count: a trace
+                                // that executes most of the body before deopting is
+                                // still a net win over the main loop.
+                                if hot.opsRun < 16,
+                                   ObjectIdentifier(fb) != fbIdBefore
+                                    || (resumePC >= traceInfo.entryPC && resumePC < traceInfo.exitPC) {
+                                    traceInfo.deoptCount &+= 1
+                                    if traceInfo.deoptCount >= 200 { traceInfo.isActive = false; traceInfo.disabled = true }
+                                } else {
+                                    traceInfo.deoptCount = 0
+                                }
                             pc = resumePC
                             continue dispatchLoop
                         } else {
                             traceInfo.hitCount &+= 1
-                            if traceInfo.hitCount >= traceHitThreshold { traceInfo.isActive = true }
+                            if traceInfo.hitCount >= traceHitThreshold, !traceInfo.disabled { traceInfo.isActive = true }
                         }
                     }
                 }
@@ -5491,18 +8669,18 @@ struct JeffJSInterpreter {
                 // The offset is relative to the end of this 5-byte instruction.
                 let offset = readI32(bc, pc + 1)
                 let catchAddr = pc + 5 + Int(offset)
-                push(.newCatchOffset(Int32(catchAddr)))
+                buf[sp] = .newCatchOffset(Int32(catchAddr)); sp += 1
                 pc += 5
 
             case .gosub:
                 // Push return address (instruction after gosub) then jump to finally block.
                 // The offset is relative to the end of this 5-byte instruction.
                 let offset = readI32(bc, pc + 1)
-                push(.newInt32(Int32(pc + 5))) // return address
+                buf[sp] = .newInt32(Int32(pc + 5)); sp += 1 // return address
                 pc += 5 + Int(offset)
 
             case .ret:
-                let addr = pop()
+                let addr = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let target = Int(addr.toInt32())
                 if target <= pc {
                     ctx.interruptCounter -= 1
@@ -5529,129 +8707,76 @@ struct JeffJSInterpreter {
             // -----------------------------------------------------------------
 
             case .to_object:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = ctx.toObject(val)
                 val.freeValue()
                 if obj.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(obj)
+                buf[sp] = obj; sp += 1
                 pc += 1
 
             case .to_propkey:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let key = ctx.toPropertyKey(val)
                 val.freeValue()
                 if key.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(key)
+                buf[sp] = key; sp += 1
                 pc += 1
 
             case .to_propkey2:
                 // QuickJS: val key -> val ToPropertyKey(key)
                 // Convert TOS to a property key in-place; leave the value below it untouched.
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let key = ctx.toPropertyKey(val)
                 val.freeValue()
                 if key.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(key)
+                buf[sp] = key; sp += 1
                 pc += 1
 
             // -----------------------------------------------------------------
             // with Statement Variable Access
             // -----------------------------------------------------------------
 
-            case .with_get_var, .with_put_var, .with_delete_var,
-                 .with_make_ref, .with_get_ref, .with_get_ref_undef:
-                let atom = readU32(bc, pc + 1)
-                let label = readI32(bc, pc + 5)
-                let withFlags = Int(readU8(bc, pc + 9))
-                let obj = peek()
-                let hasProp = ctx.hasProperty(obj: obj, atom: atom)
-                if hasProp {
-                    switch op {
-                    case .with_get_var:
-                        // nPop=1, nPush=1: replace the with_obj on TOS with the property value
-                        let _ = pop() // remove with object
-                        let val = ctx.getProperty(obj: obj, atom: atom)
-                        push(val)
-                    case .with_get_ref, .with_get_ref_undef:
-                        // nPop=1, nPush=2: replace with_obj with (obj, propKey) reference pair
-                        let _ = pop() // remove with object
-                        push(obj.dupValue())
-                        let propKey = ctx.atomToString(atom)
-                        push(propKey)
-                    case .with_put_var:
-                        // nPop=2, nPush=0: pop val and with_obj, set property
-                        // Note: in QuickJS the table says nPush=1 but the code does sp -= 2.
-                        // The with_obj is TOS, val is below it.
-                        let _ = pop() // with object
-                        let val = pop() // value to assign
-                        let _ = ctx.setProperty(obj: obj, atom: atom, value: val)
-                    case .with_delete_var:
-                        // nPop=1, nPush=1: replace with_obj with delete result bool
-                        let _ = pop() // remove with object
-                        let ok = ctx.deleteProperty(obj: obj, atom: atom)
-                        push(.newBool(ok))
-                    case .with_make_ref:
-                        // nPop=1, nPush=2: replace with_obj with (obj, propKey) reference
-                        let _ = pop() // remove with object
-                        push(obj.dupValue())
-                        let propKey = ctx.atomToString(atom)
-                        push(propKey)
-                    default: break
-                    }
-                    pc += 10
-                } else {
-                    // Fall through to non-with access: jump past the with_xxx
-                    // instruction. The label is a relative offset from the
-                    // end of this 10-byte instruction.
-                    let _ = withFlags
-                    pc += 10 + Int(label)
-                }
-
-            // -----------------------------------------------------------------
-            // Reference Construction
-            // -----------------------------------------------------------------
-
             case .make_loc_ref:
                 let atom = readU32(bc, pc + 1)
                 let idx = Int(readU16(bc, pc + 5))
                 let ref = ctx.makeLocalRef(frame: frame, idx: idx)
-                push(.makeObject(ref))
-                push(ctx.atomToString(atom))
+                buf[sp] = .makeObject(ref); sp += 1
+                buf[sp] = ctx.atomToString(atom); sp += 1
                 pc += 7
 
             case .make_arg_ref:
                 let atom = readU32(bc, pc + 1)
                 let idx = Int(readU16(bc, pc + 5))
                 let ref = ctx.makeArgRef(frame: frame, idx: idx)
-                push(.makeObject(ref))
-                push(ctx.atomToString(atom))
+                buf[sp] = .makeObject(ref); sp += 1
+                buf[sp] = ctx.atomToString(atom); sp += 1
                 pc += 7
 
             case .make_var_ref_ref:
                 let atom = readU32(bc, pc + 1)
                 let idx = Int(readU16(bc, pc + 5))
                 if idx < varRefs.count, let vr = varRefs[idx] {
-                    push(.mkPtr(tag: .object, ptr: vr))
+                    buf[sp] = .mkPtr(tag: .object, ptr: vr); sp += 1
                 } else {
-                    push(.undefined)
+                    buf[sp] = .undefined; sp += 1
                 }
-                push(ctx.atomToString(atom))
+                buf[sp] = ctx.atomToString(atom); sp += 1
                 pc += 7
 
             case .make_var_ref:
                 let atom = readU32(bc, pc + 1)
                 let ref = ctx.makeGlobalVarRef(atom: atom)
-                push(ref.0)
-                push(ref.1)
+                buf[sp] = ref.0; sp += 1
+                buf[sp] = ref.1; sp += 1
                 pc += 5
 
             // -----------------------------------------------------------------
@@ -5659,10 +8784,10 @@ struct JeffJSInterpreter {
             // -----------------------------------------------------------------
 
             case .for_in_start:
-                let obj = pop()
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let iter = ctx.createForInIterator(obj: obj)
                 obj.freeValue()
-                push(iter)
+                buf[sp] = iter; sp += 1
                 pc += 1
 
             case .for_of_start:
@@ -5670,42 +8795,42 @@ struct JeffJSInterpreter {
                 // Pops the iterable, gets its [Symbol.iterator] method, calls it to
                 // get the iterator object, then pushes the 3-element iterator state:
                 // [iter_obj, obj, method] where method = iter_obj.next
-                let obj = pop()
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let iter = ctx.getIterator(obj: obj, isAsync: false)
                 if iter.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
                 let nextMethod = ctx.getPropertyStr(obj: iter, name: "next")
-                push(iter)
-                push(obj)
-                push(nextMethod)
+                buf[sp] = iter; sp += 1
+                buf[sp] = obj; sp += 1
+                buf[sp] = nextMethod; sp += 1
                 pc += 1
 
             case .for_await_of_start:
                 // QuickJS: iterable -> iter_obj obj method
                 // Same as for_of_start but uses [Symbol.asyncIterator].
-                let obj = pop()
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let iter = ctx.getIterator(obj: obj, isAsync: true)
                 if iter.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
                 let nextMethod = ctx.getPropertyStr(obj: iter, name: "next")
-                push(iter)
-                push(obj)
-                push(nextMethod)
+                buf[sp] = iter; sp += 1
+                buf[sp] = obj; sp += 1
+                buf[sp] = nextMethod; sp += 1
                 pc += 1
 
             case .for_in_next:
-                let iter = peek()
+                let iter = buf[sp - 1]
                 let result = ctx.forInNext(iter: iter)
                 if result.0.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(result.0) // value
-                push(.newBool(result.1)) // done
+                buf[sp] = result.0; sp += 1 // value
+                buf[sp] = .newBool(result.1); sp += 1 // done
                 pc += 1
 
             case .for_of_next:
@@ -5716,8 +8841,8 @@ struct JeffJSInterpreter {
                 // pop/push) and correctly handles non-zero offsets.
                 let offset = Int(readU8(bc, pc + 1))
                 // Peek at the iterator state without popping
-                let method = peekAt(0 + offset)  // top of iter state
-                let iter   = peekAt(2 + offset)  // bottom of iter state
+                let method = buf[sp - 1 - (0 + offset)]  // top of iter state
+                let iter   = buf[sp - 1 - (2 + offset)]  // bottom of iter state
                 // Call method (next) with iter as this.
                 if traceOps {
                     print("[FOR-OF-NEXT] method.isFunction=\(method.isFunction) method.isUndefined=\(method.isUndefined) iter.isObject=\(iter.isObject)")
@@ -5736,29 +8861,31 @@ struct JeffJSInterpreter {
                 // (e.g. for-in) return primitives.
                 if !forOfResult.isObject {
                     // Treat non-object as {value: result, done: false}
-                    push(forOfResult)
-                    push(.newBool(false))
+                    buf[sp] = forOfResult; sp += 1
+                    buf[sp] = .newBool(false); sp += 1
                     pc += 2
                     break // continue dispatch
                 }
                 // Extract .done and .value from the iterator result
                 let forOfDoneVal = ctx.getPropertyStr(obj: forOfResult, name: "done")
-                let forOfDone = JeffJSTypeConvert.toBool(forOfDoneVal)
+                let forOfDone = jeffJS_fastToBool(forOfDoneVal)
                 if traceOps {
                     let v = ctx.getPropertyStr(obj: forOfResult, name: "value")
                     print("[FOR-OF] result.isObject=\(forOfResult.isObject) done=\(forOfDone) doneVal.bits=0x\(String(forOfDoneVal.bits, radix: 16)) value=\(ctx.toSwiftString(v) ?? "nil")")
                     if let obj = forOfResult.toObject() {
-                        print("[FOR-OF] result props: \(obj.prop.count) shape: \(obj.shape?.propCount ?? -1)")
+                        print("[FOR-OF] result props: \(obj.propCount) shape: \(obj.shape?.propCount ?? -1)")
                     }
                 }
                 if forOfDone {
-                    push(.undefined)
-                    push(.newBool(true))
+                    buf[sp] = .undefined; sp += 1
+                    buf[sp] = .newBool(true); sp += 1
                 } else {
                     let forOfValue = ctx.getPropertyStr(obj: forOfResult, name: "value")
-                    push(forOfValue)
-                    push(.newBool(false))
+                    buf[sp] = forOfValue; sp += 1
+                    buf[sp] = .newBool(false); sp += 1
                 }
+                forOfDoneVal.freeValue()
+                forOfResult.freeValue()   // the {value, done} object from next()
                 pc += 2
 
             case .for_await_of_next:
@@ -5768,9 +8895,9 @@ struct JeffJSInterpreter {
                 // Full async iteration requires coroutine/promise support. For now,
                 // we call next() synchronously. If the result is a promise, true
                 // async iteration would require awaiting it.
-                let method = pop()
-                let iterObj = pop()
-                let asyncIter = pop()
+                let method = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let iterObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let asyncIter = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let asyncResult: JeffJSValue
                 if method.isFunction {
                     asyncResult = ctx.callFunction(method, thisVal: asyncIter, args: [])
@@ -5782,14 +8909,14 @@ struct JeffJSInterpreter {
                     break dispatchLoop
                 }
                 // Push back the 3-element state plus the result
-                push(asyncIter)
-                push(iterObj)
-                push(method)
-                push(asyncResult)
+                buf[sp] = asyncIter; sp += 1
+                buf[sp] = iterObj; sp += 1
+                buf[sp] = method; sp += 1
+                buf[sp] = asyncResult; sp += 1
                 pc += 1
 
             case .iterator_check_object:
-                let val = peek()
+                let val = buf[sp - 1]
                 if !val.isObject {
                     _ = ctx.throwTypeError(message: "iterator result is not an object")
                     retVal = .exception
@@ -5798,20 +8925,21 @@ struct JeffJSInterpreter {
                 pc += 1
 
             case .iterator_get_value_done:
-                let result = pop()
+                let result = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let done = ctx.getPropertyStr(obj: result, name: "done")
                 let value = ctx.getPropertyStr(obj: result, name: "value")
-                push(value)
-                push(.newBool(JeffJSTypeConvert.toBool(done)))
+                buf[sp] = value; sp += 1
+                buf[sp] = .newBool(jeffJS_fastToBool(done)); sp += 1
                 pc += 1
 
             case .iterator_close:
                 // QuickJS: iter obj method -> (empty)
                 // nPop=3, nPush=0: pops the 3-element iterator state and closes the iterator.
-                let _ = pop()   // method
-                let _ = pop()   // obj
-                let iter = pop() // iter
+                let icMethod = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)   // method
+                let icObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)      // obj
+                let iter = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) // iter
                 ctx.iteratorClose(iter: iter, isThrow: false)
+                icMethod.freeValue(); icObj.freeValue(); iter.freeValue()
                 pc += 1
 
             case .iterator_close_return:
@@ -5819,12 +8947,12 @@ struct JeffJSInterpreter {
                 // nPop=4, nPush=1: pops the 3-element iterator state plus the
                 // return value below, closes the iterator, then pushes the
                 // return value back.
-                let _ = pop()   // method
-                let _ = pop()   // obj
-                let iter = pop() // iter
-                let retValue = pop() // return value that was below the iterator state
+                let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)   // method
+                let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)   // obj
+                let iter = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) // iter
+                let retValue = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) // return value that was below the iterator state
                 ctx.iteratorClose(iter: iter, isThrow: false)
-                push(retValue)
+                buf[sp] = retValue; sp += 1
                 pc += 1
 
             case .iterator_next:
@@ -5832,10 +8960,10 @@ struct JeffJSInterpreter {
                 // nPop=4, nPush=4: pops the 3-element iterator state plus the
                 // value below, calls next on the iterator, pushes result then
                 // the 3-element state back.
-                let method = pop()
-                let iterObj = pop()
-                let iter = pop()
-                let _ = pop()  // val (argument to pass, often unused)
+                let method = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let iterObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let iter = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)  // val (argument to pass, often unused)
                 let result: JeffJSValue
                 if method.isFunction {
                     result = ctx.callFunction(method, thisVal: iter, args: [])
@@ -5846,10 +8974,10 @@ struct JeffJSInterpreter {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(result)
-                push(iter)
-                push(iterObj)
-                push(method)
+                buf[sp] = result; sp += 1
+                buf[sp] = iter; sp += 1
+                buf[sp] = iterObj; sp += 1
+                buf[sp] = method; sp += 1
                 pc += 1
 
             case .iterator_call:
@@ -5858,19 +8986,19 @@ struct JeffJSInterpreter {
                 // value below, calls the specified method on the iterator, pushes
                 // result then the 3-element state back.
                 let methodType = Int(readU8(bc, pc + 1))
-                let nextMethod = pop()
-                let iterObj = pop()
-                let iter = pop()
-                let _ = pop()  // val (argument)
+                let nextMethod = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let iterObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let iter = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)  // val (argument)
                 let result = ctx.iteratorCallMethod(iter: iter, method: methodType)
                 if result.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(result)
-                push(iter)
-                push(iterObj)
-                push(nextMethod)
+                buf[sp] = result; sp += 1
+                buf[sp] = iter; sp += 1
+                buf[sp] = iterObj; sp += 1
+                buf[sp] = nextMethod; sp += 1
                 pc += 2
 
             // -----------------------------------------------------------------
@@ -5884,7 +9012,7 @@ struct JeffJSInterpreter {
                 if let genObj = generatorObject.toObject(),
                    case .generatorData(let genData) = genObj.payload {
                     // Sync buf → frame for saved state
-                    syncBufToFrame()
+                    jeffJS_syncBufToFrame(frame, buf, varBase)
                     // Save value-stack region
                     let stackCount = sp - spBase
                     var savedStack = [JeffJSValue](repeating: .undefined, count: stackCount)
@@ -5911,11 +9039,11 @@ struct JeffJSInterpreter {
                 // Pop the value being yielded, save state, and break out.
                 // The yielded value becomes the retVal so the caller
                 // (generatorResume) can wrap it in {value, done: false}.
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if let genObj = generatorObject.toObject(),
                    case .generatorData(let genData) = genObj.payload {
                     // Sync buf → frame for saved state
-                    syncBufToFrame()
+                    jeffJS_syncBufToFrame(frame, buf, varBase)
                     // Save value-stack region as an array for GeneratorSavedState
                     let stackCount = sp - spBase
                     var savedStack = [JeffJSValue](repeating: .undefined, count: stackCount)
@@ -5939,7 +9067,7 @@ struct JeffJSInterpreter {
                 // yield* delegation: pop the iterable, get its iterator,
                 // and yield each value lazily. When the inner iterator is
                 // exhausted, push the return value and continue.
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if let genObj = generatorObject.toObject(),
                    case .generatorData(let genData) = genObj.payload {
                     // Get the iterator from the value
@@ -5958,13 +9086,13 @@ struct JeffJSInterpreter {
                     let value = ctx.iteratorGetValue(result: result)
                     if done {
                         // Inner iterator immediately done — push return value
-                        push(value)
+                        buf[sp] = value; sp += 1
                         genData.state = .executing
                         pc += 1
                     } else {
                         // Yield this value and save state for lazy resumption.
                         // On resume, we'll continue iterating the inner iterator.
-                        syncBufToFrame()
+                        jeffJS_syncBufToFrame(frame, buf, varBase)
                         let stackCount = sp - spBase
                         var savedStack = [JeffJSValue](repeating: .undefined, count: stackCount)
                         for i in 0..<stackCount { savedStack[i] = buf[spBase + i] }
@@ -5990,7 +9118,7 @@ struct JeffJSInterpreter {
                 // Async yield* delegation: similar to yield_star but for
                 // async iterators. Falls back to synchronous iteration for
                 // non-Promise values.
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if let genObj = generatorObject.toObject(),
                    case .generatorData(let genData) = genObj.payload {
                     let iter = ctx.getIterator(obj: val, isAsync: true)
@@ -6015,7 +9143,7 @@ struct JeffJSInterpreter {
                             lastValue = value
                         }
                     }
-                    push(lastValue)
+                    buf[sp] = lastValue; sp += 1
                     genData.state = .executing
                 }
                 pc += 1
@@ -6032,12 +9160,12 @@ struct JeffJSInterpreter {
                 // Since JeffJS runs single-threaded without a real event loop,
                 // we implement synchronous unwrapping: drain the microtask queue
                 // to settle pending Promises, then extract the result directly.
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
 
                 // Fast path: non-object values pass through unchanged.
                 // `await 42` === 42, `await "hello"` === "hello"
                 guard val.isObject else {
-                    push(val)
+                    buf[sp] = val; sp += 1
                     pc += 1
                     break
                 }
@@ -6058,7 +9186,7 @@ struct JeffJSInterpreter {
                     case .fulfilled:
                         // Dup: the promise owns its result; the VM stack takes
                         // its own reference (a borrowed push here over-freed).
-                        push(promData.promiseResult.dupValue())
+                        buf[sp] = promData.promiseResult.dupValue(); sp += 1
                         pc += 1
                     case .rejected:
                         ctx.throwValue(promData.promiseResult.dupValue())
@@ -6069,7 +9197,7 @@ struct JeffJSInterpreter {
                         // function and register a continuation to resume later.
                         guard !ctx._asyncResolve.isUndefined else {
                             // Not inside an async function — fallback
-                            push(.undefined)
+                            buf[sp] = .undefined; sp += 1
                             pc += 1
                             break
                         }
@@ -6078,7 +9206,7 @@ struct JeffJSInterpreter {
                         // pay for a capability + resolver pair.
                         if ctx._asyncResolve.isUninitialized {
                             guard let cap = JeffJSBuiltinPromise.newPromiseCapability(ctx: ctx, ctor: .undefined) else {
-                                push(.undefined)
+                                buf[sp] = .undefined; sp += 1
                                 pc += 1
                                 break
                             }
@@ -6090,10 +9218,10 @@ struct JeffJSInterpreter {
                         var stackSnap = [JeffJSValue]()
                         for i in spBase..<sp { stackSnap.append(buf[i]) }
                         var varSnap = [JeffJSValue]()
-                        for i in 0..<frame.varBuf.count { varSnap.append(buf[varBase + i]) }
+                        for i in 0..<frame.varCount { varSnap.append(buf[varBase + i]) }
                         var argSnap = [JeffJSValue]()
                         for i in 0..<min(varBase, bufCapacity) { argSnap.append(buf[i]) }
-                        syncBufToFrame()
+                        jeffJS_syncBufToFrame(frame, buf, varBase)
 
                         let saved = GeneratorSavedState(
                             pc: pc + 1, sp: sp - spBase,
@@ -6141,21 +9269,21 @@ struct JeffJSInterpreter {
                         switch tpData.promiseState {
                         case .fulfilled:
                             // Dup: the promise owns its result (borrowed push over-freed)
-                            push(tpData.promiseResult.dupValue())
+                            buf[sp] = tpData.promiseResult.dupValue(); sp += 1
                         case .rejected:
                             ctx.throwValue(tpData.promiseResult.dupValue())
                             retVal = .exception
                             break dispatchLoop
                         case .pending:
-                            push(.undefined)
+                            buf[sp] = .undefined; sp += 1
                         }
                     } else {
                         // Fallback: push the original value
-                        push(val)
+                        buf[sp] = val; sp += 1
                     }
                 } else {
                     // Not a thenable: await on non-Promise is identity.
-                    push(val)
+                    buf[sp] = val; sp += 1
                 }
                 pc += 1
 
@@ -6164,89 +9292,89 @@ struct JeffJSInterpreter {
             // -----------------------------------------------------------------
 
             case .neg:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if val.isInt {
                     let v = val.toInt32()
-                    if v == 0 { push(.newFloat64(-0.0)) }
-                    else if v == Int32.min { push(.newFloat64(-Double(v))) }
-                    else { push(.newInt32(-v)) }
+                    if v == 0 { buf[sp] = .newFloat64(-0.0); sp += 1 }
+                    else if v == Int32.min { buf[sp] = .newFloat64(-Double(v)); sp += 1 }
+                    else { buf[sp] = .newInt32(-v); sp += 1 }
                 } else {
                     let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: val)
                     val.freeValue()
                     if !ok { retVal = .exception; break dispatchLoop }
-                    push(.newFloat64(-d))
+                    buf[sp] = .newFloat64(-d); sp += 1
                 }
                 pc += 1
 
             case .plus:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if val.isNumber {
-                    push(val)
+                    buf[sp] = val; sp += 1
                 } else {
                     let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: val)
                     val.freeValue()
                     if !ok { retVal = .exception; break dispatchLoop }
-                    push(.newFloat64(d))
+                    buf[sp] = .newFloat64(d); sp += 1
                 }
                 pc += 1
 
             case .inc:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if val.isInt {
                     let v = val.toInt32()
-                    if v == Int32.max { push(.newFloat64(Double(v) + 1)) }
-                    else { push(.newInt32(v + 1)) }
+                    if v == Int32.max { buf[sp] = .newFloat64(Double(v) + 1); sp += 1 }
+                    else { buf[sp] = .newInt32(v + 1); sp += 1 }
                 } else {
                     let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: val)
                     val.freeValue()
                     if !ok { retVal = .exception; break dispatchLoop }
-                    push(.newFloat64(d + 1))
+                    buf[sp] = .newFloat64(d + 1); sp += 1
                 }
                 pc += 1
 
             case .dec:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if val.isInt {
                     let v = val.toInt32()
-                    if v == Int32.min { push(.newFloat64(Double(v) - 1)) }
-                    else { push(.newInt32(v - 1)) }
+                    if v == Int32.min { buf[sp] = .newFloat64(Double(v) - 1); sp += 1 }
+                    else { buf[sp] = .newInt32(v - 1); sp += 1 }
                 } else {
                     let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: val)
                     val.freeValue()
                     if !ok { retVal = .exception; break dispatchLoop }
-                    push(.newFloat64(d - 1))
+                    buf[sp] = .newFloat64(d - 1); sp += 1
                 }
                 pc += 1
 
             case .post_inc:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if val.isInt {
                     let v = val.toInt32()
-                    push(val) // original value
-                    if v == Int32.max { push(.newFloat64(Double(v) + 1)) }
-                    else { push(.newInt32(v + 1)) }
+                    buf[sp] = val; sp += 1 // original value
+                    if v == Int32.max { buf[sp] = .newFloat64(Double(v) + 1); sp += 1 }
+                    else { buf[sp] = .newInt32(v + 1); sp += 1 }
                 } else {
                     let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: val)
                     val.freeValue()
                     if !ok { retVal = .exception; break dispatchLoop }
-                    push(.newFloat64(d))
-                    push(.newFloat64(d + 1))
+                    buf[sp] = .newFloat64(d); sp += 1
+                    buf[sp] = .newFloat64(d + 1); sp += 1
                 }
                 pc += 1
 
             case .post_dec:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if val.isInt {
                     let v = val.toInt32()
-                    push(val)
-                    if v == Int32.min { push(.newFloat64(Double(v) - 1)) }
-                    else { push(.newInt32(v - 1)) }
+                    buf[sp] = val; sp += 1
+                    if v == Int32.min { buf[sp] = .newFloat64(Double(v) - 1); sp += 1 }
+                    else { buf[sp] = .newInt32(v - 1); sp += 1 }
                 } else {
                     let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: val)
                     val.freeValue()
                     if !ok { retVal = .exception; break dispatchLoop }
-                    push(.newFloat64(d))
-                    push(.newFloat64(d - 1))
+                    buf[sp] = .newFloat64(d); sp += 1
+                    buf[sp] = .newFloat64(d - 1); sp += 1
                 }
                 pc += 1
 
@@ -6277,39 +9405,39 @@ struct JeffJSInterpreter {
                 pc += 2
 
             case .not:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let (i, ok) = JeffJSTypeConvert.toInt32(ctx: ctx, val: val)
                 val.freeValue()
                 if !ok { retVal = .exception; break dispatchLoop }
-                push(.newInt32(~i))
+                buf[sp] = .newInt32(~i); sp += 1
                 pc += 1
 
             case .lnot:
-                let val = pop()
-                let lnotResult = !JeffJSTypeConvert.toBool(val)
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let lnotResult = !jeffJS_fastToBool(val)
                 val.freeValue()
-                push(.newBool(lnotResult))
+                buf[sp] = .newBool(lnotResult); sp += 1
                 pc += 1
 
             case .typeof_:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let t = JeffJSOperators.jsTypeof(val)
                 val.freeValue()
-                push(ctx.newString(t))
+                buf[sp] = ctx.newString(t); sp += 1
                 pc += 1
 
             case .delete_:
-                let key = pop()
-                let obj = pop()
+                let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let ok = ctx.deletePropertyValue(obj: obj, key: key)
                 obj.freeValue(); key.freeValue()
-                push(.newBool(ok))
+                buf[sp] = .newBool(ok); sp += 1
                 pc += 1
 
             case .delete_var:
                 let atom = readU32(bc, pc + 1)
                 let ok = ctx.deleteGlobalVar(atom: atom)
-                push(.newBool(ok))
+                buf[sp] = .newBool(ok); sp += 1
                 pc += 5
 
             // -----------------------------------------------------------------
@@ -6317,94 +9445,94 @@ struct JeffJSInterpreter {
             // -----------------------------------------------------------------
 
             case .add:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 // Inline fast path for int+int avoids function call overhead
                 if lhs.isInt && rhs.isInt {
                     let a = lhs.toInt32(), b = rhs.toInt32()
                     let (r, overflow) = a.addingReportingOverflow(b)
-                    push(overflow ? .newFloat64(Double(a) + Double(b)) : .newInt32(r))
+                    buf[sp] = overflow ? .newFloat64(Double(a) + Double(b)) : .newInt32(r); sp += 1
                 } else if lhs.isString && rhs.isString {
                     // String+string fast path: rope-based O(1) concat, bypasses jsAdd
                     let concatResult = jeffJS_concatStrings(s1: lhs, s2: rhs)
                     lhs.freeValue(); rhs.freeValue()
-                    push(concatResult)
+                    buf[sp] = concatResult; sp += 1
                 } else {
                     let result = JeffJSOperators.jsAdd(ctx: ctx, lhs: lhs, rhs: rhs)
                     lhs.freeValue(); rhs.freeValue()
                     if result.isException { retVal = .exception; break dispatchLoop }
-                    push(result)
+                    buf[sp] = result; sp += 1
                 }
                 pc += 1
 
             case .sub:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if lhs.isInt && rhs.isInt {
                     let (r, overflow) = lhs.toInt32().subtractingReportingOverflow(rhs.toInt32())
-                    push(overflow ? .newFloat64(Double(lhs.toInt32()) - Double(rhs.toInt32())) : .newInt32(r))
+                    buf[sp] = overflow ? .newFloat64(Double(lhs.toInt32()) - Double(rhs.toInt32())) : .newInt32(r); sp += 1
                 } else {
                     let (a, ok1) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lhs)
                     let (b, ok2) = JeffJSTypeConvert.toNumber(ctx: ctx, val: rhs)
                     lhs.freeValue(); rhs.freeValue()
                     if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                    push(.newFloat64(a - b))
+                    buf[sp] = .newFloat64(a - b); sp += 1
                 }
                 pc += 1
 
             case .mul:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if lhs.isInt && rhs.isInt {
                     let a = Int64(lhs.toInt32()), b = Int64(rhs.toInt32())
                     let r = a * b
                     if r >= Int64(Int32.min) && r <= Int64(Int32.max) && !(r == 0 && (a < 0 || b < 0)) {
-                        push(.newInt32(Int32(r)))
+                        buf[sp] = .newInt32(Int32(r)); sp += 1
                     } else {
-                        push(.newFloat64(Double(a) * Double(b)))
+                        buf[sp] = .newFloat64(Double(a) * Double(b)); sp += 1
                     }
                 } else {
                     let (a, ok1) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lhs)
                     let (b, ok2) = JeffJSTypeConvert.toNumber(ctx: ctx, val: rhs)
                     lhs.freeValue(); rhs.freeValue()
                     if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                    push(.newFloat64(a * b))
+                    buf[sp] = .newFloat64(a * b); sp += 1
                 }
                 pc += 1
 
             case .div:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let (a, ok1) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lhs)
                 let (b, ok2) = JeffJSTypeConvert.toNumber(ctx: ctx, val: rhs)
                 lhs.freeValue(); rhs.freeValue()
                 if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                push(.newFloat64(a / b))
+                buf[sp] = .newFloat64(a / b); sp += 1
                 pc += 1
 
             case .mod:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if lhs.isInt && rhs.isInt {
                     let a = lhs.toInt32(), b = rhs.toInt32()
                     if b != 0 && !(a == Int32.min && b == -1) {
                         let r = a % b
-                        if r != 0 || a >= 0 { push(.newInt32(r)) }
-                        else { push(.newFloat64(Double(a).truncatingRemainder(dividingBy: Double(b)))) }
+                        if r != 0 || a >= 0 { buf[sp] = .newInt32(r); sp += 1 }
+                        else { buf[sp] = .newFloat64(Double(a).truncatingRemainder(dividingBy: Double(b))); sp += 1 }
                     } else {
-                        push(.newFloat64(Double(a).truncatingRemainder(dividingBy: Double(b))))
+                        buf[sp] = .newFloat64(Double(a).truncatingRemainder(dividingBy: Double(b))); sp += 1
                     }
                 } else {
                     let (a, ok1) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lhs)
                     let (b, ok2) = JeffJSTypeConvert.toNumber(ctx: ctx, val: rhs)
                     lhs.freeValue(); rhs.freeValue()
                     if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                    push(.newFloat64(a.truncatingRemainder(dividingBy: b)))
+                    buf[sp] = .newFloat64(a.truncatingRemainder(dividingBy: b)); sp += 1
                 }
                 pc += 1
 
             case .pow:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let (a, ok1) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lhs)
                 let (b, ok2) = JeffJSTypeConvert.toNumber(ctx: ctx, val: rhs)
                 lhs.freeValue(); rhs.freeValue()
                 if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                push(.newFloat64(pow(a, b)))
+                buf[sp] = .newFloat64(pow(a, b)); sp += 1
                 pc += 1
 
             // -----------------------------------------------------------------
@@ -6412,32 +9540,42 @@ struct JeffJSInterpreter {
             // -----------------------------------------------------------------
 
             case .shl:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                if lhs.isInt && rhs.isInt {
+                    buf[sp] = .newInt32(lhs.toInt32() << (rhs.toInt32() & 0x1F)); sp += 1
+                    pc += 1
+                    continue dispatchLoop
+                }
                 let (a, ok1) = JeffJSTypeConvert.toInt32(ctx: ctx, val: lhs)
                 let (b, ok2) = JeffJSTypeConvert.toInt32(ctx: ctx, val: rhs)
                 lhs.freeValue(); rhs.freeValue()
                 if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                push(.newInt32(a << (b & 0x1F)))
+                buf[sp] = .newInt32(a << (b & 0x1F)); sp += 1
                 pc += 1
 
             case .sar:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                if lhs.isInt && rhs.isInt {
+                    buf[sp] = .newInt32(lhs.toInt32() >> (rhs.toInt32() & 0x1F)); sp += 1
+                    pc += 1
+                    continue dispatchLoop
+                }
                 let (a, ok1) = JeffJSTypeConvert.toInt32(ctx: ctx, val: lhs)
                 let (b, ok2) = JeffJSTypeConvert.toInt32(ctx: ctx, val: rhs)
                 lhs.freeValue(); rhs.freeValue()
                 if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                push(.newInt32(a >> (b & 0x1F)))
+                buf[sp] = .newInt32(a >> (b & 0x1F)); sp += 1
                 pc += 1
 
             case .shr:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let (a32, ok1) = JeffJSTypeConvert.toInt32(ctx: ctx, val: lhs)
                 let (b, ok2) = JeffJSTypeConvert.toInt32(ctx: ctx, val: rhs)
                 lhs.freeValue(); rhs.freeValue()
                 if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
                 let ua = UInt32(bitPattern: a32)
                 let result = ua >> (UInt32(b & 0x1F))
-                push(.newUInt32(result))
+                buf[sp] = .newUInt32(result); sp += 1
                 pc += 1
 
             // -----------------------------------------------------------------
@@ -6445,64 +9583,64 @@ struct JeffJSInterpreter {
             // -----------------------------------------------------------------
 
             case .lt:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 // Inline fast path for int<int avoids function call
                 if lhs.isInt && rhs.isInt {
-                    push(.newBool(lhs.toInt32() < rhs.toInt32()))
+                    buf[sp] = .newBool(lhs.toInt32() < rhs.toInt32()); sp += 1
                 } else {
                     let (cmp, ok) = JeffJSOperators.jsCompare(ctx: ctx, lhs: lhs, rhs: rhs)
                     lhs.freeValue(); rhs.freeValue()
                     if !ok { retVal = .exception; break dispatchLoop }
-                    push(.newBool(cmp < 0)) // true only when LT; false for unordered (NaN)
+                    buf[sp] = .newBool(cmp < 0); sp += 1 // true only when LT; false for unordered (NaN)
                 }
                 pc += 1
 
             case .lte:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if lhs.isInt && rhs.isInt {
-                    push(.newBool(lhs.toInt32() <= rhs.toInt32()))
+                    buf[sp] = .newBool(lhs.toInt32() <= rhs.toInt32()); sp += 1
                 } else {
                     let (cmp, ok) = JeffJSOperators.jsCompare(ctx: ctx, lhs: rhs, rhs: lhs)
                     lhs.freeValue(); rhs.freeValue()
                     if !ok { retVal = .exception; break dispatchLoop }
-                    push(.newBool(cmp == 0))
+                    buf[sp] = .newBool(cmp == 0); sp += 1
                 }
                 pc += 1
 
             case .gt:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if lhs.isInt && rhs.isInt {
-                    push(.newBool(lhs.toInt32() > rhs.toInt32()))
+                    buf[sp] = .newBool(lhs.toInt32() > rhs.toInt32()); sp += 1
                 } else {
                     let (cmp, ok) = JeffJSOperators.jsCompare(ctx: ctx, lhs: rhs, rhs: lhs)
                     lhs.freeValue(); rhs.freeValue()
                     if !ok { retVal = .exception; break dispatchLoop }
-                    push(.newBool(cmp < 0))
+                    buf[sp] = .newBool(cmp < 0); sp += 1
                 }
                 pc += 1
 
             case .gte:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if lhs.isInt && rhs.isInt {
-                    push(.newBool(lhs.toInt32() >= rhs.toInt32()))
+                    buf[sp] = .newBool(lhs.toInt32() >= rhs.toInt32()); sp += 1
                 } else {
                     let (cmp, ok) = JeffJSOperators.jsCompare(ctx: ctx, lhs: lhs, rhs: rhs)
                     lhs.freeValue(); rhs.freeValue()
                     if !ok { retVal = .exception; break dispatchLoop }
-                    push(.newBool(cmp == 0))
+                    buf[sp] = .newBool(cmp == 0); sp += 1
                 }
                 pc += 1
 
             case .instanceof_:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let result = JeffJSOperators.jsInstanceof(ctx: ctx, val: lhs, target: rhs)
                 lhs.freeValue(); rhs.freeValue()
                 if result.isException { retVal = .exception; break dispatchLoop }
-                push(result)
+                buf[sp] = result; sp += 1
                 pc += 1
 
             case .in_:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if !rhs.isObject {
                     _ = ctx.throwTypeError(message: "Cannot use 'in' operator to search for property in non-object")
                     retVal = .exception; break dispatchLoop
@@ -6518,7 +9656,7 @@ struct JeffJSInterpreter {
                     if key.isException { retVal = .exception; break dispatchLoop }
                 }
                 let has = ctx.hasPropertyValue(obj: rhs, key: key)
-                push(.newBool(has))
+                buf[sp] = .newBool(has); sp += 1
                 pc += 1
 
             // -----------------------------------------------------------------
@@ -6526,33 +9664,33 @@ struct JeffJSInterpreter {
             // -----------------------------------------------------------------
 
             case .eq:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let (result, ok) = JeffJSOperators.jsEq(ctx: ctx, lhs: lhs, rhs: rhs)
                 lhs.freeValue(); rhs.freeValue()
                 if !ok { retVal = .exception; break dispatchLoop }
-                push(.newBool(result))
+                buf[sp] = .newBool(result); sp += 1
                 pc += 1
 
             case .neq:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let (result, ok) = JeffJSOperators.jsEq(ctx: ctx, lhs: lhs, rhs: rhs)
                 lhs.freeValue(); rhs.freeValue()
                 if !ok { retVal = .exception; break dispatchLoop }
-                push(.newBool(!result))
+                buf[sp] = .newBool(!result); sp += 1
                 pc += 1
 
             case .strict_eq:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let seqResult = JeffJSOperators.jsStrictEq(lhs: lhs, rhs: rhs)
                 lhs.freeValue(); rhs.freeValue()
-                push(.newBool(seqResult))
+                buf[sp] = .newBool(seqResult); sp += 1
                 pc += 1
 
             case .strict_neq:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let sneqResult = JeffJSOperators.jsStrictEq(lhs: lhs, rhs: rhs)
                 lhs.freeValue(); rhs.freeValue()
-                push(.newBool(!sneqResult))
+                buf[sp] = .newBool(!sneqResult); sp += 1
                 pc += 1
 
             // -----------------------------------------------------------------
@@ -6560,30 +9698,45 @@ struct JeffJSInterpreter {
             // -----------------------------------------------------------------
 
             case .and:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                if lhs.isInt && rhs.isInt {
+                    buf[sp] = .newInt32(lhs.toInt32() & rhs.toInt32()); sp += 1
+                    pc += 1
+                    continue dispatchLoop
+                }
                 let (a, ok1) = JeffJSTypeConvert.toInt32(ctx: ctx, val: lhs)
                 let (b, ok2) = JeffJSTypeConvert.toInt32(ctx: ctx, val: rhs)
                 lhs.freeValue(); rhs.freeValue()
                 if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                push(.newInt32(a & b))
+                buf[sp] = .newInt32(a & b); sp += 1
                 pc += 1
 
             case .xor:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                if lhs.isInt && rhs.isInt {
+                    buf[sp] = .newInt32(lhs.toInt32() ^ rhs.toInt32()); sp += 1
+                    pc += 1
+                    continue dispatchLoop
+                }
                 let (a, ok1) = JeffJSTypeConvert.toInt32(ctx: ctx, val: lhs)
                 let (b, ok2) = JeffJSTypeConvert.toInt32(ctx: ctx, val: rhs)
                 lhs.freeValue(); rhs.freeValue()
                 if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                push(.newInt32(a ^ b))
+                buf[sp] = .newInt32(a ^ b); sp += 1
                 pc += 1
 
             case .or:
-                let rhs = pop(); let lhs = pop()
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                if lhs.isInt && rhs.isInt {
+                    buf[sp] = .newInt32(lhs.toInt32() | rhs.toInt32()); sp += 1
+                    pc += 1
+                    continue dispatchLoop
+                }
                 let (a, ok1) = JeffJSTypeConvert.toInt32(ctx: ctx, val: lhs)
                 let (b, ok2) = JeffJSTypeConvert.toInt32(ctx: ctx, val: rhs)
                 lhs.freeValue(); rhs.freeValue()
                 if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                push(.newInt32(a | b))
+                buf[sp] = .newInt32(a | b); sp += 1
                 pc += 1
 
             // -----------------------------------------------------------------
@@ -6591,39 +9744,39 @@ struct JeffJSInterpreter {
             // -----------------------------------------------------------------
 
             case .is_undefined:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let isUndefResult = val.isUndefined
                 val.freeValue()
-                push(.newBool(isUndefResult))
+                buf[sp] = .newBool(isUndefResult); sp += 1
                 pc += 1
 
             case .is_null:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let isNullResult = val.isNull
                 val.freeValue()
-                push(.newBool(isNullResult))
+                buf[sp] = .newBool(isNullResult); sp += 1
                 pc += 1
 
             case .typeof_is_undefined:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let isUndef = val.isUndefined ||
                               (val.isObject && val.toObject()?.isHTMLDDA == true)
                 val.freeValue()
-                push(.newBool(isUndef))
+                buf[sp] = .newBool(isUndef); sp += 1
                 pc += 1
 
             case .typeof_is_function:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let isFuncResult = JeffJSOperators.jsTypeof(val) == "function"
                 val.freeValue()
-                push(.newBool(isFuncResult))
+                buf[sp] = .newBool(isFuncResult); sp += 1
                 pc += 1
 
             case .is_undefined_or_null:
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let isUON = val.isNull || val.isUndefined
                 val.freeValue()
-                push(.newBool(isUON))
+                buf[sp] = .newBool(isUON); sp += 1
                 pc += 1
 
             // -----------------------------------------------------------------
@@ -6631,39 +9784,39 @@ struct JeffJSInterpreter {
             // -----------------------------------------------------------------
 
             case .push_null:
-                push(.null)
+                buf[sp] = .null; sp += 1
                 pc += 1
 
             case .push_this:
-                push(frame.thisVal.dupValue())
+                buf[sp] = frame.thisVal.dupValue(); sp += 1
                 pc += 1
 
-            case .push_0: push(.newInt32(0)); pc += 1
-            case .push_1: push(.newInt32(1)); pc += 1
-            case .push_2: push(.newInt32(2)); pc += 1
-            case .push_3: push(.newInt32(3)); pc += 1
-            case .push_4: push(.newInt32(4)); pc += 1
-            case .push_5: push(.newInt32(5)); pc += 1
-            case .push_6: push(.newInt32(6)); pc += 1
-            case .push_7: push(.newInt32(7)); pc += 1
-            case .push_minus1: push(.newInt32(-1)); pc += 1
+            case .push_0: buf[sp] = .newInt32(0); sp += 1; pc += 1
+            case .push_1: buf[sp] = .newInt32(1); sp += 1; pc += 1
+            case .push_2: buf[sp] = .newInt32(2); sp += 1; pc += 1
+            case .push_3: buf[sp] = .newInt32(3); sp += 1; pc += 1
+            case .push_4: buf[sp] = .newInt32(4); sp += 1; pc += 1
+            case .push_5: buf[sp] = .newInt32(5); sp += 1; pc += 1
+            case .push_6: buf[sp] = .newInt32(6); sp += 1; pc += 1
+            case .push_7: buf[sp] = .newInt32(7); sp += 1; pc += 1
+            case .push_minus1: buf[sp] = .newInt32(-1); sp += 1; pc += 1
 
             case .push_i8:
                 let val = readI8(bc, pc + 1)
-                push(.newInt32(Int32(val)))
+                buf[sp] = .newInt32(Int32(val)); sp += 1
                 pc += 2
 
             case .push_i16:
                 let val = readI16(bc, pc + 1)
-                push(.newInt32(Int32(val)))
+                buf[sp] = .newInt32(Int32(val)); sp += 1
                 pc += 3
 
             case .push_const8:
                 let idx = Int(readU8(bc, pc + 1))
                 if idx < fb.cpool.count {
-                    push(fb.cpool[idx].dupValue())
+                    buf[sp] = fb.cpool[idx].dupValue(); sp += 1
                 } else {
-                    push(.undefined)
+                    buf[sp] = .undefined; sp += 1
                 }
                 pc += 2
 
@@ -6671,21 +9824,42 @@ struct JeffJSInterpreter {
                 let idx = Int(readU8(bc, pc + 1))
                 let closureVal = ctx.createClosure(fb: fb, cpoolIdx: idx, varRefs: varRefs,
                                                     parentFrame: frame)
-                push(closureVal)
+                buf[sp] = closureVal; sp += 1
                 pc += 2
 
             case .push_empty_string:
-                push(ctx.newString(""))
+                buf[sp] = ctx.newString(""); sp += 1
                 pc += 1
 
             case .get_length:
-                let obj = pop()
-                let len = ctx.getPropertyStr(obj: obj, name: "length")
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                // IC fast path: own "length" data slot (arrays keep it at slot 0).
+                if let jsObj = obj.obj, let sid = jsObj.shapeIdentity, let ents = fb.icEntries {
+                    let entry = ents[pc & JeffJSInlineCache.mask]
+                    if entry.pc == pc, entry.shapePtr == sid, entry.holderPtr == nil,
+                       entry.propOffset >= 0, entry.propOffset < jsObj.propCount,
+                       jsObj.extra(at: entry.propOffset) == nil {
+                        buf[sp] = jsObj.dataValue(at: entry.propOffset).dupValue(); sp += 1
+                        obj.freeValue()
+                        pc += 1
+                        continue dispatchLoop
+                    }
+                }
+                // Atom-based lookup (the old string-keyed getPropertyStr re-interned
+                // "length" on every execution) + cache fill.
+                let lengthAtom = JeffJSAtomID.JS_ATOM_length.rawValue
+                let len = ctx.getProperty(obj: obj, atom: lengthAtom)
                 if len.isException {
+                    obj.freeValue()
                     retVal = .exception
                     break dispatchLoop
                 }
-                push(len)
+                buf[sp] = len; sp += 1
+                if let jsObj = obj.obj, let shape = jsObj.shape,
+                   let idx = findShapeProperty(shape, lengthAtom) {
+                    fb.getIC().update(pc, shape: shape, propOffset: idx)
+                }
+                obj.freeValue()
                 pc += 1
 
             // -----------------------------------------------------------------
@@ -6709,10 +9883,13 @@ struct JeffJSInterpreter {
                         let val = ctx.getProperty(obj: obj, atom: atom)
                         if val.isException { retVal = .exception; break dispatchLoop }
                         var callArgs = [JeffJSValue](repeating: .undefined, count: argc)
-                        for i in stride(from: argc - 1, through: 0, by: -1) { callArgs[i] = pop() }
+                        for i in stride(from: argc - 1, through: 0, by: -1) { callArgs[i] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
+                        let subBytecode = jeffJS_isPlainBytecodeCallee(val)
                         let result = ctx.callFunction(val, thisVal: obj, args: callArgs)
+                        val.freeValue(); obj.freeValue()
+                        if subBytecode { for a in callArgs { a.freeValue() } }
                         if result.isException { retVal = .exception; break dispatchLoop }
-                        push(result)
+                        buf[sp] = result; sp += 1
                         pc += 9  // 1(nop) + 1(sub) + 1(loc) + 4(atom) + 2(argc)
 
                     // Sub 1: get_loc(a) + get_loc(b) + get_array_el
@@ -6724,7 +9901,7 @@ struct JeffJSInterpreter {
                         let idx = buf[varBase + idxIdx]
                         let val = ctx.getPropertyValue(obj: arr, prop: idx)
                         if val.isException { retVal = .exception; break dispatchLoop }
-                        push(val)
+                        buf[sp] = val; sp += 1
                         pc += 4  // 1(nop) + 1(sub) + 1(arr) + 1(idx)
 
                     // Sub 2: get_loc(a) + get_field(atom) + put_loc(b)
@@ -6767,10 +9944,13 @@ struct JeffJSInterpreter {
                         let method = ctx.getProperty(obj: obj, atom: atom)
                         if method.isException { retVal = .exception; break dispatchLoop }
                         var callArgs = [JeffJSValue](repeating: .undefined, count: argc)
-                        for i in stride(from: argc - 1, through: 0, by: -1) { callArgs[i] = pop() }
+                        for i in stride(from: argc - 1, through: 0, by: -1) { callArgs[i] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
+                        let subBytecode = jeffJS_isPlainBytecodeCallee(method)
                         let result = ctx.callFunction(method, thisVal: obj, args: callArgs)
+                        method.freeValue(); obj.freeValue()
+                        if subBytecode { for a in callArgs { a.freeValue() } }
                         if result.isException { retVal = .exception; break dispatchLoop }
-                        push(result)
+                        buf[sp] = result; sp += 1
                         pc += 9
 
                     default:
@@ -6822,33 +10002,33 @@ struct JeffJSInterpreter {
                 // Wide opcode: now handled via .invalid wide-prefix path.
                 // Kept for exhaustiveness. Wide prefix = 2 bytes.
                 let atom = readU32(bc, pc + 2)
-                let obj = pop()
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if obj.isNull || obj.isUndefined {
-                    push(.undefined)
+                    buf[sp] = .undefined; sp += 1
                 } else {
                     let val = ctx.getProperty(obj: obj, atom: atom)
                     if val.isException {
                         retVal = .exception
                         break dispatchLoop
                     }
-                    push(val)
+                    buf[sp] = val; sp += 1
                 }
                 pc += 2 + 4  // wide prefix (2) + u32 atom (4)
 
             case .get_array_el_opt_chain:
                 // Wide opcode: now handled via .invalid wide-prefix path.
                 // Kept for exhaustiveness. Wide prefix = 2 bytes.
-                let key = pop()
-                let obj = pop()
+                let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if obj.isNull || obj.isUndefined {
-                    push(.undefined)
+                    buf[sp] = .undefined; sp += 1
                 } else {
                     let val = ctx.getPropertyValue(obj: obj, prop: key)
                     if val.isException {
                         retVal = .exception
                         break dispatchLoop
                     }
-                    push(val)
+                    buf[sp] = val; sp += 1
                 }
                 pc += 2  // wide opcode, no operands
 
@@ -6863,15 +10043,21 @@ struct JeffJSInterpreter {
                 let atom = readU32(bc, pc + 2)
                 let obj = buf[varBase + locIdx]
                 // Inline cache fast path
-                if let jsObj = obj.obj, let shape = jsObj.shape {
-                    let ic = fb.ic
-                    if let ic = ic {
-                        let entry = ic.lookup(pc)
-                        if entry.pc == pc,
-                           entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(shape).toOpaque()),
-                           entry.propOffset >= 0, entry.propOffset < jsObj.prop.count {
-                            if case .value(let v) = jsObj.prop[entry.propOffset] {
-                                push(v.dupValue())
+                if let jsObj = obj.obj, jsObj.shapeIdentity != nil {
+                    if let ents = fb.icEntries {
+                        let entry = ents[pc & JeffJSInlineCache.mask]
+                        var icHit: JeffJSValue? = nil
+                        if entry.pc == pc, entry.shapePtr == jsObj.shapeIdentity {
+                            if entry.holderPtr != nil {
+                                icHit = jeffJS_icProtoHit(entry)     // prototype method/field
+                            } else if entry.propOffset >= 0, entry.propOffset < jsObj.propCount,
+                                      jsObj.extra(at: entry.propOffset) == nil {
+                                icHit = jsObj.dataValue(at: entry.propOffset)
+                            }
+                        }
+                        if let hv = icHit {
+                            do {
+                                buf[sp] = hv.dupValue(); sp += 1
                                 pc += 6
                                 continue dispatchLoop
                             }
@@ -6879,14 +10065,21 @@ struct JeffJSInterpreter {
                     }
                     let val = ctx.getProperty(obj: obj, atom: atom)
                     if val.isException { retVal = .exception; break dispatchLoop }
-                    push(val)
-                    if let propIdx = findShapeProperty(shape, atom) {
-                        fb.getIC().update(pc, shape: shape, propOffset: propIdx)
+                    buf[sp] = val; sp += 1
+                    if let shape = jsObj.shape {
+                        if let propIdx = findShapeProperty(shape, atom) {
+                            fb.getIC().update(pc, shape: shape, propOffset: propIdx)
+                        } else if let holder = jsObj.proto, let hs = holder.shape,
+                                  let hIdx = findShapeProperty(hs, atom),
+                                  hIdx < holder.propValues.count, holder.extra(at: hIdx) == nil {
+                            fb.getIC().updateProto(pc, receiverShape: shape, holder: holder,
+                                                   holderShape: hs, propOffset: hIdx)
+                        }
                     }
                 } else {
                     let val = ctx.getProperty(obj: obj, atom: atom)
                     if val.isException { retVal = .exception; break dispatchLoop }
-                    push(val)
+                    buf[sp] = val; sp += 1
                 }
                 pc += 6
 
@@ -6896,15 +10089,21 @@ struct JeffJSInterpreter {
                 let atom = readU32(bc, pc + 1)
                 let obj = varBase > 0 ? buf[0] : JeffJSValue.undefined
                 // Inline cache fast path
-                if let jsObj = obj.obj, let shape = jsObj.shape {
-                    let ic = fb.ic
-                    if let ic = ic {
-                        let entry = ic.lookup(pc)
-                        if entry.pc == pc,
-                           entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(shape).toOpaque()),
-                           entry.propOffset >= 0, entry.propOffset < jsObj.prop.count {
-                            if case .value(let v) = jsObj.prop[entry.propOffset] {
-                                push(v.dupValue())
+                if let jsObj = obj.obj, jsObj.shapeIdentity != nil {
+                    if let ents = fb.icEntries {
+                        let entry = ents[pc & JeffJSInlineCache.mask]
+                        var icHit: JeffJSValue? = nil
+                        if entry.pc == pc, entry.shapePtr == jsObj.shapeIdentity {
+                            if entry.holderPtr != nil {
+                                icHit = jeffJS_icProtoHit(entry)     // prototype method/field
+                            } else if entry.propOffset >= 0, entry.propOffset < jsObj.propCount,
+                                      jsObj.extra(at: entry.propOffset) == nil {
+                                icHit = jsObj.dataValue(at: entry.propOffset)
+                            }
+                        }
+                        if let hv = icHit {
+                            do {
+                                buf[sp] = hv.dupValue(); sp += 1
                                 pc += 5
                                 continue dispatchLoop
                             }
@@ -6912,34 +10111,44 @@ struct JeffJSInterpreter {
                     }
                     let val = ctx.getProperty(obj: obj, atom: atom)
                     if val.isException { retVal = .exception; break dispatchLoop }
-                    push(val)
-                    if let propIdx = findShapeProperty(shape, atom) {
-                        fb.getIC().update(pc, shape: shape, propOffset: propIdx)
+                    buf[sp] = val; sp += 1
+                    if let shape = jsObj.shape {
+                        if let propIdx = findShapeProperty(shape, atom) {
+                            fb.getIC().update(pc, shape: shape, propOffset: propIdx)
+                        } else if let holder = jsObj.proto, let hs = holder.shape,
+                                  let hIdx = findShapeProperty(hs, atom),
+                                  hIdx < holder.propValues.count, holder.extra(at: hIdx) == nil {
+                            fb.getIC().updateProto(pc, receiverShape: shape, holder: holder,
+                                                   holderShape: hs, propOffset: hIdx)
+                        }
                     }
                 } else {
                     let val = ctx.getProperty(obj: obj, atom: atom)
                     if val.isException { retVal = .exception; break dispatchLoop }
-                    push(val)
+                    buf[sp] = val; sp += 1
                 }
                 pc += 5
 
             case .get_loc8_add:
                 // Fused: get_loc8(idx) + add
                 // Format: opcode(1) + loc8(1) = 2 bytes
-                // Stack: pops rhs, pushes (local[idx] + rhs)
+                // Stack: pops the value pushed BEFORE the get_loc (lhs) and
+                // pushes (lhs + local[idx]). Operand order matters for string
+                // concatenation: `x + loc` compiles to <x> get_loc add.
                 let locIdx = Int(readU8(bc, pc + 1))
-                let rhs = pop()
-                let lhs = buf[varBase + locIdx].dupValue()
+                let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let rhs = buf[varBase + locIdx]          // borrowed from the slot
                 let result = JeffJSOperators.jsAdd(ctx: ctx, lhs: lhs, rhs: rhs)
+                lhs.freeValue()
                 if result.isException { retVal = .exception; break dispatchLoop }
-                push(result)
+                buf[sp] = result; sp += 1
                 pc += 2
 
             case .put_loc8_return:
                 // Fused: put_loc8(idx) + return
                 // Format: opcode(1) + loc8(1) = 2 bytes
                 let locIdx = Int(readU8(bc, pc + 1))
-                let val = pop()
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let oldPL8R = buf[varBase + locIdx]
                 buf[varBase + locIdx] = val.dupValue()
                 oldPL8R.freeValue()
@@ -6961,21 +10170,154 @@ struct JeffJSInterpreter {
                 // Format: opcode(1) + loc8(1) + loc8(1) = 3 bytes
                 let idxA = Int(readU8(bc, pc + 1))
                 let idxB = Int(readU8(bc, pc + 2))
-                push(buf[varBase + idxA].dupValue())
-                push(buf[varBase + idxB].dupValue())
+                buf[sp] = buf[varBase + idxA].dupValue(); sp += 1
+                buf[sp] = buf[varBase + idxB].dupValue(); sp += 1
                 pc += 3
 
             case .get_loc8_call:
-                // Fused: get_loc8(idx) + call(argc)
+                // Fused: get_loc8(idx) + call(argc). Only emitted for argc == 0.
                 // Format: opcode(1) + loc8(1) + u16(2) = 4 bytes
                 let locIdx = Int(readU8(bc, pc + 1))
                 let argc = Int(readU16(bc, pc + 2))
+                // Same inline fast path as `call`: push the callee and enter
+                // its frame in place (this used to go through callFunction,
+                // which made every zero-arg closure call a full recursive
+                // callInternal with an args array).
+                if inlineCallsEnabled, argc == 0,
+                   let callObj = buf[varBase + locIdx].obj,
+                   let fastFb = callObj.fbFast, !fastFb.isGenerator, !fastFb.isAsyncFunc,
+                   rt.inlineStackTop - inlineBase <= 10000 {
+                    let calleeSlot = sp
+                    let funcVal = buf[varBase + locIdx].dupValue()
+                    buf[sp] = funcVal; sp += 1
+                    do { // inline call (expanded; no nested-function capture of hot locals)
+                        let e_fastFb = fastFb
+                        let e_callObj = callObj
+                        let e_funcVal = funcVal
+                        let e_argc = 0
+                        let e_calleeSlot = calleeSlot
+                        let e_restoreSp = calleeSlot
+                        let e_thisVal: JeffJSValue = .undefined
+                        let e_instrSize = 4
+                        let argStart = e_calleeSlot + 1
+                        rt.inlinePush(InlineCallFrame(
+                            pc: pc + e_instrSize, sp: e_restoreSp, spTop: sp,
+                            buf: buf, bufCapacity: bufCapacity,
+                            varBase: varBase, spBase: spBase,
+                            bc: bc, bcLen: bcLen, fb: fb,
+                            frame: frame,
+                            funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned))
+                        fb = e_fastFb
+                        bc = e_fastFb.bcPtrFast ?? e_fastFb.bytecodePtr
+                        bcLen = e_fastFb.bytecodeLen
+                        // Only functions with closure variables need their varRefs
+                        // array (a retain/release pair per assignment otherwise).
+                        if e_fastFb.closureVarCount > 0 {
+                            varRefs = e_callObj.varRefsFast
+                            varRefsLoaded = true
+                        } else if varRefsLoaded {
+                            varRefs = []
+                            varRefsLoaded = false
+                        }
+                        mFuncObj = e_funcVal
+                        mFlags = 0
+                        unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
+                        newFrame.prevFrame = ctx.currentFrame
+                        newFrame.curFunc = e_funcVal
+                        if e_fastFb.isArrow, let arrowThis = e_callObj.arrowThisVal {
+                            newFrame.thisVal = arrowThis.dupValue()
+                        } else if !e_fastFb.isStrictMode && e_thisVal.isNullOrUndefined {
+                            // ES §10.2.1.2: sloppy callees see the global object.
+                            newFrame.thisVal = ctx.globalObj
+                        } else {
+                            newFrame.thisVal = e_thisVal
+                        }
+                        newFrame.argCount = e_argc
+                        let newVarCount = Int(e_fastFb.varCount)
+                        newFrame.varCount = newVarCount
+                        let fbArgCount = Int(e_fastFb.argCount); let newArgSlots = fbArgCount > e_argc ? fbArgCount : e_argc
+                        let fbStack = Int(e_fastFb.stackSize); let newStackSlots = (fbStack > 4 ? fbStack : 4) + 32
+                        let newTotalSlots = newArgSlots + newVarCount + newStackSlots
+                        let newBuf: UnsafeMutablePointer<JeffJSValue>
+                        let newBufCap: Int
+                        if argStart + newTotalSlots <= bufCapacity {
+                            newBuf = buf + argStart
+                            newBufCap = bufCapacity - argStart
+                            // Args are already in place; pad missing args + locals.
+                            // Straight-line stores for the common small counts: the loop
+                            // form was turned into a memset_pattern16 call per call.
+                            let prefix = newArgSlots + newVarCount
+                            let pad = prefix - e_argc
+                            if pad > 0 {
+                                newBuf[e_argc] = .undefined
+                                if pad > 1 { newBuf[e_argc + 1] = .undefined }
+                                if pad > 2 { newBuf[e_argc + 2] = .undefined }
+                                if pad > 3 {
+                                    var i = e_argc + 3
+                                    while i < prefix { newBuf[i] = .undefined; i += 1 }
+                                }
+                            }
+                            bufOwned = false
+                        } else {
+                            (newBuf, newBufCap) = rt.acquireInterpBuf(size: newTotalSlots,
+                                                                      initializedPrefix: newArgSlots + newVarCount)
+                            for i in 0..<e_argc { newBuf[i] = buf[argStart + i] }
+                            bufOwned = true
+                        }
+                        frame = newFrame
+                        ctx.currentFrame = frame
+                        frame.spBase = 0
+                        buf = newBuf
+                        bufCapacity = newBufCap
+                        varBase = newArgSlots
+                        spBase = newArgSlots + newVarCount
+                        sp = spBase
+                        // Named function expression self-reference (ES §15.2.4).
+                        if e_fastFb.selfRefVarIdx >= 0 {
+                            buf[varBase + e_fastFb.selfRefVarIdx] = e_funcVal.dupValue()
+                        }
+                        frame.buf = buf
+                        frame.bufCapacity = bufCapacity
+                        frame.bufVarBase = varBase
+                        frame.bufSpBase = spBase
+                        pc = 0
+                    }
+                    // Run the callee in the fast trace from its first instruction.
+                    if fb.traceLean {
+                        let r = executeFastTraceLean(bc: bc, bcLen: bcLen, entryPC: 0, exitPC: bcLen, startPC: pc,
+                                                     buf: buf, varBase: varBase, sp: &sp, ctx: ctx, cpool: fb.cpool,
+                                                     stackLimit: bufCapacity, icEntries: fb.icEntries)
+                        if r == -1 { retVal = .exception; break dispatchLoop }
+                        pc = r
+                        continue dispatchLoop
+                    }
+                    if fb.traceEntryEnabled {
+                        let fbIdBefore = ObjectIdentifier(fb)
+                        var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
+                        let resumePC = executeFastTrace(state: &hot, startPC: pc, ctx: ctx, rt: rt, inlineBase: inlineBase)
+                        sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
+                        bc = hot.bc; bcLen = hot.bcLen; fb = hot.fb; frame = hot.frame
+                        mFuncObj = hot.funcObj; mFlags = hot.flags; bufOwned = hot.bufOwned
+                        if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
+                        // Entry deopt accounting: an early exit still inside this function
+                        // means the trace could not run it; stop trying after a while.
+                        if hot.opsRun < 16, ObjectIdentifier(fb) == fbIdBefore {
+                            fb.traceEntryDeopts &+= 1
+                            if fb.traceEntryDeopts >= 100 { fb.traceEntryEnabled = false }
+                        }
+                        if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                        pc = resumePC
+                    }
+                    continue dispatchLoop
+                }
                 var callArgs = [JeffJSValue](repeating: .undefined, count: argc)
-                for i in stride(from: argc - 1, through: 0, by: -1) { callArgs[i] = pop() }
-                let funcVal = buf[varBase + locIdx].dupValue()
+                for i in stride(from: argc - 1, through: 0, by: -1) { callArgs[i] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
+                let funcVal = buf[varBase + locIdx]       // borrowed from the slot
+                let glcBytecode = jeffJS_isPlainBytecodeCallee(funcVal)
                 let result = ctx.callFunction(funcVal, thisVal: .undefined, args: callArgs)
+                if glcBytecode { for a in callArgs { a.freeValue() } }
                 if result.isException { retVal = .exception; break dispatchLoop }
-                push(result)
+                buf[sp] = result; sp += 1
                 pc += 4
 
             case .dup_put_loc8:
@@ -6984,7 +10326,7 @@ struct JeffJSInterpreter {
                 // Peek TOS and store copy to local (value remains on stack)
                 let locIdx = Int(readU8(bc, pc + 1))
                 let oldDupPL8 = buf[varBase + locIdx]
-                buf[varBase + locIdx] = peek().dupValue()
+                buf[varBase + locIdx] = buf[sp - 1].dupValue()
                 oldDupPL8.freeValue()
                 pc += 2
 
@@ -7059,7 +10401,7 @@ struct JeffJSInterpreter {
                 if entry.isCatchOffset {
                     let catchAddr = Int(entry.toInt32())
                     let excVal = ctx.getException()
-                    push(excVal)
+                    buf[sp] = excVal; sp += 1
                     pc = catchAddr
                     retVal = .undefined
                     handlerFound = true
@@ -7069,23 +10411,23 @@ struct JeffJSInterpreter {
             }
             // If no handler found, unwind through inline call frames
             if !handlerFound {
-                while !inlineCallStack.isEmpty {
+                while rt.inlineStackTop != inlineBase {
                     // Run frame epilogue for current (callee) frame
-                    if !frame.liveVarRefs.isEmpty {
-                        syncBufToFrame()
+                    if frame.hasLiveVarRefs {
+                        jeffJS_syncBufToFrame(frame, buf, varBase)
                         for vr in frame.liveVarRefs where !vr.isDetached {
                             // pvalue prefers frame.buf, which holds padded arg
                             // slots that argBuf (un-padded) does not.
                             vr.value = vr.pvalue.dupValue()
                             vr.isDetached = true
-                            vr.parentFrame = nil
+                            vr.parentFrame = nil; vr.slot = nil
                         }
                     }
                     ctx.currentFrame = frame.prevFrame
                     rt.releaseFrame(frame)
-                    rt.releaseInterpBuf(buf, capacity: bufCapacity)
+                    if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
                     // Restore caller state
-                    let saved = inlineCallStack.removeLast()
+                    let saved = rt.inlinePop()
                     pc = saved.pc
                     sp = saved.sp
                     buf = saved.buf
@@ -7096,9 +10438,9 @@ struct JeffJSInterpreter {
                     bcLen = saved.bcLen
                     fb = saved.fb
                     frame = saved.frame
-                    varRefs = saved.varRefs
+                    if saved.fb.closureVarCount > 0 { varRefs = saved.funcObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
                     mFuncObj = saved.funcObj
-                    mFlags = saved.flags
+                    mFlags = saved.flags; bufOwned = saved.bufOwned
                     // Scan caller's stack for catch handler (skipped entirely
                     // for uncatchable interrupt termination)
                     while !ctx.interruptTerminated && sp > spBase {
@@ -7107,7 +10449,7 @@ struct JeffJSInterpreter {
                         if entry.isCatchOffset {
                             let catchAddr = Int(entry.toInt32())
                             let excVal = ctx.getException()
-                            push(excVal)
+                            buf[sp] = excVal; sp += 1
                             pc = catchAddr
                             retVal = .undefined
                             handlerFound = true
@@ -7136,13 +10478,19 @@ struct JeffJSInterpreter {
         // (e.g. a top-level expression evaluation like "1 + 2"), return
         // whatever is on top of the value stack.
         if retVal.isUndefined && sp > spBase {
-            retVal = pop()
+            retVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
         }
 
         // Free remaining stack values (left over from unclean exits)
         while sp > spBase {
             sp -= 1
             buf[sp].freeValue()
+        }
+        // Release the variable slots (QuickJS frees var_buf at exit). Args are
+        // the caller's (borrowed). Generator/async frames keep their state.
+        if !fb.isGenerator, !fb.isAsyncFunc, !frame.hasLiveVarRefs {
+            var i = varBase
+            while i < spBase { buf[i].freeValue(); i += 1 }
         }
 
         // Detach any remaining live var-refs that still point at this frame.
@@ -7151,14 +10499,14 @@ struct JeffJSInterpreter {
         // them, so we must detach here before the frame goes away.
         // Skipped entirely for the common case (no captures): the sync loops
         // and detach walk cost real time at 250k calls/sec.
-        if !frame.liveVarRefs.isEmpty {
-            syncBufToFrame()
+        if frame.hasLiveVarRefs {
+            jeffJS_syncBufToFrame(frame, buf, varBase)
             for vr in frame.liveVarRefs where !vr.isDetached {
                 // pvalue prefers frame.buf (still set here), which holds the
                 // padded arg slots that the un-padded argBuf does not.
                 vr.value = vr.pvalue.dupValue()
                 vr.isDetached = true
-                vr.parentFrame = nil
+                vr.parentFrame = nil; vr.slot = nil
             }
         }
 
@@ -7166,11 +10514,15 @@ struct JeffJSInterpreter {
         ctx.currentFrame = frame.prevFrame
 
         // Release the contiguous buffer to pool
-        rt.releaseInterpBuf(buf, capacity: bufCapacity)
+        if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
 
         // Return frame to pool for reuse (only if no live closures reference it,
         // since closures have already been detached above and copied their values)
         rt.releaseFrame(frame)
+
+        // Abandon any inline frames left by an abrupt exit (uncatchable
+        // interrupt termination) so the next activation starts clean.
+        rt.inlineStackTop = inlineBase
 
         return retVal
     }
@@ -7182,3 +10534,73 @@ struct JeffJSInterpreter {
 
 // jeffJSGetOpcodeInfo(_:) is defined in JeffJSOpcodes.swift.
 // This file uses it from there to avoid duplicate declarations.
+
+
+/// Materialise the frame's argBuf/varBuf from the unsafe buffer (lazy
+/// arrays; see the interpreter). File-scope on purpose: a nested function
+/// inside callInternal would capture `frame`/`buf`/`varBase` by reference and
+/// pin those hot locals to memory.
+@inline(never)
+private func jeffJS_syncBufToFrame(_ frame: JeffJSStackFrame, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {
+    // The frame arrays are materialised lazily: the call paths no
+    // longer fill argBuf/varBuf per call (that array churn dominated
+    // call cost). Consumers that need the arrays (arguments object,
+    // generator save/restore) call this first, which (re)builds them
+    // from the authoritative unsafe buffer.
+    let ac = min(frame.argCount, varBase)
+    frame.bufArraysLive = true
+    if frame.argBuf.count != ac {
+        frame.argBuf = Array(UnsafeBufferPointer(start: buf, count: ac))
+    } else {
+        for i in 0..<ac { frame.argBuf[i] = buf[i] }
+    }
+    let vc = frame.varCount
+    if frame.varBuf.count != vc {
+        frame.varBuf = Array(UnsafeBufferPointer(start: buf + varBase, count: vc))
+    } else {
+        for i in 0..<vc { frame.varBuf[i] = buf[varBase + i] }
+    }
+}
+
+/// Copy the frame arrays back into the unsafe buffer (after external
+/// modification, e.g. generator restore).
+@inline(never)
+private func jeffJS_syncFrameToBuf(_ frame: JeffJSStackFrame, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {
+    for i in 0..<frame.argBuf.count {
+        if i < varBase { buf[i] = frame.argBuf[i] }
+    }
+    for i in 0..<frame.varBuf.count {
+        buf[varBase + i] = frame.varBuf[i]
+    }
+}
+
+// MARK: - Unsafe inline call stack (per runtime)
+
+extension JeffJSRuntime {
+    /// Push a saved caller state. Frames are trivially copyable, so this is
+    /// a plain store; the buffer grows geometrically and is never shrunk.
+    @inline(__always)
+    func inlinePush(_ f: JeffJSInterpreter.InlineCallFrame) {
+        if inlineStackTop == inlineStackCap { growInlineStack() }
+        (inlineStackBuf! + inlineStackTop).pointee = f   // trivially-copyable: plain store
+        inlineStackTop += 1
+    }
+
+    @inline(__always)
+    func inlinePop() -> JeffJSInterpreter.InlineCallFrame {
+        inlineStackTop -= 1
+        return (inlineStackBuf! + inlineStackTop).pointee
+    }
+
+    @inline(never)
+    func growInlineStack() {
+        let newCap = max(256, inlineStackCap * 2)
+        let nb = UnsafeMutablePointer<JeffJSInterpreter.InlineCallFrame>.allocate(capacity: newCap)
+        if let ob = inlineStackBuf {
+            nb.moveInitialize(from: ob, count: inlineStackTop)
+            ob.deallocate()
+        }
+        inlineStackBuf = nb
+        inlineStackCap = newCap
+    }
+}

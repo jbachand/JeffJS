@@ -13,9 +13,27 @@
 
 import Foundation
 
-/// True when the JEFFJS_ZOMBIES env var is set. Read once.
-let jeffJSZombiesEnabled: Bool =
-    ProcessInfo.processInfo.environment["JEFFJS_ZOMBIES"] == "1"
+/// True when the JEFFJS_ZOMBIES env var is set. A stored literal global (no
+/// swift_once on read — it is checked on every object dup/free); populated by
+/// `jeffJS_bootstrapDebugFlags()` from JeffJSRuntime.init.
+nonisolated(unsafe) var jeffJSZombiesEnabled: Bool = false
+/// JEFFJS_NO_POOL=1: never recycle plain objects (JeffJSObjectPool.swift).
+nonisolated(unsafe) var jeffJSObjectPoolDisabled: Bool = false
+/// trackRefcounts || zombies: one load on the inline dup/free fast paths.
+nonisolated(unsafe) var jeffJS_refDebugMode: Bool = false
+/// JEFFJS_TRACE_DEBUG=1: log fast-trace entries/exits (first few per block).
+nonisolated(unsafe) var jeffJSTraceDebug: Bool = false
+
+/// Copy the config/env-derived debug flags into their plain stored globals.
+/// Idempotent; called from JeffJSRuntime.init.
+func jeffJS_bootstrapDebugFlags() {
+    jeffJSZombiesEnabled = ProcessInfo.processInfo.environment["JEFFJS_ZOMBIES"] == "1"
+    jeffJSTraceDebug = ProcessInfo.processInfo.environment["JEFFJS_TRACE_DEBUG"] == "1"
+    jeffJSObjectPoolDisabled = ProcessInfo.processInfo.environment["JEFFJS_NO_POOL"] == "1"
+    JeffJSGCObjectHeader.trackRefcounts = JeffJSConfig.trackRefcounts
+    jeffJS_refDebugMode = JeffJSGCObjectHeader.trackRefcounts || jeffJSZombiesEnabled
+    jeffJS_computeStoreOpcodeMask()
+}
 
 enum JeffJSZombieDebug {
     /// Cap report spam — first few stacks are the signal.

@@ -76,8 +76,8 @@ extension JeffJSContext {
         )
         // Create a shape so properties (like static methods) can be added.
         let protoObj = functionProto.isObject ? functionProto.toObject() : nil
-        obj.shape = createShape(self, proto: protoObj, hashSize: 0, propSize: 0)
-        obj.prop = []
+        obj.shape = jeffJS_rootShape(self, proto: protoObj)
+        obj.clearProps()
         return JeffJSValue.makeObject(obj)
     }
 

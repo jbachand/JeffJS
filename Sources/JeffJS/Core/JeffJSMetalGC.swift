@@ -368,20 +368,20 @@ final class JeffJSMetalGC {
             visitor(proto)
         }
 
-        // 3. Property values
-        for propEntry in obj.prop {
-            switch propEntry {
-            case .value(let val):
-                if let child = val.toGCObjectHeader() {
-                    visitor(child)
+        // 3. Property values (split storage: data values + rare-case boxes)
+        for i in 0..<obj.propValues.count {
+            if let e = obj.extra(at: i) {
+                switch e.kind {
+                case .getset:
+                    if let g = e.getter { visitor(g) }
+                    if let s = e.setter { visitor(s) }
+                case .varRef:
+                    if let vr = e.varRef { visitor(vr) }
+                case .autoInit:
+                    break
                 }
-            case .getset(let getter, let setter):
-                if let g = getter { visitor(g) }
-                if let s = setter { visitor(s) }
-            case .varRef(let vr):
-                visitor(vr)
-            case .autoInit:
-                break
+            } else if let child = obj.propValues[i].toGCObjectHeader() {
+                visitor(child)
             }
         }
     }

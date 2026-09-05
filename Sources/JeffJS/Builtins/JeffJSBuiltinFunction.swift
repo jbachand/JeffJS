@@ -240,13 +240,15 @@ struct JeffJSBuiltinFunction {
             return ctx.throwTypeError("not a function")
         }
 
-        let thisArg: JeffJSValue = args.isEmpty ? .undefined : args[0]
-        let boundArgs: [JeffJSValue] = args.count > 1 ? Array(args[1...]) : []
+        // Captured by the bound function's closure: take our own references
+        // (the caller releases its argument references after the call).
+        let thisArg: JeffJSValue = (args.isEmpty ? .undefined : args[0]).dupValue()
+        let boundArgs: [JeffJSValue] = args.count > 1 ? args[1...].map { $0.dupValue() } : []
 
         // Capture the target function and bound state in a closure.
         // When the bound function is called, prepend boundArgs to the
         // call-site args and invoke the original target with the bound this.
-        let capturedFunc = this
+        let capturedFunc = this.dupValue()
         let capturedThis = thisArg
         let capturedBoundArgs = boundArgs
 
@@ -687,9 +689,9 @@ struct JeffJSBuiltinFunction {
         jeffJS_addProperty(ctx: ctx, obj: proto, atom: name,
                            flags: [.configurable, .getset])
         // For a getter-only property, we store it as a getset with no setter
-        let propIdx = proto.prop.count - 1
+        let propIdx = proto.propValues.count - 1
         if propIdx >= 0 {
-            proto.prop[propIdx] = .getset(getter: getterObj, setter: nil)
+            proto.setPropEntry(at: propIdx, .getset(getter: getterObj, setter: nil))
         }
     }
 

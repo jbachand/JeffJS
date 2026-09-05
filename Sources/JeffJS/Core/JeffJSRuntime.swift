@@ -379,7 +379,13 @@ final class JeffJSRuntime {
     let cfgTraceHitThreshold = UInt8(JeffJSConfig.traceHitThreshold)
 
     /// Pool of recycled stack frames (avoids a heap alloc per JS call).
-    var framePool: [JeffJSStackFrame] = []
+    /// Free list of pooled frames, linked through `prevFrame`. A linked list
+    /// instead of an array: no uniqueness/capacity checks per push/pop.
+    var frameFreeListU: Unmanaged<JeffJSStackFrame>? = nil   // owned by allFrames
+    var frameFreeCount: Int = 0
+    /// Owns every frame ever created on this runtime. Frames are immortal so
+    /// that prevFrame / currentFrame links can be unowned(unsafe).
+    var allFrames: [JeffJSStackFrame] = []
 
     /// JEFFJS_ZOMBIES=1 keep-alive list: freed JS objects retained here so
     /// use-after-free touches are detectable (see JeffJSZombieDebug).
@@ -388,41 +394,65 @@ final class JeffJSRuntime {
     /// Identities of objects that must never be freed mid-run (global objects).
     /// freeObject consults this to catch over-releases of load-bearing objects.
     var protectedGlobals: Set<ObjectIdentifier> = []
+    /// Recycled plain objects (JeffJSObjectPool.swift).
+    var objectPool: [JeffJSObject] = []
 
     /// Pool of interpreter value buffers: (pointer, capacity) pairs.
     var interpBufPool: [(UnsafeMutablePointer<JeffJSValue>, Int)] = []
 
     @inline(__always)
     func acquireFrame() -> JeffJSStackFrame {
-        if let frame = framePool.popLast() { return frame }
-        return JeffJSStackFrame()
+        return acquireFrameU().takeUnretainedValue()
+    }
+
+    /// Unmanaged form for the fast trace: no retain/release on the way out.
+    @inline(__always)
+    func acquireFrameU() -> Unmanaged<JeffJSStackFrame> {
+        if let f = frameFreeListU {
+            frameFreeListU = f._withUnsafeGuaranteedRef { $0.nextFree }
+            frameFreeCount -= 1
+            return f
+        }
+        let frame = JeffJSStackFrame()
+        allFrames.append(frame)
+        return Unmanaged.passUnretained(frame)
     }
 
     @inline(__always)
     func releaseFrame(_ frame: JeffJSStackFrame) {
-        frame.prevFrame = nil
-        frame.curFunc = .undefined
-        frame.thisVal = .undefined
-        frame.newTarget = .undefined
-        frame.curPC = 0
-        frame.argCount = 0
-        frame.varCount = 0
-        frame.spBase = 0
-        frame.sp = 0
-        // Drop any receiver stashed by get_field that no call consumed
-        frame.lastGetFieldReceiver.freeValue()
-        frame.lastGetFieldReceiver = .undefined
-        frame.lastGetFieldPC = -1
-        frame.buf = nil
-        frame.bufCapacity = 0
-        frame.bufVarBase = 0
-        frame.bufSpBase = 0
-        frame.argBuf.removeAll(keepingCapacity: true)
-        frame.varBuf.removeAll(keepingCapacity: true)
-        frame.liveVarRefs.removeAll(keepingCapacity: true)
-        if framePool.count < 32 {
-            framePool.append(frame)
+        releaseFrameU(Unmanaged.passUnretained(frame))
+    }
+
+    @inline(__always)
+    func releaseFrameU(_ u: Unmanaged<JeffJSStackFrame>) {
+        // Only reset what the next acquire does not overwrite: callInternal /
+        // enterInlineFrame set curFunc, thisVal, argCount, varCount and the
+        // buf* fields on every use. This runs on every inline return.
+        u._withUnsafeGuaranteedRef { frame in
+            if !frame.newTarget.isUndefined { frame.newTarget = .undefined }
+            frame.curPC = 0
+            if frame.lastGetFieldPC >= 0 {
+                // Drop any receiver stashed by get_field that no call consumed
+                frame.lastGetFieldReceiver.freeValue()
+                frame.lastGetFieldReceiver = .undefined
+                frame.lastGetFieldPC = -1
+            }
+            frame.buf = nil
+            // The arrays are materialised on demand; one flag instead of two
+            // array-count loads per return.
+            if frame.bufArraysLive {
+                frame.argBuf.removeAll(keepingCapacity: true)
+                frame.varBuf.removeAll(keepingCapacity: true)
+                frame.bufArraysLive = false
+            }
+            if frame.hasLiveVarRefs {
+                frame.liveVarRefs.removeAll(keepingCapacity: true)
+                frame.hasLiveVarRefs = false
+            }
+            frame.nextFree = frameFreeListU
         }
+        frameFreeListU = u
+        frameFreeCount += 1
     }
 
     /// Acquire an interpreter value buffer. Only `initializedPrefix` slots are
@@ -430,7 +460,25 @@ final class JeffJSRuntime {
     /// is always written before it is read, so clearing it per call is wasted
     /// work. Pass `initializedPrefix: size` for fully-cleared buffers.
     @inline(__always)
+    /// Unsafe stack of saved caller states for inline calls (see
+    /// JeffJSInterpreter.InlineCallFrame). Shared by all activations of
+    /// callInternal on this runtime; each activation uses the region above
+    /// the `inlineStackTop` it observed on entry.
+    var inlineStackBuf: UnsafeMutablePointer<JeffJSInterpreter.InlineCallFrame>? = nil
+    var inlineStackCap: Int = 0
+    var inlineStackTop: Int = 0
+
+    /// Upper bound on hashed (shared) shapes kept in the transition table.
+    /// Beyond this, new transitions produce private shapes.
+    static let maxHashedShapes = JeffJSConfig.shapesMaxHashed
+
+    /// Minimum capacity of an interpreter value buffer. Inline callees carve
+    /// their frames out of the caller's buffer, so buffers are sized to hold
+    /// a whole call chain (8192 slots = 64 KB), not a single frame.
+    static let interpBufMinSlots = 8192
+
     func acquireInterpBuf(size: Int, initializedPrefix: Int? = nil) -> (UnsafeMutablePointer<JeffJSValue>, Int) {
+        let size = max(size, Self.interpBufMinSlots)
         let clearCount = min(initializedPrefix ?? size, size)
         if let (ptr, cap) = interpBufPool.popLast() {
             if cap >= size {
@@ -449,7 +497,7 @@ final class JeffJSRuntime {
 
     @inline(__always)
     func releaseInterpBuf(_ ptr: UnsafeMutablePointer<JeffJSValue>, capacity: Int) {
-        if interpBufPool.count < JeffJSConfig.bufPoolMax && capacity <= 512 {
+        if interpBufPool.count < JeffJSConfig.bufPoolMax && capacity <= Self.interpBufMinSlots {
             interpBufPool.append((ptr, capacity))
         } else {
             ptr.deinitialize(count: capacity)
@@ -464,7 +512,9 @@ final class JeffJSRuntime {
             ptr.deallocate()
         }
         interpBufPool.removeAll()
-        framePool.removeAll()
+        frameFreeListU = nil
+        frameFreeCount = 0
+        allFrames.removeAll()
     }
 
     // MARK: - Per-Runtime GC Tracking (replaces module-level globals)
@@ -583,6 +633,7 @@ final class JeffJSRuntime {
     /// - GC state, job queue, and shape hash
     /// - Default stack size (1 MB)
     init() {
+        jeffJS_bootstrapDebugFlags()
         // Memory state
         mallocState = JSMallocState()
 
@@ -682,6 +733,7 @@ final class JeffJSRuntime {
 
         // Return pooled interpreter buffers/frames to the allocator
         drainInterpPools()
+        drainObjectPool()
 
         // Clear bytecode cache
         bytecodeCache.clear()
