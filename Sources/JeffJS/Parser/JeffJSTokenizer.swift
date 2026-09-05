@@ -183,6 +183,13 @@ private let keywordTable: [(String, Int)] = [
     ("accessor",    JSTokenType.TOK_ACCESSOR.rawValue),
 ]
 
+/// Keyword token -> its source spelling (for keywords used as property
+/// names, e.g. `Array.of`, `promise.then`, `obj.default`).
+func jeffJS_keywordName(forToken tok: Int) -> String? {
+    for (name, value) in keywordTable where value == tok { return name }
+    return nil
+}
+
 /// Pre-built dictionary for fast keyword lookup.
 private let keywordDict: [String: Int] = {
     var d = [String: Int](minimumCapacity: keywordTable.count)

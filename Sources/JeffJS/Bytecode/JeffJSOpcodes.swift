@@ -1390,6 +1390,7 @@ enum SpecialObjectType: UInt8 {
     case homeObject         = 4   // home object for super
     case varObject          = 5   // variable environment object (with)
     case importMeta         = 6   // import.meta
+    case homeObjectProto    = 7   // [[HomeObject]].[[Prototype]] (super.x base)
 }
 
 // MARK: - Define Method Flags

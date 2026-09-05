@@ -722,6 +722,12 @@ func js_map_iterator_create(_ ctx: JeffJSContext,
     iterObj.classID = iterClassID
     iterObj.extensible = true
     iterObj.payload = .opaque(iterData)
+    // %MapIteratorPrototype% / %SetIteratorPrototype% (next, Symbol.iterator
+    // through %IteratorPrototype%): without it the object had no `next`.
+    if iterClassID < ctx.classProto.count, let protoObj = ctx.classProto[iterClassID].toObject() {
+        iterObj.shape = jeffJS_rootShape(ctx, proto: protoObj)
+        iterObj.proto = protoObj
+    }
 
     return JeffJSValue.makeObject(iterObj)
 }
@@ -780,24 +786,10 @@ func js_map_iterator_next(_ ctx: JeffJSContext,
             return rec.key.dupValue() // Set value iteration returns the key
         }
     case .JS_ITERATOR_KIND_KEY_AND_VALUE:
-        let pairObj = JeffJSObject()
-        pairObj.classID = JeffJSClassID.array.rawValue
-        pairObj.fastArray = true
-        pairObj.extensible = true
-        if obj.classID == JSClassID.JS_CLASS_MAP_ITERATOR.rawValue {
-            pairObj.payload = .array(
-                size: 2,
-                values: [rec.key.dupValue(), rec.value.dupValue()],
-                count: 2
-            )
-        } else {
-            pairObj.payload = .array(
-                size: 2,
-                values: [rec.key.dupValue(), rec.key.dupValue()],
-                count: 2
-            )
-        }
-        return JeffJSValue.makeObject(pairObj)
+        // A real array (shape, Array.prototype, `length`): the hand-built
+        // object had no length, so `[k, v]` destructuring and spread failed.
+        let second = obj.classID == JSClassID.JS_CLASS_MAP_ITERATOR.rawValue ? rec.value : rec.key
+        return ctx.newArrayFrom([rec.key.dupValue(), second.dupValue()])
     }
 }
 
@@ -1300,6 +1292,25 @@ struct JeffJSBuiltinMap {
         _ = ctx.setPropertyStr(obj: ctx.globalObj, name: "Set", value: setCtorNew)
 
         // Map.prototype methods
+        // Iterator prototypes: inherit from %IteratorPrototype% (reached via
+        // the array iterator prototype) so `for...of` over map.entries() works.
+        do {
+            var iterProtoVal: JeffJSValue = ctx.objectPrototype
+            if ctx.iteratorProto.isObject {
+                iterProtoVal = ctx.iteratorProto
+            } else if let aip = ctx.classProto[JSClassID.JS_CLASS_ARRAY_ITERATOR.rawValue].toObject(),
+                      let base = aip.proto, base !== ctx.objectPrototype.toObject() {
+                iterProtoVal = JeffJSValue.makeObjectRecycled(base)
+            }
+            for (cid, tag) in [(JSClassID.JS_CLASS_MAP_ITERATOR.rawValue, "Map Iterator"),
+                               (JSClassID.JS_CLASS_SET_ITERATOR.rawValue, "Set Iterator")] {
+                let proto = ctx.newObjectProto(proto: iterProtoVal)
+                installFuncs(ctx: ctx, obj: proto, funcs: js_map_iterator_proto_funcs)
+                _ = ctx.setProperty(obj: proto, atom: JeffJSAtomID.JS_ATOM_Symbol_toStringTag.rawValue,
+                                    value: ctx.newStringValue(tag))
+                if cid < ctx.classProto.count { ctx.classProto[cid] = proto }
+            }
+        }
         let mapProto = ctx.classProto[JSClassID.JS_CLASS_MAP.rawValue]
         if mapProto.isObject {
             installFuncs(ctx: ctx, obj: mapProto, funcs: js_map_proto_funcs)
@@ -1389,8 +1400,17 @@ struct JeffJSBuiltinMap {
                 }, name: "get \(entry.name)", length: 0)
                 ctx.setPropertyGetSet(obj: obj, name: entry.name, getter: getter, setter: nil)
             case .iteratorNext(let fn):
+                // QuickJS-style next: returns the value and reports completion
+                // through `pdone`; JS callers need an iterator result object.
                 let wrapper: JeffJSNativeFunc = { c, this, args in
-                    return fn(c, this, args, nil, 0)
+                    var done: Int32 = 0
+                    let v = fn(c, this, args, &done, 0)
+                    if v.isException { return v }
+                    let res = c.newPlainObject()
+                    c.setPropertyStr(obj: res, name: "value", value: done != 0 ? JeffJSValue.undefined : v)
+                    c.setPropertyStr(obj: res, name: "done", value: .newBool(done != 0))
+                    if done != 0 { v.freeValue() }
+                    return res
                 }
                 ctx.setPropertyFunc(obj: obj, name: entry.name, fn: wrapper, length: entry.length)
             }

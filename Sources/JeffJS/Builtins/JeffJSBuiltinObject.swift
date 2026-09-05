@@ -386,19 +386,34 @@ extension JeffJSContext {
 
     /// Get an iterator from an iterable.
     func getIterator(_ iterable: JeffJSValue, isAsync: Bool) -> JeffJSValue {
-        guard let obj = iterable.toObject() else { return .exception }
-        // Look for Symbol.iterator
-        let iterFn = obj.getOwnPropertyValue(atom: JSAtomID.Symbol_iterator)
-        if iterFn.isUndefined { return .exception }
-        return call(iterFn, this: iterable, args: [])
+        // Symbol.iterator lives on the prototype (Array.prototype, %MapPrototype%,
+        // ...): an own-property lookup found nothing and returned a bare
+        // exception marker, which surfaced whatever stale error was pending.
+        guard iterable.isObject || iterable.isString else {
+            return throwTypeError(message: "object is not iterable")
+        }
+        let iterFn = getProperty(obj: iterable, atom: JSAtomID.Symbol_iterator)
+        if iterFn.isException { return iterFn }
+        if !iterFn.isFunction {
+            iterFn.freeValue()
+            return throwTypeError(message: "object is not iterable")
+        }
+        let it = call(iterFn, this: iterable, args: [])
+        iterFn.freeValue()
+        return it
     }
 
-    /// Get the next value from an iterator.
     func iteratorNext(_ iter: JeffJSValue) -> JeffJSValue {
-        guard let obj = iter.toObject() else { return .exception }
-        let nextFn = obj.getOwnPropertyValue(atom: JSAtomID.next)
-        if nextFn.isUndefined { return .exception }
-        return call(nextFn, this: iter, args: [])
+        guard iter.isObject else { return throwTypeError(message: "iterator result is not an object") }
+        let nextFn = getProperty(obj: iter, atom: JSAtomID.next)
+        if nextFn.isException { return nextFn }
+        if !nextFn.isFunction {
+            nextFn.freeValue()
+            return throwTypeError(message: "iterator.next is not a function")
+        }
+        let r = call(nextFn, this: iter, args: [])
+        nextFn.freeValue()
+        return r
     }
 
     /// Freeze/seal integrity levels (ES SetIntegrityLevel):

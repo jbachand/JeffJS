@@ -99,6 +99,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     var iteratorCtor: JeffJSValue
     /// AsyncIterator.prototype.
     var asyncIteratorProto: JeffJSValue
+    /// %IteratorPrototype% (JeffJSBuiltinIterator): parent of every builtin
+    /// iterator prototype, so iterators are themselves iterable.
+    var iteratorProto: JeffJSValue = .undefined
     /// Array.prototype.values — cached because it's also used as %ArrayIteratorPrototype%[@@iterator].
     var arrayProtoValues: JeffJSValue
     /// Array.prototype.push — cached object pointer for interpreter fast-path identity check.

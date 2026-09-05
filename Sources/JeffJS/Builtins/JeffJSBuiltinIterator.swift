@@ -102,6 +102,18 @@ struct JeffJSBuiltinIterator {
         }, name: "[Symbol.iterator]", length: 0)
         let symIterAtom = JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue
         ctx.setProperty(obj: iterProto, atom: symIterAtom, value: iterSymbolIter)
+        ctx.iteratorProto = iterProto.dupValue()
+        // The builtin iterator prototypes were created as plain objects: give
+        // them %IteratorPrototype% as [[Prototype]] so `[...arr.values()]`,
+        // `Array.from(map.keys())` and `for...of` over an iterator work.
+        for cid in [JSClassID.JS_CLASS_ARRAY_ITERATOR.rawValue,
+                    JSClassID.JS_CLASS_MAP_ITERATOR.rawValue,
+                    JSClassID.JS_CLASS_SET_ITERATOR.rawValue] where cid < ctx.classProto.count {
+            let p = ctx.classProto[cid]
+            if let po = p.toObject(), po.proto == nil || po.proto === ctx.objectPrototype.toObject() {
+                _ = ctx.setPrototypeOf(obj: p, proto: iterProto)
+            }
+        }
 
         // Iterator.prototype[Symbol.toStringTag] = "Iterator"
         ctx.setPropertyStr(obj: iterProto, name: "toStringTag",

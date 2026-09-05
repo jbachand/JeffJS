@@ -549,9 +549,19 @@ extension JeffJSContext {
             if let funcObj = frame.curFunc.toObject(),
                case .bytecodeFunc(_, _, let homeObj) = funcObj.payload,
                let home = homeObj {
-                return JeffJSValue.makeObject(home)
+                return JeffJSValue.makeObjectRecycled(home).dupValue()   // owned reference
             }
             return .undefined
+        case .homeObjectProto:
+            // Base for `super.x`: the prototype of the method's [[HomeObject]].
+            if let funcObj = frame.curFunc.toObject(),
+               case .bytecodeFunc(_, _, let homeObj) = funcObj.payload,
+               let home = homeObj {
+                if let p = home.proto { return JeffJSValue.makeObjectRecycled(p).dupValue() }
+                return .null
+            }
+            _ = throwSyntaxError(message: "'super' keyword unexpected here")
+            return .exception
         case .varObject:
             // Variable environment object for `with` statement
             return newObject()
@@ -996,12 +1006,12 @@ extension JeffJSContext {
             _ = throwTypeError(message: "super constructor is not a constructor")
             return .exception
         }
-        let protoVal = JeffJSValue.makeObject(proto)
+        let protoVal = JeffJSValue.makeObjectRecycled(proto)
         if !protoVal.isFunction {
             _ = throwTypeError(message: "super constructor is not a constructor")
             return .exception
         }
-        return protoVal
+        return protoVal.dupValue()   // owned: the call site releases it
     }
 
     /// Dynamic import().
@@ -7858,6 +7868,10 @@ struct JeffJSInterpreter {
                 let methodFlags = Int(readU8(bc, pc + 5))
                 let funcVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = buf[sp - 1]
+                // [[HomeObject]] for `super.x` inside the method (QuickJS sets it
+                // in OP_define_method; class, static, object-literal methods and
+                // accessors all come through here).
+                ctx.setHomeObject(funcVal: funcVal, homeObj: obj)
                 let ok = ctx.defineMethod(obj: obj, atom: atom, funcVal: funcVal,
                                            flags: methodFlags)
                 if !ok {
@@ -7871,6 +7885,7 @@ struct JeffJSInterpreter {
                 let funcVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = buf[sp - 1]
+                ctx.setHomeObject(funcVal: funcVal, homeObj: obj)
                 let ok = ctx.defineMethodComputed(obj: obj, key: key, funcVal: funcVal,
                                                    flags: methodFlags)
                 if !ok {

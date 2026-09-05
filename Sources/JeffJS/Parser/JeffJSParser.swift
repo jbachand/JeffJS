@@ -180,6 +180,10 @@ final class JeffJSParser {
     /// Set to true after parsing 'super' as a primary expression so that
     /// parseCallExpr can emit call_constructor instead of a regular call.
     var lastExprWasSuper: Bool = false
+    /// `super.x` / `super[x]` base was just pushed (home object's prototype).
+    var lastExprWasSuperProp: Bool = false
+    /// `obj[key]` was kept as [obj, value] because a call follows: emit call_method.
+    var pendingMethodCall: Bool = false
     /// True while parsing an interpolated expression inside a template literal
     /// (`${...}`).  Prevents `parseCallExpr` from treating the next
     /// TOK_TEMPLATE (produced when the tokenizer hits `}`) as a tagged
@@ -589,8 +593,10 @@ final class JeffJSParser {
 
     /// Returns the string name for a keyword token type.
     func keywordTokenName(_ t: Int) -> String {
-        // Map each keyword token to its string representation.
-        // This covers all JS keywords that can appear as property names after '.'.
+        // The tokenizer's keyword table is the source of truth: the old
+        // predefined-atom offset mapped `of` (and other late keywords) to the
+        // wrong atom, so `Array.of` / `o.of = v` used an empty property name.
+        if let name = jeffJS_keywordName(forToken: t) { return name }
         if let pa = JSPredefinedAtom(rawValue: UInt32(t - JSTokenType.TOK_NULL.rawValue + 1)) {
             return pa.stringValue
         }
@@ -3151,6 +3157,18 @@ final class JeffJSParser {
 
             let savedFd = fd
             fd = defaultCtorFd
+            if hasExtends {
+                // constructor(...args) { super(...args); }
+                emitOp(.push_this)
+                emitOp(.get_super)       // [parentCtor]
+                emitOp(.push_this)
+                emitOp(.swap)            // [this, parentCtor]
+                emitOp(.rest)
+                emitU16(0)               // [this, parentCtor, argsArray]
+                emitOp(.apply)
+                emitU16(0)               // [result]
+                emitOp(.drop)
+            }
             emitOp(.return_undef)
             fd = savedFd
 
@@ -4549,6 +4567,8 @@ final class JeffJSParser {
             case 0x28: // '(' -- function call
                 let isSuperCall = lastExprWasSuper
                 lastExprWasSuper = false
+                let isMethodCall = pendingMethodCall
+                pendingMethodCall = false
 
                 if isSuperCall {
                     // super(args) in a derived constructor.
@@ -4597,6 +4617,14 @@ final class JeffJSParser {
                     // only the drop here left the stack one below its base.
                     emitOp(.drop)
                     emitOp(.push_this)
+                } else if isMethodCall {
+                    // [receiver, func, args...]: obj[key](...) and super.m(...)
+                    if hasSpread {
+                        emitOp(.apply)       // [this, func, argsArray] -> result
+                        emitU16(UInt16(argc))
+                    } else {
+                        emitCallMethod(argc)
+                    }
                 } else if hasSpread {
                     // The .apply opcode expects stack: [thisObj, funcVal, argsArray].
                     // For plain function calls the parser only has [funcVal, argsArray]
@@ -4611,28 +4639,51 @@ final class JeffJSParser {
 
             case 0x5B: // '[' -- computed member access
                 lastExprWasSuper = false
+                let superBase = lastExprWasSuperProp
+                lastExprWasSuperProp = false
                 next()
                 parseExpression()
                 expect(0x5D) // ']'
-                emitOp(.get_array_el)
+                if superBase {
+                    // [homeProto, key] -> value; a following call gets `this`.
+                    emitOp(.get_array_el)
+                    if tok == 0x28 { emitOp(.push_this); emitOp(.swap); pendingMethodCall = true }
+                } else if tok == 0x28 {
+                    // obj[key](...): keep the receiver so the call is a method call
+                    // (QuickJS get_array_el2 + call_method); a plain call passed
+                    // `this` = undefined.
+                    emitOp(.get_array_el2)
+                    pendingMethodCall = true
+                } else {
+                    emitOp(.get_array_el)
+                }
 
             case 0x2E: // '.' -- member access
                 lastExprWasSuper = false
+                let superBase = lastExprWasSuperProp
+                lastExprWasSuperProp = false
                 next()
                 // After '.', accept identifiers AND keywords as property names.
                 // In JS, keywords are valid property names: obj.delete, Promise.finally,
                 // Symbol.for, etc.
+                var fieldAtomOpt: JSAtom? = nil
                 if tok == JSTokenType.TOK_IDENT.rawValue {
-                    let fieldAtom = s.token.identAtom
+                    fieldAtomOpt = s.token.identAtom
                     next()
-                    emitGetField(fieldAtom)
                 } else if isKeywordToken(tok) {
                     // Keywords as property names: resolve to the canonical string
                     // atom via getAtom(string). The keyword's identAtom is often 0
                     // for keyword tokens, so we must get the string from the token type.
                     let kwName = keywordTokenName(tok)
-                    let fieldAtom = getAtom(kwName)
+                    fieldAtomOpt = getAtom(kwName)
                     next()
+                }
+                if let fieldAtom = fieldAtomOpt {
+                    if superBase && tok == 0x28 {
+                        // super.m(...): [homeProto] -> [this, homeProto] -> [this, m]
+                        emitOp(.push_this); emitOp(.swap)
+                        pendingMethodCall = true
+                    }
                     emitGetField(fieldAtom)
                 } else if tok == JSTokenType.TOK_PRIVATE_NAME.rawValue {
                     let fieldAtom = s.token.identAtom
@@ -5307,12 +5358,20 @@ final class JeffJSParser {
 
         case JSTokenType.TOK_SUPER.rawValue:
             next()
-            // Push a dummy value that get_super will pop (nPop=1).
-            // The interpreter resolves the parent constructor from
-            // frame.curFunc.__proto__ regardless of this value.
-            emitOp(.push_this)
-            emitOp(.get_super)
-            lastExprWasSuper = true
+            if tok == 0x2E || tok == 0x5B {
+                // super.x / super[x]: the [[HomeObject]]'s prototype is the base
+                // (parent prototype in instance methods, parent class in static
+                // methods). The member access below adds `this` for calls.
+                emitOp(.special_object)
+                emitU8(SpecialObjectType.homeObjectProto.rawValue)
+                lastExprWasSuperProp = true
+            } else {
+                // super(...): push a dummy that get_super pops; the parent
+                // constructor is resolved from frame.curFunc.__proto__.
+                emitOp(.push_this)
+                emitOp(.get_super)
+                lastExprWasSuper = true
+            }
 
         case JSTokenType.TOK_IDENT.rawValue:
             // Check for 'async function' expression (e.g. var f = async function(){})
