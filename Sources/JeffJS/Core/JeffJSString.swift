@@ -32,7 +32,9 @@ enum JeffJSStringStorage {
 /// Common base of the three string representations so refcount traffic
 /// (dup/free) needs one unchecked cast instead of an `as?` chain with
 /// unknown-object retain/release on every string dup.
-class JeffJSStringBase {
+// nonisolated for the same reason as JeffJSGCObjectHeader: strings are freed
+// off the main actor, and JeffJSString has a deinit.
+nonisolated class JeffJSStringBase {
     var refCount: Int
     /// UAF tripwire (zombie mode).
     var freeMark: Bool = false

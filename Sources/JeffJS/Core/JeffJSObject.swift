@@ -419,7 +419,11 @@ final class ListNode {
 // MARK: - JeffJSGCObjectHeader
 
 /// Base class for every GC-managed object.
-class JeffJSGCObjectHeader {
+// nonisolated: GC objects are created and freed on whatever thread runs the
+// engine. Without this they inherit the host's default actor isolation (React
+// Natively builds with SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor), which makes
+// the implicit base deinit main-actor isolated and clashes with subclass deinits.
+nonisolated class JeffJSGCObjectHeader {
     var refCount: Int
     var gcObjType: JSGCObjectTypeEnum
     var mark: Bool
