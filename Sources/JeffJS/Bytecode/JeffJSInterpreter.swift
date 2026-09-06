@@ -245,6 +245,24 @@ extension JeffJSContext {
 
     /// Calls a JS function with the given this-value and arguments.
     /// Dispatches to C-function path or bytecode interpreter path.
+    @inline(__always)
+    static func dispatchCFunction(_ ctx: JeffJSContext, _ cFunction: JSCFunctionType,
+                                  _ thisVal: JeffJSValue, _ args: [JeffJSValue], _ magic: Int) -> JeffJSValue {
+        switch cFunction {
+        case .generic(let fn): return fn(ctx, thisVal, args)
+        case .genericMagic(let fn): return fn(ctx, thisVal, args, magic)
+        case .constructor(let fn): return fn(ctx, thisVal, args)
+        case .constructorOrFunc(let fn): return fn(ctx, thisVal, args, false)
+        case .getter(let fn): return fn(ctx, thisVal)
+        case .setter(let fn): return fn(ctx, thisVal, args.first ?? .undefined)
+        case .getterMagic(let fn): return fn(ctx, thisVal, magic)
+        case .setterMagic(let fn): return fn(ctx, thisVal, args.first ?? .undefined, magic)
+        case .fFloat64(let fn): return .newFloat64(fn(args.first?.toFloat64() ?? .nan))
+        case .fFloat64_2(let fn): return .newFloat64(fn(args.first?.toFloat64() ?? .nan, (args.count > 1 ? args[1] : .undefined).toFloat64()))
+        case .iteratorNext(let fn): return fn(ctx, thisVal, args, nil, magic)
+        }
+    }
+
     func callFunction(_ funcVal: JeffJSValue, thisVal: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         if jeffJSZombiesEnabled, let zo = funcVal.obj, zo.asClass.freeMark {
             JeffJSZombieDebug.reportTouch("CALL", zo.asClass)   // calling a dead function: an under-retained reference
@@ -290,7 +308,10 @@ extension JeffJSContext {
             let boundThis = bound.thisVal.isUndefined ? thisVal : bound.thisVal
             return callFunction(bound.funcObj, thisVal: boundThis, args: fullArgs)
         }
-        // C function path
+        // C function path (mirrored fields: no payload copy per call)
+        if let cf = obj.cFuncFast {
+            return JeffJSContext.dispatchCFunction(self, cf, thisVal, args, obj.cMagicFast)
+        }
         if case .cFunc(_, let cFunction, _, _, let magic) = obj.payload {
             switch cFunction {
             case .generic(let fn):
@@ -2968,6 +2989,7 @@ private func executeFastTrace(
             let old = storage.values[Int(idx)]
             storage.values[Int(idx)] = val
             old.freeValue()
+            objV.freeValueFast()   // the popped receiver ref
             sp -= 3
             pc += 1
 
@@ -2996,14 +3018,15 @@ private func executeFastTrace(
         case .drop:
             if sp <= state.spBase { resume = pc; break traceLoop }   // underflow: let the guarded main loop report it
             sp -= 1
+            buf[sp].freeValueFast()   // `a[k] = obj;` compiles to dup/put/drop: the dropped ref must go
             pc += 1
 
         case .nip:
-            buf[sp - 2] = buf[sp - 1]; sp -= 1
+            buf[sp - 2].freeValueFast(); buf[sp - 2] = buf[sp - 1]; sp -= 1
             pc += 1
 
         case .nip1:
-            buf[sp - 3] = buf[sp - 2]; buf[sp - 2] = buf[sp - 1]; sp -= 1
+            buf[sp - 3].freeValueFast(); buf[sp - 3] = buf[sp - 2]; buf[sp - 2] = buf[sp - 1]; sp -= 1
             pc += 1
 
         case .perm3:
@@ -4191,6 +4214,7 @@ private func executeFastTraceLean(
             let old = storage.values[Int(idx)]
             storage.values[Int(idx)] = val
             old.freeValue()
+            objV.freeValueFast()   // the popped receiver ref
             sp -= 3
             pc += 1
 
@@ -4219,14 +4243,15 @@ private func executeFastTraceLean(
         case .drop:
             if sp <= varBase { ctx.interruptCounter = interrupt; return pc }   // underflow: let the guarded main loop report it
             sp -= 1
+            buf[sp].freeValueFast()
             pc += 1
 
         case .nip:
-            buf[sp - 2] = buf[sp - 1]; sp -= 1
+            buf[sp - 2].freeValueFast(); buf[sp - 2] = buf[sp - 1]; sp -= 1
             pc += 1
 
         case .nip1:
-            buf[sp - 3] = buf[sp - 2]; buf[sp - 2] = buf[sp - 1]; sp -= 1
+            buf[sp - 3].freeValueFast(); buf[sp - 3] = buf[sp - 2]; buf[sp - 2] = buf[sp - 1]; sp -= 1
             pc += 1
 
         case .perm3:
@@ -4978,8 +5003,18 @@ struct JeffJSTypeConvert {
     static func toString(ctx: JeffJSContext, val: JeffJSValue) -> JeffJSValue {
         if val.isString { return val.dupValue() }
         if val.isInt {
-            let s = String(val.toInt32())
-            return ctx.newString(s)
+            // Digits straight into a Latin-1 string (the Swift String round
+            // trip dominated `"s" + i` and template building).
+            var n = Int(val.toInt32())
+            var digits = [UInt8](); digits.reserveCapacity(11)
+            if n == 0 { digits.append(48) } else {
+                let neg = n < 0
+                if neg { n = -n }
+                while n > 0 { digits.append(UInt8(48 + n % 10)); n /= 10 }
+                if neg { digits.append(45) }
+                digits.reverse()
+            }
+            return JeffJSValue.makeString(JeffJSString(refCount: 1, len: digits.count, isWideChar: false, storage: .str8(digits)))
         }
         if val.isFloat64 {
             let d = val.toFloat64()

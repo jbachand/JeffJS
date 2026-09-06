@@ -343,8 +343,8 @@ private func js_map_forEach_iterable(_ ctx: JeffJSContext,
 
     // Determine element count: fast-array payload or length property.
     let elemCount: Int
-    if case .array(_, _, let count) = obj.payload {
-        elemCount = Int(count)
+    if let snap = obj.arraySnapshot() {
+        elemCount = snap.count
     } else {
         let lenVal = obj.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_length.rawValue)
         if lenVal.isInt {
@@ -359,8 +359,8 @@ private func js_map_forEach_iterable(_ ctx: JeffJSContext,
     for i in 0..<elemCount {
         // Read element: try fast-array first, then property-based lookup.
         let elem: JeffJSValue
-        if case .array(_, let vals, let count) = obj.payload, i < Int(count), i < vals.count {
-            elem = vals[i]
+        if let snap = obj.arraySnapshot(), i < snap.count, i < snap.values.count {
+            elem = snap.values[i]
         } else {
             elem = ctx.getPropertyUint32(obj: iterable, index: UInt32(i))
         }
@@ -376,10 +376,10 @@ private func js_map_forEach_iterable(_ ctx: JeffJSContext,
             guard let pair = elem.toObject() else { continue }
             let pairKey: JeffJSValue
             let pairVal: JeffJSValue
-            if case .array(_, let pv, let pc) = pair.payload, pc >= 2 {
+            if let snap = pair.arraySnapshot(), snap.count >= 2, snap.values.count >= 2 {
                 // Fast-array path for the pair.
-                pairKey = pv[0]
-                pairVal = pv[1]
+                pairKey = snap.values[0]
+                pairVal = snap.values[1]
             } else {
                 // Property-based fallback for the pair.
                 pairKey = ctx.getPropertyUint32(obj: elem, index: 0)
@@ -1086,8 +1086,9 @@ func js_map_groupBy(_ ctx: JeffJSContext,
     // Iterate items (fast path: arrays).
     if let arrObj = items.toObject(),
        arrObj.isArray,
-       case .array(_, let vals, let count) = arrObj.payload {
-        for i in 0..<Int(count) {
+       let snap = arrObj.arraySnapshot() {
+        let vals = snap.values, count = snap.count
+        for i in 0..<count where i < vals.count {
             let elem = vals[i]
             // In a full engine, we'd call the callback through JS_Call.
             // The key would be the return value. For the data structure:

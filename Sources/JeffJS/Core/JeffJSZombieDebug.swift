@@ -23,6 +23,8 @@ nonisolated(unsafe) var jeffJSObjectPoolDisabled: Bool = false
 nonisolated(unsafe) var jeffJS_refDebugMode: Bool = false
 /// JEFFJS_TRACE_DEBUG=1: log fast-trace entries/exits (first few per block).
 nonisolated(unsafe) var jeffJSTraceDebug: Bool = false
+/// JEFFJS_TRACK_RC=1: refcount tracking with a report at exit.
+nonisolated(unsafe) var jeffJS_rcReportRegistered: Bool = false
 
 /// Copy the config/env-derived debug flags into their plain stored globals.
 /// Idempotent; called from JeffJSRuntime.init.
@@ -31,8 +33,13 @@ func jeffJS_bootstrapDebugFlags() {
     jeffJSTraceDebug = ProcessInfo.processInfo.environment["JEFFJS_TRACE_DEBUG"] == "1"
     jeffJSObjectPoolDisabled = ProcessInfo.processInfo.environment["JEFFJS_NO_POOL"] == "1"
     JeffJSGCObjectHeader.trackRefcounts = JeffJSConfig.trackRefcounts
+        || ProcessInfo.processInfo.environment["JEFFJS_TRACK_RC"] == "1"
     jeffJS_refDebugMode = JeffJSGCObjectHeader.trackRefcounts || jeffJSZombiesEnabled
     jeffJS_computeStoreOpcodeMask()
+    if JeffJSGCObjectHeader.trackRefcounts && !jeffJS_rcReportRegistered {
+        jeffJS_rcReportRegistered = true
+        atexit { FileHandle.standardError.write(JeffJSGCObjectHeader.refcountReport().data(using: .utf8)!) }
+    }
 }
 
 enum JeffJSZombieDebug {

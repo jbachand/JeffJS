@@ -1065,8 +1065,8 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                     if idx < storage.count && Int(idx) < storage.values.count {
                         return true
                     }
-                } else if case .array(_, let vals, let count) = jsObj.payload {
-                    if idx < count && Int(idx) < vals.count {
+                } else if let snap = jsObj.arraySnapshot() {
+                    if Int(idx) < snap.count && Int(idx) < snap.values.count {
                         return true
                     }
                 }
@@ -3827,18 +3827,15 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             if obj.isString {
                 // String indexing
                 if rt.atomIsArrayIndex(atom) {
-                    if let idx = rt.atomToUInt32(atom), let str = obj.stringValue?.toSwiftString() {
-                        let index = str.index(str.startIndex, offsetBy: Int(idx), limitedBy: str.endIndex)
-                        if let index = index, index < str.endIndex {
-                            return newStringValue(String(str[index]))
-                        }
+                    if let idx = rt.atomToUInt32(atom), let js = obj.stringValue, Int(idx) < js.len {
+                        return JeffJSBuiltinString.oneCodeUnitString(jeffJS_getString(str: js, at: Int(idx)))
                     }
                     return .JS_UNDEFINED
                 }
                 // String.length
                 if atom == JeffJSAtomID.JS_ATOM_length.rawValue {
-                    if let str = obj.stringValue?.toSwiftString() {
-                        return .newInt32(Int32(str.utf16.count))
+                    if let sb = obj.stringBase {
+                        return .newInt32(Int32(jeffJS_stringLength(sb)))
                     }
                 }
                 // Fall through to String.prototype
@@ -3955,17 +3952,14 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             let pv = jsObj.primitiveValue
             if pv.isString {
                 if rt.atomIsArrayIndex(atom) {
-                    if let idx = rt.atomToUInt32(atom), let str = pv.stringValue?.toSwiftString() {
-                        let index = str.index(str.startIndex, offsetBy: Int(idx), limitedBy: str.endIndex)
-                        if let index = index, index < str.endIndex {
-                            return newStringValue(String(str[index]))
-                        }
+                    if let idx = rt.atomToUInt32(atom), let js = pv.stringValue, Int(idx) < js.len {
+                        return JeffJSBuiltinString.oneCodeUnitString(jeffJS_getString(str: js, at: Int(idx)))
                     }
                     return .JS_UNDEFINED
                 }
                 if atom == JeffJSAtomID.JS_ATOM_length.rawValue {
-                    if let str = pv.stringValue?.toSwiftString() {
-                        return .newInt32(Int32(str.utf16.count))
+                    if let sb = pv.stringBase {
+                        return .newInt32(Int32(jeffJS_stringLength(sb)))
                     }
                 }
             }

@@ -85,6 +85,10 @@ final class JeffJSString: JeffJSStringBase {
 
     /// Next pointer in the atom hash chain.
     var hashNext: UInt32
+    /// Regex input caches (js_regexp_execInternal): the code units / code
+    /// points of this string as UInt32, built once instead of per exec.
+    var codeUnits32: [UInt32]? = nil
+    var codePoints32: [UInt32]? = nil
 
     // -- Storage -------------------------------------------------------------
 
@@ -153,6 +157,9 @@ final class JeffJSString: JeffJSStringBase {
 /// Port of QuickJS rope node used by `js_concat_string`.
 /// A rope postpones flattening until the string content is actually needed.
 final class JeffJSStringRope: JeffJSStringBase {
+    /// Flattened form, built on first read and kept (reads of a string built
+    /// with `+=` used to re-flatten the whole rope on every access).
+    var flat: JeffJSString? = nil
 
     /// UAF tripwire (zombie mode) — see JeffJSString.freeMark.
     var len: Int
@@ -213,6 +220,17 @@ func jeffJS_allocString(maxLen: Int, isWideChar: Bool) -> JeffJSString? {
 // MARK: - Character access
 
 /// Return the code unit at `index` as a UInt32 (works for both widths).
+/// Length in UTF-16 code units of any string representation, without
+/// flattening or re-encoding.
+@inline(__always)
+func jeffJS_stringLength(_ sb: JeffJSStringBase) -> Int {
+    switch sb.kind {
+    case JeffJSStringBase.kindFlat: return unsafeDowncast(sb, to: JeffJSString.self).len
+    case JeffJSStringBase.kindRope: return unsafeDowncast(sb, to: JeffJSStringRope.self).len
+    default: return unsafeDowncast(sb, to: JeffJSStringBuffer.self).size
+    }
+}
+
 func jeffJS_getString(str: JeffJSString, at index: Int) -> UInt32 {
     guard index >= 0, index < str.len else { return 0 }
     switch str.storage {

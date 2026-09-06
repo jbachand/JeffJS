@@ -1161,12 +1161,22 @@ final class JeffJSObject: JeffJSGCObjectHeader {
 
     // -- Payload (union) -----------------------------------------------------
 
-    var payload: JeffJSObjectPayload    = .opaque(nil)
+    var payload: JeffJSObjectPayload    = .opaque(nil) {
+        didSet {
+            if case .cFunc(_, let cf, _, _, let magic) = payload { cFuncFast = cf; cMagicFast = Int(magic) }
+            else if cFuncFast != nil { cFuncFast = nil }
+        }
+    }
 
     // -- Denormalized .bytecodeFunc payload (call-path fast fields) -----------
     // Pattern-matching `case .bytecodeFunc(...) = payload` copies the enum
     // (retaining the FB and the varRefs array) on every JS call. The hot call
     // path reads these instead; they are kept in sync at every payload write.
+    /// Native-function dispatch fields, mirrored from the `.cFunc` payload so
+    /// callFunction never pattern-matches (copies) the payload enum: that copy
+    /// retained the realm context, whose refcount lives in a side table.
+    var cFuncFast: JSCFunctionType? = nil
+    var cMagicFast: Int = 0
     var fbFast: JeffJSFunctionBytecode? = nil {
         didSet { fbFastU = fbFast.map { Unmanaged.passUnretained($0) } }
     }
@@ -1629,6 +1639,15 @@ extension JeffJSObject {
         return 0
     }
 
+    /// Elements and count of a fast array from the authoritative storage
+    /// (the enum payload is stale once the ref-type store exists). nil for
+    /// non-array payloads. Readers must use this, not `case .array`.
+    func arraySnapshot() -> (values: ContiguousArray<JeffJSValue>, count: Int)? {
+        if let storage = _fastArrayValues { return (storage.values, Int(storage.count)) }
+        if case .array(_, let vals, let count) = payload { return (ContiguousArray(vals), Int(count)) }
+        return nil
+    }
+
     /// Direct access to fast-array element at `index`.
     func getArrayElement(_ index: UInt32) -> JeffJSValue {
         if let storage = _fastArrayValues {
@@ -1665,25 +1684,14 @@ extension JeffJSObject {
             return true
         }
 
-        guard case .array(var size, var vals, var count) = payload else { return false }
-
-        let idx = Int(index)
-        if idx >= vals.count {
-            // Cap growth: don't allocate more than 2x current count + 8,
-            // to prevent arr[1_000_000] = x from allocating 1M slots.
-            let minRequired = idx + 1
-            let growthTarget = max(minRequired, vals.count * 2)
-            let maxSafe = max(minRequired, Int(count) * 4 + 8)
-            let newSize = min(growthTarget, maxSafe)
-            vals.reserveCapacity(newSize)
-            vals.append(contentsOf: repeatElement(JeffJSValue.undefined, count: newSize - vals.count))
-            size = UInt32(newSize)
-        }
-        if index < count { vals[idx].freeValue() }   // overwrite releases the old element
-        vals[idx] = value
-        if index >= count { count = index + 1 }
-        payload = .array(size: size, values: vals, count: count)
-        return true
+        guard case .array(_, let vals, let count) = payload else { return false }
+        // First indexed store: switch to the ref-type storage so later stores
+        // happen in place. Extracting the enum's array and writing it back
+        // copied the whole array per store (map/filter/Array.from/split
+        // results were quadratic: memmove was 71% of a callback profile).
+        let storage = JeffJSFastArrayStorage(values: ContiguousArray(vals), count: count)
+        _fastArrayValues = storage
+        return setArrayElement(index, value: value)
     }
 
     /// Shrink a fast array to `newLen` elements, releasing the dropped

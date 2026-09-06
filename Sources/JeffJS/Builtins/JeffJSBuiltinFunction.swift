@@ -451,9 +451,9 @@ struct JeffJSBuiltinFunction {
         }
 
         // Fast path for arrays
-        if argsObj.isArray, case .array(_, let values, let count) = argsObj.payload {
-            let actualCount = min(length, Int(count))
-            return Array(values.prefix(actualCount))
+        if argsObj.isArray, let snap = argsObj.arraySnapshot() {
+            let actualCount = min(length, snap.count)
+            return Array(snap.values.prefix(actualCount))
         }
 
         // General path: read indexed properties

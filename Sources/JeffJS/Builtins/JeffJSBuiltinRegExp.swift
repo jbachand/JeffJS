@@ -1573,7 +1573,7 @@ private func js_regexp_execInternal(
     // Unwrap the JeffJSString -> [UInt8].
     let bytecode: [UInt8]
     if case .str8(let buf) = bc.storage {
-        bytecode = Array(buf.prefix(bc.len))
+        bytecode = buf.count == bc.len ? buf : Array(buf.prefix(bc.len))   // no per-exec copy
     } else {
         return nil  // bytecode must be str8
     }
@@ -1582,18 +1582,34 @@ private func js_regexp_execInternal(
 
     // 2. Convert the input JeffJSString to [UInt32] code units.
     //    For non-unicode mode we use UTF-16 code units (matching JS semantics).
+    // Input as UInt32 code units, converted once per string and cached on it:
+    // split/replace/global match run one exec per match (or per position),
+    // and re-encoding the whole input each time made them quadratic.
     let inputCodeUnits: [UInt32]
     let isUnicode = (flags & LRE_FLAG_UNICODE) != 0 || (flags & LRE_FLAG_UNICODE_SETS) != 0
     if isUnicode {
-        let s = inputStr.toSwiftString()
-        inputCodeUnits = Array(s.unicodeScalars.map { $0.value })
+        if let c = inputStr.codePoints32 {
+            inputCodeUnits = c
+        } else {
+            let s = inputStr.toSwiftString()
+            let c = Array(s.unicodeScalars.map { $0.value })
+            inputStr.codePoints32 = c
+            inputCodeUnits = c
+        }
     } else {
-        // UTF-16 code units, matching JS string semantics.
-        let s = inputStr.toSwiftString()
-        inputCodeUnits = Array(s.utf16.map { UInt32($0) })
+        if let c = inputStr.codeUnits32 {
+            inputCodeUnits = c
+        } else {
+            var c = [UInt32](); c.reserveCapacity(inputStr.len)
+            switch inputStr.storage {
+            case .str8(let b): for u in b { c.append(UInt32(u)) }
+            case .str16(let b): for u in b { c.append(UInt32(u)) }
+            }
+            inputStr.codeUnits32 = c
+            inputCodeUnits = c
+        }
     }
 
-    // 3. Build JeffJSRegExpFlags from the integer bitmask.
     var regexpFlags = JeffJSRegExpFlags()
     if flags & LRE_FLAG_GLOBAL != 0       { regexpFlags.insert(.global) }
     if flags & LRE_FLAG_IGNORECASE != 0   { regexpFlags.insert(.ignoreCase) }

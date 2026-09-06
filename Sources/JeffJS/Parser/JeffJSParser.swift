@@ -4683,8 +4683,17 @@ final class JeffJSParser {
                         // super.m(...): [homeProto] -> [this, homeProto] -> [this, m]
                         emitOp(.push_this); emitOp(.swap)
                         pendingMethodCall = true
+                        emitGetField(fieldAtom)
+                    } else if tok == 0x28 {
+                        // obj.m(...): keep the receiver for call_method right here.
+                        // The later get_field+call rewrite pass loses the receiver
+                        // when the arguments contain branches (`o.m(c ? a : b)`).
+                        emitOp(.get_field2)
+                        emitAtom(fieldAtom)
+                        pendingMethodCall = true
+                    } else {
+                        emitGetField(fieldAtom)
                     }
-                    emitGetField(fieldAtom)
                 } else if tok == JSTokenType.TOK_PRIVATE_NAME.rawValue {
                     let fieldAtom = s.token.identAtom
                     next()

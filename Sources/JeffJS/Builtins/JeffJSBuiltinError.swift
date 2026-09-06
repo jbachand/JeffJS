@@ -650,8 +650,8 @@ struct JeffJSBuiltinError {
             cloneObj.extensible = true
             cloneObj.fastArray = true
 
-            if case .array(let size, let values, let count) = iterObj.payload {
-                cloneObj.payload = .array(size: size, values: values, count: count)
+            if let snap = iterObj.arraySnapshot() {
+                cloneObj.payload = .array(size: UInt32(snap.values.count), values: Array(snap.values), count: UInt32(snap.count))
             } else {
                 cloneObj.payload = .array(size: 0, values: [], count: 0)
             }

@@ -15,16 +15,21 @@ import Foundation
 extension JeffJSContext {
     /// Convert a JS string value to an array of UTF-16 code units.
     func toUTF16Array(_ val: JeffJSValue) -> [UInt16] {
+        // Straight from the string's own storage (the Swift String round trip
+        // re-encoded the whole string on every method call).
         let jsStr = toString(val)
         if jsStr.isException { return [] }
-        guard let s = jsStr.stringValue?.toSwiftString() else { return [] }
-        return Array(s.utf16)
+        guard let js = jsStr.stringValue else { return [] }
+        let out = js.str16
+        jsStr.freeValue()
+        return out
     }
 
     /// Optional version of toUTF16Array (returns nil on failure).
     func toUTF16ArrayOpt(_ val: JeffJSValue) -> [UInt16]? {
         let jsStr = toString(val)
         if jsStr.isException { return nil }
+        if let js = jsStr.stringValue { let out = js.str16; jsStr.freeValue(); return out }
         guard let s = jsStr.stringValue?.toSwiftString() else { return nil }
         return Array(s.utf16)
     }
@@ -542,10 +547,30 @@ struct JeffJSBuiltinString {
     // MARK: - Character Access
 
     /// `String.prototype.charAt(pos)`
-    static func charAt(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard let str = requireThisString(ctx: ctx, this: this, method: "charAt") else {
-            return .exception
+    /// Owned string value of `this` for O(1) code-unit access through
+    /// `jeffJS_getString(str:at:)` (no per-call re-encoding of the string).
+    static func requireThisStringValue(ctx: JeffJSContext, this: JeffJSValue, method: String) -> JeffJSValue? {
+        if this.isNull || this.isUndefined {
+            _ = ctx.throwTypeError("String.prototype.\(method) called on null or undefined")
+            return nil
         }
+        let str = ctx.toString(this)
+        if str.isException { return nil }
+        return str
+    }
+
+    @inline(__always)
+    static func oneCodeUnitString(_ cu: UInt32) -> JeffJSValue {
+        if cu < 256 {
+            return JeffJSValue.makeString(JeffJSString(refCount: 1, len: 1, isWideChar: false, storage: .str8([UInt8(cu)])))
+        }
+        return JeffJSValue.makeString(JeffJSString(refCount: 1, len: 1, isWideChar: true, storage: .str16([UInt16(cu)])))
+    }
+
+    static func charAt(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        guard let sv = requireThisStringValue(ctx: ctx, this: this, method: "charAt") else { return .exception }
+        defer { sv.freeValue() }
+        guard let js = sv.stringValue else { return ctx.newStringValue("") }
         let pos: Int
         if args.isEmpty {
             pos = 0
@@ -554,36 +579,38 @@ struct JeffJSBuiltinString {
             if n.isException { return .exception }
             pos = ctx.extractInt(n)
         }
-        if pos < 0 || pos >= str.count {
+        if pos < 0 || pos >= js.len {
             return ctx.newStringValue("")
         }
-        return makeString(ctx: ctx, utf16: [str[pos]])
+        return oneCodeUnitString(jeffJS_getString(str: js, at: pos))
     }
 
     /// `String.prototype.charCodeAt(pos)`
     static func charCodeAt(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard let str = requireThisString(ctx: ctx, this: this, method: "charCodeAt") else {
-            return .exception
-        }
+        guard let sv = requireThisStringValue(ctx: ctx, this: this, method: "charCodeAt") else { return .exception }
+        defer { sv.freeValue() }
+        guard let js = sv.stringValue else { return JeffJSValue.JS_NAN }
         let pos: Int
         if args.isEmpty {
             pos = 0
+        } else if args[0].isInt {
+            pos = Int(args[0].toInt32())
         } else {
             let n = ctx.toInteger(args[0])
             if n.isException { return .exception }
             pos = ctx.extractInt(n)
         }
-        if pos < 0 || pos >= str.count {
+        if pos < 0 || pos >= js.len {
             return JeffJSValue.JS_NAN
         }
-        return JeffJSValue.newInt32(Int32(str[pos]))
+        return JeffJSValue.newInt32(Int32(jeffJS_getString(str: js, at: pos)))
     }
 
     /// `String.prototype.codePointAt(pos)`
     static func codePointAt(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard let str = requireThisString(ctx: ctx, this: this, method: "codePointAt") else {
-            return .exception
-        }
+        guard let sv = requireThisStringValue(ctx: ctx, this: this, method: "codePointAt") else { return .exception }
+        defer { sv.freeValue() }
+        guard let js = sv.stringValue else { return .undefined }
         let pos: Int
         if args.isEmpty {
             pos = 0
@@ -592,12 +619,12 @@ struct JeffJSBuiltinString {
             if n.isException { return .exception }
             pos = ctx.extractInt(n)
         }
-        if pos < 0 || pos >= str.count {
+        if pos < 0 || pos >= js.len {
             return .undefined
         }
-        let first = str[pos]
-        if isHiSurrogate(first) && pos + 1 < str.count {
-            let second = str[pos + 1]
+        let first = UInt16(jeffJS_getString(str: js, at: pos))
+        if isHiSurrogate(first) && pos + 1 < js.len {
+            let second = UInt16(jeffJS_getString(str: js, at: pos + 1))
             if isLoSurrogate(second) {
                 let cp = unicodeFromUTF16Surrogates(high: first, low: second)
                 return JeffJSValue.newInt32(Int32(cp))
@@ -608,10 +635,10 @@ struct JeffJSBuiltinString {
 
     /// `String.prototype.at(index)` (ES2022)
     static func at(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard let str = requireThisString(ctx: ctx, this: this, method: "at") else {
-            return .exception
-        }
-        let len = str.count
+        guard let sv = requireThisStringValue(ctx: ctx, this: this, method: "at") else { return .exception }
+        defer { sv.freeValue() }
+        guard let js = sv.stringValue else { return .undefined }
+        let len = js.len
         let relIndex: Int
         if args.isEmpty {
             relIndex = 0
@@ -624,7 +651,7 @@ struct JeffJSBuiltinString {
         if k < 0 || k >= len {
             return .undefined
         }
-        return makeString(ctx: ctx, utf16: [str[k]])
+        return oneCodeUnitString(jeffJS_getString(str: js, at: k))
     }
 
     // MARK: - Search Methods

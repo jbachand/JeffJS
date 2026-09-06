@@ -296,8 +296,9 @@ extension JeffJSContext {
         // 1. Integer-indexed array elements (from fast-array payload).
         //    These are always enumerable and already in ascending order.
         if wantStrings {
-            if case .array(_, let values, let count) = jsObj.payload {
-                for i in 0..<Int(count) {
+            if let snap = jsObj.arraySnapshot() {
+                let values = snap.values, count = snap.count
+                for i in 0..<count {
                     if i < values.count && !values[i].isUndefined {
                         intKeys.append((UInt32(i), newStringValue(String(i))))
                     }

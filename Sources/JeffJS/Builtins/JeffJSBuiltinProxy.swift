@@ -673,8 +673,9 @@ func js_reflect_apply(_ ctx: JeffJSContext,
     var args: [JeffJSValue] = []
     if let arrObj = argList.toObject(),
        arrObj.isArray,
-       case .array(_, let vals, let count) = arrObj.payload {
-        for i in 0..<Int(count) {
+       let snap = arrObj.arraySnapshot() {
+        let vals = snap.values, count = snap.count
+        for i in 0..<count where i < vals.count {
             args.append(vals[i])
         }
     }

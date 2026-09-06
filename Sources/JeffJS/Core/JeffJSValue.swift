@@ -325,8 +325,12 @@ struct JeffJSValue {
         case JeffJSStringBase.kindFlat:
             return unsafeDowncast(sb, to: JeffJSString.self)
         case JeffJSStringBase.kindRope:
-            // Rope: flatten to a contiguous JeffJSString
-            return jeffJS_flattenRope(unsafeDowncast(sb, to: JeffJSStringRope.self))
+            // Rope: flatten to a contiguous JeffJSString, once
+            let rope = unsafeDowncast(sb, to: JeffJSStringRope.self)
+            if let f = rope.flat { return f }
+            let f = jeffJS_flattenRope(rope)
+            rope.flat = f
+            return f
         default:
             // Buffer accumulator — materialise to flat string
             return unsafeDowncast(sb, to: JeffJSStringBuffer.self).toJeffJSString()

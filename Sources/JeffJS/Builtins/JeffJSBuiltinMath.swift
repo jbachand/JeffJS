@@ -541,8 +541,9 @@ private func jsMath_sumPrecise(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ a
     }
 
     var count: Int = 0
-    if case .array(_, let vals, let c) = arrObj.payload {
-        count = Int(c)
+    if let snap = arrObj.arraySnapshot() {
+        let vals = snap.values
+        count = snap.count
 
         // Neumaier compensated summation
         var sum = 0.0
