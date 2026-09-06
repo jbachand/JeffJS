@@ -3639,6 +3639,39 @@ private func executeFastTrace(
                 pc += 2
             }
 
+        case .cmp_if8, .cmp_if:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            let cbSub = Int(bc[pc + 1])
+            let cbShort = (op == .cmp_if8)
+            let cbSize = cbShort ? 3 : 6
+            var cbCond = false
+            if lhs.isInt && rhs.isInt {
+                let a = lhs.toInt32(), b = rhs.toInt32()
+                switch cbSub & 7 { case 0: cbCond = a < b; case 1: cbCond = a <= b; case 2: cbCond = a > b; case 3: cbCond = a >= b; case 4, 6: cbCond = a == b; default: cbCond = a != b }
+            } else if lhs.isNumber && rhs.isNumber {
+                let a = jeffJS_traceNum(lhs), b = jeffJS_traceNum(rhs)
+                switch cbSub & 7 { case 0: cbCond = a < b; case 1: cbCond = a <= b; case 2: cbCond = a > b; case 3: cbCond = a >= b; case 4, 6: cbCond = a == b; default: cbCond = a != b }
+            } else { resume = pc; break traceLoop }
+            sp -= 2
+            if cbCond == ((cbSub & 8) != 0) {
+                let offset = cbShort ? Int(readI8(bc, pc + 2)) : Int(readI32(bc, pc + 2))
+                let target = pc + cbSize + offset
+                if target < 0 || target >= bcLen {
+                    resume = target; break traceLoop
+                }
+                if offset < 0 {   // loop back-edge: interrupt check
+                    interrupt -= 1
+                    if interrupt <= 0 {
+                        interrupt = JS_INTERRUPT_COUNTER_INIT
+                        ctx.interruptCounter = interrupt
+                        if ctx.checkInterrupt() { resume = -1; break traceLoop }
+                    }
+                }
+                pc = target
+            } else {
+                pc += cbSize
+            }
+
         case .if_true8:
             sp -= 1
             let cond = buf[sp]
@@ -4868,6 +4901,39 @@ private func executeFastTraceLean(
                 pc = target
             } else {
                 pc += 2
+            }
+
+        case .cmp_if8, .cmp_if:
+            let rhs = buf[sp - 1]; let lhs = buf[sp - 2]
+            let cbSub = Int(bc[pc + 1])
+            let cbShort = (op == .cmp_if8)
+            let cbSize = cbShort ? 3 : 6
+            var cbCond = false
+            if lhs.isInt && rhs.isInt {
+                let a = lhs.toInt32(), b = rhs.toInt32()
+                switch cbSub & 7 { case 0: cbCond = a < b; case 1: cbCond = a <= b; case 2: cbCond = a > b; case 3: cbCond = a >= b; case 4, 6: cbCond = a == b; default: cbCond = a != b }
+            } else if lhs.isNumber && rhs.isNumber {
+                let a = jeffJS_traceNum(lhs), b = jeffJS_traceNum(rhs)
+                switch cbSub & 7 { case 0: cbCond = a < b; case 1: cbCond = a <= b; case 2: cbCond = a > b; case 3: cbCond = a >= b; case 4, 6: cbCond = a == b; default: cbCond = a != b }
+            } else { ctx.interruptCounter = interrupt; return pc }
+            sp -= 2
+            if cbCond == ((cbSub & 8) != 0) {
+                let offset = cbShort ? Int(readI8(bc, pc + 2)) : Int(readI32(bc, pc + 2))
+                let target = pc + cbSize + offset
+                if target < entryPC || target >= exitPC {
+                    ctx.interruptCounter = interrupt; return target
+                }
+                if offset < 0 {   // loop back-edge: interrupt check
+                    interrupt -= 1
+                    if interrupt <= 0 {
+                        interrupt = JS_INTERRUPT_COUNTER_INIT
+                        ctx.interruptCounter = interrupt
+                        if ctx.checkInterrupt() { ctx.interruptCounter = interrupt; return -1 }
+                    }
+                }
+                pc = target
+            } else {
+                pc += cbSize
             }
 
         case .if_true8:
@@ -8754,6 +8820,109 @@ struct JeffJSInterpreter {
                     }
                 } else {
                     pc += 2
+                }
+
+            case .cmp_if8, .cmp_if:
+                // Fused compare + conditional branch (see fuseCompareBranches).
+                let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let cbSub = Int(readU8(bc, pc + 1))
+                let cbShort = (op == .cmp_if8)
+                let cbSize = cbShort ? 3 : 6
+                let offset = cbShort ? Int(readI8(bc, pc + 2)) : Int(readI32(bc, pc + 2))
+                var cbCond = false
+                if lhs.isInt && rhs.isInt {
+                    let a = lhs.toInt32(), b = rhs.toInt32()
+                    switch cbSub & 7 { case 0: cbCond = a < b; case 1: cbCond = a <= b; case 2: cbCond = a > b; case 3: cbCond = a >= b; case 4, 6: cbCond = a == b; default: cbCond = a != b }
+                } else {
+                    switch cbSub & 7 {
+                    case 0:
+                        let (cmp, ok) = JeffJSOperators.jsCompare(ctx: ctx, lhs: lhs, rhs: rhs)
+                        lhs.freeValue(); rhs.freeValue()
+                        if !ok { retVal = .exception; break dispatchLoop }
+                        cbCond = cmp < 0
+                    case 1:
+                        let (cmp, ok) = JeffJSOperators.jsCompare(ctx: ctx, lhs: rhs, rhs: lhs)
+                        lhs.freeValue(); rhs.freeValue()
+                        if !ok { retVal = .exception; break dispatchLoop }
+                        cbCond = cmp == 0
+                    case 2:
+                        let (cmp, ok) = JeffJSOperators.jsCompare(ctx: ctx, lhs: rhs, rhs: lhs)
+                        lhs.freeValue(); rhs.freeValue()
+                        if !ok { retVal = .exception; break dispatchLoop }
+                        cbCond = cmp < 0
+                    case 3:
+                        let (cmp, ok) = JeffJSOperators.jsCompare(ctx: ctx, lhs: lhs, rhs: rhs)
+                        lhs.freeValue(); rhs.freeValue()
+                        if !ok { retVal = .exception; break dispatchLoop }
+                        cbCond = cmp == 0
+                    case 4, 5:
+                        let (r, ok) = JeffJSOperators.jsEq(ctx: ctx, lhs: lhs, rhs: rhs)
+                        lhs.freeValue(); rhs.freeValue()
+                        if !ok { retVal = .exception; break dispatchLoop }
+                        cbCond = (cbSub & 7) == 4 ? r : !r
+                    default:
+                        let r = JeffJSOperators.jsStrictEq(lhs: lhs, rhs: rhs)
+                        lhs.freeValue(); rhs.freeValue()
+                        cbCond = (cbSub & 7) == 6 ? r : !r
+                    }
+                }
+                if cbCond == ((cbSub & 8) != 0) {
+                    pc += cbSize + offset
+                    if offset < 0 {
+                        ctx.interruptCounter -= 1
+                        if ctx.interruptCounter <= 0 {
+                            ctx.interruptCounter = JS_INTERRUPT_COUNTER_INIT
+                            if ctx.checkInterrupt() { retVal = .exception; break dispatchLoop }
+                        }
+                    // Trace block dispatch for hot loops
+                    if let traceInfo = fb.traceBlocks?[pc] {
+                        if traceInfo.isActive {
+                            if !traceInfo.hasCalls {
+                                let resumePC = executeFastTraceLean(
+                                    bc: bc, bcLen: bcLen,
+                                    entryPC: traceInfo.entryPC, exitPC: traceInfo.exitPC,
+                                    startPC: traceInfo.startPC,
+                                    buf: buf, varBase: varBase, sp: &sp, ctx: ctx,
+                                    cpool: fb.cpool, stackLimit: bufCapacity, icEntries: fb.icEntries)
+                                if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                                pc = resumePC
+                                continue dispatchLoop
+                            }
+                                let fbIdBefore = ObjectIdentifier(fb)
+                                var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
+                                let resumePC = executeFastTrace(state: &hot, startPC: traceInfo.startPC, ctx: ctx, rt: rt, inlineBase: inlineBase)
+                                sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
+                                bc = hot.bc; bcLen = hot.bcLen; fb = hot.fb; frame = hot.frame
+                                mFuncObj = hot.funcObj; mFlags = hot.flags; bufOwned = hot.bufOwned
+                                if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
+                                if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                                if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
+                                    FileHandle.standardError.write("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun)\n".data(using: .utf8)!)
+                                }
+                                // A block that keeps deopting (unsupported op in the
+                                // body or in a callee) costs a state handoff per
+                                // iteration: switch it off after 200 in a row.
+                                // Only runs that made little progress count: a trace
+                                // that executes most of the body before deopting is
+                                // still a net win over the main loop.
+                                if hot.opsRun < 16,
+                                   ObjectIdentifier(fb) != fbIdBefore
+                                    || (resumePC >= traceInfo.entryPC && resumePC < traceInfo.exitPC) {
+                                    traceInfo.deoptCount &+= 1
+                                    if traceInfo.deoptCount >= 200 { traceInfo.isActive = false; traceInfo.disabled = true }
+                                } else {
+                                    traceInfo.deoptCount = 0
+                                }
+                            pc = resumePC
+                            continue dispatchLoop
+                        } else {
+                            traceInfo.hitCount &+= 1
+                            if traceInfo.hitCount >= traceHitThreshold, !traceInfo.disabled { traceInfo.isActive = true }
+                        }
+                    }
+                    }
+                } else {
+                    pc += cbSize
                 }
 
             case .if_true8:

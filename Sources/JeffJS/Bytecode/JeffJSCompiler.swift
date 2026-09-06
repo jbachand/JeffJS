@@ -2083,6 +2083,10 @@ struct JeffJSCompiler {
         }
         fd.pc2Events.removeAll()
 
+        // Pass 5: fuse compare + conditional branch into cmp_if8 / cmp_if
+        // (same byte size as the pair, so no relayout; jump offsets stay).
+        fuseCompareBranches(fd: fd, bc: &bc)
+
         // ------------------------------------------------------------------
         // Compute stack size
         // ------------------------------------------------------------------
@@ -2778,6 +2782,58 @@ struct JeffJSCompiler {
     /// Remove dead code after terminal opcodes (return, throw, goto).
     /// Dead code regions end when a jump target (label address) points to the
     /// current position, since that means live code can reach this point.
+    /// Fuse `lt/lte/gt/gte/eq/neq/strict_eq/strict_neq` followed by
+    /// `if_true8/if_false8` (-> cmp_if8, 3 bytes) or `if_true/if_false`
+    /// (-> cmp_if, 6 bytes). The fused instruction occupies exactly the bytes
+    /// of the pair and ends where the branch ended, so every relative offset
+    /// in the function stays valid. Skipped when a label targets the branch
+    /// itself (something jumps to the branch without the compare).
+    /// sub byte: bits 0-2 = compare kind, bit 3 = branch when true.
+    private static func fuseCompareBranches(fd: JeffJSFunctionDefCompiler, bc: inout DynBuf) {
+        let len = bc.len
+        var labelAddrs = Set<Int>()
+        for l in fd.labels where l.addr >= 0 { labelAddrs.insert(l.addr) }
+        var pos = 0
+        while pos < len {
+            guard pos < bc.buf.count, let (op, width) = readOpcodeFromBuf(bc.buf, pos) else { pos += 1; continue }
+            let size = max(Int(jeffJSGetOpcodeInfo(op).size) + (width - 1), 1)
+            let kind: Int
+            switch op {
+            case .lt: kind = 0
+            case .lte: kind = 1
+            case .gt: kind = 2
+            case .gte: kind = 3
+            case .eq: kind = 4
+            case .neq: kind = 5
+            case .strict_eq: kind = 6
+            case .strict_neq: kind = 7
+            default: kind = -1
+            }
+            if kind >= 0, width == 1, size == 1 {
+                let np = pos + 1
+                if np < len, np < bc.buf.count, !labelAddrs.contains(np),
+                   let (nop, nwidth) = readOpcodeFromBuf(bc.buf, np), nwidth == 1 {
+                    switch nop {
+                    case .if_true8, .if_false8:
+                        // [cmp][if8 op][i8]  ->  [cmp_if8][sub][i8]
+                        bc.buf[pos] = UInt8(truncatingIfNeeded: JeffJSOpcode.cmp_if8.rawValue)
+                        bc.buf[pos + 1] = UInt8(kind | (nop == .if_true8 ? 8 : 0))
+                        pos = np + 2
+                        continue
+                    case .if_true, .if_false:
+                        // [cmp][if op][i32]  ->  [cmp_if][sub][i32]
+                        bc.buf[pos] = UInt8(truncatingIfNeeded: JeffJSOpcode.cmp_if.rawValue)
+                        bc.buf[pos + 1] = UInt8(kind | (nop == .if_true ? 8 : 0))
+                        pos = np + 5
+                        continue
+                    default: break
+                    }
+                }
+            }
+            pos += size
+        }
+    }
+
     /// Remove every NOP byte from the final bytecode and remap all relative
     /// jump operands (label / label8 / label16 / atom_label_u8 / atom_label_u16,
     /// narrow or wide-prefixed), the resolved label addresses and (via the
@@ -3500,7 +3556,15 @@ struct JeffJSCompiler {
                 break
 
             case .u8:
-                if pos + 1 < len {
+                if info.name == "cmp_if8" || info.name == "cmp_if" {
+                    let sub = pos + 1 < len ? Int(bytecode[pos + 1]) : 0
+                    let names = ["lt", "lte", "gt", "gte", "eq", "neq", "strict_eq", "strict_neq"]
+                    let isShort = info.name == "cmp_if8"
+                    let off: Int = isShort
+                        ? (pos + 2 < len ? Int(Int8(bitPattern: bytecode[pos + 2])) : 0)
+                        : (pos + 5 < len ? Int(Int32(bitPattern: readU32(bytecode, pos + 2))) : 0)
+                    out += " \(names[sub & 7]) \((sub & 8) != 0 ? "if_true" : "if_false") -> \(formatPC(pos + (isShort ? 3 : 6) + off))"
+                } else if pos + 1 < len {
                     out += " \(bytecode[pos + 1])"
                 }
 
@@ -3790,6 +3854,7 @@ struct JeffJSCompiler {
 
         // Control flow (branches + jumps — handled within the trace)
         .if_true, .if_false, .goto_, .if_true8, .if_false8, .goto8, .goto16,
+        .cmp_if8, .cmp_if,
 
         // Property access (IC hit paths only; misses deopt)
         .get_field, .get_field2, .put_field, .get_loc8_get_field, .get_arg0_get_field, .get_length,
@@ -3973,6 +4038,25 @@ struct JeffJSCompiler {
                 guard pc + opWidth < bc.count else { break }
                 let raw = bc[pc + opWidth]
                 let offset = Int(Int8(bitPattern: raw))
+                if offset < 0 {
+                    let target = pc + instrSize + offset
+                    if target >= 0 {
+                        candidates.append(Candidate(entryPC: target, exitPC: pc + instrSize))
+                    }
+                }
+            case .cmp_if8:
+                // fused compare + 8-bit branch: offset after the sub byte
+                guard pc + opWidth + 1 < bc.count else { break }
+                let offset = Int(Int8(bitPattern: bc[pc + opWidth + 1]))
+                if offset < 0 {
+                    let target = pc + instrSize + offset
+                    if target >= 0 {
+                        candidates.append(Candidate(entryPC: target, exitPC: pc + instrSize))
+                    }
+                }
+            case .cmp_if:
+                guard pc + opWidth + 4 < bc.count else { break }
+                let offset = Int(Int32(bitPattern: readU32(bc, pc + opWidth + 1)))
                 if offset < 0 {
                     let target = pc + instrSize + offset
                     if target >= 0 {

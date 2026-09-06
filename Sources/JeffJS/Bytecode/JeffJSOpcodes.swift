@@ -99,7 +99,7 @@ enum JeffJSOpcode: UInt16, CaseIterable {
     case nip                     // remove second-from-top
     case nip1                    // remove third-from-top
     case dup                     // duplicate top
-    case dup1                    // duplicate top and second element
+    case cmp_if                  // cmp_if(sub:u8, i32): fused compare + if_true/if_false
     case dup2                    // duplicate top 2
     case dup3                    // duplicate top 3
     case insert2                 // insert top value at position 2
@@ -109,7 +109,7 @@ enum JeffJSOpcode: UInt16, CaseIterable {
     case perm4                   // rotate 4
     case perm5                   // rotate 5
     case swap                    // swap top 2
-    case swap2                   // swap top 2 pairs
+    case cmp_if8                 // cmp_if8(sub:u8, i8): fused compare + if_true8/if_false8 (post-compaction rewrite)
     case rot3l                   // rotate 3 left:  a b c -> b c a
     case rot3r                   // rotate 3 right: a b c -> c a b (opposite of rot3l)
     case rot4l                   // rotate 4 left
@@ -486,6 +486,8 @@ enum JeffJSOpcode: UInt16, CaseIterable {
     case with_make_ref           // with_make_ref(atom, label, u8)
     case with_get_ref            // with_get_ref(atom, label, u8)
     case with_get_ref_undef      // with_get_ref_undef(atom, label, u8)
+    case swap2                   // swap top 2 pairs   (never emitted; parked in the wide range)
+    case dup1                    // duplicate top and second element   (never emitted; parked in the wide range)
 }
 
 // MARK: - Opcode Info Table
@@ -565,7 +567,7 @@ let jeffJSOpcodeInfo: [OpcodeInfo] = [
     OpcodeInfo(name: "nip",              size: 1, nPop: 1,  nPush: 0,  format: .none),
     OpcodeInfo(name: "nip1",             size: 1, nPop: 1,  nPush: 0,  format: .none),
     OpcodeInfo(name: "dup",              size: 1, nPop: 1,  nPush: 2,  format: .none),
-    OpcodeInfo(name: "dup1",             size: 1, nPop: 2,  nPush: 3,  format: .none),
+    OpcodeInfo(name: "cmp_if",           size: 6, nPop: 2,  nPush: 0,  format: .u8),
     OpcodeInfo(name: "dup2",             size: 1, nPop: 2,  nPush: 4,  format: .none),
     OpcodeInfo(name: "dup3",             size: 1, nPop: 3,  nPush: 6,  format: .none),
     OpcodeInfo(name: "insert2",          size: 1, nPop: 2,  nPush: 3,  format: .none),
@@ -575,7 +577,7 @@ let jeffJSOpcodeInfo: [OpcodeInfo] = [
     OpcodeInfo(name: "perm4",            size: 1, nPop: 4,  nPush: 4,  format: .none),
     OpcodeInfo(name: "perm5",            size: 1, nPop: 5,  nPush: 5,  format: .none),
     OpcodeInfo(name: "swap",             size: 1, nPop: 2,  nPush: 2,  format: .none),
-    OpcodeInfo(name: "swap2",            size: 1, nPop: 4,  nPush: 4,  format: .none),
+    OpcodeInfo(name: "cmp_if8",          size: 3, nPop: 2,  nPush: 0,  format: .u8),
     OpcodeInfo(name: "rot3l",            size: 1, nPop: 3,  nPush: 3,  format: .none),
     OpcodeInfo(name: "rot3r",            size: 1, nPop: 3,  nPush: 3,  format: .none),
     OpcodeInfo(name: "rot4l",            size: 1, nPop: 4,  nPush: 4,  format: .none),
@@ -1254,6 +1256,8 @@ let jeffJSOpcodeInfo: [OpcodeInfo] = [
     OpcodeInfo(name: "with_make_ref",    size: 10, nPop: 1, nPush: 2,  format: .atom_label_u8),
     OpcodeInfo(name: "with_get_ref",     size: 10, nPop: 1, nPush: 2,  format: .atom_label_u8),
     OpcodeInfo(name: "with_get_ref_undef", size: 10, nPop: 1, nPush: 2, format: .atom_label_u8),
+    OpcodeInfo(name: "swap2",            size: 1, nPop: 4,  nPush: 4,  format: .none),
+    OpcodeInfo(name: "dup1",             size: 1, nPop: 2,  nPush: 3,  format: .none),
 ]
 
 // MARK: - Opcode Lookup Helpers
