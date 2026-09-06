@@ -4,12 +4,25 @@
 
 import Foundation
 
+/// Bundle holding the engine's resources (config plist, Metal shaders).
+///
+/// `Bundle.module` is synthesized by SwiftPM only. These sources are also
+/// compiled directly into a host app (React Natively builds the engine into
+/// its own module), where the resources ship in the app bundle instead.
+let jeffJSResourceBundle: Bundle = {
+    #if SWIFT_PACKAGE
+    return Bundle.module
+    #else
+    return Bundle.main
+    #endif
+}()
+
 enum JeffJSConfig {
 
     // MARK: - Plist backing store (loaded once at process start)
 
     private static let dict: [String: Any] = {
-        guard let url = Bundle.module.url(forResource: "JeffJSConfig", withExtension: "plist"),
+        guard let url = jeffJSResourceBundle.url(forResource: "JeffJSConfig", withExtension: "plist"),
               let data = try? Data(contentsOf: url),
               let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
         else {

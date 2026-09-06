@@ -39,9 +39,9 @@ final class QuantumSimulatorGPU {
         // Try pre-compiled metallib first (SPM compiles .metal → .metallib),
         // then fall back to runtime source compilation.
         let lib: MTLLibrary
-        if let compiled = try? dev.makeDefaultLibrary(bundle: Bundle.module) {
+        if let compiled = try? dev.makeDefaultLibrary(bundle: jeffJSResourceBundle) {
             lib = compiled
-        } else if let url = Bundle.module.url(forResource: "QuantumSimulator", withExtension: "metal"),
+        } else if let url = jeffJSResourceBundle.url(forResource: "QuantumSimulator", withExtension: "metal"),
                   let source = try? String(contentsOf: url, encoding: .utf8),
                   let fallback = try? dev.makeLibrary(source: source, options: nil) {
             lib = fallback

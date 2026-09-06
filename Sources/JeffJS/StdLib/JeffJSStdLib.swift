@@ -191,12 +191,10 @@ struct JeffJSStdLib {
             } else if arg.isInt {
                 parts.append(String(arg.toInt32()))
             } else if arg.isFloat64 {
-                let d = arg.toFloat64()
-                if d == Double(Int64(d)) && !d.isNaN && !d.isInfinite {
-                    parts.append(String(Int64(d)))
-                } else {
-                    parts.append(String(d))
-                }
+                // Int64(d) traps for anything outside Int64's range, so
+                // console.log(1e300) used to kill the process; and Swift's
+                // own layout differs from JS ("1e-07" vs "1e-7").
+                parts.append(JeffJSTypeConvert.formatNumber(arg.toFloat64()))
             } else {
                 // Object: call toString via the context
                 let str = ctx.toString(arg)

@@ -2786,8 +2786,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 return .newInt32(0)
             }
             if let d = self.toFloat64(args[0]) {
-                if d == Double(Int32(d)) && !d.isNaN {
-                    return .newInt32(Int32(d))
+                // Int32(exactly:) rejects non-integral and out-of-range
+                // values; Int32(d) traps on them.
+                if let i32 = Int32(exactly: d) {
+                    return .newInt32(i32)
                 }
                 return .newFloat64(d)
             }
@@ -4393,8 +4395,8 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             }
             #endif
             let d = num.doubleValue
-            if d == Double(Int32(d)) && !d.isNaN {
-                return .newInt32(Int32(d))
+            if let i32 = Int32(exactly: d) {
+                return .newInt32(i32)
             }
             return .newFloat64(d)
         }

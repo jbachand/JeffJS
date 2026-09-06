@@ -24,7 +24,7 @@ final class QuantumGPU {
 
         // Load and compile the .metal source at runtime so Metal works in
         // pure SPM, not just Xcode app target consumers.
-        guard let url = Bundle.module.url(forResource: "QuantumSearch", withExtension: "metal"),
+        guard let url = jeffJSResourceBundle.url(forResource: "QuantumSearch", withExtension: "metal"),
               let source = try? String(contentsOf: url, encoding: .utf8),
               let lib = try? dev.makeLibrary(source: source, options: nil)
         else { return nil }
