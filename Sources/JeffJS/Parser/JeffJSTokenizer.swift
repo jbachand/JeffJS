@@ -78,6 +78,10 @@ class JeffJSParseState {
 
     // -- Line tracking --
     var lineNum: Int = 1             // current line number (1-based)
+    // getLineCol incremental cache: state at byte offset lcCacheEnd.
+    var lcCacheEnd: Int = 0
+    var lcCacheLine: Int = 1
+    var lcCacheLineStart: Int = 0
 
     // -- Parser flags --
     var curFunc: JeffJSFunctionDef?
@@ -470,10 +474,18 @@ extension JeffJSParseState {
     /// Scans from the beginning of the buffer each time.
     /// QuickJS uses a similar approach with `find_line_num`.
     func getLineCol(_ offset: Int) -> (line: Int, col: Int) {
+        // Called for every statement (line_num emission): scanning from byte 0
+        // each time made parsing quadratic (76% of the time on a 343 KB
+        // script). Queries are almost always monotonic, so continue from the
+        // last answer; fall back to a full scan only when going backwards.
         var line = 1
         var lineStart = 0
         let end = min(offset, bufLen)
         var i = 0
+        if end >= lcCacheEnd {
+            line = lcCacheLine; lineStart = lcCacheLineStart; i = lcCacheEnd
+        }
+        defer { lcCacheEnd = end; lcCacheLine = line; lcCacheLineStart = lineStart }
         while i < end {
             if buf[i] == 0x0A { // '\n'
                 line += 1

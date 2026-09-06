@@ -357,12 +357,16 @@ final class JeffJSParser {
     func isIdent(_ name: String) -> Bool {
         if tok != JSTokenType.TOK_IDENT.rawValue { return false }
         let atom = s.token.identAtom
-        // Compare against the atom table
-        if let ctx = s.ctx {
-            return ctx.findAtom(name) == atom
-        }
-        return false
+        // Contextual keywords ("async", "of", "from", ...) are checked at many
+        // parse decisions; intern each name once per parser instead of
+        // hashing it through the atom table on every check.
+        if let cached = contextualAtoms[name] { return cached == atom }
+        guard let ctx = s.ctx else { return false }
+        let a = ctx.findAtom(name)
+        contextualAtoms[name] = a
+        return a == atom
     }
+    private var contextualAtoms: [String: UInt32] = [:]
 
     /// Check if the current token can start an expression.
     var isExprStart: Bool {
@@ -1977,6 +1981,7 @@ final class JeffJSParser {
 
     /// Parse: switch '(' Expression ')' '{' CaseClause* '}'
     func parseSwitchStatement() {
+        fd.hasSwitch = true   // enables the compiler's switch fix-up pass for this function
         expect(JSTokenType.TOK_SWITCH.rawValue)
         expect(0x28) // '('
         parseExpression()

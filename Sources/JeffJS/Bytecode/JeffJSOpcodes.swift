@@ -1440,3 +1440,20 @@ private let _opcodeTableCheck: Void = {
     assert(jeffJSOpcodeInfo.count == JeffJSOpcode.allCases.count,
            "Opcode info table size (\(jeffJSOpcodeInfo.count)) does not match opcode count (\(JeffJSOpcode.allCases.count))")
 }()
+
+
+/// Highest valid opcode raw value (wide opcodes included); used by the
+/// compiler's bitcast decode to reject garbage bytes after the wide prefix.
+let jeffJSMaxOpcodeRawValue: UInt16 = {
+    var m: UInt16 = 0
+    var v: UInt16 = 0
+    while v < 1024 {
+        if JeffJSOpcode(rawValue: v) != nil { m = v }
+        v += 1
+    }
+    return m
+}()
+
+/// JEFFJS_DUMP=1 dumps compiled bytecode. Read once: ProcessInfo.environment
+/// rebuilds a dictionary on every access and it was consulted per function.
+let jeffJSDumpEnabled: Bool = ProcessInfo.processInfo.environment["JEFFJS_DUMP"] != nil

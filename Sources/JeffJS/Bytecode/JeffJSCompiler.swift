@@ -104,6 +104,10 @@ class JeffJSFunctionDefCompiler {
     var hoistedGlobalVarAtoms: [JSAtom] = []
     /// Bytecode position where the function body starts (after prologue/args).
     var bodyBytecodeStart: Int = 0
+    /// Set by the parser when this function body contains a `switch`
+    /// statement: only then does the switch fix-up pass have work to do
+    /// (it is a full bytecode scan, skipped for every other function).
+    var hasSwitch: Bool = false
 
     // -- Function identity --
     var funcName: JSAtom = 0
@@ -3286,7 +3290,7 @@ struct JeffJSCompiler {
         transformMethodCalls(fd: fd)
 
         // 2d. Fix switch statement case/body interleaving and array spread.
-        fixSwitchAndSpread(fd: fd)
+        if fd.hasSwitch { fixSwitchAndSpread(fd: fd) }
 
         // 3. Label resolution and peephole optimization
         if !resolveLabels(ctx: ctx, fd: fd) {
@@ -3378,7 +3382,7 @@ struct JeffJSCompiler {
 
         // Debug aid: JEFFJS_DUMP=1 prints the final bytecode of every
         // compiled function (after all passes) to stdout.
-        if ProcessInfo.processInfo.environment["JEFFJS_DUMP"] != nil {
+        if jeffJSDumpEnabled {
             print(dumpFunctionBytecode(fb: fb))
             if let blocks = fb.traceBlocks, !blocks.isEmpty {
                 print("  traceBlocks: \(blocks.map { "\($0.key)->\($0.value.exitPC)\($0.value.hasCalls ? "c" : "")" }.sorted()) lean=\(fb.traceLean)")
@@ -3659,15 +3663,18 @@ struct JeffJSCompiler {
         guard offset >= 0, offset < buf.count else { return nil }
         let byte0 = buf[offset]
         if byte0 != 0 {
-            // Normal 1-byte opcode
-            guard let op = JeffJSOpcode(rawValue: UInt16(byte0)) else { return nil }
-            return (op, 1)
+            // Normal 1-byte opcode: every narrow byte is a valid case (the
+            // interpreter relies on the same fact), so decode by bitcast
+            // instead of the failable init (a per-instruction switch that
+            // showed up in parse profiles; the compiler passes decode every
+            // instruction several times).
+            return (unsafeBitCast(UInt16(byte0), to: JeffJSOpcode.self), 1)
         }
         // Wide opcode: 0x00 prefix + low byte
         guard offset + 1 < buf.count else { return nil }
         let rawValue = 256 + UInt16(buf[offset + 1])
-        guard let op = JeffJSOpcode(rawValue: rawValue) else { return nil }
-        return (op, 2)
+        guard rawValue <= jeffJSMaxOpcodeRawValue else { return nil }
+        return (unsafeBitCast(rawValue, to: JeffJSOpcode.self), 2)
     }
 
     /// Read a little-endian UInt16 from a byte array.
