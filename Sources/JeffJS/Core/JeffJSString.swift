@@ -800,6 +800,10 @@ private func flattenInto8(_ buf: inout [UInt8], _ offset: inout Int, _ val: Jeff
 
 /// Growable string builder matching the QuickJS `StringBuffer` API.
 final class JeffJSStringBuffer: JeffJSStringBase {
+    /// Flat form of the current contents, built on first read and reused
+    /// until the next append (every read used to materialise a new string:
+    /// a regex loop over a `+=`-built local leaked 80 KB per exec).
+    private var flatCache: JeffJSString? = nil
 
     /// Reference count for when the buffer is stored directly in a JeffJSValue
     /// as an accumulator (Phase 4 string concat optimization).
@@ -873,6 +877,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
 
     /// Append a single byte (Latin-1 code point).
     func putc8(_ c: UInt8) {
+        flatCache = nil
         guard !hasError else { return }
         if isWideChar {
             buf16!.append(UInt16(c))
@@ -884,6 +889,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
 
     /// Append a 16-bit code unit.  Widens the buffer if necessary.
     func putc16(_ c: UInt16) {
+        flatCache = nil
         guard !hasError else { return }
         if c <= 0xFF && !isWideChar {
             buf8.append(UInt8(c))
@@ -898,6 +904,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
     /// Append a Unicode code point.  If the code point is in the supplementary
     /// planes (> 0xFFFF) it is encoded as a surrogate pair.
     func putc(_ codePoint: UInt32) {
+        flatCache = nil
         guard !hasError else { return }
         if codePoint < 0x100 && !isWideChar {
             buf8.append(UInt8(codePoint))
@@ -920,6 +927,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
     /// Append a Swift `String` interpreted as Latin-1 (only the low byte of
     /// each scalar is used).  This is the equivalent of QuickJS `string_buffer_puts8`.
     func puts8(_ string: String) {
+        flatCache = nil
         guard !hasError else { return }
         for scalar in string.unicodeScalars {
             let c = UInt8(scalar.value & 0xFF)
@@ -934,6 +942,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
 
     /// Append raw 16-bit data.
     func puts16(_ data: [UInt16]) {
+        flatCache = nil
         guard !hasError else { return }
         if !isWideChar { widenTo16() }
         buf16!.append(contentsOf: data)
@@ -942,6 +951,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
 
     /// Append the full contents of a `JeffJSString`.
     func concat(_ str: JeffJSString) {
+        flatCache = nil
         guard !hasError else { return }
         switch str.storage {
         case .str8(let data):
@@ -963,6 +973,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
 
     /// Append `count` copies of the code unit `c`.
     func fill(_ c: UInt32, count: Int) {
+        flatCache = nil
         guard !hasError, count > 0 else { return }
         if c > 0xFF || isWideChar {
             if !isWideChar { widenTo16() }
@@ -984,6 +995,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
     /// Append the string content of a JeffJSValue (flat string, rope, or buffer).
     /// Used by `jeffJS_concatStrings` to append the right operand into this buffer.
     func concatValue(_ val: JeffJSValue) {
+        flatCache = nil
         guard !hasError, let sb = val.stringBase else { return }
         switch sb.kind {
         case JeffJSStringBase.kindFlat:   concat(unsafeDowncast(sb, to: JeffJSString.self))
@@ -1000,6 +1012,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
 
     /// Append the contents of another buffer.
     func concatBuffer(_ other: JeffJSStringBuffer) {
+        flatCache = nil
         guard !hasError else { return }
         if other.isWideChar {
             if let otherBuf = other.buf16 {
@@ -1021,6 +1034,13 @@ final class JeffJSStringBuffer: JeffJSStringBase {
     /// Materialise the buffer contents as a `JeffJSString` without resetting.
     /// The buffer remains valid for further appends (unlike `end()` which resets).
     func toJeffJSString() -> JeffJSString {
+        if let f = flatCache { return f }
+        let f = materializeFlat()
+        flatCache = f
+        return f
+    }
+
+    private func materializeFlat() -> JeffJSString {
         if isWideChar {
             let buf = buf16!
             var canNarrow = true

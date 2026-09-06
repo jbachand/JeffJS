@@ -140,6 +140,149 @@ Conformance 1706/0. The ownership fixes cost the call kernels about 7% against t
 5. Float loop (1.34x): the fused arithmetic ops decode both operands through the generic numeric path; a double-only fast path in `arith_loc_loc`/`arith_const8` when both tags are float.
 6. Arguments after C-function calls are still leaked (see the convention note above); making every storing builtin dup its stored arguments would let the call sites release arguments unconditionally.
 
+## Round 6: real-world workloads (2026-09-05)
+
+Jeff's ask: "real usage speed, not just random benchmarks". `bench/realworld.js`
+runs 38 browser-style kernels (DOM-ish tree building, JSON, regex tokenising,
+string formatting, Map/Set, classes, closures, promises, typed arrays, proxies,
+generators ...) and prints each result so it can be checked against
+`/opt/homebrew/bin/qjs`. The first run found three crashes/wrong results
+(Map/Set iteration, multi-level class default constructors + `super.method()`,
+regex exec on long inputs) and several quadratic paths.
+
+### What was fixed
+
+Speed (real-world blockers):
+- regex exec: bytecode compiled once and reused, code units cached on the input
+  string, one VM reused across start positions (regex-tokenize 15754 ms -> 80 ms);
+- array building: fast-array storage migration, `Array.of`, `Object.fromEntries`,
+  `arraySnapshot()` at every direct payload reader (map/filter/reduce 2906 -> 546 ms);
+- string builtins: O(1) `charAt/charCodeAt/codePointAt/at`, direct UTF-16 string
+  construction, `requireThisString` leak (charcode-encode 1172 -> 92 ms);
+- native calls: C functions dispatched directly from the fat trace, ARC-free
+  `dispatchCFunction` (native-calls 1129 -> 540 ms);
+- dynamic keys: atoms cached on JS strings used as property keys, hashed from
+  code units (object-dictionary 422 -> 311 ms);
+- string buffer `flatCache` (the `+=` accumulator materialised a fresh 16 KB
+  string per read: 1.3 GB peak on the tokenizer kernel);
+- Map/Set iterator prototypes and `{value, done}` results; array `length`
+  non-enumerable and for-in over arrays.
+
+Correctness (found by the suite and by the probes written for it, all
+verified against QuickJS):
+- `try` inside `for-of`/`for-in`, nested `try`, and `break`/`continue`/`return`
+  crossing a `try` or an inner `for-of`: the parser emitted `nip_catch` with the
+  catch offset on top (deleting the value below it, e.g. the loop's iterator
+  state or the outer handler) and `break`/`continue` ignored pending `finally`
+  blocks and inner iterators. Now `emitUnwind` walks block envs (with
+  `iteratorSlots`/`finallyDepth`) innermost-first and emits drop/nip_catch +
+  gosub + iterator_close/perm4 in nesting order; nested functions get a fresh
+  block-env chain; `nip_catch` at runtime pops the offset if it is on top, else
+  keeps TOS and frees down to the offset (QuickJS semantics, needed because the
+  eval completion-value pass treats `nip_catch` as transparent).
+- `async function` *expressions* compiled as plain functions (returned raw
+  values instead of promises): the primary parser consumed `async` before
+  delegating, so `parseFunctionDef` never saw it.
+- generators: `return()` now runs `finally` blocks (resume pushes
+  `[value, is_return]`, parser emits `if_false; unwind; return_` after
+  `yield`/`yield*`, QuickJS style); `yield*` forwards `next(v)` and `throw()` to
+  the inner iterator and `return()` closes it; `for-of`/`for-in` inside a
+  generator crashed on the second `next()` (the saved value stack was copied
+  without ownership and freed by the frame epilogue: now moved into the saved
+  state, released in `JeffJSGeneratorData.deinit` if abandoned); `yield` as a
+  call argument / assignment RHS lost its operands for the same reason.
+
+Leaks (per-operation leak scan in /tmp/jjbench/leaks, all files now at the
+17 MB floor except the pre-existing arr_map 79 MB and json 66 MB):
+- trace `put_loc*`/`put_loc_check` stores never released the previous slot
+  value and `set_loc0-3` shared one reference between slot and stack (one object
+  per iteration for any `var o = {...}` in a traced loop; the shared ref was the
+  tokenizer crash);
+- generator args/locals never released at completion or abandonment; each
+  yielded/returned value leaked one reference (`createIterResult` copies);
+  each `next()` on an array iterator leaked a reference to the array; `yield*`
+  leaked the iterable, the first result object and the delegate; the resume
+  prologue's early returns skipped `releaseFrame` (a frame per `yield*` step);
+- `var x = ...` inside a top-level loop: the per-iteration `define_var`
+  redefined the global with `undefined` without releasing the old value
+  (`defineGlobalVar` now leaves an existing binding alone, per
+  CreateGlobalVarBinding; one shared-context test expectation updated).
+
+### Real-world standing (ms, lower is better; `start` = first run of the suite)
+
+| kernel | start | now | QuickJS | now/qjs |
+|---|---:|---:|---:|---:|
+| generators-iterators | 238 | 241 | 17.7 | 13.6x |
+| object-dictionary | 422 | 311 | 26.5 | 11.8x |
+| string-sort-compare | 599 | 341 | 30.2 | 11.3x |
+| regex-tokenize | 15754 | 80 | 7.2 | 11.2x |
+| array-find-indexof | 233 | 236 | 23.8 | 9.9x |
+| bind-call-apply | 404 | 358 | 36.6 | 9.8x |
+| string-split-trim | 459 | 239 | 24.8 | 9.6x |
+| for-in-entries | 824 | 705 | 84.2 | 8.4x |
+| proxy-reactive | 312 | 266 | 31.9 | 8.3x |
+| json-parse | 561 | 606 | 73.5 | 8.2x |
+| date-number-format | 774 | 725 | 88.1 | 8.2x |
+| charcode-encode | 1172 | 92 | 11.2 | 8.2x |
+| rest-spread-destructure | 939 | 890 | 109 | 8.1x |
+| typed-array-image | 1034 | 944 | 120 | 7.8x |
+| object-assign-create | 715 | 522 | 71.3 | 7.3x |
+| getter-setter | 123 | 126 | 17.2 | 7.3x |
+| map-set | crash | 339 | 47.8 | 7.1x |
+| array-map-filter-reduce | 2906 | 546 | 79.5 | 6.9x |
+| template-html | 409 | 288 | 41.9 | 6.9x |
+| arguments-object | 251 | 243 | 39.8 | 6.1x |
+| template-literals | 299 | 200 | 33.6 | 6.0x |
+| large-object-keys | 308 | 238 | 41.4 | 5.8x |
+| array-from-fill | 194 | 99 | 18.3 | 5.4x |
+| native-calls | 1129 | 540 | 101 | 5.4x |
+| vdom-build-diff | 115 | 101 | 18.9 | 5.4x |
+| event-emitter | 108 | 77 | 16.2 | 4.7x |
+| class-hierarchy | crash | 335 | 70.6 | 4.7x |
+| string-replace-regex | wrong | 222 | 52.2 | 4.2x |
+| polymorphic-access | 125 | 118 | 31.2 | 3.8x |
+| json-stringify | 450 | 343 | 91.3 | 3.8x |
+| array-sort-comparator | 949 | 226 | 65.6 | 3.4x |
+| physics-vectors | 94 | 69 | 21.9 | 3.1x |
+| tree-walk | 43 | 43 | 15.3 | 2.8x |
+| array-splice-concat | 45 | 33 | 13.9 | 2.3x |
+| closure-creation | 56 | 42 | 20.6 | 2.0x |
+| switch-interpreter | 133 | 143 | 72.8 | 2.0x |
+| try-catch-throw | 49 | 46 | 42.6 | 1.1x |
+| promise-chain-setup | 11.4 | 10.9 | 12.0 | 0.9x |
+
+All 38 results match QuickJS; geometric mean 5.5x slower. Micro-kernels are
+unchanged by this round (int 1.04x, alloc 1.05x, others 1.3-1.6x, fib 2.1x).
+Conformance 1706/0.
+
+### Known gaps left (documented, not fixed)
+
+- A closure capturing a generator local sees a stale value after a `yield`
+  (var refs are detached when the generator frame is released at the yield).
+- `yield*` + `return()`: an inner `return()` that reports `done: false` is
+  treated as done instead of re-yielding its value.
+- eval completion value through `for-of` + `try` is `undefined` (QuickJS: the
+  last statement value); the tail-position analysis does not look through
+  loops.
+
+### Next levers (from the table)
+
+1. generators (13.6x): each `next()` re-enters `callInternal` with a fresh
+   frame, copies the saved stack/vars both ways and allocates a `{value, done}`
+   object; keep the generator frame alive across yields (also fixes the closure
+   gap) and build the result object from a cached shape.
+2. dynamic keys / for-in / Object.keys (8-12x): `findAtom(jsString:)` still
+   hashes per access when the string has no cached atom (computed keys built
+   per iteration); a small string->atom cache keyed by content, and a for-in
+   enumerator that walks the shape directly.
+3. string compare/sort/split/trim (9-11x): comparisons go through
+   `stringValue` + Swift String; compare code units directly and give
+   `split`/`trim` narrow-storage fast paths.
+4. call/apply/bind (9.8x) and rest/spread/arguments (6-8x): args arrays are
+   built and copied per call; hand the callee a slice of the caller's stack.
+5. Date/number formatting, JSON.parse, typed arrays (8x): builtins written with
+   Swift String/Array conveniences; rewrite the hot ones over raw buffers.
+
 ## Current standing (2026-09-05, end of round 4)
 
 | kernel | baseline | round 3 | now | QuickJS | now vs QuickJS |

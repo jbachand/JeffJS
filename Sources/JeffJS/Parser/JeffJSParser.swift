@@ -25,7 +25,8 @@ struct JeffJSBlockEnv {
     var continueLabel: Int = -1      // label for continue
     var labelName: JSAtom = 0        // named label (0 = anonymous)
     var scopeLevel: Int = 0          // scope level at block entry
-    var hasIterator: Bool = false    // true if this is a for-of/for-in block
+    var iteratorSlots: Int = 0       // stack slots held by the loop's iterator state: 1 for for-in (enumerator), 3 for for-of ([iter, obj, method])
+    var finallyDepth: Int = 0        // finallyScopes.count when this env was pushed (try scopes above it are inside it)
     var parent: Int = -1             // index of parent block env
 }
 
@@ -983,13 +984,14 @@ final class JeffJSParser {
 
     /// Push a new block environment for break/continue.
     func pushBlockEnv(breakLabel: Int, continueLabel: Int, labelName: JSAtom = 0,
-                      hasIterator: Bool = false) {
+                      iteratorSlots: Int = 0) {
         var env = JeffJSBlockEnv()
         env.breakLabel = breakLabel
         env.continueLabel = continueLabel
         env.labelName = labelName
         env.scopeLevel = fd.curScope
-        env.hasIterator = hasIterator
+        env.iteratorSlots = iteratorSlots
+        env.finallyDepth = finallyScopes.count
         env.parent = curBlockEnvIdx
         blockEnvs.append(env)
         curBlockEnvIdx = blockEnvs.count - 1
@@ -999,6 +1001,26 @@ final class JeffJSParser {
     func popBlockEnv() {
         guard curBlockEnvIdx >= 0 else { return }
         curBlockEnvIdx = blockEnvs[curBlockEnvIdx].parent
+    }
+
+    /// Index of the innermost enclosing block env whose break label is `label`.
+    func findBlockEnv(breakLabel label: Int) -> Int {
+        var idx = curBlockEnvIdx
+        while idx >= 0 {
+            if blockEnvs[idx].breakLabel == label { return idx }
+            idx = blockEnvs[idx].parent
+        }
+        return -1
+    }
+
+    /// Index of the innermost enclosing block env whose continue label is `label`.
+    func findBlockEnv(continueLabel label: Int) -> Int {
+        var idx = curBlockEnvIdx
+        while idx >= 0 {
+            if blockEnvs[idx].continueLabel == label { return idx }
+            idx = blockEnvs[idx].parent
+        }
+        return -1
     }
 
     /// Find a break label by optional label name.
@@ -1623,7 +1645,7 @@ final class JeffJSParser {
                     s.lastLineNum = rhsLastLineNum; s.lastPtr = rhsLastPtr
                     s.lastTokenType = rhsLastTokenType
 
-                    pushBlockEnv(breakLabel: breakLabel, continueLabel: continueLabel, hasIterator: true)
+                    pushBlockEnv(breakLabel: breakLabel, continueLabel: continueLabel, iteratorSlots: 1)
                     parseStatement()
                     popBlockEnv()
 
@@ -1677,7 +1699,7 @@ final class JeffJSParser {
                     s.lastLineNum = rhsLastLineNum; s.lastPtr = rhsLastPtr
                     s.lastTokenType = rhsLastTokenType
 
-                    pushBlockEnv(breakLabel: breakLabel, continueLabel: continueLabel, hasIterator: true)
+                    pushBlockEnv(breakLabel: breakLabel, continueLabel: continueLabel, iteratorSlots: 3)
                     parseStatement()
                     popBlockEnv()
 
@@ -1864,7 +1886,7 @@ final class JeffJSParser {
         }
         // Stack here: [iter]
 
-        pushBlockEnv(breakLabel: breakLabel, continueLabel: continueLabel, hasIterator: true)
+        pushBlockEnv(breakLabel: breakLabel, continueLabel: continueLabel, iteratorSlots: 1)
         parseStatement()
         popBlockEnv()
 
@@ -1923,7 +1945,7 @@ final class JeffJSParser {
             emitOp(.drop)
         }
 
-        pushBlockEnv(breakLabel: breakLabel, continueLabel: continueLabel, hasIterator: true)
+        pushBlockEnv(breakLabel: breakLabel, continueLabel: continueLabel, iteratorSlots: 3)
         parseStatement()
         popBlockEnv()
 
@@ -2119,7 +2141,11 @@ final class JeffJSParser {
 
         finallyScopes.removeLast()
 
-        emitOp(.nip_catch) // remove catch handler
+        // Remove the try body's catch offset. Normally it is on top of the
+        // stack; in eval completion-value mode the body's completion value
+        // may sit above it, and nip_catch keeps that value (the completion
+        // analysis treats nip_catch as transparent, unlike a plain drop).
+        emitOp(.nip_catch)
 
         // Check for finally
         let hasFinally = tok == JSTokenType.TOK_FINALLY.rawValue
@@ -2211,13 +2237,15 @@ final class JeffJSParser {
         let isAsync = fd.funcKind == JSFunctionKindEnum.JS_FUNC_ASYNC.rawValue ||
                       fd.funcKind == JSFunctionKindEnum.JS_FUNC_ASYNC_GENERATOR.rawValue
 
+        let needsUnwind = returnNeedsUnwind()
         if tok == 0x3B || tok == 0x7D || tok == JSTokenType.TOK_EOF.rawValue || s.gotLF {
             // return; (no value)
-            if !finallyScopes.isEmpty {
-                // Inside try-finally: push undefined as return value, then
-                // gosub to each enclosing finally, then return.
+            if needsUnwind {
+                // Inside try-finally or a for-of/for-in body: push undefined
+                // as the return value, close iterators / run finally blocks
+                // in nesting order, then return.
                 emitOp(.undefined)
-                emitFinallyGosubs()
+                emitUnwind(toBlockEnv: -1, hasValue: true)
                 emitOp(isAsync ? .return_async : .return_)
             } else if isAsync {
                 emitOp(.undefined)
@@ -2227,10 +2255,10 @@ final class JeffJSParser {
             }
         } else {
             parseExpression()
-            if !finallyScopes.isEmpty {
-                // Inside try-finally: return value is on stack,
-                // gosub to each enclosing finally, then return.
-                emitFinallyGosubs()
+            if needsUnwind {
+                // Return value is on the stack: close enclosing iterators and
+                // run finally blocks in nesting order, keeping the value.
+                emitUnwind(toBlockEnv: -1, hasValue: true)
             }
             emitOp(isAsync ? .return_async : .return_)
         }
@@ -2238,17 +2266,62 @@ final class JeffJSParser {
         expectSemicolon()
     }
 
-    /// Emit nip_catch + gosub for each enclosing finally scope (innermost first).
-    /// Called before return_ when inside try-finally blocks.
-    private func emitFinallyGosubs() {
-        // Process innermost scope first (top of stack).
-        // Each scope may need nip_catch (if inside try body with catch handler on stack).
-        for scope in finallyScopes.reversed() {
-            if scope.needsNipCatch {
-                emitOp(.nip_catch)
+    /// Emit the stack cleanup needed to jump from the current position to
+    /// the break/continue label of block env `targetIdx` (or out of the
+    /// function when `targetIdx` is -1, for `return`).  Walks the enclosing
+    /// constructs innermost-first and, in nesting order:
+    ///   - for a try body: drops its catch offset (`drop`, or `nip_catch`
+    ///     when a value must be kept on top) and runs its finally block;
+    ///   - for a catch body / try-finally scope: runs the finally block;
+    ///   - for an inner for-of / for-in loop: closes/drops its iterator
+    ///     state (`perm4` + `iterator_close` / `nip` when a value is on top).
+    /// The target env's own iterator state is left alone: its break label
+    /// closes it and its continue label needs it.
+    /// `hasValue` says whether a value (the return value) sits on top of the
+    /// stack and must be preserved across the cleanup.
+    private func emitUnwind(toBlockEnv targetIdx: Int, hasValue: Bool) {
+        var fsIdx = finallyScopes.count - 1
+        var envIdx = curBlockEnvIdx
+        while envIdx >= 0 && envIdx != targetIdx {
+            let env = blockEnvs[envIdx]
+            while fsIdx >= env.finallyDepth {
+                emitFinallyCleanup(finallyScopes[fsIdx], hasValue: hasValue)
+                fsIdx -= 1
             }
-            emitGosub(scope.label)
+            if env.iteratorSlots == 3 {
+                if hasValue { emitOp(.perm4) }       // [iter, obj, method, v] -> [v, iter, obj, method]
+                emitOp(.iterator_close)              // pops [iter, obj, method]
+            } else if env.iteratorSlots == 1 {
+                emitOp(hasValue ? .nip : .drop)      // drop the for-in enumerator
+            }
+            envIdx = env.parent
         }
+        let base = targetIdx >= 0 ? blockEnvs[targetIdx].finallyDepth : 0
+        while fsIdx >= base {
+            emitFinallyCleanup(finallyScopes[fsIdx], hasValue: hasValue)
+            fsIdx -= 1
+        }
+    }
+
+    private func emitFinallyCleanup(_ scope: FinallyScope, hasValue: Bool) {
+        if scope.needsNipCatch {
+            // The try body's catch offset is on the stack (directly below the
+            // kept value, if any): remove it before leaving the try body.
+            emitOp(hasValue ? .nip_catch : .drop)
+        }
+        emitGosub(scope.label)
+    }
+
+    /// True when a `return` at the current position has to close an
+    /// enclosing for-of/for-in iterator or run a finally block.
+    private func returnNeedsUnwind() -> Bool {
+        if !finallyScopes.isEmpty { return true }
+        var idx = curBlockEnvIdx
+        while idx >= 0 {
+            if blockEnvs[idx].iteratorSlots != 0 { return true }
+            idx = blockEnvs[idx].parent
+        }
+        return false
     }
 
     // MARK: Throw Statement
@@ -2289,6 +2362,7 @@ final class JeffJSParser {
             return
         }
 
+        emitUnwind(toBlockEnv: findBlockEnv(breakLabel: label), hasValue: false)
         emitGoto(label)
         expectSemicolon()
     }
@@ -2315,6 +2389,7 @@ final class JeffJSParser {
             return
         }
 
+        emitUnwind(toBlockEnv: findBlockEnv(continueLabel: label), hasValue: false)
         emitGoto(label)
         expectSemicolon()
     }
@@ -2808,6 +2883,8 @@ final class JeffJSParser {
         let savedInFlag_ = inFlag
         let savedFinallyScopes = finallyScopes
         finallyScopes = []  // nested function has its own scope — don't leak outer try-finally
+        let savedBlockEnvIdx = curBlockEnvIdx
+        curBlockEnvIdx = -1  // nor the enclosing function's loops (break/continue/return unwinding)
         inFlag = true // FunctionBody always uses [+In] per ECMAScript spec
         fd = childFd
 
@@ -2960,6 +3037,7 @@ final class JeffJSParser {
         fd = savedFd
         inFlag = savedInFlag_
         finallyScopes = savedFinallyScopes
+        curBlockEnvIdx = savedBlockEnvIdx
     }
 
     /// Parse an arrow function body (concise or block).
@@ -2971,6 +3049,8 @@ final class JeffJSParser {
         let savedInFlagArrow = inFlag
         let savedFinallyScopesArrow = finallyScopes
         finallyScopes = []  // nested function has its own scope
+        let savedBlockEnvIdxArrow = curBlockEnvIdx
+        curBlockEnvIdx = -1
         inFlag = true // Default params always use [+In]
         fd = childFd
 
@@ -3082,6 +3162,7 @@ final class JeffJSParser {
         fd = savedFd
         inFlag = savedInFlagArrow
         finallyScopes = savedFinallyScopesArrow
+        curBlockEnvIdx = savedBlockEnvIdxArrow
     }
 
     /// Skip a destructuring pattern without emitting bytecode (for parameters).
@@ -5399,11 +5480,9 @@ final class JeffJSParser {
                 let savedLastTokenType = s.lastTokenType
 
                 next() // consume 'async'
-                if !s.gotLF {
-                    parseFunctionDef(isExpression: true, isArrow: false)
-                    return
-                }
-                // LF between async and function — backtrack
+                let asyncThenLF = s.gotLF
+                // Backtrack in both cases: parseFunctionDef expects to see the
+                // 'async' token itself (that is what marks the function async).
                 fd.byteCode.len = savedBc
                 s.bufPtr = savedBufPtr
                 s.lineNum = savedLineNum
@@ -5413,6 +5492,11 @@ final class JeffJSParser {
                 s.lastPtr = savedLastPtr
                 s.templateNestLevel = savedTemplateNest
                 s.lastTokenType = savedLastTokenType
+                if !asyncThenLF {
+                    parseFunctionDef(isExpression: true, isArrow: false)
+                    return
+                }
+                // LF between async and function: not an async function expression
             }
 
             // Check for async arrow: async () =>, async (a,b) =>, async x =>
@@ -6432,6 +6516,26 @@ final class JeffJSParser {
     // MARK: - Yield Expression
     // =========================================================================
 
+    /// After `yield_` in a sync generator the interpreter resumes with
+    /// [sent_value, is_return] on the stack (QuickJS layout): `is_return` is
+    /// true when the generator was resumed by `return(v)`.  In that case run
+    /// the enclosing finally blocks (removing their catch offsets) and return
+    /// the value; otherwise fall through with the sent value as the yield
+    /// expression's result.
+    private func emitYieldReturnCheck() {
+        guard fd.funcKind == JSFunctionKindEnum.JS_FUNC_GENERATOR.rawValue else { return }
+        let skip = newLabel()
+        emitIfFalse(skip)
+        for scope in finallyScopes.reversed() {
+            // nip_catch scans down to the catch offset, so operands left on the
+            // stack by an enclosing expression (`f(yield x)`) are freed too.
+            if scope.needsNipCatch { emitOp(.nip_catch) }
+            emitGosub(scope.label)
+        }
+        emitOp(.return_)
+        emitLabel(skip)
+    }
+
     /// Parse: yield [* AssignmentExpression]
     ///      | yield [AssignmentExpression]
     func parseYieldExpression() {
@@ -6442,6 +6546,7 @@ final class JeffJSParser {
             // yield without operand
             emitOp(.undefined)
             emitOp(.yield_)
+            emitYieldReturnCheck()
             return
         }
 
@@ -6450,9 +6555,11 @@ final class JeffJSParser {
             next()
             parseAssignExpr()
             emitOp(.yield_star)
+            emitYieldReturnCheck()
         } else {
             parseAssignExpr()
             emitOp(.yield_)
+            emitYieldReturnCheck()
         }
     }
 

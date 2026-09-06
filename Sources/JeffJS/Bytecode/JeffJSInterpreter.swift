@@ -517,15 +517,21 @@ extension JeffJSContext {
 
         // If the generator completed (return_ or return_undef opcode was hit
         // rather than a yield), the state will be .executing still — mark completed.
+        // `result` (the returned or yielded value) is owned by us;
+        // createIterResult copies it, so release it after wrapping.
         if genData.state == .executing {
             genData.state = .completed
             genData.savedState = nil
-            return JeffJSBuiltinIterator.createIterResult(ctx: self, val: result, done: true)
+            let iterResult = JeffJSBuiltinIterator.createIterResult(ctx: self, val: result, done: true)
+            result.freeValue()
+            return iterResult
         }
 
         // If still suspended (yield set the state), the result is the yielded
         // value, wrapped as {value, done: false}.
-        return JeffJSBuiltinIterator.createIterResult(ctx: self, val: result, done: false)
+        let iterResult = JeffJSBuiltinIterator.createIterResult(ctx: self, val: result, done: false)
+        result.freeValue()
+        return iterResult
     }
 
     // MARK: - Object Creation Stubs
@@ -765,10 +771,23 @@ extension JeffJSContext {
 
     /// Converts an atom to a JS string value.
     func atomToString(_ atom: UInt32) -> JeffJSValue {
-        if let str = rt.atomToString(atom) {
-            return newString(str)
+        if (atom & JS_ATOM_TAG_INT) != 0 { return intKeyString(Int(atom & ~JS_ATOM_TAG_INT)) }
+        if let cached = rt.atomJSStrings[atom] { return JeffJSValue.makeString(cached.retain()) }
+        guard let str = rt.atomToString(atom) else { return .undefined }
+        let js = JeffJSString(swiftString: str)   // refCount 1: the cache's reference
+        rt.atomJSStrings[atom] = js
+        return JeffJSValue.makeString(js.retain())
+    }
+
+    /// Cached string for a small integer key (array indices in for-in / keys).
+    func intKeyString(_ i: Int) -> JeffJSValue {
+        if i >= 0 && i < rt.intKeyStrings.count {
+            if let c = rt.intKeyStrings[i] { return JeffJSValue.makeString(c.retain()) }
+            let js = JeffJSString(swiftString: String(i))
+            rt.intKeyStrings[i] = js
+            return JeffJSValue.makeString(js.retain())
         }
-        return .undefined
+        return newStringValue(String(i))
     }
 
     /// Converts an atom to a Swift String.
@@ -1120,8 +1139,15 @@ extension JeffJSContext {
         return setProperty(obj: globalObj, atom: atom, value: val) >= 0
     }
 
-    /// Defines a new global variable.
+    /// Defines a new global variable (CreateGlobalVarBinding).  An existing
+    /// binding is left untouched: `var x = ...` inside a loop re-executes
+    /// define_var every iteration, and redefining the slot with `undefined`
+    /// would drop the previous value without releasing it.
     func defineGlobalVar(atom: UInt32, flags: Int) -> Bool {
+        if let gObj = globalObj.toObject(), gObj.shape != nil,
+           jeffJS_findOwnPropertyIndex(obj: gObj, atom: atom) >= 0 {
+            return true
+        }
         return definePropertyValue(obj: globalObj, atom: atom, value: .undefined, flags: flags) >= 0
     }
 
@@ -1676,7 +1702,16 @@ extension JeffJSContext {
         var current: JeffJSObject? = obj.toObject()
         while let cur = current {
             var intKeys: [(UInt32, String)] = []
-            var strKeys: [String] = []
+            var strKeys: [(String, UInt32)] = []
+            // Fast-array elements are not shape properties: enumerate their
+            // indices (present, i.e. not a hole) first.
+            if cur.classID == JeffJSClassID.array.rawValue, let snap = cur.arraySnapshot() {
+                var i = 0
+                while i < snap.count && i < snap.values.count {
+                    if !snap.values[i].isUninitialized { intKeys.append((UInt32(i), String(i))) }
+                    i += 1
+                }
+            }
             if let shape = cur.shape {
                 for prop in shape.prop {
                     let atom = prop.atom
@@ -1691,23 +1726,27 @@ extension JeffJSContext {
                             if isEnumerable { intKeys.append((idx, name)) }
                             else { seen.insert(name) }
                         }
-                    } else if let name = rt.atomToString(atom) {
-                        if isEnumerable { strKeys.append(name) }
+                    } else if let entry = rt.atomArray[Int(atom)],
+                              entry.atomType != .JS_ATOM_TYPE_SYMBOL,
+                              entry.atomType != .JS_ATOM_TYPE_GLOBAL_SYMBOL {
+                        // Symbol keys are never enumerated by for-in.
+                        let name = entry.str
+                        if isEnumerable { strKeys.append((name, atom)) }
                         else { seen.insert(name) }
                     }
                 }
             }
             intKeys.sort { $0.0 < $1.0 }
-            for (_, name) in intKeys {
+            for (idx, name) in intKeys {
                 if !seen.contains(name) {
                     seen.insert(name)
-                    keys.append(newString(name))
+                    keys.append(intKeyString(Int(idx)))
                 }
             }
-            for name in strKeys {
+            for (name, atom) in strKeys {
                 if !seen.contains(name) {
                     seen.insert(name)
-                    keys.append(newString(name))
+                    keys.append(atomToString(atom))
                 }
             }
             current = cur.proto
@@ -2308,34 +2347,40 @@ private func executeFastTrace(
             buf[sp] = buf[varBase + idx].dupValue(); sp += 1
             pc += 3
 
-        case .put_loc0: sp -= 1; buf[varBase] = buf[sp]; pc += 1
-        case .put_loc1: sp -= 1; buf[varBase + 1] = buf[sp]; pc += 1
-        case .put_loc2: sp -= 1; buf[varBase + 2] = buf[sp]; pc += 1
-        case .put_loc3: sp -= 1; buf[varBase + 3] = buf[sp]; pc += 1
+        case .put_loc0: sp -= 1; let oP0 = buf[varBase]; buf[varBase] = buf[sp]; oP0.freeValueFast(); pc += 1
+        case .put_loc1: sp -= 1; let oP1 = buf[varBase + 1]; buf[varBase + 1] = buf[sp]; oP1.freeValueFast(); pc += 1
+        case .put_loc2: sp -= 1; let oP2 = buf[varBase + 2]; buf[varBase + 2] = buf[sp]; oP2.freeValueFast(); pc += 1
+        case .put_loc3: sp -= 1; let oP3 = buf[varBase + 3]; buf[varBase + 3] = buf[sp]; oP3.freeValueFast(); pc += 1
 
         case .put_loc8:
             let idx = Int(bc[pc + 1])
-            sp -= 1; buf[varBase + idx] = buf[sp]
+            sp -= 1; let oPL8 = buf[varBase + idx]; buf[varBase + idx] = buf[sp]; oPL8.freeValueFast()
             pc += 2
 
         case .put_loc:
             let idx = Int(readU16(bc, pc + 1))
-            sp -= 1; buf[varBase + idx] = buf[sp]
+            sp -= 1; let oPL = buf[varBase + idx]; buf[varBase + idx] = buf[sp]; oPL.freeValueFast()
             pc += 3
 
-        case .set_loc0: buf[varBase] = buf[sp - 1]; pc += 1
-        case .set_loc1: buf[varBase + 1] = buf[sp - 1]; pc += 1
-        case .set_loc2: buf[varBase + 2] = buf[sp - 1]; pc += 1
-        case .set_loc3: buf[varBase + 3] = buf[sp - 1]; pc += 1
+        case .set_loc0: let oS0 = buf[varBase]; buf[varBase] = buf[sp - 1].dupValueFast(); oS0.freeValueFast(); pc += 1
+        case .set_loc1: let oS1 = buf[varBase + 1]; buf[varBase + 1] = buf[sp - 1].dupValueFast(); oS1.freeValueFast(); pc += 1
+        case .set_loc2: let oS2 = buf[varBase + 2]; buf[varBase + 2] = buf[sp - 1].dupValueFast(); oS2.freeValueFast(); pc += 1
+        case .set_loc3: let oS3 = buf[varBase + 3]; buf[varBase + 3] = buf[sp - 1].dupValueFast(); oS3.freeValueFast(); pc += 1
 
         case .set_loc8:
+            // Store and keep the value: the slot needs its own reference and the
+            // previous binding goes (sharing one ref with the stack double-freed).
             let idx = Int(bc[pc + 1])
-            buf[varBase + idx] = buf[sp - 1]
+            let oldSL = buf[varBase + idx]
+            buf[varBase + idx] = buf[sp - 1].dupValueFast()
+            oldSL.freeValueFast()
             pc += 2
 
         case .set_loc:
             let idx = Int(readU16(bc, pc + 1))
-            buf[varBase + idx] = buf[sp - 1]
+            let oldSL = buf[varBase + idx]
+            buf[varBase + idx] = buf[sp - 1].dupValueFast()
+            oldSL.freeValueFast()
             pc += 3
 
         case .put_loc_check:
@@ -2343,7 +2388,7 @@ private func executeFastTrace(
             let idx = Int(readU16(bc, pc + 1))
             let current = buf[varBase + idx]
             if current.isUninitialized { resume = pc; break traceLoop } // deopt: main loop throws
-            sp -= 1; buf[varBase + idx] = buf[sp]
+            sp -= 1; buf[varBase + idx] = buf[sp]; current.freeValueFast()
             current.freeValue()
             pc += 3
 
@@ -2382,6 +2427,20 @@ private func executeFastTrace(
             default: argc = 3; instrSize = 1
             }
             let calleeSlot = sp - argc - 1
+            if calleeSlot >= state.spBase, let nObj = buf[calleeSlot].obj, let cf = nObj.cFuncFast {
+                // Native callee: dispatch from the trace. A deopt per native
+                // call made Math.* loops bounce between trace and main loop.
+                var cargs = [JeffJSValue](); cargs.reserveCapacity(argc)
+                var ai = 0
+                while ai < argc { cargs.append(buf[calleeSlot + 1 + ai]); ai += 1 }
+                let r = JeffJSContext.dispatchCFunction(ctx, cf, .undefined, cargs, nObj.cMagicFast)
+                buf[calleeSlot].freeValueFast()
+                sp = calleeSlot
+                if r.isException { resume = -1; break traceLoop }
+                buf[sp] = r; sp += 1
+                pc += instrSize
+                continue traceLoop
+            }
             guard calleeSlot >= state.spBase,
                   let callObj = buf[calleeSlot].obj,
                   let fbU = callObj.fbFastU,
@@ -2489,6 +2548,18 @@ private func executeFastTrace(
             let instrSize = 3
             let calleeSlot = sp - argc - 1
             let thisSlot = calleeSlot - 1
+            if thisSlot >= state.spBase, let nObj = buf[calleeSlot].obj, let cf = nObj.cFuncFast {
+                var cargs = [JeffJSValue](); cargs.reserveCapacity(argc)
+                var ai = 0
+                while ai < argc { cargs.append(buf[calleeSlot + 1 + ai]); ai += 1 }
+                let r = JeffJSContext.dispatchCFunction(ctx, cf, buf[thisSlot], cargs, nObj.cMagicFast)
+                buf[calleeSlot].freeValueFast(); buf[thisSlot].freeValueFast()
+                sp = thisSlot
+                if r.isException { resume = -1; break traceLoop }
+                buf[sp] = r; sp += 1
+                pc += instrSize
+                continue traceLoop
+            }
             guard thisSlot >= state.spBase,
                   let callObj = buf[calleeSlot].obj,
                   let fbU = callObj.fbFastU,
@@ -2970,8 +3041,10 @@ private func executeFastTrace(
                 }
             }
             guard let el = element else { resume = pc; break traceLoop } // deopt: OOB/holes — slow path decides
+            let elDup = el.dupValue()
+            objV.freeValueFast()   // the popped receiver ref (`arr[i]` leaked one per read)
             sp -= 1
-            buf[sp - 1] = el.dupValue()
+            buf[sp - 1] = elDup
             pc += 1
 
         case .put_array_el:
@@ -3949,34 +4022,40 @@ private func executeFastTraceLean(
             buf[sp] = buf[varBase + idx].dupValue(); sp += 1
             pc += 3
 
-        case .put_loc0: sp -= 1; buf[varBase] = buf[sp]; pc += 1
-        case .put_loc1: sp -= 1; buf[varBase + 1] = buf[sp]; pc += 1
-        case .put_loc2: sp -= 1; buf[varBase + 2] = buf[sp]; pc += 1
-        case .put_loc3: sp -= 1; buf[varBase + 3] = buf[sp]; pc += 1
+        case .put_loc0: sp -= 1; let oP0 = buf[varBase]; buf[varBase] = buf[sp]; oP0.freeValueFast(); pc += 1
+        case .put_loc1: sp -= 1; let oP1 = buf[varBase + 1]; buf[varBase + 1] = buf[sp]; oP1.freeValueFast(); pc += 1
+        case .put_loc2: sp -= 1; let oP2 = buf[varBase + 2]; buf[varBase + 2] = buf[sp]; oP2.freeValueFast(); pc += 1
+        case .put_loc3: sp -= 1; let oP3 = buf[varBase + 3]; buf[varBase + 3] = buf[sp]; oP3.freeValueFast(); pc += 1
 
         case .put_loc8:
             let idx = Int(bc[pc + 1])
-            sp -= 1; buf[varBase + idx] = buf[sp]
+            sp -= 1; let oPL8 = buf[varBase + idx]; buf[varBase + idx] = buf[sp]; oPL8.freeValueFast()
             pc += 2
 
         case .put_loc:
             let idx = Int(readU16(bc, pc + 1))
-            sp -= 1; buf[varBase + idx] = buf[sp]
+            sp -= 1; let oPL = buf[varBase + idx]; buf[varBase + idx] = buf[sp]; oPL.freeValueFast()
             pc += 3
 
-        case .set_loc0: buf[varBase] = buf[sp - 1]; pc += 1
-        case .set_loc1: buf[varBase + 1] = buf[sp - 1]; pc += 1
-        case .set_loc2: buf[varBase + 2] = buf[sp - 1]; pc += 1
-        case .set_loc3: buf[varBase + 3] = buf[sp - 1]; pc += 1
+        case .set_loc0: let oS0 = buf[varBase]; buf[varBase] = buf[sp - 1].dupValueFast(); oS0.freeValueFast(); pc += 1
+        case .set_loc1: let oS1 = buf[varBase + 1]; buf[varBase + 1] = buf[sp - 1].dupValueFast(); oS1.freeValueFast(); pc += 1
+        case .set_loc2: let oS2 = buf[varBase + 2]; buf[varBase + 2] = buf[sp - 1].dupValueFast(); oS2.freeValueFast(); pc += 1
+        case .set_loc3: let oS3 = buf[varBase + 3]; buf[varBase + 3] = buf[sp - 1].dupValueFast(); oS3.freeValueFast(); pc += 1
 
         case .set_loc8:
+            // Store and keep the value: the slot needs its own reference and the
+            // previous binding goes (sharing one ref with the stack double-freed).
             let idx = Int(bc[pc + 1])
-            buf[varBase + idx] = buf[sp - 1]
+            let oldSL = buf[varBase + idx]
+            buf[varBase + idx] = buf[sp - 1].dupValueFast()
+            oldSL.freeValueFast()
             pc += 2
 
         case .set_loc:
             let idx = Int(readU16(bc, pc + 1))
-            buf[varBase + idx] = buf[sp - 1]
+            let oldSL = buf[varBase + idx]
+            buf[varBase + idx] = buf[sp - 1].dupValueFast()
+            oldSL.freeValueFast()
             pc += 3
 
         case .put_loc_check:
@@ -3984,7 +4063,7 @@ private func executeFastTraceLean(
             let idx = Int(readU16(bc, pc + 1))
             let current = buf[varBase + idx]
             if current.isUninitialized { ctx.interruptCounter = interrupt; return pc } // deopt: main loop throws
-            sp -= 1; buf[varBase + idx] = buf[sp]
+            sp -= 1; buf[varBase + idx] = buf[sp]; current.freeValueFast()
             current.freeValue()
             pc += 3
 
@@ -4195,8 +4274,10 @@ private func executeFastTraceLean(
                 }
             }
             guard let el = element else { ctx.interruptCounter = interrupt; return pc } // deopt: OOB/holes — slow path decides
+            let elDup = el.dupValue()
+            objV.freeValueFast()
             sp -= 1
-            buf[sp - 1] = el.dupValue()
+            buf[sp - 1] = elDup
             pc += 1
 
         case .put_array_el:
@@ -5774,62 +5855,187 @@ struct JeffJSInterpreter {
             // Sync restored frame arrays into buf
             jeffJS_syncFrameToBuf(frame, buf, varBase)
 
+            // Result object produced by advancing a `yield*` delegated
+            // iterator (next/throw forwarded from the outer generator's
+            // caller); handled uniformly after the switch.
+            var delegatedResult: JeffJSValue? = nil
             switch resumeCompletionType {
             case 1:
-                retVal = resumeValue
-                ctx.currentFrame = frame.prevFrame
-                if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
-                return retVal
-            case 2:
-                // Throw: inject the exception and fall through to the dispatch
-                // loop so try/catch handlers in the generator body can catch it.
-                ctx.throwValue(resumeValue.dupValue())
-                retVal = .exception
-            default:
-                // yield* delegation: if we're resuming from a yield_star with
-                // a delegated iterator, advance it instead of pushing resumeValue.
-                if !saved.delegatedIter.isUndefined {
+                if fb.isGenerator && !fb.isAsyncFunc && !saved.isInitialYield &&
+                   saved.delegatedIter.isUndefined && saved.pc >= 1 &&
+                   bc[saved.pc - 1] == JeffJSOpcode.yield_.rawValue {
+                    // Suspended at a plain `yield` of a sync generator: resume
+                    // with [value, true] so the parser-emitted check after the
+                    // yield runs the enclosing finally blocks and returns.
+                    buf[sp] = resumeValue; sp += 1
+                    buf[sp] = .newBool(true); sp += 1
+                } else if fb.isGenerator && !fb.isAsyncFunc && !saved.delegatedIter.isUndefined {
+                    // Suspended inside a `yield*` delegation: forward the
+                    // return to the inner iterator first (its finally blocks
+                    // run there), then resume the outer generator with
+                    // [value, true] so its own finally blocks run too.
                     let iter = saved.delegatedIter
-                    let result = ctx.iteratorNext(iter: iter)
-                    if result.isException {
-                        retVal = .exception
-                    } else {
-                        let done = ctx.iteratorCheckDone(result: result)
-                        let value = ctx.iteratorGetValue(result: result)
-                        if done {
-                            // Inner iterator exhausted — push return value and
-                            // advance pc past the yield_star opcode.
-                            buf[sp] = value; sp += 1
-                            pc += 1  // skip past yield_star
+                    var doneValue = resumeValue
+                    var failed = false
+                    let retM = ctx.getPropertyStr(obj: iter, name: "return")
+                    if retM.isException {
+                        failed = true
+                    } else if retM.isFunction {
+                        let res = ctx.callFunction(retM, thisVal: iter, args: [resumeValue])
+                        retM.freeValue()
+                        if res.isException {
+                            failed = true
+                        } else if !res.isObject {
+                            _ = ctx.throwTypeError(message: "iterator result is not an object")
+                            failed = true
                         } else {
-                            // More values — yield this one and re-suspend.
-                            if let genObj = generatorObject.toObject(),
-                               case .generatorData(let genData) = genObj.payload {
-                                jeffJS_syncBufToFrame(frame, buf, varBase)
-                                let stackCount = sp - spBase
-                                var savedStack = [JeffJSValue](repeating: .undefined, count: stackCount)
-                                for i in 0..<stackCount { savedStack[i] = buf[spBase + i] }
-                                var newSaved = GeneratorSavedState(
-                                    pc: pc,
-                                    sp: stackCount,
-                                    stack: savedStack,
-                                    varBuf: frame.varBuf,
-                                    argBuf: frame.argBuf,
-                                    funcObj: mFuncObj,
-                                    thisVal: thisVal)
-                                newSaved.delegatedIter = iter
-                                genData.savedState = newSaved
-                                genData.state = .suspended_yield_star
-                            }
-                            retVal = value
-                            ctx.currentFrame = frame.prevFrame
-                            if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
-                            return retVal
+                            // (If the inner return() reports done:false the spec
+                            // re-yields its value; that pathological case is
+                            // treated as done here.)
+                            doneValue = ctx.iteratorGetValue(result: res)
+                            res.freeValue()
+                        }
+                    } else {
+                        retM.freeValue()
+                    }
+                    iter.freeValue()   // the delegation is over either way
+                    if failed {
+                        retVal = .exception   // dispatch loop runs the generator's handlers
+                    } else {
+                        buf[sp] = doneValue; sp += 1
+                        buf[sp] = .newBool(true); sp += 1
+                        pc += 1   // saved.pc points at the yield_star opcode: skip it
+                    }
+                } else {
+                    retVal = resumeValue
+                    // Early exit: same teardown as the epilogue (detach captured
+                    // locals, return the frame to its pool).
+                    if frame.hasLiveVarRefs {
+                        jeffJS_syncBufToFrame(frame, buf, varBase)
+                        for vr in frame.liveVarRefs where !vr.isDetached {
+                            vr.value = vr.pvalue.dupValue()
+                            vr.isDetached = true
+                            vr.parentFrame = nil; vr.slot = nil
                         }
                     }
+                    ctx.currentFrame = frame.prevFrame
+                    if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
+                    rt.releaseFrame(frame)
+                    rt.inlineStackTop = inlineBase
+                    return retVal
+                }
+            case 2:
+                if !saved.delegatedIter.isUndefined {
+                    // Suspended inside `yield*`: forward the throw to the inner
+                    // iterator (its try/catch sees it); the result decides
+                    // whether the delegation continues.
+                    let iter = saved.delegatedIter
+                    let thM = ctx.getPropertyStr(obj: iter, name: "throw")
+                    if thM.isException {
+                        retVal = .exception
+                    } else if thM.isFunction {
+                        let res = ctx.callFunction(thM, thisVal: iter, args: [resumeValue])
+                        thM.freeValue()
+                        if res.isException { retVal = .exception } else { delegatedResult = res }
+                    } else {
+                        thM.freeValue()
+                        // No throw method: close the inner iterator, then throw
+                        // a TypeError at the yield* in the outer generator.
+                        ctx.iteratorClose(iter: iter, isThrow: false)
+                        _ = ctx.throwTypeError(message: "iterator does not have a throw method")
+                        retVal = .exception
+                    }
+                    if delegatedResult == nil { iter.freeValue() }   // delegation ended by the exception
+                } else {
+                    // Throw: inject the exception and fall through to the dispatch
+                    // loop so try/catch handlers in the generator body can catch it.
+                    ctx.throwValue(resumeValue.dupValue())
+                    retVal = .exception
+                }
+            default:
+                if !saved.delegatedIter.isUndefined {
+                    // yield* delegation: advance the inner iterator with the
+                    // value sent by next(v) instead of pushing it.
+                    let iter = saved.delegatedIter
+                    let nextM = ctx.getPropertyStr(obj: iter, name: "next")
+                    if nextM.isException {
+                        retVal = .exception
+                    } else if nextM.isFunction {
+                        let res = ctx.callFunction(nextM, thisVal: iter, args: [resumeValue])
+                        nextM.freeValue()
+                        if res.isException { retVal = .exception } else { delegatedResult = res }
+                    } else {
+                        nextM.freeValue()
+                        _ = ctx.throwTypeError(message: "iterator does not have a next method")
+                        retVal = .exception
+                    }
+                    if delegatedResult == nil { iter.freeValue() }   // delegation ended by the exception
                 } else if !saved.isInitialYield {
                     buf[sp] = resumeValue
                     sp += 1
+                    if fb.isGenerator && !fb.isAsyncFunc && saved.pc >= 1 &&
+                       bc[saved.pc - 1] == JeffJSOpcode.yield_.rawValue {
+                        buf[sp] = .newBool(false); sp += 1   // is_return flag for the check after yield_
+                    }
+                }
+            }
+            if let result = delegatedResult {
+                let iter = saved.delegatedIter
+                if !result.isObject {
+                    result.freeValue()
+                    iter.freeValue()
+                    _ = ctx.throwTypeError(message: "iterator result is not an object")
+                    retVal = .exception
+                } else {
+                    let done = ctx.iteratorCheckDone(result: result)
+                    let value = ctx.iteratorGetValue(result: result)
+                    result.freeValue()
+                    if done {
+                        // Inner iterator exhausted — its return value is the
+                        // value of the yield* expression; skip the yield_star.
+                        iter.freeValue()   // the delegation is over
+                        buf[sp] = value; sp += 1
+                        if fb.isGenerator && !fb.isAsyncFunc {
+                            buf[sp] = .newBool(false); sp += 1   // is_return flag for the check after yield_star
+                        }
+                        pc += 1  // skip past yield_star
+                    } else {
+                        // More values — yield this one and re-suspend.
+                        if let genObj = generatorObject.toObject(),
+                           case .generatorData(let genData) = genObj.payload {
+                            jeffJS_syncBufToFrame(frame, buf, varBase)
+                            let stackCount = sp - spBase
+                            var savedStack = [JeffJSValue](repeating: .undefined, count: stackCount)
+                            for i in 0..<stackCount { savedStack[i] = buf[spBase + i]; buf[spBase + i] = .undefined }  // move: the saved state owns them now
+                            var newSaved = GeneratorSavedState(
+                                pc: pc,
+                                sp: stackCount,
+                                stack: savedStack,
+                                varBuf: frame.varBuf,
+                                argBuf: frame.argBuf,
+                                funcObj: mFuncObj,
+                                thisVal: thisVal)
+                            newSaved.delegatedIter = iter
+                            genData.savedState = newSaved
+                            genData.state = .suspended_yield_star
+                        }
+                        retVal = value
+                        // Early exit: same teardown as the epilogue (detach
+                        // captured locals, return the frame to its pool).
+                        if frame.hasLiveVarRefs {
+                            jeffJS_syncBufToFrame(frame, buf, varBase)
+                            for vr in frame.liveVarRefs where !vr.isDetached {
+                                vr.value = vr.pvalue.dupValue()
+                                vr.isDetached = true
+                                vr.parentFrame = nil; vr.slot = nil
+                            }
+                        }
+                        ctx.currentFrame = frame.prevFrame
+                        if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
+                        rt.releaseFrame(frame)
+                        rt.inlineStackTop = inlineBase
+                        return retVal
+                    }
                 }
             }
         }
@@ -7702,12 +7908,14 @@ struct JeffJSInterpreter {
                         if let storage = jsObj._fastArrayValues {
                             if uidx < storage.count, Int(uidx) < storage.values.count {
                                 buf[sp] = storage.values[Int(uidx)].dupValue(); sp += 1
+                                obj.freeValue()   // popped receiver
                                 pc += 1
                                 continue dispatchLoop
                             }
                         } else if case .array(_, let vals, let count) = jsObj.payload {
                             if uidx < count, Int(uidx) < vals.count {
                                 buf[sp] = vals[Int(uidx)].dupValue(); sp += 1
+                                obj.freeValue()
                                 pc += 1
                                 continue dispatchLoop
                             }
@@ -7715,6 +7923,7 @@ struct JeffJSInterpreter {
                     }
                 }
                 let val = ctx.getPropertyValue(obj: obj, prop: key)
+                obj.freeValue(); key.freeValue()   // getPropertyValue borrows both
                 if val.isException {
                     retVal = .exception
                     break dispatchLoop
@@ -7746,6 +7955,7 @@ struct JeffJSInterpreter {
                     }
                 }
                 let val = ctx.getPropertyValue(obj: obj, prop: key)
+                key.freeValue()
                 if val.isException {
                     retVal = .exception
                     break dispatchLoop
@@ -8745,13 +8955,26 @@ struct JeffJSInterpreter {
                 pc = target
 
             case .nip_catch:
-                // Remove the catch handler (second from top) while keeping the
-                // top-of-stack value.  QuickJS: sp[-2] = sp[-1]; sp--;
-                if sp >= spBase + 2 {
-                    buf[sp - 2] = buf[sp - 1]
+                // QuickJS: catch_offset ... ret_val -> ret_val
+                // Keep the top value, free everything below it down to the
+                // nearest catch offset, and replace that catch offset with the
+                // value (operands left by an enclosing expression, or iterator
+                // state, are released here).  When the catch offset itself is
+                // on top (normal end of a try body) it is simply popped.
+                if sp > spBase && buf[sp - 1].isCatchOffset {
                     sp -= 1
-                } else if sp >= spBase + 1 {
+                } else if sp > spBase {
+                    let keptVal = buf[sp - 1]
                     sp -= 1
+                    while sp > spBase && !buf[sp - 1].isCatchOffset {
+                        sp -= 1
+                        buf[sp].freeValue()
+                    }
+                    if sp > spBase {
+                        buf[sp - 1] = keptVal   // overwrite the catch offset (no free needed)
+                    } else {
+                        buf[sp] = keptVal; sp += 1   // no handler on the stack: keep the value
+                    }
                 }
                 pc += 1
 
@@ -9069,7 +9292,7 @@ struct JeffJSInterpreter {
                     // Save value-stack region
                     let stackCount = sp - spBase
                     var savedStack = [JeffJSValue](repeating: .undefined, count: stackCount)
-                    for i in 0..<stackCount { savedStack[i] = buf[spBase + i] }
+                    for i in 0..<stackCount { savedStack[i] = buf[spBase + i]; buf[spBase + i] = .undefined }  // move: the saved state owns them now
                     // The pc saved points to the instruction *after* initial_yield
                     // so that when we resume, we continue with the next opcode.
                     genData.savedState = GeneratorSavedState(
@@ -9100,7 +9323,7 @@ struct JeffJSInterpreter {
                     // Save value-stack region as an array for GeneratorSavedState
                     let stackCount = sp - spBase
                     var savedStack = [JeffJSValue](repeating: .undefined, count: stackCount)
-                    for i in 0..<stackCount { savedStack[i] = buf[spBase + i] }
+                    for i in 0..<stackCount { savedStack[i] = buf[spBase + i]; buf[spBase + i] = .undefined }  // move: the saved state owns them now
                     // Save state for resumption. pc + 1 points past the yield_
                     // opcode so resumption continues with the next instruction.
                     genData.savedState = GeneratorSavedState(
@@ -9123,8 +9346,10 @@ struct JeffJSInterpreter {
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if let genObj = generatorObject.toObject(),
                    case .generatorData(let genData) = genObj.payload {
-                    // Get the iterator from the value
+                    // Get the iterator from the value (the iterator holds its
+                    // own reference; the popped iterable is released here).
                     let iter = ctx.getIterator(obj: val, isAsync: false)
+                    val.freeValue()
                     if iter.isException {
                         retVal = .exception
                         break dispatchLoop
@@ -9132,14 +9357,21 @@ struct JeffJSInterpreter {
                     // Get the first value from the inner iterator
                     let result = ctx.iteratorNext(iter: iter)
                     if result.isException {
+                        iter.freeValue()
                         retVal = .exception
                         break dispatchLoop
                     }
                     let done = ctx.iteratorCheckDone(result: result)
                     let value = ctx.iteratorGetValue(result: result)
+                    result.freeValue()
                     if done {
-                        // Inner iterator immediately done — push return value
+                        // Inner iterator immediately done — push return value;
+                        // the delegation is over, release the iterator.
+                        iter.freeValue()
                         buf[sp] = value; sp += 1
+                        if fb.isGenerator && !fb.isAsyncFunc {
+                            buf[sp] = .newBool(false); sp += 1   // is_return flag for the check after yield_star
+                        }
                         genData.state = .executing
                         pc += 1
                     } else {
@@ -9148,7 +9380,7 @@ struct JeffJSInterpreter {
                         jeffJS_syncBufToFrame(frame, buf, varBase)
                         let stackCount = sp - spBase
                         var savedStack = [JeffJSValue](repeating: .undefined, count: stackCount)
-                        for i in 0..<stackCount { savedStack[i] = buf[spBase + i] }
+                        for i in 0..<stackCount { savedStack[i] = buf[spBase + i]; buf[spBase + i] = .undefined }  // move: the saved state owns them now
                         var saved = GeneratorSavedState(
                             pc: pc,  // resume at this same yield_star opcode
                             sp: stackCount,
@@ -9164,6 +9396,7 @@ struct JeffJSInterpreter {
                         break dispatchLoop
                     }
                 } else {
+                    val.freeValue()
                     pc += 1
                 }
 
@@ -10540,9 +10773,19 @@ struct JeffJSInterpreter {
             buf[sp].freeValue()
         }
         // Release the variable slots (QuickJS frees var_buf at exit). Args are
-        // the caller's (borrowed). Generator/async frames keep their state.
+        // the caller's (borrowed). Generator/async frames keep their state
+        // while suspended; a generator that has completed (state still
+        // .executing after the loop, i.e. no yield suspended it) releases
+        // its locals and its arguments (generator args are owned by the
+        // generator: the call site hands them over at creation).
         if !fb.isGenerator, !fb.isAsyncFunc, !frame.hasLiveVarRefs {
             var i = varBase
+            while i < spBase { buf[i].freeValue(); i += 1 }
+        } else if fb.isGenerator, !fb.isAsyncFunc, !frame.hasLiveVarRefs,
+                  let genObj = generatorObject.toObject(),
+                  case .generatorData(let genData) = genObj.payload,
+                  genData.state == .executing {
+            var i = 0
             while i < spBase { buf[i].freeValue(); i += 1 }
         }
 

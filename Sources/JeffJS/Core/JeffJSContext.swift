@@ -578,13 +578,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             jsObj.fastArray = true
         }
 
-        // Set initial length to 0
+        // Set initial length to 0: writable, not enumerable, not configurable
+        // (it showed up in Object.keys/entries and for-in before).
         let lengthAtom = JeffJSAtomID.JS_ATOM_length.rawValue
-        _ = setPropertyInternal(
-            obj: obj, atom: lengthAtom,
-            value: .newInt32(0),
-            flags: JS_PROP_WRITABLE
-        )
+        _ = defineProperty(obj: obj, atom: lengthAtom, value: .newInt32(0), flags: JS_PROP_WRITABLE)
         return obj
     }
 
@@ -4891,6 +4888,7 @@ extension JeffJSContext {
         // Reads _target[_index], advances _index, returns {value, done}.
         let nextFn = newCFunction({ ctx, this_, args -> JeffJSValue in
             let target = ctx.getPropertyStr(obj: this_, name: "_target")
+            defer { target.freeValue() }   // owned lookup: release on every path
             let idxVal = ctx.getPropertyStr(obj: this_, name: "_index")
             let kindVal = ctx.getPropertyStr(obj: this_, name: "_kind")
             let idx = idxVal.isInt ? Int(idxVal.toInt32()) : 0

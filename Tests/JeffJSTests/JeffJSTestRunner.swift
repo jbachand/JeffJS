@@ -3641,8 +3641,9 @@ extension JeffJSTestRunner {
         // multiple assignments
         evalCheck(ctx, "var a, b, c; a = b = c = 5; a + b + c", expectInt: 15)
 
-        // undefined variables
-        evalCheckUndefined(ctx, "var x; x")
+        // undefined variables (a fresh name: the context is shared with the
+        // checks above, and `var x;` leaves an existing global `x` untouched)
+        evalCheckUndefined(ctx, "var xUndeclared; xUndeclared")
     }
 
     // MARK: - Opcode: Control Flow (if_false, if_true, goto)

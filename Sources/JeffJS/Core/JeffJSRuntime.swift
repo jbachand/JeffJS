@@ -396,6 +396,11 @@ final class JeffJSRuntime {
     var protectedGlobals: Set<ObjectIdentifier> = []
     /// Recycled plain objects (JeffJSObjectPool.swift).
     var objectPool: [JeffJSObject] = []
+    /// JS strings for atoms / small integer keys handed out by property
+    /// enumeration (for-in, Object.keys): one string per atom instead of one
+    /// per key per loop. Entries hold one JS reference (dropped in freeAtom).
+    var atomJSStrings: [UInt32: JeffJSString] = [:]
+    var intKeyStrings: [JeffJSString?] = Array(repeating: nil, count: 1024)
 
     /// Pool of interpreter value buffers: (pointer, capacity) pairs.
     var interpBufPool: [(UnsafeMutablePointer<JeffJSValue>, Int)] = []
@@ -1142,6 +1147,7 @@ final class JeffJSRuntime {
             // Predefined atoms (< JS_ATOM_END) are never freed
             if atom >= JeffJSAtomID.JS_ATOM_END.rawValue {
                 removeAtomFromHash(atom)
+                if let js = atomJSStrings.removeValue(forKey: atom) { js.refCount -= 1 }
                 atomArray[Int(atom)] = nil
                 // Add to free list by storing free list head in hashNext
                 let freeEntry = JeffJSAtomStruct()

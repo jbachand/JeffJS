@@ -285,7 +285,7 @@ extension JeffJSContext {
             let pv = jsObj.primitiveValue
             if pv.isString, let s = pv.stringValue {
                 for i in 0 ..< s.len {
-                    intKeys.append((UInt32(i), newStringValue(String(i))))
+                    intKeys.append((UInt32(i), intKeyString(i)))
                 }
                 if !enumOnly {
                     stringKeys.append(newStringValue("length"))
@@ -300,7 +300,7 @@ extension JeffJSContext {
                 let values = snap.values, count = snap.count
                 for i in 0..<count {
                     if i < values.count && !values[i].isUndefined {
-                        intKeys.append((UInt32(i), newStringValue(String(i))))
+                        intKeys.append((UInt32(i), intKeyString(i)))
                     }
                 }
             }
@@ -323,7 +323,7 @@ extension JeffJSContext {
                     // Integer atom — collect separately for numeric sorting.
                     if wantStrings {
                         if let idx = rt.atomToUInt32(atom) {
-                            intKeys.append((idx, newStringValue(String(idx))))
+                            intKeys.append((idx, intKeyString(Int(idx))))
                         }
                     }
                 } else if let entry = rt.atomArray[Int(atom)] {
@@ -335,7 +335,7 @@ extension JeffJSContext {
                         }
                     } else {
                         if wantStrings {
-                            stringKeys.append(newStringValue(entry.str))
+                            stringKeys.append(atomToString(atom))
                         }
                     }
                 }

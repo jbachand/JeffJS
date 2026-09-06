@@ -738,10 +738,23 @@ final class JeffJSGeneratorData {
     var state: JeffJSGeneratorStateEnum = .suspended_start
     var asyncState: JeffJSAsyncFunctionState = JeffJSAsyncFunctionState()
     /// Saved interpreter state from the last yield/initial_yield.
-    /// Non-nil when the generator is in a suspended state.
+    /// Non-nil when the generator is in a suspended state.  The saved value
+    /// stack is *owned* by this state (the suspending frame moves its slots
+    /// here); resuming moves the values back into the interpreter buffer.
     var savedState: GeneratorSavedState? = nil
 
     init() {}
+
+    deinit {
+        // Generator dropped while suspended: release the value stack it was
+        // holding across the yield (for-of iterator state, call operands...).
+        if let saved = savedState, JeffJSGCObjectHeader.activeRuntime != nil {
+            for v in saved.stack { v.freeValue() }
+            for v in saved.varBuf { v.freeValue() }
+            for v in saved.argBuf { v.freeValue() }   // generator args are owned by the generator
+            if !saved.delegatedIter.isUndefined { saved.delegatedIter.freeValue() }   // yield* delegate
+        }
+    }
 }
 
 /// Map / Set record entry.
@@ -1916,6 +1929,8 @@ struct JeffJSObj {
         nonmutating set { _obj.fbFast = newValue }
     }
     @inline(__always) var fbFastU: Unmanaged<JeffJSFunctionBytecode>? { _obj.fbFastU }
+    @inline(__always) var cFuncFast: JSCFunctionType? { _obj.cFuncFast }
+    @inline(__always) var cMagicFast: Int { _obj.cMagicFast }
 
     @inline(__always) var varRefsRaw: UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>? { _obj.varRefsRaw }
     @inline(__always) var varRefsRawCount: Int { _obj.varRefsRawCount }

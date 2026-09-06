@@ -36,8 +36,16 @@ extension JeffJSContext {
 
     /// Create a new JS string from UTF-16 code units.
     func newStringFromUTF16(_ units: [UInt16]) -> JeffJSValue {
-        let str = String(utf16CodeUnits: units, count: units.count)
-        return newStringValue(str)
+        // Build the JS string directly (narrow when every unit fits Latin-1);
+        // the Swift String round trip re-encoded every result.
+        var narrow = true
+        for u in units where u > 0xFF { narrow = false; break }
+        if narrow {
+            var b = [UInt8](); b.reserveCapacity(units.count)
+            for u in units { b.append(UInt8(truncatingIfNeeded: u)) }
+            return JeffJSValue.makeString(JeffJSString(refCount: 1, len: units.count, isWideChar: false, storage: .str8(b)))
+        }
+        return JeffJSValue.makeString(JeffJSString(refCount: 1, len: units.count, isWideChar: true, storage: .str16(units)))
     }
 
     /// Create an iterator result object { value, done }.
@@ -249,7 +257,9 @@ struct JeffJSBuiltinString {
         }
         let str = ctx.toString(this)
         if str.isException { return nil }
-        return ctx.toUTF16Array(str)
+        let units = ctx.toUTF16Array(str)
+        str.freeValue()   // toUTF16Array takes its own reference; this one leaked per call
+        return units
     }
 
     /// Clamp an index to [0, length]. Negative indices count from the end.
