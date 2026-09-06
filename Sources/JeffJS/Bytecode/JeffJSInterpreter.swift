@@ -10846,9 +10846,11 @@ func jeffJS_opProfDump() {
     for c in jeffJS_opProfSingles { total &+= c }
     var out = "OPPROF total ops \(total)\n== top opcodes\n"
     let singles = (0..<jeffJS_opProfN).map { ($0, jeffJS_opProfSingles[$0]) }.filter { $0.1 > 0 }.sorted { $0.1 > $1.1 }
-    for (v, c) in singles.prefix(40) {
+    for (v, c) in singles {
         out += String(format: "%10llu %5.1f%%  %@\n", c, Double(c) * 100 / Double(max(total, 1)), jeffJS_opProfName(v))
     }
+    let never = (1..<256).filter { jeffJS_opProfSingles[$0] == 0 && JeffJSOpcode(rawValue: UInt16($0)) != nil }
+    out += "== narrow opcodes never executed (\(never.count)): " + never.map { jeffJS_opProfName($0) }.joined(separator: " ") + "\n"
     out += "== top pairs\n"
     var pairs: [(Int, Int, UInt64)] = []
     for a in 0..<jeffJS_opProfN { for b in 0..<jeffJS_opProfN { let c = jeffJS_opProfPairs[a * jeffJS_opProfN + b]; if c > 0 { pairs.append((a, b, c)) } } }

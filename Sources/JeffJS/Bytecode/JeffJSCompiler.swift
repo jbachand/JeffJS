@@ -1770,6 +1770,19 @@ struct JeffJSCompiler {
             //   ->  get_xxx(n) + inc + dup + put_xxx(n)
             //   dup keeps the value on stack as the expression result.
             // ------------------------------------------------------------------
+            // Statement-form element store: `a[i] = v;` compiles as
+            //   dup perm4 put_array_el drop   ([obj idx v] -> [v obj idx v] -> [v] -> [])
+            // i.e. three wasted dispatches per store (8M stores on the
+            // real-world suite). Fold to the consuming put_array_el.
+            if op == .dup, nextOp == .perm4,
+               nextPos + 2 < srcLen, nextPos + 2 < srcBuf.count,
+               srcBuf[nextPos + 1] == UInt8(truncatingIfNeeded: JeffJSOpcode.put_array_el.rawValue),
+               srcBuf[nextPos + 2] == UInt8(truncatingIfNeeded: JeffJSOpcode.drop.rawValue) {
+                bc.putOpcode(JeffJSOpcode.put_array_el.rawValue)
+                pos = nextPos + 3
+                continue
+            }
+
             if (op == .get_var_ref || op == .get_loc || op == .get_arg),
                let next = nextOp, (next == .inc || next == .dec) {
                 let varIdx = readU16(srcBuf, operandBase)
