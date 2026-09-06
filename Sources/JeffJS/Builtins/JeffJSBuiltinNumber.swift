@@ -174,7 +174,7 @@ struct JeffJSBuiltinNumber {
 
         // Update classProto so auto-boxing (e.g., (42).toString()) finds
         // Number.prototype methods when getPropertyInternal looks them up.
-        ctx.classProto[JSClassID.JS_CLASS_NUMBER.rawValue] = proto
+        ctx.classProto[JSClassID.JS_CLASS_NUMBER.rawValue] = proto.dupValue()
 
         // 2. Create the Number constructor
         let ctor = ctx.newCFunction(
@@ -967,7 +967,7 @@ struct JeffJSBuiltinBoolean {
 
         // Update classProto so auto-boxing (e.g., true.toString()) finds
         // Boolean.prototype methods when getPropertyInternal looks them up.
-        ctx.classProto[JSClassID.JS_CLASS_BOOLEAN.rawValue] = proto
+        ctx.classProto[JSClassID.JS_CLASS_BOOLEAN.rawValue] = proto.dupValue()
 
         // 2. Create the Boolean constructor
         let ctor = ctx.newCFunction(

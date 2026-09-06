@@ -132,7 +132,7 @@ struct JeffJSBuiltinString {
 
         // Update classProto so auto-boxing (e.g., 'hello'.toUpperCase()) finds
         // String.prototype methods when getPropertyInternal looks them up.
-        ctx.classProto[JSClassID.JS_CLASS_STRING.rawValue] = proto
+        ctx.classProto[JSClassID.JS_CLASS_STRING.rawValue] = proto.dupValue()
 
         // 2. Create the String constructor
         let ctor = ctx.newCFunction(

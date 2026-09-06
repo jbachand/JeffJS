@@ -2778,7 +2778,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// Adds Number constructor, prototype, and Math object.
     private func addNumberIntrinsic() {
         let numberProto = newObjectClass(classID: JSClassID.JS_CLASS_NUMBER.rawValue)
-        classProto[JSClassID.JS_CLASS_NUMBER.rawValue] = numberProto
+        classProto[JSClassID.JS_CLASS_NUMBER.rawValue] = numberProto.dupValue()
 
         let numberCtor = newCFunction({ [weak self] ctx, thisVal, args in
             guard let self = self else { return .exception }
@@ -3030,7 +3030,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// Adds String constructor and prototype methods.
     private func addStringIntrinsic() {
         let stringProto = newObjectClass(classID: JSClassID.JS_CLASS_STRING.rawValue)
-        classProto[JSClassID.JS_CLASS_STRING.rawValue] = stringProto
+        classProto[JSClassID.JS_CLASS_STRING.rawValue] = stringProto.dupValue()
 
         let stringCtor = newCFunction({ [weak self] ctx, thisVal, args in
             guard let self = self else { return .exception }
@@ -3063,7 +3063,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// Adds Boolean constructor.
     private func addBooleanIntrinsic() {
         let boolProto = newObjectClass(classID: JSClassID.JS_CLASS_BOOLEAN.rawValue)
-        classProto[JSClassID.JS_CLASS_BOOLEAN.rawValue] = boolProto
+        classProto[JSClassID.JS_CLASS_BOOLEAN.rawValue] = boolProto.dupValue()
 
         let boolCtor = newCFunction({ [weak self] ctx, thisVal, args in
             guard let self = self else { return .exception }
