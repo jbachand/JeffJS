@@ -283,6 +283,80 @@ Conformance 1706/0.
 5. Date/number formatting, JSON.parse, typed arrays (8x): builtins written with
    Swift String/Array conveniences; rewrite the hot ones over raw buffers.
 
+## Round 7: everyday speed without a JIT (2026-09-05, evening)
+
+Jeff's direction: "wildly more performant for every day use", ideally running
+on Metal "at raw memory speed like JIT". Measured on the M1 Max first
+(`/tmp/jjbench/metal/probe.swift`):
+
+| probe | result |
+|---|---:|
+| compile 3 kernels from MSL source at runtime | 55 ms |
+| empty compute dispatch round trip | 221 us median, 131 us min |
+| serial LCG+switch loop, one GPU lane vs one CPU core | GPU 26.6x slower |
+| element-wise map, 1K / 100K / 10M floats | GPU 290x slower / 15x slower / 4x faster |
+
+The dispatch floor alone is worth ~200,000 interpreted opcodes and a lone GPU
+lane is 25x behind a CPU core before dynamic typing enters, so Metal is not a
+JIT substitute. It remains a throughput tier for element-wise numeric loops
+over typed arrays with a million or more work items (integer/bitwise math
+exact, float math not JS-exact: no f64). Chosen tracks instead: the "legal
+JIT" (quickening + superinstructions: code generation as indices into a
+build-time compiled handler table, allowed on iOS) and the page-load track
+(parse speed, bytecode cache, lazy compilation, off-thread compile, GC).
+
+### Parsing was quadratic
+
+`bench`-style timing of parse+compile only (the script wrapped in a function
+that is never called):
+
+| script | before | after | QuickJS |
+|---|---:|---:|---:|
+| libvorbis.module.min.js (343 KB, one line) | 5448 ms | 123 ms | 34 ms |
+| challenge.js (1 MB) | 7893 ms | 172 ms | 73 ms |
+| synthetic 817 KB | 27876 ms | 394 ms | 50 ms |
+
+`JeffJSParseState.getLineCol` rescanned the source from byte 0 for every
+statement (the `line_num` emission), 76% of parse time and quadratic; it now
+continues from the previous query. The remaining 2-4x is spread thin (Swift
+array bounds checks, ARC, DynBuf appends, several compiler passes that each
+decode every instruction). Also done: bitcast opcode decode in the compiler
+passes, the switch fix-up pass gated on functions that contain a switch, the
+JEFFJS_DUMP environment lookup read once, contextual-keyword checks cached.
+
+### The bytecode cache was off because it was wrong
+
+`JeffJSBytecodeCache` (in-memory, plus disk at
+`~/Library/Caches/JeffJSBytecodeCache/v<n>/`, invalidated by a build stamp
+and `compilerVersion`) existed but `cache.bytecodeEnabled` was false in the
+plist. Deserialized code was wrong: the JFBC format dropped
+`closureVarsList` (which parent slot each var_ref binds), `selfRefVarIdx`,
+`isStrictMode` and the debug flags, and never restored trace regions. JFBC
+v3 carries the descriptors and flags, recomputes trace regions with
+`JeffJSCompiler.fuseBasicBlocks` on load, writes the disk file synchronously
+(a queued write was lost when a short-lived host exited), and is enabled by
+default. Checks: the real-world suite deserialized matches QuickJS on all 38
+kernels at the same speed as freshly compiled code; every probe battery is
+identical across compile and cache-hit evaluation; conformance 1706/0.
+
+| script | parse+compile+store | disk hit |
+|---|---:|---:|
+| challenge.js (1 MB) | 183 ms | ~5 ms (30 ms process total, 24 ms is startup) |
+| libvorbis (343 KB) | 132 ms | ~3 ms |
+
+Scripts whose bytecode exceeds `cache.bytecodeMaxSize` used to throw
+"Bytecode too large"; they now run uncached. Any config key can be overridden
+from the environment (`JEFFJS_CACHE_BYTECODEENABLED=1`).
+
+### Superinstruction tooling
+
+`swift build -c release --product jeffjs-cli --scratch-path <dir> -Xswiftc
+-DJEFFJS_OPPROF` builds a CLI that counts executed opcodes and consecutive
+pairs across the main loop and both traces and dumps the top entries at exit.
+All 256 narrow opcode slots are in use (the compile-time-only scope_*/label_
+ops already live in the wide range), so each new fused opcode must evict a
+narrow opcode that the profile shows is essentially never executed.
+
 ## Current standing (2026-09-05, end of round 4)
 
 | kernel | baseline | round 3 | now | QuickJS | now vs QuickJS |

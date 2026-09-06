@@ -17,7 +17,7 @@
 	<key>optimize.useInlineCalls</key>
 	<true/>
 	<key>cache.bytecodeEnabled</key>
-	<false/>
+	<true/>
 	<key>cache.bytecodePrefixes</key>
 	<string></string>
 	<key>cache.bytecodeExcludePrefixes</key>

@@ -16,7 +16,7 @@ import Foundation
 /// Magic bytes: "JFBC" (JeffJS Function ByteCode)
 private let JFBC_MAGIC: UInt32 = 0x4A46_4243
 /// Version 2: adds atom table for cross-runtime portability
-private let JFBC_VERSION: UInt8 = 2
+private let JFBC_VERSION: UInt8 = 3   // 3: closure var descriptors, selfRefVarIdx, strict/debug flags
 
 /// Constant pool entry tags
 private let CPOOL_UNDEFINED: UInt8 = 0
@@ -45,6 +45,10 @@ private func packFlags(_ fb: JeffJSFunctionBytecode) -> UInt16 {
     if fb.superCallAllowed              { flags |= 1 << 8 }
     if fb.superAllowed                  { flags |= 1 << 9 }
     if fb.argumentsAllowed              { flags |= 1 << 10 }
+    if fb.isStrictMode                  { flags |= 1 << 11 }
+    if fb.hasDebug                      { flags |= 1 << 12 }
+    if fb.readOnly                      { flags |= 1 << 13 }
+    if fb.backtrace                     { flags |= 1 << 14 }
     return flags
 }
 
@@ -61,6 +65,10 @@ private func unpackFlags(_ flags: UInt16, into fb: JeffJSFunctionBytecode) {
     fb.superCallAllowed              = (flags & (1 << 8)) != 0
     fb.superAllowed                  = (flags & (1 << 9)) != 0
     fb.argumentsAllowed              = (flags & (1 << 10)) != 0
+    fb.isStrictMode                  = (flags & (1 << 11)) != 0
+    fb.hasDebug                      = (flags & (1 << 12)) != 0
+    fb.readOnly                      = (flags & (1 << 13)) != 0
+    fb.backtrace                     = (flags & (1 << 14)) != 0
 }
 
 // MARK: - Atom Table Builder
@@ -292,6 +300,23 @@ struct JeffJSBytecodeSerializer {
         for val in fb.cpool {
             writeCpoolEntry(val, rt: rt)
         }
+        // v3 trailer: closure variable descriptors (which parent slot each
+        // var_ref binds) and the self-reference slot. Without them a
+        // deserialized closure binds the wrong variables.
+        writeU16(UInt16(fb.closureVarsList.count))
+        for cv in fb.closureVarsList {
+            let nameRef: UInt32 = (rt != nil) ? atomTable.intern(cv.varName, rt: rt!) : cv.varName
+            writeU32(nameRef)
+            var f: UInt8 = 0
+            if cv.isLocal { f |= 1 }
+            if cv.isArg { f |= 2 }
+            if cv.isConst { f |= 4 }
+            if cv.isLexical { f |= 8 }
+            writeU8(f)
+            writeU8(UInt8(truncatingIfNeeded: cv.varKind))
+            writeU32(UInt32(bitPattern: Int32(truncatingIfNeeded: cv.varIdx)))
+        }
+        writeU32(UInt32(bitPattern: Int32(truncatingIfNeeded: fb.selfRefVarIdx)))
     }
 
     // MARK: Constant Pool Entry
@@ -426,8 +451,12 @@ struct JeffJSBytecodeDeserializer {
             guard pos < data.count else { return false }
             guard skipCpoolEntry(data: data, pos: &pos) else { return false }
         }
+        // v3 trailer: u16 count + (u32 name, u8 flags, u8 kind, u32 idx) per entry, u32 selfRef
+        guard pos + 1 < data.count else { return false }
+        let cvCount = Int(data[pos]) | (Int(data[pos + 1]) << 8)
+        pos += 2 + cvCount * 10 + 4
 
-        return true
+        return pos <= data.count
     }
 
     /// Skip a single cpool entry.
@@ -502,7 +531,7 @@ struct JeffJSBytecodeDeserializer {
     private mutating func readFunctionBytecode() -> JeffJSFunctionBytecode? {
         // Header
         guard let magic = readU32(), magic == JFBC_MAGIC else { return nil }
-        guard let version = readU8(), (version == 1 || version == 2) else { return nil }
+        guard let version = readU8(), version == 3 else { return nil }   // older layouts lack closure descriptors
         guard let flags = readU16() else { return nil }
         guard let argCount = readU16() else { return nil }
         guard let varCount = readU16() else { return nil }
@@ -537,6 +566,30 @@ struct JeffJSBytecodeDeserializer {
             cpool.append(val)
         }
 
+        // v3 trailer: closure variable descriptors + self-reference slot
+        guard let cvCount = readU16() else { return nil }
+        var closureVars: [JeffJSClosureVar] = []
+        closureVars.reserveCapacity(Int(cvCount))
+        for _ in 0..<cvCount {
+            guard let nameRef = readU32(), let f = readU8(), let kind = readU8(),
+                  let idxRaw = readU32() else { return nil }
+            var cv = JeffJSClosureVar()
+            if let remapper {
+                guard Int(nameRef) < remapper.indexToAtom.count else { return nil }
+                cv.varName = remapper.indexToAtom[Int(nameRef)]
+            } else {
+                cv.varName = nameRef
+            }
+            cv.isLocal = (f & 1) != 0
+            cv.isArg = (f & 2) != 0
+            cv.isConst = (f & 4) != 0
+            cv.isLexical = (f & 8) != 0
+            cv.varKind = Int(kind)
+            cv.varIdx = Int(Int32(bitPattern: idxRaw))
+            closureVars.append(cv)
+        }
+        guard let selfRefRaw = readU32() else { return nil }
+
         // Construct fresh JeffJSFunctionBytecode
         let fb = JeffJSFunctionBytecode()
         fb.bytecode = bytecode
@@ -551,6 +604,11 @@ struct JeffJSBytecodeDeserializer {
         fb.fileName = fileName
         fb.cpool = cpool
         unpackFlags(flags, into: fb)
+        fb.closureVarsList = closureVars
+        fb.selfRefVarIdx = Int(Int32(bitPattern: selfRefRaw))
+        // Trace regions are derived from the final bytecode (not stored):
+        // recompute them so cached code runs with the same loop traces.
+        JeffJSCompiler.fuseBasicBlocks(fb)
 
         return fb
     }
@@ -659,7 +717,7 @@ final class JeffJSBytecodeCache {
     // MARK: - Disk Cache
 
     /// Bump when the bytecode format changes.
-    private static let diskVersion: UInt32 = 2
+    private static let diskVersion: UInt32 = 3
 
     /// Bump when parser or compiler logic changes (bug fixes, new opcodes, etc.).
     /// This is mixed into the source hash so cached bytecode from an older compiler
@@ -668,7 +726,7 @@ final class JeffJSBytecodeCache {
     ///   - JeffJSCompiler.swift (resolveLabels, resolveVariables, peephole)
     ///   - JeffJSOpcodes.swift (opcode additions/changes)
     ///   - JeffJSInterpreter.swift (only if opcode semantics change)
-    static let compilerVersion: UInt64 = 2  // 2026-09-05: opcode renumbering (with_* evicted to wide; fused superinstructions)
+    static let compilerVersion: UInt64 = 3  // 2026-09-05: JFBC v3 (closure descriptors), unwinding/generator bytecode changes
 
     /// Lazily-initialized disk cache directory.
     /// Automatically clears cached .jfbc files when the app binary changes (new build).
@@ -758,12 +816,10 @@ final class JeffJSBytecodeCache {
         guard cache.count < maxEntries else { return }
         let serialized = JeffJSBytecodeSerializer.serialize(fb, rt: rt)
         cache[sourceHash] = serialized
-        // Persist to disk on background queue
+        // Persist to disk synchronously: a few hundred KB takes ~1 ms, and a
+        // queued write is lost when a short-lived host (the CLI) exits first.
         if let url = diskURL(for: sourceHash) {
-            let data = Data(serialized)
-            DispatchQueue.global(qos: .utility).async {
-                try? data.write(to: url, options: .atomic)
-            }
+            try? Data(serialized).write(to: url, options: .atomic)
         }
     }
 

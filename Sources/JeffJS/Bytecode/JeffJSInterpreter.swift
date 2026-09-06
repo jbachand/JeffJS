@@ -2146,6 +2146,9 @@ private func executeFastTrace(
         // Byte 0 is the wide-opcode prefix: it decodes to .invalid, whose
         // case below deopts (no separate compare per opcode).
         let op = unsafeBitCast(UInt16(opByte), to: JeffJSOpcode.self)
+        #if JEFFJS_OPPROF
+        jeffJS_opProfRecord(Int(opByte))
+        #endif
 
         switch op {
         case .invalid:
@@ -3821,6 +3824,9 @@ private func executeFastTraceLean(
         let opByte = bc[pc]
         // Byte 0 (wide-opcode prefix) decodes to .invalid, which deopts below.
         let op = unsafeBitCast(UInt16(opByte), to: JeffJSOpcode.self)
+        #if JEFFJS_OPPROF
+        jeffJS_opProfRecord(Int(opByte))
+        #endif
 
         switch op {
         case .invalid:
@@ -6100,6 +6106,9 @@ struct JeffJSInterpreter {
                    "JeffJSOpcode layout drift: bitcast decode no longer valid")
             #else
             let op = unsafeBitCast(UInt16(bc[pc]), to: JeffJSOpcode.self)
+            #endif
+            #if JEFFJS_OPPROF
+            jeffJS_opProfRecord(bc[pc] == 0 && pc + 1 < bcLen ? 256 + Int(bc[pc + 1]) : Int(bc[pc]))
             #endif
 
             #if DEBUG
@@ -10900,3 +10909,43 @@ extension JeffJSRuntime {
         inlineStackCap = newCap
     }
 }
+
+
+#if JEFFJS_OPPROF
+// Dynamic opcode-sequence profile (build with -Xswiftc -DJEFFJS_OPPROF):
+// counts executed opcodes and consecutive pairs across all three
+// dispatchers, dumped to stderr at exit. Used to pick superinstructions.
+let jeffJS_opProfN = 320
+nonisolated(unsafe) var jeffJS_opProfPairs = [UInt64](repeating: 0, count: 320 * 320)
+nonisolated(unsafe) var jeffJS_opProfSingles = [UInt64](repeating: 0, count: 320)
+nonisolated(unsafe) var jeffJS_opProfPrev = 0
+nonisolated(unsafe) var jeffJS_opProfRegistered = false
+@inline(__always)
+func jeffJS_opProfRecord(_ op: Int) {
+    if !jeffJS_opProfRegistered { jeffJS_opProfRegistered = true; atexit(jeffJS_opProfDump) }
+    jeffJS_opProfSingles[op] &+= 1
+    jeffJS_opProfPairs[jeffJS_opProfPrev * jeffJS_opProfN + op] &+= 1
+    jeffJS_opProfPrev = op
+}
+func jeffJS_opProfName(_ v: Int) -> String {
+    if let op = JeffJSOpcode(rawValue: UInt16(v)) { return String(describing: op) }
+    return "op\(v)"
+}
+func jeffJS_opProfDump() {
+    var total: UInt64 = 0
+    for c in jeffJS_opProfSingles { total &+= c }
+    var out = "OPPROF total ops \(total)\n== top opcodes\n"
+    let singles = (0..<jeffJS_opProfN).map { ($0, jeffJS_opProfSingles[$0]) }.filter { $0.1 > 0 }.sorted { $0.1 > $1.1 }
+    for (v, c) in singles.prefix(40) {
+        out += String(format: "%10llu %5.1f%%  %@\n", c, Double(c) * 100 / Double(max(total, 1)), jeffJS_opProfName(v))
+    }
+    out += "== top pairs\n"
+    var pairs: [(Int, Int, UInt64)] = []
+    for a in 0..<jeffJS_opProfN { for b in 0..<jeffJS_opProfN { let c = jeffJS_opProfPairs[a * jeffJS_opProfN + b]; if c > 0 { pairs.append((a, b, c)) } } }
+    pairs.sort { $0.2 > $1.2 }
+    for (a, b, c) in pairs.prefix(60) {
+        out += String(format: "%10llu %5.1f%%  %@ -> %@\n", c, Double(c) * 100 / Double(max(total, 1)), jeffJS_opProfName(a), jeffJS_opProfName(b))
+    }
+    FileHandle.standardError.write(out.data(using: .utf8)!)
+}
+#endif

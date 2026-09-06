@@ -18,14 +18,24 @@ enum JeffJSConfig {
         return plist
     }()
 
+    /// Environment override for experiments: `cache.bytecodeEnabled` is read
+    /// from `JEFFJS_CACHE_BYTECODEENABLED` when set (1/0, true/false), else
+    /// from the plist, else the default.
+    private static func envOverride(_ key: String) -> String? {
+        let envKey = "JEFFJS_" + key.uppercased().replacingOccurrences(of: ".", with: "_")
+        return ProcessInfo.processInfo.environment[envKey]
+    }
     private static func bool(_ key: String, default d: Bool) -> Bool {
-        dict[key] as? Bool ?? d
+        if let e = envOverride(key) { return e == "1" || e.lowercased() == "true" }
+        return dict[key] as? Bool ?? d
     }
     private static func int(_ key: String, default d: Int) -> Int {
-        dict[key] as? Int ?? d
+        if let e = envOverride(key), let v = Int(e) { return v }
+        return dict[key] as? Int ?? d
     }
     private static func string(_ key: String, default d: String) -> String {
-        dict[key] as? String ?? d
+        if let e = envOverride(key) { return e }
+        return dict[key] as? String ?? d
     }
 
     // MARK: - Build

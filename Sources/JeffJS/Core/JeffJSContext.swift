@@ -2395,9 +2395,8 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         if bcSize == 0 {
             return .JS_UNDEFINED
         }
-        if bcSize > JeffJSConfig.bytecodeMaxSize {
-            return throwInternalError(message: "Bytecode too large (\(bcSize) bytes) for \(filename)")
-        }
+        // Scripts above the cache size limit still run; they are just not cached.
+        let tooLargeToCache = bcSize > JeffJSConfig.bytecodeMaxSize
 
         // Step 3: Compile (recursively compiles child functions, resolves
         // variables/labels, and produces final bytecode).
@@ -2410,7 +2409,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         totalBytecodeSize += compiledSize
 
         // Store serialized bytecode in cache for future evals of the same source
-        if cacheEnabled {
+        if cacheEnabled && !tooLargeToCache {
             rt.bytecodeCache.store(cacheKey, bytecode: fb)
         }
 
