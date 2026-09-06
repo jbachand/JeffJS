@@ -183,6 +183,9 @@ class JeffJSFunctionDefCompiler {
     var lastColNum: Int = 1
     var lastPC: Int = 0
     var lastColPC: Int = 0
+    /// line_num events recorded during label resolution (pre-compaction
+    /// positions); encoded into pc2line/pc2col after NOP compaction.
+    var pc2Events: [(pc: Int, line: Int, col: Int)] = []
 
     // -- Stack --
     var stackSize: Int = 0
@@ -1369,8 +1372,7 @@ struct JeffJSCompiler {
             if op == .line_num {
                 let lineNum = Int(readU32(srcBuf, operandBase))
                 let colNum = Int(readU32(srcBuf, operandBase + 4))
-                addPC2Line(fd: fd, pc: bc.len, lineNum: lineNum)
-                addPC2Col(fd: fd, pc: bc.len, colNum: colNum)
+                fd.pc2Events.append((pc: bc.len, line: lineNum, col: colNum))
                 pos += instrSize
                 continue
             }
@@ -1918,108 +1920,10 @@ struct JeffJSCompiler {
             // where the pattern appears after other transformations (e.g., in the
             // short opcode encoding phase), but we don't emit it here.
 
-            // ------------------------------------------------------------------
-            // Level-2 compound fusions (3+ opcodes → NOP prefix + sub-opcode)
-            // These use NOP as a prefix byte, followed by a sub-opcode byte,
-            // enabling 256 compound instructions beyond the 256 single-byte limit.
-            // ------------------------------------------------------------------
-
-            // Compound 0: get_loc(a) + get_field(atom) + call(argc) → obj.method(args)
-            if op == .get_loc, nextOp == .get_field {
-                let thirdPos = nextPos + 5  // get_field is 5 bytes
-                if thirdPos < srcLen {
-                    let thirdOp = JeffJSOpcode(rawValue: UInt16(srcBuf[thirdPos]))
-                    // Same argc == 0 restriction as Fusion 7: with arguments
-                    // the args sit between get_field and call, so this
-                    // pattern can only be a zero-argument call.
-                    if thirdOp == .call, readU16(srcBuf, thirdPos + 1) == 0 {
-                        let locIdx = readU16(srcBuf, pos + 1)
-                        if locIdx < 256 {
-                            let atom = readU32(srcBuf, nextPos + 1)
-                            let argc = readU16(srcBuf, thirdPos + 1)
-                            bc.putOpcode(JeffJSOpcode.nop.rawValue)  // prefix
-                            bc.putU8(0)  // sub-opcode 0: get_loc_get_field_call
-                            bc.putU8(UInt8(locIdx))
-                            bc.putU32(atom)
-                            bc.putU16(argc)
-                            pos = thirdPos + 3  // skip all 3 opcodes
-                            continue
-                        }
-                    }
-                }
-            }
-
-            // Compound 1: get_loc(a) + get_loc(b) + get_array_el → arr[i]
-            if op == .get_loc, nextOp == .get_loc {
-                let thirdPos = nextPos + 3  // get_loc is 3 bytes
-                if thirdPos < srcLen {
-                    let thirdOp = JeffJSOpcode(rawValue: UInt16(srcBuf[thirdPos]))
-                    if thirdOp == .get_array_el {
-                        let arrIdx = readU16(srcBuf, pos + 1)
-                        let idxIdx = readU16(srcBuf, nextPos + 1)
-                        if arrIdx < 256 && idxIdx < 256 {
-                            bc.putOpcode(JeffJSOpcode.nop.rawValue)
-                            bc.putU8(1)  // sub-opcode 1: get_loc_get_loc_get_array_el
-                            bc.putU8(UInt8(arrIdx))
-                            bc.putU8(UInt8(idxIdx))
-                            pos = thirdPos + 1  // skip all 3 opcodes (get_array_el is 1 byte)
-                            continue
-                        }
-                    }
-                }
-            }
-
-            // Compound 2: get_loc(a) + get_field(atom) + put_loc(b) → x = obj.prop
-            if op == .get_loc, nextOp == .get_field {
-                let thirdPos = nextPos + 5
-                if thirdPos < srcLen {
-                    let thirdOp = JeffJSOpcode(rawValue: UInt16(srcBuf[thirdPos]))
-                    if thirdOp == .put_loc {
-                        let srcIdx = readU16(srcBuf, pos + 1)
-                        let dstIdx = readU16(srcBuf, thirdPos + 1)
-                        if srcIdx < 256 && dstIdx < 256 {
-                            let atom = readU32(srcBuf, nextPos + 1)
-                            bc.putOpcode(JeffJSOpcode.nop.rawValue)
-                            bc.putU8(2)  // sub-opcode 2: get_loc_get_field_put_loc
-                            bc.putU8(UInt8(srcIdx))
-                            bc.putU32(atom)
-                            bc.putU8(UInt8(dstIdx))
-                            pos = thirdPos + 3  // skip put_loc (3 bytes)
-                            continue
-                        }
-                    }
-                }
-            }
-
-            // Compound 3: (removed — fusing jump instructions breaks offset resolution)
-
-            // Compound 4: get_loc(a) + get_loc(b) + add + put_loc(c) → c = a + b
-            if op == .get_loc, nextOp == .get_loc {
-                let thirdPos = nextPos + 3
-                if thirdPos < srcLen {
-                    let thirdOp = JeffJSOpcode(rawValue: UInt16(srcBuf[thirdPos]))
-                    if thirdOp == .add {
-                        let fourthPos = thirdPos + 1
-                        if fourthPos < srcLen {
-                            let fourthOp = JeffJSOpcode(rawValue: UInt16(srcBuf[fourthPos]))
-                            if fourthOp == .put_loc {
-                                let aIdx = readU16(srcBuf, pos + 1)
-                                let bIdx = readU16(srcBuf, nextPos + 1)
-                                let cIdx = readU16(srcBuf, fourthPos + 1)
-                                if aIdx < 256 && bIdx < 256 && cIdx < 256 {
-                                    bc.putOpcode(JeffJSOpcode.nop.rawValue)
-                                    bc.putU8(4)  // sub-opcode 4: add_loc_loc_put
-                                    bc.putU8(UInt8(aIdx))
-                                    bc.putU8(UInt8(bIdx))
-                                    bc.putU8(UInt8(cIdx))
-                                    pos = fourthPos + 3  // skip put_loc (3 bytes)
-                                    continue
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // (The NOP-prefixed compound fusions were removed: every pattern they
+            // matched is already captured by the fusions above, and a NOP prefix
+            // conflicts with NOP padding/compaction and with the traces, which
+            // treat NOP as a plain skip.)
 
             // ------------------------------------------------------------------
             // Emit the opcode, converting to short forms where possible
@@ -2150,6 +2054,21 @@ struct JeffJSCompiler {
         // Pass 3: Dead code elimination after terminal opcodes
         // ------------------------------------------------------------------
         eliminateDeadCode(fd: fd, bc: &bc)
+
+        // ------------------------------------------------------------------
+        // Pass 4: NOP compaction. The passes above (jump inversion, dead code
+        // elimination) leave NOP runs in the output; they executed at run time
+        // (5% of all dispatches on the real-world suite, mostly right after
+        // conditional jumps). Remove them and remap every jump, the label
+        // addresses and the line/column tables.
+        // ------------------------------------------------------------------
+        let pcMap = compactNops(fd: fd, bc: &bc)
+        for e in fd.pc2Events {
+            let np = e.pc < pcMap.count ? pcMap[e.pc] : bc.len
+            addPC2Line(fd: fd, pc: np, lineNum: e.line)
+            addPC2Col(fd: fd, pc: np, colNum: e.col)
+        }
+        fd.pc2Events.removeAll()
 
         // ------------------------------------------------------------------
         // Compute stack size
@@ -2846,6 +2765,100 @@ struct JeffJSCompiler {
     /// Remove dead code after terminal opcodes (return, throw, goto).
     /// Dead code regions end when a jump target (label address) points to the
     /// current position, since that means live code can reach this point.
+    /// Remove every NOP byte from the final bytecode and remap all relative
+    /// jump operands (label / label8 / label16 / atom_label_u8 / atom_label_u16,
+    /// narrow or wide-prefixed), the resolved label addresses and (via the
+    /// returned map) the line/column events. Returns newPos indexed by old
+    /// position (instruction starts and NOP bytes are mapped; index len is
+    /// the new length).
+    private static func compactNops(fd: JeffJSFunctionDefCompiler,
+                                    bc: inout DynBuf) -> [Int] {
+        let src = bc.buf
+        let len = bc.len
+        var newPos = [Int](repeating: -1, count: len + 1)
+        var out = [UInt8]()
+        out.reserveCapacity(len)
+        let nopByte = UInt8(truncatingIfNeeded: JeffJSOpcode.nop.rawValue)
+
+        // Pass 1: copy non-NOP instructions, recording new positions.
+        var pos = 0
+        while pos < len {
+            newPos[pos] = out.count
+            guard pos < src.count, let (op, width) = readOpcodeFromBuf(src, pos) else {
+                // Unknown byte: keep it verbatim (never expected).
+                out.append(src[pos]); pos += 1; continue
+            }
+            if op == .nop { pos += 1; continue }
+            let size = max(Int(jeffJSGetOpcodeInfo(op).size) + (width - 1), 1)
+            let end = min(pos + size, len)
+            out.append(contentsOf: src[pos..<end])
+            pos = end
+        }
+        newPos[len] = out.count
+        if out.count == len {
+            // Nothing removed: keep positions as they are.
+            return newPos
+        }
+        _ = nopByte
+
+        // Pass 2: rewrite relative jump operands in the compacted buffer.
+        pos = 0
+        while pos < len {
+            guard pos < src.count, let (op, width) = readOpcodeFromBuf(src, pos) else { pos += 1; continue }
+            if op == .nop { pos += 1; continue }
+            let info = jeffJSGetOpcodeInfo(op)
+            let size = max(Int(info.size) + (width - 1), 1)
+            let np = newPos[pos]
+            var operandOffset = -1
+            var operandWidth = 0
+            switch info.format {
+            case .label: operandOffset = width; operandWidth = 4
+            case .label8: operandOffset = width; operandWidth = 1
+            case .label16: operandOffset = width; operandWidth = 2
+            case .atom_label_u8, .atom_label_u16: operandOffset = width + 4; operandWidth = 4
+            default: break
+            }
+            if operandOffset >= 0, pos + operandOffset + operandWidth <= len {
+                let o = pos + operandOffset
+                let rel: Int
+                switch operandWidth {
+                case 1: rel = Int(Int8(bitPattern: src[o]))
+                case 2: rel = Int(Int16(bitPattern: readU16(src, o)))
+                default: rel = Int(Int32(bitPattern: readU32(src, o)))
+                }
+                let oldTarget = pos + size + rel
+                if oldTarget >= 0 && oldTarget <= len {
+                    let newTarget = newPos[oldTarget]
+                    let newRel = newTarget - (np + size)
+                    let no = np + operandOffset
+                    switch operandWidth {
+                    case 1: out[no] = UInt8(bitPattern: Int8(truncatingIfNeeded: newRel))
+                    case 2:
+                        out[no] = UInt8(truncatingIfNeeded: newRel)
+                        out[no + 1] = UInt8(truncatingIfNeeded: newRel >> 8)
+                    default:
+                        let v = UInt32(bitPattern: Int32(truncatingIfNeeded: newRel))
+                        out[no] = UInt8(truncatingIfNeeded: v)
+                        out[no + 1] = UInt8(truncatingIfNeeded: v >> 8)
+                        out[no + 2] = UInt8(truncatingIfNeeded: v >> 16)
+                        out[no + 3] = UInt8(truncatingIfNeeded: v >> 24)
+                    }
+                }
+            }
+            pos += size
+        }
+
+        // Pass 3: label addresses.
+        for i in 0..<fd.labels.count {
+            let a = fd.labels[i].addr
+            if a >= 0 && a <= len { fd.labels[i].addr = newPos[a] }
+        }
+
+        bc.buf = out
+        bc.len = out.count
+        return newPos
+    }
+
     private static func eliminateDeadCode(fd: JeffJSFunctionDefCompiler,
                                            bc: inout DynBuf) {
         // Build a set of all label target addresses for fast lookup.

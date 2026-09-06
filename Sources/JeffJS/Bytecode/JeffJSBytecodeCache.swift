@@ -726,7 +726,7 @@ final class JeffJSBytecodeCache {
     ///   - JeffJSCompiler.swift (resolveLabels, resolveVariables, peephole)
     ///   - JeffJSOpcodes.swift (opcode additions/changes)
     ///   - JeffJSInterpreter.swift (only if opcode semantics change)
-    static let compilerVersion: UInt64 = 3  // 2026-09-05: JFBC v3 (closure descriptors), unwinding/generator bytecode changes
+    static let compilerVersion: UInt64 = 4  // 2026-09-05: NOP compaction changes final bytecode
 
     /// Lazily-initialized disk cache directory.
     /// Automatically clears cached .jfbc files when the app binary changes (new build).
