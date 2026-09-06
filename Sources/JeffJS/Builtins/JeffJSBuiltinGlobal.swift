@@ -249,119 +249,61 @@ struct JeffJSBuiltinGlobal {
         let inputVal = args.isEmpty ? JeffJSValue.undefined : args[0]
         let inputStr = ctx.toString(inputVal)
         if inputStr.isException { return .exception }
-        guard let str = ctx.toSwiftString(inputStr) else {
-            return .JS_NAN
+        guard let js = inputStr.stringValue else { return .JS_NAN }
+        // Scan the code units directly (no Swift String / Character arrays) and
+        // hand the validated decimal prefix to strtod, which rounds correctly.
+        var s8: [UInt8]? = nil
+        var s16: [UInt16]? = nil
+        switch js.storage {
+        case .str8(let b): s8 = b
+        case .str16(let w): s16 = w
         }
-
-        let chars = Array(str)
+        let n = js.len
+        @inline(__always) func unit(_ i: Int) -> UInt32 {
+            if let b = s8 { return i < b.count ? UInt32(b[i]) : 0 }
+            if let w = s16 { return i < w.count ? UInt32(w[i]) : 0 }
+            return 0
+        }
         var pos = 0
-
-        // Skip leading whitespace
-        while pos < chars.count,
-              let scalar = chars[pos].unicodeScalars.first,
-              isWhitespace(scalar.value) {
-            pos += 1
-        }
-
-        if pos >= chars.count {
-            return .JS_NAN
-        }
-
-        // Check for Infinity
-        let remaining = String(chars[pos...])
-        if remaining.hasPrefix("Infinity") {
-            return .JS_POSITIVE_INFINITY
-        }
-        if remaining.hasPrefix("+Infinity") {
-            return .JS_POSITIVE_INFINITY
-        }
-        if remaining.hasPrefix("-Infinity") {
-            return .JS_NEGATIVE_INFINITY
-        }
-
-        // Determine sign
+        while pos < n, isWhitespace(unit(pos)) { pos += 1 }
+        if pos >= n { return .JS_NAN }
+        var text = [UInt8]()
+        text.reserveCapacity(24)
         var sign: Double = 1.0
-        if pos < chars.count && chars[pos] == "-" {
-            sign = -1.0
-            pos += 1
-        } else if pos < chars.count && chars[pos] == "+" {
-            pos += 1
+        if unit(pos) == 0x2D { sign = -1.0; pos += 1 }        // '-'
+        else if unit(pos) == 0x2B { pos += 1 }                 // '+'
+        // Infinity
+        let inf: [UInt32] = [0x49, 0x6E, 0x66, 0x69, 0x6E, 0x69, 0x74, 0x79]
+        if pos + 8 <= n {
+            var isInf = true
+            for k in 0..<8 where unit(pos + k) != inf[k] { isInf = false; break }
+            if isInf { return .newFloat64(sign * Double.infinity) }
         }
-
-        // Check for Infinity after sign
-        if pos + 8 <= chars.count && String(chars[pos..<pos+8]) == "Infinity" {
-            return .newFloat64(sign * Double.infinity)
-        }
-
-        // Parse digits
-        var result: Double = 0.0
         var hasDigit = false
         var hasDot = false
-        var fracDiv: Double = 1.0
-
-        // Integer + fractional part
-        while pos < chars.count {
-            let c = chars[pos]
-            if c >= "0" && c <= "9" {
-                hasDigit = true
-                let d = Double(c.asciiValue! - 48)
-                if hasDot {
-                    fracDiv *= 10.0
-                    result += d / fracDiv
-                } else {
-                    result = result * 10.0 + d
-                }
-                pos += 1
-            } else if c == "." && !hasDot {
-                hasDot = true
-                pos += 1
-            } else {
-                break
-            }
+        while pos < n {
+            let c = unit(pos)
+            if c >= 0x30 && c <= 0x39 { hasDigit = true; text.append(UInt8(c)); pos += 1 }
+            else if c == 0x2E && !hasDot { hasDot = true; text.append(0x2E); pos += 1 }
+            else { break }
         }
-
-        if !hasDigit {
-            return .JS_NAN
+        if !hasDigit { return .JS_NAN }
+        // Exponent: only when followed by at least one digit
+        if pos < n, unit(pos) == 0x65 || unit(pos) == 0x45 {
+            var p2 = pos + 1
+            var expText: [UInt8] = [0x65]
+            if p2 < n, unit(p2) == 0x2B || unit(p2) == 0x2D { expText.append(UInt8(unit(p2))); p2 += 1 }
+            var expDigits = 0
+            while p2 < n, unit(p2) >= 0x30 && unit(p2) <= 0x39 { expText.append(UInt8(unit(p2))); p2 += 1; expDigits += 1 }
+            if expDigits > 0 { text.append(contentsOf: expText); pos = p2 }
         }
-
-        // Exponent part
-        if pos < chars.count && (chars[pos] == "e" || chars[pos] == "E") {
-            let savedPos = pos
-            pos += 1
-            var expSign: Double = 1.0
-            if pos < chars.count && chars[pos] == "+" {
-                pos += 1
-            } else if pos < chars.count && chars[pos] == "-" {
-                expSign = -1.0
-                pos += 1
-            }
-            var exp: Double = 0.0
-            var hasExpDigit = false
-            while pos < chars.count && chars[pos] >= "0" && chars[pos] <= "9" {
-                hasExpDigit = true
-                exp = exp * 10.0 + Double(chars[pos].asciiValue! - 48)
-                pos += 1
-            }
-            if hasExpDigit {
-                result *= Foundation.pow(10.0, expSign * exp)
-            } else {
-                // No valid exponent digits; revert the 'e' consumption
-                pos = savedPos
-            }
+        text.append(0)
+        let value = text.withUnsafeBufferPointer { p -> Double in
+            p.baseAddress!.withMemoryRebound(to: CChar.self, capacity: p.count) { strtod($0, nil) }
         }
-
-        result *= sign
-        return .newFloat64(result)
+        return .newFloat64(sign * value)
     }
 
-    // MARK: - isNaN(number)
-
-    /// `isNaN(number)` -- the global isNaN function.
-    ///
-    /// Performs ToNumber conversion then checks for NaN.
-    /// This is the legacy global isNaN (not Number.isNaN which has no coercion).
-    ///
-    /// Mirrors `js_global_isNaN` in QuickJS.
     static func globalIsNaN(ctx: JeffJSContext, this: JeffJSValue,
                              args: [JeffJSValue]) -> JeffJSValue {
         let val = args.isEmpty ? JeffJSValue.undefined : args[0]

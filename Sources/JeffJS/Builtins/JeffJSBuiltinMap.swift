@@ -58,8 +58,11 @@ private func sameValueZero(_ a: JeffJSValue, _ b: JeffJSValue) -> Bool {
 private func normalizeKey(_ val: JeffJSValue) -> JeffJSValue {
     if val.isFloat64 {
         let d = val.toFloat64()
-        if d == 0.0 && d.sign == .minus {
-            return JeffJSValue.newFloat64(0.0)
+        // Canonicalize integral doubles (including -0) to the int32
+        // representation: keys are compared tag-first, so a float 0 or 1.0
+        // would otherwise never match an int 0 / 1 key.
+        if d == floor(d), Swift.abs(d) <= 2147483647, !d.isInfinite {
+            return JeffJSValue.newInt32(Int32(d))
         }
     }
     return val

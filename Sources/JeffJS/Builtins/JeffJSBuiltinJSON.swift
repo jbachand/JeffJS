@@ -120,11 +120,10 @@ struct JeffJSBuiltinJSON {
             return ctx.throwSyntaxError("JSON.parse: expected string argument")
         }
 
-        let swiftStr = jsStr.toSwiftString()
+        // UTF-8 bytes straight from the JS string (ASCII Latin-1 storage is
+        // used as-is; other content is transcoded without a Swift String).
+        let bytes = jeffJS_utf8Bytes(of: jsStr)
         ctx.freeValue(textStr)
-
-        // Convert to UTF-8 bytes for parsing
-        let bytes = Array(swiftStr.utf8)
         let state = JSONParseState(ctx: ctx, input: bytes, extJSON: false)
 
         // Parse the value
@@ -323,9 +322,8 @@ struct JeffJSBuiltinJSON {
             }
 
             if ch == 0x22 { // closing "
-                // Convert UTF-16 to Swift String
-                let str = String(utf16CodeUnits: result, count: result.count)
-                return state.ctx.newStringValue(str)
+                // Build the JS string directly from the code units
+                return state.ctx.newStringFromUTF16(result)
             }
 
             if ch == 0x5C { // backslash
@@ -542,12 +540,13 @@ struct JeffJSBuiltinJSON {
                 state.ctx.freeValue(keyVal)
                 return state.ctx.throwSyntaxError("JSON.parse: invalid property name")
             }
-            let key = keyStr.toSwiftString()
+            let keyAtom = state.ctx.rt.findAtom(jsString: keyStr)   // owned; freed after the set
             state.ctx.freeValue(keyVal)
 
             // Expect colon
             state.skipWhitespace()
             guard state.advance() == 0x3A else { // :
+                state.ctx.rt.freeAtom(keyAtom)
                 state.ctx.freeValue(obj)
                 return state.ctx.throwSyntaxError("JSON.parse: expected ':'")
             }
@@ -556,12 +555,14 @@ struct JeffJSBuiltinJSON {
             state.skipWhitespace()
             let value = parseValue(state)
             if value.isException {
+                state.ctx.rt.freeAtom(keyAtom)
                 state.ctx.freeValue(obj)
                 return value
             }
 
             // Set property on the object
-            state.ctx.setPropertyStr(obj: obj, name: key, value: value)
+            _ = state.ctx.setProperty(obj: obj, atom: keyAtom, value: value)
+            state.ctx.rt.freeAtom(keyAtom)
 
             state.skipWhitespace()
             guard let sep = state.peek() else {
@@ -834,7 +835,7 @@ struct JeffJSBuiltinJSON {
                 ctx.freeValue(value)
                 return .value("\"\"")
             }
-            let quoted = quoteJSONString(jsStr.toSwiftString())
+            let quoted = quoteJSONString(units: jsStr)
             ctx.freeValue(value)
             return .value(quoted)
         }
@@ -979,6 +980,52 @@ struct JeffJSBuiltinJSON {
     /// Quote a string for JSON output with proper escape sequences.
     /// Escapes: \t, \r, \n, \b, \f, \\, \", control chars < 0x20,
     /// and lone surrogates as \uXXXX.
+    /// Quote a JS string for JSON output straight from its code units: no
+    /// Swift String round trip, and lone surrogates are escaped as \uXXXX
+    /// (a Swift String cannot carry them, so they used to become U+FFFD).
+    private static func quoteJSONString(units js: JeffJSString) -> String {
+        var result = "\""
+        let n = js.len
+        var s8: [UInt8]? = nil
+        var s16: [UInt16]? = nil
+        switch js.storage {
+        case .str8(let b): s8 = b
+        case .str16(let w): s16 = w
+        }
+        var i = 0
+        while i < n {
+            let cp: UInt32
+            if let b = s8 { guard i < b.count else { break }; cp = UInt32(b[i]) }
+            else if let w = s16 { guard i < w.count else { break }; cp = UInt32(w[i]) }
+            else { break }
+            i += 1
+            switch cp {
+            case 0x22: result += "\\\""
+            case 0x5C: result += "\\\\"
+            case 0x08: result += "\\b"
+            case 0x0C: result += "\\f"
+            case 0x0A: result += "\\n"
+            case 0x0D: result += "\\r"
+            case 0x09: result += "\\t"
+            default:
+                if cp < 0x20 {
+                    result += String(format: "\\u%04x", cp)
+                } else if cp >= 0xD800 && cp <= 0xDBFF, let w = s16, i < n, i < w.count,
+                          w[i] >= 0xDC00 && w[i] <= 0xDFFF {
+                    let full = 0x10000 + ((cp - 0xD800) << 10) + (UInt32(w[i]) - 0xDC00)
+                    i += 1
+                    if let sc = Unicode.Scalar(full) { result.unicodeScalars.append(sc) }
+                } else if cp >= 0xD800 && cp <= 0xDFFF {
+                    result += String(format: "\\u%04x", cp)
+                } else if let sc = Unicode.Scalar(cp) {
+                    result.unicodeScalars.append(sc)
+                }
+            }
+        }
+        result += "\""
+        return result
+    }
+
     private static func quoteJSONString(_ str: String) -> String {
         var result = "\""
         for scalar in str.unicodeScalars {
@@ -1251,14 +1298,14 @@ extension JeffJSContext {
 
     // MARK: - Error Throwing
 
+    // Real error objects: `e instanceof SyntaxError`, `e.name`, `e.message`
+    // must work for JSON.parse failures (they used to throw plain strings).
     func throwSyntaxError(_ msg: String) -> JeffJSValue {
-        rt.currentException = newStringValue(msg)
-        return .exception
+        return throwSyntaxError(message: msg)
     }
 
     func throwTypeError(_ msg: String) -> JeffJSValue {
-        rt.currentException = newStringValue(msg)
-        return .exception
+        return throwTypeError(message: msg)
     }
 
     func throwRangeError(_ msg: String) -> JeffJSValue {
@@ -1270,5 +1317,42 @@ extension JeffJSContext {
 
     var globalObject: JeffJSValue {
         return globalObj
+    }
+}
+
+
+/// UTF-8 bytes of a JS string for the JSON parser: Latin-1 storage that is
+/// all ASCII is returned as-is; otherwise code units are transcoded directly.
+func jeffJS_utf8Bytes(of js: JeffJSString) -> [UInt8] {
+    let n = js.len
+    switch js.storage {
+    case .str8(let b):
+        let m = min(n, b.count)
+        var ascii = true
+        for i in 0..<m where b[i] >= 0x80 { ascii = false; break }
+        if ascii { return m == b.count ? b : Array(b[0..<m]) }
+        var out = [UInt8](); out.reserveCapacity(m + m / 4)
+        for i in 0..<m {
+            let c = b[i]
+            if c < 0x80 { out.append(c) } else { out.append(0xC0 | (c >> 6)); out.append(0x80 | (c & 0x3F)) }
+        }
+        return out
+    case .str16(let w):
+        let m = min(n, w.count)
+        var out = [UInt8](); out.reserveCapacity(m + m / 2)
+        var i = 0
+        while i < m {
+            var cp = UInt32(w[i]); i += 1
+            if cp >= 0xD800 && cp < 0xDC00, i < m, w[i] >= 0xDC00 && w[i] < 0xE000 {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (UInt32(w[i]) - 0xDC00); i += 1
+            } else if cp >= 0xD800 && cp < 0xE000 {
+                cp = 0xFFFD   // lone surrogate: replacement character
+            }
+            if cp < 0x80 { out.append(UInt8(cp)) }
+            else if cp < 0x800 { out.append(UInt8(0xC0 | (cp >> 6))); out.append(UInt8(0x80 | (cp & 0x3F))) }
+            else if cp < 0x10000 { out.append(UInt8(0xE0 | (cp >> 12))); out.append(UInt8(0x80 | ((cp >> 6) & 0x3F))); out.append(UInt8(0x80 | (cp & 0x3F))) }
+            else { out.append(UInt8(0xF0 | (cp >> 18))); out.append(UInt8(0x80 | ((cp >> 12) & 0x3F))); out.append(UInt8(0x80 | ((cp >> 6) & 0x3F))); out.append(UInt8(0x80 | (cp & 0x3F))) }
+        }
+        return out
     }
 }

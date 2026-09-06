@@ -357,6 +357,83 @@ All 256 narrow opcode slots are in use (the compile-time-only scope_*/label_
 ops already live in the wide range), so each new fused opcode must evict a
 narrow opcode that the profile shows is essentially never executed.
 
+### Superinstructions: what the opcode profile actually said
+
+The profiled build (`-DJEFFJS_OPPROF`) over the real-world suite: 715 M
+dispatches. `nop` was 5.1% of them (padding left by the late label-resolution
+passes, mostly right after conditional jumps) and `nop -> nop` the top pair.
+A final NOP-compaction pass with jump/label/line-table remapping removed
+them: 3.6% faster overall, up to 10% on switch-heavy code. The NOP-prefixed
+compound fusions (a NOP byte as an escape for a sub-opcode) were removed:
+every pattern they matched was already captured by earlier fusions, and they
+conflicted with padding compaction and with the traces. `a[i] = v;` compiled
+as `dup perm4 put_array_el drop`; folded to one `put_array_el`.
+
+Fused compare-and-branch (`cmp_if8`/`cmp_if`, a same-size post-compaction
+rewrite of `lt/.../strict_neq` + `if_true(8)/if_false(8)`, taking the slots of
+the never-emitted `swap2`/`dup1`) helped the micro-kernels (int loop at
+QuickJS parity, fib25 -8%, method calls -4%) but a paired A/B on the
+real-world suite was exactly neutral (1.000). Lesson: everyday code is not
+dispatch-bound.
+
+### Where everyday time really goes (CPU profile of the whole suite)
+
+| bucket | share |
+|---|---:|
+| Swift retain/release (incl. slow paths and stubs) | ~26% |
+| malloc/free/alloc (Swift arrays, strings, objects) | ~11% |
+| callInternal self | 7.8% |
+| traces self | 4% |
+| shape transition lookup on property add (findHashedShape) | 2.4% |
+
+Callers: payload enum copies (`if case ... = obj.payload` retains every
+associated object even when the case does not match), `callInternal`,
+prototype-chain walks in get/setPropertyInternal, `[JeffJSValue]` argument
+arrays per native-to-JS call, and above all Swift `String` round trips:
+`JeffJSString.toSwiftString()` built an array of `Character` per Latin-1
+string and was the top allocation source (JSON, sort, assign, join, values,
+parseFloat).
+
+### String-conversion batch (2026-09-06)
+
+`toSwiftString` decodes ASCII Latin-1 in one pass (non-ASCII transcoded
+directly, UTF-16 without an Array copy); `indexOf`/`includes`/`sameValueZero`
+compare code units instead of converting; `parseFloat` scans code units and
+uses strtod (also correctly rounded now); `JSON.parse` takes bytes straight
+from the JS string, builds result strings from UTF-16 units and object keys
+through atoms; `JSON.stringify` quotes from code units (lone surrogates are
+escaped instead of becoming U+FFFD). Correctness fixes found on the way:
+`JSON.parse` errors are real `SyntaxError` objects (they were plain strings),
+`sameValueZero` coerced every value to a number so `["cherry"].includes("Cherry")`
+was true, Map/Set keys now canonicalize integral doubles (so `get(-0)` and
+`get(0.5+0.5)` find an int key), and all three number-to-string paths follow
+ES Number::toString layout (`0.000001` not `1e-06`, `1e-7` not `1e-07`,
+`123456789012345680000` not the exact binary value).
+
+| kernel | before | after | QuickJS | after/qjs |
+|---|---:|---:|---:|---:|
+| string-sort-compare | 329 | 111 | 30 | 3.7x |
+| json-parse | 579 | 296 | 74 | 4.0x |
+| date-number-format | 698 | 524 | 88 | 5.9x |
+| object-assign-create | 511 | 421 | 71 | 5.9x |
+| json-stringify | 344 | 297 | 91 | 3.3x |
+
+Real-world geomean 4.9x QuickJS (from 5.3x); all 38 kernels match; conformance
+1706/0. Known gaps left: `(0.1).toString(2)` last digits, `JSON.stringify(1n)`
+must throw, a lone-surrogate escape in a source string literal becomes U+FFFD.
+
+### Next levers (from the profile, in order)
+
+1. Payload enum copies: guard every `if case ... = obj.payload` on a
+   non-copying kind byte and read hot cases from dedicated fields.
+2. Prototype-chain walks with unowned/Unmanaged references in
+   get/setPropertyInternal; a per-shape transition cache for property adds.
+3. Native-to-JS calls without a fresh `[JeffJSValue]` per call (sort
+   comparators, map/filter/forEach callbacks, call/apply/bind).
+4. Remaining Swift String users on hot paths: Object.assign/values/join keys,
+   getProperty(obj:key:), string concatenation buffers.
+5. Then generators (frame kept alive across yields), dynamic keys, for-in.
+
 ## Current standing (2026-09-05, end of round 4)
 
 | kernel | baseline | round 3 | now | QuickJS | now vs QuickJS |

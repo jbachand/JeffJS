@@ -5201,13 +5201,15 @@ struct JeffJSTypeConvert {
     /// Format a Double to string per ECMAScript Number::toString.
     static func formatNumber(_ d: Double) -> String {
         if d.isNaN { return "NaN" }
-        if d.isInfinite { return d > 0 ? "Infinity" : "-Infinity" }
         if d == 0 { return "0" }
-        // Use Swift's default which is close to spec for most values
-        if abs(d) < 1e15 && d == Double(Int64(d)) {
+        if d.isInfinite { return d > 0 ? "Infinity" : "-Infinity" }
+        let a = Swift.abs(d)
+        if a < 9007199254740992 && a == a.rounded(.towardZero) {
             return String(Int64(d))
         }
-        return String(d)
+        // ES Number::toString layout (string concatenation used Swift's own
+        // layout here: "1e-07" instead of "1e-7", "1e-06" for 0.000001).
+        return jeffJS_formatDoubleJS(d)
     }
 
     // MARK: ToBool

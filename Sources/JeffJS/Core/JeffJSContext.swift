@@ -4553,44 +4553,19 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// - Trailing zeros are stripped: "1.5" not "1.50"
     private func formatDouble(_ d: Double) -> String {
         if d == 0 { return "0" }
-
+        if d.isNaN { return "NaN" }
+        if d.isInfinite { return d > 0 ? "Infinity" : "-Infinity" }
+        // Exact integers below 2^53 print directly; everything else follows
+        // ES Number::toString layout (see jeffJS_formatDoubleJS): shortest
+        // round-trip digits, plain form for decimal exponents in (-6, 21],
+        // exponent form otherwise. The old "%.0f" path printed the exact
+        // binary value of large integers (123456789012345683968) and Swift's
+        // layout for small numbers (1e-06 instead of 0.000001).
         let abs_d = Swift.abs(d)
-        let sign = d < 0 ? "-" : ""
-
-        // Integer values in range [1, 10^21) → print as integer without exponent
-        if abs_d < 1e21 && abs_d >= 1 && abs_d == floor(abs_d) {
-            // Format as integer (no decimal point, no exponent)
-            // Use a format that avoids scientific notation
-            return sign + String(format: "%.0f", abs_d)
+        if abs_d < 9007199254740992 && abs_d == floor(abs_d) {
+            return String(Int64(d))
         }
-
-        // For other values, use Swift's default formatting and fix up
-        let str = String(d)
-
-        // Remove trailing ".0" for integers that slipped through
-        if str.hasSuffix(".0") {
-            return String(str.dropLast(2))
-        }
-
-        // Fix exponent formatting: Swift uses "e+07" or "e-07", JS uses "e+7" or "e-7"
-        // Also Swift uses lowercase 'e' which matches JS
-        if let eIdx = str.firstIndex(of: "e") {
-            let mantissa = str[str.startIndex..<eIdx]
-            var expPart = String(str[eIdx...])  // e.g. "e+07" or "e-07"
-
-            // Remove leading zeros from exponent: "e+07" → "e+7", "e-07" → "e-7"
-            if expPart.count > 2 {
-                let signChar = expPart[expPart.index(after: expPart.startIndex)]  // '+' or '-'
-                let digits = String(expPart.dropFirst(2))  // "07"
-                let trimmed = String(digits.drop(while: { $0 == "0" }))
-                let expDigits = trimmed.isEmpty ? "0" : trimmed
-                expPart = "e\(signChar)\(expDigits)"
-            }
-
-            return String(mantissa) + expPart
-        }
-
-        return str
+        return jeffJS_formatDoubleJS(d)
     }
 }
 
@@ -4832,17 +4807,22 @@ extension JeffJSContext {
 
     // -- Comparison --
 
+    /// SameValueZero (Array.prototype.includes, Map/Set keys): numbers by
+    /// IEEE equality with NaN equal to NaN, strings by code units, objects by
+    /// identity. (It used to coerce every value to a number first, so any two
+    /// non-numeric strings compared equal: ["cherry"].includes("Cherry").)
     func sameValueZero(_ a: JeffJSValue, _ b: JeffJSValue) -> Bool {
-        if let da = toFloat64(a), let db = toFloat64(b) {
+        if a.isNumber && b.isNumber {
+            guard let da = extractFloat64(a), let db = extractFloat64(b) else { return false }
             if da.isNaN && db.isNaN { return true }
             return da == db
         }
-        if let ia = toInt32(a), let ib = toInt32(b) { return ia == ib }
-        if let sa = a.stringValue?.toSwiftString(), let sb = b.stringValue?.toSwiftString() {
-            return sa == sb
+        if let sa = a.stringValue, let sb = b.stringValue {
+            return sa.len == sb.len && jeffJS_stringCompare(s1: sa, s2: sb) == 0
         }
-        if let oa = a.toObject(), let ob = b.toObject() { return oa === ob }
-        return toBool(a) == toBool(b)
+        if a.isObject && b.isObject { return a.toObject() === b.toObject() }
+        if !JeffJSValue.sameTag(a, b) { return false }
+        return a == b
     }
 
     // -- Constructor helpers --

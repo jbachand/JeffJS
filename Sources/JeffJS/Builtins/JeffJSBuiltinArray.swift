@@ -1879,9 +1879,10 @@ struct JeffJSBuiltinArray {
         }
         // Different tags (after excluding mixed int/float) means different types
         if !JeffJSValue.sameTag(a, b) { return false }
-        // Strings
-        if let sa = a.stringValue?.toSwiftString(), let sb = b.stringValue?.toSwiftString() {
-            return sa == sb
+        // Strings: compare code units directly (no Swift String round trip;
+        // indexOf/includes over string arrays did two conversions per element)
+        if let sa = a.stringValue, let sb = b.stringValue {
+            return sa.len == sb.len && jeffJS_stringCompare(s1: sa, s2: sb) == 0
         }
         // Objects: reference identity
         if a.isObject && b.isObject {

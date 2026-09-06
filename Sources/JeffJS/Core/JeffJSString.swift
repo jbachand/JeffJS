@@ -1071,9 +1071,9 @@ final class JeffJSStringBuffer: JeffJSStringBase {
     /// Convert buffer contents to a Swift String.
     func toSwiftString() -> String {
         if isWideChar, let buf = buf16 {
-            return String(utf16CodeUnits: Array(buf.prefix(size)), count: size)
+            return jeffJS_swiftStringFromUTF16(buf, count: size)
         } else {
-            return String(buf8.prefix(size).map { Character(Unicode.Scalar($0)) })
+            return jeffJS_swiftStringFromLatin1(buf8, count: size)
         }
     }
 
@@ -1176,9 +1176,40 @@ extension JeffJSString {
     func toSwiftString() -> String {
         switch storage {
         case .str8(let buf):
-            return String(buf.prefix(len).map { Character(Unicode.Scalar($0)) })
+            return jeffJS_swiftStringFromLatin1(buf, count: len)
         case .str16(let buf):
-            return String(utf16CodeUnits: Array(buf.prefix(len)), count: len)
+            return jeffJS_swiftStringFromUTF16(buf, count: len)
         }
+    }
+}
+
+/// Latin-1 bytes -> Swift String. ASCII (the common case) decodes in one
+/// pass; the old path built an array of Character values per byte and was
+/// the top allocation source on the real-world suite (JSON, sort, join...).
+func jeffJS_swiftStringFromLatin1(_ buf: [UInt8], count: Int) -> String {
+    let n = min(count, buf.count)
+    if n == 0 { return "" }
+    return buf.withUnsafeBufferPointer { p -> String in
+        var ascii = true
+        var i = 0
+        while i < n { if p[i] >= 0x80 { ascii = false; break }; i += 1 }
+        if ascii {
+            return String(decoding: UnsafeBufferPointer(rebasing: p[0..<n]), as: UTF8.self)
+        }
+        var utf8 = [UInt8](); utf8.reserveCapacity(n + n / 4)
+        for j in 0..<n {
+            let b = p[j]
+            if b < 0x80 { utf8.append(b) } else { utf8.append(0xC0 | (b >> 6)); utf8.append(0x80 | (b & 0x3F)) }
+        }
+        return String(decoding: utf8, as: UTF8.self)
+    }
+}
+
+/// UTF-16 code units -> Swift String without an intermediate Array copy.
+func jeffJS_swiftStringFromUTF16(_ buf: [UInt16], count: Int) -> String {
+    let n = min(count, buf.count)
+    if n == 0 { return "" }
+    return buf.withUnsafeBufferPointer { p in
+        String(decoding: UnsafeBufferPointer(rebasing: p[0..<n]), as: UTF16.self)
     }
 }

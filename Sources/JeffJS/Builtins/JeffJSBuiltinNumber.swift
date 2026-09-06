@@ -354,15 +354,7 @@ struct JeffJSBuiltinNumber {
             return String(i)
         }
 
-        // Use Swift's default formatting which produces the shortest
-        // round-trip-safe decimal representation.
-        var s = "\(d)"
-        // Ensure we don't produce trailing ".0" for exact integers
-        // (already handled above, but just in case)
-        if s.hasSuffix(".0") {
-            s = String(s.dropLast(2))
-        }
-        return s
+        return jeffJS_formatDoubleJS(d)
     }
 
     // MARK: - Constructor
@@ -1275,4 +1267,50 @@ struct JeffJSBuiltinBigInt {
         let result = value & mask
         return JeffJSValue.mkShortBigInt(Int64(bitPattern: result))
     }
+}
+
+
+/// ES Number::toString(10): Swift's description supplies the shortest
+/// round-trip digits; this lays them out with the spec's rules (plain digits
+/// when the decimal exponent n is in (-6, 21], exponent form otherwise, and
+/// the exponent written without zero padding). Swift's own layout differs:
+/// "1e-07" for 1e-7, "1e+20" for 1e20 (JS: "100000000000000000000").
+func jeffJS_formatDoubleJS(_ d: Double) -> String {
+    let negative = d < 0
+    let s = "\(Swift.abs(d))"
+    var mant = Substring(s)
+    var exp10 = 0
+    if let ei = s.firstIndex(where: { $0 == "e" || $0 == "E" }) {
+        mant = s[s.startIndex..<ei]
+        exp10 = Int(s[s.index(after: ei)...]) ?? 0
+    }
+    var digits: [Character]
+    var pointPos: Int
+    if let dot = mant.firstIndex(of: ".") {
+        let intPart = mant[mant.startIndex..<dot]
+        let frac = mant[mant.index(after: dot)...]
+        digits = Array(intPart) + Array(frac)
+        pointPos = intPart.count
+    } else {
+        digits = Array(mant)
+        pointPos = digits.count
+    }
+    while digits.count > 1 && digits.first == "0" { digits.removeFirst(); pointPos -= 1 }
+    while digits.count > 1 && digits.last == "0" { digits.removeLast() }
+    let n = pointPos + exp10
+    let k = digits.count
+    var out = ""
+    if k <= n && n <= 21 {
+        out = String(digits) + String(repeating: "0", count: n - k)
+    } else if 0 < n && n <= 21 {
+        out = String(digits[0..<n]) + "." + String(digits[n...])
+    } else if -6 < n && n <= 0 {
+        out = "0." + String(repeating: "0", count: -n) + String(digits)
+    } else {
+        let e = n - 1
+        let expStr = (e >= 0 ? "+" : "-") + String(Swift.abs(e))
+        out = k == 1 ? String(digits) + "e" + expStr
+                     : String(digits[0]) + "." + String(digits[1...]) + "e" + expStr
+    }
+    return negative ? "-" + out : out
 }
