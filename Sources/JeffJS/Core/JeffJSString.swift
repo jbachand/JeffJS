@@ -46,6 +46,9 @@ class JeffJSStringBase {
 }
 
 final class JeffJSString: JeffJSStringBase {
+    deinit {
+        if cachedAtom != 0, let rt = JeffJSGCObjectHeader.activeRuntime { rt.freeAtom(cachedAtom) }
+    }
 
     // -- Reference counting --------------------------------------------------
 
@@ -89,6 +92,10 @@ final class JeffJSString: JeffJSStringBase {
     /// points of this string as UInt32, built once instead of per exec.
     var codeUnits32: [UInt32]? = nil
     var codePoints32: [UInt32]? = nil
+    /// Atom interned for this string when it was used as a property key
+    /// (JeffJSRuntime.findAtom(jsString:)); holds one atom reference, released
+    /// in deinit. 0 = none.
+    var cachedAtom: UInt32 = 0
 
     // -- Storage -------------------------------------------------------------
 

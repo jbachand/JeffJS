@@ -1077,6 +1077,51 @@ final class JeffJSRuntime {
         return addAtom(str: str, hash: hash, atomType: .JS_ATOM_TYPE_STRING)
     }
 
+    /// findAtom for a JS string used as a dynamic property key (`obj[key]`).
+    /// Hashes and compares the string's own code units against the table
+    /// (no Swift String round trip) and caches the atom on the string, so a
+    /// repeated key costs one field read. Returns an owned reference.
+    func findAtom(jsString js: JeffJSString) -> UInt32 {
+        if js.cachedAtom != 0 { return dupAtom(js.cachedAtom) }
+        guard atomHashSize > 0, !atomHash.isEmpty else { return 0 }
+        // UTF-8-equivalent hash from the code units (Latin-1 and BMP; strings
+        // with surrogates take the generic path).
+        var h: UInt32 = 0
+        var simple = true
+        func mix(_ b: UInt32) { h = h &* 31 &+ b }
+        switch js.storage {
+        case .str8(let buf):
+            for cu in buf {
+                if cu < 0x80 { mix(UInt32(cu)) } else { mix(0xC0 | UInt32(cu >> 6)); mix(0x80 | UInt32(cu & 0x3F)) }
+            }
+        case .str16(let buf):
+            for cu in buf {
+                if cu < 0x80 { mix(UInt32(cu)) }
+                else if cu < 0x800 { mix(0xC0 | UInt32(cu >> 6)); mix(0x80 | UInt32(cu & 0x3F)) }
+                else if cu >= 0xD800 && cu < 0xE000 { simple = false; break }
+                else { mix(0xE0 | UInt32(cu >> 12)); mix(0x80 | UInt32((cu >> 6) & 0x3F)); mix(0x80 | UInt32(cu & 0x3F)) }
+            }
+        }
+        let atom: UInt32
+        if simple {
+            let hash = h & JS_ATOM_HASH_MASK
+            var found: UInt32 = 0
+            var atomIdx = atomHash[Int(hash) & (atomHashSize - 1)]
+            while atomIdx != 0 {
+                guard let entry = atomArray[Int(atomIdx)] else { break }
+                if entry.hash == hash && jeffJS_utf8Equals(entry.str, js) { found = atomIdx; break }
+                atomIdx = entry.hashNext
+            }
+            if found != 0 { atomArray[Int(found)]?.refCount += 1; atom = found }
+            else { atom = findAtom(js.toSwiftString()) }
+        } else {
+            atom = findAtom(js.toSwiftString())
+        }
+        // Cache with its own reference (released by the string's deinit).
+        js.cachedAtom = dupAtom(atom)
+        return atom
+    }
+
     /// Duplicates an atom (increments its refcount).
     /// Mirrors `JS_DupAtom()` from QuickJS.
     func dupAtom(_ atom: UInt32) -> UInt32 {
@@ -1383,4 +1428,26 @@ final class JeffJSRuntime {
         jobQueue.removeAll()
         jobQueueHead = 0
     }
+}
+
+/// Compare a Swift string's UTF-8 with a JS string's code units without
+/// materialising either (Latin-1 / BMP without surrogates only; callers
+/// route other strings through the Swift path).
+func jeffJS_utf8Equals(_ str: String, _ js: JeffJSString) -> Bool {
+    var it = str.utf8.makeIterator()
+    @inline(__always) func take() -> UInt32? { if let b = it.next() { return UInt32(b) } ; return nil }
+    switch js.storage {
+    case .str8(let buf):
+        for cu in buf {
+            if cu < 0x80 { if take() != UInt32(cu) { return false } }
+            else { if take() != (0xC0 | UInt32(cu >> 6)) || take() != (0x80 | UInt32(cu & 0x3F)) { return false } }
+        }
+    case .str16(let buf):
+        for cu in buf {
+            if cu < 0x80 { if take() != UInt32(cu) { return false } }
+            else if cu < 0x800 { if take() != (0xC0 | UInt32(cu >> 6)) || take() != (0x80 | UInt32(cu & 0x3F)) { return false } }
+            else { if take() != (0xE0 | UInt32(cu >> 12)) || take() != (0x80 | UInt32((cu >> 6) & 0x3F)) || take() != (0x80 | UInt32(cu & 0x3F)) { return false } }
+        }
+    }
+    return it.next() == nil
 }

@@ -2242,7 +2242,7 @@ func lreGetGroupNames(_ bytecode: [UInt8]) -> [String?] {
 /// - Stack and captures use ContiguousArray with pre-allocated capacity.
 /// - Input and bytecode are accessed through UnsafeBufferPointer in the
 ///   hot loop to eliminate bounds checking.
-private final class REVirtualMachine {
+final class REVirtualMachine {
     let bc: [UInt8]         // full bytecode including header
     let bcStart: Int        // offset of first opcode (after header)
     let bcEnd: Int          // offset past last opcode
@@ -2319,7 +2319,7 @@ private final class REVirtualMachine {
         // Initialise captures to -1 (unmatched).
         self.captures = ContiguousArray<Int>(repeating: -1, count: captureCount * 2)
         self.stack = ContiguousArray<BacktrackEntry>()
-        self.stack.reserveCapacity(1024)
+        self.stack.reserveCapacity(32)   // grows geometrically; 1024 entries (40 KB) per exec was the exec cost
     }
 
     /// Reset the VM for another match attempt at a new starting position.

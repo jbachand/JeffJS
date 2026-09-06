@@ -1627,10 +1627,14 @@ private func js_regexp_execInternal(
     //    longer need to create a sliced copy per starting position.
     //    For non-global/non-sticky regexps, we try successive start positions.
     //    For sticky, we only try at startIndex.
+    // One VM for every start position tried by this exec (each attempt
+    // used to allocate its own backtrack stack).
+    let vm = REVirtualMachine(bytecode: bytecode, input: inputCodeUnits,
+                              startPos: startIndex, flags: regexpFlags)
     var pos = startIndex
     while pos <= inputCodeUnits.count {
-        let result = lreExec(bytecode: bytecode, input: inputCodeUnits,
-                             startPos: pos, flags: regexpFlags)
+        vm.reset(startPos: pos)
+        let result = vm.exec()
 
         if result.result == .match {
             // Captures already have correct offsets (no slicing adjustment needed).

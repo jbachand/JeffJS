@@ -1157,7 +1157,10 @@ extension JeffJSContext {
             return getPropertyUint32(obj: obj, index: UInt32(bitPattern: prop.toInt32()))
         }
         if prop.isString, let str = prop.stringValue {
-            return getPropertyStr(obj: obj, name: str.toSwiftString())
+            let atom = rt.findAtom(jsString: str)
+            let result = getProperty(obj: obj, atom: atom)
+            rt.freeAtom(atom)
+            return result
         }
         if prop.isFloat64 {
             let d = prop.toFloat64()
@@ -1198,7 +1201,7 @@ extension JeffJSContext {
                                      value: val) >= 0
         }
         if prop.isString, let str = prop.stringValue {
-            let atom = rt.findAtom(str.toSwiftString())
+            let atom = rt.findAtom(jsString: str)
             let result = setProperty(obj: obj, atom: atom, value: val) >= 0
             rt.freeAtom(atom)
             // Don't free atom — setProperty stores it in the shape.
