@@ -86,11 +86,16 @@ struct JeffJSBuiltinArray {
         ctx.setPropertyFunc(obj: arrayProto, name: "values", fn: values, length: 0)
         ctx.setPropertyFunc(obj: arrayProto, name: "entries", fn: entries, length: 0)
 
-        // @@iterator is the same as values — must be stored under the well-known
-        // symbol atom so that for-of / spread can find it via [Symbol.iterator].
-        let valuesFunc = ctx.newCFunction(values, name: "values", length: 0)
+        // @@iterator is the same *function object* as values (ES spec
+        // §23.1.3.36), not just an equivalent one, and it is cached on the
+        // context: the arguments object installs it directly instead of
+        // walking global -> Array -> prototype -> @@iterator per call. The
+        // placeholder cached during context setup is released here.
+        let valuesFunc = ctx.getPropertyStr(obj: arrayProto, name: "values")
         let symIterAtom = JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue
-        ctx.setProperty(obj: arrayProto, atom: symIterAtom, value: valuesFunc)
+        ctx.setProperty(obj: arrayProto, atom: symIterAtom, value: valuesFunc.dupValue())
+        ctx.arrayProtoValues.freeValue()
+        ctx.arrayProtoValues = valuesFunc
 
         // -- Array constructor --------------------------------------------------
         let arrayCtor = ctx.newConstructorFunc(name: "Array", fn: arrayConstructor, length: 1, proto: arrayProto)

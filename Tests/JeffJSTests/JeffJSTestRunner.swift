@@ -281,6 +281,7 @@ struct JeffJSTestRunner {
             ("AsyncPromises", { $0.testAsyncPromises() }),
             ("FetchBridgeCallPattern", { $0.testFetchBridgeCallPattern() }),
             ("ProxyHasTrap", { $0.testProxyHasTrap() }),
+            ("NumericPropertyKeys", { $0.testNumericPropertyKeys() }),
             ("TraceBlocks", { $0.testTraceBlocks() }),
             ("ModulesAndImports", { $0.testModulesAndImportPatterns() }),
         ]
@@ -6702,6 +6703,64 @@ extension JeffJSTestRunner {
     }
 
     // MARK: - Proxy has trap (style property detection)
+
+    /// A numeric property key must denote the same property whether it is
+    /// written as a number or as its canonical decimal string: `o[1]` and
+    /// `o["1"]` are one property. Non-canonical spellings ("01", "1.0", " 1")
+    /// and values at or above 2^31 stay ordinary string keys.
+    mutating func testNumericPropertyKeys() {
+        let (rt, ctx) = makeCtx()
+
+        evalCheckBool(ctx, """
+            var a = {}; a[1] = 'v';
+            var b = {}; b['1'] = 'v';
+            var c = {1: 'v'};
+            a['1'] === 'v' && a[1] === 'v' &&
+            b['1'] === 'v' && b[1] === 'v' &&
+            c['1'] === 'v' && c[1] === 'v'
+            """, expect: true)
+
+        // One property, not two: last write wins and the key appears once.
+        evalCheckBool(ctx, """
+            var d = {}; d[1] = 'x'; d['1'] = 'y';
+            d[1] === 'y' && d['1'] === 'y' &&
+            Object.keys(d).length === 1 && Object.keys(d)[0] === '1' &&
+            JSON.stringify(d) === '{"1":"y"}'
+            """, expect: true)
+
+        // `in`, delete and for-in agree with both spellings.
+        evalCheckBool(ctx, """
+            var e = {}; e[7] = 1;
+            var seen = []; for (var k in e) seen.push(k);
+            var ok = (7 in e) && ('7' in e) && seen.length === 1 && seen[0] === '7';
+            delete e['7'];
+            ok && !(7 in e) && !('7' in e)
+            """, expect: true)
+
+        // Non-canonical numeric spellings are distinct string keys.
+        evalCheckBool(ctx, """
+            var f = {};
+            f['01'] = 'a'; f['1.0'] = 'b'; f[' 1'] = 'c'; f['-1'] = 'd'; f[1] = 'e';
+            f['01'] === 'a' && f['1.0'] === 'b' && f[' 1'] === 'c' &&
+            f['-1'] === 'd' && f[1] === 'e' && Object.keys(f).length === 5
+            """, expect: true)
+
+        // Above the tagged-int range the key stays a string atom, and both
+        // spellings must still agree.
+        evalCheckBool(ctx, """
+            var g = {}; g[2147483648] = 'big'; g[4294967294] = 'max';
+            g['2147483648'] === 'big' && g['4294967294'] === 'max' &&
+            g[0] === undefined
+            """, expect: true)
+
+        // Property order: integer keys ascending before string keys.
+        evalCheckBool(ctx, """
+            var h = {}; h.z = 1; h[2] = 1; h.a = 1; h['1'] = 1; h[10] = 1;
+            Object.keys(h).join(',') === '1,2,10,z,a'
+            """, expect: true)
+
+        _ = rt
+    }
 
     mutating func testProxyHasTrap() {
         let (rt, ctx) = makeCtx()

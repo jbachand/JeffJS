@@ -557,18 +557,15 @@ extension JeffJSContext {
                 let calleeAtom = JeffJSAtomID.JS_ATOM_callee.rawValue
                 _ = setProperty(obj: argsObj, atom: calleeAtom, value: frame.curFunc.dupValue())
             }
-            // Add Symbol.iterator so arguments is iterable
-            let symIterAtom = JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue
-            let arrayProtoIterAtom = getProperty(obj: globalObj, atom: rt.findAtom("Array"))
-            if arrayProtoIterAtom.isObject {
-                let arrProto = getProperty(obj: arrayProtoIterAtom,
-                                            atom: JeffJSAtomID.JS_ATOM_prototype.rawValue)
-                if arrProto.isObject {
-                    let iterFn = getProperty(obj: arrProto, atom: symIterAtom)
-                    if iterFn.isFunction {
-                        _ = setProperty(obj: argsObj, atom: symIterAtom, value: iterFn)
-                    }
-                }
+            // Add Symbol.iterator so arguments is iterable. This is
+            // Array.prototype.values, already cached on the context: the old
+            // code interned the atom "Array" and walked global -> Array ->
+            // prototype -> @@iterator on every arguments object (and leaked
+            // the two intermediate references).
+            if arrayProtoValues.isFunction {
+                _ = setProperty(obj: argsObj,
+                                atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue,
+                                value: arrayProtoValues.dupValue())
             }
             return argsObj
         case .thisVal:
@@ -615,16 +612,23 @@ extension JeffJSContext {
         return arr
     }
 
-    /// Creates a new array from the given items.
+    /// Creates a new array from the given items, taking ownership of each.
     func newArrayFrom(_ items: [JeffJSValue]) -> JeffJSValue {
         let arr = newArray()
+        if items.isEmpty { return arr }
+        // Fill the element storage in one shot. Going through the generic
+        // indexed setter interned an index atom, walked the prototype chain
+        // and grew the backing store once per element; for-in key lists and
+        // every builtin that returns an array paid that per element.
+        if let obj = arr.toObject(), obj.fastArray, obj.arraySnapshot()?.count == 0 {
+            obj.installFastArrayValues(ContiguousArray(items))
+            setArrayLength(arr, Int64(items.count))
+            return arr
+        }
         for (i, item) in items.enumerated() {
             _ = setPropertyUint32(obj: arr, index: UInt32(i), value: item)
         }
-        // Update length to match the number of items
-        if !items.isEmpty {
-            setArrayLength(arr, Int64(items.count))
-        }
+        setArrayLength(arr, Int64(items.count))
         return arr
     }
 
@@ -780,6 +784,27 @@ extension JeffJSContext {
         guard let str = rt.atomToString(atom) else { return .undefined }
         let js = JeffJSString(swiftString: str)   // refCount 1: the cache's reference
         rt.atomJSStrings[atom] = js
+        return JeffJSValue.makeString(js.retain())
+    }
+
+    /// Shared JS string for a `typeof` result. Falls back to a fresh string
+    /// for anything outside the fixed set.
+    func typeofString(_ t: String) -> JeffJSValue {
+        let idx: Int
+        switch t {
+        case "object": idx = 0
+        case "function": idx = 1
+        case "string": idx = 2
+        case "number": idx = 3
+        case "boolean": idx = 4
+        case "undefined": idx = 5
+        case "symbol": idx = 6
+        case "bigint": idx = 7
+        default: return newString(t)
+        }
+        if let cached = rt.typeofStrings[idx] { return JeffJSValue.makeString(cached.retain()) }
+        let js = JeffJSString(swiftString: t)   // refCount 1: the cache's reference
+        rt.typeofStrings[idx] = js
         return JeffJSValue.makeString(js.retain())
     }
 
@@ -1386,12 +1411,14 @@ extension JeffJSContext {
 
     /// Sets the .name property on a function.
     func setFunctionName(_ funcVal: JeffJSValue, atom: UInt32) {
-        if let name = rt.atomToString(atom) {
-            let nameAtom = rt.findAtom("name")
-            _ = setProperty(obj: funcVal, atom: nameAtom, value: newString(name))
-            rt.freeAtom(nameAtom)
-            // Don't free nameAtom — setProperty stores it in the shape.
-        }
+        // "name" is a predefined atom and the name string is cached per atom:
+        // this used to intern "name" and allocate a fresh string on every
+        // closure creation, which React does constantly.
+        guard atom != 0 else { return }
+        let nameValue = atomToString(atom)
+        if nameValue.isUndefined { return }
+        _ = setProperty(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
+                        value: nameValue)
     }
 
     /// Sets the .name property on a function from a computed key.
@@ -1689,30 +1716,41 @@ extension JeffJSContext {
     /// Collects all enumerable string-keyed properties from the object and its
     /// prototype chain, then wraps them in an iterator object.
     func createForInIterator(obj: JeffJSValue) -> JeffJSValue {
+        // Interned once per context: re-interning these two names by string on
+        // every for-in showed up as String hashing in React profiles.
+        let keysAtom = forInKeysAtomCached
+        let idxAtom = forInIdxAtomCached
         // For null/undefined, return an empty iterator
         if obj.isNull || obj.isUndefined {
             let iter = newObject()
             // Store empty keys array and index 0 in the iterator
-            _ = setPropertyStr(obj: iter, name: "__forInKeys__",
-                               value: newArrayFrom([]))
-            _ = setPropertyStr(obj: iter, name: "__forInIdx__", value: .newInt32(0))
+            _ = setProperty(obj: iter, atom: keysAtom, value: newArrayFrom([]))
+            _ = setProperty(obj: iter, atom: idxAtom, value: .newInt32(0))
             return iter
         }
         // Collect all enumerable string-keyed properties from obj and its prototype chain.
         // Per ES spec §9.1.12, integer indices come first (ascending), then string keys
         // (insertion order). Each prototype level follows the same ordering.
+        // Shadowing is resolved on the interned identity of a key, not on its
+        // spelling: array indices by numeric value (the "5" string atom and the
+        // index 5 denote the same property), everything else by atom. The old
+        // Set<String> formatted every index into a fresh Swift String and
+        // hashed it, which made for-in one of the hottest paths under React.
         var keys = [JeffJSValue]()
-        var seen = Set<String>()
+        var seenIdx = JeffJSKeySeen()
+        var seenAtom = JeffJSKeySeen()
+        var intKeys: [UInt32] = []
+        var strKeys: [UInt32] = []
         var current: JeffJSObject? = obj.toObject()
         while let cur = current {
-            var intKeys: [(UInt32, String)] = []
-            var strKeys: [(String, UInt32)] = []
+            intKeys.removeAll(keepingCapacity: true)
+            strKeys.removeAll(keepingCapacity: true)
             // Fast-array elements are not shape properties: enumerate their
             // indices (present, i.e. not a hole) first.
             if cur.classID == JeffJSClassID.array.rawValue, let snap = cur.arraySnapshot() {
                 var i = 0
                 while i < snap.count && i < snap.values.count {
-                    if !snap.values[i].isUninitialized { intKeys.append((UInt32(i), String(i))) }
+                    if !snap.values[i].isUninitialized { intKeys.append(UInt32(i)) }
                     i += 1
                 }
             }
@@ -1722,42 +1760,32 @@ extension JeffJSContext {
                     if atom == 0 { continue }
                     let isEnumerable = prop.flags.contains(.enumerable)
                     // Non-enumerable own properties must shadow enumerable
-                    // prototype properties (ES spec §14.7.5.9), so add all
-                    // property names to `seen` but only collect enumerable ones.
+                    // prototype properties (ES spec §14.7.5.9), so record every
+                    // property name as seen but only collect enumerable ones.
                     if rt.atomIsArrayIndex(atom) {
                         if let idx = rt.atomToUInt32(atom) {
-                            let name = String(idx)
-                            if isEnumerable { intKeys.append((idx, name)) }
-                            else { seen.insert(name) }
+                            if isEnumerable { intKeys.append(idx) } else { _ = seenIdx.insert(idx) }
                         }
                     } else if let entry = rt.atomArray[Int(atom)],
                               entry.atomType != .JS_ATOM_TYPE_SYMBOL,
                               entry.atomType != .JS_ATOM_TYPE_GLOBAL_SYMBOL {
                         // Symbol keys are never enumerated by for-in.
-                        let name = entry.str
-                        if isEnumerable { strKeys.append((name, atom)) }
-                        else { seen.insert(name) }
+                        if isEnumerable { strKeys.append(atom) } else { _ = seenAtom.insert(atom) }
                     }
                 }
             }
-            intKeys.sort { $0.0 < $1.0 }
-            for (idx, name) in intKeys {
-                if !seen.contains(name) {
-                    seen.insert(name)
-                    keys.append(intKeyString(Int(idx)))
-                }
+            intKeys.sort()
+            for idx in intKeys where seenIdx.insert(idx) {
+                keys.append(intKeyString(Int(idx)))
             }
-            for (name, atom) in strKeys {
-                if !seen.contains(name) {
-                    seen.insert(name)
-                    keys.append(atomToString(atom))
-                }
+            for atom in strKeys where seenAtom.insert(atom) {
+                keys.append(atomToString(atom))
             }
             current = cur.proto
         }
         let iter = newObject()
-        _ = setPropertyStr(obj: iter, name: "__forInKeys__", value: newArrayFrom(keys))
-        _ = setPropertyStr(obj: iter, name: "__forInIdx__", value: .newInt32(0))
+        _ = setProperty(obj: iter, atom: keysAtom, value: newArrayFrom(keys))
+        _ = setProperty(obj: iter, atom: idxAtom, value: .newInt32(0))
         return iter
     }
 
@@ -1835,8 +1863,8 @@ extension JeffJSContext {
     /// Gets the next value from a for-in iterator.
     /// Returns (nextKey, done). When done is true, iteration is complete.
     func forInNext(iter: JeffJSValue) -> (JeffJSValue, Bool) {
-        let keysArr = getPropertyStr(obj: iter, name: "__forInKeys__")
-        let idxVal = getPropertyStr(obj: iter, name: "__forInIdx__")
+        let keysArr = getProperty(obj: iter, atom: forInKeysAtomCached)
+        let idxVal = getProperty(obj: iter, atom: forInIdxAtomCached)
         let idx = idxVal.isInt ? Int(idxVal.toInt32()) : 0
         let lenVal = getPropertyStr(obj: keysArr, name: "length")
         let len = lenVal.isInt ? Int(lenVal.toInt32()) : 0
@@ -1845,7 +1873,7 @@ extension JeffJSContext {
         }
         let key = getPropertyUint32(obj: keysArr, index: UInt32(idx))
         // Advance the index
-        _ = setPropertyStr(obj: iter, name: "__forInIdx__", value: .newInt32(Int32(idx + 1)))
+        _ = setProperty(obj: iter, atom: forInIdxAtomCached, value: .newInt32(Int32(idx + 1)))
         return (key, false)
     }
 
@@ -9901,7 +9929,7 @@ struct JeffJSInterpreter {
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let t = JeffJSOperators.jsTypeof(val)
                 val.freeValue()
-                buf[sp] = ctx.newString(t); sp += 1
+                buf[sp] = ctx.typeofString(t); sp += 1
                 pc += 1
 
             case .delete_:
@@ -11044,3 +11072,24 @@ func jeffJS_opProfDump() {
     FileHandle.standardError.write(out.data(using: .utf8)!)
 }
 #endif
+
+
+/// Tracks which property keys a for-in enumeration has already produced.
+/// A for-in normally sees a handful of keys, where a linear scan over
+/// UInt32s is much cheaper than hashing each one; the set is only built
+/// once an object turns out to be large.
+struct JeffJSKeySeen {
+    private var list: [UInt32] = []
+    private var set: Set<UInt32>?
+    private static let promoteAt = 48
+
+    /// Records `v`, returning true if it had not been seen before.
+    @inline(__always)
+    mutating func insert(_ v: UInt32) -> Bool {
+        if set != nil { return set!.insert(v).inserted }
+        if list.contains(v) { return false }
+        list.append(v)
+        if list.count > Self.promoteAt { set = Set(list) }
+        return true
+    }
+}

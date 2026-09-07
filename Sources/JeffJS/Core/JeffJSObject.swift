@@ -1678,6 +1678,13 @@ extension JeffJSObject {
         return .undefined
     }
 
+    /// Bulk-installs `values` as this array's elements, taking ownership of
+    /// each. Only valid on a fast array that has no elements yet.
+    func installFastArrayValues(_ values: ContiguousArray<JeffJSValue>) {
+        _fastArrayValues = JeffJSFastArrayStorage(values: values,
+                                                  count: UInt32(values.count))
+    }
+
     /// Set fast-array element.  Grows the backing array if needed.
     /// Limits growth factor to prevent sparse arrays from allocating
     /// excessively large backing stores (#21).

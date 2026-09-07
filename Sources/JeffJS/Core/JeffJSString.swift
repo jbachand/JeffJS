@@ -1174,6 +1174,31 @@ extension JeffJSString {
         }
     }
 
+    /// This string read as a canonical decimal array index, if it is one.
+    /// Lets a numeric property key intern to the same tagged-int atom that
+    /// `obj[1]` produces, instead of a separate string atom.
+    @inline(__always)
+    func canonicalArrayIndex() -> UInt32? {
+        switch storage {
+        case .str8(let buf): return jeffJS_canonicalArrayIndex(utf8: buf.prefix(len))
+        case .str16(let buf):
+            var value: UInt64 = 0
+            var count = 0
+            var first: UInt16 = 0
+            for cu in buf.prefix(len) {
+                if cu < 0x30 || cu > 0x39 { return nil }
+                if count == 0 { first = cu }
+                value = value &* 10 &+ UInt64(cu - 0x30)
+                count += 1
+                if count > 10 { return nil }
+            }
+            if count == 0 { return nil }
+            if count > 1 && first == 0x30 { return nil }
+            if value > UInt64(JS_ATOM_MAX_INT) { return nil }
+            return UInt32(value)
+        }
+    }
+
     /// Convert back to a Swift `String`.
     func toSwiftString() -> String {
         switch storage {

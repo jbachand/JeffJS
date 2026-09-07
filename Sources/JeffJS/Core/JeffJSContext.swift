@@ -102,6 +102,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// %IteratorPrototype% (JeffJSBuiltinIterator): parent of every builtin
     /// iterator prototype, so iterators are themselves iterable.
     var iteratorProto: JeffJSValue = .undefined
+    /// Interned once: the for-in iterator's internal slot names.
+    lazy var forInKeysAtomCached: UInt32 = rt.findAtom("__forInKeys__")
+    lazy var forInIdxAtomCached: UInt32 = rt.findAtom("__forInIdx__")
     /// Array.prototype.values — cached because it's also used as %ArrayIteratorPrototype%[@@iterator].
     var arrayProtoValues: JeffJSValue
     /// Array.prototype.push — cached object pointer for interpreter fast-path identity check.
@@ -694,15 +697,14 @@ public final class JeffJSContext: JeffJSTokenizerContext {
 
         let funcVal = JeffJSValue.makeObject(obj)
 
-        // Set the name property
-        let nameAtom = rt.findAtom(name)
-        let nameStr = newStringValue(name)
+        // Set the name property. This used to intern the function's own name
+        // as the key, so every builtin got a junk self-named property
+        // ([].map had "map", not "name") and fn.name read back undefined.
         _ = setPropertyInternal(
-            obj: funcVal, atom: nameAtom,
-            value: nameStr,
+            obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
+            value: newStringValue(name),
             flags: JS_PROP_CONFIGURABLE
         )
-        rt.freeAtom(nameAtom)
 
         // Set the length property
         let lengthAtom = JeffJSAtomID.JS_ATOM_length.rawValue

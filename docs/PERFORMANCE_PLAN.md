@@ -499,3 +499,78 @@ Known flaky conformance test: `allLoaded18` (Promise.all + executePendingJobs) f
 Profiling note: `sample` stopped producing output on 2026-09-05 (hangs or exits silently even by pid); the round-2 targets were chosen by reading bytecode dumps (`JEFFJS_DUMP=1`) and reasoning about the paths instead.
 
 Next up, in order of expected payoff: object allocation (JeffJSObject has ~26 stored properties incl. closures; move rare fields to a side object, or pool objects), trace-native fused arithmetic on locals (`get_loc8_get_loc8 + add` -> one op), constructor calls on the inline path, define_field transition IC for object literals, frame objects (immortal pooled frames with unowned links to remove per-call ARC), superinstructions / cold-opcode split in the dispatch loop (phase 6).
+
+## Round 8 (2026-09-06/07) — React re-render
+
+Target: the React re-render burst in React Natively (`window.__bump()` x100 on a
+page rendered by React 18 UMD + ReactDOM), measured on macOS with the app's real
+`JSScriptEngine`, best of 12 rounds.
+
+| build | ms per 100 re-renders |
+| --- | --- |
+| before | 40.2 |
+| after | 31.1 |
+| JavaScriptCore | 17.2 |
+
+23% faster; the gap to JSC on this workload narrowed from 2.34x to 1.81x.
+
+What the Time Profiler pointed at, in the order it was fixed:
+
+1. **for-in built Swift Strings to deduplicate** (16% inclusive). `createForInIterator`
+   formatted every integer key into a `String`, hashed it into a `Set<String>`, and
+   re-interned the iterator's two internal slot names on every loop. It now
+   deduplicates on interned identity (array index by value, everything else by
+   atom) and holds the slot atoms on the context. Shadowing semantics are
+   unchanged: a non-enumerable own property still hides an enumerable one on the
+   prototype.
+2. **`typeof` allocated a JS string per evaluation.** The eight possible results
+   are interned on the runtime, like `intKeyStrings`. React's reconciler runs
+   `typeof x === 'function'` constantly; this was the single biggest win.
+3. **`setFunctionName` interned "name" and allocated a string per closure.** It
+   uses the predefined atom and the per-atom cached string.
+4. **`atomIsArrayIndex` re-parsed the atom's string on every property visit.**
+   The index value is computed once at atom creation (`arrayIndexValue`).
+5. **for-in deduplication hashed every key.** `Set<UInt32>` (SipHash + resize) is
+   now a linear scan over a small array that promotes to a set past 48 keys.
+6. **`newArrayFrom` went through the generic indexed setter per element**, each
+   one interning an index atom and walking the prototype chain. It installs the
+   element storage in one shot.
+7. **The arguments object re-derived `Array.prototype[Symbol.iterator]`** on every
+   creation, interning "Array" and walking three properties (and leaking two
+   references). It uses the context's cached `arrayProtoValues`.
+
+Correctness fixed along the way (each has conformance coverage or a differential
+check against `qjs`):
+
+- **`o[1]` and `o["1"]` were two different properties.** Numeric keys reached the
+  tagged-int atom only from the integer path; a numeric *string* interned as an
+  ordinary string atom. `JSON.stringify` of such an object emitted the key twice.
+  `findAtom` now maps a canonical decimal index to the tagged-int atom, matching
+  QuickJS's `__JS_AtomFromUInt32`, and `atomToString` renders tagged atoms (they
+  previously read back as nil, so the bytecode cache serialised them as ""). New
+  conformance group `NumericPropertyKeys`. **JFBC `compilerVersion` bumped to 6**,
+  so precompiled bundles must be regenerated.
+- **`Array.prototype.values !== Array.prototype[Symbol.iterator]`.** They are one
+  function object now, and it is what the context caches.
+- **Every builtin carried a junk self-named property instead of `name`.**
+  `newCFunction` interned the function's own name as the property key, so
+  `Object.getOwnPropertyNames([].map)` was `["map","length"]` and `[].map.name`
+  was undefined.
+
+Still open, found while profiling and not fixed:
+
+- **User-defined functions have no own `length` or `name`.** Defining them
+  eagerly would add two property definitions per closure creation, which is the
+  hot path this round was trying to shrink; it wants a lazy own-property handler.
+- **Symbol keys collide with their description.** `Symbol('s')` interns as the
+  plain string atom `"s"`, so `obj[Symbol('s')]` is readable as `obj.s`, two
+  symbols with the same description are one property, and the key shows up in
+  `Object.keys`. Well-known symbols are fine (they have real symbol atoms).
+- **`delete arr[i]` does not punch a hole** in a fast array (`i in arr` stays
+  true), and **for-in over a primitive string enumerates nothing**.
+- **`Object.getOwnPropertyDescriptor(arr, '0')`** returns undefined for fast-array
+  elements.
+- **Array.prototype.map is 23% of the re-render profile**, almost all of it the
+  per-element `[JeffJSValue]` argument array and the generic indexed get/has/set.
+  A fast path over the element storage plus a borrowed argument buffer is the
+  next big lever.

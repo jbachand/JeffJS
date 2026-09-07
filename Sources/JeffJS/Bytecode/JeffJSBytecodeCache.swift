@@ -726,7 +726,7 @@ final class JeffJSBytecodeCache {
     ///   - JeffJSCompiler.swift (resolveLabels, resolveVariables, peephole)
     ///   - JeffJSOpcodes.swift (opcode additions/changes)
     ///   - JeffJSInterpreter.swift (only if opcode semantics change)
-    static let compilerVersion: UInt64 = 5  // 2026-09-06: cmp_if8/cmp_if fused compare-branch opcodes
+    static let compilerVersion: UInt64 = 6  // 2026-09-06: numeric string keys intern to tagged-int atoms
 
     /// Lazily-initialized disk cache directory.
     /// Automatically clears cached .jfbc files when the app binary changes (new build).

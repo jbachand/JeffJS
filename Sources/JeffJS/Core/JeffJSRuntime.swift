@@ -107,6 +107,10 @@ class JeffJSAtomStruct {
     var len: Int = 0
     /// True if this atom is a small integer index (array index optimization).
     var isIntegerIndex: Bool = false
+    /// The array index this atom's spelling denotes, if it is a canonical
+    /// decimal index. Computed once here because `atomIsArrayIndex` used to
+    /// re-parse the string on every property enumeration.
+    var arrayIndexValue: UInt32?
 
     init() {}
 
@@ -115,6 +119,8 @@ class JeffJSAtomStruct {
         self.hash = hash
         self.atomType = atomType
         self.len = str.utf16.count
+        self.arrayIndexValue = jeffJS_canonicalArrayIndex(utf8: str.utf8, max: 0xFFFF_FFFE)
+        self.isIntegerIndex = self.arrayIndexValue != nil
     }
 }
 
@@ -401,6 +407,10 @@ final class JeffJSRuntime {
     /// per key per loop. Entries hold one JS reference (dropped in freeAtom).
     var atomJSStrings: [UInt32: JeffJSString] = [:]
     var intKeyStrings: [JeffJSString?] = Array(repeating: nil, count: 1024)
+    /// Shared JS strings for the eight possible `typeof` results. The opcode
+    /// allocated a fresh JeffJSString per evaluation, and React's reconciler
+    /// runs `typeof x === 'function'` constantly.
+    var typeofStrings: [JeffJSString?] = Array(repeating: nil, count: 8)
 
     /// Pool of interpreter value buffers: (pointer, capacity) pairs.
     var interpBufPool: [(UnsafeMutablePointer<JeffJSValue>, Int)] = []
@@ -1104,6 +1114,10 @@ final class JeffJSRuntime {
     /// - Parameter str: The string to intern.
     /// - Returns: The atom index. The atom's refcount is incremented.
     func findAtom(_ str: String) -> UInt32 {
+        // A canonical decimal index interns to the tagged-int atom, the same
+        // atom `obj[1]` produces (QuickJS `__JS_AtomFromUInt32`). Without this
+        // `o[1]` and `o["1"]` are two different properties.
+        if let idx = jeffJS_canonicalArrayIndex(utf8: str.utf8) { return idx | JS_ATOM_TAG_INT }
         guard atomHashSize > 0, !atomHash.isEmpty else { return 0 }
         let hash = atomHashString(str)
         let bucketIndex = Int(hash) & (atomHashSize - 1)
@@ -1132,6 +1146,11 @@ final class JeffJSRuntime {
     /// repeated key costs one field read. Returns an owned reference.
     func findAtom(jsString js: JeffJSString) -> UInt32 {
         if js.cachedAtom != 0 { return dupAtom(js.cachedAtom) }
+        if let idx = js.canonicalArrayIndex() {
+            let atom = idx | JS_ATOM_TAG_INT
+            js.cachedAtom = atom   // tagged atoms are not refcounted
+            return atom
+        }
         guard atomHashSize > 0, !atomHash.isEmpty else { return 0 }
         // UTF-8-equivalent hash from the code units (Latin-1 and BMP; strings
         // with surrogates take the generic path).
@@ -1208,6 +1227,7 @@ final class JeffJSRuntime {
     /// Returns the string for an atom.
     /// Mirrors `JS_AtomToCString()` from QuickJS.
     func atomToString(_ atom: UInt32) -> String? {
+        if (atom & JS_ATOM_TAG_INT) != 0 { return String(atom & ~JS_ATOM_TAG_INT) }
         guard atom != JS_ATOM_NULL && Int(atom) < atomCount else { return nil }
         return atomArray[Int(atom)]?.str
     }
@@ -1219,12 +1239,11 @@ final class JeffJSRuntime {
         if (atom & JS_ATOM_TAG_INT) != 0 {
             return true
         }
-        // Also check string atoms that represent valid array indices (e.g. "1", "2").
-        // Per ES spec §6.1.7, integer-indexed property keys must be enumerated
-        // in ascending numeric order before other string keys.
-        guard let str = atomToString(atom), !str.isEmpty else { return false }
-        guard let val = UInt32(str) else { return false }
-        return val <= 0xFFFFFFFE && String(val) == str
+        // Per ES spec §6.1.7, integer-indexed property keys are enumerated in
+        // ascending numeric order before other string keys. The answer is
+        // cached on the atom, so this is a field read.
+        guard atom != JS_ATOM_NULL, Int(atom) < atomCount else { return false }
+        return atomArray[Int(atom)]?.arrayIndexValue != nil
     }
 
     /// Creates an atom from an integer array index.
@@ -1243,13 +1262,8 @@ final class JeffJSRuntime {
         if (atom & JS_ATOM_TAG_INT) != 0 {
             return atom & ~JS_ATOM_TAG_INT
         }
-        // Also handle string atoms that represent valid array indices.
-        guard let str = atomToString(atom), !str.isEmpty else { return nil }
-        guard let val = UInt32(str) else { return nil }
-        if val <= 0xFFFFFFFE && String(val) == str {
-            return val
-        }
-        return nil
+        guard atom != JS_ATOM_NULL, Int(atom) < atomCount else { return nil }
+        return atomArray[Int(atom)]?.arrayIndexValue
     }
 
     // MARK: - Private Atom Helpers
@@ -1500,4 +1514,27 @@ func jeffJS_utf8Equals(_ str: String, _ js: JeffJSString) -> Bool {
         }
     }
     return it.next() == nil
+}
+
+
+/// True decimal array index, i.e. the canonical string form of a value in
+/// 0...JS_ATOM_MAX_INT: no sign, no leading zero (except "0" itself), no
+/// fractional part. "01", "1.0", "+1", " 1" and 2^31 or above are ordinary
+/// string keys. Mirrors QuickJS's `__JS_AtomFromUInt32` admission test.
+@inline(__always)
+func jeffJS_canonicalArrayIndex<S: Sequence>(utf8: S, max: UInt32 = JS_ATOM_MAX_INT) -> UInt32? where S.Element == UInt8 {
+    var value: UInt64 = 0
+    var count = 0
+    var first: UInt8 = 0
+    for b in utf8 {
+        if b < 0x30 || b > 0x39 { return nil }
+        if count == 0 { first = b }
+        value = value &* 10 &+ UInt64(b - 0x30)
+        count += 1
+        if count > 10 { return nil }
+    }
+    if count == 0 { return nil }
+    if count > 1 && first == 0x30 { return nil }   // leading zero is not canonical
+    if value > UInt64(max) { return nil }
+    return UInt32(value)
 }
