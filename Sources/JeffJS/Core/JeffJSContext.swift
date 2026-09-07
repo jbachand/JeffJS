@@ -2431,13 +2431,22 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// Execute precompiled bytecode loaded from a .jfbc file.
     /// Deserializes with atom remapping and runs on the global object.
     func evalPrecompiled(_ bytes: [UInt8]) -> JeffJSValue {
+        let tStart = jeffJSTimePrecompiled ? CFAbsoluteTimeGetCurrent() : 0
         guard let fb = JeffJSBytecodeDeserializer.deserialize(bytes, rt: rt) else {
             return throwInternalError(message: "Failed to deserialize precompiled bytecode")
         }
+        let tDeser = jeffJSTimePrecompiled ? CFAbsoluteTimeGetCurrent() : 0
         let size = Self.totalBytecodeLen(fb)
         lastBytecodeSize = size
         totalBytecodeSize += size
-        return executeBytecode(fb)
+        let result = executeBytecode(fb)
+        if jeffJSTimePrecompiled {
+            let tEnd = CFAbsoluteTimeGetCurrent()
+            FileHandle.standardError.write(String(format:
+                "[jeffjs] precompiled %d bytes: deserialize %.1fms, execute %.1fms\n",
+                bytes.count, (tDeser - tStart) * 1000, (tEnd - tDeser) * 1000).data(using: .utf8)!)
+        }
+        return result
     }
 
     private func executeBytecode(_ fb: JeffJSFunctionBytecode) -> JeffJSValue {
@@ -4945,3 +4954,8 @@ extension JeffJSContext {
         return classProto.count > idx ? classProto[idx] : JeffJSValue.undefined
     }
 }
+
+
+/// JEFFJS_TIME_PRECOMPILED=1 reports the deserialize/execute split of
+/// evalPrecompiled, for startup profiling in embedders.
+nonisolated(unsafe) let jeffJSTimePrecompiled = ProcessInfo.processInfo.environment["JEFFJS_TIME_PRECOMPILED"] == "1"
