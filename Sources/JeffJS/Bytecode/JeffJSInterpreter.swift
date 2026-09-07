@@ -276,6 +276,10 @@ extension JeffJSContext {
         if callDepth > JeffJSInterpreter.maxCallDepth {
             return throwInternalError(message: "Maximum call stack size exceeded")
         }
+        if callDepth == 1 { rt.updateStackLimitForCurrentThread() }
+        if rt.checkStackOverflow() {
+            return throwInternalError(message: "Maximum call stack size exceeded")
+        }
 
         guard let obj = funcVal.toObject() else {
             let desc: String
@@ -5713,6 +5717,14 @@ struct JeffJSInterpreter {
         ctx.callDepth += 1
         defer { ctx.callDepth -= 1 }
         if ctx.callDepth > maxCallDepth {
+            _ = ctx.throwInternalError(message: "Maximum call stack size exceeded")
+            return .exception
+        }
+        // Entering JS from native: bind the guard to this thread's stack.
+        if ctx.callDepth == 1 { ctx.rt.updateStackLimitForCurrentThread() }
+        // Native frames are large, so the depth limit alone does not bound stack
+        // use; check the real stack pointer every call.
+        if ctx.rt.checkStackOverflow() {
             _ = ctx.throwInternalError(message: "Maximum call stack size exceeded")
             return .exception
         }

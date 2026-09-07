@@ -545,6 +545,8 @@ final class JeffJSRuntime {
     var stackTop: UInt
     /// Computed stack limit (stackTop - stackSize).
     var stackLimit: UInt
+    /// Lowest valid address of the stack JS is currently running on.
+    var stackFloor: UInt = 0
 
     // MARK: - Exception State
 
@@ -802,15 +804,57 @@ final class JeffJSRuntime {
     ///
     /// - Parameter margin: Additional bytes required beyond current usage.
     /// - Returns: True if stack overflow would occur.
+    /// Reserved headroom below the limit so the error path itself can run.
+    static let stackSafetyMargin: UInt = 256 * 1024
+
+    /// Point the stack guard at the thread that is about to run JS.
+    ///
+    /// `stackTop` used to be captured once, wherever the runtime happened to be
+    /// constructed, and the budget was a fixed config value. Both are wrong as
+    /// soon as JS runs on another thread (this app evaluates polyfills on one
+    /// thread and page scripts on the main thread) or on a thread smaller than
+    /// the configured budget: the comparison is meaningless across stacks, and
+    /// on a small stack the engine happily recursed past the end and died with
+    /// SIGBUS instead of throwing. Cheap enough to call when entering JS.
+    func updateStackLimitForCurrentThread() {
+        let thread = pthread_self()
+        let top = UInt(bitPattern: pthread_get_stackaddr_np(thread))
+        let size = UInt(pthread_get_stacksize_np(thread))
+        guard size > 0, top > size else { return }
+        // JS may use the whole thread except a margin reserved for the error
+        // path. The configured stack size is not a cap here: it described a
+        // budget on one thread, while runaway recursion is already bounded by
+        // stack.maxCallDepth.
+        let floor = top - size
+        let margin = Swift.min(Self.stackSafetyMargin, size / 4)
+        stackTop = top
+        stackFloor = floor
+        stackLimit = floor + margin
+    }
+
     func checkStackOverflow(margin: UInt = 0) -> Bool {
-        if stackLimit == 0 { return false }
         var localVar: UInt = 0
         var currentSP: UInt = 0
         withUnsafePointer(to: &localVar) { ptr in
             currentSP = UInt(bitPattern: ptr)
         }
+        // A stack pointer outside the recorded range means JS moved to another
+        // thread (this app runs polyfills on one and page scripts on another).
+        // Re-derive rather than compare against a different thread's addresses,
+        // which reads as a bogus overflow.
+        if currentSP > stackTop || currentSP < stackFloor {
+            updateStackLimitForCurrentThread()
+            withUnsafePointer(to: &localVar) { ptr in
+                currentSP = UInt(bitPattern: ptr)
+            }
+        }
+        if stackLimit == 0 { return false }
         // Stack grows downward on most architectures
-        return currentSP < stackLimit + margin
+        let over = currentSP < stackLimit + margin
+        if over, ProcessInfo.processInfo.environment["JEFFJS_STACK_DEBUG"] == "1" {
+            FileHandle.standardError.write("[stack] trip: sp=0x\(String(currentSP, radix: 16)) limit=0x\(String(stackLimit, radix: 16)) top=0x\(String(stackTop, radix: 16)) used=\((stackTop &- currentSP) / 1024)KB budget=\((stackTop &- stackLimit) / 1024)KB\n".data(using: .utf8)!)
+        }
+        return over
     }
 
     // MARK: - Interrupt Handler
