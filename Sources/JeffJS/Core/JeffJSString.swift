@@ -94,6 +94,9 @@ final class JeffJSString: JeffJSStringBase {
     /// points of this string as UInt32, built once instead of per exec.
     var codeUnits32: [UInt32]? = nil
     var codePoints32: [UInt32]? = nil
+    /// For a compiled RegExp bytecode string: its capture-group names,
+    /// parsed once (exec used to copy the bytecode and re-parse per match).
+    var regexpGroupNames: [String?]? = nil
     /// Atom interned for this string when it was used as a property key
     /// (JeffJSRuntime.findAtom(jsString:)); holds one atom reference, released
     /// in deinit. 0 = none.

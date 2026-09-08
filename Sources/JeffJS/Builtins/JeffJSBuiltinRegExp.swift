@@ -320,31 +320,20 @@ func js_regexp_exec(
     )
     resultArray.fastArray = true
 
-    // Set `length` property so array.length works.
-    jeffJS_appendOwnProperty(ctx, resultArray,
-                             atom: JeffJSAtomID.JS_ATOM_length.rawValue,
-                             flags: [.writable],
-                             value: JeffJSValue.newInt32(Int32(arrayValues.count)))
-
-    // Set `index` property.
-    jeffJS_appendOwnProperty(ctx, resultArray,
-                             atom: JeffJSAtomID.JS_ATOM_index.rawValue,
-                             flags: [.writable, .enumerable, .configurable],
-                             value: JeffJSValue.newInt32(Int32(matchStart)))
-
-    // Set `input` property.
-    jeffJS_appendOwnProperty(ctx, resultArray,
-                             atom: JeffJSAtomID.JS_ATOM_input.rawValue,
-                             flags: [.writable, .enumerable, .configurable],
-                             value: JeffJSValue.makeString(inputStr.retain()))
-
-    // Set `groups` property — populate from named capture groups if present.
+    // `groups`: named capture groups, if the pattern has any. The names are
+    // parsed once per compiled pattern (this used to copy the bytecode and
+    // re-parse it on every match).
     var groupsVal: JeffJSValue = .undefined
-    if case .regexp(_, let bytecodeStr) = obj.payload,
-       let bc = bytecodeStr,
-       case .str8(let bcBuf) = bc.storage {
-        let bytecodeBytes = Array(bcBuf.prefix(bc.len))
-        let groupNames = lreGetGroupNames(bytecodeBytes)
+    if case .regexp(_, let bytecodeStr) = obj.payload, let bc = bytecodeStr {
+        let groupNames: [String?]
+        if let cached = bc.regexpGroupNames {
+            groupNames = cached
+        } else if case .str8(let bcBuf) = bc.storage {
+            groupNames = lreGetGroupNames(bcBuf.count == bc.len ? bcBuf : Array(bcBuf.prefix(bc.len)))
+            bc.regexpGroupNames = groupNames
+        } else {
+            groupNames = []
+        }
         var hasNamedGroup = false
         for name in groupNames { if name != nil { hasNamedGroup = true; break } }
         if hasNamedGroup {
@@ -364,10 +353,36 @@ func js_regexp_exec(
             groupsVal = groupsObj
         }
     }
-    jeffJS_appendOwnProperty(ctx, resultArray,
-                             atom: JeffJSAtomID.JS_ATOM_groups.rawValue,
-                             flags: [.writable, .enumerable, .configurable],
-                             value: groupsVal)
+
+    // length, index, input, groups: on the shared match-result shape after
+    // the first result, four slot appends instead of four transition lookups.
+    let lengthVal = JeffJSValue.newInt32(Int32(arrayValues.count))
+    let indexVal = JeffJSValue.newInt32(Int32(matchStart))
+    let inputStrVal = JeffJSValue.makeString(inputStr.retain())
+    if let shape = ctx.regexpMatchShape, shape.isHashed, shape.propCount == 4,
+       resultArray.propValues.count == 0, let old = resultArray.shape {
+        shape.refCount += 1
+        resultArray.shape = shape
+        jeffJS_leaveShape(ctx.rt, old)
+        resultArray.appendDataValue(lengthVal)
+        resultArray.appendDataValue(indexVal)
+        resultArray.appendDataValue(inputStrVal)
+        resultArray.appendDataValue(groupsVal)
+    } else {
+        jeffJS_appendOwnProperty(ctx, resultArray, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
+                                 flags: [.writable], value: lengthVal)
+        jeffJS_appendOwnProperty(ctx, resultArray, atom: JeffJSAtomID.JS_ATOM_index.rawValue,
+                                 flags: [.writable, .enumerable, .configurable], value: indexVal)
+        jeffJS_appendOwnProperty(ctx, resultArray, atom: JeffJSAtomID.JS_ATOM_input.rawValue,
+                                 flags: [.writable, .enumerable, .configurable], value: inputStrVal)
+        jeffJS_appendOwnProperty(ctx, resultArray, atom: JeffJSAtomID.JS_ATOM_groups.rawValue,
+                                 flags: [.writable, .enumerable, .configurable], value: groupsVal)
+        if ctx.regexpMatchShape == nil, let sh = resultArray.shape, sh.isHashed, sh.propCount == 4,
+           resultArray.propValues.count == 4 {
+            sh.refCount += 1   // the context keeps it alive
+            ctx.regexpMatchShape = sh
+        }
+    }
 
     // Set `indices` property (if 'd' flag).
     if hasIndices {

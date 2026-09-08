@@ -131,6 +131,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         return obj
     }
 
+    /// Transition shape of a RegExp match result (length, index, input,
+    /// groups), captured from the first one built.
+    var regexpMatchShape: JeffJSShape? = nil
+
     /// Transition shapes of arguments objects, by argument count (0...8), for
     /// sloppy (with `callee`) and strict functions: captured from the first
     /// object built with that count, then every later one is put on the
