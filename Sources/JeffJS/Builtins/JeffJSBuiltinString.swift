@@ -271,6 +271,126 @@ struct JeffJSBuiltinString {
     }
 
     /// Convert a UTF-16 code unit array back to a JeffJSValue string.
+    // MARK: - Code-unit view
+
+    /// The code units of a JS string read straight from its storage, narrow
+    /// (Latin-1) or wide (UTF-16), with slicing that keeps narrow input
+    /// narrow. The builtins used to widen every Latin-1 string into a
+    /// [UInt16] on entry and narrow every result on exit; on a CSV-parsing
+    /// kernel that was a third of the time.
+    struct CodeUnits {
+        enum Storage { case narrow([UInt8]), wide([UInt16]) }
+        let storage: Storage
+        let count: Int
+
+        init(_ js: JeffJSString) {
+            switch js.storage {
+            case .str8(let b): storage = .narrow(b)
+            case .str16(let w): storage = .wide(w)
+            }
+            count = js.len
+        }
+        init(wide: [UInt16]) { storage = .wide(wide); count = wide.count }
+
+        @inline(__always) subscript(i: Int) -> UInt16 {
+            switch storage {
+            case .narrow(let b): return UInt16(b[i])
+            case .wide(let w): return w[i]
+            }
+        }
+
+        /// The substring [start, end) as an owned JS string value.
+        func slice(_ start: Int, _ end: Int) -> JeffJSValue {
+            let lo = max(0, min(start, count)), hi = max(lo, min(end, count))
+            switch storage {
+            case .narrow(let b):
+                return JeffJSValue.makeString(JeffJSString(refCount: 1, len: hi - lo, isWideChar: false,
+                                                           storage: .str8(Array(b[lo..<hi]))))
+            case .wide(let w):
+                var narrow = true
+                var i = lo
+                while i < hi { if w[i] > 0xFF { narrow = false; break }; i += 1 }
+                if narrow {
+                    var out = [UInt8](); out.reserveCapacity(hi - lo)
+                    for j in lo..<hi { out.append(UInt8(truncatingIfNeeded: w[j])) }
+                    return JeffJSValue.makeString(JeffJSString(refCount: 1, len: hi - lo, isWideChar: false, storage: .str8(out)))
+                }
+                return JeffJSValue.makeString(JeffJSString(refCount: 1, len: hi - lo, isWideChar: true,
+                                                           storage: .str16(Array(w[lo..<hi]))))
+            }
+        }
+
+        /// First index >= startPos where `search` occurs, or -1.
+        func indexOf(_ search: CodeUnits, from startPos: Int) -> Int {
+            let sLen = count, searchLen = search.count
+            if searchLen == 0 { return min(max(startPos, 0), sLen) }
+            if searchLen > sLen { return -1 }
+            let limit = sLen - searchLen
+            var i = max(startPos, 0)
+            if case .narrow(let hb) = storage, case .narrow(let nb) = search.storage {
+                let first = nb[0]
+                while i <= limit {
+                    if hb[i] == first {
+                        var j = 1
+                        while j < searchLen && hb[i + j] == nb[j] { j += 1 }
+                        if j == searchLen { return i }
+                    }
+                    i += 1
+                }
+                return -1
+            }
+            while i <= limit {
+                var j = 0
+                while j < searchLen && self[i + j] == search[j] { j += 1 }
+                if j == searchLen { return i }
+                i += 1
+            }
+            return -1
+        }
+
+        /// True when [start, start+search.count) equals `search`.
+        func matches(_ search: CodeUnits, at start: Int) -> Bool {
+            if start < 0 || start + search.count > count { return false }
+            var j = 0
+            while j < search.count { if self[start + j] != search[j] { return false }; j += 1 }
+            return true
+        }
+    }
+
+    /// `this` coerced to a string, as a code-unit view (throws on null/undefined).
+    static func requireThisUnits(ctx: JeffJSContext, this: JeffJSValue, method: String) -> CodeUnits? {
+        if this.isNull || this.isUndefined {
+            _ = ctx.throwTypeError("String.prototype.\(method) called on null or undefined")
+            return nil
+        }
+        let str = ctx.toString(this)
+        if str.isException { return nil }
+        defer { str.freeValue() }   // the view holds the storage buffer itself
+        if let js = str.stringValue { return CodeUnits(js) }
+        return CodeUnits(wide: ctx.toUTF16Array(str))
+    }
+
+    /// A value coerced to a string, as a code-unit view (nil on exception).
+    static func codeUnits(ctx: JeffJSContext, of val: JeffJSValue) -> CodeUnits? {
+        let str = ctx.toString(val)
+        if str.isException { return nil }
+        defer { str.freeValue() }
+        if let js = str.stringValue { return CodeUnits(js) }
+        return CodeUnits(wide: ctx.toUTF16Array(str))
+    }
+
+    private static func findTrimStart(_ str: CodeUnits) -> Int {
+        var i = 0
+        while i < str.count && isJSWhitespace(str[i]) { i += 1 }
+        return i
+    }
+    private static func findTrimEnd(_ str: CodeUnits) -> Int {
+        var i = str.count - 1
+        while i >= 0 && isJSWhitespace(str[i]) { i -= 1 }
+        return i
+    }
+
+
     static func makeString(ctx: JeffJSContext, utf16: [UInt16]) -> JeffJSValue {
         return ctx.newStringFromUTF16(utf16)
     }
@@ -668,16 +788,13 @@ struct JeffJSBuiltinString {
 
     /// `String.prototype.indexOf(searchString [, position])`
     static func indexOf(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard let str = requireThisString(ctx: ctx, this: this, method: "indexOf") else {
-            return .exception
-        }
-        let searchStr: [UInt16]
+        guard let str = requireThisUnits(ctx: ctx, this: this, method: "indexOf") else { return .exception }
+        let searchStr: CodeUnits
         if args.isEmpty {
-            searchStr = Array("undefined".utf16)
+            searchStr = CodeUnits(wide: Array("undefined".utf16))
         } else {
-            let s = ctx.toString(args[0])
-            if s.isException { return .exception }
-            searchStr = ctx.toUTF16Array(s)
+            guard let s = codeUnits(ctx: ctx, of: args[0]) else { return .exception }
+            searchStr = s
         }
         var pos = 0
         if args.count >= 2 {
@@ -686,8 +803,7 @@ struct JeffJSBuiltinString {
             pos = ctx.extractInt(n)
         }
         pos = max(0, min(pos, str.count))
-        let result = indexOfInternal(str, searchStr, pos)
-        return JeffJSValue.newInt32(Int32(result))
+        return JeffJSValue.newInt32(Int32(str.indexOf(searchStr, from: pos)))
     }
 
     /// `String.prototype.lastIndexOf(searchString [, position])`
@@ -718,19 +834,16 @@ struct JeffJSBuiltinString {
 
     /// `String.prototype.includes(searchString [, position])`
     static func includes(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard let str = requireThisString(ctx: ctx, this: this, method: "includes") else {
-            return .exception
-        }
+        guard let str = requireThisUnits(ctx: ctx, this: this, method: "includes") else { return .exception }
         if !args.isEmpty && isRegExp(ctx: ctx, args[0]) {
             return ctx.throwTypeError("First argument to String.prototype.includes must not be a regular expression")
         }
-        let searchStr: [UInt16]
+        let searchStr: CodeUnits
         if args.isEmpty {
-            searchStr = Array("undefined".utf16)
+            searchStr = CodeUnits(wide: Array("undefined".utf16))
         } else {
-            let s = ctx.toString(args[0])
-            if s.isException { return .exception }
-            searchStr = ctx.toUTF16Array(s)
+            guard let s = codeUnits(ctx: ctx, of: args[0]) else { return .exception }
+            searchStr = s
         }
         var pos = 0
         if args.count >= 2 {
@@ -739,24 +852,21 @@ struct JeffJSBuiltinString {
             pos = ctx.extractInt(n)
         }
         pos = max(0, min(pos, str.count))
-        return JeffJSValue.newBool(indexOfInternal(str, searchStr, pos) >= 0)
+        return JeffJSValue.newBool(str.indexOf(searchStr, from: pos) >= 0)
     }
 
     /// `String.prototype.startsWith(searchString [, position])`
     static func startsWith(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard let str = requireThisString(ctx: ctx, this: this, method: "startsWith") else {
-            return .exception
-        }
+        guard let str = requireThisUnits(ctx: ctx, this: this, method: "startsWith") else { return .exception }
         if !args.isEmpty && isRegExp(ctx: ctx, args[0]) {
             return ctx.throwTypeError("First argument to String.prototype.startsWith must not be a regular expression")
         }
-        let searchStr: [UInt16]
+        let searchStr: CodeUnits
         if args.isEmpty {
-            searchStr = Array("undefined".utf16)
+            searchStr = CodeUnits(wide: Array("undefined".utf16))
         } else {
-            let s = ctx.toString(args[0])
-            if s.isException { return .exception }
-            searchStr = ctx.toUTF16Array(s)
+            guard let s = codeUnits(ctx: ctx, of: args[0]) else { return .exception }
+            searchStr = s
         }
         var start = 0
         if args.count >= 2 {
@@ -765,16 +875,7 @@ struct JeffJSBuiltinString {
             start = ctx.extractInt(n)
         }
         start = max(0, min(start, str.count))
-        let searchLen = searchStr.count
-        if start + searchLen > str.count {
-            return .JS_FALSE
-        }
-        for i in 0..<searchLen {
-            if str[start + i] != searchStr[i] {
-                return .JS_FALSE
-            }
-        }
-        return .JS_TRUE
+        return JeffJSValue.newBool(str.matches(searchStr, at: start))
     }
 
     /// `String.prototype.endsWith(searchString [, endPosition])`
@@ -1068,8 +1169,6 @@ struct JeffJSBuiltinString {
         }
         let separator = args.count > 0 ? args[0] : JeffJSValue.undefined
         let limitArg  = args.count > 1 ? args[1] : JeffJSValue.undefined
-
-        // Delegate via Symbol.split if present
         if !separator.isNullOrUndefined {
             let splitter = ctx.getProperty(obj: separator, atom: JeffJSAtomConstants.Symbol_split)
             if splitter.isException { return .exception }
@@ -1077,90 +1176,59 @@ struct JeffJSBuiltinString {
                 return ctx.callFunction(splitter, thisVal: separator,
                                         args: [ctx.toString(this), limitArg])
             }
-            // Direct fallback: if this is a RegExp, call [@@split] logic directly
             if let sepObj = separator.toObject(),
                sepObj.classID == JeffJSClassID.regexp.rawValue {
                 return js_regexp_Symbol_split(ctx: ctx, this: separator,
                                               argv: [ctx.toString(this), limitArg])
             }
         }
-
         let strVal = ctx.toString(this)
         if strVal.isException { return .exception }
-        let str = ctx.toUTF16Array(strVal)
-
-        // Compute limit
+        guard let js = strVal.stringValue else { strVal.freeValue(); return ctx.newArray() }
+        let str = CodeUnits(js)
         let lim: Int
         if limitArg.isUndefined {
             lim = Int(UInt32.max)
         } else {
             lim = Int(ctx.toUInt32(limitArg))
         }
-
-        let arr = ctx.newArray()
-        if arr.isException { return .exception }
-
         if lim == 0 {
-            return arr
+            strVal.freeValue()
+            return ctx.newArray()
         }
-
-        // undefined separator returns the whole string as single element
         if separator.isUndefined {
-            ctx.setPropertyUInt32(obj: arr, index: 0, value: strVal)
-            return arr
+            return ctx.newArrayFrom([strVal])
         }
-
-        let sepVal = ctx.toString(separator)
-        if sepVal.isException { return .exception }
-        let sepStr = ctx.toUTF16Array(sepVal)
-
-        if str.isEmpty {
-            // Empty string: if sep matches empty, return []; else [""]
-            if sepStr.isEmpty {
-                return arr
-            }
-            ctx.setPropertyUInt32(obj: arr, index: 0, value: strVal)
-            return arr
+        guard let sepStr = codeUnits(ctx: ctx, of: separator) else { strVal.freeValue(); return .exception }
+        if str.count == 0 {
+            if sepStr.count == 0 { strVal.freeValue(); return ctx.newArray() }
+            return ctx.newArrayFrom([strVal])
         }
-
-        if sepStr.isEmpty {
-            // Split into individual code units
-            var count = 0
-            for i in 0..<str.count {
-                if count >= lim { break }
-                ctx.setPropertyUInt32(obj: arr, index: UInt32(count),
-                                      value: makeString(ctx: ctx, utf16: [str[i]]))
-                count += 1
-            }
-            return arr
+        strVal.freeValue()   // segments are sliced from the view's buffer
+        var parts: [JeffJSValue] = []
+        if sepStr.count == 0 {
+            parts.reserveCapacity(min(str.count, lim))
+            var i = 0
+            while i < str.count && parts.count < lim { parts.append(str.slice(i, i + 1)); i += 1 }
+            return ctx.newArrayFrom(parts)
         }
-
-        var count = 0
         var start = 0
         while start <= str.count {
-            let pos = indexOfInternal(str, sepStr, start)
+            let pos = str.indexOf(sepStr, from: start)
             if pos == -1 { break }
-            let segment = Array(str[start..<pos])
-            ctx.setPropertyUInt32(obj: arr, index: UInt32(count),
-                                  value: makeString(ctx: ctx, utf16: segment))
-            count += 1
-            if count >= lim { return arr }
+            parts.append(str.slice(start, pos))
+            if parts.count >= lim { return ctx.newArrayFrom(parts) }
             start = pos + sepStr.count
         }
-        // Remaining portion
-        let tail = Array(str[start...])
-        ctx.setPropertyUInt32(obj: arr, index: UInt32(count),
-                              value: makeString(ctx: ctx, utf16: tail))
-        return arr
+        parts.append(str.slice(start, str.count))
+        return ctx.newArrayFrom(parts)
     }
 
     // MARK: - Extraction Methods
 
     /// `String.prototype.substring(start, end)`
     static func substring(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard let str = requireThisString(ctx: ctx, this: this, method: "substring") else {
-            return .exception
-        }
+        guard let str = requireThisUnits(ctx: ctx, this: this, method: "substring") else { return .exception }
         let len = str.count
         var intStart = 0
         if !args.isEmpty {
@@ -1176,17 +1244,13 @@ struct JeffJSBuiltinString {
         }
         intStart = max(0, min(intStart, len))
         intEnd = max(0, min(intEnd, len))
-        if intStart > intEnd {
-            swap(&intStart, &intEnd)
-        }
-        return makeString(ctx: ctx, utf16: Array(str[intStart..<intEnd]))
+        if intStart > intEnd { swap(&intStart, &intEnd) }
+        return str.slice(intStart, intEnd)
     }
 
     /// `String.prototype.substr(start, length)` (legacy, Annex B)
     static func substr(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard let str = requireThisString(ctx: ctx, this: this, method: "substr") else {
-            return .exception
-        }
+        guard let str = requireThisUnits(ctx: ctx, this: this, method: "substr") else { return .exception }
         let len = str.count
         var intStart: Int
         if args.isEmpty {
@@ -1204,21 +1268,15 @@ struct JeffJSBuiltinString {
         } else {
             resultLength = len
         }
-        if intStart < 0 {
-            intStart = max(len + intStart, 0)
-        }
+        if intStart < 0 { intStart = max(len + intStart, 0) }
         resultLength = max(0, min(resultLength, len - intStart))
-        if resultLength <= 0 {
-            return ctx.newStringValue("")
-        }
-        return makeString(ctx: ctx, utf16: Array(str[intStart..<(intStart + resultLength)]))
+        if resultLength <= 0 { return ctx.newStringValue("") }
+        return str.slice(intStart, intStart + resultLength)
     }
 
     /// `String.prototype.slice(start, end)`
     static func slice(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard let str = requireThisString(ctx: ctx, this: this, method: "slice") else {
-            return .exception
-        }
+        guard let str = requireThisUnits(ctx: ctx, this: this, method: "slice") else { return .exception }
         let len = str.count
         var intStart: Int
         if args.isEmpty {
@@ -1238,33 +1296,58 @@ struct JeffJSBuiltinString {
         }
         if intStart < 0 { intStart = max(len + intStart, 0) } else { intStart = min(intStart, len) }
         if intEnd < 0 { intEnd = max(len + intEnd, 0) } else { intEnd = min(intEnd, len) }
-        let span = max(intEnd - intStart, 0)
-        if span == 0 {
-            return ctx.newStringValue("")
-        }
-        return makeString(ctx: ctx, utf16: Array(str[intStart..<(intStart + span)]))
+        if intEnd <= intStart { return ctx.newStringValue("") }
+        return str.slice(intStart, intEnd)
     }
 
     // MARK: - Transformation Methods
 
     /// `String.prototype.toLowerCase()`
     static func toLowerCase(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard let str = requireThisString(ctx: ctx, this: this, method: "toLowerCase") else {
-            return .exception
+        guard let str = requireThisUnits(ctx: ctx, this: this, method: "toLowerCase") else { return .exception }
+        // ASCII in narrow storage maps in place; anything else takes the
+        // Unicode-aware Swift path.
+        if case .narrow(let b) = str.storage {
+            var ascii = true
+            var i = 0
+            while i < str.count { if b[i] >= 0x80 { ascii = false; break }; i += 1 }
+            if ascii {
+                var out = [UInt8](); out.reserveCapacity(str.count)
+                for j in 0..<str.count {
+                    let c = b[j]
+                    out.append(c >= 0x41 && c <= 0x5a ? c + 0x20 : c)
+                }
+                return JeffJSValue.makeString(JeffJSString(refCount: 1, len: str.count, isWideChar: false, storage: .str8(out)))
+            }
         }
-        let swiftStr = String(utf16CodeUnits: str, count: str.count)
-        let lower = swiftStr.lowercased()
-        return ctx.newStringFromUTF16(Array(lower.utf16))
+        var units = [UInt16](); units.reserveCapacity(str.count)
+        for i in 0..<str.count { units.append(str[i]) }
+        let swiftStr = String(utf16CodeUnits: units, count: units.count)
+        return ctx.newStringFromUTF16(Array(swiftStr.lowercased().utf16))
     }
 
     /// `String.prototype.toUpperCase()`
     static func toUpperCase(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard let str = requireThisString(ctx: ctx, this: this, method: "toUpperCase") else {
-            return .exception
+        guard let str = requireThisUnits(ctx: ctx, this: this, method: "toUpperCase") else { return .exception }
+        // ASCII in narrow storage maps in place; anything else takes the
+        // Unicode-aware Swift path.
+        if case .narrow(let b) = str.storage {
+            var ascii = true
+            var i = 0
+            while i < str.count { if b[i] >= 0x80 { ascii = false; break }; i += 1 }
+            if ascii {
+                var out = [UInt8](); out.reserveCapacity(str.count)
+                for j in 0..<str.count {
+                    let c = b[j]
+                    out.append(c >= 0x61 && c <= 0x7a ? c - 0x20 : c)
+                }
+                return JeffJSValue.makeString(JeffJSString(refCount: 1, len: str.count, isWideChar: false, storage: .str8(out)))
+            }
         }
-        let swiftStr = String(utf16CodeUnits: str, count: str.count)
-        let upper = swiftStr.uppercased()
-        return ctx.newStringFromUTF16(Array(upper.utf16))
+        var units = [UInt16](); units.reserveCapacity(str.count)
+        for i in 0..<str.count { units.append(str[i]) }
+        let swiftStr = String(utf16CodeUnits: units, count: units.count)
+        return ctx.newStringFromUTF16(Array(swiftStr.uppercased().utf16))
     }
 
     /// `String.prototype.toLocaleLowerCase([locale])`
@@ -1305,39 +1388,27 @@ struct JeffJSBuiltinString {
 
     /// `String.prototype.trim()`
     static func trim(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard let str = requireThisString(ctx: ctx, this: this, method: "trim") else {
-            return .exception
-        }
+        guard let str = requireThisUnits(ctx: ctx, this: this, method: "trim") else { return .exception }
         let start = findTrimStart(str)
         let end = findTrimEnd(str)
-        if start > end {
-            return ctx.newStringValue("")
-        }
-        return makeString(ctx: ctx, utf16: Array(str[start...end]))
+        if start > end { return ctx.newStringValue("") }
+        return str.slice(start, end + 1)
     }
 
     /// `String.prototype.trimStart()`
     static func trimStart(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard let str = requireThisString(ctx: ctx, this: this, method: "trimStart") else {
-            return .exception
-        }
+        guard let str = requireThisUnits(ctx: ctx, this: this, method: "trimStart") else { return .exception }
         let start = findTrimStart(str)
-        if start >= str.count {
-            return ctx.newStringValue("")
-        }
-        return makeString(ctx: ctx, utf16: Array(str[start...]))
+        if start >= str.count { return ctx.newStringValue("") }
+        return str.slice(start, str.count)
     }
 
     /// `String.prototype.trimEnd()`
     static func trimEnd(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard let str = requireThisString(ctx: ctx, this: this, method: "trimEnd") else {
-            return .exception
-        }
+        guard let str = requireThisUnits(ctx: ctx, this: this, method: "trimEnd") else { return .exception }
         let end = findTrimEnd(str)
-        if end < 0 {
-            return ctx.newStringValue("")
-        }
-        return makeString(ctx: ctx, utf16: Array(str[...end]))
+        if end < 0 { return ctx.newStringValue("") }
+        return str.slice(0, end + 1)
     }
 
     /// Helper: find the index of the first non-whitespace character.
