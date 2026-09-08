@@ -311,15 +311,16 @@ extension JeffJSContext {
             return JeffJSInterpreter.callInternal(ctx: self, funcObj: funcVal,
                                                   thisVal: thisVal, args: args)
         }
+        // C function path (mirrored fields: no payload copy per call). Checked
+        // before the bound-function match below, which copies the payload.
+        if let cf = obj.cFuncFast {
+            return JeffJSContext.dispatchCFunction(self, cf, thisVal, args, obj.cMagicFast)
+        }
         // Bound function path: unwrap and recurse with bound this/args
         if case .boundFunction(let bound) = obj.payload {
             var fullArgs = bound.argv
             fullArgs.append(contentsOf: args)
             return callFunction(bound.funcObj, thisVal: bound.thisVal, args: fullArgs)   // [[BoundThis]] as is
-        }
-        // C function path (mirrored fields: no payload copy per call)
-        if let cf = obj.cFuncFast {
-            return JeffJSContext.dispatchCFunction(self, cf, thisVal, args, obj.cMagicFast)
         }
         if case .cFunc(_, let cFunction, _, _, let magic) = obj.payload {
             switch cFunction {

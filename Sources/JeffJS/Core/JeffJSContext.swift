@@ -580,15 +580,24 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         if obj.isException { return obj }
 
         // Initialize the fast-array payload so setArrayElement works
-        if let jsObj = obj.toObject() {
-            jsObj.payload = .array(size: 0, values: [], count: 0)
-            jsObj.fastArray = true
-        }
+        guard let jsObj = obj.toObject() else { return obj }
+        jsObj.payload = .array(size: 0, values: [], count: 0)
+        jsObj.fastArray = true
 
-        // Set initial length to 0: writable, not enumerable, not configurable
-        // (it showed up in Object.keys/entries and for-in before).
+        // `length` (writable, not enumerable, not configurable) lives in slot
+        // 0 of the shared array shape; on it already, just fill the slot.
+        // Defining it per array cost a transition lookup for every literal.
+        if let cached = arrayShape, jsObj.shape === cached, jsObj.propValues.count == 0 {
+            jsObj.appendDataValue(.newInt32(0))
+            return obj
+        }
         let lengthAtom = JeffJSAtomID.JS_ATOM_length.rawValue
         _ = defineProperty(obj: obj, atom: lengthAtom, value: .newInt32(0), flags: JS_PROP_WRITABLE)
+        if arrayShape == nil, let sh = jsObj.shape, sh.isHashed, sh.propCount == 1,
+           jsObj.propValues.count == 1 {
+            sh.refCount += 1   // the context keeps it alive
+            arrayShape = sh
+        }
         return obj
     }
 
@@ -626,9 +635,11 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             }
         }
 
-        // Set shape (use arrayShape for arrays, cached empty shape for others)
-        if classID == JSClassID.JS_CLASS_ARRAY.rawValue {
-            obj.shape = arrayShape
+        // Arrays go straight onto the shared shape that already holds
+        // `length` (captured by newArray from the first array built).
+        if classID == JSClassID.JS_CLASS_ARRAY.rawValue, let cached = arrayShape {
+            cached.refCount += 1
+            obj.shape = cached
         }
 
         // Ensure shape exists — use zero-alloc initial shape (no pre-allocated arrays)

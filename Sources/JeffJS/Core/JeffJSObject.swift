@@ -1529,6 +1529,10 @@ extension JeffJSObject {
 
     /// Quick check: is this object callable?
     var isCallable: Bool {
+        // The mirrored fields answer for bytecode and C functions without
+        // copying the payload enum (which retains its associated values):
+        // this ran on every native call.
+        if fbFast != nil || cFuncFast != nil { return true }
         switch payload {
         case .bytecodeFunc, .cFunc, .boundFunction:
             return true
