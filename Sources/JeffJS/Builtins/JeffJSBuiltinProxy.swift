@@ -541,8 +541,9 @@ func js_proxy_apply(_ ctx: JeffJSContext,
     }
 
     // Call trap(target, thisArg, argumentsList).
-    let argArray = ctx.newArrayFrom(argv)
+    let argArray = ctx.newArrayFrom(argv.map { $0.dupValue() })   // the array owns its elements
     let result = ctx.callFunction(trap, thisVal: pd.handler, args: [pd.target, thisArg, argArray])
+    argArray.freeValue()
     return result
 }
 
@@ -564,8 +565,9 @@ func js_proxy_construct(_ ctx: JeffJSContext,
     }
 
     // Call trap(target, argumentsList, newTarget).
-    let argArray = ctx.newArrayFrom(argv)
+    let argArray = ctx.newArrayFrom(argv.map { $0.dupValue() })   // the array owns its elements
     let result = ctx.callFunction(trap, thisVal: pd.handler, args: [pd.target, argArray, newTarget])
+    argArray.freeValue()
     if result.isException { return result }
 
     // Invariant: result must be an object.

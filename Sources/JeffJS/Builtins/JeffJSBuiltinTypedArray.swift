@@ -761,7 +761,7 @@ func jsTypedArray_fill(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Je
         info.writeElement(&data, offset: ta.byteOffset + i * info.bytesPerElement, value: fillVal)
     }
     ab.data = data
-    return thisVal
+    return thisVal.dupValue()   // the caller releases this argument; the result is a new reference
 }
 
 /// %TypedArray%.prototype.copyWithin(target, start [, end])
@@ -791,7 +791,7 @@ func jsTypedArray_copyWithin(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ arg
     let temp = Array(data[srcByteOff..<(srcByteOff + byteCount)])
     data.replaceSubrange(dstByteOff..<(dstByteOff + byteCount), with: temp)
     ab.data = data
-    return thisVal
+    return thisVal.dupValue()   // the caller releases this argument; the result is a new reference
 }
 
 /// %TypedArray%.prototype.reverse()
@@ -815,7 +815,7 @@ func jsTypedArray_reverse(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: 
         lo += 1; hi -= 1
     }
     ab.data = data
-    return thisVal
+    return thisVal.dupValue()   // the caller releases this argument; the result is a new reference
 }
 
 /// %TypedArray%.prototype.indexOf(searchElement [, fromIndex])

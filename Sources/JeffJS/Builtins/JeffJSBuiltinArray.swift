@@ -142,7 +142,7 @@ struct JeffJSBuiltinArray {
 
         // Multiple arguments or single non-numeric: Array(element0, element1, ...)
         for i in 0..<args.count {
-            ctx.setPropertyByIndex(obj: arr, index: UInt32(i), value: args[i])
+            ctx.setPropertyByIndex(obj: arr, index: UInt32(i), value: args[i].dupValue())   // the setter takes ownership; args are borrowed
         }
 
         ctx.setArrayLength(arr, Int64(args.count))
@@ -232,6 +232,7 @@ struct JeffJSBuiltinArray {
         // Array-like fallback
         let arrayLike = ctx.toObject(items)
         if arrayLike.isException { return arrayLike }
+        defer { ctx.freeValue(arrayLike) }
 
         let lenAtom = ctx.rt.findAtom("length")
         let lenVal = ctx.getProperty(obj: arrayLike, atom: lenAtom)
@@ -287,7 +288,7 @@ struct JeffJSBuiltinArray {
         }
 
         for i in 0..<len {
-            ctx.setPropertyByIndex(obj: arr, index: UInt32(i), value: args[i])
+            ctx.setPropertyByIndex(obj: arr, index: UInt32(i), value: args[i].dupValue())   // the setter takes ownership; args are borrowed
         }
 
         ctx.setArrayLength(arr, Int64(len))
@@ -298,7 +299,7 @@ struct JeffJSBuiltinArray {
     /// `get Array[Symbol.species]`
     /// Returns the Array constructor.
     static func speciesGetter(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        return this
+        return this.dupValue()   // the caller releases this argument; the result is a new reference
     }
 
     // MARK: - Array.prototype mutation methods
@@ -308,6 +309,7 @@ struct JeffJSBuiltinArray {
     static func push(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         var len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -318,7 +320,7 @@ struct JeffJSBuiltinArray {
         }
 
         for i in 0..<args.count {
-            ctx.setPropertyByIndex(obj: obj, index: UInt32(len), value: args[i])
+            ctx.setPropertyByIndex(obj: obj, index: UInt32(len), value: args[i].dupValue())   // the setter takes ownership; args are borrowed
             len += 1
         }
 
@@ -332,6 +334,7 @@ struct JeffJSBuiltinArray {
     static func pop(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         var len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -357,6 +360,7 @@ struct JeffJSBuiltinArray {
     static func shift(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         var len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -397,6 +401,7 @@ struct JeffJSBuiltinArray {
     static func unshift(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         var len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -427,7 +432,7 @@ struct JeffJSBuiltinArray {
 
             // Insert new elements at the beginning
             for i in 0..<args.count {
-                ctx.setPropertyByIndex(obj: obj, index: UInt32(i), value: args[i])
+                ctx.setPropertyByIndex(obj: obj, index: UInt32(i), value: args[i].dupValue())   // the setter takes ownership; args are borrowed
             }
 
             len += argCount
@@ -444,6 +449,7 @@ struct JeffJSBuiltinArray {
     static func splice(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -546,7 +552,7 @@ struct JeffJSBuiltinArray {
 
         // Insert new items
         for i in 0..<Int(itemCount) {
-            ctx.setPropertyByIndex(obj: obj, index: UInt32(actualStart + Int64(i)), value: args[i + 2])
+            ctx.setPropertyByIndex(obj: obj, index: UInt32(actualStart + Int64(i)), value: args[i + 2].dupValue())
         }
 
         let newLen = len - actualDeleteCount + itemCount
@@ -567,10 +573,11 @@ struct JeffJSBuiltinArray {
 
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
-        if len <= 1 { return obj }
+        if len <= 1 { return obj.dupValue() }
 
         // Collect elements into a Swift array, handling holes
         var elements: [(index: Int64, value: JeffJSValue)] = []
@@ -645,7 +652,7 @@ struct JeffJSBuiltinArray {
             writeIdx += 1
         }
 
-        return obj
+        return obj.dupValue()
     }
 
     /// `Array.prototype.reverse()`
@@ -653,6 +660,7 @@ struct JeffJSBuiltinArray {
     static func reverse(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -690,7 +698,7 @@ struct JeffJSBuiltinArray {
             lower += 1
         }
 
-        return obj
+        return obj.dupValue()
     }
 
     /// `Array.prototype.fill(value, start?, end?)`
@@ -698,6 +706,7 @@ struct JeffJSBuiltinArray {
     static func fill(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -716,7 +725,7 @@ struct JeffJSBuiltinArray {
             i += 1
         }
 
-        return obj
+        return obj.dupValue()
     }
 
     /// `Array.prototype.copyWithin(target, start, end?)`
@@ -724,6 +733,7 @@ struct JeffJSBuiltinArray {
     static func copyWithin(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -738,7 +748,7 @@ struct JeffJSBuiltinArray {
         if final_ < -1 { return .exception }
 
         var count = min(final_ - from, len - to)
-        if count <= 0 { return obj }
+        if count <= 0 { return obj.dupValue() }
 
         // Determine copy direction to handle overlapping regions
         let direction: Int64
@@ -766,7 +776,7 @@ struct JeffJSBuiltinArray {
             count -= 1
         }
 
-        return obj
+        return obj.dupValue()
     }
 
     // MARK: - Array.prototype non-mutating methods
@@ -780,6 +790,7 @@ struct JeffJSBuiltinArray {
         let thisOrEmpty: JeffJSValue = (this.isNull || this.isUndefined) ? ctx.newArray() : this
         let obj = ctx.toObject(thisOrEmpty)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let result = arraySpeciesCreate(ctx: ctx, obj: obj, length: 0)
         if result.isException { return result }
@@ -813,7 +824,7 @@ struct JeffJSBuiltinArray {
                 if n >= MAX_SAFE_INTEGER {
                     return ctx.throwTypeError(message: "Array.prototype.concat: array length overflow")
                 }
-                ctx.setPropertyByIndex(obj: result, index: UInt32(n), value: item)
+                ctx.setPropertyByIndex(obj: result, index: UInt32(n), value: item.dupValue())   // args are borrowed
                 n += 1
             }
         }
@@ -828,6 +839,7 @@ struct JeffJSBuiltinArray {
     static func join(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -865,6 +877,7 @@ struct JeffJSBuiltinArray {
     static func slice(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -904,6 +917,7 @@ struct JeffJSBuiltinArray {
     static func indexOf(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -944,6 +958,7 @@ struct JeffJSBuiltinArray {
     static func lastIndexOf(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -987,6 +1002,7 @@ struct JeffJSBuiltinArray {
     static func includes(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1026,6 +1042,7 @@ struct JeffJSBuiltinArray {
     static func flat(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1055,6 +1072,7 @@ struct JeffJSBuiltinArray {
     static func flatMap(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1084,6 +1102,7 @@ struct JeffJSBuiltinArray {
     static func forEach(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1094,7 +1113,7 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        let isBytecode = jeffJS_isPlainBytecodeCallee(callbackFn)
+        let isBytecode = !jeffJS_calleeTakesArgs(callbackFn)   // true: this caller releases the pinned element
         var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
         var cursor = ElementCursor(obj: obj, len: len)
@@ -1113,6 +1132,7 @@ struct JeffJSBuiltinArray {
     static func map(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1123,7 +1143,7 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        let isBytecode = jeffJS_isPlainBytecodeCallee(callbackFn)
+        let isBytecode = !jeffJS_calleeTakesArgs(callbackFn)   // true: this caller releases the pinned element
         var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
         let result = arraySpeciesCreate(ctx: ctx, obj: obj, length: len)
@@ -1177,6 +1197,7 @@ struct JeffJSBuiltinArray {
     static func filter(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1187,7 +1208,7 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        let isBytecode = jeffJS_isPlainBytecodeCallee(callbackFn)
+        let isBytecode = !jeffJS_calleeTakesArgs(callbackFn)   // true: this caller releases the pinned element
         var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
         let result = arraySpeciesCreate(ctx: ctx, obj: obj, length: 0)
@@ -1232,6 +1253,7 @@ struct JeffJSBuiltinArray {
     static func every(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1242,7 +1264,7 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        let isBytecode = jeffJS_isPlainBytecodeCallee(callbackFn)
+        let isBytecode = !jeffJS_calleeTakesArgs(callbackFn)   // true: this caller releases the pinned element
         var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
         var cursor = ElementCursor(obj: obj, len: len)
@@ -1263,6 +1285,7 @@ struct JeffJSBuiltinArray {
     static func some(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1273,7 +1296,7 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        let isBytecode = jeffJS_isPlainBytecodeCallee(callbackFn)
+        let isBytecode = !jeffJS_calleeTakesArgs(callbackFn)   // true: this caller releases the pinned element
         var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
         var cursor = ElementCursor(obj: obj, len: len)
@@ -1294,6 +1317,7 @@ struct JeffJSBuiltinArray {
     static func find(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1304,7 +1328,7 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        let isBytecode = jeffJS_isPlainBytecodeCallee(callbackFn)
+        let isBytecode = !jeffJS_calleeTakesArgs(callbackFn)   // true: this caller releases the pinned element
         var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
         // find visits holes as undefined rather than skipping them.
@@ -1327,6 +1351,7 @@ struct JeffJSBuiltinArray {
     static func findIndex(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1337,7 +1362,7 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        let isBytecode = jeffJS_isPlainBytecodeCallee(callbackFn)
+        let isBytecode = !jeffJS_calleeTakesArgs(callbackFn)   // true: this caller releases the pinned element
         var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
         var cursor = ElementCursor(obj: obj, len: len, visitHoles: true)
@@ -1358,6 +1383,7 @@ struct JeffJSBuiltinArray {
     static func findLast(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1391,6 +1417,7 @@ struct JeffJSBuiltinArray {
     static func findLastIndex(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1426,6 +1453,7 @@ struct JeffJSBuiltinArray {
     static func reduce(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1434,7 +1462,7 @@ struct JeffJSBuiltinArray {
         if !ctx.isCallable(callbackFn) {
             return ctx.throwTypeError(message: "Array.prototype.reduce: callback is not a function")
         }
-        let isBytecode = jeffJS_isPlainBytecodeCallee(callbackFn)
+        let isBytecode = !jeffJS_calleeTakesArgs(callbackFn)   // true: this caller releases the pinned element
 
         var cursor = ElementCursor(obj: obj, len: len)
         // The accumulator is borrowed while it is still the caller's initial
@@ -1476,6 +1504,7 @@ struct JeffJSBuiltinArray {
     static func reduceRight(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1533,6 +1562,7 @@ struct JeffJSBuiltinArray {
     static func toReversed(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1562,6 +1592,7 @@ struct JeffJSBuiltinArray {
 
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1588,6 +1619,7 @@ struct JeffJSBuiltinArray {
     static func toSpliced(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1640,7 +1672,7 @@ struct JeffJSBuiltinArray {
 
         // Insert new items
         for j in 0..<Int(insertCount) {
-            ctx.setPropertyByIndex(obj: result, index: UInt32(i), value: args[j + 2])
+            ctx.setPropertyByIndex(obj: result, index: UInt32(i), value: args[j + 2].dupValue())
             i += 1
         }
 
@@ -1664,6 +1696,7 @@ struct JeffJSBuiltinArray {
     static func with_(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1707,6 +1740,7 @@ struct JeffJSBuiltinArray {
     static func at(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1736,6 +1770,7 @@ struct JeffJSBuiltinArray {
     static func toString(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let joinAtom = ctx.rt.findAtom("join")
         let joinFn = ctx.getProperty(obj: obj, atom: joinAtom)
@@ -1754,6 +1789,7 @@ struct JeffJSBuiltinArray {
     static func toLocaleString(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let len = getLength(ctx: ctx, obj: obj)
         if len < 0 { return .exception }
@@ -1796,8 +1832,9 @@ struct JeffJSBuiltinArray {
     static func keys(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
-        return ctx.createArrayIterator(obj: obj, kind: JeffJSArrayIteratorKind.key.rawValue)
+        return ctx.createArrayIterator(obj: obj.dupValue(), kind: JeffJSArrayIteratorKind.key.rawValue)
     }
 
     /// `Array.prototype.values()` / `Array.prototype[Symbol.iterator]()`
@@ -1805,8 +1842,9 @@ struct JeffJSBuiltinArray {
     static func values(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
-        return ctx.createArrayIterator(obj: obj, kind: JeffJSArrayIteratorKind.value.rawValue)
+        return ctx.createArrayIterator(obj: obj.dupValue(), kind: JeffJSArrayIteratorKind.value.rawValue)
     }
 
     /// `Array.prototype.entries()`
@@ -1814,8 +1852,9 @@ struct JeffJSBuiltinArray {
     static func entries(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
-        return ctx.createArrayIterator(obj: obj, kind: JeffJSArrayIteratorKind.keyAndValue.rawValue)
+        return ctx.createArrayIterator(obj: obj.dupValue(), kind: JeffJSArrayIteratorKind.keyAndValue.rawValue)
     }
 
 
@@ -1965,13 +2004,17 @@ struct JeffJSBuiltinArray {
 
         let ctorAtom = ctx.rt.findAtom("constructor")
         let ctor = ctx.getProperty(obj: obj, atom: ctorAtom)
+        ctx.rt.freeAtom(ctorAtom)
         if ctor.isException { return ctor }
+        defer { ctor.freeValue() }
 
         if ctor.isObject {
             // Check @@species
             let speciesAtom = ctx.rt.findAtom("Symbol.species")
             let species = ctx.getProperty(obj: ctor, atom: speciesAtom)
+            ctx.rt.freeAtom(speciesAtom)
             if species.isException { return species }
+            defer { species.freeValue() }
 
             if species.isNullOrUndefined {
                 return ctx.newArrayWithLength(Int(length))

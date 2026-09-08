@@ -756,13 +756,17 @@ struct JeffJSBuiltinPromise {
     /// Registers a handler that is called when the promise settles (regardless of outcome).
     static func finally_(ctx: JeffJSContext, this: JeffJSValue,
                          args: [JeffJSValue]) -> JeffJSValue {
-        let onFinally = args.count >= 1 ? args[0] : JeffJSValue.undefined
+        let onFinallyArg = args.count >= 1 ? args[0] : JeffJSValue.undefined
 
-        if !ctx.isFunction(onFinally) {
+        if !ctx.isFunction(onFinallyArg) {
             // If onFinally is not callable, pass through
             return then(ctx: ctx, this: this,
-                        args: [onFinally, onFinally])
+                        args: [onFinallyArg, onFinallyArg])
         }
+        // The callback is borrowed from the caller, which releases it after
+        // this call; the two reactions below outlive it, so they share one
+        // retained reference released when the last reaction is dropped.
+        let onFinallyRef = JeffJSRetainedValue(onFinallyArg)
 
         // Get the constructor
         let ctor = ctx.getPropertyStr(obj: this, name: "constructor")
@@ -772,6 +776,7 @@ struct JeffJSBuiltinPromise {
         // Create then-finally callback: value => { onFinally(); return value; }
         let thenFinally = ctx.newCFunction(name: "thenFinally", length: 1) { c, _, innerArgs in
             let value = innerArgs.count >= 1 ? innerArgs[0] : JeffJSValue.undefined
+            let onFinally = onFinallyRef.value
             let callResult = c.callFunction(func_: onFinally, this: .undefined, args: [])
             if callResult.isException { return callResult }
             c.freeValue(callResult)
@@ -794,6 +799,7 @@ struct JeffJSBuiltinPromise {
         // Create catch-finally callback: reason => { onFinally(); throw reason; }
         let catchFinally = ctx.newCFunction(name: "catchFinally", length: 1) { c, _, innerArgs in
             let reason = innerArgs.count >= 1 ? innerArgs[0] : JeffJSValue.undefined
+            let onFinally = onFinallyRef.value
             let callResult = c.callFunction(func_: onFinally, this: .undefined, args: [])
             if callResult.isException { return callResult }
             c.freeValue(callResult)
@@ -1487,3 +1493,13 @@ struct JeffJSBuiltinPromise {
 
 // getException() is defined in JeffJSContext.swift.
 // This file uses it from there to avoid duplicate declarations.
+
+
+/// A JS value retained for the lifetime of the Swift closures that capture
+/// it (native callbacks stored in C function objects); released once, when
+/// the last closure is dropped.
+final class JeffJSRetainedValue {
+    let value: JeffJSValue
+    init(_ v: JeffJSValue) { value = v.dupValue() }
+    deinit { if JeffJSGCObjectHeader.activeRuntime != nil { value.freeValue() } }
+}

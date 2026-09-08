@@ -55,7 +55,7 @@ enum JeffJSZombieDebug {
         guard reportsRemaining > 0 else { return }
         reportsRemaining -= 1
         let classID = (hdr as? JeffJSObject)?.classID ?? -1
-        print("[ZOMBIE-\(kind)] touch on freed object classID=\(classID) rc=\(hdr.refCount) type=\(hdr.gcObjType)")
+        print("[ZOMBIE-\(kind)] touch on freed object classID=\(classID) rc=\(hdr.refCount) type=\(hdr.gcObjType) ptr=\(Unmanaged.passUnretained(hdr).toOpaque())")
         for sym in Thread.callStackSymbols.prefix(14) {
             print("    \(sym)")
         }

@@ -47,7 +47,11 @@ func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
         o.mark = JeffJSGCMark.white
         o.weakrefCount = 0
         o.needsLazyPrototype = false
-        if o.arrowThisVal != nil { o.arrowThisVal = nil }
+        if let capturedThis = o.arrowThisVal {
+            // The closure owns its captured `this` (dup'd at creation); frames borrow it.
+            o.arrowThisVal = nil
+            capturedThis.freeValue()
+        }
         if o.storedCFunction != nil { o.storedCFunction = nil; o.storedCFunctionLength = 0 }
         if !o.varRefsFast.isEmpty { o.varRefsFast = [] }
         o.payload = .opaque(nil)

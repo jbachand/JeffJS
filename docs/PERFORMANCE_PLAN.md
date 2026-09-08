@@ -675,3 +675,68 @@ kernel); the regex VM allocated per exec; proxies (8x); getters/setters
 (7x, the accessor call path); and the structural items from Round 8:
 `callInternal` self time, retain/release around it, and the payload-enum
 copies still visible in every profile.
+
+## Round 9 — argument ownership (leak fixes, perf-neutral)
+
+Measured with `JEFFJS_TRACK_RC=1` (objects still alive at runtime teardown)
+and `JEFFJS_ZOMBIES=1` (touches on freed objects, now printed with the
+object pointer so free/dup traces can be matched). Real-world suite geomean
+0.99x of Round 8c (noise), re-render 26.2 -> 26.4 ms, React page RSS
+82 -> 71 MB. 1712/1712 conformance and the full suite pass under zombies.
+
+- **One argument convention.** Every callee borrows its arguments and the
+  caller releases them after the call — bytecode, C builtins, bound
+  functions and proxies alike; generators and async functions are the one
+  exception (they move the arguments into their saved state, see
+  `jeffJS_calleeTakesArgs`). Before, only plain bytecode callees were
+  released after, so every temporary passed to a native function leaked
+  (`arr.map(x => ...)` kept 100k closures alive, `new Map()` leaked per
+  call; `arr_map` 80 -> 18 MB). Builtins that keep an argument, return one,
+  or return `this` now `dupValue()` it (Array ctor/of/push/unshift/concat/
+  splice/toSpliced, Object.__defineGetter__/Setter__, iterator results,
+  Reflect helpers, 18 `return this/arg` sites); `Promise.prototype.finally`
+  retains its callback through `JeffJSRetainedValue`; generator objects own
+  their `this` and function.
+- **The trace interpreter's native fast paths never released arguments** —
+  `call`/`call_method` freed the callee and `this` slots after
+  `dispatchCFunction` and left the arg slots alone, so every argument to a
+  builtin from a hot loop leaked under the old convention too
+  (`JSON.stringify(o)`, `Reflect.get(o, k)`, `Object.is(o, o)` each pinned
+  their arguments for the life of the runtime).
+- **`ctx.toObject()` results are owned and were never released** in 62
+  builtins (`Array.prototype.*`, `Object.keys/values/entries/assign/...`,
+  `String.raw`): `[1,2,3].indexOf(2)`, `({}).hasOwnProperty()`,
+  `Object.assign({}, src)` each leaked their receiver (`Object.assign` loop
+  124 -> 18 MB). They now `defer { freeValue(obj) }` and dup on
+  `return obj`; array iterators dup the target they store; `keysArr`/key
+  strings in values/entries/assign/defineProperties are released.
+- **Arrow functions.** Frames borrow the closure's captured `this` instead
+  of dup'ing it on every call (the frame never released it, so each arrow
+  call pinned `this`), the closure's own retain is released at teardown
+  (pool recycle, freeObject, GC free), and the captured `this` is a real GC
+  edge — the CPU mark and the Metal graph builder both see it (the Metal
+  path now delegates to `markChildren` instead of a partial copy that had
+  no payload edges at all).
+- **Prototypes installed from borrowed arguments get a JS retain**
+  (`Object.create`, `setPrototypeOf`, `newObjectProto`), and constructors
+  release the pre-created `this` when a C or bytecode constructor returns
+  its own object.
+
+Found, not fixed:
+- **Cycles are never collected during a run.** A self-referencing object
+  held only through a `WeakRef` survives 200k further allocations on both
+  GC paths, even with `JEFFJS_GC_MALLOCTHRESHOLD=1` (QuickJS reclaims it).
+  Reference counting frees everything acyclic, but React-style trees
+  (parent <-> child, instance <-> arrow handler) only go away with the
+  runtime. This is pre-existing and the next memory item.
+- `Reflect.construct(F, args, newTarget)` ignores `newTarget` (uses
+  `callConstructor(_:args:)`, `callConstructor(_:newTarget:args:)` exists)
+  and a script mixing it with `Object.create`/`setPrototypeOf` reports two
+  zombies on the pre-session build as well.
+- `EngineTests/testSuspectGroups` traps in `findHashedShapeProto` (shape
+  table already torn down) when ErrorHandling runs after
+  ES262CriticalSubset — identical on the pre-session commit; the test is
+  the teardown investigation itself.
+- `Object.assign` +6% and `bind-call-apply` +15% from the extra
+  release work; `closure-creation` is unchanged once the zombie
+  instrumentation is off.

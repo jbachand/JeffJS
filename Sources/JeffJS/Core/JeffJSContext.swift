@@ -709,6 +709,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         let obj = JeffJSObject()
         obj.classID = JSClassID.JS_CLASS_OBJECT.rawValue
         let protoObj = proto.isObject ? proto.toObject() : nil
+        if protoObj != nil { _ = proto.dupValue() }   // the object keeps its prototype alive
         obj.shape = jeffJS_rootShape(self, proto: protoObj)
         obj.proto = protoObj
         obj.extensible = true
@@ -3322,7 +3323,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             let arg = args[0]
             // Already a BigInt: return as-is
             if arg.isBigInt || arg.isShortBigInt {
-                return arg
+                return arg.dupValue()   // the caller releases this argument; the result is a new reference
             }
             // Number -> BigInt (must be an integer)
             if arg.isInt {

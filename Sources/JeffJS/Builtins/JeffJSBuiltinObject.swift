@@ -68,6 +68,7 @@ extension JeffJSContext {
     func setPrototypeOf(_ obj: JeffJSValue, proto: JeffJSValue) -> Bool {
         guard let jsObj = obj.toObject() else { return false }
         if jsObj.shape == nil { jsObj.shape = JeffJSShape() }
+        if let p = proto.toObject(), p !== jsObj.proto { _ = proto.dupValue() }   // the object keeps its prototype alive
         jsObj.proto = proto.toObject()
         return true
     }
@@ -579,6 +580,7 @@ struct JeffJSBuiltinObject {
             return ctx.throwTypeError("Object prototype may only be an Object or null")
         }
 
+        if proto.isObject { _ = proto.dupValue() }   // the new object keeps its prototype alive
         let obj = ctx.newObjectWithProto(proto)
         if obj.isException { return obj }
 
@@ -598,6 +600,7 @@ struct JeffJSBuiltinObject {
         // ES2015: ToObject conversion for non-objects
         let obj = ctx.toObject(arg)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         return ctx.getPrototypeOf(obj)
     }
@@ -620,7 +623,7 @@ struct JeffJSBuiltinObject {
 
         // If obj is not an object (it is a primitive), return it unchanged (no-op per spec)
         if !obj.isObject {
-            return obj
+            return obj.dupValue()   // the caller releases this argument; the result is a new reference
         }
 
         let success = ctx.setPrototypeOf(obj, proto: proto)
@@ -628,7 +631,7 @@ struct JeffJSBuiltinObject {
             return ctx.throwTypeError("Cyclic __proto__ value")
         }
 
-        return obj
+        return obj.dupValue()   // the caller releases this argument; the result is a new reference
     }
 
     /// `Object.defineProperty(obj, prop, descriptor)`
@@ -649,7 +652,7 @@ struct JeffJSBuiltinObject {
         let result = ctx.definePropertyFromDescriptor(obj, key: key, desc: desc)
         if result.isException { return result }
 
-        return obj
+        return obj.dupValue()   // the caller releases this argument; the result is a new reference
     }
 
     /// `Object.defineProperties(obj, props)`
@@ -665,7 +668,7 @@ struct JeffJSBuiltinObject {
         let result = objectDefineProperties(ctx: ctx, obj: obj, props: props)
         if result.isException { return result }
 
-        return obj
+        return obj.dupValue()   // the caller releases this argument; the result is a new reference
     }
 
     /// `Object.getOwnPropertyNames(obj)`
@@ -674,6 +677,7 @@ struct JeffJSBuiltinObject {
         let arg = args.count > 0 ? args[0] : .undefined
         let obj = ctx.toObject(arg)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         return ctx.getOwnPropertyNames(obj, flags: JS_GPN_STRING_MASK)
     }
@@ -684,6 +688,7 @@ struct JeffJSBuiltinObject {
         let arg = args.count > 0 ? args[0] : .undefined
         let obj = ctx.toObject(arg)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         return ctx.getOwnPropertyNames(obj, flags: JS_GPN_SYMBOL_MASK)
     }
@@ -696,6 +701,7 @@ struct JeffJSBuiltinObject {
 
         let obj = ctx.toObject(arg)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let key = ctx.toPropertyKey(prop)
         if key.isException { return key }
@@ -709,6 +715,7 @@ struct JeffJSBuiltinObject {
         let arg = args.count > 0 ? args[0] : .undefined
         let obj = ctx.toObject(arg)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         // Get all own property names (strings + symbols)
         let names = ctx.getOwnPropertyNames(obj, flags: JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK)
@@ -740,6 +747,7 @@ struct JeffJSBuiltinObject {
         let arg = args.count > 0 ? args[0] : .undefined
         let obj = ctx.toObject(arg)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         return ctx.getOwnPropertyNames(obj, flags: JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)
     }
@@ -750,9 +758,11 @@ struct JeffJSBuiltinObject {
         let arg = args.count > 0 ? args[0] : .undefined
         let obj = ctx.toObject(arg)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let keysArr = ctx.getOwnPropertyNames(obj, flags: JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)
         if keysArr.isException { return keysArr }
+        defer { ctx.freeValue(keysArr) }
 
         let result = ctx.newArray()
         if result.isException { return result }
@@ -761,6 +771,7 @@ struct JeffJSBuiltinObject {
         for i in 0..<len {
             let key = ctx.getPropertyByIndex(obj:keysArr, index: UInt32(i))
             if key.isException { return key }
+            defer { ctx.freeValue(key) }
 
             let val = ctx.getProperty(obj: obj, key: key)
             if val.isException { return val }
@@ -777,9 +788,11 @@ struct JeffJSBuiltinObject {
         let arg = args.count > 0 ? args[0] : .undefined
         let obj = ctx.toObject(arg)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let keysArr = ctx.getOwnPropertyNames(obj, flags: JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)
         if keysArr.isException { return keysArr }
+        defer { ctx.freeValue(keysArr) }
 
         let result = ctx.newArray()
         if result.isException { return result }
@@ -809,6 +822,7 @@ struct JeffJSBuiltinObject {
 
         let to = ctx.toObject(target)
         if to.isException { return to }
+        defer { ctx.freeValue(to) }
 
         // Iterate over each source
         for i in 1..<args.count {
@@ -819,14 +833,17 @@ struct JeffJSBuiltinObject {
 
             let source = ctx.toObject(nextSource)
             if source.isException { return source }
+            defer { ctx.freeValue(source) }
 
             let keysArr = ctx.getOwnPropertyNames(source, flags: JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK | JS_GPN_ENUM_ONLY)
             if keysArr.isException { return keysArr }
+            defer { ctx.freeValue(keysArr) }
 
             let len = ctx.getArrayLength(keysArr)
             for j in 0..<len {
                 let key = ctx.getPropertyByIndex(obj:keysArr, index: UInt32(j))
                 if key.isException { return key }
+                defer { ctx.freeValue(key) }
 
                 let val = ctx.getProperty(obj: source, key: key)
                 if val.isException { return val }
@@ -836,7 +853,7 @@ struct JeffJSBuiltinObject {
             }
         }
 
-        return to
+        return to.dupValue()
     }
 
     /// `Object.is(value1, value2)`
@@ -856,13 +873,13 @@ struct JeffJSBuiltinObject {
 
         // Per ES2015, non-objects are returned as-is
         if !arg.isObject {
-            return arg
+            return arg.dupValue()   // the caller releases this argument; the result is a new reference
         }
 
         let result = ctx.setIntegrityLevel(arg, level: .frozen)
         if result.isException { return result }
 
-        return arg
+        return arg.dupValue()   // the caller releases this argument; the result is a new reference
     }
 
     /// `Object.seal(obj)`
@@ -871,13 +888,13 @@ struct JeffJSBuiltinObject {
         let arg = args.count > 0 ? args[0] : .undefined
 
         if !arg.isObject {
-            return arg
+            return arg.dupValue()   // the caller releases this argument; the result is a new reference
         }
 
         let result = ctx.setIntegrityLevel(arg, level: .sealed)
         if result.isException { return result }
 
-        return arg
+        return arg.dupValue()   // the caller releases this argument; the result is a new reference
     }
 
     /// `Object.isFrozen(obj)`
@@ -922,13 +939,13 @@ struct JeffJSBuiltinObject {
         let arg = args.count > 0 ? args[0] : .undefined
 
         if !arg.isObject {
-            return arg
+            return arg.dupValue()   // the caller releases this argument; the result is a new reference
         }
 
         let result = ctx.preventExtensions(arg)
         if result.isException { return result }
 
-        return arg
+        return arg.dupValue()   // the caller releases this argument; the result is a new reference
     }
 
     /// `Object.fromEntries(iterable)`
@@ -1005,6 +1022,7 @@ struct JeffJSBuiltinObject {
 
         let o = ctx.toObject(obj)
         if o.isException { return o }
+        defer { ctx.freeValue(o) }
 
         let key = ctx.toPropertyKey(prop)
         if key.isException { return key }
@@ -1120,6 +1138,7 @@ struct JeffJSBuiltinObject {
 
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         // Check Symbol.toStringTag
         let tag = ctx.getProperty(obj: obj, atom: JSAtomID.Symbol_toStringTag)
@@ -1189,6 +1208,7 @@ struct JeffJSBuiltinObject {
 
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let key = ctx.toPropertyKey(prop)
         if key.isException { return key }
@@ -1211,6 +1231,7 @@ struct JeffJSBuiltinObject {
 
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         guard let thisObj = obj.toObject() else {
             return .JS_FALSE
@@ -1240,6 +1261,7 @@ struct JeffJSBuiltinObject {
 
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         let key = ctx.toPropertyKey(prop)
         if key.isException { return key }
@@ -1264,6 +1286,7 @@ struct JeffJSBuiltinObject {
     static func protoGetter(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         return ctx.getPrototypeOf(obj)
     }
@@ -1305,6 +1328,7 @@ struct JeffJSBuiltinObject {
 
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         if !ctx.isCallable(getter) {
             return ctx.throwTypeError("__defineGetter__: getter is not a function")
@@ -1316,7 +1340,7 @@ struct JeffJSBuiltinObject {
         // Build a descriptor: { get: getter, enumerable: true, configurable: true }
         let desc = ctx.newPlainObject()
         if desc.isException { return desc }
-        var ret = ctx.setProperty(obj: desc, atom: JSAtomID.get, value: getter)
+        var ret = ctx.setProperty(obj: desc, atom: JSAtomID.get, value: getter.dupValue())
         if ret < 0 { return .exception }
         ret = ctx.setProperty(obj: desc, atom: JSAtomID.enumerable, value: .JS_TRUE)
         if ret < 0 { return .exception }
@@ -1337,6 +1361,7 @@ struct JeffJSBuiltinObject {
 
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
+        defer { ctx.freeValue(obj) }
 
         if !ctx.isCallable(setter) {
             return ctx.throwTypeError("__defineSetter__: setter is not a function")
@@ -1348,7 +1373,7 @@ struct JeffJSBuiltinObject {
         // Build a descriptor: { set: setter, enumerable: true, configurable: true }
         let desc = ctx.newPlainObject()
         if desc.isException { return desc }
-        var ret = ctx.setProperty(obj: desc, atom: JSAtomID.set, value: setter)
+        var ret = ctx.setProperty(obj: desc, atom: JSAtomID.set, value: setter.dupValue())
         if ret < 0 { return .exception }
         ret = ctx.setProperty(obj: desc, atom: JSAtomID.enumerable, value: .JS_TRUE)
         if ret < 0 { return .exception }
@@ -1438,9 +1463,11 @@ struct JeffJSBuiltinObject {
     private static func objectDefineProperties(ctx: JeffJSContext, obj: JeffJSValue, props: JeffJSValue) -> JeffJSValue {
         let propsObj = ctx.toObject(props)
         if propsObj.isException { return propsObj }
+        defer { ctx.freeValue(propsObj) }
 
         let keysArr = ctx.getOwnPropertyNames(propsObj, flags: JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK | JS_GPN_ENUM_ONLY)
         if keysArr.isException { return keysArr }
+        defer { ctx.freeValue(keysArr) }
 
         // First pass: collect all descriptors (spec requires this before applying any)
         let len = ctx.getArrayLength(keysArr)

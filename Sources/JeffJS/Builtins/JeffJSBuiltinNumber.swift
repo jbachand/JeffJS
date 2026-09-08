@@ -243,7 +243,7 @@ struct JeffJSBuiltinNumber {
     /// and Number wrapper objects.  Mirrors QuickJS `thisNumberValue`.
     static func thisNumberValue(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
         if this.isInt || this.isFloat64 {
-            return this
+            return this.dupValue()   // the caller releases this argument; the result is a new reference
         }
         if this.isObject {
             if let obj = this.toObject(), obj.classID == JeffJSClassID.number.rawValue {
@@ -996,7 +996,7 @@ struct JeffJSBuiltinBoolean {
     /// and Boolean wrapper objects.
     static func thisBooleanValue(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
         if this.isBool {
-            return this
+            return this.dupValue()   // the caller releases this argument; the result is a new reference
         }
         if this.isObject {
             if let obj = this.toObject(), obj.classID == JeffJSClassID.boolean.rawValue {
@@ -1067,7 +1067,7 @@ struct JeffJSBuiltinBigInt {
     /// and BigInt wrapper objects.
     private static func thisBigIntValue(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
         if this.isBigInt || this.isShortBigInt {
-            return this
+            return this.dupValue()   // the caller releases this argument; the result is a new reference
         }
         if this.isObject {
             if this.toObject() != nil {

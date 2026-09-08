@@ -320,6 +320,7 @@ extension JeffJSContext {
         if case .boundFunction(let bound) = obj.payload {
             var fullArgs = bound.argv
             fullArgs.append(contentsOf: args)
+            if jeffJS_calleeTakesArgs(bound.funcObj) { fullArgs = fullArgs.map { $0.dupValue() } }
             return callFunction(bound.funcObj, thisVal: bound.thisVal, args: fullArgs)   // [[BoundThis]] as is
         }
         if case .cFunc(_, let cFunction, _, _, let magic) = obj.payload {
@@ -383,14 +384,17 @@ extension JeffJSContext {
             // to pc=0 (start of the generator body).
             let genData = JeffJSGeneratorData()
             genData.state = .suspended_start
+            // The generator outlives this call: it takes its own references to
+            // its function and `this` (both borrowed here), released when it
+            // completes or is dropped.
             genData.savedState = GeneratorSavedState(
                 pc: 0,
                 sp: 0,
                 stack: [],
                 varBuf: initVarBuf,
                 argBuf: initArgBuf,
-                funcObj: funcVal,
-                thisVal: thisVal,
+                funcObj: funcVal.dupValue(),
+                thisVal: thisVal.dupValue(),
                 isInitialYield: true)
             genObj.toObject()?.payload = .generatorData(genData)
 
@@ -522,6 +526,7 @@ extension JeffJSContext {
         if result.isException {
             genData.state = .completed
             genData.savedState = nil
+            saved.thisVal.freeValue(); saved.funcObj.freeValue()   // the frame consumed the rest
             return .exception
         }
 
@@ -532,6 +537,7 @@ extension JeffJSContext {
         if genData.state == .executing {
             genData.state = .completed
             genData.savedState = nil
+            saved.thisVal.freeValue(); saved.funcObj.freeValue()   // the frame consumed the rest
             let iterResult = JeffJSBuiltinIterator.createIterResult(ctx: self, val: result, done: true)
             result.freeValue()
             return iterResult
@@ -884,8 +890,13 @@ extension JeffJSContext {
                 // Some generic C functions can be called as constructors
                 let newObj = newObject()
                 let result = fn(self, newObj, args)
-                if result.isException { return .exception }
-                return result.isObject ? result : newObj
+                if result.isException { newObj.freeValue(); return .exception }
+                // A constructor that builds its own instance (Array, Map, ...)
+                // leaves the pre-created object unused: release it (it was
+                // leaked once per `new` before).
+                if result.isObject { newObj.freeValue(); return result }
+                result.freeValue()
+                return newObj
             default:
                 return throwTypeError(message: "not a constructor")
             }
@@ -917,18 +928,21 @@ extension JeffJSContext {
         let protoVal = getProperty(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue)
         let newObj: JeffJSValue
         if protoVal.isObject {
-            newObj = newObjectProto(proto: protoVal)
+            newObj = newObjectProto(proto: protoVal)   // takes its own reference to the prototype
         } else {
             // If .prototype is not an object, use Object.prototype
             newObj = newObject()
         }
+        protoVal.freeValue()
         // 2. Call the constructor with the new object as `this`
         let result = JeffJSInterpreter.callInternal(ctx: self, funcObj: funcVal,
                                                      thisVal: newObj, args: args,
                                                      flags: JS_CALL_FLAG_CONSTRUCTOR)
-        if result.isException { return .exception }
-        // 3. If the constructor explicitly returned an object, use it
-        if result.isObject { return result }
+        if result.isException { newObj.freeValue(); return .exception }
+        // 3. If the constructor explicitly returned an object, use it (and
+        //    release the pre-created one)
+        if result.isObject { newObj.freeValue(); return result }
+        result.freeValue()
         // 4. Otherwise return the newly created object
         return newObj
     }
@@ -1469,6 +1483,7 @@ extension JeffJSContext {
             return true
         }
         // obj.proto is the single source of truth; its setter auto-syncs shape.proto.
+        if let p = protoObj, p !== jsObj.proto { _ = proto.dupValue() }   // the object keeps its prototype alive
         jsObj.proto = protoObj
         return true
     }
@@ -2130,6 +2145,20 @@ func jeffJS_isPlainBytecodeCallee(_ v: JeffJSValue) -> Bool {
     return !fb.isGenerator && !fb.isAsyncFunc
 }
 
+/// Ownership of call arguments. Every callee borrows its arguments and the
+/// caller releases them after the call — bytecode, C builtins, bound
+/// functions and proxies alike; a builtin that keeps an argument takes its
+/// own reference with dupValue(). The one exception is a generator or async
+/// function, which moves the arguments into its saved state and releases
+/// them itself. (Callers used to release only after plain bytecode callees,
+/// so any argument a C builtin did not store was leaked: `a.map(x => ...)`
+/// leaked the arrow on every call.)
+@inline(__always)
+func jeffJS_calleeTakesArgs(_ v: JeffJSValue) -> Bool {
+    guard let o = v.obj, let fb = o.fbFast else { return false }
+    return fb.isGenerator || fb.isAsyncFunc
+}
+
 /// Filled once at runtime bootstrap (jeffJS_computeStoreOpcodeMask): a
 /// stored global is a plain load, a lazily-initialised `let` costs a
 /// swift_once-guarded addressor call on every isStoreOpcode.
@@ -2529,6 +2558,10 @@ private func executeFastTrace(
                 var ai = 0
                 while ai < argc { cargs.append(buf[calleeSlot + 1 + ai]); ai += 1 }
                 let r = JeffJSContext.dispatchCFunction(ctx, cf, .undefined, cargs, nObj.cMagicFast)
+                // Native callees borrow their arguments: release the arg slots
+                // here (the general path does the same after callInternal).
+                ai = 0
+                while ai < argc { buf[calleeSlot + 1 + ai].freeValueFast(); ai += 1 }
                 buf[calleeSlot].freeValueFast()
                 sp = calleeSlot
                 if r.isException { resume = -1; break traceLoop }
@@ -2569,7 +2602,7 @@ private func executeFastTrace(
                 newFrame.prevFrame = ctx.currentFrame
                 newFrame.curFunc = funcVal
                 if fastFb.isArrow, let arrowThis = callObj.arrowThisVal {
-                    newFrame.thisVal = arrowThis.dupValue()
+                    newFrame.thisVal = arrowThis
                 } else if !fastFb.isStrictMode && thisVal.isNullOrUndefined {
                     newFrame.thisVal = ctx.globalObj
                 } else {
@@ -2648,6 +2681,8 @@ private func executeFastTrace(
                 var ai = 0
                 while ai < argc { cargs.append(buf[calleeSlot + 1 + ai]); ai += 1 }
                 let r = JeffJSContext.dispatchCFunction(ctx, cf, buf[thisSlot], cargs, nObj.cMagicFast)
+                ai = 0
+                while ai < argc { buf[calleeSlot + 1 + ai].freeValueFast(); ai += 1 }
                 buf[calleeSlot].freeValueFast(); buf[thisSlot].freeValueFast()
                 sp = thisSlot
                 if r.isException { resume = -1; break traceLoop }
@@ -2688,7 +2723,7 @@ private func executeFastTrace(
                 newFrame.prevFrame = ctx.currentFrame
                 newFrame.curFunc = funcVal
                 if fastFb.isArrow, let arrowThis = callObj.arrowThisVal {
-                    newFrame.thisVal = arrowThis.dupValue()
+                    newFrame.thisVal = arrowThis
                 } else if !fastFb.isStrictMode && thisVal.isNullOrUndefined {
                     newFrame.thisVal = ctx.globalObj
                 } else {
@@ -2782,7 +2817,7 @@ private func executeFastTrace(
                 newFrame.prevFrame = ctx.currentFrame
                 newFrame.curFunc = funcVal
                 if fastFb.isArrow, let arrowThis = callObj.arrowThisVal {
-                    newFrame.thisVal = arrowThis.dupValue()
+                    newFrame.thisVal = arrowThis
                 } else if !fastFb.isStrictMode && thisVal.isNullOrUndefined {
                     newFrame.thisVal = ctx.globalObj
                 } else {
@@ -5859,6 +5894,7 @@ struct JeffJSInterpreter {
             if case .boundFunction(let bound) = obj.payload {
                 var fullArgs = bound.argv
                 fullArgs.append(contentsOf: args)
+                if jeffJS_calleeTakesArgs(bound.funcObj) { fullArgs = fullArgs.map { $0.dupValue() } }
                 return ctx.callFunction(bound.funcObj, thisVal: bound.thisVal, args: fullArgs)   // [[BoundThis]] as is
             }
             // Callable proxy: delegate to the proxy apply trap handler
@@ -5914,7 +5950,7 @@ struct JeffJSInterpreter {
         // Arrow functions use the lexical `this` captured at closure creation
         // time, overriding whatever the caller passed.
         if fb0.isArrow, let arrowThis = obj.arrowThisVal {
-            frame.thisVal = arrowThis.dupValue()
+            frame.thisVal = arrowThis
         }
         frame.argCount = args.count
         // No padding append: `buf` carries the undefined-padded arg slots, and
@@ -6040,7 +6076,7 @@ struct JeffJSInterpreter {
                     // Suspended at a plain `yield` of a sync generator: resume
                     // with [value, true] so the parser-emitted check after the
                     // yield runs the enclosing finally blocks and returns.
-                    buf[sp] = resumeValue; sp += 1
+                    buf[sp] = resumeValue.dupValue(); sp += 1   // next(v)'s caller releases v
                     buf[sp] = .newBool(true); sp += 1
                 } else if fb.isGenerator && !fb.isAsyncFunc && !saved.delegatedIter.isUndefined {
                     // Suspended inside a `yield*` delegation: forward the
@@ -6144,7 +6180,7 @@ struct JeffJSInterpreter {
                     }
                     if delegatedResult == nil { iter.freeValue() }   // delegation ended by the exception
                 } else if !saved.isInitialYield {
-                    buf[sp] = resumeValue
+                    buf[sp] = resumeValue.dupValue()   // next(v)'s caller releases v
                     sp += 1
                     if fb.isGenerator && !fb.isAsyncFunc && saved.pc >= 1 &&
                        bc[saved.pc - 1] == JeffJSOpcode.yield_.rawValue {
@@ -6810,7 +6846,7 @@ struct JeffJSInterpreter {
                         newFrame.prevFrame = ctx.currentFrame
                         newFrame.curFunc = e_funcVal
                         if e_fastFb.isArrow, let arrowThis = e_callObj.arrowThisVal {
-                            newFrame.thisVal = arrowThis.dupValue()
+                            newFrame.thisVal = arrowThis
                         } else if !e_fastFb.isStrictMode && e_thisVal.isNullOrUndefined {
                             // ES §10.2.1.2: sloppy callees see the global object.
                             newFrame.thisVal = ctx.globalObj
@@ -6922,7 +6958,7 @@ struct JeffJSInterpreter {
                         && frame.lastGetFieldPC >= 0 && pc == frame.lastGetFieldPC + 5
                     let slowThis = stashValid ? frame.lastGetFieldReceiver : JeffJSValue.undefined
                     let result: JeffJSValue
-                    var calleeIsBytecode = false
+                    let releasesArgs = !jeffJS_calleeTakesArgs(funcVal)
                     if let callObj = funcVal.obj,
                        let fastFb2 = callObj.fbFast, !fastFb2.isGenerator, !fastFb2.isAsyncFunc {
                         // fbFast avoids copying the payload enum per call;
@@ -6931,7 +6967,6 @@ struct JeffJSInterpreter {
                         // callInternal for plain bytecode functions).
                         result = JeffJSInterpreter.callInternal(ctx: ctx, funcObj: funcVal,
                                                                 thisVal: slowThis, args: callArgs, flags: 0)
-                        calleeIsBytecode = true
                     } else {
                         result = ctx.callFunction(funcVal, thisVal: slowThis, args: callArgs)
                     }
@@ -6939,11 +6974,10 @@ struct JeffJSInterpreter {
                     frame.lastGetFieldReceiver.freeValue()
                     frame.lastGetFieldReceiver = .undefined  // clear after use
                     frame.lastGetFieldPC = -1
-                    // The call borrows: release the popped callee, and the args
-                    // for bytecode callees (C functions may store an arg
-                    // without a dup; those keep the old leak for now).
+                    // The call borrows: release the popped callee and the args
+                    // (see jeffJS_calleeTakesArgs).
                     funcVal.freeValue()
-                    if calleeIsBytecode { for a in callArgs { a.freeValue() } }
+                    if releasesArgs { for a in callArgs { a.freeValue() } }
                     if result.isException {
                         retVal = .exception
                         break dispatchLoop
@@ -7070,7 +7104,7 @@ struct JeffJSInterpreter {
                         newFrame.prevFrame = ctx.currentFrame
                         newFrame.curFunc = e_funcVal
                         if e_fastFb.isArrow, let arrowThis = e_callObj.arrowThisVal {
-                            newFrame.thisVal = arrowThis.dupValue()
+                            newFrame.thisVal = arrowThis
                         } else if !e_fastFb.isStrictMode && e_thisVal.isNullOrUndefined {
                             // ES §10.2.1.2: sloppy callees see the global object.
                             newFrame.thisVal = ctx.globalObj
@@ -7173,18 +7207,16 @@ struct JeffJSInterpreter {
                 let cmFuncVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let cmThisObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let cmResult: JeffJSValue
-                var cmBytecode = false
+                let cmReleasesArgs = !jeffJS_calleeTakesArgs(cmFuncVal)
                 if let cmCallObj = cmFuncVal.obj,
-                   case .bytecodeFunc(let cmFbOpt2, _, _) = cmCallObj.payload,
-                   let cmFastFb2 = cmFbOpt2, !cmFastFb2.isGenerator, !cmFastFb2.isAsyncFunc {
+                   let cmFastFb2 = cmCallObj.fbFast, !cmFastFb2.isGenerator, !cmFastFb2.isAsyncFunc {
                     cmResult = JeffJSInterpreter.callInternal(ctx: ctx, funcObj: cmFuncVal,
                                                               thisVal: cmThisObj, args: cmArgs, flags: 0)
-                    cmBytecode = true
                 } else {
                     cmResult = ctx.callFunction(cmFuncVal, thisVal: cmThisObj, args: cmArgs)
                 }
                 cmFuncVal.freeValue(); cmThisObj.freeValue()
-                if cmBytecode { for a in cmArgs { a.freeValue() } }
+                if cmReleasesArgs { for a in cmArgs { a.freeValue() } }
                 if cmResult.isException {
                     retVal = .exception
                     break dispatchLoop
@@ -7210,12 +7242,12 @@ struct JeffJSInterpreter {
                     tcArgs = tmp
                 }
                 let tcFuncVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                let tcBytecode = jeffJS_isPlainBytecodeCallee(tcFuncVal)
+                let tcReleasesArgs = !jeffJS_calleeTakesArgs(tcFuncVal)
                 if rt.inlineStackTop == inlineBase {
                     ctx.currentFrame = frame.prevFrame
                     retVal = ctx.callFunction(tcFuncVal, thisVal: .undefined, args: tcArgs)
                     tcFuncVal.freeValue()
-                    if tcBytecode { for a in tcArgs { a.freeValue() } }
+                    if tcReleasesArgs { for a in tcArgs { a.freeValue() } }
                     break dispatchLoop
                 }
                 // Inside an inline frame: `break dispatchLoop` would return from
@@ -7225,7 +7257,7 @@ struct JeffJSInterpreter {
                 // inline frame, and resume the caller — mirroring return_.
                 let tcResult = ctx.callFunction(tcFuncVal, thisVal: .undefined, args: tcArgs)
                 tcFuncVal.freeValue()
-                if tcBytecode { for a in tcArgs { a.freeValue() } }
+                if tcReleasesArgs { for a in tcArgs { a.freeValue() } }
                 if tcResult.isException { retVal = .exception; break dispatchLoop }
                 if frame.hasLiveVarRefs {
                     jeffJS_syncBufToFrame(frame, buf, varBase)
@@ -7265,19 +7297,19 @@ struct JeffJSInterpreter {
                 }
                 let tcmFuncVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let tcmThisObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                let tcmBytecode = jeffJS_isPlainBytecodeCallee(tcmFuncVal)
+                let tcmReleasesArgs = !jeffJS_calleeTakesArgs(tcmFuncVal)
                 if rt.inlineStackTop == inlineBase {
                     ctx.currentFrame = frame.prevFrame
                     retVal = ctx.callFunction(tcmFuncVal, thisVal: tcmThisObj, args: tcmArgs)
                     tcmFuncVal.freeValue(); tcmThisObj.freeValue()
-                    if tcmBytecode { for a in tcmArgs { a.freeValue() } }
+                    if tcmReleasesArgs { for a in tcmArgs { a.freeValue() } }
                     break dispatchLoop
                 }
                 // Inside an inline frame: treat as call + inline-return (see
                 // tail_call above for why `break dispatchLoop` is wrong here).
                 let tcmResult = ctx.callFunction(tcmFuncVal, thisVal: tcmThisObj, args: tcmArgs)
                 tcmFuncVal.freeValue(); tcmThisObj.freeValue()
-                if tcmBytecode { for a in tcmArgs { a.freeValue() } }
+                if tcmReleasesArgs { for a in tcmArgs { a.freeValue() } }
                 if tcmResult.isException { retVal = .exception; break dispatchLoop }
                 if frame.hasLiveVarRefs {
                     jeffJS_syncBufToFrame(frame, buf, varBase)
@@ -7305,10 +7337,10 @@ struct JeffJSInterpreter {
                 for i in stride(from: argc - 1, through: 0, by: -1) { callArgs[i] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
                 let newTarget = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let funcVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                let ctorBytecode = jeffJS_isPlainBytecodeCallee(funcVal)
+                let ctorReleasesArgs = !jeffJS_calleeTakesArgs(funcVal)
                 let result = ctx.callConstructor(funcVal, newTarget: newTarget, args: callArgs)
                 funcVal.freeValue(); newTarget.freeValue()
-                if ctorBytecode { for a in callArgs { a.freeValue() } }
+                if ctorReleasesArgs { for a in callArgs { a.freeValue() } }
                 if result.isException {
                     retVal = .exception
                     break dispatchLoop
@@ -7342,10 +7374,10 @@ struct JeffJSInterpreter {
                 let funcVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let thisObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let callArgs = ctx.arrayToArgs(argsArray)   // owned copies
-                let applyBytecode = jeffJS_isPlainBytecodeCallee(funcVal)
+                let applyReleasesArgs = !jeffJS_calleeTakesArgs(funcVal)
                 let result = ctx.callFunction(funcVal, thisVal: thisObj, args: callArgs)
                 argsArray.freeValue(); funcVal.freeValue(); thisObj.freeValue()
-                if applyBytecode { for a in callArgs { a.freeValue() } }
+                if applyReleasesArgs { for a in callArgs { a.freeValue() } }
                 if result.isException {
                     retVal = .exception
                     break dispatchLoop
@@ -7359,10 +7391,10 @@ struct JeffJSInterpreter {
                 let newTarget = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let funcVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let callArgs = ctx.arrayToArgs(argsArray)   // owned copies
-                let applyCtorBytecode = jeffJS_isPlainBytecodeCallee(funcVal)
+                let applyCtorReleasesArgs = !jeffJS_calleeTakesArgs(funcVal)
                 let result = ctx.callConstructor(funcVal, newTarget: newTarget, args: callArgs)
                 argsArray.freeValue(); funcVal.freeValue(); newTarget.freeValue()
-                if applyCtorBytecode { for a in callArgs { a.freeValue() } }
+                if applyCtorReleasesArgs { for a in callArgs { a.freeValue() } }
                 if result.isException {
                     retVal = .exception
                     break dispatchLoop
@@ -10736,7 +10768,7 @@ struct JeffJSInterpreter {
                         newFrame.prevFrame = ctx.currentFrame
                         newFrame.curFunc = e_funcVal
                         if e_fastFb.isArrow, let arrowThis = e_callObj.arrowThisVal {
-                            newFrame.thisVal = arrowThis.dupValue()
+                            newFrame.thisVal = arrowThis
                         } else if !e_fastFb.isStrictMode && e_thisVal.isNullOrUndefined {
                             // ES §10.2.1.2: sloppy callees see the global object.
                             newFrame.thisVal = ctx.globalObj
@@ -10824,9 +10856,9 @@ struct JeffJSInterpreter {
                 var callArgs = [JeffJSValue](repeating: .undefined, count: argc)
                 for i in stride(from: argc - 1, through: 0, by: -1) { callArgs[i] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
                 let funcVal = buf[varBase + locIdx]       // borrowed from the slot
-                let glcBytecode = jeffJS_isPlainBytecodeCallee(funcVal)
+                let glcReleasesArgs = !jeffJS_calleeTakesArgs(funcVal)
                 let result = ctx.callFunction(funcVal, thisVal: .undefined, args: callArgs)
-                if glcBytecode { for a in callArgs { a.freeValue() } }
+                if glcReleasesArgs { for a in callArgs { a.freeValue() } }
                 if result.isException { retVal = .exception; break dispatchLoop }
                 buf[sp] = result; sp += 1
                 pc += 4

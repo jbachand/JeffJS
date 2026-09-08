@@ -485,7 +485,7 @@ struct JeffJSBuiltinIterator {
                 return createIterResult(ctx: ctx, val: .undefined, done: true)
             }
             guard let result = iteratorNext(ctx: ctx, iterator: underlying,
-                                             value: args.isEmpty ? .undefined : args[0]) else {
+                                             value: args.isEmpty ? .undefined : args[0].dupValue()) else {
                 return .exception
             }
             return result
@@ -1350,6 +1350,7 @@ struct JeffJSBuiltinIterator {
         case .suspended_start:
             // Generator hasn't executed any code yet; just complete it.
             genData.state = .completed
+            if let saved = genData.savedState { JeffJSGeneratorData.releaseSuspendedState(saved) }
             genData.savedState = nil
             return createIterResult(ctx: ctx, val: value, done: true)
 
@@ -1395,6 +1396,7 @@ struct JeffJSBuiltinIterator {
         case .suspended_start:
             // Generator hasn't executed any code; complete it and throw
             genData.state = .completed
+            if let saved = genData.savedState { JeffJSGeneratorData.releaseSuspendedState(saved) }
             genData.savedState = nil
             return ctx.throwValue(exception.dupValue())
 

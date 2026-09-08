@@ -639,12 +639,15 @@ struct JeffJSBuiltinString {
         }
         let cooked = ctx.toObject(args[0])
         if cooked.isException { return .exception }
+        defer { ctx.freeValue(cooked) }
 
         let rawProp = ctx.getPropertyStr(obj: cooked, name: "raw")
         if rawProp.isException { return .exception }
+        defer { ctx.freeValue(rawProp) }
 
         let rawObj = ctx.toObject(rawProp)
         if rawObj.isException { return .exception }
+        defer { ctx.freeValue(rawObj) }
 
         let lenVal = ctx.getPropertyStr(obj: rawObj, name: "length")
         if lenVal.isException { return .exception }

@@ -426,6 +426,7 @@ func markChildren(_ rt: JeffJSRuntime,
                 }
             }
         }
+        if let at = obj.arrowThisVal, let child = at.toGCObjectHeader() { markFunc(rt, child) }
     case .varRef:
         // Mark the value stored in the var-ref.
         let vr = unsafeBitCast(header, to: JeffJSVarRef.self)
@@ -488,6 +489,9 @@ func markObject(_ rt: JeffJSRuntime,
             if let vr = vr { markFunc(rt, vr) }
         }
         if let ho = homeObject { markFunc(rt, ho) }
+        // An arrow's captured `this` is a real edge: cycles through it
+        // (instance.f = () => this) are only collectable if it is marked.
+        if let at = obj.arrowThisVal, let child = at.toGCObjectHeader() { markFunc(rt, child) }
     case .array(_, let values, let count):
         for i in 0..<Int(count) where i < values.count {
             if let child = values[i].toGCObjectHeader() { markFunc(rt, child) }
@@ -554,6 +558,7 @@ func freeGCObjectChildren(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
         freeShape(rt, shape)
     case .functionBytecode:
         let obj = unsafeBitCast(header, to: JeffJSObject.self)
+        if let at = obj.arrowThisVal { obj.arrowThisVal = nil; freeValue(rt, at) }
         if case .bytecodeFunc(let fb, let varRefs, _) = obj.payload, let fb = fb {
             for cpVal in fb.cpool {
                 freeValue(rt, cpVal)
@@ -623,6 +628,8 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     obj.payload = .opaque(nil)
     obj.fbFast = nil
     obj.varRefsFast = []
+    let savedArrowThis = obj.arrowThisVal    // owned by the closure; released below
+    obj.arrowThisVal = nil
 
     // Release each property value. Data values are manually refcounted;
     // getset/autoInit refs are released by ARC when `savedExtra` drops at the
@@ -638,6 +645,7 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
             freeValue(rt, savedValues[i])
         }
     }
+    savedArrowThis?.freeValue()
     savedValues.deallocateStorage()
 
     // Payload was already cleared to .opaque(nil) above.
@@ -764,6 +772,7 @@ func clearGCState(_ rt: JeffJSRuntime) {
             obj.payload = .opaque(nil)
             obj.fbFast = nil
             obj.varRefsFast = []
+            obj.arrowThisVal = nil
         }
         if hdr.gcObjType == .shape {
             let shape = unsafeBitCast(hdr, to: JeffJSShape.self)
@@ -790,6 +799,7 @@ func clearGCState(_ rt: JeffJSRuntime) {
             obj.payload = .opaque(nil)
             obj.fbFast = nil
             obj.varRefsFast = []
+            obj.arrowThisVal = nil
         }
     }
     rt.gcObjects.removeAll()

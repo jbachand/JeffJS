@@ -755,11 +755,20 @@ final class JeffJSGeneratorData {
         // Generator dropped while suspended: release the value stack it was
         // holding across the yield (for-of iterator state, call operands...).
         if let saved = savedState, JeffJSGCObjectHeader.activeRuntime != nil {
-            for v in saved.stack { v.freeValue() }
-            for v in saved.varBuf { v.freeValue() }
-            for v in saved.argBuf { v.freeValue() }   // generator args are owned by the generator
-            if !saved.delegatedIter.isUndefined { saved.delegatedIter.freeValue() }   // yield* delegate
+            JeffJSGeneratorData.releaseSuspendedState(saved)
         }
+    }
+
+    /// Releases everything a suspended (never resumed) state owns: its value
+    /// stack, locals and arguments, a `yield*` delegate, and the generator's
+    /// own references to its function and `this`.
+    static func releaseSuspendedState(_ saved: GeneratorSavedState) {
+        for v in saved.stack { v.freeValue() }
+        for v in saved.varBuf { v.freeValue() }
+        for v in saved.argBuf { v.freeValue() }   // generator args are owned by the generator
+        if !saved.delegatedIter.isUndefined { saved.delegatedIter.freeValue() }   // yield* delegate
+        saved.thisVal.freeValue()
+        saved.funcObj.freeValue()
     }
 }
 

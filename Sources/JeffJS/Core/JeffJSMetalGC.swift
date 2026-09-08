@@ -309,81 +309,15 @@ final class JeffJSMetalGC {
     // MARK: - Object graph child enumeration
 
     /// Enumerate all GC-managed children of a header, calling the visitor for each.
-    /// Replicates the logic from markChildren in JeffJSGC.swift but collects
-    /// child headers directly instead of calling a mark function.
+    /// Delegates to the CPU collector's `markChildren` so the GPU graph can never
+    /// drift from the reference traversal (payload edges, bound functions,
+    /// arrow captured `this`, ...).
     private func enumerateChildren(
         _ rt: JeffJSRuntime,
         _ header: JeffJSGCObjectHeader,
         _ visitor: (JeffJSGCObjectHeader) -> Void
     ) {
-        switch header.gcObjType {
-        case .jsObject:
-            let obj = unsafeBitCast(header, to: JeffJSObject.self)
-            enumerateObjectChildren(obj, visitor)
-        case .shape:
-            let shape = unsafeBitCast(header, to: JeffJSShape.self)
-            if let proto = shape.proto {
-                visitor(proto)
-            }
-        case .functionBytecode:
-            let obj = unsafeBitCast(header, to: JeffJSObject.self)
-            if case .bytecodeFunc(let fb, let varRefs, _) = obj.payload, let fb = fb {
-                for cpVal in fb.cpool {
-                    if let child = cpVal.toGCObjectHeader() {
-                        visitor(child)
-                    }
-                }
-                for vr in varRefs {
-                    if let vr = vr {
-                        visitor(vr)
-                    }
-                }
-            }
-        case .varRef:
-            let vr = unsafeBitCast(header, to: JeffJSVarRef.self)
-            if let child = vr.pvalue.toGCObjectHeader() {
-                visitor(child)
-            }
-        case .bigInt, .bigFloat, .bigDecimal:
-            break // leaf types
-        case .asyncFunction:
-            break
-        case .mapIteratorData, .arrayIteratorData, .regexpStringIteratorData:
-            break
-        }
-    }
-
-    /// Enumerate children of a JeffJSObject (shape, prototype, property values).
-    private func enumerateObjectChildren(
-        _ obj: JeffJSObject,
-        _ visitor: (JeffJSGCObjectHeader) -> Void
-    ) {
-        // 1. Shape
-        if let shape = obj.shape {
-            visitor(shape)
-        }
-
-        // 2. Prototype
-        if let proto = obj.proto {
-            visitor(proto)
-        }
-
-        // 3. Property values (split storage: data values + rare-case boxes)
-        for i in 0..<obj.propValues.count {
-            if let e = obj.extra(at: i) {
-                switch e.kind {
-                case .getset:
-                    if let g = e.getter { visitor(g) }
-                    if let s = e.setter { visitor(s) }
-                case .varRef:
-                    if let vr = e.varRef { visitor(vr) }
-                case .autoInit:
-                    break
-                }
-            } else if let child = obj.propValues[i].toGCObjectHeader() {
-                visitor(child)
-            }
-        }
+        markChildren(rt, header) { _, child in visitor(child) }
     }
 }
 
