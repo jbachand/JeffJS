@@ -544,28 +544,48 @@ extension JeffJSContext {
     func newSpecialObject(kind: UInt8, frame: JeffJSStackFrame) -> JeffJSValue {
         switch SpecialObjectType(rawValue: kind) {
         case .arguments, .mappedArguments:
-            // Create an arguments object with the current frame's arguments
+            // Arguments objects of one kind and count all share one transition
+            // shape (indices, length[, callee], @@iterator). After the first,
+            // creation is one object plus slot appends; the old path paid N + 3
+            // property adds through the transition table every time.
+            let mapped = kind == SpecialObjectType.mappedArguments.rawValue
+            let argc = frame.argBuf.count
+            let fixedCount = mapped ? 3 : 2
             let argsObj = newObject()
+            guard let o = argsObj.toObject() else { return argsObj }
+            let iterFn: JeffJSValue = arrayProtoValues.isFunction ? arrayProtoValues.dupValue() : .undefined
+            if argc < argumentsShapesMapped.count,
+               let shape = (mapped ? argumentsShapesMapped : argumentsShapesStrict)[argc],
+               shape.isHashed, shape.propCount == argc + fixedCount,
+               o.propValues.count == 0, let old = o.shape {
+                shape.refCount += 1
+                o.shape = shape
+                jeffJS_leaveShape(rt, old)
+                for a in frame.argBuf { o.appendDataValue(a.dupValue()) }
+                o.appendDataValue(.newInt32(Int32(argc)))                  // length
+                if mapped { o.appendDataValue(frame.curFunc.dupValue()) }  // callee
+                o.appendDataValue(iterFn)                                  // @@iterator
+                return argsObj
+            }
+            // First object of this kind and count: build it property by
+            // property (length, callee and @@iterator non-enumerable, as the
+            // spec has them) and remember the resulting transition shape.
             for (i, arg) in frame.argBuf.enumerated() {
                 _ = setPropertyUint32(obj: argsObj, index: UInt32(i), value: arg.dupValue())
             }
-            let lengthAtom = JeffJSAtomID.JS_ATOM_length.rawValue
-            _ = setProperty(obj: argsObj, atom: lengthAtom,
-                           value: .newInt32(Int32(frame.argBuf.count)))
-            // Set callee for non-strict mode
-            if kind == SpecialObjectType.mappedArguments.rawValue {
-                let calleeAtom = JeffJSAtomID.JS_ATOM_callee.rawValue
-                _ = setProperty(obj: argsObj, atom: calleeAtom, value: frame.curFunc.dupValue())
+            let wc = JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE
+            _ = definePropertyValue(obj: argsObj, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
+                                    value: .newInt32(Int32(argc)), flags: wc)
+            if mapped {
+                _ = definePropertyValue(obj: argsObj, atom: JeffJSAtomID.JS_ATOM_callee.rawValue,
+                                        value: frame.curFunc.dupValue(), flags: wc)
             }
-            // Add Symbol.iterator so arguments is iterable. This is
-            // Array.prototype.values, already cached on the context: the old
-            // code interned the atom "Array" and walked global -> Array ->
-            // prototype -> @@iterator on every arguments object (and leaked
-            // the two intermediate references).
-            if arrayProtoValues.isFunction {
-                _ = setProperty(obj: argsObj,
-                                atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue,
-                                value: arrayProtoValues.dupValue())
+            _ = definePropertyValue(obj: argsObj, atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue,
+                                    value: iterFn, flags: wc)
+            if argc < argumentsShapesMapped.count, let sh = o.shape, sh.isHashed,
+               sh.propCount == argc + fixedCount, o.propValues.count == sh.propCount {
+                sh.refCount += 1   // the context keeps the shape alive
+                if mapped { argumentsShapesMapped[argc] = sh } else { argumentsShapesStrict[argc] = sh }
             }
             return argsObj
         case .thisVal:
@@ -1789,7 +1809,7 @@ extension JeffJSContext {
             strKeys.removeAll(keepingCapacity: true)
             // Fast-array elements are not shape properties: enumerate their
             // indices (present, i.e. not a hole) first.
-            if cur.classID == JeffJSClassID.array.rawValue, let snap = cur.arraySnapshot() {
+            if let snap = cur.arraySnapshot() {
                 var i = 0
                 while i < snap.count && i < snap.values.count {
                     if !snap.values[i].isUninitialized { intKeys.append(UInt32(i)) }

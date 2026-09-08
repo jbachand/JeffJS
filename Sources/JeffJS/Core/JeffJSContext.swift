@@ -102,6 +102,13 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// %IteratorPrototype% (JeffJSBuiltinIterator): parent of every builtin
     /// iterator prototype, so iterators are themselves iterable.
     var iteratorProto: JeffJSValue = .undefined
+    /// Transition shapes of arguments objects, by argument count (0...8), for
+    /// sloppy (with `callee`) and strict functions: captured from the first
+    /// object built with that count, then every later one is put on the
+    /// shape directly and its slots appended, instead of paying N + 3
+    /// property adds through the transition table.
+    var argumentsShapesMapped: [JeffJSShape?] = Array(repeating: nil, count: 9)
+    var argumentsShapesStrict: [JeffJSShape?] = Array(repeating: nil, count: 9)
     /// Array.prototype.values — cached because it's also used as %ArrayIteratorPrototype%[@@iterator].
     var arrayProtoValues: JeffJSValue
     /// Array.prototype.push — cached object pointer for interpreter fast-path identity check.
