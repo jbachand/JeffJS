@@ -67,6 +67,10 @@ final class JeffJSShape: JeffJSGCObjectHeader {
     /// `propHash[hash(atom) & propHashMask]` gives the index of the first
     /// `JeffJSShapeProperty` in the chain; follow `hashNext` from there.
     var propHash: [UInt32] = []
+    /// Own enumerable string keys in for-in order, built on first use and
+    /// dropped by every in-place mutation of the property table (append,
+    /// delete, flag change, compaction). Clones start without one.
+    var enumKeyCache: JeffJSForInKeyList? = nil
 
     // MARK: - Initialisers
 
@@ -313,6 +317,7 @@ func addShapeProperty(_ ctx: JeffJSContext,
     shape.hash = shapeHash(shape.hash, flags)
 
     shape.propCount += 1
+    shape.enumKeyCache = nil
     return newIndex
 }
 
@@ -349,6 +354,7 @@ func removeShapeProperty(_ ctx: JeffJSContext,
     shape.prop[propertyIndex].atom = 0        // JS_ATOM_NULL
     shape.prop[propertyIndex].hashNext = JeffJSShape.noNext
     shape.deletedPropCount += 1
+    shape.enumKeyCache = nil
 }
 
 /// Compact a shape's property list by removing deleted entries and
@@ -381,6 +387,7 @@ func compactProperties(_ ctx: JeffJSContext, _ obj: JeffJSObject) {
     shape.propCount = liveCount
     shape.propSize = liveCount
     shape.deletedPropCount = 0
+    shape.enumKeyCache = nil
     obj.replaceProps(newValues)
 
     // Rebuild hash table
@@ -571,6 +578,8 @@ func prepareShapeUpdateRT(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
         obj.shape = newShape
         jeffJS_leaveShape(rt, shape)
     }
+    // The caller is about to edit the property table in place.
+    obj.shape?.enumKeyCache = nil
 }
 
 // MARK: - Utility

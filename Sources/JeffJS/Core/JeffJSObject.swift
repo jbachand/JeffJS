@@ -606,22 +606,24 @@ struct JeffJSBoundFunction {
     }
 }
 
-/// For-in iterator data.
-struct JeffJSForInIterator {
-    var obj: JeffJSValue
-    var isArray: Bool
-    var arrayLength: UInt32
-    var idx: UInt32
+/// The keys one `for (k in obj)` visits, as owned JS string values. A list
+/// built from a single shape is cached on that shape and shared by every
+/// iterator over an object of that shape; the strings are released when the
+/// last holder lets go.
+final class JeffJSForInKeyList {
+    let keys: [JeffJSValue]
+    init(keys: [JeffJSValue]) { self.keys = keys }
+    deinit { for k in keys { k.freeValue() } }
+}
 
-    init(obj: JeffJSValue = .undefined,
-         isArray: Bool = false,
-         arrayLength: UInt32 = 0,
-         idx: UInt32 = 0) {
-        self.obj = obj
-        self.isArray = isArray
-        self.arrayLength = arrayLength
-        self.idx = idx
-    }
+/// For-in iterator state: the key list being walked and the position. Lives
+/// in the iterator object's payload; the old implementation kept the keys in
+/// a JS array under two internal properties and paid five property
+/// operations per iteration.
+final class JeffJSForInIterator {
+    let keys: JeffJSForInKeyList
+    var idx: Int = 0
+    init(keys: JeffJSForInKeyList) { self.keys = keys }
 }
 
 /// ArrayBuffer data.
@@ -1676,6 +1678,18 @@ extension JeffJSObject {
             return vals[Int(index)]
         }
         return .undefined
+    }
+
+    /// The ref-type element storage of a fast array, converting from the
+    /// `.array` enum payload on first use (the same switch setArrayElement
+    /// performs on the first store) so callers can read elements in place.
+    /// nil when this object has no array payload.
+    func fastArrayStorage() -> JeffJSFastArrayStorage? {
+        if let st = _fastArrayValues { return st }
+        guard case .array(_, let vals, let count) = payload else { return nil }
+        let st = JeffJSFastArrayStorage(values: ContiguousArray(vals), count: count)
+        _fastArrayValues = st
+        return st
     }
 
     /// Bulk-installs `values` as this array's elements, taking ownership of

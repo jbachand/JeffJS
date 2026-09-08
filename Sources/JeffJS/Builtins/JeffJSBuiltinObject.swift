@@ -270,6 +270,18 @@ extension JeffJSContext {
         let wantSymbols = (flags & JS_GPN_SYMBOL_MASK) != 0
         let enumOnly    = (flags & JS_GPN_ENUM_ONLY) != 0
 
+        // Object.keys / Object.entries / Object.assign on a plain object:
+        // the shape's cached for-in key list already has exactly these keys
+        // in this order.
+        if enumOnly, wantStrings, !wantSymbols, let shape = jsObj.shape,
+           jsObj.classID != JSClassID.JS_CLASS_STRING.rawValue, jsObj.arraySnapshot() == nil {
+            let cached = shapeEnumKeys(shape).keys
+            var names: [JeffJSValue] = []
+            names.reserveCapacity(cached.count)
+            for k in cached { names.append(k.dupValue()) }
+            return newArrayFrom(names)
+        }
+
         // Per ES spec §9.1.12, own property keys are returned in this order:
         // 1. Integer indices in ascending numeric order
         // 2. String keys in insertion order

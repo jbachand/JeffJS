@@ -456,7 +456,11 @@ final class JeffJSRuntime {
             // The arrays are materialised on demand; one flag instead of two
             // array-count loads per return.
             if frame.bufArraysLive {
-                frame.argBuf.removeAll(keepingCapacity: true)
+                // argBuf shares the caller's argument array, so it is dropped
+                // rather than emptied in place: removeAll(keepingCapacity:) on
+                // a shared buffer copied it, one allocation per return, and
+                // left the caller unable to reuse its array without a copy.
+                frame.argBuf = []
                 frame.varBuf.removeAll(keepingCapacity: true)
                 frame.bufArraysLive = false
             }

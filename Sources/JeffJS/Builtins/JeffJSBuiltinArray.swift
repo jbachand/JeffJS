@@ -577,41 +577,50 @@ struct JeffJSBuiltinArray {
         var undefinedCount: Int64 = 0
         var holeCount: Int64 = 0
 
-        for i in 0..<len {
-            let has = ctx.hasPropertyByIndex(obj: obj, index: UInt32(i))
-
-            if has {
-                let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(i))
-                if val.isException { return val }
-                if val.isUndefined {
-                    undefinedCount += 1
-                } else {
-                    elements.append((index: i, value: val))
-                }
+        var cursor = ElementCursor(obj: obj, len: len)
+        var present: Int64 = 0
+        while let e = cursor.next(ctx) {
+            if e.value.isException { for el in elements { el.value.freeValue() }; return e.value }
+            present += 1
+            if e.value.isUndefined {
+                if e.owned { e.value.freeValue() }
+                undefinedCount += 1
             } else {
-                holeCount += 1
+                elements.append((index: e.index, value: e.owned ? e.value : e.value.dupValue()))
             }
         }
+        holeCount = len - present
 
         // Sort the non-undefined, non-hole elements
         var sortError = false
+        var cmpArgs: [JeffJSValue] = [.undefined, .undefined]
         elements.sort { a, b in
             if sortError { return false }
 
             if !comparefn.isUndefined {
-                let result = ctx.call(comparefn, this: .undefined, args: [a.value, b.value])
+                cmpArgs[0] = a.value
+                cmpArgs[1] = b.value
+                let result = ctx.callFunction(comparefn, thisVal: .undefined, args: cmpArgs)
                 if result.isException {
                     sortError = true
                     return false
                 }
                 let d = ctx.extractFloat64(result) ?? Double.nan
+                result.freeValue()
                 if d.isNaN { return false }
                 return d < 0
             } else {
-                // Default string comparison
-                let sa = ctx.jsValueToString(a.value) ?? ""
-                let sb = ctx.jsValueToString(b.value) ?? ""
-                return sa < sb
+                // Default order: code-unit comparison of ToString(a) and
+                // ToString(b). Building a Swift String per comparison made
+                // string sorts 11x slower than QuickJS.
+                if let sa = a.value.stringValue, let sb = b.value.stringValue {
+                    return jeffJS_stringCompare(s1: sa, s2: sb) < 0
+                }
+                let ta = ctx.toString(a.value)
+                let tb = ctx.toString(b.value)
+                defer { ta.freeValue(); tb.freeValue() }
+                guard let sa = ta.stringValue, let sb = tb.stringValue else { return false }
+                return jeffJS_stringCompare(s1: sa, s2: sb) < 0
             }
         }
 
@@ -916,20 +925,16 @@ struct JeffJSBuiltinArray {
             k = 0
         }
 
-        while k < len {
-            let has = ctx.hasPropertyByIndex(obj: obj, index: UInt32(k))
-
-            if has {
-                let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
-                if val.isException { return val }
-
-                if strictEqual(ctx: ctx, val, searchElement) {
-                    return ctx.newInt64(k)
-                }
-            }
-            k += 1
+        // No user code runs during the comparison, so borrowed elements are
+        // compared in place.
+        var cursor = ElementCursor(obj: obj, len: len)
+        cursor.k = k
+        while let e = cursor.next(ctx) {
+            if e.value.isException { return e.value }
+            let hit = strictEqual(ctx: ctx, e.value, searchElement)
+            if e.owned { e.value.freeValue() }
+            if hit { return ctx.newInt64(e.index) }
         }
-
         return ctx.newInt64(-1)
     }
 
@@ -1003,16 +1008,15 @@ struct JeffJSBuiltinArray {
             k = 0
         }
 
-        while k < len {
-            let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
-            if val.isException { return val }
-
-            if ctx.sameValueZero(val, searchElement) {
-                return .JS_TRUE
-            }
-            k += 1
+        // includes treats holes as undefined.
+        var cursor = ElementCursor(obj: obj, len: len, visitHoles: true)
+        cursor.k = k
+        while let e = cursor.next(ctx) {
+            if e.value.isException { return e.value }
+            let hit = ctx.sameValueZero(e.value, searchElement)
+            if e.owned { e.value.freeValue() }
+            if hit { return .JS_TRUE }
         }
-
         return .JS_FALSE
     }
 
@@ -1090,20 +1094,18 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
+        let isBytecode = jeffJS_isPlainBytecodeCallee(callbackFn)
+        var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
-        for k in 0..<len {
-            let has = ctx.hasPropertyByIndex(obj: obj, index: UInt32(k))
-
-            if has {
-                let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
-                if val.isException { return val }
-
-                let kVal = ctx.newInt64(k)
-                let result = ctx.call(callbackFn, this: thisArg, args: [val, kVal, obj])
-                if result.isException { return result }
-            }
+        var cursor = ElementCursor(obj: obj, len: len)
+        while let e = cursor.next(ctx) {
+            if e.value.isException { return e.value }
+            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn, isBytecode: isBytecode,
+                                                 thisArg: thisArg, element: e, cbArgs: &cbArgs)
+            if isBytecode { pinned.freeValue() }
+            if r.isException { return r }
+            r.freeValue()
         }
-
         return .undefined
     }
 
@@ -1121,25 +1123,53 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
+        let isBytecode = jeffJS_isPlainBytecodeCallee(callbackFn)
+        var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
         let result = arraySpeciesCreate(ctx: ctx, obj: obj, length: len)
         if result.isException { return result }
 
-        for k in 0..<len {
-            let has = ctx.hasPropertyByIndex(obj: obj, index: UInt32(k))
-
-            if has {
-                let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
-                if val.isException { return val }
-
-                let kVal = ctx.newInt64(k)
-                let mappedValue = ctx.call(callbackFn, this: thisArg, args: [val, kVal, obj])
-                if mappedValue.isException { return mappedValue }
-
-                ctx.setPropertyByIndex(obj: result, index: UInt32(k), value: mappedValue)
+        // A dense fast array mapped into a fresh plain array: collect the
+        // results and install them in one shot instead of paying a generic
+        // indexed store (plus a length-slot update) per element.
+        if let src = fastElements(obj), Int64(src.count) == len,
+           let res = result.toObject(), res.classID == JeffJSClassID.array.rawValue,
+           res.fastArray, res.arrayCount == 0 {
+            var out = ContiguousArray<JeffJSValue>()
+            out.reserveCapacity(Int(len))
+            var dense = true
+            var cursor = ElementCursor(obj: obj, len: len)
+            while let e = cursor.next(ctx) {
+                if e.value.isException { for v in out { v.freeValue() }; return e.value }
+                // A hole, or the array shrinking under the callback, leaves a gap.
+                while Int64(out.count) < e.index { out.append(.uninitialized); dense = false }
+                let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn, isBytecode: isBytecode,
+                                                     thisArg: thisArg, element: e, cbArgs: &cbArgs)
+                if isBytecode { pinned.freeValue() }
+                if r.isException { for v in out { v.freeValue() }; return r }
+                out.append(r)
             }
+            if dense && Int64(out.count) == len {
+                res.installFastArrayValues(out)
+                return result
+            }
+            // Sparse: store the present results individually; the result's
+            // length is already `len`.
+            for (i, v) in out.enumerated() where !v.isUninitialized {
+                ctx.setPropertyByIndex(obj: result, index: UInt32(i), value: v)
+            }
+            return result
         }
 
+        var cursor = ElementCursor(obj: obj, len: len)
+        while let e = cursor.next(ctx) {
+            if e.value.isException { return e.value }
+            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn, isBytecode: isBytecode,
+                                                 thisArg: thisArg, element: e, cbArgs: &cbArgs)
+            if isBytecode { pinned.freeValue() }
+            if r.isException { return r }
+            ctx.setPropertyByIndex(obj: result, index: UInt32(e.index), value: r)
+        }
         return result
     }
 
@@ -1157,31 +1187,44 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
+        let isBytecode = jeffJS_isPlainBytecodeCallee(callbackFn)
+        var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
         let result = arraySpeciesCreate(ctx: ctx, obj: obj, length: 0)
         if result.isException { return result }
-
+        // Fresh plain result: kept elements are collected and installed once.
+        let plainResult: Bool = {
+            guard let res = result.toObject() else { return false }
+            return res.classID == JeffJSClassID.array.rawValue && res.fastArray && res.arrayCount == 0
+        }()
+        var kept = ContiguousArray<JeffJSValue>()
         var to: Int64 = 0
-        for k in 0..<len {
-            let has = ctx.hasPropertyByIndex(obj: obj, index: UInt32(k))
 
-            if has {
-                let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
-                if val.isException { return val }
-
-                let kVal = ctx.newInt64(k)
-                let selected = ctx.call(callbackFn, this: thisArg, args: [val, kVal, obj])
-                if selected.isException { return selected }
-
-                if ctx.toBoolFree(selected) {
-                    ctx.setPropertyByIndex(obj: result, index: UInt32(to), value: val)
-                    to += 1
-                }
+        var cursor = ElementCursor(obj: obj, len: len)
+        while let e = cursor.next(ctx) {
+            if e.value.isException { for v in kept { v.freeValue() }; return e.value }
+            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn, isBytecode: isBytecode,
+                                                 thisArg: thisArg, element: e, cbArgs: &cbArgs)
+            if r.isException {
+                if isBytecode { pinned.freeValue() }
+                for v in kept { v.freeValue() }
+                return r
+            }
+            let selected = ctx.toBool(r)
+            r.freeValue()
+            if selected {
+                // The result takes its own reference; after a C callee the
+                // pinned one was handed over, so take a fresh one.
+                let keep = isBytecode ? pinned : pinned.dupValue()
+                if plainResult { kept.append(keep) }
+                else { ctx.setPropertyByIndex(obj: result, index: UInt32(to), value: keep) }
+                to += 1
+            } else if isBytecode {
+                pinned.freeValue()
             }
         }
-
+        if plainResult, let res = result.toObject() { res.installFastArrayValues(kept) }
         setLength(ctx: ctx, obj: result, length: to)
-
         return result
     }
 
@@ -1199,24 +1242,20 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
+        let isBytecode = jeffJS_isPlainBytecodeCallee(callbackFn)
+        var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
-        for k in 0..<len {
-            let has = ctx.hasPropertyByIndex(obj: obj, index: UInt32(k))
-
-            if has {
-                let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
-                if val.isException { return val }
-
-                let kVal = ctx.newInt64(k)
-                let testResult = ctx.call(callbackFn, this: thisArg, args: [val, kVal, obj])
-                if testResult.isException { return testResult }
-
-                if !ctx.toBoolFree(testResult) {
-                    return .JS_FALSE
-                }
-            }
+        var cursor = ElementCursor(obj: obj, len: len)
+        while let e = cursor.next(ctx) {
+            if e.value.isException { return e.value }
+            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn, isBytecode: isBytecode,
+                                                 thisArg: thisArg, element: e, cbArgs: &cbArgs)
+            if isBytecode { pinned.freeValue() }
+            if r.isException { return r }
+            let t = ctx.toBool(r)
+            r.freeValue()
+            if !t { return .JS_FALSE }
         }
-
         return .JS_TRUE
     }
 
@@ -1234,24 +1273,20 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
+        let isBytecode = jeffJS_isPlainBytecodeCallee(callbackFn)
+        var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
-        for k in 0..<len {
-            let has = ctx.hasPropertyByIndex(obj: obj, index: UInt32(k))
-
-            if has {
-                let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
-                if val.isException { return val }
-
-                let kVal = ctx.newInt64(k)
-                let testResult = ctx.call(callbackFn, this: thisArg, args: [val, kVal, obj])
-                if testResult.isException { return testResult }
-
-                if ctx.toBoolFree(testResult) {
-                    return .JS_TRUE
-                }
-            }
+        var cursor = ElementCursor(obj: obj, len: len)
+        while let e = cursor.next(ctx) {
+            if e.value.isException { return e.value }
+            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn, isBytecode: isBytecode,
+                                                 thisArg: thisArg, element: e, cbArgs: &cbArgs)
+            if isBytecode { pinned.freeValue() }
+            if r.isException { return r }
+            let t = ctx.toBool(r)
+            r.freeValue()
+            if t { return .JS_TRUE }
         }
-
         return .JS_FALSE
     }
 
@@ -1269,20 +1304,22 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
+        let isBytecode = jeffJS_isPlainBytecodeCallee(callbackFn)
+        var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
-        for k in 0..<len {
-            let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
-            if val.isException { return val }
-
-            let kVal = ctx.newInt64(k)
-            let testResult = ctx.call(callbackFn, this: thisArg, args: [val, kVal, obj])
-            if testResult.isException { return testResult }
-
-            if ctx.toBoolFree(testResult) {
-                return val
-            }
+        // find visits holes as undefined rather than skipping them.
+        var cursor = ElementCursor(obj: obj, len: len, visitHoles: true)
+        while let e = cursor.next(ctx) {
+            if e.value.isException { return e.value }
+            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn, isBytecode: isBytecode,
+                                                 thisArg: thisArg, element: e, cbArgs: &cbArgs)
+            if r.isException { if isBytecode { pinned.freeValue() }; return r }
+            let t = ctx.toBool(r)
+            r.freeValue()
+            // The value read before the callback ran is the one returned.
+            if t { return isBytecode ? pinned : pinned.dupValue() }
+            if isBytecode { pinned.freeValue() }
         }
-
         return .undefined
     }
 
@@ -1300,20 +1337,20 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
+        let isBytecode = jeffJS_isPlainBytecodeCallee(callbackFn)
+        var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
-        for k in 0..<len {
-            let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
-            if val.isException { return val }
-
-            let kVal = ctx.newInt64(k)
-            let testResult = ctx.call(callbackFn, this: thisArg, args: [val, kVal, obj])
-            if testResult.isException { return testResult }
-
-            if ctx.toBoolFree(testResult) {
-                return ctx.newInt64(k)
-            }
+        var cursor = ElementCursor(obj: obj, len: len, visitHoles: true)
+        while let e = cursor.next(ctx) {
+            if e.value.isException { return e.value }
+            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn, isBytecode: isBytecode,
+                                                 thisArg: thisArg, element: e, cbArgs: &cbArgs)
+            if isBytecode { pinned.freeValue() }
+            if r.isException { return r }
+            let t = ctx.toBool(r)
+            r.freeValue()
+            if t { return ctx.newInt64(e.index) }
         }
-
         return ctx.newInt64(-1)
     }
 
@@ -1397,47 +1434,42 @@ struct JeffJSBuiltinArray {
         if !ctx.isCallable(callbackFn) {
             return ctx.throwTypeError(message: "Array.prototype.reduce: callback is not a function")
         }
+        let isBytecode = jeffJS_isPlainBytecodeCallee(callbackFn)
 
-        var k: Int64 = 0
-        var accumulator: JeffJSValue = .undefined
-
+        var cursor = ElementCursor(obj: obj, len: len)
+        // The accumulator is borrowed while it is still the caller's initial
+        // value and owned once it has come back from the callback.
+        var acc: JeffJSValue
+        var accOwned: Bool
         if args.count >= 2 {
-            accumulator = args[1]
+            acc = args[1]
+            accOwned = false
         } else {
-            // Find first present element
-            var kPresent = false
-            while k < len {
-                let has = ctx.hasPropertyByIndex(obj: obj, index: UInt32(k))
-
-                if has {
-                    accumulator = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
-                    if accumulator.isException { return accumulator }
-                    kPresent = true
-                    k += 1
-                    break
-                }
-                k += 1
-            }
-            if !kPresent {
+            guard let first = cursor.next(ctx) else {
                 return ctx.throwTypeError(message: "Reduce of empty array with no initial value")
             }
+            if first.value.isException { return first.value }
+            acc = first.owned ? first.value : first.value.dupValue()
+            accOwned = true
         }
 
-        while k < len {
-            let has = ctx.hasPropertyByIndex(obj: obj, index: UInt32(k))
-
-            if has {
-                let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
-                if val.isException { return val }
-
-                let kVal = ctx.newInt64(k)
-                accumulator = ctx.call(callbackFn, this: .undefined, args: [accumulator, val, kVal, obj])
-                if accumulator.isException { return accumulator }
+        var cbArgs: [JeffJSValue] = [.undefined, .undefined, .undefined, obj]
+        while let e = cursor.next(ctx) {
+            if e.value.isException { if accOwned { acc.freeValue() }; return e.value }
+            let pinned = e.owned ? e.value : e.value.dupValue()
+            cbArgs[0] = acc
+            cbArgs[1] = pinned
+            cbArgs[2] = ctx.newInt64(e.index)
+            let r = ctx.callFunction(callbackFn, thisVal: .undefined, args: cbArgs)
+            if isBytecode {
+                pinned.freeValue()
+                if accOwned { acc.freeValue() }   // the callback returned its own reference
             }
-            k += 1
+            if r.isException { return r }
+            acc = r
+            accOwned = true
         }
-
-        return accumulator
+        return accOwned ? acc : acc.dupValue()
     }
 
     /// `Array.prototype.reduceRight(callback, initialValue?)`
@@ -1792,19 +1824,102 @@ struct JeffJSBuiltinArray {
     /// Get the length of an array-like object as Int64.
     /// Mirrors `js_get_length64` in QuickJS.
     private static func getLength(ctx: JeffJSContext, obj: JeffJSValue) -> Int64 {
-        let lenAtom = ctx.rt.findAtom("length")
-        let lenVal = ctx.getProperty(obj: obj, atom: lenAtom)
+        let lenVal = ctx.getProperty(obj: obj, atom: JeffJSAtomID.JS_ATOM_length.rawValue)
         if lenVal.isException { return -1 }
         return ctx.toLength(lenVal)
+    }
+
+    // MARK: - Iteration fast path
+
+    /// Walks the elements of an array-like in index order for the iteration
+    /// builtins. A plain fast array is read straight from its element storage,
+    /// re-fetched on every step because a callback may grow, shrink or convert
+    /// the array; anything else (array-likes, proxies, slow arrays) takes the
+    /// generic has/get path. This replaced two generic property lookups per
+    /// element, each interning an index atom and walking the prototype chain.
+    struct ElementCursor {
+        let obj: JeffJSValue
+        let len: Int64
+        /// Visit absent indices as `undefined` (find/findIndex/includes do not
+        /// skip holes) instead of skipping them.
+        let visitHoles: Bool
+        var k: Int64 = 0
+
+        /// One element. `value` is owned by the caller when `owned` is true
+        /// (generic path) and borrowed from the element storage otherwise, so
+        /// it must be pinned with dupValue() before any user code runs.
+        struct Element {
+            let index: Int64
+            let value: JeffJSValue
+            let owned: Bool
+        }
+
+        init(obj: JeffJSValue, len: Int64, visitHoles: Bool = false) {
+            self.obj = obj
+            self.len = len
+            self.visitHoles = visitHoles
+        }
+
+        @inline(__always)
+        mutating func next(_ ctx: JeffJSContext) -> Element? {
+            while k < len {
+                let index = k
+                k += 1
+                if let st = JeffJSBuiltinArray.fastElements(obj) {
+                    let i = Int(index)
+                    if i < Int(st.count) && i < st.values.count {
+                        let v = st.values[i]
+                        if !v.isUninitialized { return Element(index: index, value: v, owned: false) }
+                    }
+                    if visitHoles { return Element(index: index, value: .undefined, owned: false) }
+                    continue
+                }
+                if !ctx.hasPropertyByIndex(obj: obj, index: UInt32(index)) {
+                    if visitHoles { return Element(index: index, value: .undefined, owned: false) }
+                    continue
+                }
+                // May be .exception: callers check before using the value.
+                let v = ctx.getPropertyByIndex(obj: obj, index: UInt32(index))
+                return Element(index: index, value: v, owned: true)
+            }
+            return nil
+        }
+    }
+
+    /// The element storage of `obj` when it is a plain fast array (an Array-
+    /// class object with fast elements; proxies and typed arrays have other
+    /// class IDs), else nil.
+    @inline(__always)
+    static func fastElements(_ obj: JeffJSValue) -> JeffJSFastArrayStorage? {
+        guard let o = obj.toObject(), o.classID == JeffJSClassID.array.rawValue, o.fastArray else { return nil }
+        return o.fastArrayStorage()
+    }
+
+    /// Calls `fn(element, index, obj)` with `this` = thisArg, reusing the
+    /// caller's argument array (the old per-element literal was a heap
+    /// allocation per callback). The element is pinned for the call because
+    /// the callback may overwrite the slot it came from. Returns the callback
+    /// result (owned) and the pinned reference: the caller releases it after a
+    /// bytecode callee, and leaves it after a C builtin, which may have handed
+    /// it to an ownership-taking setter — the interpreter's own call sites
+    /// follow the same rule.
+    @inline(__always)
+    private static func callElementCallback(ctx: JeffJSContext, fn: JeffJSValue, isBytecode: Bool,
+                                            thisArg: JeffJSValue, element: ElementCursor.Element,
+                                            cbArgs: inout [JeffJSValue]) -> (result: JeffJSValue, pinned: JeffJSValue) {
+        let pinned = element.owned ? element.value : element.value.dupValue()
+        cbArgs[0] = pinned
+        cbArgs[1] = ctx.newInt64(element.index)
+        let r = ctx.callFunction(fn, thisVal: thisArg, args: cbArgs)
+        return (r, pinned)
     }
 
     /// Set the "length" property of an object.
     /// Returns 0 on success, -1 on failure.
     @discardableResult
     private static func setLength(ctx: JeffJSContext, obj: JeffJSValue, length: Int64) -> Int {
-        let lenAtom = ctx.rt.findAtom("length")
-        let lenVal = ctx.newInt64(length)
-        return ctx.setProperty(obj: obj, atom: lenAtom, value: lenVal)
+        return ctx.setProperty(obj: obj, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
+                               value: ctx.newInt64(length))
     }
 
     /// Resolve a relative index argument to an absolute index.

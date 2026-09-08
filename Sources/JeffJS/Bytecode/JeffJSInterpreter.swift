@@ -1716,32 +1716,74 @@ extension JeffJSContext {
     /// Collects all enumerable string-keyed properties from the object and its
     /// prototype chain, then wraps them in an iterator object.
     func createForInIterator(obj: JeffJSValue) -> JeffJSValue {
-        // Interned once per context: re-interning these two names by string on
-        // every for-in showed up as String hashing in React profiles.
-        let keysAtom = forInKeysAtomCached
-        let idxAtom = forInIdxAtomCached
-        // For null/undefined, return an empty iterator
-        if obj.isNull || obj.isUndefined {
-            let iter = newObject()
-            // Store empty keys array and index 0 in the iterator
-            _ = setProperty(obj: iter, atom: keysAtom, value: newArrayFrom([]))
-            _ = setProperty(obj: iter, atom: idxAtom, value: .newInt32(0))
-            return iter
+        let keys = forInKeyList(obj: obj)
+        let iter = newObject()
+        if let o = iter.toObject() { o.payload = .forInIterator(JeffJSForInIterator(keys: keys)) }
+        return iter
+    }
+
+    /// Own enumerable string keys of `shape` in for-in order (integer keys
+    /// ascending, then names in insertion order), from the shape's cache.
+    /// Every object on a hashed shape shares one list, so a loop over the
+    /// same kind of object (props, style, fiber...) builds no keys at all.
+    func shapeEnumKeys(_ shape: JeffJSShape) -> JeffJSForInKeyList {
+        if let cached = shape.enumKeyCache { return cached }
+        var intKeys: [UInt32] = []
+        var keys: [JeffJSValue] = []
+        for prop in shape.prop {
+            let atom = prop.atom
+            if atom == 0 || !prop.flags.contains(.enumerable) { continue }
+            if rt.atomIsArrayIndex(atom) {
+                if let idx = rt.atomToUInt32(atom) { intKeys.append(idx) }
+            } else if let entry = rt.atomArray[Int(atom)],
+                      entry.atomType != .JS_ATOM_TYPE_SYMBOL,
+                      entry.atomType != .JS_ATOM_TYPE_GLOBAL_SYMBOL {
+                keys.append(atomToString(atom))
+            }
         }
-        // Collect all enumerable string-keyed properties from obj and its prototype chain.
-        // Per ES spec §9.1.12, integer indices come first (ascending), then string keys
-        // (insertion order). Each prototype level follows the same ordering.
-        // Shadowing is resolved on the interned identity of a key, not on its
-        // spelling: array indices by numeric value (the "5" string atom and the
-        // index 5 denote the same property), everything else by atom. The old
-        // Set<String> formatted every index into a fresh Swift String and
-        // hashed it, which made for-in one of the hottest paths under React.
+        if !intKeys.isEmpty {
+            intKeys.sort()
+            var ordered: [JeffJSValue] = []
+            ordered.reserveCapacity(intKeys.count + keys.count)
+            for idx in intKeys { ordered.append(intKeyString(Int(idx))) }
+            ordered.append(contentsOf: keys)
+            keys = ordered
+        }
+        let list = JeffJSForInKeyList(keys: keys)
+        shape.enumKeyCache = list
+        return list
+    }
+
+    /// The keys `for (k in obj)` visits. When neither the object nor any
+    /// prototype has fast-array elements and no prototype contributes an
+    /// enumerable key (the normal case: a plain object over Object.prototype),
+    /// the object's own cached list is returned as is. Otherwise the list is
+    /// built level by level with the usual shadowing rules.
+    func forInKeyList(obj: JeffJSValue) -> JeffJSForInKeyList {
+        guard let root = obj.toObject() else { return JeffJSForInKeyList(keys: []) }   // null / undefined
+        if let rootShape = root.shape, root.arraySnapshot() == nil {
+            var protosEmpty = true
+            var p = root.proto
+            while let cur = p {
+                guard let sh = cur.shape, cur.arraySnapshot() == nil, shapeEnumKeys(sh).keys.isEmpty else {
+                    protosEmpty = false
+                    break
+                }
+                p = cur.proto
+            }
+            if protosEmpty { return shapeEnumKeys(rootShape) }
+        }
+
+        // General path: integer keys ascending then names per level, with a
+        // non-enumerable own property shadowing an enumerable one further up
+        // the chain (ES §14.7.5.9). Shadowing is resolved on interned identity
+        // (index by value, name by atom).
         var keys = [JeffJSValue]()
         var seenIdx = JeffJSKeySeen()
         var seenAtom = JeffJSKeySeen()
         var intKeys: [UInt32] = []
         var strKeys: [UInt32] = []
-        var current: JeffJSObject? = obj.toObject()
+        var current: JeffJSObject? = root
         while let cur = current {
             intKeys.removeAll(keepingCapacity: true)
             strKeys.removeAll(keepingCapacity: true)
@@ -1759,9 +1801,6 @@ extension JeffJSContext {
                     let atom = prop.atom
                     if atom == 0 { continue }
                     let isEnumerable = prop.flags.contains(.enumerable)
-                    // Non-enumerable own properties must shadow enumerable
-                    // prototype properties (ES spec §14.7.5.9), so record every
-                    // property name as seen but only collect enumerable ones.
                     if rt.atomIsArrayIndex(atom) {
                         if let idx = rt.atomToUInt32(atom) {
                             if isEnumerable { intKeys.append(idx) } else { _ = seenIdx.insert(idx) }
@@ -1783,10 +1822,7 @@ extension JeffJSContext {
             }
             current = cur.proto
         }
-        let iter = newObject()
-        _ = setProperty(obj: iter, atom: keysAtom, value: newArrayFrom(keys))
-        _ = setProperty(obj: iter, atom: idxAtom, value: .newInt32(0))
-        return iter
+        return JeffJSForInKeyList(keys: keys)
     }
 
     /// Gets an iterator from an iterable by calling its [Symbol.iterator]
@@ -1863,18 +1899,13 @@ extension JeffJSContext {
     /// Gets the next value from a for-in iterator.
     /// Returns (nextKey, done). When done is true, iteration is complete.
     func forInNext(iter: JeffJSValue) -> (JeffJSValue, Bool) {
-        let keysArr = getProperty(obj: iter, atom: forInKeysAtomCached)
-        let idxVal = getProperty(obj: iter, atom: forInIdxAtomCached)
-        let idx = idxVal.isInt ? Int(idxVal.toInt32()) : 0
-        let lenVal = getPropertyStr(obj: keysArr, name: "length")
-        let len = lenVal.isInt ? Int(lenVal.toInt32()) : 0
-        if idx >= len {
+        guard let o = iter.toObject(), case .forInIterator(let st) = o.payload else {
             return (.undefined, true)
         }
-        let key = getPropertyUint32(obj: keysArr, index: UInt32(idx))
-        // Advance the index
-        _ = setProperty(obj: iter, atom: forInIdxAtomCached, value: .newInt32(Int32(idx + 1)))
-        return (key, false)
+        if st.idx >= st.keys.keys.count { return (.undefined, true) }
+        let key = st.keys.keys[st.idx]
+        st.idx += 1
+        return (key.dupValue(), false)
     }
 
     /// Gets the next value from an iterator.

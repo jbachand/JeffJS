@@ -102,9 +102,6 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// %IteratorPrototype% (JeffJSBuiltinIterator): parent of every builtin
     /// iterator prototype, so iterators are themselves iterable.
     var iteratorProto: JeffJSValue = .undefined
-    /// Interned once: the for-in iterator's internal slot names.
-    lazy var forInKeysAtomCached: UInt32 = rt.findAtom("__forInKeys__")
-    lazy var forInIdxAtomCached: UInt32 = rt.findAtom("__forInIdx__")
     /// Array.prototype.values — cached because it's also used as %ArrayIteratorPrototype%[@@iterator].
     var arrayProtoValues: JeffJSValue
     /// Array.prototype.push — cached object pointer for interpreter fast-path identity check.

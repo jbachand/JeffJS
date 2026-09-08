@@ -574,3 +574,48 @@ Still open, found while profiling and not fixed:
   per-element `[JeffJSValue]` argument array and the generic indexed get/has/set.
   A fast path over the element storage plus a borrowed argument buffer is the
   next big lever.
+
+### Round 8b (2026-09-07) — array callbacks and a native for-in iterator
+
+Re-render burst (same bench as Round 8): **31.1 -> 27.5 ms per 100**, 1.59x
+JavaScriptCore's interpreter (JSC with its JIT does it in 10.0 ms; on iOS
+third-party apps never get that JIT). Real-world geomean **4.9x -> 4.61x**
+QuickJS, all 38 kernels still byte-identical.
+
+- **Array callback builtins** (`map`/`filter`/`forEach`/`every`/`some`/`find`/
+  `findIndex`/`reduce`/`indexOf`/`includes`/`sort`) read a plain fast array's
+  element storage in place through one `ElementCursor` (re-fetched per step,
+  since callbacks may mutate the array) instead of a generic `has` + `get`
+  per element, reuse one argument array per loop instead of allocating one
+  per callback, and install `map`/`filter` results in one shot. `sort`'s
+  default order compares code units instead of building two Swift Strings per
+  comparison. Elements are pinned around the callback and released after a
+  bytecode callee, the interpreter's own rule; before, every element read was
+  leaked. `array-find-indexof` 9.9x -> 6.5x, `array-map-filter-reduce`
+  7.2x -> 4.7x, `array-sort-comparator` 2.7x.
+- **`releaseFrameU` drops `argBuf`** instead of `removeAll(keepingCapacity:)`
+  on a buffer shared with the caller, which copied it on every return.
+- **for-in is a native iterator with a per-shape key cache.** The iterator
+  object carries a `JeffJSForInIterator` payload over a `JeffJSForInKeyList`;
+  the old one stored the keys in a JS array under two internal properties and
+  did five property operations per iteration (and leaked the keys array once
+  per step). Each shape caches its own enumerable key list
+  (`enumKeyCache`, dropped by every in-place mutation: append, delete, flag
+  change, compaction, `prepareShapeUpdate`, GC teardown), so a loop over a
+  plain object whose prototypes contribute nothing shares the cached list
+  without building a key. `Object.keys`/`entries`/`assign` take the same
+  cache. `for-in-entries` 8.4x -> 4.8x.
+
+Profile after this round: `executeFastTraceLean` 41% + `callInternal` 20%
+self, retain/release ~11%; `setPropertyInternal` 8.7% inclusive (property
+adds on fresh objects), the arguments object 3.8%, the DOM bridge accessors
+6.2%, payload-enum copy/destroy ~5%, `String.indexOf` + `toUTF16Array` 3%.
+
+Found, not fixed: class prototype methods/getters and `Function.prototype`
+methods are enumerable (for-in over an instance or a function lists them);
+`@@hasInstance` enumerates as a string key; a native call leaks any
+temporary argument its C callee does not store (`a.map(x => ...)` leaks the
+arrow per call: the interpreter releases arguments only after bytecode
+callees because some builtins hand borrowed arguments to ownership-taking
+setters). The fix is to make every storing builtin dup and release after C
+callees too, verified with `JEFFJS_ZOMBIES=1`.

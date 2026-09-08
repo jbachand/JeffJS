@@ -695,6 +695,7 @@ func freeShape(_ rt: JeffJSRuntime, _ shape: JeffJSShape) {
     // reached through stale references; stale propCount/propHashMask with
     // empty arrays makes any later addShapeProperty index out of bounds.
     shape.prop.removeAll()
+    shape.enumKeyCache = nil
     shape.propHash.removeAll()
     shape.propCount = 0
     shape.propSize = 0
@@ -768,6 +769,7 @@ func clearGCState(_ rt: JeffJSRuntime) {
             let shape = unsafeBitCast(hdr, to: JeffJSShape.self)
             shape.proto = nil
             shape.prop.removeAll()
+            shape.enumKeyCache = nil
             shape.propHash.removeAll()
             shape.propCount = 0
             shape.propSize = 0
