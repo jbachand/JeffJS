@@ -71,6 +71,13 @@ final class JeffJSShape: JeffJSGCObjectHeader {
     /// dropped by every in-place mutation of the property table (append,
     /// delete, flag change, compaction). Clones start without one.
     var enumKeyCache: JeffJSForInKeyList? = nil
+    /// For a hashed transition shape, the shape it was created from by
+    /// appending its last property. Its identity proves the property prefix
+    /// matches, so findHashedShape compares one property instead of all of
+    /// them (building an object with N keys used to be O(N^2); a 5000-key
+    /// dictionary spent 70% of its time there). Hashed shapes are never
+    /// evicted, so the strong reference is safe.
+    var parent: JeffJSShape? = nil
 
     // MARK: - Initialisers
 
@@ -226,6 +233,7 @@ func jeffJS_objectAddShapeProperty(_ ctx: JeffJSContext,
     let ns = cloneShape(ctx, shape)                       // private copy, refCount 1
     let idx = addShapeProperty(ctx, ns, atom: atom, flags: flags)
     if rt.shapeHashCount < JeffJSRuntime.maxHashedShapes {
+        ns.parent = shape
         insertHashedShape(rt, ns)                         // becomes the shared transition
     }
     obj.shape = ns
@@ -447,42 +455,41 @@ func findHashedShape(_ rt: JeffJSRuntime,
                      atom: UInt32,
                      propFlags: UInt32) -> JeffJSShape? {
     guard rt.shapeHashSize > 0 else { return nil }
-
     // The target hash is the base shape's hash extended with the new property.
     var h = baseShape.hash
     h = shapeHash(h, atom)
     h = shapeHash(h, propFlags)
-
     let idx = Int(h & UInt32(rt.shapeHashSize - 1))
     var cur = rt.shapeHash[idx]
-
     while let shape = cur {
         if shape.hash == h,
            shape.proto === baseShape.proto,
            shape.propCount == baseShape.propCount + 1 {
-
-            // Verify that the first N-1 properties match baseShape
-            var matches = true
-            let baseCount = baseShape.propCount
-            if baseCount <= shape.propCount {
-                for i in 0 ..< baseCount {
-                    if shape.prop[i].atom  != baseShape.prop[i].atom ||
-                       shape.prop[i].flags != baseShape.prop[i].flags {
-                        matches = false
-                        break
+            let lastIdx = shape.propCount - 1
+            let lastMatches = lastIdx < shape.prop.count &&
+                shape.prop[lastIdx].atom == atom &&
+                shape.prop[lastIdx].flags.rawValue == propFlags
+            if let parent = shape.parent {
+                // A transition recorded from a base shape: the base's identity
+                // proves the prefix, only the last property needs checking.
+                if parent === baseShape && lastMatches { return shape }
+            } else if lastMatches {
+                // No parent link (root or captured shapes): verify that the
+                // first N-1 properties match baseShape.
+                var matches = true
+                let baseCount = baseShape.propCount
+                if baseCount <= shape.prop.count {
+                    for i in 0 ..< baseCount {
+                        if shape.prop[i].atom  != baseShape.prop[i].atom ||
+                           shape.prop[i].flags != baseShape.prop[i].flags {
+                            matches = false
+                            break
+                        }
                     }
+                } else {
+                    matches = false
                 }
-            } else {
-                matches = false
-            }
-
-            // Verify the new (last) property matches
-            if matches {
-                let lastIdx = shape.propCount - 1
-                if shape.prop[lastIdx].atom == atom &&
-                   shape.prop[lastIdx].flags.rawValue == propFlags {
-                    return shape
-                }
+                if matches { return shape }
             }
         }
         cur = shape.shapeHashNext
