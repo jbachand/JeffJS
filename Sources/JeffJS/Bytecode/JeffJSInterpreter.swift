@@ -6953,7 +6953,40 @@ struct JeffJSInterpreter {
                 }
 
             case .call_method:
-                let argc = Int(readU16(bc, pc + 1))
+                var argc = Int(readU16(bc, pc + 1))
+                // ── Function.prototype.call intrinsic ───────────────────
+                // f.call(thisArg, a, b) becomes a direct call of f with
+                // this = thisArg and args (a, b), rewritten on the stack: the
+                // receiver moves into the callee slot, the first argument
+                // into the this slot, the rest shift down one. This skips the
+                // native call layer and the argument array the builtin
+                // allocated on every call; the rest of call_method sees an
+                // ordinary call.
+                // Only for callees the inline path below will take (plain
+                // bytecode functions): that path reads the adjusted argc; the
+                // general path re-derives it from the bytecode.
+                if inlineCallsEnabled, let callObj = ctx.funcProtoCallObj,
+                   sp - argc - 2 >= spBase,
+                   let fnObj = buf[sp - argc - 1].obj, fnObj === callObj,
+                   let target = buf[sp - argc - 2].obj,
+                   let targetFb = target.fbFast, !targetFb.isGenerator, !targetFb.isAsyncFunc {
+                    let calleeSlot = sp - argc - 1
+                    let thisSlot = calleeSlot - 1
+                    let targetVal = buf[thisSlot]
+                    let callFnVal = buf[calleeSlot]
+                    if argc >= 1 {
+                        buf[thisSlot] = buf[calleeSlot + 1]
+                        buf[calleeSlot] = targetVal
+                        var i = calleeSlot + 1
+                        while i + 1 < sp { buf[i] = buf[i + 1]; i += 1 }
+                        sp -= 1
+                        argc -= 1
+                    } else {
+                        buf[thisSlot] = .undefined
+                        buf[calleeSlot] = targetVal
+                    }
+                    callFnVal.freeValue()   // the `call` function value the stack owned
+                }
                 // ── Array.prototype.push fast path ──────────────────────
                 // For arr.push(val) (the overwhelmingly common case), skip
                 // the full callFunction dispatch.  Conditions:

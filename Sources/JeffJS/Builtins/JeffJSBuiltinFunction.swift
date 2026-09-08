@@ -50,6 +50,7 @@ struct JeffJSBuiltinFunction {
             return call_(ctx: ctxArg, this: thisVal, args: args)
         }, name: "call", length: 1)
         _ = ctx.setPropertyStr(obj: ctx.functionProto, name: "call", value: callMethod)
+        ctx.funcProtoCallObj = callMethod.toObject()
 
         // Function.prototype.apply
         let applyMethod = ctx.newCFunction({ ctxArg, thisVal, args in

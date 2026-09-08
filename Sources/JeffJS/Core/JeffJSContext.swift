@@ -148,6 +148,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// Set during JeffJSBuiltinArray.addIntrinsic(). Used by call_method to skip the full
     /// callFunction dispatch when pushing a single element onto a dense array.
     var arrayProtoPushObj: JeffJSObject?
+    /// Function.prototype.call — identity for the call_method intrinsic that
+    /// turns `f.call(thisArg, ...)` into a direct call of `f`.
+    var funcProtoCallObj: JeffJSObject?
     /// Borrowed value form of `arrayProtoPushObj` (owned by Array.prototype)
     /// for pushing `arr.push` onto the stack without an inline cache.
     var arrayProtoPushVal: JeffJSValue = .undefined
