@@ -1936,7 +1936,8 @@ extension JeffJSContext {
 
     /// Gets the next value from an iterator.
     func iteratorNext(iter: JeffJSValue) -> JeffJSValue {
-        let nextFn = getPropertyStr(obj: iter, name: "next")
+        let nextFn = getProperty(obj: iter, atom: iterNextAtom)
+        defer { nextFn.freeValue() }   // was leaked once per step
         if nextFn.isFunction {
             return callFunction(nextFn, thisVal: iter, args: [])
         }
@@ -1945,18 +1946,20 @@ extension JeffJSContext {
 
     /// Checks if an iterator result is done.
     func iteratorCheckDone(result: JeffJSValue) -> Bool {
-        let done = getPropertyStr(obj: result, name: "done")
-        return jeffJS_fastToBool(done)
+        let done = getProperty(obj: result, atom: JeffJSAtomID.JS_ATOM_done.rawValue)
+        let r = jeffJS_fastToBool(done)
+        done.freeValue()
+        return r
     }
 
     /// Gets the value from an iterator result.
     func iteratorGetValue(result: JeffJSValue) -> JeffJSValue {
-        return getPropertyStr(obj: result, name: "value")
+        return getProperty(obj: result, atom: JeffJSAtomID.JS_ATOM_value.rawValue)
     }
 
     /// Closes an iterator.
     func iteratorClose(iter: JeffJSValue, isThrow: Bool) {
-        let returnFn = getPropertyStr(obj: iter, name: "return")
+        let returnFn = getProperty(obj: iter, atom: iterReturnAtom)
         if returnFn.isFunction {
             let r = callFunction(returnFn, thisVal: iter, args: [])
             r.freeValue()
@@ -6047,7 +6050,7 @@ struct JeffJSInterpreter {
                     let iter = saved.delegatedIter
                     var doneValue = resumeValue
                     var failed = false
-                    let retM = ctx.getPropertyStr(obj: iter, name: "return")
+                    let retM = ctx.getProperty(obj: iter, atom: ctx.iterReturnAtom)
                     if retM.isException {
                         failed = true
                     } else if retM.isFunction {
@@ -6127,7 +6130,7 @@ struct JeffJSInterpreter {
                     // yield* delegation: advance the inner iterator with the
                     // value sent by next(v) instead of pushing it.
                     let iter = saved.delegatedIter
-                    let nextM = ctx.getPropertyStr(obj: iter, name: "next")
+                    let nextM = ctx.getProperty(obj: iter, atom: ctx.iterNextAtom)
                     if nextM.isException {
                         retVal = .exception
                     } else if nextM.isFunction {
@@ -9353,7 +9356,7 @@ struct JeffJSInterpreter {
                     retVal = .exception
                     break dispatchLoop
                 }
-                let nextMethod = ctx.getPropertyStr(obj: iter, name: "next")
+                let nextMethod = ctx.getProperty(obj: iter, atom: ctx.iterNextAtom)
                 buf[sp] = iter; sp += 1
                 buf[sp] = obj; sp += 1
                 buf[sp] = nextMethod; sp += 1
@@ -9368,7 +9371,7 @@ struct JeffJSInterpreter {
                     retVal = .exception
                     break dispatchLoop
                 }
-                let nextMethod = ctx.getPropertyStr(obj: iter, name: "next")
+                let nextMethod = ctx.getProperty(obj: iter, atom: ctx.iterNextAtom)
                 buf[sp] = iter; sp += 1
                 buf[sp] = obj; sp += 1
                 buf[sp] = nextMethod; sp += 1
@@ -9478,10 +9481,13 @@ struct JeffJSInterpreter {
 
             case .iterator_get_value_done:
                 let result = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                let done = ctx.getPropertyStr(obj: result, name: "done")
-                let value = ctx.getPropertyStr(obj: result, name: "value")
+                let done = ctx.getProperty(obj: result, atom: JeffJSAtomID.JS_ATOM_done.rawValue)
+                let value = ctx.getProperty(obj: result, atom: JeffJSAtomID.JS_ATOM_value.rawValue)
+                let isDone = jeffJS_fastToBool(done)
+                done.freeValue()
+                result.freeValue()   // the popped result object was leaked per step
                 buf[sp] = value; sp += 1
-                buf[sp] = .newBool(jeffJS_fastToBool(done)); sp += 1
+                buf[sp] = .newBool(isDone); sp += 1
                 pc += 1
 
             case .iterator_close:

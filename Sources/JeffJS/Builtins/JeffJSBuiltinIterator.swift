@@ -276,13 +276,9 @@ struct JeffJSBuiltinIterator {
     /// - Returns: A new JS object `{ value, done }`.
     static func createIterResult(ctx: JeffJSContext, val: JeffJSValue,
                                   done: Bool) -> JeffJSValue {
-        let obj = ctx.newObject()
-        if obj.isException { return .exception }
-
-        ctx.setPropertyStr(obj: obj, name: "value", value: val.dupValue())
-        ctx.setPropertyStr(obj: obj, name: "done", value: .newBool(done))
-
-        return obj
+        // Shared `{ value, done }` shape: one object and two slot appends,
+        // instead of two string-interned property adds per step.
+        return ctx.makeIterResult(value: val.dupValue(), done: done)
     }
 
     // MARK: - Get Iterator Helper

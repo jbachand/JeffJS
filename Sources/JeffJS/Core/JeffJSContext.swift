@@ -102,6 +102,35 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// %IteratorPrototype% (JeffJSBuiltinIterator): parent of every builtin
     /// iterator prototype, so iterators are themselves iterable.
     var iteratorProto: JeffJSValue = .undefined
+    /// Iterator protocol names without predefined atoms, interned once.
+    lazy var iterNextAtom: UInt32 = rt.findAtom("next")
+    lazy var iterReturnAtom: UInt32 = rt.findAtom("return")
+    /// Transition shape of `{ value, done }` iterator results, captured from
+    /// the first one built: every later result is put on it directly.
+    var iterResultShape: JeffJSShape? = nil
+
+    /// Builds an iterator result `{ value, done }` (takes ownership of `value`).
+    func makeIterResult(value: JeffJSValue, done: Bool) -> JeffJSValue {
+        let obj = newObject()
+        guard let o = obj.toObject() else { return obj }
+        if let shape = iterResultShape, shape.isHashed, shape.propCount == 2,
+           o.propValues.count == 0, let old = o.shape {
+            shape.refCount += 1
+            o.shape = shape
+            jeffJS_leaveShape(rt, old)
+            o.appendDataValue(value)
+            o.appendDataValue(.newBool(done))
+            return obj
+        }
+        _ = setProperty(obj: obj, atom: JeffJSAtomID.JS_ATOM_value.rawValue, value: value)
+        _ = setProperty(obj: obj, atom: JeffJSAtomID.JS_ATOM_done.rawValue, value: .newBool(done))
+        if iterResultShape == nil, let sh = o.shape, sh.isHashed, sh.propCount == 2, o.propValues.count == 2 {
+            sh.refCount += 1   // the context keeps it alive
+            iterResultShape = sh
+        }
+        return obj
+    }
+
     /// Transition shapes of arguments objects, by argument count (0...8), for
     /// sloppy (with `callee`) and strict functions: captured from the first
     /// object built with that count, then every later one is put on the

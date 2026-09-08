@@ -51,8 +51,8 @@ extension JeffJSContext {
     /// Create an iterator result object { value, done }.
     func createIterResult(value: JeffJSValue, done: Bool) -> JeffJSValue {
         let obj = newObject()
-        _ = setPropertyStr(obj: obj, name: "value", value: value)
-        _ = setPropertyStr(obj: obj, name: "done", value: done ? .JS_TRUE : .JS_FALSE)
+        _ = setProperty(obj: obj, atom: JeffJSAtomID.JS_ATOM_value.rawValue, value: value)
+        _ = setProperty(obj: obj, atom: JeffJSAtomID.JS_ATOM_done.rawValue, value: done ? .JS_TRUE : .JS_FALSE)
         return obj
     }
 
