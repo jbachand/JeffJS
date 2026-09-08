@@ -619,3 +619,59 @@ arrow per call: the interpreter releases arguments only after bytecode
 callees because some builtins hand borrowed arguments to ownership-taking
 setters). The fix is to make every storing builtin dup and release after C
 callees too, verified with `JEFFJS_ZOMBIES=1`.
+
+### Round 8c (2026-09-07) — the rest of the browser-shaped hot paths
+
+Re-render burst **27.5 -> 25.5 ms per 100** (1.47x JavaScriptCore's
+interpreter; 40.2 at the start of Round 8). Real-world geomean **4.61x ->
+~4.1-4.2x** QuickJS (run-to-run noise on this machine is about 0.1x), all 38
+kernels byte-identical. Each item below shipped with conformance 1712/0, a
+zombie scan over the leak and stress sets, and no RSS change.
+
+- **Arguments objects share one transition shape per argument count** (sloppy
+  and strict, counts 0...8). N + 3 transition lookups per creation became slot
+  appends; length/callee/@@iterator are non-enumerable as the spec has them,
+  so Object.keys / JSON / spread over `arguments` now see the indices only.
+  `arguments-object` 5.8x -> 3.3x.
+- **`bind` builds a real bound function** (JS_CLASS_BOUND_FUNCTION with the
+  .boundFunction payload the call paths already unwrapped) instead of a Swift
+  closure wrapped in a C function. `new` through a bound function works,
+  instanceof unwraps to the target, length/name are right and non-enumerable,
+  [[BoundThis]] is used as is.
+- **Native calls stop copying the payload enum**: isCallable answers from the
+  mirrored fbFast/cFuncFast fields, and callFunction checks cFuncFast before
+  the bound-function payload match. **Arrays share the shape that holds
+  length** (arrayShape was never populated, so every literal paid a
+  root-shape lookup plus a transition). Re-render 27.0 -> 25.5 ms.
+- **Shape transitions match by parent identity.** findHashedShape re-compared
+  all N-1 earlier properties per add, so building an object with N keys was
+  O(N^2); a hashed transition now records the shape it came from.
+  `object-dictionary` 11.0x -> 3.3x.
+- **String builtins read code units from the string's own storage** through a
+  CodeUnits view (split, trim family, slice, substring, substr, indexOf,
+  includes, startsWith, case mapping with an ASCII fast path). Every method
+  used to widen Latin-1 into [UInt16] on entry and narrow on exit.
+  `string-split-trim` 8.4x -> 6.0x.
+- **Iterator protocol on atoms with a shared { value, done } shape**; the
+  next method and result object leaked per step are released.
+  `generators-iterators` 12.5x -> ~10.5x.
+- **RegExp.exec caches group names** on the compiled pattern (it copied and
+  re-parsed the bytecode per match) and shares the match-result shape.
+  `regex-tokenize` 10.6x -> 9.5x.
+
+Found, not fixed: `for..of` does not call the iterator's `return()` when the
+loop body throws (only on `break`); `String.prototype.matchAll` results are
+not iterable; the `groups` object of a match has Object.prototype instead of
+a null prototype; `/./u` matches one code unit of a surrogate pair; a bound
+function's `name` is "bound " because bytecode functions still have no own
+`name`; sloppy-mode arguments do not alias parameters, `arguments.callee` does
+not throw in strict mode, and `Object.prototype.toString` reports
+`[object Object]` for arguments.
+
+Next levers, from the profiles: `Function.prototype.call/apply` as
+interpreter intrinsics (the kernel is per-call argument arrays, 7.4x);
+the per-yield generator save/restore (`generatorResume` is 43% of that
+kernel); the regex VM allocated per exec; proxies (8x); getters/setters
+(7x, the accessor call path); and the structural items from Round 8:
+`callInternal` self time, retain/release around it, and the payload-enum
+copies still visible in every profile.
