@@ -235,29 +235,15 @@ struct JeffJSBuiltinFunction {
     /// Mirrors `js_function_bind` in QuickJS.
     static func bind(ctx: JeffJSContext, this: JeffJSValue,
                      args: [JeffJSValue]) -> JeffJSValue {
-        // `this` must be callable
         guard let targetObj = getObject(this), targetObj.isCallable else {
             return ctx.throwTypeError("not a function")
         }
-
-        // Captured by the bound function's closure: take our own references
-        // (the caller releases its argument references after the call).
         let thisArg: JeffJSValue = (args.isEmpty ? .undefined : args[0]).dupValue()
         let boundArgs: [JeffJSValue] = args.count > 1 ? args[1...].map { $0.dupValue() } : []
 
-        // Capture the target function and bound state in a closure.
-        // When the bound function is called, prepend boundArgs to the
-        // call-site args and invoke the original target with the bound this.
-        let capturedFunc = this.dupValue()
-        let capturedThis = thisArg
-        let capturedBoundArgs = boundArgs
-
-        let boundClosure: (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue = { callCtx, _, callArgs in
-            let fullArgs = capturedBoundArgs + callArgs
-            return callCtx.callFunction(capturedFunc, thisVal: capturedThis, args: fullArgs)
-        }
-
-        // Compute the new length: max(0, targetLength - boundArgs.count)
+        // length = max(0, target.length - bound argument count). Bytecode
+        // functions carry their parameter count on the bytecode (they have no
+        // own `length` property yet).
         var targetLength: Int32 = 0
         let targetLengthVal = targetObj.getOwnPropertyValue(
             atom: JeffJSAtomID.JS_ATOM_length.rawValue)
@@ -266,11 +252,13 @@ struct JeffJSBuiltinFunction {
         } else if targetLengthVal.isFloat64 {
             let d = targetLengthVal.toFloat64()
             if d.isFinite { targetLength = Int32(d) }
+        } else if let fb = targetObj.fbFast {
+            targetLength = Int32(fb.argCount)
         }
         let newLength = max(Int32(0), targetLength - Int32(boundArgs.count))
-
-        // Build the name: "bound " + targetName
-        var targetName = "anonymous"
+        // name = "bound " + target.name (an empty string when the target has
+        // no string-valued name, per ES §10.4.1.3).
+        var targetName = ""
         let targetNameVal = targetObj.getOwnPropertyValue(
             atom: JeffJSAtomID.JS_ATOM_name.rawValue)
         if targetNameVal.isString, let nameStr = targetNameVal.stringValue {
@@ -278,18 +266,22 @@ struct JeffJSBuiltinFunction {
         }
         let boundName = "bound \(targetName)"
 
-        // Create the bound function via newCFunction so the interpreter's
-        // callFunction dispatches it through the .cFunc path.
-        let boundVal = ctx.newCFunction(boundClosure, name: boundName, length: Int(newLength))
-
-        // Per ES spec, bound functions inherit the target's prototype for
-        // instanceof checks. Copy the prototype property from the target.
-        let targetProto = ctx.getProperty(obj: this,
-                                          atom: JeffJSAtomID.JS_ATOM_prototype.rawValue)
-        if targetProto.isObject {
-            ctx.setPropertyStr(obj: boundVal, name: "prototype", value: targetProto)
-        }
-
+        // A real bound-function object (JS_CLASS_BOUND_FUNCTION with a
+        // .boundFunction payload): callFunction, callInternal and
+        // callConstructor unwrap it directly, and instanceof walks through it
+        // to the target. The old version wrapped a Swift closure in a C
+        // function, so every call through a bound function paid native
+        // dispatch, a closure context and an array concatenation on top of the
+        // target call; `new` through it lost the bound arguments, and it
+        // carried an enumerable copy of the target's prototype.
+        let boundVal = ctx.newObjectClass(classID: JSClassID.JS_CLASS_BOUND_FUNCTION.rawValue)
+        guard let boundObj = boundVal.toObject() else { return boundVal }
+        boundObj.payload = .boundFunction(JeffJSBoundFunction(funcObj: this.dupValue(), thisVal: thisArg,
+                                                              argc: boundArgs.count, argv: boundArgs))
+        _ = ctx.definePropertyValue(obj: boundVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
+                                    value: ctx.newStringValue(boundName), flags: JS_PROP_CONFIGURABLE)
+        _ = ctx.definePropertyValue(obj: boundVal, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
+                                    value: .newInt32(newLength), flags: JS_PROP_CONFIGURABLE)
         return boundVal
     }
 

@@ -227,11 +227,17 @@ extension JeffJSContext {
     /// `target.prototype`.  Per ECMAScript spec section 7.3.21.
     func ordinaryHasInstance(_ target: JeffJSValue, _ val: JeffJSValue) -> Bool {
         // 1. If target is not callable, return false (handled by caller).
-        // 2. Bound functions have .prototype copied from target at bind() time.
+        // 2. A bound function has no prototype of its own: test against its
+        //    target (following a chain of bindings).
+        var target = target
+        while let tObj = target.toObject(), case .boundFunction(let bound) = tObj.payload {
+            target = bound.funcObj
+        }
         // 3. If val is not an object, return false.
         guard let valObj = val.toObject() else { return false }
         // 4. Let P be target.prototype
         let protoVal = getProperty(obj: target, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue)
+        defer { protoVal.freeValue() }
         guard protoVal.isObject, let targetProto = protoVal.toObject() else { return false }
         // 5. Walk the prototype chain of val looking for P.
         //    obj.proto is the single source of truth for the prototype.
@@ -309,8 +315,7 @@ extension JeffJSContext {
         if case .boundFunction(let bound) = obj.payload {
             var fullArgs = bound.argv
             fullArgs.append(contentsOf: args)
-            let boundThis = bound.thisVal.isUndefined ? thisVal : bound.thisVal
-            return callFunction(bound.funcObj, thisVal: boundThis, args: fullArgs)
+            return callFunction(bound.funcObj, thisVal: bound.thisVal, args: fullArgs)   // [[BoundThis]] as is
         }
         // C function path (mirrored fields: no payload copy per call)
         if let cf = obj.cFuncFast {
@@ -5850,8 +5855,7 @@ struct JeffJSInterpreter {
             if case .boundFunction(let bound) = obj.payload {
                 var fullArgs = bound.argv
                 fullArgs.append(contentsOf: args)
-                let boundThis = bound.thisVal.isUndefined ? thisVal : bound.thisVal
-                return ctx.callFunction(bound.funcObj, thisVal: boundThis, args: fullArgs)
+                return ctx.callFunction(bound.funcObj, thisVal: bound.thisVal, args: fullArgs)   // [[BoundThis]] as is
             }
             // Callable proxy: delegate to the proxy apply trap handler
             if case .proxyData = obj.payload {
