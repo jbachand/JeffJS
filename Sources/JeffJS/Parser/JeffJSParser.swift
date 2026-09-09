@@ -4680,11 +4680,30 @@ final class JeffJSParser {
                 inFlag = true
                 while tok != 0x29 && tok != JSTokenType.TOK_EOF.rawValue && !shouldAbort {
                     if tok == JSTokenType.TOK_ELLIPSIS.rawValue {
-                        hasSpread = true
+                        if !hasSpread {
+                            // First spread: `.apply` wants a single args array, so pack
+                            // the plain arguments parsed so far into one (same
+                            // incremental strategy as array literals; `array_from`
+                            // only pops the sentinel object literals push, and the
+                            // value below the args here is the callee, so it's left alone).
+                            hasSpread = true
+                            emitOp(.array_from)
+                            emitU16(UInt16(argc))
+                            // Stack: [..., func, argsArray]
+                        }
                         next()
+                        parseAssignExpr()
+                        // Stack: [..., func, argsArray, iterable]
+                        emitSpreadAppend()
+                        // Stack: [..., func, argsArray]
+                    } else {
+                        parseAssignExpr()
+                        if hasSpread {
+                            emitOp(.append)          // [..., func, argsArray]
+                        } else {
+                            argc += 1
+                        }
                     }
-                    parseAssignExpr()
-                    argc += 1
                     if tok == 0x2C { // ','
                         next()
                     }
@@ -4696,7 +4715,12 @@ final class JeffJSParser {
                     // Emit call_method so the parent constructor is called
                     // with the derived constructor's `this` as the receiver.
                     // Stack: ..., this, parentCtor, arg0, ..., argN
-                    emitCallMethod(argc)
+                    if hasSpread {
+                        emitOp(.apply)   // [this, parentCtor, argsArray] -> result
+                        emitU16(UInt16(argc))
+                    } else {
+                        emitCallMethod(argc)
+                    }
                     // Drop the parent constructor's return value and leave
                     // `this` as the value of the `super(...)` expression (ES
                     // semantics). The enclosing statement drops that; emitting
@@ -5035,11 +5059,19 @@ final class JeffJSParser {
                 var hasSpread = false
                 while tok != 0x29 && tok != JSTokenType.TOK_EOF.rawValue && !shouldAbort {
                     if tok == JSTokenType.TOK_ELLIPSIS.rawValue {
-                        hasSpread = true
+                        if !hasSpread {
+                            // Pack the plain args parsed so far; see parseCallExpr.
+                            hasSpread = true
+                            emitOp(.array_from)
+                            emitU16(UInt16(argc))
+                        }
                         next()
+                        parseAssignExpr()
+                        emitSpreadAppend()      // [func, newTarget, argsArray]
+                    } else {
+                        parseAssignExpr()
+                        if hasSpread { emitOp(.append) } else { argc += 1 }
                     }
-                    parseAssignExpr()
-                    argc += 1
                     if tok == 0x2C { next() }
                 }
                 expect(0x29)
@@ -5813,36 +5845,7 @@ final class JeffJSParser {
                 next()
                 parseAssignExpr()
                 // Stack: [array, iterable]
-
-                emitOp(.for_of_start)
-                // Stack: [array, iter, obj, method]
-
-                let loopLabel = newLabel()
-                let doneLabel = newLabel()
-
-                emitLabel(loopLabel)
-                emitOp(.for_of_next)
-                emitU8(0)
-                // Stack: [array, iter, obj, method, value, done]
-                emitIfTrue(doneLabel)
-                // Stack: [array, iter, obj, method, value]
-
-                // Rotate value down next to array, then append.
-                emitOp(.rot5l)
-                // Stack: [iter, obj, method, value, array]
-                emitOp(.swap)
-                // Stack: [iter, obj, method, array, value]
-                emitOp(.append)
-                // Stack: [iter, obj, method, array]
-                emitOp(.perm4)
-                // Stack: [array, iter, obj, method]
-
-                emitGoto(loopLabel)
-
-                emitLabel(doneLabel)
-                // Stack: [array, iter, obj, method, value]
-                emitOp(.drop)           // drop value
-                emitOp(.iterator_close) // pops [iter, obj, method]
+                emitSpreadAppend()
                 // Stack: [array]
             } else {
                 // --- normal element ---
@@ -5869,6 +5872,41 @@ final class JeffJSParser {
         }
         // If hasSpread, the array was already built incrementally and is on
         // the stack as a proper Array.  Nothing more to emit.
+    }
+
+    /// Stack: [array, iterable] -> [array]. Iterates the iterable and appends
+    /// every value to the array. Shared by array literals and spread call args.
+    func emitSpreadAppend() {
+        emitOp(.for_of_start)
+        // Stack: [array, iter, obj, method]
+
+        let loopLabel = newLabel()
+        let doneLabel = newLabel()
+
+        emitLabel(loopLabel)
+        emitOp(.for_of_next)
+        emitU8(0)
+        // Stack: [array, iter, obj, method, value, done]
+        emitIfTrue(doneLabel)
+        // Stack: [array, iter, obj, method, value]
+
+        // Rotate value down next to array, then append.
+        emitOp(.rot5l)
+        // Stack: [iter, obj, method, value, array]
+        emitOp(.swap)
+        // Stack: [iter, obj, method, array, value]
+        emitOp(.append)
+        // Stack: [iter, obj, method, array]
+        emitOp(.perm4)
+        // Stack: [array, iter, obj, method]
+
+        emitGoto(loopLabel)
+
+        emitLabel(doneLabel)
+        // Stack: [array, iter, obj, method, value]
+        emitOp(.drop)           // drop value
+        emitOp(.iterator_close) // pops [iter, obj, method]
+        // Stack: [array]
     }
 
     // =========================================================================

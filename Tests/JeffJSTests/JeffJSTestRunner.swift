@@ -2790,6 +2790,40 @@ extension JeffJSTestRunner {
             add(...[1, 2, 3])
             """, expectInt: 6)
 
+        // Mixed plain + spread arguments (regression: the plain args used to be
+        // pushed individually, so `.apply` saw the last plain arg as the callee)
+        evalCheck(ctx, """
+            function add(a, b, c) { return a + b + c; }
+            add(1, ...[2, 3])
+            """, expectInt: 6)
+        evalCheck(ctx, """
+            function add(a, b, c) { return a + b + c; }
+            add(...[1], 2, ...[3])
+            """, expectInt: 6)
+        evalCheckStr(ctx, """
+            function join() { return Array.prototype.join.call(arguments, ','); }
+            join('h', ...[])
+            """, expect: "h")
+        evalCheck(ctx, """
+            var o = { m: function (a, b, c) { return a + b + c; } };
+            o.m(1, ...[2, 3])
+            """, expectInt: 6)
+        evalCheck(ctx, """
+            function P() { this.n = arguments.length; }
+            new P('h', ...['x', 'y']).n
+            """, expectInt: 3)
+        evalCheckStr(ctx, """
+            class P { constructor(...a) { this.s = a.join(','); } }
+            class D extends P { constructor(x, ...r) { super(x, ...r, 'd'); } }
+            new D('h', 'x').s
+            """, expect: "h,x,d")
+        evalCheck(ctx, "Math.max(1, ...[5, 3])", expectInt: 5)
+        evalCheckStr(ctx, """
+            var wrap = (name, ...args) => name + '|' + args.join('+');
+            var call = k => wrap('tag', k, ...[1, 2]);
+            call('x')
+            """, expect: "tag|x+1+2")
+
         // Object spread
         evalCheck(ctx, """
             var o = {...{a: 1}, ...{b: 2}};
