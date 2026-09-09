@@ -336,6 +336,19 @@ public final class JeffJSEnvironment {
         _ = runtime.executePendingJobs()
     }
 
+    // MARK: - Native functions
+
+    /// Install a global function that JavaScript can call into Swift.
+    /// Arguments arrive coerced to strings (use JSON for structured data);
+    /// return a string to hand a value back, or nil for `undefined`.
+    public func registerNativeFunction(_ name: String, _ body: @escaping ([String]) -> String?) {
+        context.setGlobalFunc(name: name, fn: { ctx, _, args in
+            let strings = args.map { ctx.toSwiftString($0) ?? "" }
+            guard let out = body(strings) else { return .undefined }
+            return ctx.newStringValue(out)
+        }, length: 0)
+    }
+
     // MARK: - Autocomplete
 
     /// Returns property name completions for a JS object expression.
