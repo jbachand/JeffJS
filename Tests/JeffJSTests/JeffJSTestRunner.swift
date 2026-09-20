@@ -3054,6 +3054,18 @@ extension JeffJSTestRunner {
 
         // BigInt to string
         evalCheckStr(ctx, "String(42n)", expect: "42")
+
+        // Regression: BigInt() of a value outside Int32's range used to trap
+        // the process in mkShortBigInt (`Int32(val)` on an Int64 out of range).
+        evalCheckStr(ctx, "String(BigInt(-2147483649))", expect: "-2147483649")
+        evalCheckStr(ctx, "String(BigInt(2147483648))", expect: "2147483648")
+        evalCheckStr(ctx, "String(BigInt(-1e15))", expect: "-1000000000000000")
+
+        // Regression: ToUint32 on a typed-array store is modular, not a
+        // trapping `UInt32(Double)` conversion.
+        evalCheckDouble(ctx, "var u = new Uint32Array(1); u[0] = -1; u[0]", expect: 4294967295, tolerance: 0)
+        evalCheck(ctx, "var u2 = new Uint32Array(1); u2[0] = 4294967303; u2[0]", expectInt: 7)
+        evalCheckDouble(ctx, "var u3 = new Uint32Array(1); u3[0] = -1.5; u3[0]", expect: 4294967295, tolerance: 0)
     }
 
     // MARK: - Math

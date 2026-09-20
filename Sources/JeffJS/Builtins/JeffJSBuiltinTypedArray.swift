@@ -175,8 +175,10 @@ struct TypedArrayElementInfo {
             data[offset + 3] = UInt8((raw >> 24) & 0xFF)
 
         case JeffJSClassID.uint32Array.rawValue:
-            let d = value.isInt ? Double(value.toInt32()) : value.toNumber()
-            var raw = UInt32(d.isNaN ? 0 : d)
+            // ToUint32 is modular: `UInt32(d)` trapped on negatives and on
+            // anything >= 2^32 (e.g. `new Uint32Array(1)[0] = -1`).
+            let v: Int32 = value.isInt ? value.toInt32() : Self.safeDoubleToInt32(value.toNumber())
+            var raw = UInt32(bitPattern: v)
             if !littleEndian { raw = raw.byteSwapped }
             data[offset] = UInt8(raw & 0xFF)
             data[offset + 1] = UInt8((raw >> 8) & 0xFF)
