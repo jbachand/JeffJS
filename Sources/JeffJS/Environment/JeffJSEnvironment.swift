@@ -8,6 +8,9 @@
 // Extracted from JSScriptEngine.swift's JeffJS initialization path.
 
 import Foundation
+#if canImport(CoreGraphics)
+import CoreGraphics  // CGRect/CGPoint/CGSize geometry helpers for the layout-rect store
+#endif
 
 // MARK: - Eval Result
 
@@ -334,6 +337,41 @@ public final class JeffJSEnvironment {
     /// Drain the microtask/job queue.
     public func drainJobs() {
         _ = runtime.executePendingJobs()
+    }
+
+    // MARK: - Layout Geometry
+
+    /// Pushes document-coordinate layout rects (keyed by `DOMNode.id`) and the
+    /// viewport size to the DOM bridge so `getBoundingClientRect()`,
+    /// `offsetWidth/Height`, `clientWidth/Height`, `scrollWidth/Height`,
+    /// `offsetTop/Left` and friends return real values. Call after every layout pass.
+    public func updateLayoutRects(_ rects: [UUID: CGRect], viewport: CGSize) {
+        domBridge?.updateLayoutRects(rects, viewport: viewport)
+    }
+
+    /// Updates one node's layout rect without replacing the rest of the store.
+    public func setLayoutRect(_ rect: CGRect, for nodeID: UUID) {
+        domBridge?.setLayoutRect(rect, for: nodeID)
+    }
+
+    /// Root scroll position in document px. `getBoundingClientRect()` subtracts it;
+    /// `window.scrollX/scrollY` and `document.documentElement.scrollTop/Left` read/write it.
+    public var scrollOffset: CGPoint {
+        get { domBridge?.scrollOffset ?? .zero }
+        set { domBridge?.scrollOffset = newValue }
+    }
+
+    /// Fired when JS scrolls an element (`scrollTop`/`scrollLeft`/`scrollTo`/`scrollBy`)
+    /// or the window (`window.scrollY = …`, `scrollTo`). A nil node means the root.
+    public var onScrollChange: ((_ node: DOMNode?, _ position: CGPoint) -> Void)? {
+        get { domBridge?.onScrollChange }
+        set { domBridge?.onScrollChange = newValue }
+    }
+
+    /// Returns and clears the node IDs for which JS called `scrollIntoView()`.
+    @discardableResult
+    public func drainScrollIntoViewRequests() -> [UUID] {
+        domBridge?.drainScrollIntoViewRequests() ?? []
     }
 
     // MARK: - Native functions

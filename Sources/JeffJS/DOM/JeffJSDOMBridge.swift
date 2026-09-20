@@ -11,6 +11,9 @@
 // instead of JavaScriptCore.
 
 import Foundation
+#if canImport(CoreGraphics)
+import CoreGraphics  // CGRect/CGPoint/CGSize geometry helpers for the layout-rect store
+#endif
 
 // MARK: - Mutation Observer Typealias
 
@@ -68,6 +71,39 @@ final class JeffJSDOMBridge {
     /// which provides proper capture/at-target/bubble phase dispatch.
     weak var eventBridge: JeffJSEventBridge?
 
+    // MARK: - Layout Geometry State
+
+    /// Layout rects in **document** coordinates keyed by `DOMNode.id`, pushed by the
+    /// host after every layout pass (same shape as the JSC path's `layoutRects`).
+    public private(set) var layoutRects: [UUID: CGRect] = [:]
+
+    /// Viewport size reported with the last layout pass. `.zero` until the host
+    /// pushes one; used for `documentElement.clientWidth/clientHeight`.
+    public private(set) var viewportSize: CGSize = .zero
+
+    /// Root scroll position in document px. `getBoundingClientRect()` subtracts it
+    /// to produce viewport coordinates; `window.scrollX/scrollY` and
+    /// `documentElement.scrollTop/scrollLeft` read and write it.
+    public var scrollOffset: CGPoint = .zero
+
+    /// Per-element `scrollTop`/`scrollLeft` values assigned from JS.
+    private var elementScrollPositions: [UUID: CGPoint] = [:]
+
+    /// Cache of `scrollWidth`/`scrollHeight` per node (descendant union is O(n));
+    /// cleared whenever any rect changes.
+    private var scrollSizeCache: [UUID: CGSize] = [:]
+
+    /// Node IDs for which JS called `scrollIntoView()` since the host last drained.
+    public private(set) var scrollIntoViewRequests: [UUID] = []
+
+    /// Optional hook fired when JS scrolls an element (`scrollTop`/`scrollLeft`
+    /// setters, `scrollTo`/`scrollBy`) or the window. `nil` node means the root.
+    /// The regular mutation callback (`onMutated`) is also fired for element scrolls.
+    public var onScrollChange: ((DOMNode?, CGPoint) -> Void)?
+
+    /// Shared prototype for DOMRect objects returned by getBoundingClientRect().
+    private var domRectPrototype: JeffJSValue?
+
     // MARK: - Init
 
     init(
@@ -101,7 +137,44 @@ final class JeffJSDOMBridge {
         elementPrototype?.freeValue()
         elementPrototype = nil
 
+        domRectPrototype?.freeValue()
+        domRectPrototype = nil
+
         nodeRegistry.removeAll()
+        layoutRects.removeAll()
+        elementScrollPositions.removeAll()
+        scrollSizeCache.removeAll()
+        scrollIntoViewRequests.removeAll()
+        scrollOffset = .zero
+    }
+
+    // MARK: - Layout Geometry (host -> bridge)
+
+    /// Replaces the layout-rect store with the result of a full layout pass.
+    /// Rects are in document coordinates, keyed by `DOMNode.id`.
+    public func updateLayoutRects(_ rects: [UUID: CGRect], viewport: CGSize) {
+        layoutRects = rects
+        viewportSize = viewport
+        scrollSizeCache.removeAll()
+    }
+
+    /// Updates a single node's rect (incremental layout) without touching the others.
+    public func setLayoutRect(_ rect: CGRect, for nodeID: UUID) {
+        layoutRects[nodeID] = rect
+        scrollSizeCache.removeAll()
+    }
+
+    /// The document-coordinate rect for a node, if the host has laid it out.
+    public func layoutRect(for nodeID: UUID) -> CGRect? {
+        layoutRects[nodeID]
+    }
+
+    /// Returns and clears the `scrollIntoView()` requests recorded since the last call.
+    @discardableResult
+    public func drainScrollIntoViewRequests() -> [UUID] {
+        let pending = scrollIntoViewRequests
+        scrollIntoViewRequests.removeAll()
+        return pending
     }
 
     /// Clears event listeners, element cache, and node registry for a node
@@ -124,6 +197,7 @@ final class JeffJSDOMBridge {
         }
         elementCache.removeValue(forKey: nodeID)
         nodeRegistry.removeValue(forKey: nodeID)
+        elementScrollPositions.removeValue(forKey: nodeID)
     }
 
     // MARK: - Registration Entry Point
@@ -134,6 +208,12 @@ final class JeffJSDOMBridge {
 
         // -- window alias --
         ctx.setPropertyStr(obj: global, name: "window", value: global.dupValue())
+
+        // -- window.scrollX/scrollY/pageXOffset/pageYOffset --
+        // Accessors over `scrollOffset`, installed before any polyfill runs so a
+        // host polyfill's `if (typeof window.scrollY === 'undefined') window.scrollY = 0`
+        // guard skips them and its scrollTo/scrollBy assignments land in the setter.
+        registerWindowScrollAccessors(on: global, ctx: ctx)
 
         // -- document object --
         let docObj = buildDocumentObject(ctx: ctx)
@@ -365,10 +445,25 @@ final class JeffJSDOMBridge {
             return self.wrapElement(html, ctx: ctx)
         }, length: 0)
 
+        // scrollingElement (standards mode: <html>)
+        ctx.setPropertyFunc(obj: doc, name: "__get_scrollingElement", fn: { [weak self] ctx, _, _ in
+            guard let self else { return JeffJSValue.null }
+            guard let html = self.findElement(in: self.root, where: { $0.tagName == "html" }) else {
+                return JeffJSValue.null
+            }
+            return self.wrapElement(html, ctx: ctx)
+        }, length: 0)
+
         // Install getter properties via a small eval shim.
         // Uses literal property names (no forEach+closure) to avoid JeffJS var_ref issues.
         let shim = """
         (function(d) {
+            if (typeof d.__get_scrollingElement === 'function') {
+                Object.defineProperty(d, 'scrollingElement', {
+                    configurable: true, enumerable: true,
+                    get: function() { return this.__get_scrollingElement(); }
+                });
+            }
             if (typeof d.__get_body === 'function') {
                 Object.defineProperty(d, 'body', {
                     configurable: true, enumerable: true,
@@ -869,14 +964,8 @@ final class JeffJSDOMBridge {
         ctx.setPropertyFunc(obj: el, name: "focus", fn: { _, _, _ in JeffJSValue.undefined }, length: 0)
         ctx.setPropertyFunc(obj: el, name: "blur", fn: { _, _, _ in JeffJSValue.undefined }, length: 0)
 
-        // getBoundingClientRect() — returns a zero rect (layout rects not yet wired)
-        ctx.setPropertyFunc(obj: el, name: "getBoundingClientRect", fn: { ctx, _, _ in
-            let rect = ctx.newObject()
-            for name in ["x", "y", "top", "left", "bottom", "right", "width", "height"] {
-                ctx.setPropertyStr(obj: rect, name: name, value: .newFloat64(0))
-            }
-            return rect
-        }, length: 0)
+        // -- Geometry: getBoundingClientRect / getClientRects / scrolling --
+        registerElementGeometryMethods(on: el, ctx: ctx)
 
         // checkVisibility(options?) — used by apple.com's globalheader.umd.js.
         // Returns true unless the element has the `hidden` attribute, or
@@ -1251,6 +1340,9 @@ final class JeffJSDOMBridge {
             guard let targetNode = self.extractNode(from: thisVal) else { return ctx.newObject() }
             return self.buildClassListObject(for: targetNode, ctx: ctx)
         }, length: 0)
+
+        // -- Geometry accessors (offset*/client*/scroll*) --
+        registerElementGeometryAccessors(on: el, ctx: ctx)
     }
 
     /// Installs getter/setter accessor properties on the element object using
@@ -1274,6 +1366,13 @@ final class JeffJSDOMBridge {
             ("nextElementSibling", false), ("previousElementSibling", false),
             ("firstElementChild", false), ("lastElementChild", false),
             ("childElementCount", false),
+            // Geometry (see registerElementGeometryAccessors)
+            ("offsetWidth", false), ("offsetHeight", false),
+            ("offsetTop", false), ("offsetLeft", false), ("offsetParent", false),
+            ("clientWidth", false), ("clientHeight", false),
+            ("clientTop", false), ("clientLeft", false),
+            ("scrollWidth", false), ("scrollHeight", false),
+            ("scrollTop", true), ("scrollLeft", true),
         ]
 
         for (name, hasSetter) in props {
@@ -1297,6 +1396,295 @@ final class JeffJSDOMBridge {
             ctx.setPropertyStr(obj: el, name: "classList", value: classList)
         }
         getClassList.freeValue()
+    }
+
+    // MARK: - Geometry (layout rects -> JS)
+
+    /// Installs `scrollX`/`scrollY`/`pageXOffset`/`pageYOffset` accessors on the
+    /// global object, backed by `scrollOffset`. Setters update the offset and fire
+    /// `onScrollChange(nil, offset)` so the host can scroll the real view.
+    private func registerWindowScrollAccessors(on global: JeffJSValue, ctx: JeffJSContext) {
+        let axes: [(names: [String], horizontal: Bool)] = [
+            (["scrollX", "pageXOffset"], true),
+            (["scrollY", "pageYOffset"], false),
+        ]
+        for axis in axes {
+            let horizontal = axis.horizontal
+            for name in axis.names {
+                // newCFunction returns an owned value; setPropertyGetSet stores the
+                // raw object pointers, taking over that reference.
+                let getter = ctx.newCFunction({ [weak self] _, _, _ in
+                    guard let self else { return .newInt32(0) }
+                    return Self.numberValue(horizontal ? self.scrollOffset.x : self.scrollOffset.y)
+                }, name: "get \(name)", length: 0)
+                let setter = ctx.newCFunction({ [weak self] ctx, _, args in
+                    guard let self, !args.isEmpty else { return JeffJSValue.undefined }
+                    let v = ctx.toFloat64(args[0]) ?? 0
+                    if horizontal { self.scrollOffset.x = v } else { self.scrollOffset.y = v }
+                    self.onScrollChange?(nil, self.scrollOffset)
+                    return JeffJSValue.undefined
+                }, name: "set \(name)", length: 1)
+                ctx.setPropertyGetSet(obj: global, name: name, getter: getter, setter: setter)
+            }
+        }
+    }
+
+    /// getBoundingClientRect(), getClientRects(), scrollIntoView(), scrollTo/scroll/scrollBy.
+    private func registerElementGeometryMethods(on el: JeffJSValue, ctx: JeffJSContext) {
+        // getBoundingClientRect() -> DOMRect in viewport coordinates
+        ctx.setPropertyFunc(obj: el, name: "getBoundingClientRect", fn: { [weak self] ctx, thisVal, _ in
+            guard let self else { return ctx.newObject() }
+            let node = self.extractNode(from: thisVal)
+            let rect = node.map { self.resolvedLayoutRect(for: $0) } ?? .zero
+            return self.buildDOMRect(rect, ctx: ctx)
+        }, length: 0)
+
+        // getClientRects() -> one-element array-like (DOMRectList shape: length + item())
+        ctx.setPropertyFunc(obj: el, name: "getClientRects", fn: { [weak self] ctx, thisVal, _ in
+            guard let self else { return ctx.newArray() }
+            let node = self.extractNode(from: thisVal)
+            let rect = node.map { self.resolvedLayoutRect(for: $0) } ?? .zero
+            let list = ctx.newArray()
+            ctx.setPropertyUint32(obj: list, index: 0, value: self.buildDOMRect(rect, ctx: ctx))
+            ctx.setPropertyFunc(obj: list, name: "item", fn: { ctx, listVal, args in
+                let idx = args.isEmpty ? 0 : (ctx.toInt32(args[0]) ?? -1)
+                guard idx == 0 else { return JeffJSValue.null }
+                return ctx.getPropertyUint32(obj: listVal, index: 0)  // owned -> returned to caller
+            }, length: 1)
+            return list
+        }, length: 0)
+
+        // scrollIntoView(arg?) — no-op for layout; records the request for the host.
+        ctx.setPropertyFunc(obj: el, name: "scrollIntoView", fn: { [weak self] _, thisVal, _ in
+            guard let self, let node = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+            self.scrollIntoViewRequests.append(node.id)
+            let rect = self.resolvedLayoutRect(for: node)
+            self.onScrollChange?(node, CGPoint(x: rect.minX, y: rect.minY))
+            return JeffJSValue.undefined
+        }, length: 1)
+        ctx.setPropertyFunc(obj: el, name: "scrollIntoViewIfNeeded", fn: { [weak self] _, thisVal, _ in
+            guard let self, let node = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+            self.scrollIntoViewRequests.append(node.id)
+            return JeffJSValue.undefined
+        }, length: 1)
+
+        // scrollTo(x, y) / scrollTo({left, top}) / scroll(...) / scrollBy(...)
+        let scrollFn: (Bool) -> JeffJSNativeFunc = { relative in
+            { [weak self] ctx, thisVal, args in
+                guard let self, let node = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+                let current = self.scrollPosition(of: node)
+                var x = relative ? 0 : current.x
+                var y = relative ? 0 : current.y
+                if let first = args.first, first.isObject {
+                    let left = ctx.getPropertyStr(obj: first, name: "left")
+                    let top = ctx.getPropertyStr(obj: first, name: "top")
+                    defer { left.freeValue(); top.freeValue() }
+                    if !left.isUndefined { x = ctx.toFloat64(left) ?? 0 }
+                    if !top.isUndefined { y = ctx.toFloat64(top) ?? 0 }
+                } else {
+                    if args.count > 0 { x = ctx.toFloat64(args[0]) ?? 0 }
+                    if args.count > 1 { y = ctx.toFloat64(args[1]) ?? 0 }
+                }
+                let target = relative ? CGPoint(x: current.x + x, y: current.y + y) : CGPoint(x: x, y: y)
+                self.setScrollPosition(target, for: node)
+                return JeffJSValue.undefined
+            }
+        }
+        ctx.setPropertyFunc(obj: el, name: "scrollTo", fn: scrollFn(false), length: 2)
+        ctx.setPropertyFunc(obj: el, name: "scroll", fn: scrollFn(false), length: 2)
+        ctx.setPropertyFunc(obj: el, name: "scrollBy", fn: scrollFn(true), length: 2)
+    }
+
+    /// `__get_offsetWidth` … `__set_scrollLeft`; wired into accessor properties by
+    /// `installElementPropertyShim`.
+    private func registerElementGeometryAccessors(on el: JeffJSValue, ctx: JeffJSContext) {
+        func metric(_ name: String, _ body: @escaping (JeffJSDOMBridge, DOMNode) -> Double) {
+            ctx.setPropertyFunc(obj: el, name: "__get_\(name)", fn: { [weak self] _, thisVal, _ in
+                guard let self, let node = self.extractNode(from: thisVal) else { return .newInt32(0) }
+                // offset*/client*/scroll* are integer `long`s in the DOM; round like browsers do.
+                return Self.numberValue(body(self, node).rounded())
+            }, length: 0)
+        }
+
+        // offsetWidth/offsetHeight — border box = layout rect size.
+        metric("offsetWidth") { b, n in b.resolvedLayoutRect(for: n).width }
+        metric("offsetHeight") { b, n in b.resolvedLayoutRect(for: n).height }
+
+        // clientWidth/clientHeight — TODO: padding box (rect minus borders/scrollbars) once
+        // the host pushes box metrics; for now the border box. The document element
+        // reports the viewport, as browsers do.
+        metric("clientWidth") { b, n in b.clientSize(of: n).width }
+        metric("clientHeight") { b, n in b.clientSize(of: n).height }
+        metric("clientTop") { _, _ in 0 }
+        metric("clientLeft") { _, _ in 0 }
+
+        // scrollWidth/scrollHeight — max(rect size, extent of descendants' rects).
+        metric("scrollWidth") { b, n in b.scrollSize(of: n).width }
+        metric("scrollHeight") { b, n in b.scrollSize(of: n).height }
+
+        // offsetTop/offsetLeft — relative to offsetParent's rect.
+        metric("offsetTop") { b, n in
+            let r = b.resolvedLayoutRect(for: n)
+            guard let parent = b.offsetParent(of: n) else { return r.minY }
+            return r.minY - b.resolvedLayoutRect(for: parent).minY
+        }
+        metric("offsetLeft") { b, n in
+            let r = b.resolvedLayoutRect(for: n)
+            guard let parent = b.offsetParent(of: n) else { return r.minX }
+            return r.minX - b.resolvedLayoutRect(for: parent).minX
+        }
+
+        // offsetParent
+        ctx.setPropertyFunc(obj: el, name: "__get_offsetParent", fn: { [weak self] ctx, thisVal, _ in
+            guard let self, let node = self.extractNode(from: thisVal),
+                  let parent = self.offsetParent(of: node) else { return JeffJSValue.null }
+            return self.wrapElement(parent, ctx: ctx)
+        }, length: 0)
+
+        // scrollTop/scrollLeft — stored per node; the document element maps to scrollOffset.
+        metric("scrollTop") { b, n in b.scrollPosition(of: n).y }
+        metric("scrollLeft") { b, n in b.scrollPosition(of: n).x }
+        ctx.setPropertyFunc(obj: el, name: "__set_scrollTop", fn: { [weak self] ctx, thisVal, args in
+            guard let self, let node = self.extractNode(from: thisVal), !args.isEmpty else { return JeffJSValue.undefined }
+            var pos = self.scrollPosition(of: node)
+            pos.y = ctx.toFloat64(args[0]) ?? 0
+            self.setScrollPosition(pos, for: node)
+            return JeffJSValue.undefined
+        }, length: 1)
+        ctx.setPropertyFunc(obj: el, name: "__set_scrollLeft", fn: { [weak self] ctx, thisVal, args in
+            guard let self, let node = self.extractNode(from: thisVal), !args.isEmpty else { return JeffJSValue.undefined }
+            var pos = self.scrollPosition(of: node)
+            pos.x = ctx.toFloat64(args[0]) ?? 0
+            self.setScrollPosition(pos, for: node)
+            return JeffJSValue.undefined
+        }, length: 1)
+    }
+
+    // MARK: Geometry helpers
+
+    /// Integer-valued doubles become int32 values (browsers report `long`s), the rest float64.
+    private static func numberValue(_ v: Double) -> JeffJSValue {
+        if v == v.rounded(), abs(v) < 2_147_483_647 { return .newInt32(Int32(v)) }
+        return .newFloat64(v)
+    }
+
+    /// Document-coordinate rect for a node. Mirrors the JSC path's `resolvedLayoutRect`:
+    /// the host's layout rect if present, else inline-style `left/top/width/height` px
+    /// (elements created after the last layout pass), else zeros.
+    private func resolvedLayoutRect(for node: DOMNode) -> CGRect {
+        if let rect = layoutRects[node.id] { return rect }
+        guard node.nodeType == .element else { return .zero }
+        let styles = node.attributes["style"].map { Self.parseInlineStyles($0) } ?? [:]
+        func px(_ key: String) -> Double {
+            var text = (styles[key] ?? node.attributes[key] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.hasSuffix("px") { text = String(text.dropLast(2)) }
+            return Double(text) ?? 0
+        }
+        return CGRect(x: px("left"), y: px("top"), width: px("width"), height: px("height"))
+    }
+
+    /// The document element's client box is the viewport (when known); everyone
+    /// else's is the border box for now (see clientWidth TODO).
+    private func clientSize(of node: DOMNode) -> CGSize {
+        if node.tagName == "html", viewportSize != .zero { return viewportSize }
+        return resolvedLayoutRect(for: node).size
+    }
+
+    /// max(own rect size, extent of all laid-out descendants measured from the node's origin).
+    private func scrollSize(of node: DOMNode) -> CGSize {
+        if let cached = scrollSizeCache[node.id] { return cached }
+        let own = resolvedLayoutRect(for: node)
+        var maxX = own.maxX
+        var maxY = own.maxY
+        func walk(_ n: DOMNode) {
+            for child in n.children {
+                if let r = layoutRects[child.id] {
+                    maxX = max(maxX, r.maxX)
+                    maxY = max(maxY, r.maxY)
+                }
+                walk(child)
+            }
+        }
+        walk(node)
+        let size = CGSize(width: max(own.width, maxX - own.minX), height: max(own.height, maxY - own.minY))
+        scrollSizeCache[node.id] = size
+        return size
+    }
+
+    /// Lowercased inline `position` value, or nil when not declared inline.
+    private func inlinePosition(of node: DOMNode) -> String? {
+        guard let style = node.attributes["style"] else { return nil }
+        return Self.parseInlineStyles(style)["position"]?.lowercased()
+    }
+
+    /// Nearest ancestor that has a layout rect and a non-static inline `position`,
+    /// else `<body>`. `<html>`, `<body>`, fixed-position and detached nodes yield nil.
+    private func offsetParent(of node: DOMNode) -> DOMNode? {
+        guard node.nodeType == .element, let tag = node.tagName, tag != "html", tag != "body" else { return nil }
+        if inlinePosition(of: node) == "fixed" { return nil }
+        var cursor = node.parent
+        while let current = cursor, current.nodeType == .element {
+            if current.tagName == "body" { return current }
+            if layoutRects[current.id] != nil, let pos = inlinePosition(of: current), pos != "static" {
+                return current
+            }
+            cursor = current.parent
+        }
+        return nil
+    }
+
+    private func scrollPosition(of node: DOMNode) -> CGPoint {
+        if node.tagName == "html" { return scrollOffset }
+        return elementScrollPositions[node.id] ?? .zero
+    }
+
+    /// Stores the scroll position, then notifies the host through the mutation
+    /// callback (so it can react on its next pass) and the optional scroll hook.
+    private func setScrollPosition(_ pos: CGPoint, for node: DOMNode) {
+        let clamped = CGPoint(x: max(0, pos.x), y: max(0, pos.y))
+        if node.tagName == "html" {
+            scrollOffset = clamped
+        } else {
+            elementScrollPositions[node.id] = clamped
+        }
+        notifyMutation(for: node)
+        onScrollChange?(node, clamped)
+    }
+
+    /// Builds a DOMRect-shaped object in viewport coordinates (document rect minus scrollOffset).
+    private func buildDOMRect(_ documentRect: CGRect, ctx: JeffJSContext) -> JeffJSValue {
+        if domRectPrototype == nil {
+            domRectPrototype = buildDOMRectPrototype(ctx: ctx)
+        }
+        let x = Double(documentRect.minX - scrollOffset.x)
+        let y = Double(documentRect.minY - scrollOffset.y)
+        let w = Double(documentRect.width)
+        let h = Double(documentRect.height)
+        let rect = ctx.newObjectProto(proto: domRectPrototype!)
+        ctx.setPropertyStr(obj: rect, name: "x", value: .newFloat64(x))
+        ctx.setPropertyStr(obj: rect, name: "y", value: .newFloat64(y))
+        ctx.setPropertyStr(obj: rect, name: "width", value: .newFloat64(w))
+        ctx.setPropertyStr(obj: rect, name: "height", value: .newFloat64(h))
+        ctx.setPropertyStr(obj: rect, name: "top", value: .newFloat64(min(y, y + h)))
+        ctx.setPropertyStr(obj: rect, name: "right", value: .newFloat64(max(x, x + w)))
+        ctx.setPropertyStr(obj: rect, name: "bottom", value: .newFloat64(max(y, y + h)))
+        ctx.setPropertyStr(obj: rect, name: "left", value: .newFloat64(min(x, x + w)))
+        return rect
+    }
+
+    /// Shared DOMRect prototype carrying `toJSON()` (so JSON.stringify(rect) works).
+    private func buildDOMRectPrototype(ctx: JeffJSContext) -> JeffJSValue {
+        let proto = ctx.newObject()
+        let toJSON = ctx.eval(input: """
+        (function() { return { x: this.x, y: this.y, width: this.width, height: this.height,
+                               top: this.top, right: this.right, bottom: this.bottom, left: this.left }; })
+        """, filename: "<domrect-toJSON>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+        if !toJSON.isException && toJSON.isFunction {
+            ctx.setPropertyStr(obj: proto, name: "toJSON", value: toJSON)  // takes ownership
+        } else {
+            toJSON.freeValue()
+        }
+        return proto
     }
 
     // MARK: - Style Sub-Object (Shared Prototype)
