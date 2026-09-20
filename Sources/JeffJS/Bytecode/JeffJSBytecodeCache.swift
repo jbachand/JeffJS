@@ -28,6 +28,10 @@ private let CPOOL_BOOL_TRUE: UInt8 = 5
 private let CPOOL_STRING8: UInt8 = 6
 private let CPOOL_STRING16: UInt8 = 7
 private let CPOOL_FUNCTION: UInt8 = 8
+/// Tagged-template site object: u32 part count, then per part the cooked
+/// string (or undefined) and the raw string as nested cpool entries. Rebuilt
+/// as a frozen array with a frozen `raw` array (JeffJSContext.newTemplateObject).
+private let CPOOL_TEMPLATE: UInt8 = 9
 
 // MARK: - Flag Packing
 
@@ -354,6 +358,17 @@ struct JeffJSBytecodeSerializer {
             // Nested function — recursive serialization (shares atom table)
             writeU8(CPOOL_FUNCTION)
             writeFunctionBytecode(fb, rt: rt)
+        } else if let rt, val.isObject, let obj = val.toObject(),
+                  let cooked = obj.arraySnapshot(),
+                  let rawObj = obj.getOwnPropertyValue(atom: rt.findAtom("raw")).toObject(),
+                  let raw = rawObj.arraySnapshot() {
+            // The only objects the parser puts in a cpool are tagged-template objects.
+            writeU8(CPOOL_TEMPLATE)
+            writeU32(UInt32(cooked.count))
+            for i in 0..<cooked.count {
+                writeCpoolEntry(cooked.values[i], rt: rt)
+                writeCpoolEntry(i < raw.count ? raw.values[i] : .JS_UNDEFINED, rt: rt)
+            }
         } else {
             writeU8(CPOOL_UNDEFINED)
         }
@@ -369,11 +384,16 @@ struct JeffJSBytecodeDeserializer {
     private let data: [UInt8]
     private var pos: Int = 0
     private var remapper: AtomRemapper?
+    /// Needed to rebuild tagged-template objects; without one, bytecode
+    /// containing a tagged template fails to deserialize (cache miss).
+    private var ctx: JeffJSContext?
 
     /// Deserialize bytes into a fresh function bytecode.
     /// If rt is provided, atoms are re-interned for cross-runtime portability.
-    static func deserialize(_ data: [UInt8], rt: JeffJSRuntime? = nil) -> JeffJSFunctionBytecode? {
+    static func deserialize(_ data: [UInt8], rt: JeffJSRuntime? = nil,
+                            ctx: JeffJSContext? = nil) -> JeffJSFunctionBytecode? {
         var d = JeffJSBytecodeDeserializer(data: data)
+        d.ctx = ctx
 
         // Peek at version to decide whether atom table is present
         if data.count > 5 && data[4] >= 2, let rt {
@@ -481,6 +501,13 @@ struct JeffJSBytecodeDeserializer {
             pos += 4 + len * 2
         case CPOOL_FUNCTION:
             return skipFunctionBytecode(data: data, pos: &pos)
+        case CPOOL_TEMPLATE:
+            guard pos + 3 < data.count else { return false }
+            let count = Int(readU32LE(data, pos))
+            pos += 4
+            for _ in 0..<(count * 2) {
+                guard skipCpoolEntry(data: data, pos: &pos) else { return false }
+            }
         default:
             break
         }
@@ -675,6 +702,18 @@ struct JeffJSBytecodeDeserializer {
             guard let nested = readFunctionBytecode() else { return nil }
             return JeffJSValue.makeFunctionBytecode(nested)
 
+        case CPOOL_TEMPLATE:
+            guard let count = readU32() else { return nil }
+            var cooked: [JeffJSValue] = []
+            var raw: [JeffJSValue] = []
+            for _ in 0..<Int(count) {
+                guard let c = readCpoolEntry(), let r = readCpoolEntry() else { return nil }
+                cooked.append(c)
+                raw.append(r)
+            }
+            guard let ctx else { return nil }
+            return ctx.newTemplateObject(cooked: cooked, raw: raw)
+
         default:
             return .JS_UNDEFINED
         }
@@ -783,10 +822,10 @@ final class JeffJSBytecodeCache {
 
     /// Look up cached bytecode. Checks in-memory first, then disk.
     /// Atom table indices are remapped to the current runtime's atom IDs.
-    func lookup(_ sourceHash: UInt64) -> JeffJSFunctionBytecode? {
+    func lookup(_ sourceHash: UInt64, ctx: JeffJSContext? = nil) -> JeffJSFunctionBytecode? {
         // In-memory cache
         if let serialized = cache[sourceHash] {
-            guard let fb = JeffJSBytecodeDeserializer.deserialize(serialized, rt: rt) else {
+            guard let fb = JeffJSBytecodeDeserializer.deserialize(serialized, rt: rt, ctx: ctx) else {
                 cache.removeValue(forKey: sourceHash)
                 return nil
             }
@@ -797,7 +836,7 @@ final class JeffJSBytecodeCache {
         guard let url = diskURL(for: sourceHash),
               let data = try? Data(contentsOf: url) else { return nil }
         let bytes = [UInt8](data)
-        guard let fb = JeffJSBytecodeDeserializer.deserialize(bytes, rt: rt) else {
+        guard let fb = JeffJSBytecodeDeserializer.deserialize(bytes, rt: rt, ctx: ctx) else {
             try? FileManager.default.removeItem(at: url)
             return nil
         }

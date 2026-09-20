@@ -563,7 +563,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// - Parameter data: Serialized JFBC bytecode bytes.
     /// - Returns: The result value, or JS_EXCEPTION on error. Returns JS_UNDEFINED if deserialization fails.
     func evalBytecode(_ data: [UInt8]) -> JeffJSValue {
-        guard let fb = JeffJSBytecodeDeserializer.deserialize(data, rt: rt) else {
+        guard let fb = JeffJSBytecodeDeserializer.deserialize(data, rt: rt, ctx: self) else {
             return .JS_UNDEFINED
         }
         lastBytecodeSize = Self.totalBytecodeLen(fb)
@@ -997,6 +997,20 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     }
 
     /// Defines a property with just a value and flags.
+    /// Builds the template object of a tagged template site: a frozen array
+    /// of the cooked strings (`undefined` where an escape was invalid) with
+    /// a frozen, non-enumerable `raw` array of the raw text. Takes
+    /// ownership of the values. Used by the parser (the object lives in the
+    /// function's constant pool) and by the bytecode cache deserializer.
+    func newTemplateObject(cooked: [JeffJSValue], raw: [JeffJSValue]) -> JeffJSValue {
+        let rawArr = newArrayFrom(raw)
+        let cookedArr = newArrayFrom(cooked)
+        _ = setIntegrityLevel(rawArr, level: .frozen)
+        _ = definePropertyValue(obj: cookedArr, atom: findAtom("raw"), value: rawArr, flags: 0)
+        _ = setIntegrityLevel(cookedArr, level: .frozen)
+        return cookedArr
+    }
+
     /// Convenience wrapper over defineProperty.
     /// Mirrors `JS_DefinePropertyValue()` from QuickJS.
     @discardableResult
@@ -2412,7 +2426,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             return true  // cache everything not excluded
         }()
         let cacheKey = cacheEnabled ? JeffJSBytecodeCache.hashSource(input) : 0
-        if cacheEnabled, let cached = rt.bytecodeCache.lookup(cacheKey) {
+        if cacheEnabled, let cached = rt.bytecodeCache.lookup(cacheKey, ctx: self) {
             bytecodeCacheHits += 1
             lastBytecodeSize = cached.bytecodeLen
             return executeBytecode(cached)
@@ -2486,7 +2500,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// Deserializes with atom remapping and runs on the global object.
     func evalPrecompiled(_ bytes: [UInt8]) -> JeffJSValue {
         let tStart = jeffJSTimePrecompiled ? CFAbsoluteTimeGetCurrent() : 0
-        guard let fb = JeffJSBytecodeDeserializer.deserialize(bytes, rt: rt) else {
+        guard let fb = JeffJSBytecodeDeserializer.deserialize(bytes, rt: rt, ctx: self) else {
             return throwInternalError(message: "Failed to deserialize precompiled bytecode")
         }
         let tDeser = jeffJSTimePrecompiled ? CFAbsoluteTimeGetCurrent() : 0

@@ -30,6 +30,17 @@ struct JeffJSToken {
     var strValue: String = ""
     var strSeparator: Character = "\0"
 
+    // -- Template literal part data --
+    /// Source byte range of the raw text of this template part (between the
+    /// delimiters, before escape processing); the tagged-template `raw` array.
+    var templateRawStart: Int = 0
+    var templateRawEnd: Int = 0
+    /// First invalid escape sequence in this part, if any. An untagged
+    /// template raises it as a SyntaxError; a tagged template gets an
+    /// `undefined` cooked string instead (QuickJS cooks in the parser too).
+    var templateEscapeError: String? = nil
+    var templateEscapeErrorPos: Int = 0
+
     // -- Identifier data --
     var identAtom: UInt32 = 0       // JSAtom index
     var identHasEscape: Bool = false
@@ -45,6 +56,10 @@ struct JeffJSToken {
         numValue = 0
         strValue = ""
         strSeparator = "\0"
+        templateRawStart = 0
+        templateRawEnd = 0
+        templateEscapeError = nil
+        templateEscapeErrorPos = 0
         identAtom = 0
         identHasEscape = false
         identIsReserved = false
@@ -999,20 +1014,32 @@ extension JeffJSParseState {
     /// Parse a template literal part. Called when bufPtr is positioned right after
     /// the opening backtick (`) or the closing `}` of an interpolation.
     /// Sets token to TOK_TEMPLATE.
+    ///
+    /// The cooked text goes to `token.strValue`; the raw source range to
+    /// `token.templateRawStart..<templateRawEnd`. Invalid escapes are not
+    /// errors here (the tokenizer cannot know whether the template is tagged
+    /// when it scans the first part): they are recorded in
+    /// `token.templateEscapeError` and the parser decides.
     func parseTemplatePart(isTagged: Bool = false) -> Bool {
         var result = [UInt8]()
         token.type = JSTokenType.TOK_TEMPLATE.rawValue
+        token.templateRawStart = bufPtr
+        token.templateRawEnd = bufPtr
+        token.templateEscapeError = nil
+        token.templateEscapeErrorPos = 0
 
         while bufPtr < bufLen {
             let c = buf[bufPtr]
 
             if c == 0x60 { // backtick — end of template
+                token.templateRawEnd = bufPtr
                 bufPtr += 1
                 token.strValue = String(bytes: result, encoding: .utf8) ?? ""
                 return true
             }
 
             if c == 0x24 && bufPtr + 1 < bufLen && buf[bufPtr + 1] == 0x7B { // ${
+                token.templateRawEnd = bufPtr
                 bufPtr += 2
                 templateNestLevel += 1
                 token.strValue = String(bytes: result, encoding: .utf8) ?? ""
@@ -1020,118 +1047,69 @@ extension JeffJSParseState {
             }
 
             if c == 0x5C { // backslash escape
+                let escPos = bufPtr
                 bufPtr += 1
                 guard bufPtr < bufLen else {
                     syntaxError("unexpected end of template literal")
                     return false
                 }
-
-                if isTagged {
-                    // In tagged templates, invalid escapes produce undefined cooked value.
-                    // We still need to skip past them correctly.
-                    let esc = buf[bufPtr]
-                    bufPtr += 1
-                    switch esc {
-                    case 0x6E: result.append(0x0A)
-                    case 0x72: result.append(0x0D)
-                    case 0x74: result.append(0x09)
-                    case 0x62: result.append(0x08)
-                    case 0x66: result.append(0x0C)
-                    case 0x76: result.append(0x0B)
-                    case 0x30:
-                        if bufPtr < bufLen && buf[bufPtr] >= 0x30 && buf[bufPtr] <= 0x39 {
-                            // Skip octal — tagged template will get undefined cooked value
-                            while bufPtr < bufLen && buf[bufPtr] >= 0x30 && buf[bufPtr] <= 0x37 {
-                                bufPtr += 1
-                            }
-                        } else {
-                            result.append(0x00)
-                        }
-                    case 0x78:
-                        if bufPtr + 1 < bufLen {
-                            let d1 = hexDigitValue(buf[bufPtr])
-                            let d2 = hexDigitValue(buf[bufPtr + 1])
-                            if d1 != UInt32.max && d2 != UInt32.max {
-                                bufPtr += 2
-                                result.append(UInt8((d1 << 4) | d2))
-                            }
-                        }
-                    case 0x75:
-                        let cp = parseUnicodeEscape()
-                        if cp != UInt32.max && cp <= 0x10FFFF {
-                            JeffJSParseState.appendUTF8(cp, to: &result)
-                        }
-                    case 0x0A:
-                        lineNum += 1
-                    case 0x0D:
-                        if bufPtr < bufLen && buf[bufPtr] == 0x0A { bufPtr += 1 }
-                        lineNum += 1
-                    default:
-                        result.append(esc)
-                    }
-                } else {
-                    // Normal template — escapes must be valid
-                    let esc = buf[bufPtr]
-                    bufPtr += 1
-                    switch esc {
-                    case 0x6E: result.append(0x0A)
-                    case 0x72: result.append(0x0D)
-                    case 0x74: result.append(0x09)
-                    case 0x62: result.append(0x08)
-                    case 0x66: result.append(0x0C)
-                    case 0x76: result.append(0x0B)
-                    case 0x30:
-                        if bufPtr < bufLen && buf[bufPtr] >= 0x30 && buf[bufPtr] <= 0x39 {
-                            syntaxError("octal escape sequences are not allowed in template literals")
-                            return false
-                        }
+                let esc = buf[bufPtr]
+                bufPtr += 1
+                switch esc {
+                case 0x6E: result.append(0x0A)
+                case 0x72: result.append(0x0D)
+                case 0x74: result.append(0x09)
+                case 0x62: result.append(0x08)
+                case 0x66: result.append(0x0C)
+                case 0x76: result.append(0x0B)
+                case 0x30:
+                    if bufPtr < bufLen && buf[bufPtr] >= 0x30 && buf[bufPtr] <= 0x39 {
+                        noteTemplateEscapeError("octal escape sequences are not allowed in template literals", at: escPos)
+                    } else {
                         result.append(0x00)
-                    case 0x31...0x39:
-                        syntaxError("octal escape sequences are not allowed in template literals")
-                        return false
-                    case 0x78: // \xNN
-                        guard bufPtr + 1 < bufLen else {
-                            syntaxError("invalid hex escape in template literal")
-                            return false
-                        }
-                        let d1 = hexDigitValue(buf[bufPtr])
-                        let d2 = hexDigitValue(buf[bufPtr + 1])
-                        guard d1 != UInt32.max && d2 != UInt32.max else {
-                            syntaxError("invalid hex escape in template literal")
-                            return false
-                        }
+                    }
+                case 0x31...0x37:
+                    noteTemplateEscapeError("octal escape sequences are not allowed in template literals", at: escPos)
+                case 0x38, 0x39:
+                    noteTemplateEscapeError("\\8 and \\9 are not allowed in template literals", at: escPos)
+                case 0x78: // \xNN
+                    if bufPtr + 1 < bufLen,
+                       case let d1 = hexDigitValue(buf[bufPtr]), d1 != UInt32.max,
+                       case let d2 = hexDigitValue(buf[bufPtr + 1]), d2 != UInt32.max {
                         bufPtr += 2
                         result.append(UInt8((d1 << 4) | d2))
-                    case 0x75: // \uNNNN or \u{N...}
-                        let cp = parseUnicodeEscape()
-                        guard cp != UInt32.max && cp <= 0x10FFFF else {
-                            syntaxError("invalid unicode escape in template literal")
-                            return false
-                        }
+                    } else {
+                        noteTemplateEscapeError("invalid hex escape in template literal", at: escPos)
+                    }
+                case 0x75: // \uNNNN or \u{N...}
+                    let cp = parseUnicodeEscape()
+                    if cp != UInt32.max && cp <= 0x10FFFF {
                         JeffJSParseState.appendUTF8(cp, to: &result)
-                    case 0x0A:
-                        lineNum += 1
-                    case 0x0D:
-                        if bufPtr < bufLen && buf[bufPtr] == 0x0A { bufPtr += 1 }
-                        lineNum += 1
-                    case 0x60, 0x5C, 0x24: // ` \ $
-                        result.append(esc)
-                    default:
-                        if esc >= 0x80 {
-                            let savedPtr = bufPtr - 1
-                            let (cp, len) = decodeUTF8At(savedPtr)
-                            if cp == 0x2028 || cp == 0x2029 {
-                                bufPtr = savedPtr + len
-                                lineNum += 1
-                            } else {
-                                bufPtr = savedPtr
-                                let (cp2, len2) = decodeUTF8()
-                                bufPtr += len2
-                                JeffJSParseState.appendUTF8(cp2, to: &result)
-                            }
+                    } else {
+                        noteTemplateEscapeError("invalid unicode escape in template literal", at: escPos)
+                    }
+                case 0x0A:
+                    lineNum += 1
+                case 0x0D:
+                    if bufPtr < bufLen && buf[bufPtr] == 0x0A { bufPtr += 1 }
+                    lineNum += 1
+                case 0x60, 0x5C, 0x24: // ` \ $
+                    result.append(esc)
+                default:
+                    if esc >= 0x80 {
+                        let savedPtr = bufPtr - 1
+                        let (cp, len) = decodeUTF8At(savedPtr)
+                        if cp == 0x2028 || cp == 0x2029 {
+                            bufPtr = savedPtr + len
+                            lineNum += 1
                         } else {
-                            result.append(esc)
+                            bufPtr = savedPtr
+                            let (cp2, len2) = decodeUTF8()
+                            bufPtr += len2
+                            JeffJSParseState.appendUTF8(cp2, to: &result)
                         }
+                    } else {
+                        result.append(esc)
                     }
                 }
             } else if c == 0x0A {
@@ -1166,6 +1144,34 @@ extension JeffJSParseState {
 
         syntaxError("unterminated template literal")
         return false
+    }
+
+    private func noteTemplateEscapeError(_ msg: String, at pos: Int) {
+        if token.templateEscapeError == nil {
+            token.templateEscapeError = msg
+            token.templateEscapeErrorPos = pos
+        }
+    }
+
+    /// The raw text (TRV) of the current template part: the source between
+    /// the delimiters with CR and CRLF normalised to LF, escapes untouched.
+    func templateRawString() -> String {
+        let start = token.templateRawStart, end = token.templateRawEnd
+        guard start <= end, end <= bufLen else { return "" }
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(end - start)
+        var i = start
+        while i < end {
+            let c = buf[i]
+            if c == 0x0D {
+                bytes.append(0x0A)
+                if i + 1 < end && buf[i + 1] == 0x0A { i += 1 }
+            } else {
+                bytes.append(c)
+            }
+            i += 1
+        }
+        return String(bytes: bytes, encoding: .utf8) ?? ""
     }
 }
 
@@ -1314,7 +1320,7 @@ extension JeffJSParseState {
     /// Parse a decimal number (integer or floating-point).
     private func parseDecimalNumber(startPtr: Int) -> Bool {
         // Integer part
-        skipDecimalDigits()
+        guard skipDecimalDigits() else { return false }
 
         var isFloat = false
 
@@ -1327,7 +1333,7 @@ extension JeffJSParseState {
                     // Definitely a decimal point
                     isFloat = true
                     bufPtr += 1
-                    skipDecimalDigits()
+                    guard skipDecimalDigits() else { return false }
                 } else if afterDot == 0x2E { // '..' — e.g. 1..toString = (1.0).toString
                     // Consume the dot as part of the number (1. = 1.0),
                     // leaving the second dot for member access
@@ -1357,7 +1363,7 @@ extension JeffJSParseState {
                 syntaxError("missing exponent")
                 return false
             }
-            skipDecimalDigits()
+            guard skipDecimalDigits() else { return false }
         }
 
         // BigInt suffix 'n'
@@ -1552,7 +1558,9 @@ extension JeffJSParseState {
     }
 
     /// Skip decimal digits (0-9) and numeric separators (_).
-    private func skipDecimalDigits() {
+    /// Returns false (after reporting) on a misplaced separator.
+    @discardableResult
+    private func skipDecimalDigits() -> Bool {
         var lastWasSep = true // prevent leading separator
         while bufPtr < bufLen {
             let c = buf[bufPtr]
@@ -1562,7 +1570,7 @@ extension JeffJSParseState {
             } else if c == 0x5F { // '_'
                 if lastWasSep {
                     syntaxError("numeric separator cannot be adjacent to another separator or at start")
-                    return
+                    return false
                 }
                 bufPtr += 1
                 lastWasSep = true
@@ -1570,6 +1578,11 @@ extension JeffJSParseState {
                 break
             }
         }
+        if lastWasSep && bufPtr > 0 && buf[bufPtr - 1] == 0x5F {
+            syntaxError("numeric separator cannot be at the end of a numeric literal")
+            return false
+        }
+        return true
     }
 
     /// Skip hex digits (0-9, a-f, A-F) and numeric separators (_).
@@ -1590,7 +1603,9 @@ extension JeffJSParseState {
     /// Extract a substring from the source buffer as a String.
     private func extractNumberString(_ start: Int, _ end: Int) -> String {
         guard start < end && end <= bufLen else { return "0" }
-        return String(bytes: buf[start..<end], encoding: .utf8) ?? "0"
+        // Numeric separators (`1_000`) are validated while scanning; drop
+        // them before conversion (the hex/octal/binary paths do the same).
+        return String(bytes: buf[start..<end].filter { $0 != 0x5F }, encoding: .utf8) ?? "0"
     }
 }
 
