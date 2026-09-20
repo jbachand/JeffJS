@@ -171,7 +171,9 @@ struct JeffJSValue {
 
     @inline(__always)
     static func newInt64(_ val: Int64) -> JeffJSValue {
-        if val == Int64(Int32(val)) { return newInt32(Int32(val)) }
+        // `Int32(val)` traps when `val` is outside Int32's range, so probe with
+        // `exactly:` instead of round-tripping through a trapping conversion.
+        if let i32 = Int32(exactly: val) { return newInt32(i32) }
         return newFloat64(Double(val))
     }
 
@@ -649,7 +651,9 @@ struct JeffJSValue {
 
     /// Short BigInt: fits in int32 -> store inline; otherwise promote to float64.
     static func mkShortBigInt(_ val: Int64) -> JeffJSValue {
-        if val == Int64(Int32(val)) { return newInt32(Int32(val)) }
+        // Same trapping-conversion hazard as `newInt64`: BigInt(-2147483649)
+        // used to crash the process on `Int32(val)`.
+        if let i32 = Int32(exactly: val) { return newInt32(i32) }
         return newFloat64(Double(val))
     }
 
