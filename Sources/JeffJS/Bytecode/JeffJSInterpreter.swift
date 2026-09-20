@@ -992,13 +992,15 @@ extension JeffJSContext {
     private func homeObjectBrand(_ home: JeffJSObject, create: Bool) -> JeffJSValue? {
         let homeVal = JeffJSValue.makeObjectRecycled(home)
         let key = privateBrandKeyAtom()
-        if let prop = getOwnProperty(obj: homeVal, atom: key) {
-            return prop.value
+        if case .value(let v)? = getOwnProperty(obj: homeVal, atom: key) {
+            return v
         }
         guard create else { return nil }
         let brand = newSymbolFromAtom(privateBrandKeyAtom(), isPrivate: true)
         _ = definePropertyValue(obj: homeVal, atom: key, value: brand.dupValue(),
                                  flags: JS_PROP_CONFIGURABLE)
+        // The property holds a reference; the returned value is borrowed.
+        brand.freeValue()
         return brand
     }
 
@@ -6804,6 +6806,18 @@ struct JeffJSInterpreter {
                 buf[sp] = a; sp += 1; buf[sp] = b; sp += 1
                 pc += 1
 
+            case .private_in:
+                // Wide opcode: normally dispatched through the 0x00 prefix
+                // path; handled here too so the switch stays exhaustive.
+                let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let res = ctx.privateIn(obj: obj, key: key)
+                key.freeValue()
+                obj.freeValue()
+                if res.isException { retVal = .exception; break dispatchLoop }
+                buf[sp] = res; sp += 1
+                pc += 1
+
             case .swap2:
                 // Swap top 2 pairs: a b c d -> c d a b
                 let d = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let c = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let b = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let a = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
@@ -8188,33 +8202,45 @@ struct JeffJSInterpreter {
                 pc += 5
 
             case .get_private_field:
-                // obj field -> val
-                let field = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                // get_private_field(atom): obj -> val. The private name is an
+                // inline atom (`#x`), never a public property name, so a plain
+                // property read cannot collide with a public `x`. Private
+                // methods live on the home object, hence the prototype walk.
+                let atom = readU32(bc, pc + 1)
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                let val = ctx.getPrivateField(obj: obj, field: field)
-                field.freeValue()
+                var val: JeffJSValue
+                if !obj.isObject || !ctx.hasProperty(obj: obj, atom: atom) {
+                    let name = ctx.rt.atomToString(atom) ?? "#<private>"
+                    val = ctx.throwTypeError(message: "cannot read private member \(name) from an object whose class did not declare it")
+                } else {
+                    val = ctx.getProperty(obj: obj, atom: atom)
+                }
                 obj.freeValue()
                 if val.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
                 buf[sp] = val; sp += 1
-                pc += 1
+                pc += 5
 
             case .put_private_field:
-                // obj val field -> ()   (QuickJS operand order)
-                let field = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                // put_private_field(atom): obj val -> ()
+                let atom = readU32(bc, pc + 1)
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                let ok = ctx.putPrivateField(obj: obj, field: field, val: val)
-                field.freeValue()
-                val.freeValue()
+                var ok = obj.isObject && ctx.hasProperty(obj: obj, atom: atom)
+                if !ok {
+                    let name = ctx.rt.atomToString(atom) ?? "#<private>"
+                    _ = ctx.throwTypeError(message: "cannot write private member \(name) to an object whose class did not declare it")
+                } else {
+                    ok = ctx.setProperty(obj: obj, atom: atom, value: val) >= 0
+                }
                 obj.freeValue()
                 if !ok {
                     retVal = .exception
                     break dispatchLoop
                 }
-                pc += 1
+                pc += 5
 
             case .define_private_field:
                 // obj field val -> ()

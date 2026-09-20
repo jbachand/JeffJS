@@ -2012,7 +2012,9 @@ extension JeffJSParseState {
                     token.type = JSTokenType.TOK_PRIVATE_NAME.rawValue
                     token.strValue = ident
                     token.identHasEscape = hasEscape
-                    token.identAtom = ctx?.findAtom(ident) ?? 0
+                    // The atom keeps the '#': a private name must never alias
+                    // the public property of the same spelling.
+                    token.identAtom = ctx?.findAtom("#" + ident) ?? 0
                     return true
                 }
             }

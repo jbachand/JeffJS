@@ -55,6 +55,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// explicitly by free() and teardown().
     var rt: JeffJSRuntime
 
+    /// Lazily created private atom used as the hidden key for class private
+    /// brands (see `privateBrandKeyAtom()`); 0 until first use.
+    var privateBrandAtom: UInt32 = 0
+
     /// Link node for insertion into the runtime's contextList.
     var link: ListNode
 
