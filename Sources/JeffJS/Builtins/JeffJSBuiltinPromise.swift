@@ -731,8 +731,25 @@ struct JeffJSBuiltinPromise {
         // capability whose ctor argument was ignored anyway and whose
         // resolver pair was never called — 3 objects + 2 property lookups
         // per .then for nothing.)
-        let resultPromise = createPromiseObject(ctx: ctx)
-        if resultPromise.isException { return resultPromise }
+        // Subclass instances (prototype !== Promise.prototype) go through
+        // SpeciesConstructor so `p.then() instanceof Sub`; one pointer compare
+        // keeps plain promises on the bare path.
+        var resultPromise = JeffJSValue.undefined
+        let intrinsicProto = ctx.classProto[JSClassID.JS_CLASS_PROMISE.rawValue].toObject()
+        if let protoObj = promiseObj.proto, let ip = intrinsicProto, protoObj !== ip {
+            let ctorVal = ctx.getProperty(obj: this, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue)
+            if ctorVal.isException { return ctorVal }
+            defer { ctx.freeValue(ctorVal) }
+            if let ctorObj = ctorVal.toObject(), ctorObj.isConstructor, ctorObj.cFuncFast == nil {
+                guard let cap = newPromiseCapability(ctx: ctx, ctor: ctorVal) else { return .exception }
+                ctx.freeValue(cap.resolve); ctx.freeValue(cap.reject)   // settled natively below
+                resultPromise = cap.promise
+            }
+        }
+        if resultPromise.isUndefined {
+            resultPromise = createPromiseObject(ctx: ctx)
+            if resultPromise.isException { return resultPromise }
+        }
 
         let result = performPromiseThen(ctx: ctx, promise: this,
                                          onFulfilled: onFulfilled, onRejected: onRejected,
@@ -838,6 +855,30 @@ struct JeffJSBuiltinPromise {
     /// captures resolve and reject.
     static func newPromiseCapability(ctx: JeffJSContext,
                                      ctor: JeffJSValue) -> (promise: JeffJSValue, resolve: JeffJSValue, reject: JeffJSValue)? {
+        // NewPromiseCapability(C) for a user constructor (a Promise subclass or
+        // any thenable-compatible class): construct C with an executor that
+        // captures the resolving functions, so `P.resolve(v) instanceof P`.
+        if let ctorObj = ctor.toObject(), ctorObj.isConstructor, ctorObj.cFuncFast == nil {
+            final class CapBox { var resolve: JeffJSValue = .undefined; var reject: JeffJSValue = .undefined }
+            let box = CapBox()
+            let executor = ctx.newCFunction(name: "", length: 2) { c, _, args in
+                if !box.resolve.isUndefined || !box.reject.isUndefined {
+                    return c.throwTypeError("Promise executor has already been invoked")
+                }
+                box.resolve = (args.count > 0 ? args[0] : .undefined).dupValue()
+                box.reject = (args.count > 1 ? args[1] : .undefined).dupValue()
+                return .undefined
+            }
+            let promise = ctx.callConstructor(ctor, args: [executor])
+            ctx.freeValue(executor)
+            if promise.isException { box.resolve.freeValue(); box.reject.freeValue(); return nil }
+            guard ctx.isFunction(box.resolve), ctx.isFunction(box.reject) else {
+                ctx.freeValue(promise); box.resolve.freeValue(); box.reject.freeValue()
+                _ = ctx.throwTypeError("Promise capability functions are not callable")
+                return nil
+            }
+            return (promise: promise, resolve: box.resolve, reject: box.reject)
+        }
         let promiseObj = createPromiseObject(ctx: ctx)
         if promiseObj.isException { return nil }
 

@@ -2043,6 +2043,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             guard let self = self else { return .exception }
             return jsArrayBuffer_constructor(self, thisVal, args)
         }, name: "ArrayBuffer", length: 1)
+        _ = setPropertyStr(obj: abCtor, name: "prototype", value: abProto.dupValue())
+        _ = definePropertyValue(obj: abProto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
+                                value: abCtor.dupValue(), flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
 
         // ArrayBuffer.isView(arg) — static method
         let abIsViewFn = newCFunction({ [weak self] ctx, thisVal, args in
@@ -2096,6 +2099,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             guard let self = self else { return .exception }
             return jsSharedArrayBuffer_constructor(self, thisVal, args)
         }, name: "SharedArrayBuffer", length: 1)
+        _ = setPropertyStr(obj: sabCtor, name: "prototype", value: sabProto.dupValue())
+        _ = definePropertyValue(obj: sabProto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
+                                value: sabCtor.dupValue(), flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
 
         if let sabProtoObj = sabProto.toObject() {
             jeffJS_addGetterProperty(ctx: self, proto: sabProtoObj, name: "byteLength") { ctx, this in
@@ -2125,6 +2131,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             guard let self = self else { return .exception }
             return jsDataView_constructor(self, thisVal, args)
         }, name: "DataView", length: 1)
+        _ = setPropertyStr(obj: dvCtor, name: "prototype", value: dvProto.dupValue())
+        _ = definePropertyValue(obj: dvProto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
+                                value: dvCtor.dupValue(), flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
 
         if let dvProtoObj = dvProto.toObject() {
             // DataView getters
@@ -2190,6 +2199,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 guard let self = self else { return .exception }
                 return jsTypedArray_constructor(self, thisVal, args, classID: capturedJeffClassID)
             }, name: name, length: 3)
+            _ = setPropertyStr(obj: ctor, name: "prototype", value: proto.dupValue())
+            _ = definePropertyValue(obj: proto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
+                                    value: ctor.dupValue(), flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
 
             // TypedArray.from(source, mapFn?, thisArg?) — static method
             let fromFn = newCFunction({ [weak self] ctx, thisVal, args in
@@ -3535,7 +3547,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 return self.throwTypeError(message: "Reflect.construct requires at least 2 arguments")
             }
             let target = args[0]
-            guard let targetObj = target.toObject(), targetObj.isConstructor else {
+            guard self.isConstructorLike(target) else {
                 return self.throwTypeError(message: "Reflect.construct: target is not a constructor")
             }
             let argList = args[1]
@@ -3545,7 +3557,15 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             for i in 0..<len {
                 callArgs.append(self.getPropertyByIndex(obj: argList, index: UInt32(i)))
             }
-            return self.callConstructor(target, args: callArgs)
+            defer { for a in callArgs { a.freeValue() } }   // owned copies; the callee borrows
+            var newTarget = target
+            if args.count >= 3 {
+                newTarget = args[2]
+                guard self.isConstructorLike(newTarget) else {
+                    return self.throwTypeError(message: "Reflect.construct: newTarget is not a constructor")
+                }
+            }
+            return self.callConstructor(target, newTarget: newTarget, args: callArgs)
         }, name: "construct", length: 2)
         _ = setPropertyStr(obj: reflectObj, name: "construct", value: reflConstruct)
 
@@ -4891,6 +4911,21 @@ extension JeffJSContext {
     }
 
     // -- Constructor helpers --
+
+    /// IsConstructor for Reflect.construct: bytecode classes/functions carry
+    /// the flag; builtin constructors registered through newCFunction do not,
+    /// but they all expose an own `prototype` (methods never do).
+    func isConstructorLike(_ v: JeffJSValue) -> Bool {
+        guard let o = v.toObject() else { return false }
+        if o.isConstructor { return true }
+        switch o.payload {
+        case .boundFunction(let b): return isConstructorLike(b.funcObj)
+        case .proxyData: return o.isCallable
+        case .cFunc:
+            return o.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_prototype.rawValue).isObject
+        default: return false
+        }
+    }
 
     func newConstructorFunc(name: String, fn: @escaping JeffJSNativeFunc, length: Int, proto: JeffJSValue) -> JeffJSValue {
         let ctor = newCFunction(fn, name: name, length: length)

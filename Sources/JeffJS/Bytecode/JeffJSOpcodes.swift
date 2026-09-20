@@ -488,6 +488,7 @@ enum JeffJSOpcode: UInt16, CaseIterable {
     case with_get_ref_undef      // with_get_ref_undef(atom, label, u8)
     case swap2                   // swap top 2 pairs   (never emitted; parked in the wide range)
     case dup1                    // duplicate top and second element   (never emitted; parked in the wide range)
+    case init_this               // super(...) result -> frame this (derived class constructors; wide range)
 }
 
 // MARK: - Opcode Info Table
@@ -1258,6 +1259,8 @@ let jeffJSOpcodeInfo: [OpcodeInfo] = [
     OpcodeInfo(name: "with_get_ref_undef", size: 10, nPop: 1, nPush: 2, format: .atom_label_u8),
     OpcodeInfo(name: "swap2",            size: 1, nPop: 4,  nPush: 4,  format: .none),
     OpcodeInfo(name: "dup1",             size: 1, nPop: 2,  nPush: 3,  format: .none),
+    // init_this: pop the parent constructor's result, bind it as `this`, push it back
+    OpcodeInfo(name: "init_this",        size: 1, nPop: 1,  nPush: 1,  format: .none),
 ]
 
 // MARK: - Opcode Lookup Helpers

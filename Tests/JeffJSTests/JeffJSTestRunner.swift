@@ -297,6 +297,8 @@ struct JeffJSTestRunner {
             ("GeneratorThrow", { $0.testGeneratorThrowCatch() }),
             ("YieldStarLazy", { $0.testYieldStarLazy() }),
             ("PerIterationLet", { $0.testPerIterationLetScope() }),
+            ("BuiltinSubclassing", { $0.testBuiltinSubclassing() }),
+            ("ReflectConstructNewTarget", { $0.testReflectConstructNewTarget() }),
         ]
     }
 
@@ -10252,6 +10254,129 @@ extension JeffJSTestRunner {
             };
             count(10)
         """, expectInt: 10)
+    }
+
+    mutating func testBuiltinSubclassing() {
+        let (_, ctx) = makeCtx()
+
+        // super() constructs the parent with new.target: builtin parents
+        // allocate the right class and use the subclass prototype.
+        evalCheckStr(ctx, "class E extends Error {}; new E('m').message", expect: "m")
+        evalCheckBool(ctx, """
+            class E2 extends Error { constructor(m) { super(m); this.name = 'E2'; } }
+            var e = new E2('msg');
+            e.message === 'msg' && e instanceof E2 && e instanceof Error && String(e) === 'E2: msg'
+        """, expect: true)
+        evalCheckBool(ctx, """
+            class M extends Map { constructor(it) { super(it); this.extra = 1; } }
+            var m = new M([[1, 2]]); m.set(3, 4);
+            m.get(1) === 2 && m.get(3) === 4 && m.size === 2 && m.extra === 1 && m instanceof M && m instanceof Map
+        """, expect: true)
+        evalCheckBool(ctx, """
+            class S extends Set {}; var s = new S([1, 2]);
+            s.size === 2 && s.has(1) && s instanceof S
+        """, expect: true)
+        evalCheckBool(ctx, """
+            class WM extends WeakMap {}; var wm = new WM(); var k = {}; wm.set(k, 1);
+            wm.get(k) === 1 && wm instanceof WM
+        """, expect: true)
+        evalCheckBool(ctx, """
+            class P extends Promise {}
+            P.resolve(1) instanceof P && new P(r => r(1)) instanceof P && P.resolve(1).then(x => x) instanceof P
+        """, expect: true)
+        evalCheckBool(ctx, """
+            class A extends Array {}; var a = new A(); a.push(1, 2, 3);
+            a.length === 3 && a instanceof A && Array.isArray(a) && new A(5).length === 5
+        """, expect: true)
+        evalCheckBool(ctx, """
+            class R extends RegExp {}; var r = new R('a+', 'g');
+            r.test('aaa') && r instanceof R && r.source === 'a+' && r.flags === 'g'
+        """, expect: true)
+        evalCheckBool(ctx, """
+            class D extends Date {}; var d = new D(2020, 0, 1);
+            d.getFullYear() === 2020 && d instanceof D && d instanceof Date
+        """, expect: true)
+        evalCheckBool(ctx, """
+            class U8 extends Uint8Array {}; var u = new U8(4);
+            u.length === 4 && u instanceof U8 && u instanceof Uint8Array
+        """, expect: true)
+        // Three-level chain, new.target through super(), super.m()
+        evalCheckStr(ctx, """
+            class A1 { constructor(x) { this.x = x; this.nt = new.target.name; } m() { return 'A'; } }
+            class B1 extends A1 { constructor(x, y) { super(x); this.y = y; } m() { return 'B>' + super.m(); } }
+            class C1 extends B1 { constructor() { super(1, 2); this.z = 3; } }
+            var c = new C1();
+            [c.x, c.y, c.z, c.nt, c.m(), c instanceof A1, Object.getPrototypeOf(c) === C1.prototype].join()
+        """, expect: "1,2,3,C1,B>A,true,true")
+        // `this` before super() is a ReferenceError; super() twice too;
+        // returning nothing without super() throws.
+        evalCheckBool(ctx, """
+            class Base {}
+            class D1 extends Base { constructor() { try { this.q = 1; } catch (e) { this.err = e; } super(); } }
+            new D1().err instanceof ReferenceError
+        """, expect: true)
+        evalCheckBool(ctx, """
+            class Base2 {}
+            var twice = false;
+            class D2 extends Base2 { constructor() { super(); try { super(); } catch (e) { twice = e instanceof ReferenceError; } } }
+            new D2(); twice
+        """, expect: true)
+        evalCheckException(ctx, "class Base3 {}; class D3 extends Base3 { constructor() { return; } }; new D3()")
+        // Explicit object return wins; the super() expression evaluates to this.
+        evalCheckBool(ctx, """
+            class Base4 {}
+            class D4 extends Base4 { constructor() { super(); return { custom: true }; } }
+            class D5 extends Base4 { constructor() { const s = super(); this.same = s === this; } }
+            new D4().custom === true && !(new D4() instanceof D4) && new D5().same
+        """, expect: true)
+        // Spread super args and the default derived constructor forward args.
+        evalCheckStr(ctx, """
+            class Base6 { constructor(a, b) { this.sum = a + b; } }
+            class D6 extends Base6 { constructor(...args) { super(...args); } }
+            class D7 extends Base6 {}
+            new D6(1, 2).sum + ',' + new D7(3, 4).sum
+        """, expect: "3,7")
+        // new.target is the invoked constructor, not `this`.
+        evalCheckBool(ctx, """
+            class N { constructor() { this.v = new.target === N; } }
+            class O extends N {}
+            function F() { return new.target; }
+            new N().v && !new O().v && new F() === F && F() === undefined
+        """, expect: true)
+    }
+
+    mutating func testReflectConstructNewTarget() {
+        let (_, ctx) = makeCtx()
+
+        evalCheckBool(ctx, """
+            function F() { this.x = 1; } function G() {}
+            var o = Reflect.construct(F, [], G);
+            o.x === 1 && Object.getPrototypeOf(o) === G.prototype && o instanceof G && !(o instanceof F)
+        """, expect: true)
+        evalCheckBool(ctx, """
+            class Base { constructor() { this.nt = new.target; } } function G2() {}
+            var o = Reflect.construct(Base, [], G2);
+            o.nt === G2 && Object.getPrototypeOf(o) === G2.prototype
+        """, expect: true)
+        evalCheckBool(ctx, """
+            function G3() {}
+            var a = Reflect.construct(Array, [3], G3);
+            var e = Reflect.construct(Error, ['m'], G3);
+            a.length === 3 && Object.getPrototypeOf(a) === G3.prototype && Array.isArray(a) &&
+                e.message === 'm' && Object.getPrototypeOf(e) === G3.prototype
+        """, expect: true)
+        evalCheckBool(ctx, """
+            var p = Object.create(null); function H() {} H.prototype = p;
+            function F2() {}
+            Object.getPrototypeOf(Reflect.construct(F2, [], H)) === p && Reflect.construct(F2, []) instanceof F2
+        """, expect: true)
+        evalCheckException(ctx, "Reflect.construct(function(){}, [], Math.max)")
+        evalCheckException(ctx, "Reflect.construct(Math.max, [])")
+        // Bound constructor: newTarget === bound function becomes the target.
+        evalCheckBool(ctx, """
+            function Bd() { this.b = 1; } var BB = Bd.bind(null);
+            var o = new BB(); o.b === 1 && o instanceof Bd && Reflect.construct(BB, []) instanceof Bd
+        """, expect: true)
     }
 
     mutating func runAPITests() -> String {

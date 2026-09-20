@@ -3245,14 +3245,18 @@ final class JeffJSParser {
             fd = defaultCtorFd
             if hasExtends {
                 // constructor(...args) { super(...args); }
-                emitOp(.push_this)
+                // `this` is uninitialised until super() returns (QuickJS
+                // semantics): construct the parent with our new.target and
+                // bind the result as `this`.
+                emitOp(.undefined)       // dummy popped by get_super
                 emitOp(.get_super)       // [parentCtor]
-                emitOp(.push_this)
-                emitOp(.swap)            // [this, parentCtor]
+                emitOp(.special_object)
+                emitU8(SpecialObjectType.newTarget.rawValue)   // [parentCtor, newTarget]
                 emitOp(.rest)
-                emitU16(0)               // [this, parentCtor, argsArray]
-                emitOp(.apply)
+                emitU16(0)               // [parentCtor, newTarget, argsArray]
+                emitOp(.apply_constructor)
                 emitU16(0)               // [result]
+                emitOp(.init_this)       // [this]
                 emitOp(.drop)
             }
             emitOp(.return_undef)
@@ -4657,17 +4661,15 @@ final class JeffJSParser {
                 pendingMethodCall = false
 
                 if isSuperCall {
-                    // super(args) in a derived constructor.
-                    // We need to call the parent constructor as a regular
-                    // function with the current `this` (the new object
-                    // created by the outer callConstructor).
+                    // super(args) in a derived constructor: [[Construct]] the
+                    // parent with the current new.target (so builtin parents
+                    // allocate the right class and use new.target.prototype),
+                    // then bind the result as `this` (init_this below).
                     //
                     // Stack currently: ..., parentCtor  (from get_super)
-                    // We need: ..., thisVal, parentCtor  (for call_method)
-                    //
-                    // Insert this below the parent ctor:
-                    emitOp(.push_this)       // ..., parentCtor, this
-                    emitOp(.swap)            // ..., this, parentCtor
+                    // call_constructor wants: ..., parentCtor, newTarget, args...
+                    emitOp(.special_object)
+                    emitU8(SpecialObjectType.newTarget.rawValue)
                 }
 
                 next()
@@ -4712,21 +4714,16 @@ final class JeffJSParser {
                 expect(0x29) // ')'
 
                 if isSuperCall {
-                    // Emit call_method so the parent constructor is called
-                    // with the derived constructor's `this` as the receiver.
-                    // Stack: ..., this, parentCtor, arg0, ..., argN
+                    // Stack: ..., parentCtor, newTarget, arg0, ..., argN
                     if hasSpread {
-                        emitOp(.apply)   // [this, parentCtor, argsArray] -> result
+                        emitOp(.apply_constructor)   // [parentCtor, newTarget, argsArray] -> result
                         emitU16(UInt16(argc))
                     } else {
-                        emitCallMethod(argc)
+                        emitCallConstructor(argc)
                     }
-                    // Drop the parent constructor's return value and leave
-                    // `this` as the value of the `super(...)` expression (ES
-                    // semantics). The enclosing statement drops that; emitting
-                    // only the drop here left the stack one below its base.
-                    emitOp(.drop)
-                    emitOp(.push_this)
+                    // Bind the constructed object as `this` and leave it as
+                    // the value of the `super(...)` expression (ES semantics).
+                    emitOp(.init_this)
                 } else if isMethodCall {
                     // [receiver, func, args...]: obj[key](...) and super.m(...)
                     if hasSpread {
@@ -5010,7 +5007,7 @@ final class JeffJSParser {
                 if isIdent("target") {
                     next()
                     emitOp(.special_object)
-                    emitU8(2) // new.target
+                    emitU8(SpecialObjectType.newTarget.rawValue)
                     return
                 }
                 syntaxError("expected 'target' after 'new.'")
@@ -5495,7 +5492,8 @@ final class JeffJSParser {
             } else {
                 // super(...): push a dummy that get_super pops; the parent
                 // constructor is resolved from frame.curFunc.__proto__.
-                emitOp(.push_this)
+                // (`this` is still uninitialised here, so not push_this.)
+                emitOp(.undefined)
                 emitOp(.get_super)
                 lastExprWasSuper = true
             }

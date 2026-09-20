@@ -296,25 +296,16 @@ func js_map_constructor(_ ctx: JeffJSContext,
         return ctx.throwTypeError("invalid map constructor magic")
     }
 
-    // Create the object.
-    let obj = JeffJSObject()
-    obj.classID = classID
-    obj.extensible = true
-
-    // Set the prototype so methods (get/set/has/size/etc.) are found.
-    if classID < ctx.classProto.count {
-        let proto = ctx.classProto[classID]
-        if proto.isObject {
-            obj.proto = proto.toObject()
-        }
-    }
+    // Create the object with the class prototype and a real root shape (a
+    // bare JeffJSObject() had no shape, so `map.extra = 1` and subclass
+    // fields silently vanished).
+    let result = ctx.newObjectClass(classID: classID)
+    guard let obj = result.toObject() else { return result }
 
     // Create and attach the map state.
     let s = JeffJSMapState(isWeak: isWeak)
     mapStateInit(s)
     obj.payload = .mapState(s)
-
-    let result = JeffJSValue.makeObject(obj)
 
     // If an iterable argument is provided, add each element.
     if !argv.isEmpty && !argv[0].isUndefined && !argv[0].isNull {
