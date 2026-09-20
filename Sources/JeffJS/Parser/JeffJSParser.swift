@@ -24,6 +24,9 @@ struct JeffJSBlockEnv {
     var breakLabel: Int = -1         // label for break
     var continueLabel: Int = -1      // label for continue
     var labelName: JSAtom = 0        // named label (0 = anonymous)
+    /// Labeled statement whose body is a loop (directly or through further
+    /// labels: `a: b: for`): the loop adopts it as a continue target.
+    var labelOnLoop: Bool = false
     var scopeLevel: Int = 0          // scope level at block entry
     var iteratorSlots: Int = 0       // stack slots held by the loop's iterator state: 1 for for-in (enumerator), 3 for for-of ([iter, obj, method])
     var finallyDepth: Int = 0        // finallyScopes.count when this env was pushed (try scopes above it are inside it)
@@ -349,6 +352,14 @@ final class JeffJSParser {
     func syntaxError(_ msg: String) {
         if !hasError {
             s.syntaxError(msg)
+            hasError = true
+        }
+    }
+
+    /// Report a syntax error at a specific source offset.
+    func syntaxErrorAt(_ offset: Int, _ msg: String) {
+        if !hasError {
+            s.syntaxErrorAt(offset, msg)
             hasError = true
         }
     }
@@ -999,6 +1010,19 @@ final class JeffJSParser {
         env.parent = curBlockEnvIdx
         blockEnvs.append(env)
         curBlockEnvIdx = blockEnvs.count - 1
+        // A loop directly under `L:` (or `L: M:`) gives those labels its
+        // continue target, so `continue L` restarts THIS loop (running its
+        // update expression) rather than whatever loop is innermost at the
+        // `continue`. The unwind still targets the loop env: findBlockEnv
+        // finds it first, innermost-out.
+        if continueLabel >= 0 {
+            var p = env.parent
+            while p >= 0 && blockEnvs[p].labelName != 0 && blockEnvs[p].continueLabel < 0
+                    && blockEnvs[p].labelOnLoop {
+                blockEnvs[p].continueLabel = continueLabel
+                p = blockEnvs[p].parent
+            }
+        }
     }
 
     /// Pop the current block environment.
@@ -1051,23 +1075,10 @@ final class JeffJSParser {
                     return env.continueLabel
                 }
             } else if env.labelName == labelName {
-                // Named continue: find this label's continue, or the nearest
-                // inner continue (the loop inside the labeled statement).
-                if env.continueLabel >= 0 {
-                    return env.continueLabel
-                }
-                // The labeled statement doesn't have a continue label itself,
-                // but the loop directly inside it does. Search inward from
-                // the current position to find it.
-                var inner = curBlockEnvIdx
-                while inner > idx {
-                    let innerEnv = blockEnvs[inner]
-                    if innerEnv.continueLabel >= 0 {
-                        return innerEnv.continueLabel
-                    }
-                    inner -= 1
-                }
-                return -1  // label found but no loop inside
+                // Named continue: the label carries its loop's continue
+                // target (set by pushBlockEnv); -1 when the label is not on
+                // a loop.
+                return env.continueLabel
             }
             idx = env.parent
         }
@@ -1537,9 +1548,14 @@ final class JeffJSParser {
     func parseForStatement() {
         expect(JSTokenType.TOK_FOR.rawValue)
 
-        // Check for 'for await'
-        let isAwait = isIdent("await")
+        // Check for 'for await' (`await` is a keyword token, TOK_AWAIT)
+        let isAwait = tok == JSTokenType.TOK_AWAIT.rawValue || isIdent("await")
         if isAwait {
+            if fd.funcKind != JSFunctionKindEnum.JS_FUNC_ASYNC.rawValue &&
+               fd.funcKind != JSFunctionKindEnum.JS_FUNC_ASYNC_GENERATOR.rawValue {
+                syntaxError("for await is only valid in asynchronous functions")
+                return
+            }
             next() // consume 'await'
         }
 
@@ -2387,7 +2403,8 @@ final class JeffJSParser {
         let label = findContinueLabel(labelName)
         if label < 0 {
             if labelName != 0 {
-                syntaxError("undefined label")
+                syntaxError(findBreakLabel(labelName) >= 0 ? "continue: label is not a loop"
+                                                          : "undefined label")
             } else {
                 syntaxError("continue must be inside loop")
             }
@@ -2448,6 +2465,12 @@ final class JeffJSParser {
 
         let breakLabel = newLabel()
         pushBlockEnv(breakLabel: breakLabel, continueLabel: -1, labelName: labelName)
+        // `L: for/while/do` (possibly via more labels) makes L a continue
+        // target; see pushBlockEnv. `L: { for ... }` does not.
+        blockEnvs[curBlockEnvIdx].labelOnLoop =
+            tok == JSTokenType.TOK_FOR.rawValue || tok == JSTokenType.TOK_WHILE.rawValue ||
+            tok == JSTokenType.TOK_DO.rawValue ||
+            (tok == JSTokenType.TOK_IDENT.rawValue && s.simpleNextToken() == 0x3A)
         parseStatement()
         popBlockEnv()
         emitLabel(breakLabel)
@@ -4757,9 +4780,11 @@ final class JeffJSParser {
                 if superBase {
                     // [homeProto, key] -> value; a following call gets `this`.
                     emitOp(.get_array_el)
-                    if tok == 0x28 { emitOp(.push_this); emitOp(.swap); pendingMethodCall = true }
-                } else if tok == 0x28 {
-                    // obj[key](...): keep the receiver so the call is a method call
+                    if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
+                        emitOp(.push_this); emitOp(.swap); pendingMethodCall = true
+                    }
+                } else if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
+                    // obj[key](...) / obj[key]`..`: keep the receiver so the call is a method call
                     // (QuickJS get_array_el2 + call_method); a plain call passed
                     // `this` = undefined.
                     emitOp(.get_array_el2)
@@ -4789,13 +4814,13 @@ final class JeffJSParser {
                     next()
                 }
                 if let fieldAtom = fieldAtomOpt {
-                    if superBase && tok == 0x28 {
+                    if superBase && (tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue) {
                         // super.m(...): [homeProto] -> [this, homeProto] -> [this, m]
                         emitOp(.push_this); emitOp(.swap)
                         pendingMethodCall = true
                         emitGetField(fieldAtom)
-                    } else if tok == 0x28 {
-                        // obj.m(...): keep the receiver for call_method right here.
+                    } else if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
+                        // obj.m(...) / obj.m`..`: keep the receiver for call_method right here.
                         // The later get_field+call rewrite pass loses the receiver
                         // when the arguments contain branches (`o.m(c ? a : b)`).
                         emitOp(.get_field2)
@@ -4854,140 +4879,18 @@ final class JeffJSParser {
                 emitLabel(endLabel)
 
             case JSTokenType.TOK_TEMPLATE.rawValue: // tagged template
-                // When we're inside a template interpolation (${...}), the
-                // tokenizer produces TOK_TEMPLATE when it hits the closing
-                // `}`.  That token belongs to the OUTER template literal,
-                // not to a tagged-template call on the expression we just
-                // parsed.  So bail out of the postfix loop and let the
-                // outer parseTemplateLiteral handle it.
+                // Inside a substitution the tokenizer never yields
+                // TOK_TEMPLATE for the closing `}` any more (the level is
+                // zeroed while the expression is parsed), but keep the
+                // guard: that token would belong to the outer literal.
                 if inTemplateExpr {
                     lastExprWasSuper = false
                     return
                 }
                 lastExprWasSuper = false
-
-                // Tagged template: tag`text0 ${expr0} text1 ${expr1} text2`
-                // calls tag(strings, expr0, expr1, ...) where strings is an
-                // array of the text segments.
-                //
-                // Strategy: parse the template, collecting text strings into
-                // an array and pushing expression values onto the stack as
-                // individual arguments. Then emit a call.
-                //
-                // The tag function value is already on the stack.
-
-                // First, build the strings array by collecting all text segments.
-                // We also need to evaluate interpolated expressions.
-                // Since we must push the strings array FIRST (as arg 0) but
-                // expressions come between text segments, we collect text
-                // segment constant pool indices, push expressions, then build
-                // the strings array below the expressions.
-                //
-                // Approach: push strings array first (empty), then for each
-                // interpolation push the expression value. We'll build the
-                // strings array by emitting the text segments into it.
-
-                var textCpoolIndices: [Int] = []
-                var exprCount = 0
-
-                // Parse template parts -- collect text cpools and emit expressions
-                // in a temporary buffer approach: push expressions in order.
-                // First pass: we need to know all text segments and emit all expressions.
-                // The template token stream alternates: text, expr, text, expr, text
-                while !shouldAbort {
-                    // Text segment
-                    let textStr = s.token.strValue
-                    let jsStr = JeffJSString(swiftString: textStr)
-                    let cpoolIdx = addConstPoolValue(JeffJSValue.makeString(jsStr))
-                    textCpoolIndices.append(cpoolIdx)
-
-                    if s.templateNestLevel <= 0 {
-                        break
-                    }
-
-                    // Expression
-                    next()
-                    // Zero templateNestLevel to allow nested { } in expressions
-                    let savedNestLevel2 = s.templateNestLevel
-                    s.templateNestLevel = 0
-                    let savedInTemplateExpr2 = inTemplateExpr
-                    inTemplateExpr = true
-                    parseExpression()
-                    inTemplateExpr = savedInTemplateExpr2
-                    exprCount += 1
-
-                    // Handle the closing } of the interpolation
-                    if tok == 0x7D {
-                        s.templateNestLevel = savedNestLevel2 > 0 ? savedNestLevel2 - 1 : 0
-                        _ = s.parseTemplatePart()
-                        // tok now reads s.token.type which parseTemplatePart set to TOK_TEMPLATE
-                    } else if tok == JSTokenType.TOK_TEMPLATE.rawValue {
-                        s.templateNestLevel = savedNestLevel2 > 0 ? savedNestLevel2 - 1 : 0
-                    } else {
-                        s.templateNestLevel = savedNestLevel2
-                        break
-                    }
-
-                    if tok != JSTokenType.TOK_TEMPLATE.rawValue {
-                        break
-                    }
-                }
-                next() // advance past the final TOK_TEMPLATE
-
-                // Stack now: ... tagFunc expr0 expr1 ... exprN
-                // We need: ... tagFunc stringsArr expr0 expr1 ... exprN
-                //
-                // Strategy: build the strings array on top of the stack,
-                // then use a rotation opcode to move it below all expressions.
-
-                // Build the strings array on top of the stack.
-                // Emit sentinel object before elements — array_from pops
-                // the sentinel after the element values, and the compiler's
-                // method-call depth tracker (findMatchingCall) counts it.
-                emitOp(.object)
-                for cpIdx in textCpoolIndices {
-                    emitPushConst(cpIdx)
-                }
-                emitOp(.array_from)
-                emitU16(UInt16(textCpoolIndices.count))
-
-                // Stack: ... tagFunc expr0 expr1 ... exprN stringsArr
-                // Rotate stringsArr below all expressions using perm/swap opcodes.
-                // perm(N+1) rotates top N+1 elements right: moves top to bottom.
-                switch exprCount {
-                case 0:
-                    break // stringsArr is already the only arg
-                case 1:
-                    emitOp(.swap)       // a b -> b a
-                case 2:
-                    emitOp(.perm3)      // a b c -> c a b
-                case 3:
-                    emitOp(.perm4)      // a b c d -> d a b c
-                case 4:
-                    emitOp(.perm5)      // a b c d e -> e a b c d
-                default:
-                    // For >4 expressions, use repeated perm5 + smaller perm
-                    // to bubble stringsArr down to the correct position.
-                    var remaining = exprCount
-                    while remaining >= 4 {
-                        emitOp(.perm5)  // rotate top 5 right
-                        remaining -= 4
-                    }
-                    switch remaining {
-                    case 1: emitOp(.swap)
-                    case 2: emitOp(.perm3)
-                    case 3: emitOp(.perm4)
-                    default: break
-                    }
-                }
-
-                // Stack: ... tagFunc stringsArr expr0 expr1 ... exprN
-                // Also add a .raw property to the strings array (ES spec requirement)
-                // For now, .raw = strings (cooked and raw are the same for non-escape cases)
-
-                // Emit the call: tag(stringsArray, expr0, expr1, ..., exprN)
-                // argc = 1 (strings array) + exprCount
-                emitCall(1 + exprCount)
+                let isMethodCall = pendingMethodCall
+                pendingMethodCall = false
+                parseTaggedTemplateCall(isMethodCall: isMethodCall)
 
             default:
                 lastExprWasSuper = false
@@ -6186,6 +6089,12 @@ final class JeffJSParser {
 
         while !shouldAbort {
             // ---- text segment (always present, may be "") ----
+            if let err = s.token.templateEscapeError {
+                // The tokenizer defers escape errors (a tagged template
+                // turns them into an undefined cooked string instead).
+                syntaxErrorAt(s.token.templateEscapeErrorPos, err)
+                return
+            }
             let textStr = s.token.strValue
             let jsStr = JeffJSString(swiftString: textStr)
             let cpoolIdx = addConstPoolValue(JeffJSValue.makeString(jsStr))
@@ -6203,15 +6112,16 @@ final class JeffJSParser {
             }
 
             // ---- interpolated expression ----
-            next() // advance past the TOK_TEMPLATE to the first expression token
-
             // Zero templateNestLevel so nested { } inside the expression
             // (e.g. object literals like `${{}}`) are treated as normal
             // braces by the tokenizer instead of prematurely closing the
-            // interpolation. Nested template literals within the expression
-            // will increment/decrement their own levels correctly.
+            // interpolation. This must happen BEFORE scanning the first
+            // token of the substitution: when that token is itself a
+            // template (`x${`y${a}`}`), its `${` bumps the level and the
+            // inner template must start from a clean level of its own.
             let savedNestLevel = s.templateNestLevel
             s.templateNestLevel = 0
+            next() // advance past the TOK_TEMPLATE to the first expression token
 
             let savedInTemplateExpr = inTemplateExpr
             inTemplateExpr = true
@@ -6234,7 +6144,7 @@ final class JeffJSParser {
             if tok == 0x7D { // '}'
                 // Restore nesting level (decremented by 1 for the consumed ${)
                 s.templateNestLevel = savedNestLevel > 0 ? savedNestLevel - 1 : 0
-                _ = s.parseTemplatePart()
+                if !s.parseTemplatePart() { hasError = true; return }
                 // tok now reads s.token.type which parseTemplatePart set to TOK_TEMPLATE
             } else if tok == JSTokenType.TOK_TEMPLATE.rawValue {
                 // The tokenizer may have already produced TOK_TEMPLATE
@@ -6253,6 +6163,71 @@ final class JeffJSParser {
         next() // advance past the final TOK_TEMPLATE to the token after the literal
     }
 
+    /// Tagged template: tag`text0 ${e0} text1 ${e1} text2` calls
+    /// tag(templateObject, e0, e1). The tag (and its receiver for a method
+    /// call) is already on the stack.
+    ///
+    /// The template object is built at parse time and stored in the
+    /// constant pool (as QuickJS does): a frozen array of the cooked strings
+    /// (`undefined` for a part with an invalid escape) carrying a frozen
+    /// `raw` array of the raw text. `push_const` hands out the same object
+    /// on every evaluation, which is the per-site caching the spec's
+    /// GetTemplateObject requires. It is pushed before the substitutions
+    /// so the call sees [tag, templateObject, e0, ...].
+    func parseTaggedTemplateCall(isMethodCall: Bool) {
+        let cpoolIdx = addConstPoolValue(.undefined)
+        emitPushConst(cpoolIdx)
+
+        var cooked: [JeffJSValue] = []
+        var raw: [JeffJSValue] = []
+        var exprCount = 0
+        while !shouldAbort {
+            // ---- text segment ----
+            if s.token.templateEscapeError == nil {
+                cooked.append(JeffJSValue.makeString(JeffJSString(swiftString: s.token.strValue)))
+            } else {
+                cooked.append(.undefined)
+            }
+            raw.append(JeffJSValue.makeString(JeffJSString(swiftString: s.templateRawString())))
+
+            // Level 0 means the tokenizer consumed the closing backtick.
+            if s.templateNestLevel <= 0 { break }
+
+            // ---- substitution (see parseTemplateLiteral for the level dance) ----
+            let savedNestLevel = s.templateNestLevel
+            s.templateNestLevel = 0
+            next()
+            let savedInTemplateExpr = inTemplateExpr
+            inTemplateExpr = true
+            let savedInFlag = inFlag
+            inFlag = true
+            parseExpression()
+            inFlag = savedInFlag
+            inTemplateExpr = savedInTemplateExpr
+            exprCount += 1
+
+            guard tok == 0x7D else { // '}'
+                s.templateNestLevel = savedNestLevel
+                syntaxError("expected '}' after template substitution")
+                return
+            }
+            s.templateNestLevel = savedNestLevel > 0 ? savedNestLevel - 1 : 0
+            if !s.parseTemplatePart() { hasError = true; return }
+        }
+        if shouldAbort { return }
+        next() // past the final TOK_TEMPLATE
+
+        if let ctx = s.ctx as? JeffJSContext {
+            fd.cpool[cpoolIdx] = ctx.newTemplateObject(cooked: cooked, raw: raw)
+        }
+
+        if isMethodCall {
+            emitCallMethod(1 + exprCount)
+        } else {
+            emitCall(1 + exprCount)
+        }
+    }
+
     // =========================================================================
     // MARK: - Destructuring
     // =========================================================================
@@ -6267,6 +6242,79 @@ final class JeffJSParser {
             parseObjectDestructuring(kind: kind, isLexical: isLexical, isConst: isConst)
         } else {
             syntaxError("expected destructuring pattern")
+        }
+    }
+
+    /// Destructure the value on top of the stack with a nested `[..]` / `{..}`
+    /// pattern that may carry a default: `{a: {b} = {}}`, `[{x} = {x: 1}]`,
+    /// `function f({a: [b] = []})`. QuickJS shape: the pattern code runs on
+    /// the value unless it is undefined, in which case the initializer is
+    /// evaluated first and control jumps back to the pattern code (the
+    /// initializer follows the pattern in the source, so it is emitted after).
+    func parseNestedDestructuringElement(kind: DestructuringKind,
+                                         isLexical: Bool, isConst: Bool) {
+        guard nestedPatternHasDefault() else {
+            parseDestructuringBinding(kind: kind, isLexical: isLexical, isConst: isConst)
+            return
+        }
+        let defaultLabel = newLabel()
+        let assignLabel = newLabel()
+        let doneLabel = newLabel()
+        emitOp(.dup)
+        emitOp(.undefined)
+        emitOp(.strict_eq)
+        emitIfTrue(defaultLabel)
+        emitLabel(assignLabel)
+        parseDestructuringBinding(kind: kind, isLexical: isLexical, isConst: isConst)
+        emitGoto(doneLabel)
+        emitLabel(defaultLabel)
+        emitOp(.drop)                  // the undefined
+        expect(0x3D)                   // '='
+        parseAssignExpr()
+        emitGoto(assignLabel)
+        emitLabel(doneLabel)
+    }
+
+    /// True when the `[` / `{` pattern at the current token is followed by
+    /// `= initializer`. Pure lookahead over balanced brackets; the tokenizer
+    /// state is restored.
+    func nestedPatternHasDefault() -> Bool {
+        guard tok == 0x5B || tok == 0x7B else { return false }
+        let savedBufPtr   = s.bufPtr
+        let savedLineNum  = s.lineNum
+        let savedToken    = s.token
+        let savedGotLF    = s.gotLF
+        let savedLastPtr  = s.lastPtr
+        let savedLastLine = s.lastLineNum
+        let savedTmplNest = s.templateNestLevel
+        let savedSuppress = JeffJSParseState.suppressErrorPrinting
+        let savedErrorMsg = s.lastErrorMessage
+        JeffJSParseState.suppressErrorPrinting = true
+        defer {
+            s.bufPtr              = savedBufPtr
+            s.lineNum             = savedLineNum
+            s.token               = savedToken
+            s.gotLF               = savedGotLF
+            s.lastPtr             = savedLastPtr
+            s.lastLineNum         = savedLastLine
+            s.templateNestLevel   = savedTmplNest
+            s.lastErrorMessage    = savedErrorMsg
+            JeffJSParseState.suppressErrorPrinting = savedSuppress
+        }
+        var depth = 0
+        while true {
+            let t = s.token.type
+            if t == JSTokenType.TOK_EOF.rawValue { return false }
+            if t == 0x5B || t == 0x7B || t == 0x28 {
+                depth += 1
+            } else if t == 0x5D || t == 0x7D || t == 0x29 {
+                depth -= 1
+                if depth <= 0 {
+                    guard s.nextToken() else { return false }
+                    return s.token.type == 0x3D
+                }
+            }
+            guard s.nextToken() else { return false }
         }
     }
 
@@ -6401,7 +6449,7 @@ final class JeffJSParser {
                     emitU16(UInt16(varIdx))
                 }
             } else if tok == 0x5B || tok == 0x7B {
-                parseDestructuringBinding(kind: kind, isLexical: isLexical, isConst: isConst)
+                parseNestedDestructuringElement(kind: kind, isLexical: isLexical, isConst: isConst)
             } else {
                 syntaxError("expected identifier or pattern in destructuring")
             }
@@ -6481,7 +6529,7 @@ final class JeffJSParser {
                 }
 
                 if tok == 0x5B || tok == 0x7B {
-                    parseDestructuringBinding(kind: kind, isLexical: isLexical, isConst: isConst)
+                    parseNestedDestructuringElement(kind: kind, isLexical: isLexical, isConst: isConst)
                 } else if tok == JSTokenType.TOK_IDENT.rawValue {
                     let varName = s.token.identAtom
                     next()

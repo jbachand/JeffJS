@@ -3977,7 +3977,7 @@ private func executeFastTraceLean(
     traceLoop: while true {
         #if DEBUG
         assert(pc >= entryPC && pc < exitPC && sp >= 0 && sp < stackLimit,
-               "fast trace left its region or overflowed")
+               "fast trace left its region or overflowed pc=\(pc) entry=\(entryPC) exit=\(exitPC) sp=\(sp) limit=\(stackLimit) op=\(bc[pc])")
         #endif
         // Same raw decode as the main loop: every narrow byte is a valid
         // case; the 0x00 wide prefix decodes to .invalid and deopts below.
