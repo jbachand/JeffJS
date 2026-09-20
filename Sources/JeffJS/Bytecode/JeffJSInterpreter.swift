@@ -1582,7 +1582,13 @@ extension JeffJSContext {
             }
         }
 
-        // Copy each enumerable own property from source to target
+        // Copy each enumerable own property from source to target.
+        // CopyDataProperties reads every key with [[Get]], so an accessor must
+        // be invoked (`({...{get a(){return 1}}}).a === 1`); a getter can also
+        // reshape the source, so the key list is snapshotted first and plain
+        // data slots are dup'd up front (the common path stays one shape walk).
+        var pending: [(atom: UInt32, value: JeffJSValue?)] = []
+        pending.reserveCapacity(shape.prop.count)
         for (i, shapeProp) in shape.prop.enumerated() {
             let atom = shapeProp.atom
             if atom == 0 { continue } // skip empty slots
@@ -1590,10 +1596,26 @@ extension JeffJSContext {
             // Only copy enumerable properties
             if !shapeProp.flags.contains(.enumerable) { continue }
             guard i < srcObj.propCount else { continue }
-            let propEntry = srcObj.propEntry(at: i)
-            if case .value(let val) = propEntry {
-                _ = setProperty(obj: target, atom: atom, value: val.dupValue())
+            switch srcObj.propEntry(at: i) {
+            case .value(let val): pending.append((atom, val.dupValue()))
+            case .getset: pending.append((atom, nil))   // read with [[Get]] below
+            default: break
             }
+        }
+        for k in 0 ..< pending.count {
+            let (atom, owned) = pending[k]
+            var val = owned
+            if val == nil {
+                let got = getProperty(obj: source, atom: atom)   // runs the getter
+                if got.isException {
+                    // Release the still-unconsumed dups (earlier ones were
+                    // handed to setProperty).
+                    for j in (k + 1) ..< pending.count { pending[j].value?.freeValue() }
+                    return false
+                }
+                val = got
+            }
+            _ = setProperty(obj: target, atom: atom, value: val!)   // takes the reference
         }
         return true
     }

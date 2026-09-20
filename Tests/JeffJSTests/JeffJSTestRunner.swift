@@ -10308,12 +10308,21 @@ extension JeffJSTestRunner {
             var c = new C1();
             [c.x, c.y, c.z, c.nt, c.m(), c instanceof A1, Object.getPrototypeOf(c) === C1.prototype].join()
         """, expect: "1,2,3,C1,B>A,true,true")
+        // Object spread reads accessors with [[Get]] (CopyDataProperties).
+        evalCheckStr(ctx, """
+            var n = 0;
+            var src = { get a() { n++; return 1; }, b: 2 };
+            var copy = { ...src };
+            [copy.a, copy.b, n, typeof Object.getOwnPropertyDescriptor(copy, 'a').get].join()
+        """, expect: "1,2,1,undefined")
         // `this` before super() is a ReferenceError; super() twice too;
         // returning nothing without super() throws.
         evalCheckBool(ctx, """
             class Base {}
-            class D1 extends Base { constructor() { try { this.q = 1; } catch (e) { this.err = e; } super(); } }
-            new D1().err instanceof ReferenceError
+            var d1err = null;
+            class D1 extends Base { constructor() { try { this.q = 1; } catch (e) { d1err = e; } super(); } }
+            new D1();
+            d1err instanceof ReferenceError
         """, expect: true)
         evalCheckBool(ctx, """
             class Base2 {}
