@@ -1704,6 +1704,11 @@ final class JeffJSParser {
                     emitOp(.for_of_next)
                     emitU8(0)
                     emitIfTrue(doneLabel)
+                    // `for await`: each value the iterator yields is awaited
+                    // (this covers a sync iterable of promises; an async
+                    // iterator's values are already settled, so the extra
+                    // await is a no-op tick).
+                    if isAwait { emitOp(.await_) }
 
                     // Rewind and parse destructuring binding
                     s.bufPtr = dSavedBufPtr; s.token = dSavedToken; s.lineNum = dSavedLineNum
@@ -1955,6 +1960,8 @@ final class JeffJSParser {
         emitOp(.for_of_next)
         emitU8(0) // flags
         emitIfTrue(doneLabel) // done flag => exit via doneLabel
+        // `for await`: await each yielded value (see parseForIn/OfDestructuring).
+        if isAwait { emitOp(.await_) }
 
         // Assign to the variable
         if varIdx >= 0 {
