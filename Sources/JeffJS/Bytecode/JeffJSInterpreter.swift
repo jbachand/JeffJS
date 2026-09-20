@@ -879,53 +879,75 @@ extension JeffJSContext {
         guard let obj = funcVal.toObject() else {
             return throwTypeError(message: "not a constructor")
         }
-        // C function constructor path
+        // C function constructor path. Builtins allocate their own instance
+        // with the class prototype; when constructed through a subclass or
+        // Reflect.construct (newTarget !== F) the instance is re-prototyped to
+        // newTarget.prototype, which is what QuickJS's js_create_from_ctor
+        // yields (right class id, subclass prototype).
         if case .cFunc(_, let cFunction, _, _, let magic) = obj.payload {
+            let result: JeffJSValue
             switch cFunction {
             case .constructor(let fn):
-                return fn(self, newTarget, args)
+                result = fn(self, newTarget, args)
             case .constructorOrFunc(let fn):
-                return fn(self, newTarget, args, true)
+                result = fn(self, newTarget, args, true)
             case .generic(let fn):
                 // Some generic C functions can be called as constructors
                 let newObj = newObject()
-                let result = fn(self, newObj, args)
-                if result.isException { newObj.freeValue(); return .exception }
+                let r = fn(self, newObj, args)
+                if r.isException { newObj.freeValue(); return .exception }
                 // A constructor that builds its own instance (Array, Map, ...)
                 // leaves the pre-created object unused: release it (it was
                 // leaked once per `new` before).
-                if result.isObject { newObj.freeValue(); return result }
-                result.freeValue()
-                return newObj
+                if r.isObject { newObj.freeValue(); result = r }
+                else { r.freeValue(); result = newObj }
+            case .genericMagic(let fn):
+                let newObj = newObject()
+                let r = fn(self, newObj, args, Int(magic))
+                if r.isException { newObj.freeValue(); return .exception }
+                if r.isObject { newObj.freeValue(); result = r }
+                else { r.freeValue(); result = newObj }
             default:
                 return throwTypeError(message: "not a constructor")
             }
+            if result.isException { return .exception }
+            if newTarget.isObject, newTarget.bits != funcVal.bits {
+                return adoptNewTargetPrototype(result, newTarget: newTarget)
+            }
+            return result
         }
         // Bound function constructor path: unwrap and recurse.
         // Per ES spec, bound functions forward [[Construct]] to the target,
-        // prepending bound args. The bound thisVal is ignored for constructors.
+        // prepending bound args. The bound thisVal is ignored for constructors,
+        // and a newTarget equal to the bound function becomes the target.
         if case .boundFunction(let bound) = obj.payload {
             var fullArgs = bound.argv
             fullArgs.append(contentsOf: args)
-            return callConstructor(bound.funcObj, newTarget: newTarget, args: fullArgs)
+            let nt = newTarget.bits == funcVal.bits ? bound.funcObj : newTarget
+            return callConstructor(bound.funcObj, newTarget: nt, args: fullArgs)
         }
         // Callable proxy constructor path: delegate to proxy construct trap
         if case .proxyData = obj.payload {
             return js_proxy_construct(self, obj, args, newTarget)
         }
         // Bytecode function constructor path — verify it IS a bytecode function
-        guard case .bytecodeFunc = obj.payload else {
-            let payloadDesc: String
-            switch obj.payload {
-            case .opaque(let v): payloadDesc = "opaque(\(v == nil ? "nil" : String(describing: type(of: v!))))"
-            case .cFunc: payloadDesc = "cFunc"
-            case .boundFunction: payloadDesc = "boundFunction"
-            default: payloadDesc = "\(obj.payload)"
-            }
+        guard case .bytecodeFunc(let fbOpt, _, _) = obj.payload else {
             return throwTypeError(message: "not a constructor")
         }
-        // 1. Get constructor's .prototype to use as the new object's [[Prototype]]
-        let protoVal = getProperty(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue)
+        // Derived class constructor: `this` is uninitialised until super()
+        // constructs it (see init_this); the activation epilogue returns it.
+        if let fb = fbOpt, fb.isDerivedClassConstructor {
+            return JeffJSInterpreter.callInternal(ctx: self, funcObj: funcVal,
+                                                  thisVal: .uninitialized, args: args,
+                                                  flags: JS_CALL_FLAG_CONSTRUCTOR,
+                                                  newTarget: newTarget)
+        }
+        // 1. OrdinaryCreateFromConstructor(newTarget): the new object's
+        //    [[Prototype]] is newTarget.prototype (=== F.prototype for plain
+        //    `new F()`), falling back to Object.prototype.
+        let protoSource = newTarget.isObject ? newTarget : funcVal
+        let protoVal = getProperty(obj: protoSource, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue)
+        if protoVal.isException { return .exception }
         let newObj: JeffJSValue
         if protoVal.isObject {
             newObj = newObjectProto(proto: protoVal)   // takes its own reference to the prototype
@@ -937,7 +959,8 @@ extension JeffJSContext {
         // 2. Call the constructor with the new object as `this`
         let result = JeffJSInterpreter.callInternal(ctx: self, funcObj: funcVal,
                                                      thisVal: newObj, args: args,
-                                                     flags: JS_CALL_FLAG_CONSTRUCTOR)
+                                                     flags: JS_CALL_FLAG_CONSTRUCTOR,
+                                                     newTarget: newTarget)
         if result.isException { newObj.freeValue(); return .exception }
         // 3. If the constructor explicitly returned an object, use it (and
         //    release the pre-created one)
@@ -945,6 +968,20 @@ extension JeffJSContext {
         result.freeValue()
         // 4. Otherwise return the newly created object
         return newObj
+    }
+
+    /// Re-prototypes a builtin constructor's freshly built instance to
+    /// `newTarget.prototype` (subclassing / Reflect.construct). Takes
+    /// ownership of `result`; returns it (or an exception).
+    func adoptNewTargetPrototype(_ result: JeffJSValue, newTarget: JeffJSValue) -> JeffJSValue {
+        guard result.isObject else { return result }
+        let protoVal = getProperty(obj: newTarget, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue)
+        if protoVal.isException { result.freeValue(); return .exception }
+        if protoVal.isObject {
+            _ = setPrototypeOf(obj: result, proto: protoVal)   // retains the prototype
+        }
+        protoVal.freeValue()
+        return result
     }
 
     /// Converts a JS array (or array-like) value to a Swift array of JeffJSValues.
@@ -1545,7 +1582,13 @@ extension JeffJSContext {
             }
         }
 
-        // Copy each enumerable own property from source to target
+        // Copy each enumerable own property from source to target.
+        // CopyDataProperties reads every key with [[Get]], so an accessor must
+        // be invoked (`({...{get a(){return 1}}}).a === 1`); a getter can also
+        // reshape the source, so the key list is snapshotted first and plain
+        // data slots are dup'd up front (the common path stays one shape walk).
+        var pending: [(atom: UInt32, value: JeffJSValue?)] = []
+        pending.reserveCapacity(shape.prop.count)
         for (i, shapeProp) in shape.prop.enumerated() {
             let atom = shapeProp.atom
             if atom == 0 { continue } // skip empty slots
@@ -1553,10 +1596,26 @@ extension JeffJSContext {
             // Only copy enumerable properties
             if !shapeProp.flags.contains(.enumerable) { continue }
             guard i < srcObj.propCount else { continue }
-            let propEntry = srcObj.propEntry(at: i)
-            if case .value(let val) = propEntry {
-                _ = setProperty(obj: target, atom: atom, value: val.dupValue())
+            switch srcObj.propEntry(at: i) {
+            case .value(let val): pending.append((atom, val.dupValue()))
+            case .getset: pending.append((atom, nil))   // read with [[Get]] below
+            default: break
             }
+        }
+        for k in 0 ..< pending.count {
+            let (atom, owned) = pending[k]
+            var val = owned
+            if val == nil {
+                let got = getProperty(obj: source, atom: atom)   // runs the getter
+                if got.isException {
+                    // Release the still-unconsumed dups (earlier ones were
+                    // handed to setProperty).
+                    for j in (k + 1) ..< pending.count { pending[j].value?.freeValue() }
+                    return false
+                }
+                val = got
+            }
+            _ = setProperty(obj: target, atom: atom, value: val!)   // takes the reference
         }
         return true
     }
@@ -2537,7 +2596,9 @@ private func executeFastTrace(
         // through callFunction deopts instead.
         // ------------------------------------------------------------------
         case .push_this:
-            buf[sp] = frame.thisVal.dupValue(); sp += 1
+            let thisV = frame.thisVal
+            if thisV.isUninitialized { resume = pc; break traceLoop }   // deopt: derived ctor before super()
+            buf[sp] = thisV.dupValue(); sp += 1
             pc += 1
 
         case .call, .call0, .call1, .call2, .call3:
@@ -5829,6 +5890,7 @@ struct JeffJSInterpreter {
         thisVal: JeffJSValue,
         args: [JeffJSValue],
         flags: Int = 0,
+        newTarget: JeffJSValue = .undefined,
         generatorObject: JeffJSValue = .undefined,
         resumeState: GeneratorSavedState? = nil,
         resumeValue: JeffJSValue = .undefined,
@@ -5952,6 +6014,9 @@ struct JeffJSInterpreter {
         if fb0.isArrow, let arrowThis = obj.arrowThisVal {
             frame.thisVal = arrowThis
         }
+        // new.target (borrowed from the constructor call site; releaseFrame
+        // resets it).
+        if isConstructor { frame.newTarget = newTarget }
         frame.argCount = args.count
         // No padding append: `buf` carries the undefined-padded arg slots, and
         // every argBuf consumer (varRef pvalue, detach, syncBufToFrame) bounds-
@@ -6371,6 +6436,21 @@ struct JeffJSInterpreter {
                             // line_num is debug info, skip it (2-byte prefix + 4-byte line + 4-byte col)
                             pc += 2 + 4 + 4
                             continue dispatchLoop
+                        case .init_this:
+                            // super(...) returned: bind the constructed object as
+                            // the derived constructor's `this` (the frame owns it
+                            // until the activation's epilogue hands it back).
+                            let constructed = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                            if !frame.thisVal.isUninitialized {
+                                constructed.freeValue()
+                                _ = ctx.throwReferenceError(message: "super() already called")
+                                retVal = .exception
+                                break dispatchLoop
+                            }
+                            frame.thisVal = constructed
+                            buf[sp] = constructed.dupValue(); sp += 1
+                            pc += 2
+                            continue dispatchLoop
                         case .get_field_opt_chain:
                             let atom = readU32(bc, pc + 2)
                             let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
@@ -6657,6 +6737,20 @@ struct JeffJSInterpreter {
             case .dup:
                 let val = buf[sp - 1]
                 buf[sp] = val.dupValue(); sp += 1
+                pc += 1
+
+            case .init_this:
+                // Single-byte form is never emitted (wide range); see the
+                // wide-prefix handler above for the semantics.
+                let constructed = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                if !frame.thisVal.isUninitialized {
+                    constructed.freeValue()
+                    _ = ctx.throwReferenceError(message: "super() already called")
+                    retVal = .exception
+                    break dispatchLoop
+                }
+                frame.thisVal = constructed
+                buf[sp] = constructed.dupValue(); sp += 1
                 pc += 1
 
             case .dup1:
@@ -10421,7 +10515,14 @@ struct JeffJSInterpreter {
                 pc += 1
 
             case .push_this:
-                buf[sp] = frame.thisVal.dupValue(); sp += 1
+                let thisV = frame.thisVal
+                if thisV.isUninitialized {
+                    // Derived class constructor before super() returned.
+                    _ = ctx.throwReferenceError(message: "must call super constructor before using 'this'")
+                    retVal = .exception
+                    break dispatchLoop
+                }
+                buf[sp] = thisV.dupValue(); sp += 1
                 pc += 1
 
             case .push_0: buf[sp] = .newInt32(0); sp += 1; pc += 1
@@ -11060,6 +11161,31 @@ struct JeffJSInterpreter {
                 vr.value = vr.pvalue.dupValue()
                 vr.isDetached = true
                 vr.parentFrame = nil; vr.slot = nil
+            }
+        }
+
+        // Derived class constructor: `this` was bound by init_this (owned by
+        // the frame). An explicit object return wins; `undefined` returns
+        // `this`, which must have been initialised by super().
+        if isConstructor, fb0.isDerivedClassConstructor {
+            let boundThis = frame.thisVal
+            frame.thisVal = .undefined
+            if retVal.isException {
+                if !boundThis.isUninitialized { boundThis.freeValue() }
+            } else if retVal.isUndefined {
+                if boundThis.isUninitialized {
+                    _ = ctx.throwReferenceError(message: "must call super constructor before returning from derived constructor")
+                    retVal = .exception
+                } else {
+                    retVal = boundThis
+                }
+            } else if retVal.isObject {
+                if !boundThis.isUninitialized { boundThis.freeValue() }
+            } else {
+                retVal.freeValue()
+                if !boundThis.isUninitialized { boundThis.freeValue() }
+                _ = ctx.throwTypeError(message: "derived constructor must return object or undefined")
+                retVal = .exception
             }
         }
 
