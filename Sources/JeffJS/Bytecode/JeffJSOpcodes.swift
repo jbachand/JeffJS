@@ -488,6 +488,7 @@ enum JeffJSOpcode: UInt16, CaseIterable {
     case with_get_ref_undef      // with_get_ref_undef(atom, label, u8)
     case swap2                   // swap top 2 pairs   (never emitted; parked in the wide range)
     case dup1                    // duplicate top and second element   (never emitted; parked in the wide range)
+    case private_in              // `#x in obj`: obj key(private symbol | private method) -> bool
 }
 
 // MARK: - Opcode Info Table
@@ -1258,6 +1259,7 @@ let jeffJSOpcodeInfo: [OpcodeInfo] = [
     OpcodeInfo(name: "with_get_ref_undef", size: 10, nPop: 1, nPush: 2, format: .atom_label_u8),
     OpcodeInfo(name: "swap2",            size: 1, nPop: 4,  nPush: 4,  format: .none),
     OpcodeInfo(name: "dup1",             size: 1, nPop: 2,  nPush: 3,  format: .none),
+    OpcodeInfo(name: "private_in",       size: 1, nPop: 2,  nPush: 1,  format: .none),
 ]
 
 // MARK: - Opcode Lookup Helpers
@@ -1434,6 +1436,7 @@ enum ThrowErrorType: UInt8 {
     case invalidOrDestructuring = 3   // invalid destructuring target
     case notDefined             = 4   // variable not defined
     case constAssign            = 5   // assignment to const variable
+    case privateAccess          = 6   // invalid private member read/write (message is the atom)
 }
 
 // MARK: - Compile-time Assertions

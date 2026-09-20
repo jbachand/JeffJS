@@ -1144,6 +1144,20 @@ final class JeffJSRuntime {
         return addAtom(str: str, hash: hash, atomType: .JS_ATOM_TYPE_STRING)
     }
 
+    /// Sequence used to make every private atom spelling unique.
+    private var privateAtomSeq: UInt32 = 0
+
+    /// Create a fresh `JS_ATOM_TYPE_PRIVATE` atom (class private names `#x`
+    /// and private brands). Private atoms are never found by string lookup:
+    /// the spelling embeds a NUL and a sequence number, so two `#x` names in
+    /// different classes never collide with each other or with a public `x`.
+    /// Property enumeration skips private atoms. Returns an owned reference.
+    func newPrivateAtom(_ desc: String) -> UInt32 {
+        privateAtomSeq &+= 1
+        let str = desc + "\u{0}" + String(privateAtomSeq)
+        return addAtom(str: str, hash: atomHashString(str), atomType: .JS_ATOM_TYPE_PRIVATE)
+    }
+
     /// findAtom for a JS string used as a dynamic property key (`obj[key]`).
     /// Hashes and compares the string's own code units against the table
     /// (no Swift String round trip) and caches the atom on the string, so a
