@@ -308,4 +308,58 @@ final class EngineTests: XCTestCase {
         let report = JeffJSPerfTests.runHeadToHead()
         print(report)
     }
+
+    // MARK: - Leak regression
+
+    /// Resident size of this process, in bytes (0 if the query fails).
+    private func residentBytes() -> UInt64 {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { raw in
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), raw, &count)
+            }
+        }
+        return kr == KERN_SUCCESS ? info.resident_size : 0
+    }
+
+    /// A frame that materialised `arguments` and then returned the result of a
+    /// nested call (`return g(...)`, i.e. the tail_call/tail_call_method
+    /// opcodes) used to abandon its whole variable region: the `arguments`
+    /// object and every other local leaked, ~400 bytes per call, so a 1M-call
+    /// loop reached ~1 GB RSS. Both shapes below (apply-forwarding and direct
+    /// element reads) go through that epilogue.
+    func testTailCallArgumentsDoesNotLeak() {
+        let cases = [
+            ("apply", "function g(a){return a}\nfunction f(){ return g.apply(null, arguments) }\n"),
+            ("index", "function g(a,b,c){return a}\nfunction f(){ return g(arguments[0],arguments[1],arguments[2]) }\n"),
+            ("method", "var o={g:function(a){return a}};\nfunction f(){ return o.g.apply(o, arguments) }\n"),
+        ]
+        for (name, prelude) in cases {
+            let rt = JeffJSRuntime()
+            let ctx = rt.newContext()
+            defer { ctx.free(); rt.free() }
+            _ = ctx.eval(input: prelude, filename: "<leak-prelude>", evalFlags: 0)
+            // Warm-up: let the object/frame/buffer pools reach steady state so
+            // the measurement below sees only growth, not first-touch cost.
+            let loop = "var s=0;for(var i=0;i<LOOPN;i++)s+=f(i,2,3);s"
+            _ = ctx.eval(input: loop.replacingOccurrences(of: "LOOPN", with: "20000"),
+                         filename: "<leak-warmup>", evalFlags: 0)
+            let before = residentBytes()
+            let r = ctx.eval(input: loop.replacingOccurrences(of: "LOOPN", with: "200000"),
+                             filename: "<leak-loop>", evalFlags: 0)
+            XCTAssertFalse(r.isException, "\(name): loop threw")
+            r.freeValue()
+            let after = residentBytes()
+            let grewMB = Double(after &- min(after, before)) / (1024 * 1024)
+            print("[leak] \(name): RSS \(Double(before) / 1048576) -> \(Double(after) / 1048576) MB (+\(grewMB) MB)")
+            // Growth, not absolute RSS: the whole suite shares one process and
+            // testConformance deliberately strands ~90 contexts in it, so the
+            // floor here is a few hundred MB. The bug cost ~74 MB over 200k
+            // calls; a fixed run grows by ~0.
+            XCTAssertLessThan(grewMB, 24.0,
+                              "\(name): 200k tail calls with a materialised `arguments` grew RSS by \(grewMB) MB")
+        }
+    }
 }
+
