@@ -2042,6 +2042,9 @@ struct JeffJSBuiltinArray {
             guard let da = ctx.extractFloat64(a), let db = ctx.extractFloat64(b) else { return false }
             return da == db  // IEEE: NaN != NaN, +0 == -0
         }
+        if a.isBigInt || b.isBigInt {
+            return a.isBigInt && b.isBigInt && JeffJSBigIntOps.equal(a, b)
+        }
         // Different tags (after excluding mixed int/float) means different types
         if !JeffJSValue.sameTag(a, b) { return false }
         // Strings: compare code units directly (no Swift String round trip;

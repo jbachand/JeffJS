@@ -33,6 +33,10 @@ private let JS_MAP_HASH_DELETED      = -1
 /// SameValueZero: NaN === NaN, -0 === +0.
 /// Used by Map/Set per the ES spec for key comparison.
 private func sameValueZero(_ a: JeffJSValue, _ b: JeffJSValue) -> Bool {
+    // BigInts compare by value, not by allocation (`m.get(2n**70n)`).
+    if a.isBigInt || b.isBigInt {
+        return a.isBigInt && b.isBigInt && JeffJSBigIntOps.equal(a, b)
+    }
     if !JeffJSValue.sameTag(a, b) { return false }
     // Heap types: identity or string content comparison
     if a.hasRefCount {
@@ -111,15 +115,10 @@ private func mapHashKey(_ key: JeffJSValue) -> UInt32 {
             return UInt32(oid.hashValue & 0x7FFF_FFFF) &* KNUTH_MULTIPLIER
         }
         return 0
-    case .bigInt:
-        if let bi = key.toBigInt() {
-            var h: UInt32 = 0
-            for limb in bi.limbs {
-                h = h ^ UInt32(limb & 0xFFFF_FFFF) ^ UInt32(limb >> 32)
-            }
-            return h &* KNUTH_MULTIPLIER
-        }
-        return 0
+    case .bigInt, .shortBigInt:
+        var h: UInt32 = key.bigIntValue.negative ? 0x9E37 : 0
+        for limb in key.bigIntValue.mag { h = h ^ limb }
+        return h &* KNUTH_MULTIPLIER
     default:
         return 0
     }

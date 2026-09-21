@@ -982,15 +982,23 @@ final class JeffJSVarRef: JeffJSGCObjectHeader {
 }
 
 /// BigInt (arbitrary-precision integer).
+///
+/// Only values outside the 48-bit inline payload live here; everything
+/// smaller is a `shortBigInt` in the NaN-boxed value itself.
 final class JeffJSBigInt: JeffJSGCObjectHeader {
-    var sign: Bool = false
-    var len: Int = 0
-    var limbs: [UInt64] = []
+    var value: JBigInt = .zero
+
+    var sign: Bool { value.negative }
 
     override init(refCount: Int = 1,
                   gcObjType: JSGCObjectTypeEnum = .bigInt,
                   mark: Bool = false) {
         super.init(refCount: refCount, gcObjType: gcObjType, mark: mark)
+    }
+
+    convenience init(_ v: JBigInt) {
+        self.init(refCount: 1, gcObjType: .bigInt, mark: false)
+        self.value = v
     }
 }
 

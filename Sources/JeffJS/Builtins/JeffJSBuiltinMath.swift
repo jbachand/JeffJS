@@ -11,6 +11,20 @@ import Foundation
 
 /// Install the `Math` object on the given global object.
 /// Mirrors `js_init_module_math` / the Math portion of `JS_AddIntrinsicBaseObjects`.
+/// Math methods take Numbers only: ToNumber(BigInt) is a TypeError, and the
+/// per-argument conversion cannot report it (it returns a Double), so the
+/// check lives at the call boundary.
+private func defineMathFunc(ctx: JeffJSContext, obj: JeffJSObject,
+                            name: String, length: Int,
+                            func cfunc: @escaping (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue) {
+    jeffJS_defineBuiltinFunc(ctx: ctx, obj: obj, name: name, length: length) { c, t, argv in
+        for v in argv where v.isBigInt {
+            return c.throwTypeError(message: "Cannot convert a BigInt value to a number")
+        }
+        return cfunc(c, t, argv)
+    }
+}
+
 func jeffJS_initMath(ctx: JeffJSContext, globalObj: JeffJSObject) {
     let mathObj = jeffJS_createObject(ctx: ctx, proto: nil, classID: UInt16(JeffJSClassID.object.rawValue))
     mathObj.extensible = true
@@ -49,79 +63,79 @@ func jeffJS_initMath(ctx: JeffJSContext, globalObj: JeffJSObject) {
 
     // -- Methods --
 
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "abs", length: 1, func: jsMath_abs)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "acos", length: 1, func: jsMath_acos)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "acosh", length: 1, func: jsMath_acosh)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "asin", length: 1, func: jsMath_asin)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "asinh", length: 1, func: jsMath_asinh)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "atan", length: 1, func: jsMath_atan)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "atanh", length: 1, func: jsMath_atanh)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "atan2", length: 2, func: jsMath_atan2)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "cbrt", length: 1, func: jsMath_cbrt)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "ceil", length: 1, func: jsMath_ceil)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "clz32", length: 1, func: jsMath_clz32)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "cos", length: 1, func: jsMath_cos)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "cosh", length: 1, func: jsMath_cosh)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "exp", length: 1, func: jsMath_exp)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "expm1", length: 1, func: jsMath_expm1)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "floor", length: 1, func: jsMath_floor)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "fround", length: 1, func: jsMath_fround)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "f16round", length: 1, func: jsMath_f16round)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "hypot", length: 2, func: jsMath_hypot)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "imul", length: 2, func: jsMath_imul)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "log", length: 1, func: jsMath_log)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "log1p", length: 1, func: jsMath_log1p)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "log10", length: 1, func: jsMath_log10)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "log2", length: 1, func: jsMath_log2)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "max", length: 2, func: jsMath_max)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "min", length: 2, func: jsMath_min)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "pow", length: 2, func: jsMath_pow)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "random", length: 0, func: jsMath_random)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "round", length: 1, func: jsMath_round)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "sign", length: 1, func: jsMath_sign)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "sin", length: 1, func: jsMath_sin)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "sinh", length: 1, func: jsMath_sinh)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "sqrt", length: 1, func: jsMath_sqrt)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "tan", length: 1, func: jsMath_tan)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "tanh", length: 1, func: jsMath_tanh)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "trunc", length: 1, func: jsMath_trunc)
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: mathObj,
+    defineMathFunc(ctx: ctx, obj: mathObj,
                              name: "sumPrecise", length: 1, func: jsMath_sumPrecise)
 
     // Install Math on the global object.
@@ -136,6 +150,11 @@ func jeffJS_initMath(ctx: JeffJSContext, globalObj: JeffJSObject) {
 private func toFloat64Arg(_ ctx: JeffJSContext, _ argv: [JeffJSValue], _ index: Int) -> Double {
     guard index < argv.count else { return Double.nan }
     let v = argv[index]
+    if v.isBigInt {
+        // ToNumber(BigInt) is a TypeError; Math.* must not silently see NaN.
+        _ = ctx.throwTypeError(message: "Cannot convert a BigInt value to a number")
+        return Double.nan
+    }
     if v.isInt {
         return Double(v.toInt32())
     } else if v.isFloat64 {

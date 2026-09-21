@@ -5332,6 +5332,14 @@ final class JeffJSParser {
         switch tok {
 
         case JSTokenType.TOK_NUMBER.rawValue:
+            if let big = s.token.bigIntValue {
+                // BigInt literals always go through the constant pool: the
+                // value is a NaN-boxed BigInt, not a double.
+                let cpoolIdx = addConstPoolValue(JeffJSValue.newBigInt(big))
+                emitPushConst(cpoolIdx)
+                next()
+                break
+            }
             let val = s.token.numValue
             let intVal = Int32(exactly: val)
             if let iv = intVal, Double(iv) == val {

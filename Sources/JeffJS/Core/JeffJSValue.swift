@@ -71,10 +71,10 @@ enum JSValuePayload {
 ///     0x7FF9 = int32      0x7FFA = bool       0x7FFB = null
 ///     0x7FFC = undefined   0x7FFD = exception   0x7FFE = uninitialized
 ///     0x7FFF = catchOffset
-///   Refcounted tags (quiet NaN, negative sign):
-///     0xFFF9 = object     0xFFFA = string      0xFFFB = symbol
-///     0xFFFC = bigInt     0xFFFD = funcBytecode 0xFFFE = module
-///     0xFFFF = (reserved)
+///   Negative-sign tags:
+///     0xFFF9 = shortBigInt (inline 48-bit signed, NOT refcounted)
+///     0xFFFA = object     0xFFFB = string      0xFFFC = symbol
+///     0xFFFD = bigInt     0xFFFE = funcBytecode 0xFFFF = module
 ///   Everything else = IEEE 754 double (stored as raw bits).
 ///
 /// Heap types store a raw pointer in the low 48 bits (via Unmanaged.passRetained).
@@ -95,13 +95,17 @@ struct JeffJSValue {
     @usableFromInline static let _exceptTag:  UInt64 = 0x7FFD_0000_0000_0000
     @usableFromInline static let _uninitTag:  UInt64 = 0x7FFE_0000_0000_0000
     @usableFromInline static let _catchTag:   UInt64 = 0x7FFF_0000_0000_0000
+    // Short BigInt — NOT refcounted: a sign-extended 48-bit integer inline in
+    // the payload. It sorts below every heap tag so `_isHeapTag` stays a
+    // single comparison (see the tag map in the type comment).
+    @usableFromInline static let _shortBigTag: UInt64 = 0xFFF9_0000_0000_0000
     // Refcounted (heap objects — raw pointer embedded in low 48 bits)
-    @usableFromInline static let _objectTag:  UInt64 = 0xFFF9_0000_0000_0000
-    @usableFromInline static let _stringTag:  UInt64 = 0xFFFA_0000_0000_0000
-    @usableFromInline static let _symbolTag:  UInt64 = 0xFFFB_0000_0000_0000
-    @usableFromInline static let _bigIntTag:  UInt64 = 0xFFFC_0000_0000_0000
-    @usableFromInline static let _fbTag:      UInt64 = 0xFFFD_0000_0000_0000
-    @usableFromInline static let _moduleTag:  UInt64 = 0xFFFE_0000_0000_0000
+    @usableFromInline static let _objectTag:  UInt64 = 0xFFFA_0000_0000_0000
+    @usableFromInline static let _stringTag:  UInt64 = 0xFFFB_0000_0000_0000
+    @usableFromInline static let _symbolTag:  UInt64 = 0xFFFC_0000_0000_0000
+    @usableFromInline static let _bigIntTag:  UInt64 = 0xFFFD_0000_0000_0000
+    @usableFromInline static let _fbTag:      UInt64 = 0xFFFE_0000_0000_0000
+    @usableFromInline static let _moduleTag:  UInt64 = 0xFFFF_0000_0000_0000
     // Masks
     @usableFromInline static let _tagMask:    UInt64 = 0xFFFF_0000_0000_0000
     @usableFromInline static let _ptrMask:    UInt64 = 0x0000_FFFF_FFFF_FFFF
@@ -233,8 +237,15 @@ struct JeffJSValue {
     func getTag() -> JSValueTag { JSValueTag(rawValue: tag) ?? .first }
 
     @inline(__always) var isNumber: Bool  { isInt || isFloat64 }
-    @inline(__always) var isBigInt: Bool  { (bits & Self._tagMask) == Self._bigIntTag }
-    @inline(__always) var isShortBigInt: Bool { false }
+    /// Heap (arbitrary-precision) BigInt.
+    @inline(__always) var isHeapBigInt: Bool { (bits & Self._tagMask) == Self._bigIntTag }
+    /// Inline 48-bit BigInt.
+    @inline(__always) var isShortBigInt: Bool { (bits & Self._tagMask) == Self._shortBigTag }
+    /// JS-level `typeof x === "bigint"` — either representation.
+    @inline(__always) var isBigInt: Bool {
+        let t = bits & Self._tagMask
+        return t == Self._bigIntTag || t == Self._shortBigTag
+    }
     @inline(__always) var isString: Bool  { (bits & Self._tagMask) == Self._stringTag }
     @inline(__always) var isObject: Bool  { (bits & Self._tagMask) == Self._objectTag }
     @inline(__always) var isInt: Bool     { (bits & Self._tagMask) == Self._intTag }
@@ -655,12 +666,22 @@ struct JeffJSValue {
         return JeffJSValue(bits: _bigIntTag | UInt64(UInt(bitPattern: raw)))
     }
 
-    /// Short BigInt: fits in int32 -> store inline; otherwise promote to float64.
+    /// The widest BigInt that fits in the 48-bit inline payload.
+    static let shortBigIntMax: Int64 =  (1 << 47) - 1
+    static let shortBigIntMin: Int64 = -(1 << 47)
+
+    /// Inline BigInt. The caller must have checked the range
+    /// (`shortBigIntMin...shortBigIntMax`); `JeffJSValue.newBigInt(Int64)`
+    /// in JeffJSBigIntValue.swift picks the representation.
+    @inline(__always)
     static func mkShortBigInt(_ val: Int64) -> JeffJSValue {
-        // Same trapping-conversion hazard as `newInt64`: BigInt(-2147483649)
-        // used to crash the process on `Int32(val)`.
-        if let i32 = Int32(exactly: val) { return newInt32(i32) }
-        return newFloat64(Double(val))
+        JeffJSValue(bits: _shortBigTag | (UInt64(bitPattern: val) & _ptrMask))
+    }
+
+    /// Sign-extend the 48-bit inline payload back to Int64.
+    @inline(__always)
+    var shortBigIntValue: Int64 {
+        Int64(bitPattern: (bits & Self._ptrMask) << 16) >> 16
     }
 
     @inline(__always)
@@ -710,6 +731,7 @@ struct JeffJSValue {
         case 0x7FFD: return JSValueTag.exception.rawValue
         case 0x7FFE: return JSValueTag.uninitialized.rawValue
         case 0x7FFF: return JSValueTag.catchOffset.rawValue
+        case 0xFFF9: return JSValueTag.shortBigInt.rawValue
         default:     return JSValueTag.float64.rawValue
         }
     }
@@ -725,6 +747,7 @@ struct JeffJSValue {
         case 0x7FFA: return .int32(Int32(bits & 1))               // bool
         case 0x7FFB, 0x7FFC, 0x7FFD, 0x7FFE: return .none        // null/undef/except/uninit
         case 0x7FFF: return .int32(toInt32())                     // catchOffset
+        case 0xFFF9: return .shortBigInt(shortBigIntValue)
         default:     return .float64(Double(bitPattern: bits))
         }
     }
