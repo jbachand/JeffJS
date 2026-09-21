@@ -104,6 +104,30 @@ final class JeffJSDOMBridge {
     /// Shared prototype for DOMRect objects returned by getBoundingClientRect().
     private var domRectPrototype: JeffJSValue?
 
+    /// Per-node `classList` wrappers, keyed by `DOMNode.id`. Built lazily by the
+    /// prototype's `classList` accessor so every element gets its *own* list
+    /// (the previous eager materialisation bound a single empty object to the
+    /// shared prototype, leaving `el.classList.add` undefined).
+    private var classListCache: [UUID: JeffJSValue] = [:]
+
+    /// Detached documents handed out by `document.implementation.createHTMLDocument`
+    /// and `DOMParser.parseFromString`, keyed by their root `DOMNode.id`.
+    /// Non-empty only on pages that ask for one, so the `ownerDocument` walk in
+    /// `wrapElement` stays free for everything else.
+    private var detachedDocuments: [UUID: JeffJSValue] = [:]
+    private var detachedDocumentRoots: [DOMNode] = []
+
+    /// `<template>` content fragments, keyed by the template element's id.
+    private var templateContent: [UUID: DOMNode] = [:]
+
+    /// The `<script>` element currently being evaluated (`document.currentScript`).
+    private var currentScriptNode: DOMNode?
+
+    /// Shared `item`/`namedItem` implementations spliced onto every array
+    /// returned by `wrapElementArray` (HTMLCollection/NodeList shape).
+    private var nodeListItemFn: JeffJSValue?
+    private var nodeListNamedItemFn: JeffJSValue?
+
     // MARK: - Init
 
     init(
@@ -139,6 +163,16 @@ final class JeffJSDOMBridge {
 
         domRectPrototype?.freeValue()
         domRectPrototype = nil
+
+        for (_, v) in classListCache { v.freeValue() }
+        classListCache.removeAll()
+        for (_, v) in detachedDocuments { v.freeValue() }
+        detachedDocuments.removeAll()
+        detachedDocumentRoots.removeAll()
+        templateContent.removeAll()
+        currentScriptNode = nil
+        nodeListItemFn?.freeValue(); nodeListItemFn = nil
+        nodeListNamedItemFn?.freeValue(); nodeListNamedItemFn = nil
 
         nodeRegistry.removeAll()
         layoutRects.removeAll()
@@ -198,6 +232,19 @@ final class JeffJSDOMBridge {
         elementCache.removeValue(forKey: nodeID)
         nodeRegistry.removeValue(forKey: nodeID)
         elementScrollPositions.removeValue(forKey: nodeID)
+        if let cachedList = classListCache.removeValue(forKey: nodeID) {
+            cachedList.freeValue()
+        }
+        templateContent.removeValue(forKey: nodeID)
+    }
+
+    // MARK: - document.currentScript
+
+    /// Records the `<script>` element being evaluated so `document.currentScript`
+    /// reports it (AdSense and most tag loaders read it to find their own tag).
+    /// Pass `nil` when evaluation finishes.
+    func setCurrentScriptNode(_ node: DOMNode?) {
+        currentScriptNode = node
     }
 
     // MARK: - Registration Entry Point
@@ -249,6 +296,15 @@ final class JeffJSDOMBridge {
         })()
         """, filename: "<dom-constructors>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         constructorResult.freeValue()
+
+        // Native HTML -> detached Document, consumed by the host's DOMParser
+        // polyfill (`DOMParser.parseFromString(str, "text/html")`).
+        ctx.setPropertyFunc(obj: global, name: "__nativeParseHTMLDocument", fn: { [weak self] ctx, _, args in
+            guard let self else { return JeffJSValue.null }
+            let html = ctx.toSwiftString(args.first ?? .undefined) ?? ""
+            return self.parseDetachedDocument(html: html, ctx: ctx)
+        }, length: 1)
+
         global.freeValue()
     }
 
@@ -413,6 +469,245 @@ final class JeffJSDOMBridge {
             self.eventBridge?.removeEventListener(ctx: ctx, target: thisVal, type: args[0], listener: args[1], options: options)
             return JeffJSValue.undefined
         }, length: 2)
+
+        // contains(node) -> bool (jQuery.contains and focus-trap libraries call it)
+        ctx.setPropertyFunc(obj: doc, name: "contains", fn: { [weak self] ctx, _, args in
+            guard let self, !args.isEmpty, let other = self.extractNode(from: args[0]) else {
+                return .newBool(false)
+            }
+            return .newBool(self.nodeContains(self.root, child: other) || other === self.root)
+        }, length: 1)
+
+        // importNode(node, deep) / adoptNode(node)
+        ctx.setPropertyFunc(obj: doc, name: "importNode", fn: { [weak self] ctx, _, args in
+            guard let self, !args.isEmpty, let node = self.extractNode(from: args[0]) else {
+                return JeffJSValue.null
+            }
+            let deep = args.count > 1 && args[1].toBool()
+            return self.wrapElement(self.cloneDOMNode(node, deep: deep), ctx: ctx)
+        }, length: 2)
+
+        ctx.setPropertyFunc(obj: doc, name: "adoptNode", fn: { [weak self] ctx, _, args in
+            guard let self, !args.isEmpty, let node = self.extractNode(from: args[0]) else {
+                return JeffJSValue.null
+            }
+            node.parent?.removeChild(node)
+            return self.wrapElement(node, ctx: ctx)
+        }, length: 1)
+
+        // document.implementation — createHTMLDocument backs jQuery.parseHTML.
+        ctx.setPropertyStr(obj: doc, name: "implementation", value: buildDOMImplementation(ctx: ctx))
+
+        // Live-ish collections: document.scripts / forms / images / links / embeds
+        let collections: [(String, (DOMNode) -> Bool)] = [
+            ("scripts", { $0.tagName == "script" }),
+            ("forms", { $0.tagName == "form" }),
+            ("images", { $0.tagName == "img" }),
+            ("embeds", { $0.tagName == "embed" }),
+            ("links", { ($0.tagName == "a" || $0.tagName == "area") && $0.attributes["href"] != nil }),
+        ]
+        for (name, predicate) in collections {
+            let getter = ctx.newCFunction({ [weak self] ctx, _, _ in
+                guard let self else { return ctx.newArray() }
+                return self.wrapElementArray(self.allElementDescendants(of: self.root).filter(predicate), ctx: ctx)
+            }, name: "get \(name)", length: 0)
+            ctx.setPropertyGetSet(obj: doc, name: name, getter: getter, setter: nil)
+        }
+
+        // document.currentScript — the <script> the host is evaluating right now.
+        let currentScriptGetter = ctx.newCFunction({ [weak self] ctx, _, _ in
+            guard let self, let node = self.currentScriptNode else { return JeffJSValue.null }
+            return self.wrapElement(node, ctx: ctx)
+        }, name: "get currentScript", length: 0)
+        ctx.setPropertyGetSet(obj: doc, name: "currentScript", getter: currentScriptGetter, setter: nil)
+    }
+
+    // MARK: - document.implementation / detached documents
+
+    /// Builds the `document.implementation` object. `createHTMLDocument` returns a
+    /// real detached `Document` (jQuery 3's `parseHTML` needs `.body`, `.head`
+    /// and `createElement` on it, and sets `base.href` on the created document).
+    private func buildDOMImplementation(ctx: JeffJSContext) -> JeffJSValue {
+        let impl = ctx.newObject()
+
+        ctx.setPropertyFunc(obj: impl, name: "hasFeature", fn: { _, _, _ in .newBool(true) }, length: 2)
+
+        ctx.setPropertyFunc(obj: impl, name: "createHTMLDocument", fn: { [weak self] ctx, _, args in
+            guard let self else { return JeffJSValue.null }
+            let title = args.isEmpty ? "" : (ctx.toSwiftString(args[0]) ?? "")
+            return self.wrapDetachedDocument(self.makeDetachedDocument(title: title), ctx: ctx)
+        }, length: 1)
+
+        // createDocument(namespace, qualifiedName, doctype) — XML flavour; the
+        // qualified name becomes the document element when supplied.
+        ctx.setPropertyFunc(obj: impl, name: "createDocument", fn: { [weak self] ctx, _, args in
+            guard let self else { return JeffJSValue.null }
+            let docNode = DOMNode.document()
+            let rootName = args.count > 1 ? (ctx.toSwiftString(args[1]) ?? "") : ""
+            if !rootName.isEmpty {
+                docNode.appendChild(DOMNode.element(tag: rootName))
+            }
+            return self.wrapDetachedDocument(docNode, ctx: ctx)
+        }, length: 3)
+
+        ctx.setPropertyFunc(obj: impl, name: "createDocumentType", fn: { ctx, _, args in
+            let obj = ctx.newObject()
+            ctx.setPropertyStr(obj: obj, name: "name", value: ctx.newStringValue(args.count > 0 ? (ctx.toSwiftString(args[0]) ?? "") : ""))
+            ctx.setPropertyStr(obj: obj, name: "publicId", value: ctx.newStringValue(args.count > 1 ? (ctx.toSwiftString(args[1]) ?? "") : ""))
+            ctx.setPropertyStr(obj: obj, name: "systemId", value: ctx.newStringValue(args.count > 2 ? (ctx.toSwiftString(args[2]) ?? "") : ""))
+            ctx.setPropertyStr(obj: obj, name: "nodeType", value: .newInt32(10))
+            return obj
+        }, length: 3)
+
+        return impl
+    }
+
+    /// `html > head > title + body` skeleton for a detached document.
+    private func makeDetachedDocument(title: String) -> DOMNode {
+        let docNode = DOMNode.document()
+        let html = DOMNode.element(tag: "html")
+        let head = DOMNode.element(tag: "head")
+        let titleNode = DOMNode.element(tag: "title")
+        titleNode.appendChild(DOMNode.text(title))
+        head.appendChild(titleNode)
+        html.appendChild(head)
+        html.appendChild(DOMNode.element(tag: "body"))
+        docNode.appendChild(html)
+        return docNode
+    }
+
+    /// Parses `html` into a detached `Document`, for `DOMParser.parseFromString`.
+    func parseDetachedDocument(html: String, ctx: JeffJSContext) -> JeffJSValue {
+        let parsed = HTMLParser.parse(html)
+        // Guarantee html/head/body exist so `.body` is never null.
+        let docNode: DOMNode
+        if parsed.querySelector("body") != nil, parsed.querySelector("html") != nil {
+            docNode = parsed
+        } else {
+            docNode = makeDetachedDocument(title: "")
+            if let body = docNode.querySelector("body") {
+                for child in parsed.children { body.appendChild(child) }
+            }
+        }
+        return wrapDetachedDocument(docNode, ctx: ctx)
+    }
+
+    /// Wraps a detached document root as a Document-shaped JS object: the element
+    /// wrapper already supplies querySelector/getElementsByTagName/appendChild
+    /// scoped to this subtree, so only the Document-only surface is added here.
+    private func wrapDetachedDocument(_ docNode: DOMNode, ctx: JeffJSContext) -> JeffJSValue {
+        if let cached = detachedDocuments[docNode.id] { return cached.dupValue() }
+
+        detachedDocumentRoots.append(docNode)
+        let wrapper = wrapElement(docNode, ctx: ctx)
+        detachedDocuments[docNode.id] = wrapper.dupValue()
+
+        // Document.ownerDocument is null; defaultView is null for a document that
+        // has no browsing context.
+        ctx.setPropertyStr(obj: wrapper, name: "ownerDocument", value: .null)
+        ctx.setPropertyStr(obj: wrapper, name: "defaultView", value: .null)
+        ctx.setPropertyStr(obj: wrapper, name: "compatMode", value: ctx.newStringValue("CSS1Compat"))
+        ctx.setPropertyStr(obj: wrapper, name: "characterSet", value: ctx.newStringValue("UTF-8"))
+        ctx.setPropertyStr(obj: wrapper, name: "contentType", value: ctx.newStringValue("text/html"))
+        ctx.setPropertyStr(obj: wrapper, name: "readyState", value: ctx.newStringValue("complete"))
+        ctx.setPropertyStr(obj: wrapper, name: "URL", value: ctx.newStringValue(baseURL.absoluteString))
+        ctx.setPropertyStr(obj: wrapper, name: "baseURI", value: ctx.newStringValue(baseURL.absoluteString))
+        ctx.setPropertyStr(obj: wrapper, name: "implementation", value: buildDOMImplementation(ctx: ctx))
+
+        func tag(_ name: String) -> DOMNode? { docNode.querySelector(name) }
+
+        let accessors: [(String, () -> DOMNode?)] = [
+            ("documentElement", { tag("html") ?? docNode.children.first(where: { $0.nodeType == .element }) }),
+            ("head", { tag("head") }),
+            ("body", { tag("body") }),
+            ("scrollingElement", { tag("html") }),
+            ("activeElement", { tag("body") }),
+        ]
+        for (name, resolve) in accessors {
+            let getter = ctx.newCFunction({ [weak self] ctx, _, _ in
+                guard let self, let node = resolve() else { return JeffJSValue.null }
+                return self.wrapElement(node, ctx: ctx)
+            }, name: "get \(name)", length: 0)
+            ctx.setPropertyGetSet(obj: wrapper, name: name, getter: getter, setter: nil)
+        }
+
+        let titleGetter = ctx.newCFunction({ ctx, _, _ in
+            ctx.newStringValue(tag("title")?.rawTextDescendants ?? "")
+        }, name: "get title", length: 0)
+        let titleSetter = ctx.newCFunction({ ctx, _, args in
+            let value = ctx.toSwiftString(args.first ?? .undefined) ?? ""
+            if let existing = tag("title") {
+                existing.setTextContent(value)
+            } else if let head = tag("head") {
+                let node = DOMNode.element(tag: "title")
+                node.appendChild(DOMNode.text(value))
+                head.appendChild(node)
+            }
+            return .undefined
+        }, name: "set title", length: 1)
+        ctx.setPropertyGetSet(obj: wrapper, name: "title", getter: titleGetter, setter: titleSetter)
+
+        // Factory methods create nodes owned by *this* document. `adopt` captures
+        // self weakly so the closures parked on the wrapper never retain the bridge.
+        let docID = docNode.id
+        let adopt: (DOMNode, JeffJSContext) -> JeffJSValue = { [weak self] node, ctx in
+            guard let self else { return JeffJSValue.null }
+            let value = self.wrapElement(node, ctx: ctx)
+            if let owner = self.detachedDocuments[docID] {
+                ctx.setPropertyStr(obj: value, name: "ownerDocument", value: owner.dupValue())
+            }
+            return value
+        }
+
+        ctx.setPropertyFunc(obj: wrapper, name: "createElement", fn: { ctx, _, args in
+            guard let tagName = ctx.toSwiftString(args.first ?? .undefined) else { return JeffJSValue.null }
+            return adopt(DOMNode.element(tag: tagName), ctx)
+        }, length: 1)
+
+        ctx.setPropertyFunc(obj: wrapper, name: "createElementNS", fn: { ctx, _, args in
+            let tagName = (args.count > 1 ? ctx.toSwiftString(args[1]) : nil)
+                ?? ctx.toSwiftString(args.first ?? .undefined) ?? "div"
+            return adopt(DOMNode.element(tag: tagName), ctx)
+        }, length: 2)
+
+        ctx.setPropertyFunc(obj: wrapper, name: "createTextNode", fn: { ctx, _, args in
+            adopt(DOMNode.text(ctx.toSwiftString(args.first ?? .undefined) ?? ""), ctx)
+        }, length: 1)
+
+        ctx.setPropertyFunc(obj: wrapper, name: "createComment", fn: { ctx, _, args in
+            adopt(DOMNode.comment(ctx.toSwiftString(args.first ?? .undefined) ?? ""), ctx)
+        }, length: 1)
+
+        ctx.setPropertyFunc(obj: wrapper, name: "createDocumentFragment", fn: { ctx, _, _ in
+            adopt(DOMNode.documentFragment(), ctx)
+        }, length: 0)
+
+        ctx.setPropertyFunc(obj: wrapper, name: "getElementById", fn: { [weak self] ctx, _, args in
+            guard let self, let idStr = ctx.toSwiftString(args.first ?? .undefined),
+                  let node = self.findElement(in: docNode, where: { $0.idAttribute == idStr }) else {
+                return JeffJSValue.null
+            }
+            return self.wrapElement(node, ctx: ctx)
+        }, length: 1)
+
+        ctx.setPropertyFunc(obj: wrapper, name: "importNode", fn: { [weak self] ctx, _, args in
+            guard let self, !args.isEmpty, let node = self.extractNode(from: args[0]) else { return JeffJSValue.null }
+            let deep = args.count > 1 && args[1].toBool()
+            return adopt(self.cloneDOMNode(node, deep: deep), ctx)
+        }, length: 2)
+
+        ctx.setPropertyFunc(obj: wrapper, name: "adoptNode", fn: { [weak self] ctx, _, args in
+            guard let self, !args.isEmpty, let node = self.extractNode(from: args[0]) else { return JeffJSValue.null }
+            node.parent?.removeChild(node)
+            return adopt(node, ctx)
+        }, length: 1)
+
+        ctx.setPropertyFunc(obj: wrapper, name: "contains", fn: { [weak self] _, _, args in
+            guard let self, !args.isEmpty, let other = self.extractNode(from: args[0]) else { return .newBool(false) }
+            return .newBool(other === docNode || self.nodeContains(docNode, child: other))
+        }, length: 1)
+
+        return wrapper
     }
 
     // MARK: - Document Property Getters
@@ -533,8 +828,8 @@ final class JeffJSDOMBridge {
         ctx.setPropertyStr(obj: el, name: "tagName", value: ctx.newStringValue((node.tagName ?? "").uppercased()))
         ctx.setPropertyStr(obj: el, name: "localName", value: ctx.newStringValue(node.tagName ?? ""))
         ctx.setPropertyStr(obj: el, name: "nativeNodeID", value: ctx.newStringValue(node.id.uuidString))
-        if let docVal = documentJSValue {
-            ctx.setPropertyStr(obj: el, name: "ownerDocument", value: docVal.dupValue())
+        if let owner = ownerDocumentValue(for: node) {
+            ctx.setPropertyStr(obj: el, name: "ownerDocument", value: owner)
         }
 
         // -- Per-instance style sub-object --
@@ -558,6 +853,21 @@ final class JeffJSDOMBridge {
         return el
     }
 
+    /// The `ownerDocument` value for a node: the page document unless the node
+    /// belongs to a detached document handed out by `createHTMLDocument` /
+    /// `DOMParser`. The subtree walk only runs once such a document exists, so
+    /// ordinary pages pay nothing.
+    private func ownerDocumentValue(for node: DOMNode) -> JeffJSValue? {
+        if !detachedDocumentRoots.isEmpty {
+            var cursor: DOMNode? = node
+            while let current = cursor {
+                if let owner = detachedDocuments[current.id] { return owner.dupValue() }
+                cursor = current.parent
+            }
+        }
+        return documentJSValue?.dupValue()
+    }
+
     /// Wraps an array of DOMNodes as a JeffJS array.
     private func wrapElementArray(_ nodes: [DOMNode], ctx: JeffJSContext) -> JeffJSValue {
         let arr = ctx.newArray()
@@ -567,7 +877,55 @@ final class JeffJSDOMBridge {
         }
         // Set the length property
         ctx.setPropertyStr(obj: arr, name: "length", value: .newInt32(Int32(nodes.count)))
+        installNodeListShape(on: arr, ctx: ctx)
         return arr
+    }
+
+    /// Adds the `item()`/`namedItem()` methods real NodeList/HTMLCollection
+    /// objects carry. The function objects are built once and duped onto each
+    /// list, so this costs two refcount bumps per query instead of two closures.
+    private func installNodeListShape(on arr: JeffJSValue, ctx: JeffJSContext) {
+        if nodeListItemFn == nil {
+            nodeListItemFn = ctx.newCFunction({ ctx, thisVal, args in
+                guard let raw = args.first, let idx = ctx.toInt32(raw), idx >= 0 else { return JeffJSValue.null }
+                let lenVal = ctx.getPropertyStr(obj: thisVal, name: "length")
+                let len = ctx.toInt32(lenVal) ?? 0
+                lenVal.freeValue()
+                guard idx < len else { return JeffJSValue.null }
+                return ctx.getPropertyUint32(obj: thisVal, index: UInt32(idx))
+            }, name: "item", length: 1)
+        }
+        if nodeListNamedItemFn == nil {
+            nodeListNamedItemFn = ctx.newCFunction({ ctx, thisVal, args in
+                guard let name = ctx.toSwiftString(args.first ?? .undefined), !name.isEmpty else {
+                    return JeffJSValue.null
+                }
+                let lenVal = ctx.getPropertyStr(obj: thisVal, name: "length")
+                let len = ctx.toInt32(lenVal) ?? 0
+                lenVal.freeValue()
+                var i: Int32 = 0
+                while i < len {
+                    let entry = ctx.getPropertyUint32(obj: thisVal, index: UInt32(i))
+                    let idVal = ctx.getPropertyStr(obj: entry, name: "id")
+                    let idStr = ctx.toSwiftString(idVal)
+                    idVal.freeValue()
+                    if idStr == name { return entry }
+                    let nameVal = ctx.getPropertyStr(obj: entry, name: "name")
+                    let nameStr = ctx.toSwiftString(nameVal)
+                    nameVal.freeValue()
+                    if nameStr == name { return entry }
+                    entry.freeValue()
+                    i += 1
+                }
+                return JeffJSValue.null
+            }, name: "namedItem", length: 1)
+        }
+        if let item = nodeListItemFn {
+            ctx.setPropertyStr(obj: arr, name: "item", value: item.dupValue())
+        }
+        if let named = nodeListNamedItemFn {
+            ctx.setPropertyStr(obj: arr, name: "namedItem", value: named.dupValue())
+        }
     }
 
     /// Builds the shared element prototype. All DOM methods and property accessors
@@ -605,6 +963,20 @@ final class JeffJSDOMBridge {
         ]
         for name in eventNames {
             ctx.setPropertyStr(obj: proto, name: name, value: .null)
+        }
+
+        // Node.* constants are also exposed on every node instance.
+        let nodeConstants: [(String, Int32)] = [
+            ("ELEMENT_NODE", 1), ("ATTRIBUTE_NODE", 2), ("TEXT_NODE", 3),
+            ("CDATA_SECTION_NODE", 4), ("PROCESSING_INSTRUCTION_NODE", 7),
+            ("COMMENT_NODE", 8), ("DOCUMENT_NODE", 9), ("DOCUMENT_TYPE_NODE", 10),
+            ("DOCUMENT_FRAGMENT_NODE", 11),
+            ("DOCUMENT_POSITION_DISCONNECTED", 1), ("DOCUMENT_POSITION_PRECEDING", 2),
+            ("DOCUMENT_POSITION_FOLLOWING", 4), ("DOCUMENT_POSITION_CONTAINS", 8),
+            ("DOCUMENT_POSITION_CONTAINED_BY", 16),
+        ]
+        for (name, value) in nodeConstants {
+            ctx.setPropertyStr(obj: proto, name: name, value: .newInt32(value))
         }
 
         return proto
@@ -935,13 +1307,108 @@ final class JeffJSDOMBridge {
                 return .newBool(false)
             }
             guard let targetNode = self.extractNode(from: thisVal) else { return .newBool(false) }
-            // Use the parent's querySelectorAll to check
-            if let parent = targetNode.parent {
-                let matches = parent.querySelectorAll(selector)
-                return .newBool(matches.contains(where: { $0 === targetNode }))
-            }
-            return .newBool(false)
+            // Match the node directly: the old parent-scoped test reported false
+            // for every detached element (jQuery filters parsed fragments).
+            return .newBool(targetNode.matchesSelector(selector))
         }, length: 1)
+
+        // webkitMatchesSelector / msMatchesSelector aliases (Sizzle probes them)
+        for alias in ["webkitMatchesSelector", "msMatchesSelector"] {
+            ctx.setPropertyFunc(obj: el, name: alias, fn: { [weak self] ctx, thisVal, args in
+                guard let self, let selector = self.extractString(ctx: ctx, args: args, index: 0),
+                      let targetNode = self.extractNode(from: thisVal) else { return .newBool(false) }
+                return .newBool(targetNode.matchesSelector(selector))
+            }, length: 1)
+        }
+
+        // closest(selector) -> nearest self-or-ancestor element, or null
+        ctx.setPropertyFunc(obj: el, name: "closest", fn: { [weak self] ctx, thisVal, args in
+            guard let self, let selector = self.extractString(ctx: ctx, args: args, index: 0),
+                  let targetNode = self.extractNode(from: thisVal),
+                  let found = targetNode.closestMatching(selector) else { return JeffJSValue.null }
+            return self.wrapElement(found, ctx: ctx)
+        }, length: 1)
+
+        // hasAttributes() -> bool
+        ctx.setPropertyFunc(obj: el, name: "hasAttributes", fn: { [weak self] ctx, thisVal, _ in
+            guard let self, let targetNode = self.extractNode(from: thisVal) else { return .newBool(false) }
+            return .newBool(!targetNode.attributes.isEmpty)
+        }, length: 0)
+
+        // toggleAttribute(name, force?) -> bool (the attribute's new presence)
+        ctx.setPropertyFunc(obj: el, name: "toggleAttribute", fn: { [weak self] ctx, thisVal, args in
+            guard let self, let targetNode = self.extractNode(from: thisVal),
+                  let rawName = self.extractString(ctx: ctx, args: args, index: 0) else { return .newBool(false) }
+            let name = rawName.lowercased()
+            let present = targetNode.attributes[name] != nil
+            let hasForce = args.count >= 2 && !args[1].isUndefined
+            let shouldSet = hasForce ? args[1].toBool() : !present
+            if shouldSet {
+                if !present { targetNode.setAttribute(name: name, value: "") }
+            } else if present {
+                targetNode.removeAttribute(name: name)
+            }
+            if shouldSet != present { self.notifyMutation(for: targetNode) }
+            return .newBool(shouldSet)
+        }, length: 2)
+
+        // compareDocumentPosition(other) -> bitmask (DISCONNECTED 1, PRECEDING 2,
+        // FOLLOWING 4, CONTAINS 8, CONTAINED_BY 16)
+        ctx.setPropertyFunc(obj: el, name: "compareDocumentPosition", fn: { [weak self] ctx, thisVal, args in
+            guard let self, !args.isEmpty,
+                  let a = self.extractNode(from: thisVal),
+                  let b = self.extractNode(from: args[0]) else { return .newInt32(1) }
+            return .newInt32(self.documentPosition(of: a, relativeTo: b))
+        }, length: 1)
+
+        // insertAdjacentElement(position, element) -> element | null
+        ctx.setPropertyFunc(obj: el, name: "insertAdjacentElement", fn: { [weak self] ctx, thisVal, args in
+            guard let self, args.count >= 2,
+                  let position = self.extractString(ctx: ctx, args: args, index: 0),
+                  let targetNode = self.extractNode(from: thisVal),
+                  let newNode = self.extractNode(from: args[1], ctx: ctx) else { return JeffJSValue.null }
+            guard self.insertAdjacent(position: position, target: targetNode, nodes: [newNode]) else {
+                return JeffJSValue.null
+            }
+            return args[1].dupValue()
+        }, length: 2)
+
+        // insertAdjacentText(position, text)
+        ctx.setPropertyFunc(obj: el, name: "insertAdjacentText", fn: { [weak self] ctx, thisVal, args in
+            guard let self, args.count >= 2,
+                  let position = self.extractString(ctx: ctx, args: args, index: 0),
+                  let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+            let text = self.extractString(ctx: ctx, args: args, index: 1) ?? ""
+            _ = self.insertAdjacent(position: position, target: targetNode, nodes: [DOMNode.text(text)])
+            return JeffJSValue.undefined
+        }, length: 2)
+
+        // insertAdjacentHTML(position, html)
+        ctx.setPropertyFunc(obj: el, name: "insertAdjacentHTML", fn: { [weak self] ctx, thisVal, args in
+            guard let self, args.count >= 2,
+                  let position = self.extractString(ctx: ctx, args: args, index: 0),
+                  let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+            let html = self.extractString(ctx: ctx, args: args, index: 1) ?? ""
+            _ = self.insertAdjacent(position: position, target: targetNode, nodes: Self.parseHTMLFragment(html))
+            return JeffJSValue.undefined
+        }, length: 2)
+
+        // replaceChildren(...nodes) — drop every child, then append the arguments
+        ctx.setPropertyFunc(obj: el, name: "replaceChildren", fn: { [weak self] ctx, thisVal, args in
+            guard let self, let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+            for child in targetNode.children { self.clearNodeAndDescendants(child) }
+            targetNode.clearChildren()
+            for arg in args {
+                if let childNode = self.extractNode(from: arg, ctx: ctx) {
+                    if let oldParent = childNode.parent { oldParent.removeChild(childNode) }
+                    targetNode.appendChild(childNode)
+                } else if let text = ctx.toSwiftString(arg) {
+                    targetNode.appendChild(DOMNode.text(text))
+                }
+            }
+            self.notifyMutation(for: targetNode)
+            return JeffJSValue.undefined
+        }, length: 0)
 
         // cloneNode(deep) -> element
         ctx.setPropertyFunc(obj: el, name: "cloneNode", fn: { [weak self] ctx, thisVal, args in
@@ -1035,14 +1502,17 @@ final class JeffJSDOMBridge {
         // -- innerHTML (read-write) --
         ctx.setPropertyFunc(obj: el, name: "__get_innerHTML", fn: { [weak self] ctx, thisVal, _ in
             guard let self else { return ctx.newStringValue("") }
-            guard let targetNode = self.extractNode(from: thisVal) else { return ctx.newStringValue("") }
+            guard var targetNode = self.extractNode(from: thisVal) else { return ctx.newStringValue("") }
+            // A <template>'s markup lives in its content fragment, not its children.
+            if targetNode.tagName == "template" { targetNode = self.templateFragment(for: targetNode) }
             let html = targetNode.children.map { Self.serializeHTML($0) }.joined()
             return ctx.newStringValue(html)
         }, length: 0)
 
         ctx.setPropertyFunc(obj: el, name: "__set_innerHTML", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.undefined }
-            guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+            guard var targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+            if targetNode.tagName == "template" { targetNode = self.templateFragment(for: targetNode) }
             let html = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
             for child in targetNode.children { self.clearNodeAndDescendants(child) }
             targetNode.clearChildren()
@@ -1059,6 +1529,27 @@ final class JeffJSDOMBridge {
             guard let self else { return ctx.newStringValue("") }
             guard let targetNode = self.extractNode(from: thisVal) else { return ctx.newStringValue("") }
             return ctx.newStringValue(Self.serializeHTML(targetNode))
+        }, length: 0)
+
+        ctx.setPropertyFunc(obj: el, name: "__set_outerHTML", fn: { [weak self] ctx, thisVal, args in
+            guard let self else { return JeffJSValue.undefined }
+            guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+            guard let parent = targetNode.parent else { return JeffJSValue.undefined }
+            let html = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
+            for node in Self.parseHTMLFragment(html) {
+                parent.insertChild(node, before: targetNode)
+            }
+            parent.removeChild(targetNode)
+            self.clearNodeAndDescendants(targetNode)
+            self.notifyMutation(for: parent)
+            return JeffJSValue.undefined
+        }, length: 1)
+
+        // -- content (read-only, <template> only) --
+        ctx.setPropertyFunc(obj: el, name: "__get_content", fn: { [weak self] ctx, thisVal, _ in
+            guard let self, let targetNode = self.extractNode(from: thisVal),
+                  targetNode.tagName == "template" else { return JeffJSValue.undefined }
+            return self.wrapElement(self.templateFragment(for: targetNode), ctx: ctx)
         }, length: 0)
 
         // -- id (read-write) --
@@ -1219,6 +1710,12 @@ final class JeffJSDOMBridge {
             guard let self else { return JeffJSValue.null }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.null }
             guard let parent = targetNode.parent else { return JeffJSValue.null }
+            // `document.documentElement.parentNode === document` in browsers, so
+            // hand back the real document object rather than a wrapper around the
+            // root node — `getRootNode()`/`isConnected` walks depend on it.
+            if parent === self.root, let docVal = self.documentJSValue {
+                return docVal.dupValue()
+            }
             return self.wrapElement(parent, ctx: ctx)
         }, length: 0)
 
@@ -1338,7 +1835,10 @@ final class JeffJSDOMBridge {
         ctx.setPropertyFunc(obj: el, name: "__get_classList", fn: { [weak self] ctx, thisVal, _ in
             guard let self else { return ctx.newObject() }
             guard let targetNode = self.extractNode(from: thisVal) else { return ctx.newObject() }
-            return self.buildClassListObject(for: targetNode, ctx: ctx)
+            if let cached = self.classListCache[targetNode.id] { return cached.dupValue() }
+            let list = self.buildClassListObject(for: targetNode, ctx: ctx)
+            self.classListCache[targetNode.id] = list.dupValue()
+            return list
         }, length: 0)
 
         // -- Geometry accessors (offset*/client*/scroll*) --
@@ -1355,7 +1855,8 @@ final class JeffJSDOMBridge {
     /// used by JeffJS's atom-based setPropertyGetSet overload).
     private func installElementPropertyShim(on el: JeffJSValue, ctx: JeffJSContext) {
         let props: [(String, Bool)] = [
-            ("textContent", true), ("innerText", true), ("innerHTML", true), ("outerHTML", false),
+            ("textContent", true), ("innerText", true), ("innerHTML", true), ("outerHTML", true),
+            ("content", false), ("classList", false),
             ("id", true), ("className", true), ("value", true),
             ("checked", true), ("hidden", true), ("src", true), ("href", true),
             ("nodeValue", true), ("data", true), ("isConnected", false),
@@ -1389,13 +1890,10 @@ final class JeffJSDOMBridge {
             }
         }
 
-        // classList — eagerly materialize (no lazy getter needed)
-        let getClassList = ctx.getPropertyStr(obj: el, name: "__get_classList")
-        if getClassList.isFunction {
-            let classList = ctx.callFunction(getClassList, thisVal: el, args: [])
-            ctx.setPropertyStr(obj: el, name: "classList", value: classList)
-        }
-        getClassList.freeValue()
+        // classList is installed as an accessor above (see the props table): the
+        // old eager materialisation called `__get_classList` with `this` bound to
+        // the prototype, which has no DOMNode, so every element shared one empty
+        // object and `el.classList.add` was undefined.
     }
 
     // MARK: - Geometry (layout rects -> JS)
@@ -1834,16 +2332,28 @@ final class JeffJSDOMBridge {
     private func buildClassListObject(for node: DOMNode, ctx: JeffJSContext) -> JeffJSValue {
         let obj = ctx.newObject()
 
+        // Document order is significant (`className` round-trips through CSS and
+        // through code that string-matches it), so the list keeps insertion order
+        // instead of the alphabetical sort the first implementation used.
+        func tokens() -> [String] {
+            (node.attributes["class"] ?? "")
+                .split(whereSeparator: \.isWhitespace)
+                .map(String.init)
+        }
+        func store(_ list: [String]) {
+            node.setAttribute(name: "class", value: list.joined(separator: " "))
+        }
+
         // add(cls, ...)
         ctx.setPropertyFunc(obj: obj, name: "add", fn: { [weak self] ctx, _, args in
             guard let self else { return JeffJSValue.undefined }
-            var classes = Set((node.attributes["class"] ?? "").split(separator: " ").map(String.init))
+            var list = tokens()
             for arg in args {
-                if let cls = ctx.toSwiftString(arg), !cls.isEmpty {
-                    classes.insert(cls)
+                if let cls = ctx.toSwiftString(arg), !cls.isEmpty, !list.contains(cls) {
+                    list.append(cls)
                 }
             }
-            node.setAttribute(name: "class", value: classes.sorted().joined(separator: " "))
+            store(list)
             self.notifyMutation(for: node)
             return JeffJSValue.undefined
         }, length: 1)
@@ -1851,13 +2361,13 @@ final class JeffJSDOMBridge {
         // remove(cls, ...)
         ctx.setPropertyFunc(obj: obj, name: "remove", fn: { [weak self] ctx, _, args in
             guard let self else { return JeffJSValue.undefined }
-            var classes = Set((node.attributes["class"] ?? "").split(separator: " ").map(String.init))
+            var list = tokens()
             for arg in args {
                 if let cls = ctx.toSwiftString(arg) {
-                    classes.remove(cls)
+                    list.removeAll { $0 == cls }
                 }
             }
-            node.setAttribute(name: "class", value: classes.sorted().joined(separator: " "))
+            store(list)
             self.notifyMutation(for: node)
             return JeffJSValue.undefined
         }, length: 1)
@@ -1867,33 +2377,23 @@ final class JeffJSDOMBridge {
             guard let self, let cls = self.extractString(ctx: ctx, args: args, index: 0), !cls.isEmpty else {
                 return .newBool(false)
             }
-            var classes = Set((node.attributes["class"] ?? "").split(separator: " ").map(String.init))
+            var list = tokens()
             let hasForce = args.count >= 2 && !args[1].isUndefined
-            let force = hasForce ? args[1].toBool() : nil
-
-            let shouldAdd: Bool
-            if let force {
-                shouldAdd = force
-            } else {
-                shouldAdd = !classes.contains(cls)
-            }
-
+            let shouldAdd = hasForce ? args[1].toBool() : !list.contains(cls)
             if shouldAdd {
-                classes.insert(cls)
+                if !list.contains(cls) { list.append(cls) }
             } else {
-                classes.remove(cls)
+                list.removeAll { $0 == cls }
             }
-            node.setAttribute(name: "class", value: classes.sorted().joined(separator: " "))
+            store(list)
             self.notifyMutation(for: node)
             return .newBool(shouldAdd)
         }, length: 1)
 
         // contains(cls) -> bool
-        ctx.setPropertyFunc(obj: obj, name: "contains", fn: { [weak self] ctx, _, args in
-            guard self != nil, let cls = ctx.toSwiftString(args.first ?? .undefined) else {
-                return .newBool(false)
-            }
-            return .newBool(node.classList.contains(cls))
+        ctx.setPropertyFunc(obj: obj, name: "contains", fn: { ctx, _, args in
+            guard let cls = ctx.toSwiftString(args.first ?? .undefined) else { return .newBool(false) }
+            return .newBool(tokens().contains(cls))
         }, length: 1)
 
         // replace(oldCls, newCls) -> bool
@@ -1903,18 +2403,70 @@ final class JeffJSDOMBridge {
                   let newCls = ctx.toSwiftString(args[1]) else {
                 return .newBool(false)
             }
-            var classes = Set((node.attributes["class"] ?? "").split(separator: " ").map(String.init))
-            guard classes.remove(oldCls) != nil else { return .newBool(false) }
-            classes.insert(newCls)
-            node.setAttribute(name: "class", value: classes.sorted().joined(separator: " "))
+            var list = tokens()
+            guard let idx = list.firstIndex(of: oldCls) else { return .newBool(false) }
+            if list.contains(newCls) {
+                list.remove(at: idx)
+            } else {
+                list[idx] = newCls
+            }
+            store(list)
             self.notifyMutation(for: node)
             return .newBool(true)
         }, length: 2)
 
-        // length getter
-        ctx.setPropertyStr(obj: obj, name: "length", value: .newInt32(Int32(node.classList.count)))
+        // item(index) -> string | null
+        ctx.setPropertyFunc(obj: obj, name: "item", fn: { ctx, _, args in
+            let list = tokens()
+            guard let raw = args.first, let idx = ctx.toInt32(raw), idx >= 0, Int(idx) < list.count else {
+                return JeffJSValue.null
+            }
+            return ctx.newStringValue(list[Int(idx)])
+        }, length: 1)
+
+        ctx.setPropertyFunc(obj: obj, name: "toString", fn: { ctx, _, _ in
+            ctx.newStringValue(node.attributes["class"] ?? "")
+        }, length: 0)
+
+        // `length` and `value` are live accessors — the list object is cached per
+        // element, so a snapshot taken at build time would go stale on the first
+        // add()/remove().
+        let lengthGetter = ctx.newCFunction({ _, _, _ in .newInt32(Int32(tokens().count)) },
+                                            name: "get length", length: 0)
+        ctx.setPropertyGetSet(obj: obj, name: "length", getter: lengthGetter, setter: nil)
+
+        let valueGetter = ctx.newCFunction({ ctx, _, _ in
+            ctx.newStringValue(node.attributes["class"] ?? "")
+        }, name: "get value", length: 0)
+        let valueSetter = ctx.newCFunction({ [weak self] ctx, _, args in
+            guard let self, let v = ctx.toSwiftString(args.first ?? .undefined) else { return .undefined }
+            node.setAttribute(name: "class", value: v)
+            self.notifyMutation(for: node)
+            return .undefined
+        }, name: "set value", length: 1)
+        ctx.setPropertyGetSet(obj: obj, name: "value", getter: valueGetter, setter: valueSetter)
+
+        for (i, cls) in tokens().enumerated() {
+            ctx.setPropertyUint32(obj: obj, index: UInt32(i), value: ctx.newStringValue(cls))
+        }
 
         return obj
+    }
+
+    /// The content fragment backing a `<template>` element. Created on first use;
+    /// any children the HTML parser left directly on the template are migrated in,
+    /// matching the spec where template markup never becomes element children.
+    private func templateFragment(for node: DOMNode) -> DOMNode {
+        if let existing = templateContent[node.id] {
+            for child in node.children { existing.appendChild(child) }
+            if !node.children.isEmpty { node.clearChildren() }
+            return existing
+        }
+        let fragment = DOMNode.documentFragment()
+        for child in node.children { fragment.appendChild(child) }
+        node.clearChildren()
+        templateContent[node.id] = fragment
+        return fragment
     }
 
     // MARK: - Update ReadyState
@@ -2043,6 +2595,69 @@ final class JeffJSDOMBridge {
     }
 
     /// Checks if `parent` contains `child` anywhere in its subtree.
+    /// Shared implementation for `insertAdjacentElement/Text/HTML`.
+    /// Returns false for an unknown position or when the node has no parent and
+    /// the position requires one.
+    @discardableResult
+    private func insertAdjacent(position: String, target: DOMNode, nodes: [DOMNode]) -> Bool {
+        guard !nodes.isEmpty else { return true }
+        for node in nodes where node.parent != nil {
+            node.parent?.removeChild(node)
+        }
+        switch position.lowercased() {
+        case "beforebegin":
+            guard let parent = target.parent else { return false }
+            for node in nodes { parent.insertChild(node, before: target) }
+            notifyMutation(for: parent)
+        case "afterbegin":
+            if let first = target.children.first {
+                for node in nodes { target.insertChild(node, before: first) }
+            } else {
+                for node in nodes { target.appendChild(node) }
+            }
+            notifyMutation(for: target)
+        case "beforeend":
+            for node in nodes { target.appendChild(node) }
+            notifyMutation(for: target)
+        case "afterend":
+            guard let parent = target.parent else { return false }
+            if let next = nextSibling(of: target) {
+                for node in nodes { parent.insertChild(node, before: next) }
+            } else {
+                for node in nodes { parent.appendChild(node) }
+            }
+            notifyMutation(for: parent)
+        default:
+            return false
+        }
+        return true
+    }
+
+    /// `Node.compareDocumentPosition` bitmask for `a` compared with `b`.
+    private func documentPosition(of a: DOMNode, relativeTo b: DOMNode) -> Int32 {
+        if a === b { return 0 }
+        if nodeContains(a, child: b) { return 0x14 }   // CONTAINED_BY | FOLLOWING
+        if nodeContains(b, child: a) { return 0x0A }   // CONTAINS | PRECEDING
+        // Walk the shared tree in document order to decide precedes/follows.
+        var rootA = a
+        while let p = rootA.parent { rootA = p }
+        var rootB = b
+        while let p = rootB.parent { rootB = p }
+        guard rootA === rootB else { return 0x21 }     // DISCONNECTED | IMPLEMENTATION_SPECIFIC
+        var found: Int32 = 0
+        func walk(_ n: DOMNode) {
+            if found != 0 { return }
+            if n === a { found = 4; return }           // a first -> b FOLLOWING a
+            if n === b { found = 2; return }           // b first -> b PRECEDING a
+            for child in n.children {
+                walk(child)
+                if found != 0 { return }
+            }
+        }
+        walk(rootA)
+        return found == 0 ? 0x21 : found
+    }
+
     private func nodeContains(_ parent: DOMNode, child: DOMNode) -> Bool {
         if parent === child { return true }
         for c in parent.children {

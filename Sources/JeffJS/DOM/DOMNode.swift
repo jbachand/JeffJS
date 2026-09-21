@@ -260,6 +260,26 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
         querySelectorAll(selector).first
     }
 
+    /// `Element.matches(selector)` — true when this element itself matches any
+    /// selector in the list. Unlike the old parent-scoped implementation this
+    /// works on detached nodes (jQuery's `parseHTML`/`filter` rely on it).
+    public func matchesSelector(_ selector: String) -> Bool {
+        guard nodeType == .element else { return false }
+        let list = CSSSelectorParser.parse(selector)
+        guard !list.selectors.isEmpty else { return false }
+        return list.selectors.contains { CSSSelectorMatcher.matches($0, node: self) }
+    }
+
+    /// `Element.closest(selector)` — nearest self-or-ancestor element matching.
+    public func closestMatching(_ selector: String) -> DOMNode? {
+        var cursor: DOMNode? = nodeType == .element ? self : parent
+        while let node = cursor {
+            if node.nodeType == .element, node.matchesSelector(selector) { return node }
+            cursor = node.parent
+        }
+        return nil
+    }
+
     public func querySelectorAll(_ selector: String) -> [DOMNode] {
         let selectorList = CSSSelectorParser.parse(selector)
         guard !selectorList.selectors.isEmpty else { return [] }
