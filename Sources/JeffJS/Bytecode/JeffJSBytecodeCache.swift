@@ -765,7 +765,7 @@ final class JeffJSBytecodeCache {
     ///   - JeffJSCompiler.swift (resolveLabels, resolveVariables, peephole)
     ///   - JeffJSOpcodes.swift (opcode additions/changes)
     ///   - JeffJSInterpreter.swift (only if opcode semantics change)
-    static let compilerVersion: UInt64 = 7  // 2026-09-20: private-name atoms keep the "#", get/put_private_field take an inline atom, private_in opcode
+    static let compilerVersion: UInt64 = 8  // 2026-09-20: class fields/static blocks/private names (get/put_private_field back to the QuickJS stack form, private_in, init_this)
 
     /// Lazily-initialized disk cache directory.
     /// Automatically clears cached .jfbc files when the app binary changes (new build).

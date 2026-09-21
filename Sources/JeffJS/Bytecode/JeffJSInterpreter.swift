@@ -1084,9 +1084,13 @@ extension JeffJSContext {
     /// Sets a private field value on an object (the field must already exist).
     func putPrivateField(obj: JeffJSValue, field: JeffJSValue, val: JeffJSValue) -> Bool {
         let atom = privateKeyAtom(field)
-        if atom == 0 { _ = throwTypeError(message: "cannot write private field"); return false }
+        if atom == 0 {
+            val.freeValue()
+            _ = throwTypeError(message: "cannot write private field"); return false
+        }
         defer { rt.freeAtom(atom) }
         guard obj.isObject, getOwnProperty(obj: obj, atom: atom) != nil else {
+            val.freeValue()
             _ = throwTypeError(message: "cannot write private member \(privateFieldName(field)) to an object whose class did not declare it")
             return false
         }
@@ -1096,12 +1100,17 @@ extension JeffJSContext {
     /// Defines a new private field on an object.
     func definePrivateField(obj: JeffJSValue, field: JeffJSValue, val: JeffJSValue) -> Bool {
         let atom = privateKeyAtom(field)
-        if atom == 0 { _ = throwTypeError(message: "cannot define private field"); return false }
+        if atom == 0 {
+            val.freeValue()
+            _ = throwTypeError(message: "cannot define private field"); return false
+        }
         defer { rt.freeAtom(atom) }
         guard obj.isObject else {
+            val.freeValue()
             _ = throwTypeError(message: "cannot define private field on a non-object"); return false
         }
         if getOwnProperty(obj: obj, atom: atom) != nil {
+            val.freeValue()
             _ = throwTypeError(message: "private member \(privateFieldName(field)) is already defined")
             return false
         }
@@ -1547,8 +1556,12 @@ extension JeffJSContext {
         guard atom != 0 else { return }
         let nameValue = atomToString(atom)
         if nameValue.isUndefined { return }
-        _ = setProperty(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
-                        value: nameValue)
+        // `name` is non-enumerable (ES §10.2.9 SetFunctionName); a plain
+        // setProperty made every named class / function own an enumerable
+        // `name`, which showed up in Object.keys(SomeClass).
+        _ = definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
+                                value: nameValue,
+                                flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
     }
 
     /// Sets the .name property on a function from a computed key.
@@ -1695,14 +1708,19 @@ extension JeffJSContext {
                       flags: Int) -> Bool {
         let isGetter = (flags & 2) != 0
         let isSetter = (flags & 4) != 0
+        // Bit 3: define the property non-enumerable. Class members are not
+        // enumerable (ES2022 ClassDefinitionEvaluation); object-literal
+        // methods are.
+        let baseFlags = (flags & 8) != 0
+            ? (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE) : JS_PROP_C_W_E
         if isGetter || isSetter {
             return defineProperty(obj: obj, atom: atom, value: .JS_UNDEFINED,
                                   getter: isGetter ? funcVal : .JS_UNDEFINED,
                                   setter: isSetter ? funcVal : .JS_UNDEFINED,
-                                  flags: JS_PROP_C_W_E | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
+                                  flags: baseFlags | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
         }
         return definePropertyValue(obj: obj, atom: atom, value: funcVal,
-                                   flags: JS_PROP_C_W_E) >= 0
+                                   flags: baseFlags) >= 0
     }
 
     /// Defines a method with a computed key.
@@ -1711,6 +1729,9 @@ extension JeffJSContext {
                               flags: Int) -> Bool {
         let isGetter = (flags & 2) != 0
         let isSetter = (flags & 4) != 0
+        // Bit 3: non-enumerable (a class member; see defineMethod).
+        let baseFlags = (flags & 8) != 0
+            ? (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE) : JS_PROP_C_W_E
         if key.isString, let str = key.stringValue {
             let atom = rt.findAtom(str.toSwiftString())
             let result: Bool
@@ -1718,10 +1739,10 @@ extension JeffJSContext {
                 result = defineProperty(obj: obj, atom: atom, value: .JS_UNDEFINED,
                                         getter: isGetter ? funcVal : .JS_UNDEFINED,
                                         setter: isSetter ? funcVal : .JS_UNDEFINED,
-                                        flags: JS_PROP_C_W_E | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
+                                        flags: baseFlags | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
             } else {
                 result = definePropertyValue(obj: obj, atom: atom, value: funcVal,
-                                              flags: JS_PROP_C_W_E) >= 0
+                                              flags: baseFlags) >= 0
             }
             // Don't free atom — defineProperty/definePropertyValue stores it in the shape.
             return result
@@ -1734,10 +1755,10 @@ extension JeffJSContext {
                 result = defineProperty(obj: obj, atom: atom, value: .JS_UNDEFINED,
                                         getter: isGetter ? funcVal : .JS_UNDEFINED,
                                         setter: isSetter ? funcVal : .JS_UNDEFINED,
-                                        flags: JS_PROP_C_W_E | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
+                                        flags: baseFlags | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
             } else {
                 result = definePropertyValue(obj: obj, atom: atom, value: funcVal,
-                                              flags: JS_PROP_C_W_E) >= 0
+                                              flags: baseFlags) >= 0
             }
             // Don't free atom — defineProperty/definePropertyValue stores it in the shape.
             return result
@@ -1977,8 +1998,9 @@ extension JeffJSContext {
                         }
                     } else if let entry = rt.atomArray[Int(atom)],
                               entry.atomType != .JS_ATOM_TYPE_SYMBOL,
-                              entry.atomType != .JS_ATOM_TYPE_GLOBAL_SYMBOL {
-                        // Symbol keys are never enumerated by for-in.
+                              entry.atomType != .JS_ATOM_TYPE_GLOBAL_SYMBOL,
+                              entry.atomType != .JS_ATOM_TYPE_PRIVATE {
+                        // Symbol and class-private keys are never enumerated.
                         if isEnumerable { strKeys.append(atom) } else { _ = seenAtom.insert(atom) }
                     }
                 }
@@ -8296,53 +8318,45 @@ struct JeffJSInterpreter {
                 pc += 5
 
             case .get_private_field:
-                // get_private_field(atom): obj -> val. The private name is an
-                // inline atom (`#x`), never a public property name, so a plain
-                // property read cannot collide with a public `x`. Private
-                // methods live on the home object, hence the prototype walk.
-                let atom = readU32(bc, pc + 1)
+                // obj prop -> value. `prop` is the class's unique private
+                // symbol, loaded from the class-scope variable the compiler
+                // resolved `scope_get_private_field` into, so a private name
+                // can never collide with a public property or with another
+                // class's identically spelled private name.
+                let prop = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                var val: JeffJSValue
-                if !obj.isObject || !ctx.hasProperty(obj: obj, atom: atom) {
-                    let name = ctx.rt.atomToString(atom) ?? "#<private>"
-                    val = ctx.throwTypeError(message: "cannot read private member \(name) from an object whose class did not declare it")
-                } else {
-                    val = ctx.getProperty(obj: obj, atom: atom)
-                }
+                let val = ctx.getPrivateField(obj: obj, field: prop)
+                prop.freeValue()
                 obj.freeValue()
                 if val.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
                 buf[sp] = val; sp += 1
-                pc += 5
+                pc += 1
 
             case .put_private_field:
-                // put_private_field(atom): obj val -> ()
-                let atom = readU32(bc, pc + 1)
+                // obj value prop -> ()
+                let prop = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                var ok = obj.isObject && ctx.hasProperty(obj: obj, atom: atom)
-                if !ok {
-                    let name = ctx.rt.atomToString(atom) ?? "#<private>"
-                    _ = ctx.throwTypeError(message: "cannot write private member \(name) to an object whose class did not declare it")
-                } else {
-                    ok = ctx.setProperty(obj: obj, atom: atom, value: val) >= 0
-                }
+                let ok = ctx.putPrivateField(obj: obj, field: prop, val: val)
+                prop.freeValue()
                 obj.freeValue()
                 if !ok {
                     retVal = .exception
                     break dispatchLoop
                 }
-                pc += 5
+                pc += 1
 
             case .define_private_field:
                 // obj field val -> ()
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let field = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                // definePropertyValue takes ownership of `val`; only the
+                // symbol and the object references the stack held are ours.
                 let ok = ctx.definePrivateField(obj: obj, field: field, val: val)
-                val.freeValue()
                 field.freeValue()
                 obj.freeValue()
                 if !ok {

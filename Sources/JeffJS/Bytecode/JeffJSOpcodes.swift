@@ -171,9 +171,9 @@ enum JeffJSOpcode: UInt16, CaseIterable {
     case get_field               // get_field(atom) - obj.prop
     case get_field2              // get_field2(atom) - obj.prop, keep obj on stack
     case put_field               // put_field(atom) - obj.prop = val
-    case get_private_field       // get private field
-    case put_private_field       // put private field
-    case define_private_field    // define private field
+    case get_private_field       // obj prop -> value  (prop = private symbol)
+    case put_private_field       // obj value prop -> ()
+    case define_private_field    // obj prop value -> ()
 
     // ---------------------------------------------------------------
     // Array element access
@@ -727,14 +727,15 @@ let jeffJSOpcodeInfo: [OpcodeInfo] = [
     // put_field: obj val -> (obj.prop = val)
     OpcodeInfo(name: "put_field",        size: 5, nPop: 2,  nPush: 0,  format: .atom),
 
-    // get_private_field(atom): obj -> val   (the parser emits the private
-    // name as an inline atom, like get_field)
-    OpcodeInfo(name: "get_private_field",size: 5, nPop: 1,  nPush: 1,  format: .atom),
+    // get_private_field: obj prop -> val   (prop is the class's private
+    // symbol, pushed by the get_var_ref the compiler resolves
+    // scope_get_private_field into)
+    OpcodeInfo(name: "get_private_field",size: 1, nPop: 2,  nPush: 1,  format: .none),
 
-    // put_private_field(atom): obj val -> ()
-    OpcodeInfo(name: "put_private_field",size: 5, nPop: 2,  nPush: 0,  format: .atom),
+    // put_private_field: obj val prop -> ()
+    OpcodeInfo(name: "put_private_field",size: 1, nPop: 3,  nPush: 0,  format: .none),
 
-    // define_private_field: obj val -> ()
+    // define_private_field: obj prop val -> ()
     OpcodeInfo(name: "define_private_field", size: 1, nPop: 3, nPush: 0, format: .none),
 
     // ---------------------------------------------------------------

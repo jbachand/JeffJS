@@ -299,6 +299,7 @@ struct JeffJSTestRunner {
             ("PerIterationLet", { $0.testPerIterationLetScope() }),
             ("BuiltinSubclassing", { $0.testBuiltinSubclassing() }),
             ("ReflectConstructNewTarget", { $0.testReflectConstructNewTarget() }),
+            ("ClassFields", { $0.testClassFields() }),
         ]
     }
 
@@ -10415,6 +10416,136 @@ extension JeffJSTestRunner {
         evalCheckBool(ctx, """
             function Bd() { this.b = 1; } var BB = Bd.bind(null);
             var o = new BB(); o.b === 1 && o instanceof Bd && Reflect.construct(BB, []) instanceof Bd
+        """, expect: true)
+    }
+
+    mutating func testClassFields() {
+        let (_, ctx) = makeCtx()
+
+        // Instance fields run per instance, in order, with `this` bound to the
+        // new object: two instances must not share one array, and an arrow
+        // field initializer captures the instance.
+        evalCheckBool(ctx, """
+            class A { x = 1; arr = []; f = () => this.x; b = this.x + 1 }
+            var a = new A(), c = new A(); a.arr.push(1);
+            a.x === 1 && a.b === 2 && a.f() === 1 && a.arr.length === 1 && c.arr.length === 0
+        """, expect: true)
+        // Base class: fields first, then the constructor body.
+        evalCheckStr(ctx, """
+            var log = [];
+            class B { x = (log.push('field'), 1); constructor() { log.push('ctor:' + this.x); } }
+            new B(); log.join(',')
+        """, expect: "field,ctor:1")
+        // Derived class: fields run after super() returns, before the rest.
+        evalCheckStr(ctx, """
+            var log = [];
+            class P { constructor() { log.push('P'); } }
+            class D extends P { y = (log.push('D field'), 2);
+                                constructor() { log.push('pre'); super(); log.push('post:' + this.y); } }
+            new D(); log.join(',')
+        """, expect: "pre,P,D field,post:2")
+        // A default derived constructor forwards args and still runs fields.
+        evalCheckBool(ctx, """
+            class P2 { constructor(v) { this.v = v; } }
+            class D2 extends P2 { w = this.v + 1 }
+            var d = new D2(4); d.v === 4 && d.w === 5
+        """, expect: true)
+        // A field initializer can call super methods and read earlier fields.
+        evalCheckStr(ctx, """
+            class P3 { greet() { return 'p'; } }
+            class Q3 extends P3 { g = super.greet() + 'q'; h = this.g + '!' }
+            new Q3().h
+        """, expect: "pq!")
+        // A field defines an own property even when the prototype chain has a
+        // setter, and a field with no initializer is `undefined` but present.
+        evalCheckBool(ctx, """
+            class P4 { get x() { return 0; } set x(v) { throw new Error('setter'); } }
+            class Q4 extends P4 { x = 5; y }
+            var q = new Q4();
+            q.x === 5 && q.y === undefined && Object.getOwnPropertyNames(q).join(',') === 'x,y'
+        """, expect: true)
+
+        // Static fields land on the constructor, in source order, with `this`
+        // = the class; `static w;` still defines the property.
+        evalCheckBool(ctx, """
+            class S { static y = 2; static w; static self = this }
+            S.y === 2 && S.w === undefined && ('w' in S) && S.self === S
+        """, expect: true)
+        // The inner class binding is initialised before the static initializers.
+        evalCheckBool(ctx, "class S2 { static a = 1; static b = S2.a + 1 } S2.b === 2", expect: true)
+        // static { } blocks run in order with the static fields.
+        evalCheckStr(ctx, """
+            var order = [];
+            class S3 { static a = order.push('a'); static { order.push('block'); this.q = 7; }
+                       static b = order.push('b'); }
+            order.join(',') + ':' + S3.q
+        """, expect: "a,block,b:7")
+        evalCheckBool(ctx, "class S4 { static { var q = 1; let r = 2; this.sum = q + r; } } S4.sum === 3", expect: true)
+        // Computed keys are evaluated at class definition time, in order.
+        evalCheckBool(ctx, """
+            var k = 'dyn', seen = [];
+            class S5 { [(seen.push('i'), k)] = 7; static [(seen.push('s'), k + '2')] = 8 }
+            new S5().dyn === 7 && S5.dyn2 === 8 && seen.join(',') === 'i,s'
+        """, expect: true)
+
+        // Private fields: read, write, compound and logical assignment.
+        evalCheckBool(ctx, """
+            class C { #p = 3; get p() { return this.#p; } set p(v) { this.#p = v; }
+                      bump() { this.#p++; this.#p += 10; this.#p ??= 99; return this.#p; }
+                      pre() { return ++this.#p; } }
+            var c = new C(); var r1 = c.p, r2 = c.bump(), r3 = c.pre(); c.p = 5;
+            r1 === 3 && r2 === 14 && r3 === 15 && c.p === 5
+        """, expect: true)
+        // A private name is invisible to reflection.
+        evalCheckBool(ctx, """
+            class C2 { #p = 1; q = 2 }
+            var o = new C2();
+            Object.getOwnPropertyNames(o).join(',') === 'q' && JSON.stringify(o) === '{"q":2}'
+        """, expect: true)
+        // Private names are per class: same spelling, different brand.
+        evalCheckStr(ctx, """
+            class A5 { #x = 1; static read(o) { return o.#x; } }
+            class B5 { #x = 2; static read(o) { return o.#x; } }
+            var r = A5.read(new A5()) + ',' + B5.read(new B5());
+            try { A5.read(new B5()); r += ',no-throw' } catch (e) { r += ',' + e.name }
+            r
+        """, expect: "1,2,TypeError")
+        // Private methods and accessors, with the brand check on a foreign object.
+        evalCheckBool(ctx, """
+            class M { #p = 3; #m() { return this.#p * 2; }
+                      get #g() { return this.#p + 1; } set #g(v) { this.#p = v; }
+                      m() { return this.#m(); } gg() { this.#g = 8; return this.#g; }
+                      static #sp = 9; static #sm() { return M.#sp; }
+                      static s() { return M.#sm(); } static has(o) { return #p in o; } }
+            var m = new M();
+            m.m() === 6 && m.gg() === 9 && M.s() === 9 && M.has(m) && !M.has({})
+        """, expect: true)
+        evalCheckException(ctx, "class M2 { #m() { return 1; } call(o) { return o.#m(); } } new M2().call({})")
+        evalCheckException(ctx, "class M3 { #x = 1; static read(o) { return o.#x; } } M3.read({})")
+        // `#x in obj` is a brand check for methods too.
+        evalCheckBool(ctx, """
+            class I { #m() {} static has(o) { return #m in o; } }
+            I.has(new I()) && !I.has({}) && !I.has(I)
+        """, expect: true)
+        // Private names reach through nested closures and nested classes.
+        evalCheckStr(ctx, """
+            class N { #v = 'o'; arrow() { return (() => this.#v)(); }
+                      make() { return new (class { #v = 'i'; get v() { return this.#v; } })(); } }
+            var n = new N(); n.arrow() + n.make().v
+        """, expect: "oi")
+        // An undeclared private name is an early error.
+        evalCheckException(ctx, "var o = {}; o.#nope")
+        evalCheckException(ctx, "(function(){ return #nope in {} })")
+        evalCheckException(ctx, "class Dup { #d; #d; }")
+        evalCheckException(ctx, "class Del { #d = 1; t() { delete this.#d; } }")
+
+        // A class expression keeps its inner binding, and a class in a loop
+        // produces independent field initializers.
+        evalCheckBool(ctx, """
+            var C6 = class Inner { static self = Inner; m() { return Inner; } };
+            var fns = [];
+            for (var i = 0; i < 2; i++) { class L { n = i } fns.push(new L()); }
+            C6.self === C6 && new C6().m() === C6 && fns[0].n === 0 && fns[1].n === 1
         """, expect: true)
     }
 

@@ -2485,6 +2485,11 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // Step 3: Compile (recursively compiles child functions, resolves
         // variables/labels, and produces final bytecode).
         guard let fb = JeffJSCompiler.createFunction(ctx: self, fd: fd) else {
+            // A pass that already threw (an undeclared private name is a
+            // SyntaxError) keeps its own error.
+            if !rt.currentException.isNull && !rt.currentException.isUndefined {
+                return .exception
+            }
             return throwInternalError(message: "Compilation failed for \(filename)")
         }
 
@@ -3747,6 +3752,8 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                             intKeys.append((idx, self.newStringValue(String(idx))))
                         }
                     } else if let entry = self.rt.atomArray[Int(atom)] {
+                        // Class private names (`#x`) are not own keys.
+                        if entry.atomType == .JS_ATOM_TYPE_PRIVATE { continue }
                         let isSymbol = entry.atomType == .JS_ATOM_TYPE_SYMBOL ||
                                        entry.atomType == .JS_ATOM_TYPE_GLOBAL_SYMBOL
                         if isSymbol {
