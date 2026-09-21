@@ -80,15 +80,52 @@ extension JeffJSContext {
     }
 
     /// JS_HasOwnProperty (key-based).
+    ///
+    /// Presence, not value: a slot holding `undefined`, an accessor, and a
+    /// mapped `arguments` var-ref all count as present. Indexed keys are
+    /// retried in the other atom form because the fast-array payload and
+    /// mapped `arguments` store them under the tagged-int atom while the
+    /// key arrives as the string "0".
     func hasOwnProperty(_ obj: JeffJSValue, key: JeffJSValue) -> Int32 {
         guard let jsObj = obj.toObject() else { return 0 }
-        if key.isString, let s = key.stringValue {
-            let atom = rt.findAtom(s.toSwiftString())
-            defer { rt.freeAtom(atom) }
-            let val = jsObj.getOwnPropertyValue(atom: atom)
-            return val.isUndefined ? 0 : 1
+        let atom: UInt32
+        if key.isInt, key.toInt32() >= 0 {
+            atom = rt.newAtomUInt32(UInt32(key.toInt32()))
+        } else if key.isString, let s = key.stringValue {
+            atom = rt.findAtom(s.toSwiftString())
+        } else if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
+            atom = rt.findAtom(symStr.toSwiftString())
+        } else if let str = toSwiftString(key) {
+            atom = rt.findAtom(str)
+        } else {
+            return 0
+        }
+        defer { rt.freeAtom(atom) }
+        if hasOwnPropertyAtom(jsObj, atom) { return 1 }
+        if let idx = rt.atomToUInt32(atom) {
+            let alt = (atom & JS_ATOM_TAG_INT) != 0 ? rt.findAtom(String(idx))
+                                                    : rt.newAtomUInt32(idx)
+            defer { rt.freeAtom(alt) }
+            if alt != atom, hasOwnPropertyAtom(jsObj, alt) { return 1 }
         }
         return 0
+    }
+
+    /// Own-property existence for one already-resolved atom.
+    func hasOwnPropertyAtom(_ jsObj: JeffJSObject, _ atom: UInt32) -> Bool {
+        if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
+            return true
+        }
+        if let shape = jsObj.shape, findShapeProperty(shape, atom) != nil { return true }
+        if jsObj.fastArray || jsObj.classID == JeffJSClassID.array.rawValue,
+           let idx = rt.atomToUInt32(atom) {
+            if let storage = jsObj._fastArrayValues {
+                if idx < storage.count, Int(idx) < storage.values.count { return true }
+            } else if let snap = jsObj.arraySnapshot() {
+                if Int(idx) < snap.count, Int(idx) < snap.values.count { return true }
+            }
+        }
+        return false
     }
 
     /// SameValue comparison (ES2023 7.2.11).
@@ -179,6 +216,14 @@ extension JeffJSContext {
         return .undefined
     }
 
+    /// True when the descriptor object carries `name` (own or inherited),
+    /// distinguishing `{writable: undefined}` from an omitted `writable`.
+    func descriptorHas(_ desc: JeffJSValue, _ name: String) -> Bool {
+        let atom = rt.findAtom(name)
+        defer { rt.freeAtom(atom) }
+        return hasProperty(obj: desc, atom: atom)
+    }
+
     /// Implements Object.defineProperty descriptor processing.
     /// Handles both data descriptors ({value, writable}) and accessor
     /// descriptors ({get, set}).
@@ -217,9 +262,12 @@ extension JeffJSContext {
             let getter = hasGetter ? getterVal.toObject() : nil
             let setter = hasSetter ? setterVal.toObject() : nil
 
-            // Build flags
-            var flags: UInt32 = UInt32(JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_ENUMERABLE)
-            flags |= UInt32(JS_PROP_GETSET)
+            // Build flags. The JS_PROP_HAS_* bits mark which attributes the
+            // descriptor actually carries: the ones it omits keep whatever
+            // the existing property had (ES2023 10.1.6.3 ValidateAndApply).
+            var flags: UInt32 = UInt32(JS_PROP_GETSET | JS_PROP_DEFINE_PROPERTY)
+            if descriptorHas(desc, "configurable") { flags |= UInt32(JS_PROP_HAS_CONFIGURABLE) }
+            if descriptorHas(desc, "enumerable")   { flags |= UInt32(JS_PROP_HAS_ENUMERABLE) }
             if hasGetter { flags |= UInt32(JS_PROP_HAS_GET) }
             if hasSetter { flags |= UInt32(JS_PROP_HAS_SET) }
 
@@ -243,7 +291,11 @@ extension JeffJSContext {
             // Data descriptor: { value, writable, configurable, enumerable }
             let val = getPropertyStr(obj: desc, name: "value")
 
-            var flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_ENUMERABLE | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_VALUE
+            var flags = JS_PROP_DEFINE_PROPERTY
+            if descriptorHas(desc, "configurable") { flags |= JS_PROP_HAS_CONFIGURABLE }
+            if descriptorHas(desc, "enumerable")   { flags |= JS_PROP_HAS_ENUMERABLE }
+            if descriptorHas(desc, "writable")     { flags |= JS_PROP_HAS_WRITABLE }
+            if descriptorHas(desc, "value")        { flags |= JS_PROP_HAS_VALUE }
 
             let configVal = getPropertyStr(obj: desc, name: "configurable")
             if !configVal.isUndefined && JeffJSTypeConvert.toBool(configVal) {
@@ -258,7 +310,7 @@ extension JeffJSContext {
                 flags |= JS_PROP_WRITABLE
             }
 
-            _ = definePropertyValue(obj: obj, atom: atom, value: val, flags: flags)
+            _ = defineProperty(obj: obj, atom: atom, value: val, flags: flags)
         }
         return obj
     }

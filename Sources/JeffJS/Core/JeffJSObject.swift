@@ -1663,19 +1663,33 @@ extension JeffJSObject {
     }
 
     /// Lookup a property value by atom, returning `.undefined` if absent.
+    ///
+    /// Borrowed result (no dup), as for a plain data slot. Accessor and
+    /// autoinit slots still report `.undefined` — they need a context to
+    /// evaluate — but a **mapped `arguments` slot** reads through its
+    /// var-ref, so `apply`/`bind`/`Reflect.apply`/`JSON`/`Object.*` see the
+    /// live parameter instead of `undefined`.
     func getOwnPropertyValue(atom: UInt32) -> JeffJSValue {
         let idx = jeffJS_findOwnPropertyIndex(obj: self, atom: atom)
         guard idx >= 0, idx < propValues.count else { return .undefined }
-        // Data slots only (matches the old `if case .value`).
-        if extra(at: idx) == nil { return propValues[idx] }
+        guard let e = extra(at: idx) else { return propValues[idx] }
+        if e.kind == .varRef, let vr = e.varRef { return vr.pvalue }
         return .undefined
     }
 
     /// Set a property value by atom.  Returns `true` on success.
+    /// A mapped `arguments` slot writes through to the live parameter and
+    /// stays mapped (the caller owns `value`; the replaced value is freed).
     @discardableResult
     func setOwnPropertyValue(atom: UInt32, value: JeffJSValue) -> Bool {
         let idx = jeffJS_findOwnPropertyIndex(obj: self, atom: atom)
         guard idx >= 0, idx < propValues.count else { return false }
+        if let e = extra(at: idx), e.kind == .varRef, let vr = e.varRef {
+            let oldVal = vr.pvalue
+            vr.pvalue = value
+            oldVal.freeValue()
+            return true
+        }
         propValues[idx] = value; setExtraSlot(idx, nil)
         return true
     }
