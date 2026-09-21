@@ -418,19 +418,33 @@ final class FetchBridgeTests: XCTestCase {
         let out = await runJS(env, """
         var blobLike = { parts: ['ab', new Uint8Array([0, 255])], type: 'application/x-app', size: 4 };
         var formLike = { _entries: [{ name: 'f', value: 'v' }] };
-        fetch('\(base)/echo', { method: 'POST', body: blobLike })
+        // A file part whose Blob uses the host app's `parts` field.
+        var fileForm = { _entries: [{ name: 'file', filename: 'a.txt',
+                                      value: { parts: ['hello'], type: 'text/plain', size: 5 } }] };
+        var usp = new URLSearchParams({ a: '1', b: 'x y' });
+        var acc = [];
+        function post(body){ return fetch('\(base)/echo', { method: 'POST', body: body }); }
+        post(blobLike)
           .then(function(r){ return r.arrayBuffer().then(function(b){
-            var u = new Uint8Array(b);
-            return fetch('\(base)/echo', { method: 'POST', body: formLike })
-              .then(function(r2){ return r2.text().then(function(t){
-                globalThis.__out = Array.prototype.join.call(u, ',') + '|' +
-                                   r.headers.get('content-type') + '|' +
-                                   (t.indexOf('name="f"') >= 0) + ',' + (t.indexOf('v') >= 0) + '|' +
-                                   (r2.headers.get('content-type') || '').split(';')[0];
-              }); });
-          }); }).catch(function(e){ globalThis.__out = 'ERR ' + e; });
+            acc.push(Array.prototype.join.call(new Uint8Array(b), ','));
+            acc.push(r.headers.get('content-type'));
+          }); })
+          .then(function(){ return post(formLike).then(function(r2){ return r2.text().then(function(t){
+            acc.push((t.indexOf('name="f"') >= 0) + ',' + (t.indexOf('v') >= 0));
+            acc.push((r2.headers.get('content-type') || '').split(';')[0]);
+          }); }); })
+          .then(function(){ return post(fileForm).then(function(r3){ return r3.text().then(function(t3){
+            acc.push((t3.indexOf('filename="a.txt"') >= 0) + ',' + (t3.indexOf('hello') >= 0));
+          }); }); })
+          .then(function(){ return post(usp).then(function(r4){ return r4.text().then(function(t4){
+            acc.push(t4);
+            acc.push(r4.headers.get('content-type') || '');
+            globalThis.__out = acc.join('|');
+          }); }); })
+          .catch(function(e){ globalThis.__out = 'ERR ' + e; });
         """)
-        XCTAssertEqual(out, "97,98,0,255|application/x-app|true,true|multipart/form-data")
+        XCTAssertEqual(out, "97,98,0,255|application/x-app|true,true|multipart/form-data"
+                            + "|true,true|a=1&b=x+y|application/x-www-form-urlencoded;charset=UTF-8")
     }
 
     // MARK: redirects

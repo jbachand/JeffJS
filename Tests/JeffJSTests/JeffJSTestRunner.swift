@@ -2584,6 +2584,8 @@ extension JeffJSTestRunner {
     /// Small spec gaps that browser-targeted code trips over.
     mutating func testWebAPIGaps() {
         let (rt, ctx) = makeCtx()
+        // The shared test context does not install the stdlib intrinsics.
+        JeffJSStdLib.addURL(ctx: ctx)
 
         // An own property whose value is `undefined` is still an own property.
         evalCheckBool(ctx, "({z: undefined}).hasOwnProperty('z')", expect: true)
@@ -2633,6 +2635,66 @@ extension JeffJSTestRunner {
             L.prototype === before
             """, expect: true)
         evalCheckBool(ctx, "var fr = Object.freeze({a:1}); fr.a = 2; fr.a === 1", expect: true)
+
+        // URLSearchParams: parsing, the full method set, and a live
+        // url.searchParams.
+        evalCheckStr(ctx, """
+            var p = new URLSearchParams("a=1&a=2&b=%20x&c=d+e");
+            [p.get("a"), p.getAll("a").join(","), p.get("b"), p.get("c"),
+             String(p.get("zz")), String(p.has("a")), String(p.has("zz")), String(p.size)].join("|")
+            """, expect: "1|1,2| x|d e|null|true|false|4")
+        evalCheckStr(ctx, """
+            var p = new URLSearchParams("a=1");
+            p.append("a", "2"); p.append("b", "x y");
+            var s1 = p.toString();
+            p.set("a", "9");
+            var s2 = p.toString();
+            p.delete("b");
+            [s1, s2, p.toString(), String(p.size)].join("|")
+            """, expect: "a=1&a=2&b=x+y|a=9&b=x+y|a=9|1")
+        evalCheckStr(ctx, "new URLSearchParams({x: '1', y: 'two words'}).toString()",
+                     expect: "x=1&y=two+words")
+        evalCheckStr(ctx, "new URLSearchParams([['k','v'],['k2','v2']]).toString()",
+                     expect: "k=v&k2=v2")
+        evalCheckStr(ctx, "new URLSearchParams(new Map([['a','1'],['b','2']])).toString()",
+                     expect: "a=1&b=2")
+        evalCheckStr(ctx, """
+            var src = new URLSearchParams("a=1");
+            var copy = new URLSearchParams(src);
+            copy.append("b", "2");
+            src.toString() + "|" + copy.toString()
+            """, expect: "a=1|a=1&b=2")
+        evalCheckStr(ctx, "var s = new URLSearchParams('c=3&a=1&b=2'); s.sort(); s.toString()",
+                     expect: "a=1&b=2&c=3")
+        evalCheckStr(ctx, """
+            var p = new URLSearchParams("x=1&y=2");
+            var acc = [];
+            p.forEach(function(v, k){ acc.push(k + "=" + v); });
+            var it = [];
+            for (var e of p) { it.push(e[0] + ":" + e[1]); }
+            [[...p.keys()].join(","), [...p.values()].join(","), acc.join("&"), it.join(",")].join("|")
+            """, expect: "x,y|1,2|x=1&y=2|x:1,y:2")
+        evalCheckBool(ctx, "typeof new URLSearchParams('a=1')[Symbol.iterator] === 'function'",
+                      expect: true)
+        evalCheckStr(ctx, """
+            var u = new URL("https://ex.com/p?a=1#frag");
+            var before = u.search + " " + u.href;
+            u.searchParams.append("b", "2 3");
+            var after = u.search + " " + u.href;
+            u.searchParams.delete("a"); u.searchParams.delete("b");
+            [before, after, u.search + "|" + u.href].join(" / ")
+            """, expect: "?a=1 https://ex.com/p?a=1#frag / ?a=1&b=2+3 https://ex.com/p?a=1&b=2+3#frag / |https://ex.com/p#frag")
+        evalCheckStr(ctx, """
+            var u = new URL("https://ex.com/p");
+            u.search = "?z=9";
+            u.searchParams.get("z") + "|" + u.search + "|" + u.href
+            """, expect: "9|?z=9|https://ex.com/p?z=9")
+        // The internal slot is `__uspEntries`, not the host app's `_entries`
+        // FormData name.
+        evalCheckBool(ctx, """
+            var p = new URLSearchParams("a=1");
+            p._entries === undefined && Array.isArray(p.__uspEntries)
+            """, expect: true)
 
         // __lookupGetter__/__lookupSetter__ walk the prototype chain.
         evalCheckBool(ctx, """
