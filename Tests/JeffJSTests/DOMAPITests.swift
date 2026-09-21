@@ -314,4 +314,74 @@ final class DOMAPITests: XCTestCase {
         })()
         """), "true|a|false")
     }
+
+    // MARK: - Reflected IDL attributes
+
+    /// apple.com's global header reads `meta.name` / `meta.content` off every
+    /// `meta[name^="globalnav-"]`; both answered undefined, so building the
+    /// flyout died on `Cannot read properties of undefined (reading 'replace')`.
+    @MainActor
+    func testMetaNameAndContentReflectAttributes() {
+        let env = makeEnvironment()
+        _ = evalString(env, """
+        document.head.innerHTML =
+          '<meta name="globalnav-store-key" content="SFX9">' +
+          '<meta name="viewport" content="width=device-width">';
+        """)
+        XCTAssertEqual(evalString(env, """
+        Array.from(document.querySelectorAll('meta[name^="globalnav-"]'))
+             .map(function(m) { return m.name + '=' + m.content; }).join(',')
+        """), "globalnav-store-key=SFX9")
+        XCTAssertEqual(evalString(env,
+            "document.querySelector('meta[name=viewport]').content"), "width=device-width")
+        // Writable, and the write lands on the content attribute.
+        XCTAssertEqual(evalString(env, """
+        (function() {
+          var m = document.querySelector('meta[name=viewport]');
+          m.content = m.content + ',initial-scale=1';
+          return m.getAttribute('content');
+        })()
+        """), "width=device-width,initial-scale=1")
+    }
+
+    /// `<template>.content` must still be the DocumentFragment, not a string.
+    @MainActor
+    func testTemplateContentStillAFragment() {
+        let env = makeEnvironment()
+        XCTAssertEqual(evalString(env, """
+        (function() {
+          var t = document.createElement('template');
+          t.innerHTML = '<i>hi</i>';
+          return [typeof t.content, String(t.content.nodeType), t.content.firstChild.tagName].join('|');
+        })()
+        """), "object|11|I")
+    }
+
+    @MainActor
+    func testStringReflectedElementAttributes() {
+        let env = makeEnvironment()
+        _ = evalString(env, """
+        document.body.innerHTML =
+          '<img id="im" src="a.png" alt="A" title="T">' +
+          '<input id="in" placeholder="P" name="q">' +
+          '<input id="in2" type="checkbox">' +
+          '<button id="bt"></button>';
+        """)
+        XCTAssertEqual(evalString(env, """
+        (function() { var i = document.getElementById('im');
+          return [i.alt, i.title, i.name].join('|'); })()
+        """), "A|T|")
+        XCTAssertEqual(evalString(env, """
+        (function() { var i = document.getElementById('in');
+          return [i.placeholder, i.name, i.type].join('|'); })()
+        """), "P|q|text")
+        XCTAssertEqual(evalString(env, "document.getElementById('in2').type"), "checkbox")
+        XCTAssertEqual(evalString(env, "document.getElementById('bt').type"), "submit")
+        XCTAssertEqual(evalString(env, """
+        (function() { var i = document.getElementById('im'); i.alt = 'B'; i.name = 'n';
+          return [i.getAttribute('alt'), i.getAttribute('name')].join('|'); })()
+        """), "B|n")
+        // document.title is the document's own accessor, not the element one.
+        XCTAssertEqual(evalString(env, "(function(){ document.title = 'Doc'; return document.title; })()"), "Doc")
+    }
 }

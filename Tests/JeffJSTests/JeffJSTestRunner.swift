@@ -310,6 +310,7 @@ struct JeffJSTestRunner {
             ("ReflectConstructNewTarget", { $0.testReflectConstructNewTarget() }),
             ("ClassFields", { $0.testClassFields() }),
             ("BuiltinGaps", { $0.testBuiltinGaps() }),
+            ("DefineProperty", { $0.testDefineProperty() }),
         ]
     }
 
@@ -11636,6 +11637,148 @@ extension JeffJSTestRunner {
     /// of seeing the `.undefined` that lives in the data slot. Regression
     /// group for `g.apply(null, arguments)` passing `undefined` once the
     /// function declared a formal parameter.
+    // MARK: - DefineProperty
+
+    /// Symbol-keyed property plumbing and ES2023 10.1.6.3
+    /// ValidateAndApplyPropertyDescriptor.
+    ///
+    /// apple.com's global header died on `TypeError: property descriptor must
+    /// be an object` because `Object.defineProperties(o,
+    /// Object.getOwnPropertyDescriptors(src))` — the TypeScript `__spreadProps`
+    /// helper — could not read a symbol-keyed entry out of the descriptor bag.
+    mutating func testDefineProperty() {
+        let (rt, ctx) = makeCtx()
+        _ = rt
+
+        // --- 1. symbol keys survive the descriptor round trip -------------
+        evalCheck(ctx, "var dpS = Symbol('dpS'), dpT = Symbol('dpT'); 0", expectInt: 0)
+        evalCheck(ctx, "var dpSrc = {a: 1}; dpSrc[dpS] = 42; dpSrc[dpT] = 7; 0", expectInt: 0)
+        evalCheckStr(ctx, "Reflect.ownKeys(Object.getOwnPropertyDescriptors(dpSrc)).map(String).join('|')",
+                     expect: "a|Symbol(dpS)|Symbol(dpT)")
+        evalCheck(ctx, "Object.getOwnPropertyDescriptors(dpSrc)[dpS].value", expectInt: 42)
+        // The exact __spreadProps shape from the apple bundle.
+        evalCheck(ctx, """
+            var dpOut = Object.defineProperties({}, Object.getOwnPropertyDescriptors(dpSrc));
+            dpOut[dpS] + dpOut[dpT] + dpOut.a
+            """, expectInt: 50)
+        evalCheck(ctx, "Object.create(null, Object.getOwnPropertyDescriptors(dpSrc))[dpS]", expectInt: 42)
+        evalCheck(ctx, "Object.assign({}, dpSrc)[dpS]", expectInt: 42)
+        evalCheck(ctx, "({...dpSrc})[dpS]", expectInt: 42)
+        // A getter defined under a symbol key keeps its accessor nature.
+        evalCheck(ctx, """
+            var dpG = {}; Object.defineProperty(dpG, dpS, {get: function () { return 9; }, configurable: true});
+            Object.getOwnPropertyDescriptor(dpG, dpS).get.call(dpG)
+            """, expectInt: 9)
+
+        // --- 2. a symbol is not its description ---------------------------
+        evalCheckBool(ctx, "({a: 1}).hasOwnProperty(Symbol('a'))", expect: false)
+        evalCheckBool(ctx, "dpSrc.hasOwnProperty(dpS)", expect: true)
+        evalCheckBool(ctx, "dpSrc.propertyIsEnumerable(dpS)", expect: true)
+        evalCheckBool(ctx, "var dpX = {}; dpX[Symbol('a')] = 1; 'a' in dpX", expect: false)
+
+        // --- 3. Reflect takes symbol keys too -----------------------------
+        evalCheck(ctx, "Reflect.get(dpSrc, dpS)", expectInt: 42)
+        evalCheckBool(ctx, "Reflect.has(dpSrc, dpS)", expect: true)
+        evalCheck(ctx, "var dpR = {}; Reflect.set(dpR, dpS, 5); dpR[dpS]", expectInt: 5)
+        evalCheckBool(ctx, "Reflect.deleteProperty(dpR, dpS); dpR[dpS] === undefined", expect: true)
+        evalCheck(ctx, "var dpR2 = {}; Reflect.defineProperty(dpR2, dpS, {value: 3}); dpR2[dpS]", expectInt: 3)
+
+        // --- 4. Reflect.defineProperty is a real descriptor consumer ------
+        // It used to read only `value`, default every attribute to true and
+        // accept a non-object descriptor.
+        evalCheck(ctx, "var dpA = {}; Reflect.defineProperty(dpA, 'x', {get: function () { return 5; }}); dpA.x",
+                  expectInt: 5)
+        evalCheckStr(ctx, """
+            var dpB = {}; Reflect.defineProperty(dpB, 'x', {value: 1});
+            var d = Object.getOwnPropertyDescriptor(dpB, 'x');
+            [d.writable, d.enumerable, d.configurable].join(',')
+            """, expect: "false,false,false")
+        evalCheckBool(ctx, """
+            try { Reflect.defineProperty({}, 'x', 1); false } catch (e) { e instanceof TypeError }
+            """, expect: true)
+        // A refused definition answers false instead of throwing.
+        evalCheckBool(ctx, "Reflect.defineProperty(Object.freeze({}), 'x', {value: 1})", expect: false)
+        evalCheckBool(ctx, "Reflect.set(Object.freeze({x: 1}), 'x', 2)", expect: false)
+        evalCheckBool(ctx, """
+            var dpC = {}; Object.defineProperty(dpC, 'x', {value: 1});
+            Reflect.deleteProperty(dpC, 'x')
+            """, expect: false)
+
+        // --- 5. ValidateAndApplyPropertyDescriptor ------------------------
+        // Extensibility only gates *new* properties: redefining an existing
+        // one on a sealed object is legal.
+        evalCheck(ctx, """
+            var dpP = {x: 1}; Object.preventExtensions(dpP);
+            Object.defineProperty(dpP, 'x', {value: 2}); dpP.x
+            """, expectInt: 2)
+        evalCheck(ctx, "var dpQ = {x: 1}; Object.seal(dpQ); Object.defineProperty(dpQ, 'x', {value: 3}); dpQ.x",
+                  expectInt: 3)
+        evalCheckBool(ctx, """
+            var dpE = {}; Object.preventExtensions(dpE);
+            try { Object.defineProperty(dpE, 'y', {value: 1}); false } catch (e) { e instanceof TypeError }
+            """, expect: true)
+        // A non-configurable property refuses every reshape.
+        evalCheckBool(ctx, """
+            var dpN = {}; Object.defineProperty(dpN, 'x', {value: 1});
+            try { Object.defineProperty(dpN, 'x', {value: 2}); false } catch (e) { e instanceof TypeError }
+            """, expect: true)
+        evalCheckBool(ctx, """
+            var dpN2 = {}; Object.defineProperty(dpN2, 'x', {value: 1});
+            try { Object.defineProperty(dpN2, 'x', {configurable: true}); false } catch (e) { e instanceof TypeError }
+            """, expect: true)
+        evalCheckBool(ctx, """
+            var dpN3 = {}; Object.defineProperty(dpN3, 'x', {value: 1, enumerable: false});
+            try { Object.defineProperty(dpN3, 'x', {enumerable: true}); false } catch (e) { e instanceof TypeError }
+            """, expect: true)
+        evalCheckBool(ctx, """
+            var dpN4 = {}; Object.defineProperty(dpN4, 'x', {value: 1});
+            try { Object.defineProperty(dpN4, 'x', {get: function () { return 2; }}); false }
+            catch (e) { e instanceof TypeError }
+            """, expect: true)
+        // Redefining with the same value, or narrowing writable, is allowed.
+        evalCheck(ctx, """
+            var dpN5 = {}; Object.defineProperty(dpN5, 'x', {value: 1});
+            Object.defineProperty(dpN5, 'x', {value: 1}); dpN5.x
+            """, expectInt: 1)
+        evalCheck(ctx, """
+            var dpN6 = {}; Object.defineProperty(dpN6, 'x', {value: 1, writable: true, configurable: false});
+            Object.defineProperty(dpN6, 'x', {writable: false});
+            dpN6.x = 5; dpN6.x
+            """, expectInt: 1)
+        // A configurable property may still be reshaped freely.
+        evalCheck(ctx, """
+            var dpN7 = {}; Object.defineProperty(dpN7, 'x', {value: 1, configurable: true});
+            Object.defineProperty(dpN7, 'x', {value: 2}); dpN7.x
+            """, expectInt: 2)
+
+        // --- 6. String(symbol) --------------------------------------------
+        evalCheckStr(ctx, "String(Symbol('k'))", expect: "Symbol(k)")
+        evalCheckStr(ctx, "[Symbol('a'), Symbol('b')].map(String).join(',')", expect: "Symbol(a),Symbol(b)")
+        evalCheckStr(ctx, "String(Symbol())", expect: "Symbol()")
+        evalCheckBool(ctx, "try { new String(Symbol('k')); false } catch (e) { e instanceof TypeError }",
+                      expect: true)
+
+        // --- 7. freezing a function must not eat its lazy own props -------
+        // `name`/`length`/`prototype` only join the shape on first touch, and
+        // an add is refused once the object is non-extensible.
+        evalCheckStr(ctx, "(function () { function dpF(a, b) {} Object.freeze(dpF); return dpF.name + ',' + dpF.length; })()",
+                     expect: "dpF,2")
+        evalCheckStr(ctx, "(function () { function dpF2(a) {} Object.seal(dpF2); return dpF2.name + ',' + dpF2.length; })()",
+                     expect: "dpF2,1")
+        evalCheckStr(ctx, "(function () { function dpF3() {} Object.preventExtensions(dpF3); return dpF3.name + ',' + dpF3.length; })()",
+                     expect: "dpF3,0")
+        evalCheckBool(ctx, """
+            (function () { function dpF4() {} Object.freeze(dpF4);
+              return typeof dpF4.prototype === 'object' && dpF4.prototype.constructor === dpF4; })()
+            """, expect: true)
+        evalCheckStr(ctx, """
+            (function () { function dpF5(a) {} Object.freeze(dpF5);
+              return Object.getOwnPropertyNames(dpF5).sort().join(','); })()
+            """, expect: "length,name,prototype")
+        evalCheckBool(ctx, "(function () { function dpF6() {} Object.freeze(dpF6); return Object.isFrozen(dpF6); })()",
+                      expect: true)
+    }
+
     mutating func testMappedArguments() {
         let (rt, ctx) = makeCtx()
         _ = rt

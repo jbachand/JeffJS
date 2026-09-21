@@ -1126,6 +1126,10 @@ extension JeffJSContext {
         return val
     }
 
+    /// Property read by key *value*. Symbol keys used to fall through to the
+    /// `.undefined` tail, which is what made `Object.defineProperties(o,
+    /// Object.getOwnPropertyDescriptors(src))` report "property descriptor
+    /// must be an object" for every symbol-keyed property of `src`.
     func getProperty(obj: JeffJSValue, key: JeffJSValue) -> JeffJSValue {
         if key.isString, let keyStr = key.stringValue {
             return getPropertyStr(obj: obj, name: keyStr.toSwiftString())
@@ -1133,9 +1137,15 @@ extension JeffJSContext {
         if key.isInt {
             return getPropertyUInt32(obj: obj, index: UInt32(key.toInt32()))
         }
-        return .undefined
+        guard let (atom, owned) = propertyKeyAtom(key) else { return .undefined }
+        defer { if owned { rt.freeAtom(atom) } }
+        return getProperty(obj: obj, atom: atom)
     }
 
+    /// Property write by key *value*. Symbol keys used to return -1 without a
+    /// pending exception, and callers that turn -1 into `.exception` then
+    /// unwound with no exception object at all (a later unrelated global read
+    /// reported as "document is not defined").
     func setProperty(obj: JeffJSValue, key: JeffJSValue, value: JeffJSValue) -> Int32 {
         if key.isString, let keyStr = key.stringValue {
             return setPropertyStr(obj: obj, name: keyStr.toSwiftString(), value: value) ? 0 : -1
@@ -1143,7 +1153,9 @@ extension JeffJSContext {
         if key.isInt {
             return Int32(setPropertyUint32(obj: obj, index: UInt32(key.toInt32()), value: value))
         }
-        return -1
+        guard let (atom, owned) = propertyKeyAtom(key) else { return -1 }
+        defer { if owned { rt.freeAtom(atom) } }
+        return Int32(setProperty(obj: obj, atom: atom, value: value))
     }
 
     func getPropertyUInt32(obj: JeffJSValue, index: UInt32) -> JeffJSValue {
