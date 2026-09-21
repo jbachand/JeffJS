@@ -10517,6 +10517,20 @@ extension JeffJSTestRunner {
         """, expect: true)
         // An explicit undefined element is still present.
         evalCheckBool(ctx, "var a = [1, undefined, 3]; (1 in a) && Object.keys(a).length === 3", expect: true)
+
+        // --- 2. GetSubstitution named groups ($<name>) ---------------------
+        // `$<name>` was parsed and then dropped, so every named-group
+        // replacement template produced an empty expansion.
+        evalCheckStr(ctx, "'2026-09'.replace(/(?<y>\\d+)-(?<m>\\d+)/, '$<m>/$<y>')", expect: "09/2026")
+        // A name that does not exist expands to "".
+        evalCheckStr(ctx, "'ab'.replace(/(?<a>a)/, '[$<zz>]')", expect: "[]b")
+        // With no named groups at all, `$<` stays literal (spec).
+        evalCheckStr(ctx, "'abc'.replace(/b/, '[$<x>]')", expect: "a[$<x>]c")
+        evalCheckStr(ctx, "'a1 a2'.replaceAll(/a(?<d>\\d)/g, '<$<d>>')", expect: "<1> <2>")
+        evalCheckStr(ctx, "'a1b2'.replace(/(?<d>\\d)/g, '$<d>$<d>')", expect: "a11b22")
+        // $<name> mixes with the numeric and $& forms.
+        evalCheckStr(ctx, "'2026-09'.replace(/(?<y>\\d+)-(?<m>\\d+)/, '$1|$2|$&|$<y>')",
+                     expect: "2026|09|2026-09|2026")
     }
 
     mutating func runAPITests() -> String {

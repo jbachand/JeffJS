@@ -1104,12 +1104,17 @@ func js_regexp_Symbol_replace(
             replResultStr.freeValue()
         } else if let rs = replaceStr {
             // Apply $-substitution.
+            // `$<name>` needs the match's `groups` object.
+            let groupsAtom = ctx.rt.findAtom("groups")
+            let namedGroups = resObj.getOwnPropertyValue(atom: groupsAtom)
+            ctx.rt.freeAtom(groupsAtom)
             let sub = js_getSubstitution(
                 ctx: ctx,
                 matched: matchedStr,
                 input: inputStr,
                 matchStart: matchStart,
                 captures: resObj,
+                namedGroups: namedGroups,
                 replacement: rs
             )
             buf.concat(sub)
@@ -1741,6 +1746,7 @@ private func js_getSubstitution(
     input: JeffJSString,
     matchStart: Int,
     captures: JeffJSObject,
+    namedGroups: JeffJSValue,
     replacement: JeffJSString
 ) -> JeffJSString {
     let buf = JeffJSStringBuffer()
@@ -1819,14 +1825,28 @@ private func js_getSubstitution(
                 j += 1
             }
 
-            if j >= replacement.len {
-                // No closing '>' -- emit literally.
+            if j >= replacement.len || namedGroups.isUndefined {
+                // No closing '>', or the regexp has no named groups at all:
+                // per spec `$<` is then a literal.
                 buf.putc8(0x24)
                 buf.putc(next)
                 i += 2
             } else {
-                // Extract the name.  Named group lookup would go here.
-                // For now, emit undefined (no named groups support yet).
+                // $<name> -> the named capture, or "" when it did not
+                // participate / does not exist.
+                guard let name = jeffJS_subString(str: replacement, start: i + 2, end: j) else {
+                    i = j + 1
+                    break
+                }
+                let nameAtom = ctx.rt.findAtom(name.toSwiftString())
+                let capture = ctx.getProperty(obj: namedGroups, atom: nameAtom)
+                ctx.rt.freeAtom(nameAtom)
+                if !capture.isUndefined {
+                    let capStr = ctx.toString(capture)
+                    if let cs = capStr.stringValue { buf.concat(cs) }
+                    capStr.freeValue()
+                }
+                capture.freeValue()
                 i = j + 1
             }
 
