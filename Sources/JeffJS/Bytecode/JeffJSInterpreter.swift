@@ -6226,7 +6226,7 @@ struct JeffJSInterpreter {
         /// (their refs move, exactly as the old copy-based path did).
 
         // ---- Generator resumption: restore saved state ----
-        if let saved = resumeState {
+        if var saved = resumeState {
             pc = saved.pc
             // Restore varBuf/argBuf from saved state
             frame.varBuf = saved.varBuf
@@ -6245,6 +6245,34 @@ struct JeffJSInterpreter {
 
             // Sync restored frame arrays into buf
             jeffJS_syncFrameToBuf(frame, buf, varBase)
+
+            // Re-attach the var-refs closures took on this generator's slots.
+            if !saved.capturedVarRefs.isEmpty {
+                for vr in saved.capturedVarRefs {
+                    guard vr.isDetached else { continue }
+                    let idx = Int(vr.varIdx)
+                    let slot: Int
+                    if vr.isArg {
+                        guard idx < varBase else { continue }
+                        slot = idx
+                    } else {
+                        slot = varBase + idx
+                    }
+                    guard slot >= 0, slot < bufCapacity else { continue }
+                    // A write through the detached ref while the generator was
+                    // suspended wins over the value restored from the saved
+                    // frame arrays; both hold a reference, so free the loser.
+                    buf[slot].freeValue()
+                    buf[slot] = vr.value
+                    vr.value = .undefined
+                    vr.isDetached = false
+                    vr.parentFrame = frame
+                    vr.slot = nil   // generator frames re-acquire their buffer
+                    frame.liveVarRefs.append(vr)
+                    frame.hasLiveVarRefs = true
+                }
+                saved.capturedVarRefs = []
+            }
 
             // Result object produced by advancing a `yield*` delegated
             // iterator (next/throw forwarded from the outer generator's
@@ -6405,7 +6433,8 @@ struct JeffJSInterpreter {
                                 varBuf: frame.varBuf,
                                 argBuf: frame.argBuf,
                                 funcObj: mFuncObj,
-                                thisVal: thisVal)
+                                thisVal: thisVal,
+                                capturedVarRefs: frame.liveVarRefs)
                             newSaved.delegatedIter = iter
                             genData.savedState = newSaved
                             genData.state = .suspended_yield_star
@@ -9869,7 +9898,8 @@ struct JeffJSInterpreter {
                         argBuf: frame.argBuf,
                         funcObj: mFuncObj,
                         thisVal: thisVal,
-                        isInitialYield: true)
+                        isInitialYield: true,
+                        capturedVarRefs: frame.liveVarRefs)
                     genData.state = .suspended_start
                 }
                 // Return undefined to the callFunction that initiated the generator.
@@ -9899,7 +9929,8 @@ struct JeffJSInterpreter {
                         varBuf: frame.varBuf,
                         argBuf: frame.argBuf,
                         funcObj: mFuncObj,
-                        thisVal: thisVal)
+                        thisVal: thisVal,
+                        capturedVarRefs: frame.liveVarRefs)
                     genData.state = .suspended_yield
                 }
                 retVal = val
@@ -9954,7 +9985,8 @@ struct JeffJSInterpreter {
                             varBuf: frame.varBuf,
                             argBuf: frame.argBuf,
                             funcObj: mFuncObj,
-                            thisVal: thisVal)
+                            thisVal: thisVal,
+                            capturedVarRefs: frame.liveVarRefs)
                         saved.delegatedIter = iter
                         genData.savedState = saved
                         genData.state = .suspended_yield_star
@@ -10079,7 +10111,8 @@ struct JeffJSInterpreter {
                             pc: pc + 1, sp: sp - spBase,
                             stack: stackSnap, varBuf: varSnap,
                             argBuf: argSnap, funcObj: mFuncObj,
-                            thisVal: frame.thisVal)
+                            thisVal: frame.thisVal,
+                            capturedVarRefs: frame.liveVarRefs)
 
                         let stateID = ctx.storeAsyncState(JeffJSContext.AsyncSavedEntry(
                             saved: saved,

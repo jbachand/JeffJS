@@ -743,6 +743,12 @@ struct GeneratorSavedState {
     /// the resume value from `.next()` should NOT be pushed onto the stack
     /// because there is no yield expression to receive it.
     var isInitialYield: Bool = false
+    /// Var-refs that closures created inside the generator hold on its
+    /// locals/arguments. The frame epilogue detaches them at every yield (the
+    /// frame's buffer is released), so they are re-attached to the fresh
+    /// buffer on resume; without that the closure and the generator body see
+    /// two different copies of the same binding after the first yield.
+    var capturedVarRefs: [JeffJSVarRef] = []
     /// For yield* delegation: the inner iterator being delegated to.
     /// When non-nil, the generator is in `suspended_yield_star` state
     /// and each .next() call should advance the inner iterator.

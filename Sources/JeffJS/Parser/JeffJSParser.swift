@@ -6831,6 +6831,21 @@ final class JeffJSParser {
         guard fd.funcKind == JSFunctionKindEnum.JS_FUNC_GENERATOR.rawValue else { return }
         let skip = newLabel()
         emitIfFalse(skip)
+        // A forced return has to close every iterator the suspended generator
+        // is holding, exactly like a `return` out of the loop does
+        // (emitUnwind): `gen.return()` inside `for (x of it) yield x` must
+        // call it.return().
+        var envIdx = curBlockEnvIdx
+        while envIdx >= 0 {
+            let env = blockEnvs[envIdx]
+            if env.iteratorSlots == 3 {
+                emitOp(.perm4)            // [iter, m, meth, v] -> [v, iter, m, meth]
+                emitOp(.iterator_close)   // pops the iterator record
+            } else if env.iteratorSlots == 1 {
+                emitOp(.nip)              // drop the for-in enumerator below the value
+            }
+            envIdx = env.parent
+        }
         for scope in finallyScopes.reversed() {
             // nip_catch scans down to the catch offset, so operands left on the
             // stack by an enclosing expression (`f(yield x)`) are freed too.

@@ -10583,6 +10583,59 @@ extension JeffJSTestRunner {
         evalCheckStr(ctx, "String((0, eval)('var ce = {}; if (false) { ce.x = 1; }'))", expect: "undefined")
         evalCheckStr(ctx, "String((0, eval)('if (true) { 7; }'))", expect: "7")
         evalCheckStr(ctx, "String((0, eval)('if (false) 1; else 2;'))", expect: "2")
+
+        // --- 5. Iterator close / yield* / generator closures --------------
+        // for..of has to call the iterator's return() when the body throws,
+        // not only on break/return.
+        evalCheckBool(ctx, """
+            var closed = false;
+            var it = { [Symbol.iterator]() { return this; }, next() { return { value: 1, done: false }; },
+                       return() { closed = true; return { done: true }; } };
+            try { for (var x of it) { throw new Error('boom'); } } catch (e) {}
+            closed
+            """, expect: true)
+        evalCheckStr(ctx, """
+            var it2 = { [Symbol.iterator]() { return this; }, next() { return { value: 1, done: false }; },
+                        return() { return { done: true }; } };
+            try { for (var x2 of it2) { throw new Error('boom'); } } catch (e) { e.message }
+            """, expect: "boom")
+        // ... and when a suspended generator is closed inside the loop.
+        evalCheckBool(ctx, """
+            var closed3 = false;
+            var it3 = { [Symbol.iterator]() { return this; }, next() { return { value: 1, done: false }; },
+                        return() { closed3 = true; return { done: true }; } };
+            function* g3() { for (var v of it3) yield v; }
+            var i3 = g3(); i3.next(); i3.return(0); closed3
+            """, expect: true)
+        // yield*: an inner return() reporting done:false re-yields instead of
+        // ending the delegation.
+        evalCheckStr(ctx, """
+            var inner = { [Symbol.iterator]() { return this; }, next() { return { value: 1, done: false }; },
+                          return(v) { return { value: 'r', done: false }; } };
+            function* g4() { yield* inner; }
+            var i4 = g4(); i4.next(); var r4 = i4.return('x'); r4.value + '/' + r4.done
+            """, expect: "r/false")
+        // Closures over generator locals stay attached across a yield.
+        evalCheck(ctx, """
+            function* g5() { var x = 1; var f = () => x; yield; x = 2; yield f(); }
+            var i5 = g5(); i5.next(); i5.next().value
+            """, expectInt: 2)
+        evalCheck(ctx, """
+            function* g6() { var x = 1; var f = () => { x = 5; }; yield; f(); yield x; }
+            var i6 = g6(); i6.next(); i6.next().value
+            """, expectInt: 5)
+        // The ordinary paths still work.
+        evalCheckStr(ctx, """
+            var log7 = [];
+            function* g7() { try { yield 1; yield 2; } finally { log7.push('f'); } }
+            var i7 = g7(); i7.next(); i7.return(9); log7.join()
+            """, expect: "f")
+        evalCheckBool(ctx, """
+            var closed8 = false;
+            var it8 = { [Symbol.iterator]() { return this; }, next() { return { value: 1, done: false }; },
+                        return() { closed8 = true; return { done: true }; } };
+            for (var x8 of it8) break; closed8
+            """, expect: true)
     }
 
     mutating func runAPITests() -> String {
