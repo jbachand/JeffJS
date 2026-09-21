@@ -150,6 +150,9 @@ extension JeffJSContext {
             return .undefined
         }
         defer { if ownedAtom { rt.freeAtom(atom) } }
+        // A function's deferred own properties must exist before they can be
+        // described.
+        jeffJS_materializeLazyProps(jsObj, atom)
 
         // Fast-array elements are not shape properties: they are always
         // { writable: true, enumerable: true, configurable: true }.
@@ -292,6 +295,10 @@ extension JeffJSContext {
         guard let jsObj = obj.toObject() else {
             return newArrayWithLength(0)
         }
+        // A function's deferred own properties have to exist before they can
+        // be listed.
+        if jsObj.needsLazyNameLength { materializeFunctionNameLength(jsObj) }
+        if jsObj.needsLazyPrototype { materializeFunctionPrototype(jsObj) }
 
         let wantStrings = (flags & JS_GPN_STRING_MASK) != 0
         let wantSymbols = (flags & JS_GPN_SYMBOL_MASK) != 0

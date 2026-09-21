@@ -923,6 +923,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         }
 
         guard let jsObj = obj.toObject() else { return -1 }
+        // A deferred own property must exist before it can be redefined,
+        // otherwise the materialiser would later overwrite the new descriptor.
+        jeffJS_materializeLazyProps(jsObj, atom)
 
         // Check extensibility
         if !jsObj.extensible {
@@ -1040,6 +1043,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// - Returns: True on success, false on error or non-configurable.
     func deleteProperty(obj: JeffJSValue, atom: UInt32, flags: Int = 0) -> Bool {
         guard let jsObj = obj.toObject() else { return false }
+        jeffJS_materializeLazyProps(jsObj, atom)
         // `delete a[i]` on a fast array punches a hole in the element storage
         // (length is unchanged, `i in a` becomes false) — the element is not a
         // shape property, so the code below would silently do nothing.
@@ -1155,8 +1159,11 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             }
         }
 
-        // Lazy function prototype counts as present
+        // Lazily created function own properties count as present
         if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
+            return true
+        }
+        if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) {
             return true
         }
 
@@ -1189,11 +1196,27 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// - Returns: The property descriptor, or nil if not found.
     func getOwnProperty(obj: JeffJSValue, atom: UInt32) -> JeffJSProperty? {
         guard let jsObj = obj.toObject() else { return nil }
+        jeffJS_materializeLazyProps(jsObj, atom)
+        let (_, prop) = jeffJS_findOwnProperty(obj: jsObj, atom: atom)
+        return prop
+    }
+
+    /// True for the two atoms whose function own-properties are created lazily.
+    @inline(__always)
+    func jeffJS_isLazyFuncPropAtom(_ atom: UInt32) -> Bool {
+        return atom == JeffJSAtomID.JS_ATOM_name.rawValue
+            || atom == JeffJSAtomID.JS_ATOM_length.rawValue
+    }
+
+    /// Materialise any deferred own property of `jsObj` that `atom` names.
+    @inline(__always)
+    func jeffJS_materializeLazyProps(_ jsObj: JeffJSObject, _ atom: UInt32) {
         if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
             materializeFunctionPrototype(jsObj)
         }
-        let (_, prop) = jeffJS_findOwnProperty(obj: jsObj, atom: atom)
-        return prop
+        if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) {
+            materializeFunctionNameLength(jsObj)
+        }
     }
 
     // MARK: - Exception Handling
@@ -3739,6 +3762,8 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 return self.throwTypeError(message: "Reflect.ownKeys: target must be an object")
             }
             guard let targetObj = args[0].toObject() else { return .exception }
+            if targetObj.needsLazyNameLength { self.materializeFunctionNameLength(targetObj) }
+            if targetObj.needsLazyPrototype { self.materializeFunctionPrototype(targetObj) }
             var intKeys: [(UInt32, JeffJSValue)] = []
             var stringKeys: [JeffJSValue] = []
             var symbolKeys: [JeffJSValue] = []
@@ -4079,6 +4104,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
             materializeFunctionPrototype(jsObj)
         }
+        if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) {
+            materializeFunctionNameLength(jsObj)
+        }
 
         // Check own properties via shape-based lookup (index form avoids
         // copying JeffJSProperty enums across the call boundary).
@@ -4170,6 +4198,25 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 _ = throwTypeError(message: "cannot set property '\(propName)' of \(desc)")
             }
             return -1
+        }
+
+        // Deferred own properties.
+        if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
+            // `F.prototype = x` replaces the default `{ constructor: F }`
+            // object outright, so don't build it first: that pair's
+            // `constructor` slot deliberately holds an uncounted reference to
+            // F (it is how the cycle is broken), and releasing the discarded
+            // prototype would then over-release F. Define the property
+            // directly with the attributes the default would have had.
+            jsObj.needsLazyPrototype = false
+            let r = definePropertyValue(obj: obj, atom: atom, value: value,
+                                        flags: JS_PROP_WRITABLE)
+            value.freeValue()   // setPropertyInternal consumes; defineProperty dups
+            return r
+        }
+        // `name`/`length` are non-writable: the assignment has to see them.
+        if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) {
+            materializeFunctionNameLength(jsObj)
         }
 
         // Proxy intercept: if this object is a proxy, dispatch to handler.set trap
@@ -4991,12 +5038,13 @@ extension JeffJSContext {
     // -- Iterator helpers --
 
     func createArrayIterator(obj: JeffJSValue, kind: Int) -> JeffJSValue {
-        let iter = newObject()
         // %ArrayIteratorPrototype% carries @@toStringTag ("Array Iterator") and
         // the %IteratorPrototype% helpers; without it the ad-hoc iterator object
         // inherits from Object.prototype and reports "[object Object]".
+        // Created with the prototype in place — re-prototyping afterwards cost
+        // a shape rebuild on every `[...arr]`.
         let aiProto = classProto[JSClassID.JS_CLASS_ARRAY_ITERATOR.rawValue]
-        if aiProto.isObject { _ = setPrototypeOf(obj: iter, proto: aiProto) }
+        let iter = aiProto.isObject ? newObjectProto(proto: aiProto) : newObject()
         _ = setPropertyStr(obj: iter, name: "_target", value: obj)
         _ = setPropertyStr(obj: iter, name: "_index", value: .newInt32(0))
         _ = setPropertyStr(obj: iter, name: "_kind", value: .newInt32(Int32(kind)))

@@ -166,6 +166,10 @@ final class JeffJSParser {
     // -- Current function definition (bytecode target) --
     var fd: JeffJSFunctionDefCompiler
 
+    /// See emitFClosure / emitNamedEvaluation: bytecode offset just past the
+    /// most recently emitted anonymous closure, or -1.
+    var lastAnonClosureEnd: Int = -1
+
     // -- Block environment stack (for break/continue) --
     var blockEnvs: [JeffJSBlockEnv] = []
     var curBlockEnvIdx: Int = -1
@@ -837,9 +841,24 @@ final class JeffJSParser {
     }
 
     /// Emit an fclosure opcode referencing a child function in the cpool.
-    func emitFClosure(_ cpoolIdx: Int) {
+    /// Bytecode offset just past the most recently emitted *anonymous*
+    /// closure, or -1. Used for NamedEvaluation (ES §8.4.5): `var f = function
+    /// () {}` and `const g = () => {}` name the function after the binding.
+    /// A plain positional check is enough — the closure op is the last thing
+    /// the initializer emitted when the initializer *is* the function.
+    func emitFClosure(_ cpoolIdx: Int, anonymous: Bool = false) {
         emitOp(.fclosure)
         emitU32(UInt32(cpoolIdx))
+        lastAnonClosureEnd = anonymous ? fd.byteCode.len : -1
+    }
+
+    /// If the expression just parsed was exactly an anonymous closure, give it
+    /// `atom` as its `name`.
+    func emitNamedEvaluation(_ atom: JSAtom) {
+        guard atom != 0, lastAnonClosureEnd == fd.byteCode.len else { return }
+        emitOp(.set_name)
+        emitAtom(atom)
+        lastAnonClosureEnd = -1
     }
 
     /// Emit a call opcode.
@@ -2613,6 +2632,7 @@ final class JeffJSParser {
             if tok == 0x3D { // '='
                 next() // consume '='
                 parseAssignExpr()
+                emitNamedEvaluation(varName)
                 emitOp(.put_var_init)
                 emitAtom(varName)
             }
@@ -2623,6 +2643,7 @@ final class JeffJSParser {
             if tok == 0x3D { // '='
                 next() // consume '='
                 parseAssignExpr()
+                emitNamedEvaluation(varName)
 
                 if isLexical {
                     emitOp(.put_loc_check_init)
@@ -2754,7 +2775,7 @@ final class JeffJSParser {
 
         // Emit closure creation in parent
         let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
-        emitFClosure(cpoolIdx)
+        emitFClosure(cpoolIdx, anonymous: funcName == 0)
 
         if !isExpression && funcName != 0 {
             if fd.parent == nil {
@@ -2906,6 +2927,9 @@ final class JeffJSParser {
         }
 
         childFd.argCount = paramCount
+        // `length` counts parameters up to (not including) the first one with
+        // a default; the rest parameter already broke out of the loop above.
+        childFd.functionLength = savedDefaults.first?.argIndex ?? paramCount
         return (savedDefaults, restParam, savedDestructs)
     }
 
@@ -3958,7 +3982,7 @@ final class JeffJSParser {
                     parseArrowFunctionBody(childFd: arrowFd, isAsync: false,
                                            defaults: adflts, rest: arst, destructs: adstructs)
                     let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
-                    emitFClosure(cpoolIdx)
+                    emitFClosure(cpoolIdx, anonymous: true)
                 } else {
                     let (dflts, rst) = consumeParenArrowParams(params)
                     emitArrowFunction(paramAtoms: params.map { $0.atom }, isAsync: false,
@@ -5038,12 +5062,13 @@ final class JeffJSParser {
             childFd.args.append(arg)
         }
         childFd.argCount = paramAtoms.count
+        childFd.functionLength = defaults.first?.argIndex ?? paramAtoms.count
 
         fd.childFunctions.append(childFd)
         parseArrowFunctionBody(childFd: childFd, isAsync: isAsync,
                                defaults: defaults, rest: rest)
         let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
-        emitFClosure(cpoolIdx)
+        emitFClosure(cpoolIdx, anonymous: true)   // arrows are always anonymous
     }
 
     /// Scan ahead from '(' to determine if this is a parenthesized arrow:
@@ -5573,7 +5598,7 @@ final class JeffJSParser {
                     parseArrowFunctionBody(childFd: arrowFd, isAsync: false,
                                            defaults: adflts, rest: arst, destructs: adstructs)
                     let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
-                    emitFClosure(cpoolIdx)
+                    emitFClosure(cpoolIdx, anonymous: true)
                 } else {
                     let (dflts, rst) = consumeParenArrowParams(params)
                     emitArrowFunction(paramAtoms: params.map { $0.atom }, isAsync: false,

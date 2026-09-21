@@ -1061,13 +1061,10 @@ extension JeffJSTestRunner {
             apply(x => x * 2, 21)
             """, expectInt: 42)
 
-        // Function.length -- bytecode functions do not yet set .length property
-        // (only C functions do). Expect 0 until createClosure is updated.
-        evalCheck(ctx, "function f(a, b, c) {} f.length", expectInt: 0)
-
-        // Function.name -- bytecode functions do not yet set .name property
-        // (only C functions do). Expect undefined until createClosure is updated.
-        evalCheckUndefined(ctx, "function myFunc() {} myFunc.name")
+        // Function.length / .name on bytecode functions (materialised lazily
+        // on first own-property access).
+        evalCheck(ctx, "function f(a, b, c) {} f.length", expectInt: 3)
+        evalCheckStr(ctx, "function myFunc() {} myFunc.name", expect: "myFunc")
 
         // Function.bind
         evalCheck(ctx, """
@@ -10628,6 +10625,56 @@ extension JeffJSTestRunner {
             var d = Object.getOwnPropertyDescriptor(Fx.prototype, 'constructor');
             d.enumerable === false && d.writable === true && d.configurable === true &&
             Object.keys(Fx.prototype).length === 0
+        """, expect: true)
+
+        // --- 6. Lazy function name / length -------------------------------
+        evalCheckStr(ctx, "function foo6(a, b) {} foo6.name + ',' + foo6.length", expect: "foo6,2")
+        evalCheckStr(ctx, "const bar6 = (a) => a; bar6.name + ',' + bar6.length", expect: "bar6,1")
+        evalCheckStr(ctx, "var fe6 = function (x) {}; fe6.name", expect: "fe6")
+        evalCheckStr(ctx, "var named6 = function inner6(x) {}; named6.name", expect: "inner6")
+        evalCheckStr(ctx, "class C6 { m6(a, b, c) {} } C6.name + ',' + C6.prototype.m6.name", expect: "C6,m6")
+        evalCheckStr(ctx, "({ meth6(a) {} }).meth6.name", expect: "meth6")
+        evalCheckStr(ctx, "(function () {}).name", expect: "")
+        // `length` stops at the first default and excludes the rest parameter.
+        evalCheckStr(ctx, """
+            function d6(a, b = 1, c) {} function r6(a, ...rest) {} function* g6(a) {}
+            [d6.length, r6.length, g6.length, (async function (a, b) {}).length].join()
+        """, expect: "1,1,1,2")
+        // Bound functions.
+        evalCheckStr(ctx, """
+            function bf6(a, b) {}
+            var b1 = bf6.bind(null), b2 = bf6.bind(null, 1);
+            [b1.name, b1.length, b2.name, b2.length].join()
+        """, expect: "bound bf6,2,bound bf6,1")
+        // Attributes and enumeration order.
+        evalCheckBool(ctx, """
+            function at6(a) {}
+            var dn = Object.getOwnPropertyDescriptor(at6, 'name');
+            var dl = Object.getOwnPropertyDescriptor(at6, 'length');
+            dn.value === 'at6' && dn.writable === false && dn.enumerable === false &&
+            dn.configurable === true &&
+            dl.value === 1 && dl.writable === false && dl.enumerable === false &&
+            dl.configurable === true &&
+            Object.getOwnPropertyNames(at6).join() === 'length,name,prototype' &&
+            Object.keys(at6).length === 0 && ('name' in at6) && ('length' in at6)
+        """, expect: true)
+        // The lazy properties can still be redefined, deleted and shadowed.
+        evalCheckBool(ctx, """
+            function rd6() {}
+            Object.defineProperty(rd6, 'name', { value: 'renamed' });
+            if (rd6.name !== 'renamed') return false;
+            function del6() {}
+            delete del6.name;
+            return rd6.name === 'renamed' && del6.name === undefined &&
+                   Object.getOwnPropertyNames(del6).indexOf('name') < 0;
+        """, expect: true)
+        // Assigning F.prototype keeps it non-enumerable and constructible.
+        evalCheckBool(ctx, """
+            var Base6 = function (x) { this.x = x; };
+            var Der6 = function (x, y) { Base6.call(this, x); this.y = y; };
+            Der6.prototype = Object.create(Base6.prototype);
+            var d = new Der6(1, 2);
+            d.x === 1 && d.y === 2 && d instanceof Base6 && Object.keys(Der6).length === 0
         """, expect: true)
     }
 

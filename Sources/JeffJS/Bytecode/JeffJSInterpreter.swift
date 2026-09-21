@@ -786,8 +786,38 @@ extension JeffJSContext {
             obj.needsLazyPrototype = true
             obj.isConstructor = true
         }
+        // `name` and `length` are likewise deferred: two flag stores instead of
+        // two property defines + two shape transitions per closure.
+        obj.needsLazyNameLength = true
 
         return funcVal
+    }
+
+    /// Materialize the `name` and `length` own properties of a bytecode
+    /// function on first own-property access. Both are
+    /// { writable: false, enumerable: false, configurable: true }.
+    /// Self-guarding: a property already defined in the meantime (an explicit
+    /// `set_name`, `Object.defineProperty`) is left untouched.
+    func materializeFunctionNameLength(_ funcObj: JeffJSObject) {
+        funcObj.needsLazyNameLength = false
+        guard let fb = funcObj.fbFast else { return }
+        // Borrowed receiver: nothing here stores a reference to the function
+        // itself (only two fresh primitives), so it must NOT be released.
+        let funcVal = JeffJSValue.mkPtr(tag: .object, ptr: funcObj)
+        if jeffJS_findOwnPropertyIndex(obj: funcObj,
+                                       atom: JeffJSAtomID.JS_ATOM_length.rawValue) < 0 {
+            _ = definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
+                                    value: .newInt32(Int32(fb.definedArgCount)),
+                                    flags: JS_PROP_CONFIGURABLE)
+        }
+        if jeffJS_findOwnPropertyIndex(obj: funcObj,
+                                       atom: JeffJSAtomID.JS_ATOM_name.rawValue) < 0 {
+            // An anonymous function's name is "" (not undefined).
+            let nameVal = fb.nameAtom != 0 ? atomToString(fb.nameAtom) : newString("")
+            _ = definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
+                                    value: nameVal, flags: JS_PROP_CONFIGURABLE)
+            nameVal.freeValue()
+        }
     }
 
     /// Materialize the default `F.prototype = { constructor: F }` pair for a
@@ -1492,16 +1522,19 @@ extension JeffJSContext {
         let nameValue = atomToString(atom)
         if nameValue.isUndefined { return }
         // Function "name": non-writable, non-enumerable, configurable.
+        // Defining it here wins over the lazy name (materialize self-guards).
         _ = definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
                                 value: nameValue, flags: JS_PROP_CONFIGURABLE)
+        nameValue.freeValue()
     }
 
     /// Sets the .name property on a function from a computed key.
     func setFunctionNameComputed(_ funcVal: JeffJSValue, key: JeffJSValue) {
         if key.isString, let str = key.stringValue {
+            let nv = newString(str.toSwiftString())
             _ = definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
-                                    value: newString(str.toSwiftString()),
-                                    flags: JS_PROP_CONFIGURABLE)
+                                    value: nv, flags: JS_PROP_CONFIGURABLE)
+            nv.freeValue()
         }
     }
 
@@ -1711,11 +1744,12 @@ extension JeffJSContext {
         }
 
         // C.prototype: non-writable, non-enumerable, non-configurable (ES §15.7.14).
+        // definePropertyValue dups the value, so no explicit dup here.
         _ = definePropertyValue(obj: ctor, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
-                                value: proto.dupValue(), flags: 0)
+                                value: proto, flags: 0)
         // C.prototype.constructor: writable + configurable, NOT enumerable.
         _ = definePropertyValue(obj: proto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
-                                value: ctor.dupValue(),
+                                value: ctor,
                                 flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
         // Set the constructor's name
         if atom != 0 {

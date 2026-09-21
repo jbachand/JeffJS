@@ -250,7 +250,14 @@ class JeffJSFunctionBytecode {
     var colNum: Int = 0
     var argCount: UInt16 = 0
     var varCount: UInt16 = 0
+    /// The value of the function's `length` own property: the number of
+    /// formal parameters before the first one with a default, and excluding
+    /// the rest parameter (ES §20.2.4.1).
     var definedArgCount: UInt16 = 0
+    /// Atom of the function's `name` own property (0 = anonymous).
+    /// On the base class so the lazy materialiser needs no downcast and so a
+    /// bytecode-cache round trip can restore it.
+    var nameAtom: UInt32 = 0
     var stackSize: UInt16 = 0
     var closureVarCount: UInt16 = 0
     /// Enter the fast trace at function entry (not only at loop back-edges).
@@ -1251,6 +1258,12 @@ final class JeffJSObject: JeffJSGCObjectHeader {
     // (an object + shape + two property defines per closure) until the first
     // read of `.prototype`. Mirrors QuickJS's JS_PROP_AUTOINIT.
     var needsLazyPrototype: Bool = false
+    /// `name` and `length` on a bytecode function are materialised on first
+    /// own-property access (see JeffJSContext.materializeFunctionNameLength).
+    /// Defining them eagerly cost two property slots + two shape transitions
+    /// on every closure creation, and almost no closure is ever asked for
+    /// its name.
+    var needsLazyNameLength: Bool = false
 
     // -- Associated storage (moved from objc_setAssociatedObject) ----------
     var storedProto: JeffJSObject? = nil

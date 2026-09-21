@@ -16,7 +16,7 @@ import Foundation
 /// Magic bytes: "JFBC" (JeffJS Function ByteCode)
 private let JFBC_MAGIC: UInt32 = 0x4A46_4243
 /// Version 2: adds atom table for cross-runtime portability
-private let JFBC_VERSION: UInt8 = 3   // 3: closure var descriptors, selfRefVarIdx, strict/debug flags
+private let JFBC_VERSION: UInt8 = 4   // 4: function nameAtom (lazy `name` own property)
 
 /// Constant pool entry tags
 private let CPOOL_UNDEFINED: UInt8 = 0
@@ -269,6 +269,8 @@ struct JeffJSBytecodeSerializer {
         writeU16(fb.argCount)
         writeU16(fb.varCount)
         writeU16(fb.definedArgCount)
+        // Function `name` atom, as an atom-table index (remapped on read).
+        writeU32((rt != nil) ? atomTable.intern(fb.nameAtom, rt: rt!) : fb.nameAtom)
         writeU16(fb.stackSize)
         writeU16(fb.closureVarCount)
         writeU32(UInt32(fb.lineNum))
@@ -443,8 +445,9 @@ struct JeffJSBytecodeDeserializer {
     /// Skip past a serialized function bytecode (for finding atom table).
     private func skipFunctionBytecode(data: [UInt8], pos: inout Int) -> Bool {
         // Magic(4) + Version(1) + Flags(2) + argCount(2) + varCount(2) +
-        // definedArgCount(2) + stackSize(2) + closureVarCount(2) + lineNum(4) + colNum(4)
-        let headerSize = 4 + 1 + 2 + 2 + 2 + 2 + 2 + 2 + 4 + 4
+        // definedArgCount(2) + nameAtom(4) + stackSize(2) + closureVarCount(2) +
+        // lineNum(4) + colNum(4)
+        let headerSize = 4 + 1 + 2 + 2 + 2 + 2 + 4 + 2 + 2 + 4 + 4
         guard pos + headerSize <= data.count else { return false }
         pos += headerSize
 
@@ -558,11 +561,12 @@ struct JeffJSBytecodeDeserializer {
     private mutating func readFunctionBytecode() -> JeffJSFunctionBytecode? {
         // Header
         guard let magic = readU32(), magic == JFBC_MAGIC else { return nil }
-        guard let version = readU8(), version == 3 else { return nil }   // older layouts lack closure descriptors
+        guard let version = readU8(), version == 4 else { return nil }   // older layouts lack the function nameAtom
         guard let flags = readU16() else { return nil }
         guard let argCount = readU16() else { return nil }
         guard let varCount = readU16() else { return nil }
         guard let definedArgCount = readU16() else { return nil }
+        guard let nameRef = readU32() else { return nil }
         guard let stackSize = readU16() else { return nil }
         guard let closureVarCount = readU16() else { return nil }
         guard let lineNum = readU32() else { return nil }
@@ -624,6 +628,11 @@ struct JeffJSBytecodeDeserializer {
         fb.argCount = argCount
         fb.varCount = varCount
         fb.definedArgCount = definedArgCount
+        if let remapper, Int(nameRef) < remapper.indexToAtom.count {
+            fb.nameAtom = remapper.indexToAtom[Int(nameRef)]
+        } else {
+            fb.nameAtom = nameRef
+        }
         fb.stackSize = stackSize
         fb.closureVarCount = closureVarCount
         fb.lineNum = Int(lineNum)

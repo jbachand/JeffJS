@@ -139,6 +139,8 @@ class JeffJSFunctionDefCompiler {
     var args: [JeffJSVarDef] = []      // parameters
     var closureVar: [JeffJSClosureVar] = []
     var argCount: Int = 0
+    /// Value of the function's `length`: parameters before the first default.
+    var functionLength: Int = 0
     var varCount: Int { return vars.count }
 
     // -- Scopes --
@@ -3394,9 +3396,13 @@ struct JeffJSCompiler {
 
         // Function metadata
         fb.funcNameAtom = fd.funcName
+        fb.nameAtom = fd.funcName
         fb.argCount = UInt16(fd.argCount)
         fb.varCount = UInt16(fd.vars.count)
         fb.definedArgCountValue = UInt16(fd.argCount)
+        // `length` stops at the first defaulted parameter (the rest parameter
+        // is already excluded from fd.argCount).
+        fb.definedArgCount = UInt16(fd.functionLength)
         fb.stackSize = UInt16(fd.stackSize)
 
         // Mode and flags
