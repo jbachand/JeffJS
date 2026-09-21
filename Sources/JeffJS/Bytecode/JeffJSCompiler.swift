@@ -237,6 +237,14 @@ class JeffJSFunctionBytecodeCompiled: JeffJSFunctionBytecode {
     var debugPc2lineBuf: [UInt8] = []
     var debugPc2colLen: Int = 0
     var debugPc2colBuf: [UInt8] = []
+    /// Decoded pc->line / pc->column tables, built on first lookup.
+    private var pc2lineTable: [(pc: Int32, value: Int32)]? = nil
+    private var pc2colTable: [(pc: Int32, value: Int32)]? = nil
+    /// Filename / function name as Swift strings, resolved once. `atomToString`
+    /// allocates a fresh String per call, and an Error stack asks for both on
+    /// every frame.
+    var cachedDebugFilename: String? = nil
+    var cachedFuncName: String? = nil
     var debugSourceStr: String?
     var definedArgCountValue: UInt16 = 0
     var varRefCountValue: UInt16 = 0
@@ -244,7 +252,60 @@ class JeffJSFunctionBytecodeCompiled: JeffJSFunctionBytecode {
 
     /// Decode the pc2line buffer to find the source line number for a given PC offset.
     /// Returns the 1-based line number, or 0 if debug info is unavailable.
+    /// Decoded (pc, value) table, built once per buffer. `lineForPC` used to
+    /// re-decode the whole delta stream on every call, which made building an
+    /// Error's stack O(size of the enclosing script): 25 000 `new Error()` in
+    /// a loop spent most of their time re-walking the top-level function's
+    /// pc2line buffer.
+    private static func decodeTable(_ buf: [UInt8], start: Int) -> [(pc: Int32, value: Int32)] {
+        var out: [(pc: Int32, value: Int32)] = []
+        let bufLen = buf.count
+        var pc = 0
+        var value = start
+        var offset = 0
+        while offset < bufLen {
+            let byte = Int(buf[offset])
+            offset += 1
+            if byte == 0 {
+                guard offset < bufLen else { break }
+                let (pcDelta, off1) = getSLEB128(buf, offset)
+                guard off1 < bufLen else { pc += Int(pcDelta); break }
+                let (valDelta, off2) = getSLEB128(buf, off1)
+                guard off2 <= bufLen else { break }
+                offset = off2
+                pc += Int(pcDelta)
+                value += Int(valDelta)
+            } else {
+                let val = byte - PC2LINE_OP_FIRST
+                pc += val / PC2LINE_RANGE
+                value += (val % PC2LINE_RANGE) + PC2LINE_BASE
+            }
+            out.append((Int32(truncatingIfNeeded: pc), Int32(truncatingIfNeeded: value)))
+        }
+        return out
+    }
+
+    /// Last entry whose pc is <= targetPC (binary search).
+    private static func lookup(_ table: [(pc: Int32, value: Int32)], _ targetPC: Int) -> Int {
+        if table.isEmpty { return 0 }
+        let t = Int32(truncatingIfNeeded: targetPC)
+        var lo = 0, hi = table.count - 1, best = -1
+        while lo <= hi {
+            let mid = (lo + hi) / 2
+            if table[mid].pc <= t { best = mid; lo = mid + 1 } else { hi = mid - 1 }
+        }
+        return Int(table[best < 0 ? 0 : best].value)
+    }
+
     func lineForPC(_ targetPC: Int) -> Int {
+        guard debugPc2lineLen > 0, !debugPc2lineBuf.isEmpty else { return 0 }
+        if pc2lineTable == nil {
+            pc2lineTable = JeffJSFunctionBytecodeCompiled.decodeTable(debugPc2lineBuf, start: 1)
+        }
+        return max(1, JeffJSFunctionBytecodeCompiled.lookup(pc2lineTable!, targetPC))
+    }
+
+    private func lineForPCSlow(_ targetPC: Int) -> Int {
         guard debugPc2lineLen > 0, !debugPc2lineBuf.isEmpty else { return 0 }
         let bufLen = debugPc2lineBuf.count
         var pc = 0
@@ -284,6 +345,14 @@ class JeffJSFunctionBytecodeCompiled: JeffJSFunctionBytecode {
     /// Decode the pc2col buffer to find the source column number for a given PC offset.
     /// Returns the 1-based column number, or 0 if debug info is unavailable.
     func colForPC(_ targetPC: Int) -> Int {
+        guard debugPc2colLen > 0, !debugPc2colBuf.isEmpty else { return 0 }
+        if pc2colTable == nil {
+            pc2colTable = JeffJSFunctionBytecodeCompiled.decodeTable(debugPc2colBuf, start: 1)
+        }
+        return max(1, JeffJSFunctionBytecodeCompiled.lookup(pc2colTable!, targetPC))
+    }
+
+    private func colForPCSlow(_ targetPC: Int) -> Int {
         guard debugPc2colLen > 0, !debugPc2colBuf.isEmpty else { return 0 }
         let bufLen = debugPc2colBuf.count
         var pc = 0

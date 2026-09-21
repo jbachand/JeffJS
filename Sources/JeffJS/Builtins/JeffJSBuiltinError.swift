@@ -410,16 +410,7 @@ struct JeffJSBuiltinError {
         // The frames come from the interpreter's live activation chain
         // (ctx.currentFrame). `rt.currentStackFrame`, which this used to walk,
         // is never assigned, so every stack was just the header line.
-        let stackStr = ctx.buildStackTrace(errorName: errorName, message: message,
-                                           skipFrames: (flags & JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL) != 0 ? 1 : 0,
-                                           includeSourceSnippet: false)
-
-        jeffJS_addProperty(ctx: ctx, obj: errObj,
-                           atom: JeffJSAtomID.JS_ATOM_stack.rawValue,
-                           flags: [.writable, .configurable])
-        errObj.setOwnPropertyValue(
-            atom: JeffJSAtomID.JS_ATOM_stack.rawValue,
-            value: JeffJSValue.makeString(JeffJSString(swiftString: stackStr)))
+        ctx.attachPendingStack(obj, errorName: errorName, message: message)
     }
 
     // MARK: - Error.isError (ES2024 proposal)

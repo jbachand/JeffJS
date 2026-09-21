@@ -152,7 +152,7 @@ extension JeffJSContext {
         defer { if ownedAtom { rt.freeAtom(atom) } }
         // A function's deferred own properties must exist before they can be
         // described.
-        jeffJS_materializeLazyProps(jsObj, atom)
+        if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
 
         // Fast-array elements are not shape properties: they are always
         // { writable: true, enumerable: true, configurable: true }.

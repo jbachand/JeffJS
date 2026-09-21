@@ -1035,6 +1035,9 @@ enum JeffJSObjectPayload {
 
     case objectData(JeffJSValue)
 
+    /// An Error's captured call site, formatted into `stack` on first read.
+    case pendingErrorStack(JeffJSPendingStack)
+
     case boundFunction(JeffJSBoundFunction)
 
     case forInIterator(JeffJSForInIterator)
@@ -1257,13 +1260,60 @@ final class JeffJSObject: JeffJSGCObjectHeader {
     // Plain function closures defer building `F.prototype = { constructor: F }`
     // (an object + shape + two property defines per closure) until the first
     // read of `.prototype`. Mirrors QuickJS's JS_PROP_AUTOINIT.
-    var needsLazyPrototype: Bool = false
+    /// Which own properties of this object are deferred. Kept as one bitmask
+    /// so the property-lookup fast path tests a single byte instead of three
+    /// separate fields (`lazyFlags != 0`).
+    ///   bit 0: `prototype` (plain function)
+    ///   bit 1: `name` + `length` (bytecode function)
+    ///   bit 2: `stack` (Error)
+    var lazyFlags: UInt8 = 0
+    @inline(__always) static let lazyPrototypeBit: UInt8 = 1
+    @inline(__always) static let lazyNameLengthBit: UInt8 = 2
+    @inline(__always) static let lazyStackBit: UInt8 = 4
+
+    var needsLazyPrototype: Bool {
+        @inline(__always) get { (lazyFlags & JeffJSObject.lazyPrototypeBit) != 0 }
+        @inline(__always) set {
+            if newValue { lazyFlags |= JeffJSObject.lazyPrototypeBit }
+            else { lazyFlags &= ~JeffJSObject.lazyPrototypeBit }
+        }
+    }
     /// `name` and `length` on a bytecode function are materialised on first
     /// own-property access (see JeffJSContext.materializeFunctionNameLength).
     /// Defining them eagerly cost two property slots + two shape transitions
     /// on every closure creation, and almost no closure is ever asked for
     /// its name.
-    var needsLazyNameLength: Bool = false
+    var needsLazyNameLength: Bool {
+        @inline(__always) get { (lazyFlags & JeffJSObject.lazyNameLengthBit) != 0 }
+        @inline(__always) set {
+            if newValue { lazyFlags |= JeffJSObject.lazyNameLengthBit }
+            else { lazyFlags &= ~JeffJSObject.lazyNameLengthBit }
+        }
+    }
+    /// Captured call site of an Error, formatted into `stack` on first read.
+    /// Formatting eagerly cost ~2.3 us per `new Error()` (25 000 of them in
+    /// bench/realworld.js `try-catch-throw`), and almost no thrown error ever
+    /// has its `stack` looked at.
+    /// The captured frames live in `payload` (an Error object has no other use
+    /// for it), so JeffJSObject does not grow a field for them — an extra
+    /// pointer on *every* object cost ~5% on object allocation.
+    var pendingStack: JeffJSPendingStack? {
+        @inline(__always) get {
+            if case .pendingErrorStack(let p) = payload { return p }
+            return nil
+        }
+    }
+
+    @inline(__always)
+    func setPendingStack(_ p: JeffJSPendingStack?) {
+        if let p = p {
+            payload = .pendingErrorStack(p)
+            lazyFlags |= JeffJSObject.lazyStackBit
+        } else {
+            if case .pendingErrorStack = payload { payload = .opaque(nil) }
+            lazyFlags &= ~JeffJSObject.lazyStackBit
+        }
+    }
 
     // -- Associated storage (moved from objc_setAssociatedObject) ----------
     var storedProto: JeffJSObject? = nil
@@ -2079,5 +2129,25 @@ struct JeffJSObj {
     /// Convert to JeffJSValue (NaN-boxed). Zero-cost — just combines tag + pointer.
     @inline(__always) var asValue: JeffJSValue {
         JeffJSValue(bits: JeffJSValue._objectTag | UInt64(UInt(bitPattern: _ptr)))
+    }
+}
+
+
+// MARK: - Deferred Error stack
+
+/// The frames captured when an Error was constructed. `JeffJSContext`
+/// turns this into the `stack` string the first time the property is read
+/// (see materializeErrorStack).
+final class JeffJSPendingStack {
+    let errorName: String
+    let message: String
+    /// (function bytecode, pc) per frame, innermost first.
+    var frames: [(fb: JeffJSFunctionBytecode, pc: Int)]
+
+    init(errorName: String, message: String,
+         frames: [(fb: JeffJSFunctionBytecode, pc: Int)]) {
+        self.errorName = errorName
+        self.message = message
+        self.frames = frames
     }
 }

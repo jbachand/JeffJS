@@ -925,7 +925,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         guard let jsObj = obj.toObject() else { return -1 }
         // A deferred own property must exist before it can be redefined,
         // otherwise the materialiser would later overwrite the new descriptor.
-        jeffJS_materializeLazyProps(jsObj, atom)
+        if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
 
         // Check extensibility
         if !jsObj.extensible {
@@ -1043,7 +1043,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// - Returns: True on success, false on error or non-configurable.
     func deleteProperty(obj: JeffJSValue, atom: UInt32, flags: Int = 0) -> Bool {
         guard let jsObj = obj.toObject() else { return false }
-        jeffJS_materializeLazyProps(jsObj, atom)
+        if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
         // `delete a[i]` on a fast array punches a hole in the element storage
         // (length is unchanged, `i in a` becomes false) — the element is not a
         // shape property, so the code below would silently do nothing.
@@ -1159,12 +1159,11 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             }
         }
 
-        // Lazily created function own properties count as present
-        if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
-            return true
-        }
-        if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) {
-            return true
+        // Lazily created own properties count as present
+        if jsObj.lazyFlags != 0 {
+            if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue { return true }
+            if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) { return true }
+            if jsObj.pendingStack != nil, atom == JeffJSAtomID.JS_ATOM_stack.rawValue { return true }
         }
 
         // Check own properties via the shape hash table
@@ -1196,7 +1195,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// - Returns: The property descriptor, or nil if not found.
     func getOwnProperty(obj: JeffJSValue, atom: UInt32) -> JeffJSProperty? {
         guard let jsObj = obj.toObject() else { return nil }
-        jeffJS_materializeLazyProps(jsObj, atom)
+        if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
         let (_, prop) = jeffJS_findOwnProperty(obj: jsObj, atom: atom)
         return prop
     }
@@ -1216,6 +1215,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         }
         if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) {
             materializeFunctionNameLength(jsObj)
+        }
+        if jsObj.pendingStack != nil, atom == JeffJSAtomID.JS_ATOM_stack.rawValue {
+            materializeErrorStack(jsObj)
         }
     }
 
@@ -2775,10 +2777,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 _ = self.setPropertyStr(obj: errObj, name: "message", value: self.newStringValue(msgStr))
             }
             // `stack` carries the call site: header + one "at fn (file:line:col)"
-            // line per live interpreter frame. It used to be just the header.
-            let stackStr = self.buildStackTrace(errorName: "Error", message: msgStr,
-                                                includeSourceSnippet: false)
-            _ = self.setPropertyStr(obj: errObj, name: "stack", value: self.newStringValue(stackStr))
+            // line per live interpreter frame. The frames are captured now and
+            // the string is built on first read.
+            self.attachPendingStack(errObj, errorName: "Error", message: msgStr)
             return errObj
         }, name: "Error", length: 1)
         // Set Error.prototype on constructor and Error.prototype.constructor = Error
@@ -2823,9 +2824,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                     msgStr = self.toSwiftString(args[0]) ?? ""
                     _ = self.setPropertyStr(obj: errObj, name: "message", value: self.newStringValue(msgStr))
                 }
-                let stackStr = self.buildStackTrace(errorName: capturedName, message: msgStr,
-                                                    includeSourceSnippet: false)
-                _ = self.setPropertyStr(obj: errObj, name: "stack", value: self.newStringValue(stackStr))
+                self.attachPendingStack(errObj, errorName: capturedName, message: msgStr)
                 return errObj
             }, name: name, length: 1)
             // Set NativeError.prototype on constructor and NativeError.prototype.constructor = NativeError
@@ -4104,12 +4103,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // Lazily materialize `F.prototype = { constructor: F }` for plain
         // function closures (creation deferred at closure time — most
         // closures never have their prototype read).
-        if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
-            materializeFunctionPrototype(jsObj)
-        }
-        if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) {
-            materializeFunctionNameLength(jsObj)
-        }
+        if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
 
         // Check own properties via shape-based lookup (index form avoids
         // copying JeffJSProperty enums across the call boundary).
@@ -4208,6 +4202,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         }
 
         // Deferred own properties.
+        if jsObj.lazyFlags != 0 {
         if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
             // `F.prototype = x` replaces the default `{ constructor: F }`
             // object outright, so don't build it first: that pair's
@@ -4224,6 +4219,11 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // `name`/`length` are non-writable: the assignment has to see them.
         if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) {
             materializeFunctionNameLength(jsObj)
+        }
+        // An assignment to `stack` replaces the captured one outright.
+        if jsObj.pendingStack != nil, atom == JeffJSAtomID.JS_ATOM_stack.rawValue {
+            jsObj.setPendingStack(nil)
+        }
         }
 
         // Proxy intercept: if this object is a proxy, dispatch to handler.set trap
@@ -4413,6 +4413,79 @@ public final class JeffJSContext: JeffJSTokenizerContext {
 
     /// Creates and throws an error of the given type.
     /// Build a stack trace string by walking the call frame chain.
+    /// Snapshot the live activation chain: (function bytecode, pc) per frame.
+    /// This is all `stack` needs, and it costs one small array instead of
+    /// formatting a multi-line string on every `new Error()`.
+    func captureStackFrames(maxDepth: Int = 16) -> [(fb: JeffJSFunctionBytecode, pc: Int)] {
+        var out: [(fb: JeffJSFunctionBytecode, pc: Int)] = []
+        out.reserveCapacity(8)
+        var frame = currentFrame
+        while let f = frame, out.count < maxDepth {
+            if let obj = f.curFunc.toObject(),
+               case .bytecodeFunc(let fbOpt, _, _) = obj.payload,
+               let fb = fbOpt {
+                out.append((fb, f.curPC))
+            }
+            frame = f.prevFrame
+        }
+        return out
+    }
+
+    /// Attach the deferred `stack` of an error object: the frames are captured
+    /// now, the string is built on first read.
+    func attachPendingStack(_ errObj: JeffJSValue, errorName: String, message: String) {
+        guard let jsObj = errObj.toObject() else { return }
+        jsObj.setPendingStack(JeffJSPendingStack(errorName: errorName, message: message,
+                                                 frames: captureStackFrames()))
+    }
+
+    /// Format and install the deferred `stack` property.
+    func materializeErrorStack(_ jsObj: JeffJSObject) {
+        guard let pending = jsObj.pendingStack else { return }
+        jsObj.setPendingStack(nil)
+        let str = formatStackTrace(errorName: pending.errorName, message: pending.message,
+                                   frames: pending.frames)
+        let errVal = JeffJSValue.mkPtr(tag: .object, ptr: jsObj)
+        _ = definePropertyValue(obj: errVal, atom: JeffJSAtomID.JS_ATOM_stack.rawValue,
+                                value: newStringValue(str),
+                                flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+    }
+
+    /// Render captured frames as "Name: message" + one "    at fn (file:line:col)"
+    /// line per frame.
+    func formatStackTrace(errorName: String, message: String,
+                          frames: [(fb: JeffJSFunctionBytecode, pc: Int)]) -> String {
+        var lines: [String] = [message.isEmpty ? errorName : "\(errorName): \(message)"]
+        for (fbBase, rawPC) in frames {
+            guard let fb = fbBase as? JeffJSFunctionBytecodeCompiled else { continue }
+            let pc = fb.bytecodeLen > 0 ? max(0, min(rawPC, fb.bytecodeLen - 1)) : 0
+            var lineNum = fb.debugPc2lineBuf.isEmpty ? 0 : fb.lineForPC(pc)
+            var colNum = fb.debugPc2colBuf.isEmpty ? 0 : fb.colForPC(pc)
+            if lineNum <= 0 { lineNum = fb.lineNum }
+            if colNum <= 0 { colNum = fb.colNum }
+            let filename: String
+            if let c = fb.cachedDebugFilename { filename = c }
+            else {
+                filename = fb.debugFilenameAtom != 0
+                    ? (rt.atomToString(fb.debugFilenameAtom) ?? "<unknown>")
+                    : (fb.fileName?.toSwiftString() ?? "<anonymous>")
+                fb.cachedDebugFilename = filename
+            }
+            let funcName: String
+            if let c = fb.cachedFuncName { funcName = c }
+            else {
+                funcName = fb.funcNameAtom != 0 ? (rt.atomToString(fb.funcNameAtom) ?? "") : ""
+                fb.cachedFuncName = funcName
+            }
+            let location: String
+            if lineNum > 0 && colNum > 0 { location = "\(filename):\(lineNum):\(colNum)" }
+            else if lineNum > 0 { location = "\(filename):\(lineNum)" }
+            else { location = filename }
+            lines.append("    at \(funcName.isEmpty ? "<anonymous>" : funcName) (\(location))")
+        }
+        return lines.joined(separator: "\n")
+    }
+
     func buildStackTrace(errorName: String, message: String,
                          skipFrames: Int = 0,
                          includeSourceSnippet: Bool = true) -> String {
@@ -4436,12 +4509,20 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 var colNum = fb.debugPc2colBuf.isEmpty ? 0 : fb.colForPC(pc)
                 if lineNum <= 0 { lineNum = fb.lineNum }
                 if colNum <= 0 { colNum = fb.colNum }
-                let filename = fb.debugFilenameAtom != 0
-                    ? (rt.atomToString(fb.debugFilenameAtom) ?? "<unknown>")
-                    : (fb.fileName?.toSwiftString() ?? "<anonymous>")
-                let funcName = fb.funcNameAtom != 0
-                    ? (rt.atomToString(fb.funcNameAtom) ?? "")
-                    : ""
+                let filename: String
+                if let c = fb.cachedDebugFilename { filename = c }
+                else {
+                    filename = fb.debugFilenameAtom != 0
+                        ? (rt.atomToString(fb.debugFilenameAtom) ?? "<unknown>")
+                        : (fb.fileName?.toSwiftString() ?? "<anonymous>")
+                    fb.cachedDebugFilename = filename
+                }
+                let funcName: String
+                if let c = fb.cachedFuncName { funcName = c }
+                else {
+                    funcName = fb.funcNameAtom != 0 ? (rt.atomToString(fb.funcNameAtom) ?? "") : ""
+                    fb.cachedFuncName = funcName
+                }
                 var location: String
                 if lineNum > 0 && colNum > 0 {
                     location = "\(filename):\(lineNum):\(colNum)"
@@ -4479,13 +4560,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
 
         // Set stack property with source location from call frames
         // Guard against re-entrant / deeply nested errors that may corrupt frame state
-        let stackStr: String
-        if let _ = currentFrame {
-            stackStr = buildStackTrace(errorName: nameStr, message: message)
-        } else {
-            stackStr = message.isEmpty ? nameStr : "\(nameStr): \(message)"
-        }
-        _ = setPropertyStr(obj: errObj, name: "stack", value: newStringValue(stackStr))
+        attachPendingStack(errObj, errorName: nameStr, message: message)
 
         // Set prototype to the appropriate NativeError.prototype.
         // Look up the constructor from the global object and get its .prototype
