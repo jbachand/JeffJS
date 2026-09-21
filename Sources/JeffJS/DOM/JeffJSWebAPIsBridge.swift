@@ -5,7 +5,9 @@
 //   - performance          (CFAbsoluteTimeGetCurrent — no JS Date.now overhead)
 //   - crypto.getRandomValues (SecRandomCopyBytes — no interpreted UTF loop)
 //   - TextEncoder/TextDecoder (native Swift UTF-8 — replaces ~70-line JS loop)
+//   - crypto.subtle.digest   (CryptoKit SHA-1/256/384/512 -> Promise<ArrayBuffer>)
 //   - MessageChannel/MessagePort (React scheduler support)
+//   - Intl                   (JeffJSIntlBridge — Foundation-backed ECMA-402)
 //
 // These are registered on the JeffJS context BEFORE polyfill evaluation so that
 // the existing polyfill `if (typeof X === 'undefined')` guards skip the JS
@@ -13,6 +15,7 @@
 
 import Foundation
 import Security
+import CryptoKit
 
 @MainActor
 final class JeffJSWebAPIsBridge {
@@ -25,6 +28,11 @@ final class JeffJSWebAPIsBridge {
 
     /// Helper: `(jsArray) -> Uint8Array`. Created once, reused by TextEncoder.encode.
     private var uint8FromArrayFn: JeffJSValue?
+
+    /// Native ECMA-402 implementation (registered alongside the other Web APIs
+    /// so a host that installs the bridges gets a real `Intl` before its own
+    /// `typeof Intl`-guarded stubs run).
+    private(set) var intlBridge: JeffJSIntlBridge?
 
     init() {
         self.initTimeMS = CFAbsoluteTimeGetCurrent() * 1000
@@ -53,9 +61,15 @@ final class JeffJSWebAPIsBridge {
         registerCrypto(on: ctx, global: global)
         registerTextEncoding(on: ctx, global: global)
         registerMessageChannel(on: ctx, global: global)
+
+        let intl = JeffJSIntlBridge()
+        intl.register(on: ctx)
+        self.intlBridge = intl
     }
 
     func teardown() {
+        intlBridge?.teardown()
+        intlBridge = nil
         uint8FromArrayFn?.freeValue()
         uint8FromArrayFn = nil
         perfMarks.removeAll()
@@ -188,6 +202,126 @@ final class JeffJSWebAPIsBridge {
         }, length: 0)
 
         _ = ctx.setPropertyStr(obj: global, name: "crypto", value: crypto)
+
+        // After crypto is on the global: the JS wrapper below looks it up there.
+        registerSubtleCrypto(on: ctx)
+    }
+
+    // MARK: - crypto.subtle
+
+    /// `crypto.subtle.digest(algorithm, data) -> Promise<ArrayBuffer>` on
+    /// CryptoKit, plus NotSupportedError-rejecting stubs for the rest of the
+    /// SubtleCrypto surface (so callers see a real failure instead of a
+    /// missing-method TypeError).
+    private func registerSubtleCrypto(on ctx: JeffJSContext) {
+        let global = ctx.getGlobalObject()
+        defer { global.freeValue() }
+        let crypto = ctx.getPropertyStr(obj: global, name: "crypto")
+        defer { crypto.freeValue() }
+        guard crypto.isObject else { return }
+
+        // Native synchronous digest; the JS wrapper below turns it into a
+        // Promise and owns the DOMException construction (DOMException is a
+        // polyfill that does not exist yet at bridge-registration time).
+        let digestFn = ctx.newCFunction({ ctx, _, args in
+            guard args.count >= 2 else {
+                return ctx.throwTypeError(message: "digest requires an algorithm and data")
+            }
+            let algorithm = ctx.toSwiftString(args[0])?.uppercased() ?? ""
+            guard let bytes = JeffJSWebAPIsBridge.bufferBytes(args[1]) else {
+                return ctx.throwTypeError(
+                    message: "Argument 2 ('data') is not of type '(ArrayBuffer or ArrayBufferView)'")
+            }
+            let data = Data(bytes)
+            let digest: [UInt8]
+            switch algorithm {
+            case "SHA-1":   digest = Array(Insecure.SHA1.hash(data: data))
+            case "SHA-256": digest = Array(SHA256.hash(data: data))
+            case "SHA-384": digest = Array(SHA384.hash(data: data))
+            case "SHA-512": digest = Array(SHA512.hash(data: data))
+            default:
+                return ctx.throwTypeError(message: "Unrecognized algorithm name")
+            }
+            return JeffJSWebAPIsBridge.newArrayBufferValue(ctx: ctx, bytes: digest)
+        }, name: "__jeffjsDigestSync", length: 2)
+        _ = ctx.setPropertyStr(obj: global, name: "__jeffjsDigestSync", value: digestFn)
+
+        let subtle = ctx.newObject()
+        _ = ctx.setPropertyStr(obj: crypto, name: "subtle", value: subtle)
+
+        let setup = ctx.eval(input: #"""
+            (function () {
+              var g = (typeof globalThis !== 'undefined') ? globalThis : window;
+              var digestSync = g.__jeffjsDigestSync;
+              try { delete g.__jeffjsDigestSync; } catch (e) {}
+              var subtle = g.crypto ? g.crypto.subtle : null;
+              if (!subtle || !digestSync) { return; }
+
+              function domError(message, name) {
+                var e;
+                try { e = new DOMException(message, name); }
+                catch (err) { e = new Error(message); e.name = name; }
+                return e;
+              }
+              var SUPPORTED = { 'SHA-1': 1, 'SHA-256': 1, 'SHA-384': 1, 'SHA-512': 1 };
+              subtle.digest = function digest(algorithm, data) {
+                var name = (typeof algorithm === 'string')
+                  ? algorithm
+                  : (algorithm && algorithm.name !== undefined ? algorithm.name : '');
+                name = String(name).toUpperCase();
+                if (!SUPPORTED[name]) {
+                  return Promise.reject(domError('Unrecognized algorithm name', 'NotSupportedError'));
+                }
+                try { return Promise.resolve(digestSync(name, data)); }
+                catch (e) { return Promise.reject(e); }
+              };
+              var unsupported = ['encrypt', 'decrypt', 'sign', 'verify', 'generateKey',
+                                 'deriveKey', 'deriveBits', 'importKey', 'exportKey',
+                                 'wrapKey', 'unwrapKey'];
+              function reject(method) {
+                return function () {
+                  return Promise.reject(
+                    domError('crypto.subtle.' + method + ' is not supported', 'NotSupportedError'));
+                };
+              }
+              for (var i = 0; i < unsupported.length; i++) {
+                subtle[unsupported[i]] = reject(unsupported[i]);
+              }
+            })();
+        """#, filename: "<native-subtle>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+        setup.freeValue()
+    }
+
+    /// Bytes behind an ArrayBuffer, TypedArray or DataView argument.
+    static func bufferBytes(_ value: JeffJSValue) -> [UInt8]? {
+        guard let obj = value.toObject() else { return nil }
+        if obj.classID == JeffJSClassID.arrayBuffer.rawValue ||
+           obj.classID == JeffJSClassID.sharedArrayBuffer.rawValue {
+            if case .arrayBuffer(let ab) = obj.payload, !ab.detached { return ab.data }
+            return nil
+        }
+        if case .typedArray(let ta) = obj.payload,
+           let bufObj = ta.buffer, case .arrayBuffer(let ab) = bufObj.payload, !ab.detached {
+            let start = max(0, min(ta.byteOffset, ab.data.count))
+            let end = max(start, min(start + ta.byteLength, ab.data.count))
+            return Array(ab.data[start..<end])
+        }
+        return nil
+    }
+
+    /// A real ArrayBuffer object (so `new Uint8Array(result)` works).
+    static func newArrayBufferValue(ctx: JeffJSContext, bytes: [UInt8]) -> JeffJSValue {
+        let ab = JeffJSArrayBuffer(byteLength: bytes.count)
+        ab.data = bytes
+        var proto: JeffJSObject? = nil
+        let abClassID = Int(JSClassID.JS_CLASS_ARRAY_BUFFER.rawValue)
+        if abClassID < ctx.classProto.count, ctx.classProto[abClassID].isObject {
+            proto = ctx.classProto[abClassID].toObject()
+        }
+        let obj = jeffJS_createObject(ctx: ctx, proto: proto,
+                                      classID: UInt16(JeffJSClassID.arrayBuffer.rawValue))
+        obj.payload = JeffJSObjectPayload.arrayBuffer(ab)
+        return .makeObject(obj)
     }
 
     // MARK: - TextEncoder / TextDecoder
