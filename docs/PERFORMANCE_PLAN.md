@@ -722,6 +722,7 @@ object pointer so free/dup traces can be matched). Real-world suite geomean
   release the pre-created `this` when a C or bytecode constructor returns
   its own object.
 
+
 Found, not fixed:
 - **Cycles are never collected during a run.** A self-referencing object
   held only through a `WeakRef` survives 200k further allocations on both
@@ -729,6 +730,7 @@ Found, not fixed:
   Reference counting frees everything acyclic, but React-style trees
   (parent <-> child, instance <-> arrow handler) only go away with the
   runtime. This is pre-existing and the next memory item.
+  *(Fixed in Round 10.)*
 - `Reflect.construct(F, args, newTarget)` ignores `newTarget` (uses
   `callConstructor(_:args:)`, `callConstructor(_:newTarget:args:)` exists)
   and a script mixing it with `Object.create`/`setPrototypeOf` reports two
@@ -736,7 +738,89 @@ Found, not fixed:
 - `EngineTests/testSuspectGroups` traps in `findHashedShapeProto` (shape
   table already torn down) when ErrorHandling runs after
   ES262CriticalSubset — identical on the pre-session commit; the test is
-  the teardown investigation itself.
+  the teardown investigation itself. *(Fixed in Round 10.)*
 - `Object.assign` +6% and `bind-call-apply` +15% from the extra
   release work; `closure-creation` is unchanged once the zombie
   instrumentation is off.
+
+## Round 10 — the cycle collector (memory)
+
+`var o = {}; o.self = o` repeated 200 000 times, a React tree of
+parent <-> child nodes, or an instance and the closure that captured it used
+to survive every collection and only died with the runtime. They are
+collected now.
+
+- **Every JS object is on the GC list**, as quickjs's
+  `JS_NewObjectFromShape` does with `add_gc_object`, and `js_trigger_gc` runs
+  from `JeffJSObject.init` when the accounted heap crosses the threshold.
+  `JS_RunGC` is the full four-phase algorithm: trial decrement, scan (rescue
+  everything reachable from an externally referenced object, iteratively —
+  a recursive rescue blows the stack on a long parent chain), **restore**
+  (quickjs's `gc_scan_incref_child2`: give the unreachable set its counts back
+  so the ordinary free path in phase 3 stays balanced — without it a live
+  object referenced only by a dying one was left one count short and the next
+  free took it), then free. Objects created while the intrinsics are being
+  installed are deliberately *not* tracked: during init `freeValueSlow` lets
+  refcounts fall to zero without freeing, so their counts do not describe
+  reachability, and leaving them off the list makes every property of a
+  prototype or of the global object an uncounted root edge — which is exactly
+  what they are.
+- **The mark set is exactly the counted edges.** Marking an edge that holds no
+  refcount removes a reference nobody added, and the object dies while it is
+  still in use. `obj.proto` and `shape.proto` are ARC strong references that
+  `freeObject`/`freeShape` never release, so they are *not* GC edges (a dead
+  class still collects through the constructor's `prototype` property). The
+  set is: property data values, accessor getter/setter, an arrow's captured
+  `this`, array elements, a typed array's buffer, a suspended generator's
+  saved stack/locals/args/`this`/function, and captured var-refs. *Not*
+  marking a counted edge is always safe — it leaks, it never over-frees.
+- **Detached var-refs are graph nodes.** `var node = {}; node.cb =
+  function () { return node; }` is what every render produces and it is only
+  collectable if the closure -> var-ref -> object chain is an edge. Nothing
+  maintains a var-ref's refcount (closures own them through ARC), so the
+  collector seeds them to zero each run and lets phases 2 and 2b recompute the
+  in-degree. Live var-refs read through their frame, which is a root, so only
+  detached ones are listed (`close_var_refs` does the same).
+- **Two bugs the collector exposed, both older than it.**
+  `materializeFunctionPrototype` built its borrowed receiver with
+  `mkPtr` (an *ARC* retain) and released it with `freeValue()` (a *refcount*
+  decrement), so every function that materialised `F.prototype` lost one
+  reference: `F` and its prototype became a self-contained garbage cycle while
+  `F` was still a global, and `TextEncoder.prototype` went `undefined` the
+  first time the collector ran. `JeffJSValue.borrowedObject` is the honest
+  spelling and both materialisers use it. Separately, `gcFreeCycles` unlinked
+  its victims by hand and so skipped the malloc accounting: `mallocSize`
+  ratcheted up by one collection's worth of garbage per run, the trigger
+  drifted with it, and peak RSS still grew linearly even though every cycle
+  was being freed.
+- **WeakRef and FinalizationRegistry observe a cycle free.** Their cells are
+  registered with the runtime and cleared by `weakrefFree`; a `weak var` alone
+  is not enough, because a collected object can still be allocated (another
+  header holds an ARC reference, and `JEFFJS_ZOMBIES=1` keeps it alive on
+  purpose).
+- **Cost.** The GC lists are unretained (quickjs's intrusive `gc_obj_list`);
+  `JeffJSGCObjectHeader.deinit` unlinks whatever reaches ARC deallocation
+  while still listed. `markObject` skips the payload entirely for a plain
+  object — both `_fastArrayValues` and `payload` are ARC-bearing reads. The
+  threshold is quickjs's (256 KB floor, 1.5x the live heap), except that a run
+  which reclaimed nothing doubles instead: `vdom-build-diff` grows to 700k
+  live objects and finds no cycles at all. bench/realworld.js geomean 1.017x
+  of the same-worktree base (worst kernel `vdom-build-diff` 1.34x, which is
+  the collector walking a genuinely live 700k-object heap).
+- **Results.** 200k self-cycles: peak RSS 91 -> 46 MB, live objects back to
+  baseline (3577 -> 3578) after a forced collection. 10k-node parent <-> child
+  tree with closures, dropped and rebuilt: 25/50/100 passes were
+  481/942/1864 MB and are now 109/111/110 MB — flat. `JeffJSEnvironment.runGC()`
+  and `gcStatistics` are public; the CLI exposes `__gc()` / `__gcStats()`.
+
+Found, not fixed:
+- **`arr.push(o)` leaks `o` when `o` holds a function.** 40 000 iterations of
+  `arr.push({ type: "d", onClick: function () { return i; } })` followed by
+  `arr = null` leave ~3 objects per iteration alive, and the collector agrees
+  they are reachable, so it is a refcount leak and not a cycle. The same
+  script without the array, or with a plain object in place of the closure,
+  frees everything. Identical on the pre-round build (RSS 83 MB vs 93 MB), and
+  it is what makes a `React.createElement` re-render microbenchmark regress
+  ~30%: the collector rescans a heap the leak keeps large.
+- **Rest parameters leak too** (`function f(a, ...rest)`: ~5 objects per call
+  retained), same shape of bug.

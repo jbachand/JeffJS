@@ -539,13 +539,24 @@ final class JeffJSRuntime {
     // MARK: - Per-Runtime GC Tracking (replaces module-level globals)
 
     /// All GC-tracked object headers for this runtime.
-    var gcObjects: [JeffJSGCObjectHeader] = []
+    ///
+    /// Unretained, like quickjs's intrusive `gc_obj_list`: the list is walked
+    /// several times per collection and appended to on every object creation,
+    /// and a strong element would put a retain/release pair on both. Every
+    /// object takes itself off the list before it can deallocate
+    /// (`freeGCObjectChildren`, `jeffJS_recycleObject`, `clearGCState`).
+    var gcObjects: ContiguousArray<Unmanaged<JeffJSGCObjectHeader>> = []
     /// Objects whose refcount hit zero during a GC cycle (deferred free).
     var gcZeroRefCountObjects: [JeffJSGCObjectHeader] = []
-    /// Temporary list used during GC cycle detection (phase 3).
-    var gcTmpObjects: [JeffJSGCObjectHeader] = []
+    /// Temporary list used during GC cycle detection (phase 3). Unretained
+    /// for the same reason as `gcObjects`.
+    var gcTmpObjects: ContiguousArray<Unmanaged<JeffJSGCObjectHeader>> = []
     /// Map from ObjectIdentifier to JeffJSWeakRef for quick lookup.
     var gcWeakRefMap: [ObjectIdentifier: JeffJSWeakRef] = [:]
+    /// Number of completed collections (diagnostics, `__gcStats()` in the CLI).
+    var gcRuns: Int = 0
+    /// Total objects reclaimed as unreachable cycles (diagnostics).
+    var gcCyclesFreed: Int = 0
 
     /// Per-runtime bytecode cache. Atom IDs in bytecode are runtime-specific,
     /// so the cache must be scoped to the runtime that compiled them.
@@ -1065,7 +1076,7 @@ final class JeffJSRuntime {
     /// A full trial-deletion cycle collector can be added in the future by
     /// inserting newly created GC objects into `gcObjList` via their
     /// `header.link` node and implementing Lins' algorithm here.
-    func runGC() {
+    public func runGC() {
         // Delegate to the real Bacon-Rajan cycle collector in JeffJSGC.swift.
         _runGCImpl(self)
     }

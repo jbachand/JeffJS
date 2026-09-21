@@ -669,6 +669,8 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             cached.refCount += 1
             o.shape = cached
             if o.storedProto !== cached.proto { o.storedProto = cached.proto }
+            // Back onto the GC list it left when it was parked.
+            addGCObject(rt, o)
             return JeffJSValue.makeObjectRecycled(o)
         }
         let obj = JeffJSObject()

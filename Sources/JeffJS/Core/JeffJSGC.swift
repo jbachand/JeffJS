@@ -43,13 +43,30 @@ final class JeffJSWeakRef {
     /// The target object.  Set to `nil` when the target is freed.
     weak var target: JeffJSObject?
 
+    /// Set by `weakrefFree` the moment the target's contents are released.
+    /// The weak Swift reference alone is not enough: an object freed by the
+    /// cycle collector can still be *allocated* (another header holds an ARC
+    /// reference, and JEFFJS_ZOMBIES=1 keeps every freed object alive on
+    /// purpose), and `deref()` must not hand a gutted object back to JS.
+    var cleared: Bool = false
+
     /// True while the target is still alive.
-    var isLive: Bool { target != nil }
+    var isLive: Bool { !cleared && target != nil }
 
     init(target: JeffJSObject) {
         self.target = target
     }
 }
+
+/// `JEFFJS_GC_DEBUG=1`: print the class and property names of the objects a
+/// collection reclaims (the first 40 per run). An over-free shows up here as
+/// a live builtin, which is how the two bugs in this round were found.
+nonisolated(unsafe) let jeffJS_gcDebug =
+    ProcessInfo.processInfo.environment["JEFFJS_GC_DEBUG"] == "1"
+/// `JEFFJS_GC_OFF=1`: reference counting only, no cycle collection — answers
+/// "is the collector responsible?" in one run.
+nonisolated(unsafe) let jeffJS_gcDisable =
+    ProcessInfo.processInfo.environment["JEFFJS_GC_OFF"] == "1"
 
 // MARK: - GC object list management
 
@@ -60,7 +77,7 @@ private let JS_GC_OBJ_COST = JeffJSConfig.gcObjectCost
 /// Called every time a new GC-managed object is created.
 func addGCObject(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
     header.gcListIndex = rt.gcObjects.count
-    rt.gcObjects.append(header)
+    rt.gcObjects.append(Unmanaged.passUnretained(header))
     header.mark = JeffJSGCMark.white
     header.ownerRuntime = rt
     // Track allocation size for GC threshold (actual collection deferred to safe points)
@@ -73,13 +90,14 @@ func addGCObject(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
 /// irrelevant to the collector, which always iterates the whole array).
 func removeGCObject(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
     let li = header.gcListIndex
+    let me = Unmanaged.passUnretained(header).toOpaque()
     if li >= 0 {
-        if li < rt.gcObjects.count, rt.gcObjects[li] === header {
+        if li < rt.gcObjects.count, rt.gcObjects[li].toOpaque() == me {
             let last = rt.gcObjects.count - 1
             if li != last {
                 let moved = rt.gcObjects[last]
                 rt.gcObjects[li] = moved
-                moved.gcListIndex = li
+                moved._withUnsafeGuaranteedRef { $0.gcListIndex = li }
             }
             rt.gcObjects.removeLast()
             header.gcListIndex = -1
@@ -89,12 +107,12 @@ func removeGCObject(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
         }
     } else if li <= -2 {
         let ti = -2 - li
-        if ti < rt.gcTmpObjects.count, rt.gcTmpObjects[ti] === header {
+        if ti < rt.gcTmpObjects.count, rt.gcTmpObjects[ti].toOpaque() == me {
             let last = rt.gcTmpObjects.count - 1
             if ti != last {
                 let moved = rt.gcTmpObjects[last]
                 rt.gcTmpObjects[ti] = moved
-                moved.gcListIndex = -2 - ti
+                moved._withUnsafeGuaranteedRef { $0.gcListIndex = -2 - ti }
             }
             rt.gcTmpObjects.removeLast()
             header.gcListIndex = -1
@@ -106,17 +124,21 @@ func removeGCObject(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
     }
     // Defensive fallback: index out of sync (should not happen) — restore
     // correctness with a linear scan rather than corrupting the lists.
-    if let idx = rt.gcObjects.firstIndex(where: { $0 === header }) {
+    if let idx = rt.gcObjects.firstIndex(where: { $0.toOpaque() == me }) {
         rt.gcObjects.remove(at: idx)
-        for i in idx ..< rt.gcObjects.count { rt.gcObjects[i].gcListIndex = i }
+        for i in idx ..< rt.gcObjects.count {
+            rt.gcObjects[i]._withUnsafeGuaranteedRef { $0.gcListIndex = i }
+        }
         header.gcListIndex = -1
         rt.mallocState.mallocSize -= JS_GC_OBJ_COST
         rt.mallocState.mallocCount -= 1
         return
     }
-    if let idx = rt.gcTmpObjects.firstIndex(where: { $0 === header }) {
+    if let idx = rt.gcTmpObjects.firstIndex(where: { $0.toOpaque() == me }) {
         rt.gcTmpObjects.remove(at: idx)
-        for i in idx ..< rt.gcTmpObjects.count { rt.gcTmpObjects[i].gcListIndex = -2 - i }
+        for i in idx ..< rt.gcTmpObjects.count {
+            rt.gcTmpObjects[i]._withUnsafeGuaranteedRef { $0.gcListIndex = -2 - i }
+        }
         header.gcListIndex = -1
     }
 }
@@ -265,22 +287,41 @@ func _runGCImpl(_ rt: JeffJSRuntime) { runGC(rt) }
 ///   2. **Scan** — rescue any object whose adjusted refcount is > 0.
 ///   3. **Free cycles** — anything still at zero is unreachable; free it.
 func runGC(_ rt: JeffJSRuntime) {
+    guard rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain, !jeffJS_gcDisable else { return }
+
+    // Objects whose refcount hit zero while a free chain was unwinding must be
+    // gone before trial deletion: a dead object still on the GC list would be
+    // decremented into the negative and confuse the scan.
+    freeZeroRefcount(rt)
+    let freedBefore = rt.gcCyclesFreed
+
     #if canImport(Metal)
     if JeffJSMetalGC.shared.shouldUseMetalGC(objectCount: rt.gcObjects.count) {
         JeffJSMetalGC.shared.runMetalGC(rt: rt)
         freeZeroRefcount(rt)
         pruneWeakRefs(rt)
-        rt.mallocGCThreshold = max(rt.mallocState.mallocSize * 2, 256 * 1024)
+        rt.gcRuns += 1
+        rt.mallocGCThreshold = jeffJS_nextGCThreshold(rt, reclaimed: rt.gcCyclesFreed - freedBefore)
         return
     }
     #endif
+
+    // Phase 0: var-ref counts are not maintained incrementally (closures hold
+    // them through ARC), so start them from zero — see gcDecrefChild.
+    gcSeedVarRefs(rt)
 
     // Phase 1: trial decrements
     rt.gcPhase = .JS_GC_PHASE_DECREF
     gcDecref(rt)
 
-    // Phase 2: scan / rescue
+    // Phase 2: scan — rescue everything reachable from an externally
+    // referenced object, restoring the counts phase 1 removed.
     gcScan(rt)
+
+    // Phase 2b: give the unreachable objects their counts back so that the
+    // ordinary free path in phase 3 (which decrements children) stays
+    // balanced. This is quickjs's `gc_scan_incref_child2` loop.
+    gcRestoreUnreachable(rt)
 
     // Phase 3: free unreachable cycles
     rt.gcPhase = .JS_GC_PHASE_REMOVE_CYCLES
@@ -294,8 +335,38 @@ func runGC(_ rt: JeffJSRuntime) {
     // Prune dead weak references
     pruneWeakRefs(rt)
 
-    // Adjust threshold: next GC when allocation doubles.
-    rt.mallocGCThreshold = max(rt.mallocState.mallocSize * 2, 256 * 1024)
+    rt.gcRuns += 1
+    rt.mallocGCThreshold = jeffJS_nextGCThreshold(rt, reclaimed: rt.gcCyclesFreed - freedBefore)
+}
+
+/// Next allocation watermark, quickjs's `JS_RunGC` tail: grow to 1.5x the
+/// live heap, never below the initial threshold. `mallocSize` is decremented
+/// on every free, so it tracks the *live* heap — transient allocations do not
+/// push the threshold up and the collector only runs when the live set grows.
+@inline(__always)
+func jeffJS_nextGCThreshold(_ rt: JeffJSRuntime, reclaimed: Int) -> Int {
+    let live = rt.mallocState.mallocSize
+    // A run that reclaimed nothing says the heap is genuinely live; doubling
+    // instead of 1.5x halves the number of fruitless full walks while a tree
+    // is being built (bench/realworld.js `vdom-build-diff` grows to 700k live
+    // objects and finds no cycles at all). Any run that *did* find garbage
+    // keeps quickjs's 1.5x, so a leaky page is still collected promptly.
+    let grown = reclaimed > 0 ? live + (live >> 1) : live << 1
+    return max(grown, JeffJSConfig.gcMallocThreshold)
+}
+
+// MARK: - Phase 0: Var-ref seeding
+
+/// Zero every listed (i.e. detached) var-ref's refcount. After the scan and
+/// the restore pass each one holds exactly the number of references to it
+/// from GC objects, so a var-ref reachable only from an unreachable closure
+/// ends the run white and is collected with it.
+private func gcSeedVarRefs(_ rt: JeffJSRuntime) {
+    for u in rt.gcObjects {
+        u._withUnsafeGuaranteedRef { hdr in
+            if hdr.gcObjType == .varRef { hdr.refCount = 0 }
+        }
+    }
 }
 
 // MARK: - Phase 1: Trial deletion (gcDecref)
@@ -304,20 +375,30 @@ func runGC(_ rt: JeffJSRuntime) {
 /// After this pass, an object whose effective refcount is zero is *probably*
 /// garbage (it might still be rescued in Phase 2).
 private func gcDecref(_ rt: JeffJSRuntime) {
-    for hdr in rt.gcObjects {
-        hdr.mark = JeffJSGCMark.white
-        markChildren(rt, hdr) { rt, child in
-            gcDecrefChild(rt, child)
+    for u in rt.gcObjects {
+        u._withUnsafeGuaranteedRef { hdr in
+            hdr.mark = JeffJSGCMark.white
+            markChildren(rt, hdr) { rt, child in
+                gcDecrefChild(rt, child)
+            }
         }
     }
 }
 
 /// Called for every child of an object during Phase 1.
 /// Decrements the child's refcount (trial deletion).
-/// Guard against objects already at zero (freed via freeValue but still in GC list).
+///
+/// No `refCount > 0` guard: the decrement and the phase-2 restore must be
+/// exactly symmetric, or a skipped decrement becomes a permanent +1 on the
+/// next scan. Every counted edge was paid for by a matching `dupValue`, so a
+/// correctly refcounted graph can never go negative here.
 func gcDecrefChild(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
     guard isGCTracked(header) else { return }
-    guard header.refCount > 0 else { return }
+    // Var-refs are seeded to zero by gcSeedVarRefs instead: nothing maintains
+    // their refcount incrementally, so "in-degree minus in-degree" is already
+    // the state trial deletion is trying to reach. Phase 2 and 2b still incref
+    // them, which leaves the count at the true in-degree afterwards.
+    if header.gcObjType == .varRef { return }
     header.refCount -= 1
 }
 
@@ -348,28 +429,67 @@ func isGCTracked(_ header: JeffJSGCObjectHeader) -> Bool {
 /// deletion is externally reachable — "rescue" it and all of its children
 /// by restoring their reference counts and marking them black.
 private func gcScan(_ rt: JeffJSRuntime) {
-    for hdr in rt.gcObjects {
-        if hdr.refCount > 0 {
-            // Externally reachable — rescue
+    // Explicit worklist, not recursion: a 200k-node parent chain would blow
+    // the Swift stack (quickjs gets the same effect for free by appending
+    // revived objects to the list it is iterating).
+    var work: ContiguousArray<Unmanaged<JeffJSGCObjectHeader>> = []
+    for u in rt.gcObjects {
+        // `mark == white` matters: an object reached as a child of an earlier
+        // root is already black and has had its children increfed once. Doing
+        // it again here would inflate every one of them by one per GC.
+        let isRoot = u._withUnsafeGuaranteedRef { hdr -> Bool in
+            guard hdr.mark == JeffJSGCMark.white, hdr.refCount > 0 else { return false }
             hdr.mark = JeffJSGCMark.black
-            markChildren(rt, hdr) { rt, child in
-                gcScanIncrefChild(rt, child)
+            return true
+        }
+        guard isRoot else { continue }
+        work.append(u)
+        while let cur = work.popLast() {
+            cur._withUnsafeGuaranteedRef { hdr in
+                markChildren(rt, hdr) { _, child in
+                    // Symmetric with gcDecrefChild: untracked nodes were never
+                    // decremented, so restoring them would inflate the count.
+                    guard isGCTracked(child) else { return }
+                    child.refCount += 1
+                    if child.mark == JeffJSGCMark.white {
+                        child.mark = JeffJSGCMark.black
+                        work.append(Unmanaged.passUnretained(child))
+                    }
+                }
             }
         }
     }
 }
 
-/// Recursively rescue a child: restore its refcount and, if this is the
-/// first rescue (mark transitions white -> black), recurse into its children.
+/// Rescue a child: restore its refcount and, if this is the first rescue,
+/// visit its children. Kept as a free function for the Metal collector and
+/// tests; `gcScan` itself uses an explicit worklist.
 func gcScanIncrefChild(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
-    // Symmetric with gcDecrefChild: untracked nodes were never decremented,
-    // so restoring them here would inflate their refcount (a leak) instead.
     guard isGCTracked(header) else { return }
     header.refCount += 1
     if header.mark == JeffJSGCMark.white {
         header.mark = JeffJSGCMark.black
         markChildren(rt, header) { rt, child in
             gcScanIncrefChild(rt, child)
+        }
+    }
+}
+
+// MARK: - Phase 2b: Restore the unreachable set (gc_scan_incref_child2)
+
+/// Every object left white is unreachable. Give its children back the counts
+/// phase 1 took, so the ordinary object-free path used in phase 3 — which
+/// decrements each child exactly once — leaves the graph balanced. Without
+/// this, a still-live object referenced only by a dying one is left one count
+/// short and the free that follows drops it to zero while it is still in use.
+private func gcRestoreUnreachable(_ rt: JeffJSRuntime) {
+    for u in rt.gcObjects {
+        u._withUnsafeGuaranteedRef { hdr in
+            guard hdr.mark == JeffJSGCMark.white else { return }
+            markChildren(rt, hdr) { _, child in
+                guard isGCTracked(child) else { return }
+                child.refCount += 1
+            }
         }
     }
 }
@@ -381,28 +501,104 @@ func gcScanIncrefChild(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
 private func gcFreeCycles(_ rt: JeffJSRuntime) {
     // Move white objects to tmp list, keep black objects.
     // Maintain the intrusive gcListIndex on both lists.
-    rt.gcTmpObjects.removeAll()
-    var remaining: [JeffJSGCObjectHeader] = []
-    for hdr in rt.gcObjects {
-        if hdr.mark == JeffJSGCMark.white {
-            hdr.gcListIndex = -2 - rt.gcTmpObjects.count
-            rt.gcTmpObjects.append(hdr)
+    rt.gcTmpObjects.removeAll(keepingCapacity: true)
+    var remaining: ContiguousArray<Unmanaged<JeffJSGCObjectHeader>> = []
+    remaining.reserveCapacity(rt.gcObjects.count)
+    for u in rt.gcObjects {
+        // Only JS values are swept. Shapes reach zero only because nothing
+        // counted them in the first place (their incoming edges are ARC
+        // strong references), and hashed shapes deliberately live on at
+        // refCount 0 as the shape cache — quickjs likewise frees only
+        // JS_GC_OBJ_TYPE_JS_OBJECT / _FUNCTION_BYTECODE / _VAR_REF here.
+        let isDead = u._withUnsafeGuaranteedRef { hdr -> Bool in
+            hdr.mark == JeffJSGCMark.white &&
+                (hdr.gcObjType == .jsObject || hdr.gcObjType == .functionBytecode
+                 || hdr.gcObjType == .varRef)
+        }
+        if isDead {
+            u._withUnsafeGuaranteedRef { $0.gcListIndex = -2 - rt.gcTmpObjects.count }
+            rt.gcTmpObjects.append(u)
         } else {
-            hdr.gcListIndex = remaining.count
-            remaining.append(hdr)
+            u._withUnsafeGuaranteedRef { $0.gcListIndex = remaining.count }
+            remaining.append(u)
         }
     }
     rt.gcObjects = remaining
+    rt.gcCyclesFreed += rt.gcTmpObjects.count
 
-    // Free everything on the tmp list.
-    // We must be careful: freeing an object might remove other objects from the
-    // tmp list via child decrements that hit zero. Consume from the END
-    // (popLast is O(1); removeFirst shifted the whole array per object).
-    while let hdr = rt.gcTmpObjects.popLast() {
-        hdr.gcListIndex = -1
-        // Set refcount to 1 so that freeGCObject does not try to re-enqueue.
-        hdr.refCount = 1
-        freeGCObject(rt, hdr)
+    // Strong from here on: gcFreeDeadObjects hands the allocations back.
+    var dead: [JeffJSGCObjectHeader] = []
+    dead.reserveCapacity(rt.gcTmpObjects.count)
+    for u in rt.gcTmpObjects {
+        dead.append(gcUnlistDead(rt, u))
+    }
+    rt.gcTmpObjects.removeAll(keepingCapacity: true)
+    if jeffJS_gcDebug {
+        for hdr in dead.prefix(40) {
+            guard let obj = hdr as? JeffJSObject, let sh = obj.shape else { continue }
+            var names: [String] = []
+            for pr in sh.prop.prefix(8) { names.append(rt.atomToString(pr.atom) ?? "?") }
+            print("[GC-FREE] class=\(obj.classID) rc=\(obj.refCount) props=\(names)")
+        }
+    }
+    gcFreeDeadObjects(rt, dead)
+}
+
+/// Take a doomed header off the GC lists by hand. The lists have already been
+/// rebuilt around it, so `removeGCObject` would find nothing to unlink and,
+/// crucially, would skip the malloc accounting — which is what the threshold
+/// is computed from. Leaving that out made `mallocSize` ratchet up by one
+/// collection's worth of garbage every run: the live heap stayed at 13 MB
+/// while the accounted heap (and therefore the trigger) climbed past 250 MB,
+/// so a long browsing session collected less and less often.
+@inline(__always)
+private func gcUnlistDead(_ rt: JeffJSRuntime,
+                          _ u: Unmanaged<JeffJSGCObjectHeader>) -> JeffJSGCObjectHeader {
+    let hdr = u.takeUnretainedValue()
+    hdr.gcListIndex = -1
+    rt.mallocState.mallocSize -= JS_GC_OBJ_COST
+    rt.mallocState.mallocCount -= 1
+    return hdr
+}
+
+/// Free a set of objects that are known to be unreachable **as a group**.
+///
+/// Two phases, for the same reason `freeGCObjectAtZeroRefcount` has them: a
+/// cycle's members point at each other, so releasing A's ARC retain as soon as
+/// A's children are processed lets A deallocate while B still holds A's raw
+/// NaN-boxed pointer — and B's own free then reads a dead object. Phase 1
+/// breaks every edge (and marks each header refCount = -1, which makes any
+/// later `freeValue` on a stale pointer a no-op); only then does phase 2 hand
+/// the allocations back.
+func gcFreeDeadObjects(_ rt: JeffJSRuntime, _ dead: [JeffJSGCObjectHeader]) {
+    var toRelease: [JeffJSGCObjectHeader] = []
+    toRelease.reserveCapacity(dead.count)
+    for hdr in dead {
+        guard hdr.refCount >= 0 else { continue }   // already processed
+        freeGCObjectChildren(rt, hdr)
+        toRelease.append(hdr)
+    }
+    // A dying object can drop a *non*-cycle object to zero (it held the last
+    // reference to an acyclic subgraph); those were deferred by
+    // freeGCObjectAtZeroRefcount because the GC phase is REMOVE_CYCLES.
+    while let deferred = rt.gcZeroRefCountObjects.popLast() {
+        if deferred.refCount == 0 {
+            freeGCObjectChildren(rt, deferred)
+            toRelease.append(deferred)
+        }
+    }
+    for hdr in toRelease {
+        switch hdr.gcObjType {
+        case .jsObject, .bigInt, .functionBytecode:
+            if jeffJSZombiesEnabled {
+                if let obj = hdr as? JeffJSObject { obj.freeMark = true }
+                rt.zombieKeepAlive.append(hdr)
+            } else {
+                Unmanaged.passUnretained(hdr).release()
+            }
+        default:
+            break   // shapes and var-refs are ARC-managed
+        }
     }
 }
 
@@ -419,149 +615,172 @@ func triggerGC(_ rt: JeffJSRuntime, size: Int) {
 
 // MARK: - Mark function dispatch
 
+/// `JS_CLASS_OBJECT`: a plain `{}`. Never carries a payload with GC edges.
+private let jeffJS_plainObjectClassID = JSClassID.JS_CLASS_OBJECT.rawValue
+
 /// Visitor callback type.
 typealias JeffJSMarkFunc = (_ rt: JeffJSRuntime, _ child: JeffJSGCObjectHeader) -> Void
 
 /// Enumerate all GC-managed children of `header`, calling `markFunc` for each.
 /// This dispatches on the object's ``JSGCObjectTypeEnum``.
+///
+/// # The one invariant
+///
+/// Trial deletion subtracts, for every tracked node, the references its
+/// children's `refCount` fields were incremented for. The set enumerated here
+/// must therefore be **exactly the set of edges that hold a manual refcount**,
+/// i.e. the edges `freeGCObjectChildren`/`freeObject` release. Two failure
+/// modes bracket it:
+///
+/// * Marking an edge that was never counted (an ARC-only strong reference)
+///   removes a reference nobody added: the child's count goes one too low on
+///   every collection and the next `freeValue` frees a live object. This is
+///   what `obj.proto` / `shape.proto` are — `freeShape` deliberately does not
+///   release `shape.proto` ("ARC strong ref, not a NaN-boxed value") and
+///   `freeObject` does not release `obj.proto`, so prototypes are *not* GC
+///   edges here. It costs nothing: a prototype's counted references come from
+///   the constructor's `prototype` property and from `ctx.classProto`, both of
+///   which are marked, so a dead class still collects.
+/// * *Not* marking a counted edge is always safe — the child keeps a
+///   reference the collector cannot account for, so it looks externally
+///   rooted and is rescued. Conservative: it leaks, it never over-frees.
+///
+/// Edges that are currently ARC-only and therefore deliberately skipped:
+/// `obj.proto`, `shape.proto`, closure var-refs (`varRefsFast` / the
+/// `.bytecodeFunc` payload and `JeffJSPropertyExtra.varRef` — see
+/// `JeffJSVarRef`, "kept alive by their varRefs arrays (ARC)"), the function
+/// bytecode constant pool (the FB is not a GC node), and `homeObject`.
 func markChildren(_ rt: JeffJSRuntime,
                   _ header: JeffJSGCObjectHeader,
                   _ markFunc: JeffJSMarkFunc) {
     switch header.gcObjType {
-    case .jsObject:
+    case .jsObject, .functionBytecode:
         let obj = unsafeBitCast(header, to: JeffJSObject.self)
         markObject(rt, obj, markFunc)
     case .shape:
-        let shape = unsafeBitCast(header, to: JeffJSShape.self)
-        markShape(rt, shape, markFunc)
-    case .functionBytecode:
-        // Mark constant pool values and closure var refs in bytecode.
-        let obj = unsafeBitCast(header, to: JeffJSObject.self)
-        if case .bytecodeFunc(let fb, let varRefs, _) = obj.payload, let fb = fb {
-            // Mark constant pool entries
-            for cpVal in fb.cpool {
-                if let child = cpVal.toGCObjectHeader() {
-                    markFunc(rt, child)
-                }
-            }
-            // Mark closure variable references
-            for vr in varRefs {
-                if let vr = vr {
-                    markFunc(rt, vr)
-                }
-            }
-        }
-        if let at = obj.arrowThisVal, let child = at.toGCObjectHeader() { markFunc(rt, child) }
+        // A shape's only reference is `proto`, which is an uncounted ARC
+        // strong reference (see freeShape) — nothing to trial-delete.
+        break
     case .varRef:
-        // Mark the value stored in the var-ref.
+        // Only detached var-refs are listed; their value is a counted edge
+        // (`close_loc` dups it, freeGCObjectChildren releases it).
         let vr = unsafeBitCast(header, to: JeffJSVarRef.self)
-        if let child = vr.pvalue.toGCObjectHeader() {
-            markFunc(rt, child)
-        }
+        if vr.isDetached, let child = vr.value.toGCObjectHeader() { markFunc(rt, child) }
     case .bigInt, .bigFloat, .bigDecimal:
         // Leaf types — no children.
         break
     case .asyncFunction:
-        // TODO: mark async function state.
         break
     case .mapIteratorData, .arrayIteratorData,
          .regexpStringIteratorData:
-        // TODO: mark iterator state.
         break
     }
 }
 
-/// Mark all children of a JSObject.
+/// Mark all counted children of a JSObject. See `markChildren` for the rule
+/// that decides what belongs here; every edge below is released by
+/// `freeObject`, and the two lists must be changed together.
 func markObject(_ rt: JeffJSRuntime,
                 _ obj: JeffJSObject,
                 _ markFunc: JeffJSMarkFunc) {
-    // 1. Shape
-    if let shape = obj.shape {
-        markFunc(rt, shape)
-    }
+    // Shapes are refcounted but never swept by the collector (hashed shapes
+    // stay cached at refCount 0 — see freeObject), and a shape's own `proto`
+    // edge is uncounted, so a shape can never be part of a collectable cycle.
+    // Trial-deleting the obj -> shape edge would only perturb the cache.
 
-    // 2. Prototype (obj.proto is the single source of truth)
-    if let proto = obj.proto {
-        markFunc(rt, proto)
-    }
-
-    // 3. Property values (split storage: data values + rare-case boxes)
-    for i in 0..<obj.propValues.count {
-        if let e = obj.extra(at: i) {
-            switch e.kind {
-            case .getset:
-                if let g = e.getter { markFunc(rt, g) }
-                if let s = e.setter { markFunc(rt, s) }
-            case .varRef:
-                if let vr = e.varRef { markFunc(rt, vr) }
-            case .autoInit:
-                break
+    // 1. Property values (split storage: data values + rare-case boxes).
+    let n = obj.propValues.count
+    if n > 0 {
+        if obj.propExtraCount == 0 {
+            for i in 0..<n {
+                if let child = obj.propValues[i].toGCObjectHeader() { markFunc(rt, child) }
             }
-        } else if let child = obj.propValues[i].toGCObjectHeader() {
-            markFunc(rt, child)
+        } else {
+            for i in 0..<n {
+                if let e = obj.extra(at: i) {
+                    switch e.kind {
+                    case .getset:
+                        // Counted: defineProperty dups getter and setter.
+                        if let g = e.getter { markFunc(rt, g) }
+                        if let s = e.setter { markFunc(rt, s) }
+                    case .varRef:
+                        // A mapped `arguments` slot holds the var-ref the
+                        // closures share; detached ones are graph nodes.
+                        if let vr = e.varRef, vr.gcListIndex != -1 { markFunc(rt, vr) }
+                    case .autoInit:
+                        break
+                    }
+                } else if let child = obj.propValues[i].toGCObjectHeader() {
+                    markFunc(rt, child)
+                }
+            }
         }
     }
 
-    // 4. Payload — mark reachable children in object payload
+    // 2. An arrow's captured `this` is a counted edge (dup'd by createClosure,
+    // released by freeObject / the recycle pool): cycles through it
+    // (instance.f = () => this) are only collectable if it is marked.
+    if let at = obj.arrowThisVal, let child = at.toGCObjectHeader() { markFunc(rt, child) }
+
+    // 3. Captured variables. `var node = {}; node.cb = function () { return node; }`
+    // is the shape every React render produces, and it is only collectable if
+    // the closure -> var-ref -> object chain is an edge. The unmanaged mirror
+    // of `varRefsFast` is used so marking costs no ARC traffic.
+    if let raw = obj.varRefsRaw {
+        for i in 0..<obj.varRefsRawCount {
+            if let vr = raw[i]?.takeUnretainedValue(), vr.gcListIndex != -1 {
+                markFunc(rt, vr)
+            }
+        }
+    }
+
+    // 4. Payload — only the counted edges (see markChildren). A plain
+    // object has none, and both `_fastArrayValues` and `payload` are
+    // ARC-bearing reads (copying the payload enum retains its associated
+    // class), so the overwhelmingly common case skips both on one compare.
+    if obj.classID == jeffJS_plainObjectClassID { return }
+    if let storage = obj._fastArrayValues {
+        // Authoritative array store when materialised; the enum payload holds
+        // the same elements, so never mark both.
+        let count = min(Int(storage.count), storage.values.count)
+        for i in 0..<count {
+            if let child = storage.values[i].toGCObjectHeader() { markFunc(rt, child) }
+        }
+        return
+    }
     switch obj.payload {
-    case .bytecodeFunc(let fb, let varRefs, let homeObject):
-        if let fb = fb {
-            for cpVal in fb.cpool {
-                if let child = cpVal.toGCObjectHeader() { markFunc(rt, child) }
-            }
-        }
-        for vr in varRefs {
-            if let vr = vr { markFunc(rt, vr) }
-        }
-        if let ho = homeObject { markFunc(rt, ho) }
-        // An arrow's captured `this` is a real edge: cycles through it
-        // (instance.f = () => this) are only collectable if it is marked.
-        if let at = obj.arrowThisVal, let child = at.toGCObjectHeader() { markFunc(rt, child) }
     case .array(_, let values, let count):
         for i in 0..<Int(count) where i < values.count {
             if let child = values[i].toGCObjectHeader() { markFunc(rt, child) }
         }
-    case .boundFunction(let bf):
-        if let child = bf.thisVal.toGCObjectHeader() { markFunc(rt, child) }
-        if let child = bf.funcObj.toGCObjectHeader() { markFunc(rt, child) }
-        for arg in bf.argv {
-            if let child = arg.toGCObjectHeader() { markFunc(rt, child) }
-        }
-    case .proxyData(let pd):
-        if let child = pd.target.toGCObjectHeader() { markFunc(rt, child) }
-        if let child = pd.handler.toGCObjectHeader() { markFunc(rt, child) }
-    case .objectData(let val):
-        if let child = val.toGCObjectHeader() { markFunc(rt, child) }
-    case .generatorData(let gd):
-        // Mark async state's saved values
-        if let child = gd.asyncState.thisVal.toGCObjectHeader() { markFunc(rt, child) }
-        if let child = gd.asyncState.resolveFunc.toGCObjectHeader() { markFunc(rt, child) }
-        if let child = gd.asyncState.rejectFunc.toGCObjectHeader() { markFunc(rt, child) }
     case .typedArray(let ta):
-        // A typed array / DataView owns its ArrayBuffer object: a real edge,
-        // otherwise the collector cannot see the buffer as reachable.
+        // A typed array / DataView owns a counted reference to its
+        // ArrayBuffer object (typedArrayAdoptBuffer), released by freeObject.
         if let buf = ta.buffer { markFunc(rt, buf) }
-    case .promiseData(let pd):
-        if let child = pd.promiseResult.toGCObjectHeader() { markFunc(rt, child) }
-        for reaction in pd.promiseFulfillReactions {
-            if let child = reaction.handler.toGCObjectHeader() { markFunc(rt, child) }
-            if let child = reaction.resultPromise.toGCObjectHeader() { markFunc(rt, child) }
+    case .generatorData(let gd):
+        // A suspended generator owns its saved stack, locals, arguments,
+        // `this` and function (JeffJSGeneratorData.releaseSuspendedState
+        // releases exactly these), and holds the var-refs its own closures
+        // captured.
+        if let saved = gd.savedState {
+            for v in saved.stack { if let c = v.toGCObjectHeader() { markFunc(rt, c) } }
+            for v in saved.varBuf { if let c = v.toGCObjectHeader() { markFunc(rt, c) } }
+            for v in saved.argBuf { if let c = v.toGCObjectHeader() { markFunc(rt, c) } }
+            if let c = saved.delegatedIter.toGCObjectHeader() { markFunc(rt, c) }
+            if let c = saved.thisVal.toGCObjectHeader() { markFunc(rt, c) }
+            if let c = saved.funcObj.toGCObjectHeader() { markFunc(rt, c) }
+            for vr in saved.capturedVarRefs where vr.gcListIndex != -1 { markFunc(rt, vr) }
         }
-        for reaction in pd.promiseRejectReactions {
-            if let child = reaction.handler.toGCObjectHeader() { markFunc(rt, child) }
-            if let child = reaction.resultPromise.toGCObjectHeader() { markFunc(rt, child) }
-        }
+        for vr in gd.asyncState.frame.liveVarRefs where vr.gcListIndex != -1 { markFunc(rt, vr) }
+    case .asyncFunctionData(let st):
+        // A parked `await` keeps its whole frame; the var-refs its closures
+        // captured are detached (the frame's buffer was released at the
+        // suspend point) and nothing else on the GC graph points at them, so
+        // without this edge the collector treats them as unreferenced and
+        // clears the locals the continuation is going to read.
+        for vr in st.frame.liveVarRefs where vr.gcListIndex != -1 { markFunc(rt, vr) }
     default:
-        break  // cFunc, regexp, mapState, asyncFunctionData, etc.
-    }
-}
-
-/// Mark children of a Shape (just the prototype).
-func markShape(_ rt: JeffJSRuntime,
-               _ shape: JeffJSShape,
-               _ markFunc: JeffJSMarkFunc) {
-    if let proto = shape.proto {
-        markFunc(rt, proto)
+        break
     }
 }
 
@@ -603,16 +822,14 @@ func freeGCObjectChildren(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
                 }
             }
         }
-        rt.mallocState.mallocCount -= 1
     case .varRef:
         let vr = unsafeBitCast(header, to: JeffJSVarRef.self)
         if vr.isDetached {
             freeValue(rt, vr.value)
             vr.value = .undefined
         }
-        rt.mallocState.mallocCount -= 1
     default:
-        rt.mallocState.mallocCount -= 1
+        break
     }
 }
 
@@ -725,8 +942,6 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
 
     // Invalidate any weak references pointing at this object.
     if !rt.gcWeakRefMap.isEmpty { weakrefFree(rt, obj) }
-
-    rt.mallocState.mallocCount -= 1
 }
 
 /// Free a Shape: remove from the runtime hash table if necessary, release the
@@ -750,8 +965,6 @@ func freeShape(_ rt: JeffJSRuntime, _ shape: JeffJSShape) {
     shape.propSize = 0
     shape.deletedPropCount = 0
     shape.propHashMask = 0
-
-    rt.mallocState.mallocCount -= 1
 }
 
 /// Drain the list of objects whose refcount dropped to zero during a GC
@@ -783,7 +996,7 @@ func weakrefNew(_ rt: JeffJSRuntime, _ target: JeffJSObject) -> JeffJSWeakRef {
 /// Called when the target object is being freed.
 func weakrefFree(_ rt: JeffJSRuntime, _ target: JeffJSObject) {
     let key = ObjectIdentifier(target)
-    rt.gcWeakRefMap.removeValue(forKey: key)
+    if let ref = rt.gcWeakRefMap.removeValue(forKey: key) { ref.cleared = true }
 }
 
 /// Returns `true` if the weak reference's target is still alive.
@@ -800,48 +1013,59 @@ private func pruneWeakRefs(_ rt: JeffJSRuntime) {
 /// Clear all GC tracking state for a runtime. Called during runtime teardown.
 /// Breaks all inter-object reference cycles so ARC can reclaim memory.
 func clearGCState(_ rt: JeffJSRuntime) {
-    // Break reference cycles on all tracked objects so ARC can deallocate them.
-    for hdr in rt.gcObjects {
+    // Three passes, in dependency order. A JS object reads its shape (and its
+    // payload's var-refs) while it is being torn down, so nothing a live
+    // object points at may be emptied before the object itself is emptied:
+    //   1. JS objects and function objects — drop props, payload, shape and
+    //      prototype links. After this nothing points at a shape or a var-ref.
+    //   2. Var-refs — drop the captured value and the (already dead) frame.
+    //   3. Shapes — drop the property tables and the hash chain.
+    // References are *dropped*, not released: teardown discards the whole
+    // graph at once, and running the refcount free paths here would walk
+    // objects that the earlier passes have already emptied.
+    // Strong for the duration: emptying one object drops ARC references that
+    // can deallocate another header in the same snapshot, and the lists are
+    // unretained, so a borrowed copy would be walked after it died.
+    let all: [JeffJSGCObjectHeader] =
+        (rt.gcObjects + rt.gcTmpObjects).map { $0.takeUnretainedValue() }
+    for hdr in all {
         hdr.gcListIndex = -1
         hdr.ownerRuntime = nil
-        if hdr.gcObjType == .jsObject || hdr.gcObjType == .functionBytecode {
-            let obj = unsafeBitCast(hdr, to: JeffJSObject.self)
-            obj.propValues.removeAll()
-            obj.propExtra.removeAll()
-            obj.shape = nil
-            obj.proto = nil
-            obj.payload = .opaque(nil)
-            obj.fbFast = nil
-            obj.varRefsFast = []
-            obj.arrowThisVal = nil
-        }
-        if hdr.gcObjType == .shape {
-            let shape = unsafeBitCast(hdr, to: JeffJSShape.self)
-            shape.proto = nil
-            shape.prop.removeAll()
-            shape.enumKeyCache = nil
-            shape.propHash.removeAll()
-            shape.propCount = 0
-            shape.propSize = 0
-            shape.deletedPropCount = 0
-            shape.propHashMask = 0
-            shape.shapeHashNext = nil
-        }
+        guard hdr.gcObjType == .jsObject || hdr.gcObjType == .functionBytecode else { continue }
+        let obj = unsafeBitCast(hdr, to: JeffJSObject.self)
+        obj.propValues.removeAll()
+        obj.propExtra.removeAll()
+        obj.shape = nil
+        obj.proto = nil
+        obj.payload = .opaque(nil)
+        obj.fbFast = nil
+        obj.varRefsFast = []
+        obj.arrowThisVal = nil
+        obj._fastArrayValues = nil
+        obj.storedProto = nil
+        obj.storedCFunction = nil
+        obj.firstWeakRef = nil
     }
-    for hdr in rt.gcTmpObjects {
-        hdr.gcListIndex = -1
-        hdr.ownerRuntime = nil
-        if hdr.gcObjType == .jsObject || hdr.gcObjType == .functionBytecode {
-            let obj = unsafeBitCast(hdr, to: JeffJSObject.self)
-            obj.propValues.removeAll()
-            obj.propExtra.removeAll()
-            obj.shape = nil
-            obj.proto = nil
-            obj.payload = .opaque(nil)
-            obj.fbFast = nil
-            obj.varRefsFast = []
-            obj.arrowThisVal = nil
-        }
+    for hdr in all {
+        guard hdr.gcObjType == .varRef else { continue }
+        let vr = unsafeBitCast(hdr, to: JeffJSVarRef.self)
+        vr.parentFrame = nil
+        vr.slot = nil
+        vr.value = .undefined
+        vr.isDetached = false
+    }
+    for hdr in all {
+        guard hdr.gcObjType == .shape else { continue }
+        let shape = unsafeBitCast(hdr, to: JeffJSShape.self)
+        shape.proto = nil
+        shape.prop.removeAll()
+        shape.enumKeyCache = nil
+        shape.propHash.removeAll()
+        shape.propCount = 0
+        shape.propSize = 0
+        shape.deletedPropCount = 0
+        shape.propHashMask = 0
+        shape.shapeHashNext = nil
     }
     rt.gcObjects.removeAll()
     rt.gcZeroRefCountObjects.removeAll()

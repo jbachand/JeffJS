@@ -22,6 +22,12 @@ let showResult = args.contains("--result")
 let status: Int32 = MainActor.assumeIsolated {
     let env = JeffJSEnvironment()
     env.onConsoleMessage = { _, msg in print(msg); fflush(stdout) }
+    // Test hooks: force a collection and read the collector's counters.
+    env.registerNativeFunction("__gc") { _ in env.runGC(); return nil }
+    env.registerNativeFunction("__gcStats") { _ in
+        let s = env.gcStatistics
+        return "{\"runs\":\(s.runs),\"cyclesFreed\":\(s.cyclesFreed),\"liveObjects\":\(s.liveObjects),\"heapBytes\":\(s.heapBytes),\"threshold\":\(s.threshold)}"
+    }
     var status: Int32 = 0
     for path in paths {
         guard let src = try? String(contentsOfFile: path, encoding: .utf8) else {
@@ -37,6 +43,9 @@ let status: Int32 = MainActor.assumeIsolated {
             status = 1
         }
     }
+    // --teardown exercises context/runtime free (the path the test suite runs
+    // between groups); the CLI otherwise leaves it to process exit.
+    if args.contains("--teardown") { env.teardown() }
     return status
 }
 exit(status)

@@ -914,8 +914,11 @@ extension JeffJSContext {
         funcObj.needsLazyNameLength = false
         guard let fb = funcObj.fbFast else { return }
         // Borrowed receiver: nothing here stores a reference to the function
-        // itself (only two fresh primitives), so it must NOT be released.
-        let funcVal = JeffJSValue.mkPtr(tag: .object, ptr: funcObj)
+        // itself (only two fresh primitives), so it must NOT be released --
+        // and it must not be *retained* either (mkPtr takes an ARC retain that
+        // nothing ever gives back, pinning every named function for the life
+        // of the runtime).
+        let funcVal = JeffJSValue.borrowedObject(funcObj)
         if jeffJS_findOwnPropertyIndex(obj: funcObj,
                                        atom: JeffJSAtomID.JS_ATOM_length.rawValue) < 0 {
             _ = definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
@@ -942,8 +945,12 @@ extension JeffJSContext {
                                        atom: JeffJSAtomID.JS_ATOM_prototype.rawValue) >= 0 {
             return
         }
-        let funcVal = JeffJSValue.mkPtr(tag: .object, ptr: funcObj)
-        defer { funcVal.freeValue() }
+        // Borrowed receiver. This used to be `mkPtr` + `freeValue()`, which
+        // pairs an ARC retain with a *refcount* decrement: every function that
+        // materialised its prototype lost one reference, so `F.prototype` (and
+        // F itself) became a self-contained garbage cycle the moment the cycle
+        // collector could see it, even while `F` was still a global.
+        let funcVal = JeffJSValue.borrowedObject(funcObj)
         let protoObj = newObject()
         // F.prototype.constructor: writable + configurable, NOT enumerable.
         _ = definePropertyValue(obj: protoObj,

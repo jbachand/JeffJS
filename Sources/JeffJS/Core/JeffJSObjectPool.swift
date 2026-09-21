@@ -24,6 +24,9 @@ func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
               rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain,
               rt.objectPool.count < jeffJSObjectPoolCapacity else { return false }
         o.refCount = 0
+        // Off the GC list while parked: a pooled object is dead, and leaving
+        // it listed would make the collector walk (and try to rescue) it.
+        removeGCObject(rt, o)
         if !rt.gcWeakRefMap.isEmpty { weakrefFree(rt, o) }
         // Release the slots. Nested zero transitions are deferred while
         // inFreeChain is set and drained below, as freeGCObjectAtZeroRefcount
@@ -56,7 +59,6 @@ func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
         if o.storedCFunction != nil { o.storedCFunction = nil; o.storedCFunctionLength = 0 }
         if !o.varRefsFast.isEmpty { o.varRefsFast = [] }
         o.payload = .opaque(nil)
-        rt.mallocState.mallocCount -= 1
         rt.objectPool.append(o)
         if !rt.gcZeroRefCountObjects.isEmpty {
             while let d = rt.gcZeroRefCountObjects.popLast() {
