@@ -228,6 +228,7 @@ struct JeffJSTestRunner {
             // ("ES262Extended", { $0.testES262CriticalSubsetPart2() }),
             ("NewMemberExpr", { $0.testNewMemberExpression() }),
             ("ErrorHandling", { $0.testErrorHandling() }),
+            ("ExceptionUnwind", { $0.testExceptionUnwind() }),
             ("TypeConversion", { $0.testTypeConversion() }),
             ("Destructuring", { $0.testDestructuring() }),
             ("Spread", { $0.testSpread() }),
@@ -2746,6 +2747,182 @@ extension JeffJSTestRunner {
     }
 
     // MARK: - Error Handling
+
+    // MARK: - Exception Unwind
+
+    /// Unwinding an exception out of an INLINE bytecode frame: the interpreter
+    /// inlines bytecode calls into one Swift frame, so the unwinder has to
+    /// restore sp / pc / catch offset and release the callee's variable slots
+    /// by hand. These cases pin that down, including the frames that hold
+    /// object locals (a bad slot release used to corrupt the unwind) and the
+    /// code that must still run after the catch.
+    mutating func testExceptionUnwind() {
+        let (rt, ctx) = makeCtx()
+        _ = rt
+
+        // Throw out of a frame holding a local object, then keep running.
+        evalCheckStr(ctx, """
+            (function(){
+              function g(){ throw new Error("x"); }
+              function f(){ var o = {p:1}; g(); }
+              var n = 0;
+              try { f(); } catch(e) { n = 1; }
+              var s = 5;
+              return n + ":" + s;
+            })()
+            """, expect: "1:5")
+
+        // Same with a primitive local (no object slot to release).
+        evalCheckStr(ctx, """
+            (function(){
+              function g(){ throw new Error("x"); }
+              function f(){ var o = 1; g(); }
+              var n = 0;
+              try { f(); } catch(e) { n = 1; }
+              return n + ":" + 5;
+            })()
+            """, expect: "1:5")
+
+        // Depth 3, every frame holding an object local.
+        evalCheckStr(ctx, """
+            (function(){
+              function h(){ throw new Error("d3"); }
+              function g(){ var a = {}; h(); }
+              function f(){ var b = {}; g(); }
+              try { f(); } catch(e) { return e.message; }
+              return "not thrown";
+            })()
+            """, expect: "d3")
+
+        // Throw out of a method call.
+        evalCheckStr(ctx, """
+            (function(){
+              var obj = { m: function(){ var o = {}; throw new Error("m"); } };
+              try { obj.m(); } catch(e) { return e.message; }
+              return "not thrown";
+            })()
+            """, expect: "m")
+
+        // Throw after a loop has run inside the frame (pc/catch offset).
+        evalCheckStr(ctx, """
+            (function(){
+              function f(){ var o = {}; for (var i = 0; i < 3; i++) o.i = i; throw new Error("L"); }
+              try { f(); } catch(e) { return e.message; }
+              return "not thrown";
+            })()
+            """, expect: "L")
+
+        // finally blocks run in order while unwinding three frames.
+        evalCheckStr(ctx, """
+            (function(){
+              var o = [];
+              function h(){ try { throw new Error("h"); } finally { o.push("h"); } }
+              function g(){ try { h(); } finally { o.push("g"); } }
+              function f(){ try { g(); } finally { o.push("f"); } }
+              try { f(); } catch(e) { o.push("c"); }
+              return o.join();
+            })()
+            """, expect: "h,g,f,c")
+
+        // A throw from finally replaces the in-flight exception.
+        evalCheckStr(ctx, """
+            (function(){
+              function f(){ try { throw new Error("t"); } finally { throw new Error("fin"); } }
+              try { f(); } catch(e) { return e.message; }
+              return "not thrown";
+            })()
+            """, expect: "fin")
+
+        // return from finally wins over the pending throw.
+        evalCheck(ctx, """
+            (function(){
+              function f(){ try { throw new Error("f7"); } finally { return 7; } }
+              return f();
+            })()
+            """, expectInt: 7)
+
+        // Generator frames: .return() runs finally, .throw() lands in catch.
+        evalCheckStr(ctx, """
+            (function(){
+              var o = [];
+              function* g(){ var l = {}; try { yield 1; yield 2; } finally { o.push("fin"); } }
+              var it = g(); it.next(); it.return(9);
+              function* g2(){ var l = {}; try { yield 1; } catch(e) { return "c:" + e; } }
+              var it2 = g2(); it2.next();
+              return o.join() + "/" + it2.throw("z").value;
+            })()
+            """, expect: "fin/c:z")
+
+        // Code after a non-empty catch body still runs.
+        evalCheckStr(ctx, """
+            (function(){
+              function g(){ throw new Error("x"); }
+              function f(){ var o = {p:1}; g(); }
+              var n = 0, after = 0;
+              try { f(); } catch(e) { n = 1; }
+              after = 2;
+              return n + ":" + after;
+            })()
+            """, expect: "1:2")
+
+        // The stack pointer is restored exactly: 2000 caught throws in a loop.
+        evalCheck(ctx, """
+            (function(){
+              function g(){ throw new Error("x"); }
+              function f(a, b, c){ var o = {p:1}; g(a, b, c); }
+              var s = 0;
+              for (var i = 0; i < 2000; i++) { try { f(i, i+1, i+2); } catch(e) { s++; } }
+              return s;
+            })()
+            """, expectInt: 2000)
+
+        // Throw with partially evaluated operands left on the stack.
+        evalCheckStr(ctx, """
+            (function(){
+              function g(){ throw new Error("x"); }
+              function f(){ var o = {}; return 1 + 2 * g(); }
+              try { return "a" + f(); } catch(e) { return "caught"; }
+            })()
+            """, expect: "caught")
+
+        // Throw while evaluating an argument of a pending call.
+        evalCheckStr(ctx, """
+            (function(){
+              function g(){ throw new Error("arg"); }
+              function f(a, b){ var o = {}; return a + b; }
+              try { f(1, g()); } catch(e) { return e.message; }
+              return "not thrown";
+            })()
+            """, expect: "arg")
+
+        // Throw from a frame with a live arguments object.
+        evalCheckStr(ctx, """
+            (function(){
+              function g(){ throw new Error("ag"); }
+              function f(){ var o = {}; var a = arguments; g.apply(null, a); }
+              try { f(1, 2, 3); } catch(e) { return e.message; }
+              return "not thrown";
+            })()
+            """, expect: "ag")
+
+        // Throw out of a constructor frame.
+        evalCheckStr(ctx, """
+            (function(){
+              function C(){ var o = {}; throw new Error("ctor"); }
+              try { new C(); } catch(e) { return e.message; }
+              return "not thrown";
+            })()
+            """, expect: "ctor")
+
+        // Unwind 50 recursive inline frames at once.
+        evalCheckStr(ctx, """
+            (function(){
+              function f(n){ var o = {n:n}; if (n === 0) throw new Error("deep"); return f(n - 1); }
+              try { f(50); } catch(e) { return e.message; }
+              return "not thrown";
+            })()
+            """, expect: "deep")
+    }
 
     mutating func testErrorHandling() {
         let (rt, ctx) = makeCtx()

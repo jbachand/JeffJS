@@ -361,5 +361,26 @@ final class EngineTests: XCTestCase {
                               "\(name): 200k tail calls with a materialised `arguments` grew RSS by \(grewMB) MB")
         }
     }
+
+    /// The qjs shell `print` global must reach the console sink.
+    ///
+    /// Regression: JeffJS only ever registered `std.print`, so the DOM globals
+    /// polyfill's browser stub (`window.print = function() {}`) was the only
+    /// `print` on the global object. Any qjs-style script whose output goes
+    /// through `print(...)` produced no output and exit status 0 -- it looked
+    /// exactly like the engine had stopped executing mid-script.
+    @MainActor
+    func testGlobalPrintReachesConsoleSink() {
+        let env = JeffJSEnvironment(configuration: .init())
+        var lines: [String] = []
+        env.onConsoleMessage = { _, msg in lines.append(msg) }
+        switch env.eval("print(\"s=\" + 5); print.name + \":\" + print.length") {
+        case .success(let s):
+            XCTAssertEqual(s, "print:1", "global print should be the qjs shell print, not window.print")
+        case .exception(let msg):
+            XCTFail("print() threw: \(msg)")
+        }
+        XCTAssertEqual(lines, ["s=5"], "print() must write to the console sink")
+    }
 }
 
