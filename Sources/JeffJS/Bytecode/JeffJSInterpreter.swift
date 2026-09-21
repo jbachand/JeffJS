@@ -804,7 +804,11 @@ extension JeffJSContext {
         defer { funcVal.freeValue() }
         let protoObj = newObject()
         _ = setPropertyStr(obj: protoObj, name: "constructor", value: funcVal.dupValue())
-        _ = setPropertyStr(obj: funcVal, name: "prototype", value: protoObj)
+        // An ordinary function's `prototype` is writable but neither
+        // enumerable nor configurable (ES2023 10.2.5).
+        _ = definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
+                                value: protoObj, flags: JS_PROP_WRITABLE)
+        protoObj.freeValue()   // defineProperty dup'd it; drop our creation ref
     }
 
     // MARK: - Atom Helpers
@@ -1710,9 +1714,10 @@ extension JeffJSContext {
         let isSetter = (flags & 4) != 0
         // Bit 3: define the property non-enumerable. Class members are not
         // enumerable (ES2022 ClassDefinitionEvaluation); object-literal
-        // methods are.
-        let baseFlags = (flags & 8) != 0
-            ? (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE) : JS_PROP_C_W_E
+        // methods are. Bit 4: the class's own `prototype`, which on top of
+        // that is non-writable and non-configurable (ES2023 15.7.14).
+        let baseFlags = (flags & 16) != 0 ? 0
+            : ((flags & 8) != 0 ? (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE) : JS_PROP_C_W_E)
         if isGetter || isSetter {
             return defineProperty(obj: obj, atom: atom, value: .JS_UNDEFINED,
                                   getter: isGetter ? funcVal : .JS_UNDEFINED,
@@ -1729,9 +1734,9 @@ extension JeffJSContext {
                               flags: Int) -> Bool {
         let isGetter = (flags & 2) != 0
         let isSetter = (flags & 4) != 0
-        // Bit 3: non-enumerable (a class member; see defineMethod).
-        let baseFlags = (flags & 8) != 0
-            ? (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE) : JS_PROP_C_W_E
+        // Bits 3/4: non-enumerable / class `prototype` (see defineMethod).
+        let baseFlags = (flags & 16) != 0 ? 0
+            : ((flags & 8) != 0 ? (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE) : JS_PROP_C_W_E)
         if key.isString, let str = key.stringValue {
             let atom = rt.findAtom(str.toSwiftString())
             let result: Bool
@@ -1789,9 +1794,12 @@ extension JeffJSContext {
             }
         }
 
-        // Set constructor.prototype = proto
-        _ = setProperty(obj: ctor, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
-                        value: proto.dupValue())
+        // Set constructor.prototype = proto. A class's `prototype` is
+        // { writable: false, enumerable: false, configurable: false }
+        // (ES2023 15.7.14 step 12); a plain `setProperty` left it writable
+        // and configurable.
+        _ = definePropertyValue(obj: ctor, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
+                                value: proto, flags: 0)
         // Set proto.constructor = ctor
         _ = setProperty(obj: proto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
                         value: ctor.dupValue())

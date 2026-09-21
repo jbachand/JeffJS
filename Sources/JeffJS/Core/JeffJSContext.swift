@@ -4273,17 +4273,19 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                     return 1
                 }
                 // No setter defined — silently fail in non-strict, throw in strict
-                if (flags & JS_PROP_THROW) != 0 {
-                    _ = throwTypeError(message: "Cannot set property which has only a getter")
-                }
                 value.freeValue()
+                if (flags & JS_PROP_THROW) == 0 { return 0 }
+                _ = throwTypeError(message: "Cannot set property which has only a getter")
                 return -1
             }
             if !exFlags.contains(.writable) {
-                if (flags & JS_PROP_THROW) != 0 {
-                    _ = throwTypeError(message: "Cannot assign to read only property")
-                }
                 value.freeValue()
+                // A sloppy-mode write to a non-writable property is a no-op,
+                // not an error: -1 made the caller report whatever exception
+                // happened to be pending (`o.a = 2` on a frozen object came
+                // back as a stale "document is not defined" ReferenceError).
+                if (flags & JS_PROP_THROW) == 0 { return 0 }
+                _ = throwTypeError(message: "Cannot assign to read only property")
                 return -1
             }
             // Update the value in place (hot path: direct trivial write)
@@ -4308,10 +4310,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                         return 1
                     }
                     // Inherited accessor with no setter
-                    if (flags & JS_PROP_THROW) != 0 {
-                        _ = throwTypeError(message: "Cannot set property which has only a getter")
-                    }
                     value.freeValue()
+                    if (flags & JS_PROP_THROW) == 0 { return 0 }
+                    _ = throwTypeError(message: "Cannot set property which has only a getter")
                     return -1
                 }
                 // Found a data property on prototype — stop walking, create own property below
@@ -4322,10 +4323,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
 
         // Check extensibility
         if !jsObj.extensible {
-            if (flags & JS_PROP_THROW) != 0 {
-                _ = throwTypeError(message: "Cannot add property, object is not extensible")
-            }
             value.freeValue()
+            if (flags & JS_PROP_THROW) == 0 { return 0 }
+            _ = throwTypeError(message: "Cannot add property, object is not extensible")
             return -1
         }
 

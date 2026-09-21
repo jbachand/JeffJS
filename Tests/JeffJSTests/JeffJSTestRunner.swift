@@ -2608,6 +2608,32 @@ extension JeffJSTestRunner {
         evalCheckBool(ctx, "(function(){ var s = Symbol('x'); if (s) { return true; } return false; })()",
                       expect: true)
 
+        // A class's `prototype` is non-writable, non-enumerable and
+        // non-configurable; an ordinary function's is writable only.
+        evalCheckBool(ctx, """
+            var d = Object.getOwnPropertyDescriptor(class {}, 'prototype');
+            d.writable === false && d.enumerable === false && d.configurable === false
+            """, expect: true)
+        evalCheckBool(ctx, """
+            class K {}
+            var d = Object.getOwnPropertyDescriptor(K.prototype, 'constructor');
+            d.writable === true && d.enumerable === false && d.configurable === true
+            """, expect: true)
+        evalCheckBool(ctx, """
+            var d = Object.getOwnPropertyDescriptor(function(){}, 'prototype');
+            d !== undefined && d.writable === true && d.enumerable === false && d.configurable === false
+            """, expect: true)
+        evalCheckBool(ctx, "(function(){}).hasOwnProperty('prototype')", expect: true)
+        // Sloppy-mode writes to a non-writable property are a silent no-op,
+        // not an error.
+        evalCheckBool(ctx, """
+            class L {}
+            var before = L.prototype;
+            L.prototype = 5;
+            L.prototype === before
+            """, expect: true)
+        evalCheckBool(ctx, "var fr = Object.freeze({a:1}); fr.a = 2; fr.a === 1", expect: true)
+
         _ = rt
     }
 
