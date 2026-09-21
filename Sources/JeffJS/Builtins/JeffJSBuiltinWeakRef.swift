@@ -152,7 +152,9 @@ func js_weakref_constructor(
         return JeffJSValue.makeObject(obj)
     }
 
-    let weakRef = JeffJSWeakRef(target: targetObj)
+    // Registered with the runtime so that freeing the target (by refcount or
+    // by the cycle collector) clears this cell — see weakrefFree.
+    let weakRef = weakrefNew(ctx.rt, targetObj)
     let data = JSWeakRefData(weakRef: weakRef, target: target)
     obj.payload = JeffJSObjectPayload.opaque(data)
 
@@ -415,7 +417,7 @@ func js_finrec_register(
 
     // Create a weak reference to the target.
     if let targetObj = target.toObject() {
-        entry.weakRef = JeffJSWeakRef(target: targetObj)
+        entry.weakRef = weakrefNew(ctx.rt, targetObj)
     }
 
     // Append to the registry's entry list.

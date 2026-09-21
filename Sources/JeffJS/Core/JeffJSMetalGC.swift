@@ -96,11 +96,12 @@ final class JeffJSMetalGC {
         var headerToIndex = [ObjectIdentifier: UInt32]()
         headerToIndex.reserveCapacity(objectCount)
 
-        for (i, hdr) in rt.gcObjects.enumerated() {
-            headerToIndex[ObjectIdentifier(hdr)] = UInt32(i)
+        for (i, u) in rt.gcObjects.enumerated() {
+            headerToIndex[ObjectIdentifier(u.takeUnretainedValue())] = UInt32(i)
         }
 
-        for hdr in rt.gcObjects {
+        for u in rt.gcObjects {
+            let hdr = u.takeUnretainedValue()
             let childOffset = UInt32(children.count)
 
             // Enumerate children (replicates markChildren logic)
@@ -242,25 +243,37 @@ final class JeffJSMetalGC {
 
         // Remove dead objects from gcObjects and collect them for freeing.
         // Walk in reverse to preserve indices during removal.
-        var remaining = [JeffJSGCObjectHeader]()
+        var remaining = ContiguousArray<Unmanaged<JeffJSGCObjectHeader>>()
         remaining.reserveCapacity(objectCount - deadCount)
 
-        for (i, hdr) in rt.gcObjects.enumerated() {
-            if deadIndexSet.contains(i) {
+        for (i, u) in rt.gcObjects.enumerated() {
+            let hdr = u.takeUnretainedValue()
+            if deadIndexSet.contains(i),
+               hdr.gcObjType == .jsObject || hdr.gcObjType == .functionBytecode
+                || hdr.gcObjType == .varRef {
+                // Unlinked by hand, so the malloc accounting the GC threshold
+                // reads must be done here too (see gcUnlistDead).
                 hdr.gcListIndex = -1
+                rt.mallocState.mallocSize -= JeffJSConfig.gcObjectCost
+                rt.mallocState.mallocCount -= 1
                 deadHeaders.append(hdr)
             } else {
                 hdr.gcListIndex = remaining.count
-                remaining.append(hdr)
+                remaining.append(u)
             }
         }
         rt.gcObjects = remaining
 
-        // Free each dead object (set refcount to 1 so freeGCObject doesn't re-enqueue)
-        for hdr in deadHeaders {
-            hdr.refCount = 1
-            freeGCObject(rt, hdr)
-        }
+        // Free each dead object (set refcount to 1 so freeGCObject doesn't
+        // re-enqueue). REMOVE_CYCLES defers every nested zero transition onto
+        // gcZeroRefCountObjects instead of freeing it here: a dead child freed
+        // by its dead parent would otherwise be freed a second time by this
+        // loop, releasing its ARC retain twice.
+        let savedPhase = rt.gcPhase
+        rt.gcPhase = .JS_GC_PHASE_REMOVE_CYCLES
+        rt.gcCyclesFreed += deadHeaders.count
+        gcFreeDeadObjects(rt, deadHeaders)
+        rt.gcPhase = savedPhase
     }
 
     // MARK: - Metal initialization

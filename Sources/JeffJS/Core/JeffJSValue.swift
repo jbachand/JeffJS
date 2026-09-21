@@ -655,6 +655,18 @@ struct JeffJSValue {
         return JeffJSValue(bits: _objectTag | UInt64(UInt(bitPattern: raw)))
     }
 
+    /// A **borrowed** JeffJSValue for an object the caller already holds:
+    /// no ARC retain and no refcount increment, so it must not be released.
+    /// `mkPtr(tag: .object, ptr:)` is the wrong tool for this — it takes an
+    /// ARC retain that the JS refcount knows nothing about, so a matching
+    /// `freeValue()` decrements a reference that was never added (that is how
+    /// `F.prototype` came to be collected while `F` was still a global).
+    @inline(__always)
+    static func borrowedObject(_ obj: JeffJSObject) -> JeffJSValue {
+        let raw = Unmanaged.passUnretained(obj).toOpaque()
+        return JeffJSValue(bits: _objectTag | UInt64(UInt(bitPattern: raw)))
+    }
+
     /// Value for an object taken from the recycle pool: it still carries the
     /// Swift retain of its original makeObject, so no new retain here.
     @inline(__always)

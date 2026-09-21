@@ -522,6 +522,17 @@ nonisolated class JeffJSGCObjectHeader {
         self.ownerRuntime = JeffJSGCObjectHeader.activeRuntime
     }
 
+    /// The runtime's GC lists hold *unretained* pointers (see
+    /// `JeffJSRuntime.gcObjects`), so anything that reaches ARC deallocation
+    /// while still listed would leave a dangling entry for the next
+    /// collection to walk. Every JS object leaves the list through
+    /// `freeGCObjectChildren` or the recycle pool, but a detached var-ref is
+    /// owned purely by ARC from the closures that captured it: when the last
+    /// closure goes, this is the only unlink there is.
+    deinit {
+        if gcListIndex != -1, let rt = ownerRuntime { removeGCObject(rt, self) }
+    }
+
     @discardableResult
     func retain() -> Self {
         refCount += 1
@@ -897,7 +908,22 @@ final class JeffJSVarRef: JeffJSGCObjectHeader {
     /// released when the last closure lets go. The GC path clears `value`
     /// after releasing it, so this never double-frees.
     deinit { if isDetached, !value.isUndefined { value.freeValue() } }
-    var isDetached: Bool
+    /// A live var-ref reads through its parent frame, which is a GC root, so
+    /// it takes no part in cycle detection. Detaching copies the value into
+    /// `value` and the only things left holding the var-ref are closures,
+    /// arguments objects and suspended generators — all of them GC objects,
+    /// so from here on it is a node in the graph (quickjs does the same in
+    /// `close_var_refs`: `add_gc_object(..., JS_GC_OBJ_TYPE_VAR_REF)`).
+    /// Its `refCount` is not maintained incrementally — nothing counts a
+    /// var-ref reference — so the collector recomputes it each run; see
+    /// `gcSeedVarRefs`.
+    var isDetached: Bool {
+        didSet {
+            if isDetached, !oldValue, gcListIndex == -1, let rt = ownerRuntime {
+                addGCObject(rt, self)
+            }
+        }
+    }
     var isArg: Bool
     var varIdx: UInt16
 
@@ -1397,6 +1423,30 @@ final class JeffJSObject: JeffJSGCObjectHeader {
                   gcObjType: JSGCObjectTypeEnum = .jsObject,
                   mark: Bool = false) {
         super.init(refCount: refCount, gcObjType: gcObjType, mark: mark)
+        // Every JS object joins the runtime's GC list, as quickjs's
+        // JS_NewObjectFromShape does with add_gc_object(): reference counting
+        // alone can never reclaim `o.self = o`, a parent <-> child tree or a
+        // closure captured by the instance it closes over. The recycle pool
+        // takes objects back off the list (see jeffJS_recycleObject).
+        // Objects built while the intrinsics are being installed are not
+        // tracked. They are the engine's roots (prototypes, constructors, the
+        // global object), and during init `freeValueSlow` deliberately lets
+        // refcounts fall to zero without freeing — "objects are context-scoped
+        // and freed by context.free()" — so their counts do not describe
+        // reachability and the collector must not judge them. Leaving them off
+        // the list also makes every one of their property edges an uncounted
+        // root edge, which is exactly right: whatever a global or a prototype
+        // still points at is reachable.
+        if let rt = ownerRuntime, rt.initComplete {
+            addGCObject(rt, self)
+            // quickjs calls js_trigger_gc here, before the object is wired
+            // into the graph: `self` is already listed with refCount 1, so a
+            // collection triggered now cannot reclaim it.
+            if rt.mallocState.mallocSize >= rt.mallocGCThreshold,
+               rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain {
+                runGC(rt)
+            }
+        }
     }
 
     deinit { propValues.deallocateStorage() }
@@ -1409,7 +1459,7 @@ extension JeffJSObject {
     @inline(__always) var isPoolable: Bool {
         classID == JeffJSClassID.object.rawValue && !isExotic && !fastArray && !isProtectedGlobal
             && !hasImmutablePrototype && !isHTMLDDA && !isStdArrayPrototype && !isConstructor
-            && firstWeakRef == nil && propExtra.isEmpty && gcListIndex == -1
+            && firstWeakRef == nil && propExtra.isEmpty
             && _fastArrayValues == nil && storedPrimitiveValue.isUndefined && fbFast == nil
     }
 }

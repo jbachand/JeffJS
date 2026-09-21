@@ -341,6 +341,27 @@ public final class JeffJSEnvironment {
         _ = runtime.executePendingJobs()
     }
 
+    // MARK: - Garbage collection
+
+    /// Run a full collection now: reference counting plus the cycle collector
+    /// (`o.self = o`, parent <-> child trees, an instance and the closure that
+    /// captured it). Normally triggered automatically when the live heap grows
+    /// past the GC threshold; call this to reclaim a page's object graph at a
+    /// navigation boundary, or from a memory-pressure handler.
+    public func runGC() {
+        runtime.runGC()
+    }
+
+    /// Collector counters: how many collections have run, how many objects
+    /// they reclaimed as unreachable cycles, how many objects are on the GC
+    /// list now, and the accounted heap size against the threshold that
+    /// triggers the next collection.
+    public var gcStatistics: (runs: Int, cyclesFreed: Int, liveObjects: Int,
+                              heapBytes: Int, threshold: Int) {
+        (runtime.gcRuns, runtime.gcCyclesFreed, runtime.gcObjects.count,
+         runtime.mallocState.mallocSize, runtime.mallocGCThreshold)
+    }
+
     // MARK: - Layout Geometry
 
     /// Pushes document-coordinate layout rects (keyed by `DOMNode.id`) and the
