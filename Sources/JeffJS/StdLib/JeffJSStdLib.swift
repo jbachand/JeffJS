@@ -108,6 +108,7 @@ struct JeffJSStdLib {
     /// from quickjs-libc.c.
     static func addIntrinsics(ctx: JeffJSContext) {
         addConsole(ctx: ctx)
+        addPrint(ctx: ctx)
         addTimers(ctx: ctx)
         addPerformance(ctx: ctx)
         addTextCodec(ctx: ctx)
@@ -115,6 +116,31 @@ struct JeffJSStdLib {
         addStructuredClone(ctx: ctx)
         addMicrotask(ctx: ctx)
         addBase64(ctx: ctx)
+    }
+
+    // MARK: - Shell `print` Helper
+
+    /// Register the global `print` function.
+    /// Mirrors the `print` global installed by `js_std_add_helpers` in
+    /// quickjs-libc.c: it writes its space-separated arguments plus a newline
+    /// and is independent of `console.group` indentation.
+    ///
+    /// This must run before the DOM polyfills, which only install the
+    /// browser's no-op `window.print` when the global is still undefined.
+    /// Without it, `print("x")` -- the standard qjs shell idiom -- silently
+    /// did nothing under JeffJS.
+    static func addPrint(ctx: JeffJSContext) {
+        let global = ctx.getGlobalObject()
+        ctx.setPropertyFunc(obj: global, name: "print", fn: globalPrint, length: 1)
+    }
+
+    /// print(...args)
+    /// Arguments are borrowed (Round 9 convention): the caller releases them.
+    static func globalPrint(ctx: JeffJSContext, this: JeffJSValue,
+                            args: [JeffJSValue]) -> JeffJSValue {
+        let msg = formatConsoleArgs(ctx: ctx, args: args)
+        emitConsole(ctx: ctx, level: "log", message: msg)
+        return .undefined
     }
 
     // MARK: - Console Module
