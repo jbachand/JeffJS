@@ -10274,6 +10274,18 @@ extension JeffJSTestRunner {
         // super() constructs the parent with new.target: builtin parents
         // allocate the right class and use the subclass prototype.
         evalCheckStr(ctx, "class E extends Error {}; new E('m').message", expect: "m")
+        // RegExp.prototype must stay alive: it was stored into both classProto
+        // and RegExp.prototype without a dup, so it hit refcount zero, returned
+        // to the object pool and was recycled, wiping every regexp method and
+        // accessor (cl.pattern.source became undefined after a deep clone).
+        evalCheckBool(ctx, """
+            var r = /a<mem>b/;
+            var seen = r instanceof RegExp;
+            typeof RegExp.prototype.test === 'function' &&
+            typeof RegExp.prototype.exec === 'function' &&
+            Object.getOwnPropertyNames(RegExp.prototype).length > 0 &&
+            seen && r.source === 'a<mem>b' && String(r) === '/a<mem>b/'
+            """, expect: true)
         // \xNN escapes above 0x7F must be UTF-8 encoded into the literal buffer
         // (a raw byte made the whole literal decode to "": threes.day's 347 KB
         // JSON literal with \xe1 evaluated to an empty string).
