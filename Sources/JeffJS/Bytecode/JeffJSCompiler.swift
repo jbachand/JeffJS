@@ -92,6 +92,13 @@ struct JeffJSBytecodeVarDef {
 /// then the compiler resolves variables and labels to produce final bytecode.
 /// Mirrors `JSFunctionDef` in QuickJS.
 class JeffJSFunctionDefCompiler {
+    /// Local slots holding the object of each enclosing `with` statement in
+    /// THIS function, outermost first. Non-empty only while a `with` body is
+    /// being parsed; a nested function starts with an empty stack, so its
+    /// identifiers resolve normally (`with` bindings are not visible to
+    /// closures, a known divergence from QuickJS).
+    var withVarStack: [Int] = []
+
     // -- Parent linkage --
     weak var parent: JeffJSFunctionDefCompiler?
     var childFunctions: [JeffJSFunctionDefCompiler] = []

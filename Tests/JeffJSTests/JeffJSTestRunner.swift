@@ -10490,6 +10490,34 @@ extension JeffJSTestRunner {
             class B1 { m() { return 1; } } class D1 extends B1 {}
             new D1().m() === 1 && Object.getPrototypeOf(D1) === B1
             """, expect: true)
+
+        // --- 7. with statement ------------------------------------------
+        // `with` parsed but emitted nothing: the body resolved identifiers
+        // as if the object were not there.
+        evalCheck(ctx, "var wo = { q: 5 }; (function () { with (wo) { return q; } })()", expectInt: 5)
+        evalCheckStr(ctx, """
+            var wo2 = { q: 5 }; var wq = 1;
+            (function () { with (wo2) { q = 7; } })(); wo2.q + '/' + wq
+            """, expect: "7/1")
+        evalCheckStr(ctx, """
+            var wo3 = {}; var wq3 = 1;
+            (function () { with (wo3) { wq3 = 7; } })(); (wo3.wq3 === undefined) + '/' + wq3
+            """, expect: "true/7")
+        evalCheck(ctx, "var wa = { a: 1 }; var wb = 2; (function () { with (wa) { return a + wb; } })()", expectInt: 3)
+        evalCheck(ctx, """
+            var w1 = { a: 1 }, w2 = { b: 2 };
+            (function () { with (w1) { with (w2) { return a + b; } } })()
+            """, expectInt: 3)
+        evalCheck(ctx, "var wi = { a: 1 }; with (wi) { a++; } wi.a", expectInt: 2)
+        evalCheck(ctx, "var wf = { f: function () { return 42; } }; (function () { with (wf) { return f(); } })()", expectInt: 42)
+        // Prototype properties are in scope; `var` still declares in the function.
+        evalCheck(ctx, "var wp = Object.create({ inh: 7 }); (function () { with (wp) { return inh; } })()", expectInt: 7)
+        evalCheckStr(ctx, "var wv = {}; (function () { with (wv) { var z9 = 9; } return z9 + '/' + (wv.z9 === undefined); })()",
+                     expect: "9/true")
+        evalCheckStr(ctx, "var wt = { n: 1 }; (function () { with (wt) { return typeof n; } })()", expect: "number")
+        evalCheckException(ctx, """
+            (0, eval)('function wsf() { "use strict"; with ({}) {} }')
+            """)
     }
 
     mutating func runAPITests() -> String {

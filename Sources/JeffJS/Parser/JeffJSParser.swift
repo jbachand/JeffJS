@@ -179,6 +179,7 @@ final class JeffJSParser {
     }
     var finallyScopes: [FinallyScope] = []
 
+
     // -- Expression parsing flags --
     var inFlag: Bool = true          // allow 'in' in relational expressions
     /// Set to true after parsing 'super' as a primary expression so that
@@ -576,16 +577,64 @@ final class JeffJSParser {
     }
 
     /// Emit a scope_get_var opcode (to be resolved by the compiler later).
+    ///
+    /// Inside a `with` body the access becomes a guarded property read on the
+    /// with object (one per enclosing `with`, innermost first) with the
+    /// ordinary scope resolution as the fallback.
     func emitScopeGetVar(_ atom: JSAtom, scopeLevel: Int) {
         noteArgumentsUse(atom)
+        if !fd.withVarStack.isEmpty && atom != JSPredefinedAtom.this_.rawValue {
+            let done = newLabel()
+            for withIdx in fd.withVarStack.reversed() {
+                let miss = newLabel()
+                emitOp(.get_loc); emitU16(UInt16(withIdx))   // [obj]
+                emitOp(.dup)                                  // [obj, obj]
+                emitOp(.push_atom_value); emitAtom(atom)      // [obj, obj, key]
+                emitOp(.swap)                                 // [obj, key, obj]
+                emitOp(.in_)                                  // [obj, hasProp]
+                emitIfFalse(miss)                             // [obj]
+                emitGetField(atom)                            // [value]
+                emitGoto(done)
+                emitLabel(miss)
+                emitOp(.drop)                                 // []
+            }
+            emitOp(.scope_get_var)
+            emitAtom(atom)
+            emitU16(UInt16(scopeLevel))
+            emitLabel(done)
+            return
+        }
         emitOp(.scope_get_var)
         emitAtom(atom)
         emitU16(UInt16(scopeLevel))
     }
 
-    /// Emit a scope_put_var opcode.
+    /// Emit a scope_put_var opcode. See emitScopeGetVar for the `with` form;
+    /// the value to store is already on the stack.
     func emitScopePutVar(_ atom: JSAtom, scopeLevel: Int) {
         noteArgumentsUse(atom)
+        if !fd.withVarStack.isEmpty && atom != JSPredefinedAtom.this_.rawValue {
+            let done = newLabel()
+            for withIdx in fd.withVarStack.reversed() {
+                let miss = newLabel()
+                emitOp(.get_loc); emitU16(UInt16(withIdx))   // [v, obj]
+                emitOp(.dup)                                  // [v, obj, obj]
+                emitOp(.push_atom_value); emitAtom(atom)      // [v, obj, obj, key]
+                emitOp(.swap)                                 // [v, obj, key, obj]
+                emitOp(.in_)                                  // [v, obj, hasProp]
+                emitIfFalse(miss)                             // [v, obj]
+                emitOp(.swap)                                 // [obj, v]
+                emitPutField(atom)                            // []
+                emitGoto(done)
+                emitLabel(miss)
+                emitOp(.drop)                                 // [v]
+            }
+            emitOp(.scope_put_var)
+            emitAtom(atom)
+            emitU16(UInt16(scopeLevel))
+            emitLabel(done)
+            return
+        }
         emitOp(.scope_put_var)
         emitAtom(atom)
         emitU16(UInt16(scopeLevel))
@@ -2441,15 +2490,18 @@ final class JeffJSParser {
         emitOp(.to_object)
 
         let scopeIdx = pushScope()
-        // The with object is stored as a special variable that the scope_*
-        // opcodes check against
-        let withVarIdx = defineVar(getAtom("*with*"), varKind: JSVarDefEnum.JS_VAR_DEF_WITH.rawValue)
-        _ = withVarIdx
+        // The with object lives in a local slot for the body's duration.
+        // Every identifier access inside the body is emitted as a guarded
+        // property access on it (emitScopeGetVar / emitScopePutVar) with the
+        // ordinary scope resolution as the fallback.
+        let withVarIdx = defineVar(getAtom("*with*"))
+        emitOp(.put_loc); emitU16(UInt16(withVarIdx))
+        fd.withVarStack.append(withVarIdx)
 
         parseStatement()
 
+        fd.withVarStack.removeLast()
         popScope(scopeIdx)
-        emitOp(.drop) // drop the with object
     }
 
     // MARK: Debugger Statement
