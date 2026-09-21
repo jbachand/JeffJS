@@ -5508,6 +5508,9 @@ struct JeffJSTypeConvert {
             return false
         }
         if val.isObject { return true }
+        // Symbols are truthy — ToBoolean is false only for the seven falsy
+        // values, and `Symbol.iterator ? 1 : 0` used to take the else branch.
+        if val.isSymbol { return true }
         return false
     }
 

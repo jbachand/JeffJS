@@ -1457,6 +1457,11 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         if val.isObject {
             return true  // all objects are truthy
         }
+        // Symbols are truthy: ToBoolean yields false only for the seven
+        // falsy values.
+        if val.isSymbol {
+            return true
+        }
         return false
     }
 

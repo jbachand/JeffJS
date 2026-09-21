@@ -2601,6 +2601,13 @@ extension JeffJSTestRunner {
         evalCheckBool(ctx, "Object.getOwnPropertyDescriptor({z: undefined}, 'nope') === undefined",
                       expect: true)
 
+        // ToBoolean(symbol) is true — only the seven falsy values are false.
+        evalCheck(ctx, "Symbol.iterator ? 1 : 0", expectInt: 1)
+        evalCheckBool(ctx, "!!Symbol()", expect: true)
+        evalCheckBool(ctx, "!Symbol.iterator", expect: false)
+        evalCheckBool(ctx, "(function(){ var s = Symbol('x'); if (s) { return true; } return false; })()",
+                      expect: true)
+
         _ = rt
     }
 
