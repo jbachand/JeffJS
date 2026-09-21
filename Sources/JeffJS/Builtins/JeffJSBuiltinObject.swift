@@ -1415,9 +1415,15 @@ struct JeffJSBuiltinObject {
 
         var obj = ctx.toObject(this)
         if obj.isException { return obj }
+        // Every value below is owned: the ToObject result, each prototype the
+        // walk steps onto, the property key and each descriptor object. The
+        // walk used to drop all of them, so one __lookupGetter__ pinned the
+        // whole prototype chain it crossed.
+        defer { ctx.freeValue(obj) }
 
         let key = ctx.toPropertyKey(prop)
         if key.isException { return key }
+        defer { ctx.freeValue(key) }
 
         // Walk the prototype chain
         while true {
@@ -1425,6 +1431,7 @@ struct JeffJSBuiltinObject {
             if desc.isException { return desc }
 
             if !desc.isUndefined {
+                defer { ctx.freeValue(desc) }
                 let getter = ctx.getProperty(obj: desc, atom: JSAtomID.get)
                 if getter.isException { return getter }
                 if !getter.isUndefined {
@@ -1440,6 +1447,7 @@ struct JeffJSBuiltinObject {
             if proto.isNull {
                 return .undefined
             }
+            ctx.freeValue(obj)
             obj = proto
         }
     }
@@ -1451,9 +1459,15 @@ struct JeffJSBuiltinObject {
 
         var obj = ctx.toObject(this)
         if obj.isException { return obj }
+        // Every value below is owned: the ToObject result, each prototype the
+        // walk steps onto, the property key and each descriptor object. The
+        // walk used to drop all of them, so one __lookupGetter__ pinned the
+        // whole prototype chain it crossed.
+        defer { ctx.freeValue(obj) }
 
         let key = ctx.toPropertyKey(prop)
         if key.isException { return key }
+        defer { ctx.freeValue(key) }
 
         // Walk the prototype chain
         while true {
@@ -1461,6 +1475,7 @@ struct JeffJSBuiltinObject {
             if desc.isException { return desc }
 
             if !desc.isUndefined {
+                defer { ctx.freeValue(desc) }
                 let setter = ctx.getProperty(obj: desc, atom: JSAtomID.set)
                 if setter.isException { return setter }
                 if !setter.isUndefined {
@@ -1474,6 +1489,7 @@ struct JeffJSBuiltinObject {
             if proto.isNull {
                 return .undefined
             }
+            ctx.freeValue(obj)
             obj = proto
         }
     }

@@ -2634,6 +2634,22 @@ extension JeffJSTestRunner {
             """, expect: true)
         evalCheckBool(ctx, "var fr = Object.freeze({a:1}); fr.a = 2; fr.a === 1", expect: true)
 
+        // __lookupGetter__/__lookupSetter__ walk the prototype chain.
+        evalCheckBool(ctx, """
+            var base = { get gg(){ return 1; } };
+            var child = Object.create(base);
+            typeof child.__lookupGetter__('gg') === 'function' &&
+              child.__lookupGetter__('nope') === undefined &&
+              child.__lookupSetter__('gg') === undefined
+            """, expect: true)
+        evalCheck(ctx, """
+            var b2 = { get v(){ return 7; } };
+            var c2 = Object.create(Object.create(b2));
+            var n = 0;
+            for (var i = 0; i < 50; i++) { if (c2.__lookupGetter__('v')) n++; }
+            n
+            """, expectInt: 50)
+
         _ = rt
     }
 
