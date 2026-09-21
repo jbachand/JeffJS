@@ -210,6 +210,7 @@ struct JeffJSTestRunner {
             ("Generators", { $0.testGenerators() }),
             ("Promises", { $0.testPromises() }),
             ("AsyncAwait", { $0.testAsyncAwait() }),
+            ("AsyncOwnership", { $0.testAsyncOwnership() }),
             ("RegExp", { $0.testRegExp() }),
             ("JSON", { $0.testJSON() }),
             ("Map", { $0.testMap() }),
@@ -1861,6 +1862,258 @@ extension JeffJSTestRunner {
             }
             af10() instanceof Promise
             """, expect: true)
+    }
+
+
+    // MARK: - Async Ownership (suspended-state lifetime)
+
+    /// What a suspended `await` owns. The saved async state is the only thing
+    /// that keeps the function object, its `this`, its arguments, its locals,
+    /// its value stack and the awaited promise alive while the function is
+    /// parked: the call expression's temporaries are gone by the time the
+    /// continuation runs. Each case here resumed into freed memory before the
+    /// state took its own references (QuickJS: async_func_init / async_func_free).
+    mutating func testAsyncOwnership() {
+        let (rt, ctx) = makeCtx()
+        _ = rt
+
+        // Fresh deferred: [promise, resolve, reject] with nothing else holding it.
+        let defer_ = """
+            function ao_defer() { var d = []; d[0] = new Promise(function(res, rej){ d[1] = res; d[2] = rej; }); return d; }
+            """
+        evalCheckBool(ctx, defer_ + "typeof ao_defer === 'function'", expect: true)
+
+        // --- The async function object's ONLY reference is the call temporary ---
+        evalCheck(ctx, """
+            var ao_out = [];
+            var ao_d1 = ao_defer();
+            (async () => { ao_out.push("A" + (await ao_d1[0])); })();
+            ao_d1[1](1);
+            ao_out.length
+            """, expectInt: 0)
+        _ = ctx.rt.executePendingJobs()
+        evalCheckStr(ctx, "ao_out.join()", expect: "A1")
+
+        // --- ...and with allocation churn between the suspension and the resume ---
+        evalCheck(ctx, """
+            var ao_out2 = [];
+            var ao_d2 = ao_defer();
+            (async () => { ao_out2.push("B" + (await ao_d2[0])); })();
+            var ao_junk = null;
+            for (var i = 0; i < 20000; i++) { ao_junk = { i: i, a: [i], s: "x" + (i & 15) }; }
+            ao_d2[1](2);
+            ao_out2.length
+            """, expectInt: 0)
+        _ = ctx.rt.executePendingJobs()
+        evalCheckStr(ctx, "ao_out2.join()", expect: "B2")
+
+        // --- Temporaries live on the value stack across the await ---
+        evalCheck(ctx, """
+            var ao_out3 = [];
+            var ao_d3 = ao_defer();
+            var ao_join = function(a, b) { return a + ":" + b; };
+            (async () => { ao_out3.push(ao_join("C", await ao_d3[0])); ao_out3.push(1 + (await 2)); })();
+            ao_d3[1](3);
+            0
+            """, expectInt: 0)
+        _ = ctx.rt.executePendingJobs()
+        evalCheckStr(ctx, "ao_out3.join()", expect: "C:3,3")
+
+        // --- Arguments and `this` survive the suspension ---
+        evalCheck(ctx, """
+            var ao_out4 = [];
+            var ao_d4 = ao_defer();
+            var ao_obj = { tag: "T", async m(x, y) { var v = await ao_d4[0]; return this.tag + x + y + v; } };
+            ao_obj.m("x", "y").then(function(s){ ao_out4.push(s); });
+            ao_obj = null;
+            ao_d4[1](4);
+            ao_out4.length
+            """, expectInt: 0)
+        _ = ctx.rt.executePendingJobs()
+        evalCheckStr(ctx, "ao_out4.join()", expect: "Txy4")
+
+        // --- Locals and a closure over them survive the suspension ---
+        evalCheck(ctx, """
+            var ao_out5 = [];
+            var ao_d5 = ao_defer();
+            (async () => {
+                var n = 5;
+                var bump = function(){ n += 1; return n; };
+                var v = await ao_d5[0];
+                bump();
+                ao_out5.push("n" + n + v);
+            })();
+            ao_d5[1]("!");
+            0
+            """, expectInt: 0)
+        _ = ctx.rt.executePendingJobs()
+        evalCheckStr(ctx, "ao_out5.join()", expect: "n6!")
+
+        // --- The rejection reason reaches the catch (not undefined) ---
+        evalCheck(ctx, """
+            var ao_out6 = [];
+            var ao_d6 = ao_defer();
+            (async () => {
+                try { await ao_d6[0]; ao_out6.push("no-throw"); }
+                catch (e) { ao_out6.push("caught:" + e); }
+                ao_out6.push("after");
+            })();
+            ao_d6[2]("E6");
+            0
+            """, expectInt: 0)
+        _ = ctx.rt.executePendingJobs()
+        evalCheckStr(ctx, "ao_out6.join()", expect: "caught:E6,after")
+
+        // --- A throw after the resume rejects the function's own promise ---
+        evalCheck(ctx, """
+            var ao_out7 = [];
+            var ao_d7 = ao_defer();
+            (async () => { await ao_d7[0]; throw new Error("boom"); })()
+                .catch(function(e){ ao_out7.push("rej:" + e.message); });
+            ao_d7[1](7);
+            0
+            """, expectInt: 0)
+        _ = ctx.rt.executePendingJobs()
+        evalCheckStr(ctx, "ao_out7.join()", expect: "rej:boom")
+
+        // --- Nested: the inner function is resumed while the outer resumes ---
+        evalCheck(ctx, """
+            var ao_out8 = [];
+            var ao_d8 = ao_defer();
+            var ao_d8b = ao_defer();
+            async function ao_inner() { return "in" + (await ao_d8b[0]); }
+            async function ao_outer() { var pi = ao_inner(); await ao_d8[0]; return "out+" + (await pi); }
+            ao_outer().then(function(s){ ao_out8.push(s); });
+            ao_d8b[1]("B");
+            ao_d8[1]("A");
+            0
+            """, expectInt: 0)
+        _ = ctx.rt.executePendingJobs()
+        evalCheckStr(ctx, "ao_out8.join()", expect: "out+inB")
+
+        // --- The same activation suspends again and again ---
+        evalCheck(ctx, """
+            var ao_out9 = [];
+            (async () => {
+                var t = 0;
+                for (var i = 0; i < 50; i++) { t += await Promise.resolve(i); }
+                ao_out9.push(t);
+            })();
+            0
+            """, expectInt: 0)
+        _ = ctx.rt.executePendingJobs()
+        evalCheck(ctx, "ao_out9[0]", expectInt: 1225)
+
+        // --- Promise.all over IIFEs that each suspend ---
+        evalCheck(ctx, """
+            var ao_out10 = [];
+            var ao_rs = [];
+            var ao_ps = [];
+            for (var i = 0; i < 100; i++) {
+                (function(k){
+                    var p = new Promise(function(r){ ao_rs.push(r); });
+                    ao_ps.push((async () => { return (await p) + k; })());
+                })(i);
+            }
+            for (var j = 0; j < ao_rs.length; j++) ao_rs[j](1);
+            Promise.all(ao_ps).then(function(vs){ ao_out10.push(vs.reduce(function(a,b){ return a+b; }, 0)); });
+            ao_rs.length = 0; ao_ps.length = 0;
+            0
+            """, expectInt: 0)
+        _ = ctx.rt.executePendingJobs()
+        evalCheck(ctx, "ao_out10[0]", expectInt: 5050)
+
+        // --- 2000 parked activations resumed from one drain (no native recursion) ---
+        evalCheck(ctx, """
+            var ao_sum = 0;
+            var ao_rs2 = [];
+            for (var i = 0; i < 2000; i++) {
+                (function(){
+                    var p = new Promise(function(r){ ao_rs2.push(r); });
+                    (async () => { var v = await p; ao_sum += v; })();
+                })();
+            }
+            for (var j = 0; j < ao_rs2.length; j++) ao_rs2[j](2);
+            ao_rs2.length = 0;
+            ao_sum
+            """, expectInt: 0)
+        _ = ctx.rt.executePendingJobs()
+        evalCheck(ctx, "ao_sum", expectInt: 4000)
+
+        // --- An async function parked forever is simply never resumed ---
+        evalCheck(ctx, """
+            var ao_out11 = [];
+            var ao_d11 = ao_defer();
+            (async () => { ao_out11.push(await ao_d11[0]); })();
+            ao_d11 = null;
+            var ao_junk2 = null;
+            for (var i = 0; i < 20000; i++) { ao_junk2 = { i: i }; }
+            ao_out11.length
+            """, expectInt: 0)
+        _ = ctx.rt.executePendingJobs()
+        evalCheck(ctx, "ao_out11.length", expectInt: 0)
+
+        // --- await on an already-settled promise still returns its value ---
+        evalCheck(ctx, """
+            var ao_out12 = [];
+            (async () => { ao_out12.push(await Promise.resolve(12)); ao_out12.push(await 13); })();
+            0
+            """, expectInt: 0)
+        _ = ctx.rt.executePendingJobs()
+        evalCheckStr(ctx, "ao_out12.join()", expect: "12,13")
+
+        // --- The result promise can be chained after the resume ---
+        evalCheck(ctx, """
+            var ao_out13 = [];
+            var ao_d13 = ao_defer();
+            (async () => { return (await ao_d13[0]) * 2; })()
+                .then(function(v){ return v + 1; })
+                .then(function(v){ ao_out13.push(v); });
+            ao_d13[1](20);
+            0
+            """, expectInt: 0)
+        _ = ctx.rt.executePendingJobs()
+        evalCheck(ctx, "ao_out13[0]", expectInt: 41)
+
+        // --- for await over a mix of promises and plain values ---
+        evalCheck(ctx, """
+            var ao_out14 = [];
+            var ao_d14 = ao_defer();
+            (async () => {
+                var t = 0;
+                for await (var v of [Promise.resolve(1), 2, ao_d14[0]]) t += v;
+                ao_out14.push(t);
+            })();
+            ao_d14[1](3);
+            0
+            """, expectInt: 0)
+        _ = ctx.rt.executePendingJobs()
+        evalCheck(ctx, "ao_out14[0]", expectInt: 6)
+
+        // --- Async generators keep their own frame (never the caller's state) ---
+        evalCheck(ctx, """
+            var ao_out15 = [];
+            async function* ao_gen() { yield 1; await Promise.resolve(); yield 2; }
+            (async () => { var s = 0; for await (var v of ao_gen()) s += v; ao_out15.push(s); })();
+            0
+            """, expectInt: 0)
+        _ = ctx.rt.executePendingJobs()
+        evalCheck(ctx, "ao_out15[0]", expectInt: 3)
+
+        // --- A resumption that drains jobs re-entrantly keeps its own resolvers ---
+        evalCheck(ctx, """
+            var ao_out16 = [];
+            var ao_d16a = ao_defer();
+            var ao_d16b = ao_defer();
+            async function ao_a() { await ao_d16a[0]; await Promise.resolve(); return "a"; }
+            async function ao_b() { await ao_d16b[0]; return "b"; }
+            Promise.all([ao_a(), ao_b()]).then(function(v){ ao_out16.push(v.join("+")); });
+            ao_d16a[1](1);
+            ao_d16b[1](2);
+            0
+            """, expectInt: 0)
+        _ = ctx.rt.executePendingJobs()
+        evalCheckStr(ctx, "ao_out16.join()", expect: "a+b")
     }
 
     // MARK: - RegExp

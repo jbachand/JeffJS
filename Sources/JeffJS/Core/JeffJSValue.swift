@@ -535,7 +535,6 @@ struct JeffJSValue {
             if jeffJSZombiesEnabled, let obj = hdr as? JeffJSObject, obj.freeMark {
                 JeffJSZombieDebug.reportTouch("FREE", obj)
             }
-            if JeffJSGCObjectHeader.trackRefcounts { JeffJSGCObjectHeader.trackFree(hdr) }
             guard hdr.refCount > 0 else { return }
             // Decrement inline. Only when the count actually reaches zero do we
             // resolve the owning runtime (binding `ownerRuntime` retains the
@@ -543,6 +542,10 @@ struct JeffJSValue {
             // and run the free machinery. The common "decrement a live object"
             // case is now just a single store.
             hdr.refCount -= 1
+            // JEFFJS_TRACK_RC: record the count AFTER the decrement. Recording
+            // it before reported every object that reached zero here as
+            // "leaked rc=1", which hid real leaks in the noise.
+            if JeffJSGCObjectHeader.trackRefcounts { JeffJSGCObjectHeader.trackFree(hdr) }
             if hdr.refCount == 0 {
                 if let rt = hdr.ownerRuntime ?? JeffJSGCObjectHeader.activeRuntime,
                    rt.initComplete {

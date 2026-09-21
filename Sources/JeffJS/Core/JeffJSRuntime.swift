@@ -947,7 +947,16 @@ final class JeffJSRuntime {
     /// - Returns: Number of jobs executed (always >= 0).
     func executePendingJobs() -> Int {
         var jobsExecuted = 0
-        let maxJobs = JeffJSConfig.maxJobsPerDrain
+        // Re-entrancy depth: an async resumption must not start a *new* drain
+        // when one is already running above it — a queue of N ready reactions
+        // would then recurse N native frames deep and blow the stack.
+        jobDrainDepth += 1
+        defer { jobDrainDepth -= 1 }
+        // The outermost drain runs the queue to exhaustion (what every host
+        // means by "drain the microtask queue", and what the old re-entrant
+        // recursion achieved a budget at a time); the per-call budget bounds
+        // the inner drains an `await` on a pending promise starts.
+        let maxJobs = jobDrainDepth > 1 ? JeffJSConfig.maxJobsPerDrain : Int.max
 
         // Flat FIFO with a head cursor: O(1) dequeue, no linear scans
         // (the old list+array pairing scanned both per job — quadratic on
@@ -987,6 +996,9 @@ final class JeffJSRuntime {
 
         return jobsExecuted
     }
+
+    /// Nesting depth of `executePendingJobs` (0 when no drain is running).
+    var jobDrainDepth: Int = 0
 
     /// Returns true if there are pending jobs in the microtask queue.
     /// Mirrors `JS_IsJobPending()` from QuickJS.

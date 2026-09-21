@@ -222,11 +222,20 @@ public final class JeffJSContext: JeffJSTokenizerContext {
 
     /// When an async function's `await` encounters a pending Promise, the
     /// interpreter saves its state here and exits. A `.then()` callback on
-    /// the awaited Promise will later resume execution via `resumeAsyncFunction`.
+    /// the awaited Promise later resumes execution via `resumeAsyncFunction`.
+    ///
+    /// Like QuickJS's
+    /// `JSAsyncFunctionState`, the entry OWNS everything the activation needs to
+    /// run again — the function object, `this`, the saved stack/locals/arguments,
+    /// the result promise's resolve/reject, and the awaited promise — because
+    /// after `await` nothing on the JS side necessarily holds them (an IIFE
+    /// `(async () => ...)()` drops its only reference when the call returns).
+    /// `releaseAsyncEntry` is this state's `async_func_free`.
     struct AsyncSavedEntry {
         var saved: GeneratorSavedState
         var resolve: JeffJSValue   // the async function's Promise resolve
         var reject: JeffJSValue    // the async function's Promise reject
+        var awaited: JeffJSValue = .undefined   // the promise being awaited
     }
     var asyncSavedStates: [Int: AsyncSavedEntry] = [:]
     private var nextAsyncStateID: Int = 1
@@ -250,14 +259,53 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         return id
     }
 
+    /// Release everything a suspended async activation owns (QuickJS
+    /// `async_func_free`). `keepFrame` is true when the activation has been
+    /// handed to the interpreter, which takes over the saved stack, locals and
+    /// arguments; only the references this state added are dropped then.
+    static func releaseAsyncEntry(_ entry: AsyncSavedEntry, keepFrame: Bool) {
+        if !keepFrame {
+            for v in entry.saved.stack { v.freeValue() }
+            for v in entry.saved.varBuf { v.freeValue() }
+            for v in entry.saved.argBuf { v.freeValue() }
+        }
+        entry.saved.funcObj.freeValue()
+        entry.saved.thisVal.freeValue()
+        entry.resolve.freeValue()
+        entry.reject.freeValue()
+        entry.awaited.freeValue()
+    }
+
+    /// Drop every still-suspended async activation (context teardown): their
+    /// awaited promises can never settle, so nothing would ever resume them.
+    func releaseAsyncSavedStates() {
+        let states = asyncSavedStates
+        asyncSavedStates.removeAll()
+        for (_, entry) in states {
+            JeffJSContext.releaseAsyncEntry(entry, keepFrame: false)
+        }
+    }
+
     /// Resume an async function from a saved await suspension.
     /// Called by the `.then()` callback registered on the awaited Promise.
     func resumeAsyncFunction(stateID: Int, value: JeffJSValue, isRejection: Bool) {
         guard let entry = asyncSavedStates.removeValue(forKey: stateID) else { return }
 
-        // Set up context for potential nested await
+        // The entry's references keep the function object, `this` and the
+        // result-promise resolvers alive for the whole resumption; they are
+        // released once it returns (a fresh suspension took its own).
+        // Set up context for potential nested await. These slots are saved and
+        // restored because the resumed body can drain the job queue and resume
+        // ANOTHER async function re-entrantly; without this, the inner
+        // activation's resolvers and suspension flag leaked back out into this
+        // one (wrong promise settled, or this promise never settled at all).
+        let prevResolve = _asyncResolve
+        let prevReject = _asyncReject
+        let prevCapPromise = _asyncCapPromise
+        let prevSuspended = _asyncSuspended
         _asyncResolve = entry.resolve
         _asyncReject = entry.reject
+        _asyncCapPromise = .undefined
         _asyncSuspended = false
 
         let result = JeffJSInterpreter.callInternal(
@@ -267,10 +315,25 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             args: [],
             flags: JS_CALL_FLAG_GENERATOR,
             resumeState: entry.saved,
-            resumeValue: isRejection ? .undefined : value,
+            // The rejection reason IS the resume value: completion type 2 makes
+            // the interpreter throw it at the await. Passing `.undefined` here
+            // made every `catch (e)` after an await see undefined.
+            resumeValue: value,
             resumeCompletionType: isRejection ? 2 : 0)
 
-        if _asyncSuspended {
+        let suspendedAgain = _asyncSuspended
+        _asyncResolve = prevResolve
+        _asyncReject = prevReject
+        _asyncCapPromise = prevCapPromise
+        _asyncSuspended = prevSuspended
+
+        // The interpreter took over the saved stack/locals/arguments (it frees
+        // them at completion or moves them into the next suspension), so only
+        // this state's own references are dropped here — after the call, since
+        // the running activation borrows the function object and `this`.
+        defer { JeffJSContext.releaseAsyncEntry(entry, keepFrame: true) }
+
+        if suspendedAgain {
             // Hit another await — new callbacks already registered, nothing to do
             return
         }
@@ -278,10 +341,16 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         if result.isException {
             let exc = getException()
             _ = call(entry.reject, this: .undefined, args: [exc])
+            exc.freeValue()
         } else {
             _ = call(entry.resolve, this: .undefined, args: [result])
+            result.freeValue()
         }
-        _ = rt.executePendingJobs()
+        // Only drain when nothing above us is draining: this runs from a
+        // reaction job, and the drain that dispatched it picks up the reactions
+        // settling the promise queued just now. Recursing here instead made the
+        // native stack grow with the number of ready continuations.
+        if rt.jobDrainDepth == 0 { _ = rt.executePendingJobs() }
     }
 
     /// Diagnostic: bytecode size from last eval (for debugging pipeline)
@@ -498,6 +567,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
 
         // Free loaded modules
         loadedModules = ListHead()
+
+        // Async functions still suspended at an `await` own a function object,
+        // a `this`, their frame and their resolvers; nothing can resume them now.
+        releaseAsyncSavedStates()
 
         // Decrement refcounts for context-owned values.
         // Actual deallocation is handled by runtime.free() → clearGCState()

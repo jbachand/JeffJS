@@ -6468,6 +6468,10 @@ struct JeffJSInterpreter {
 
         var pc = 0  // program counter (index into bc[])
         var retVal: JeffJSValue = .undefined
+        // Set by the `await_` opcode when THIS activation suspended: its locals
+        // and arguments moved into the saved async state, so the epilogue must
+        // not free them (a nested resume can clobber ctx._asyncSuspended).
+        var asyncSuspendedHere = false
 
         // Mutable copies of parameters for inline call state swapping
         var mFuncObj = funcObj
@@ -10402,16 +10406,25 @@ struct JeffJSInterpreter {
                         // Dup: the promise owns its result; the VM stack takes
                         // its own reference (a borrowed push here over-freed).
                         buf[sp] = promData.promiseResult.dupValue(); sp += 1
+                        val.freeValue()   // the popped awaited promise
                         pc += 1
                     case .rejected:
                         ctx.throwValue(promData.promiseResult.dupValue())
+                        val.freeValue()   // the popped awaited promise
                         retVal = .exception
                         break dispatchLoop
                     case .pending:
                         // Promise still pending (async I/O). Suspend the async
                         // function and register a continuation to resume later.
-                        guard !ctx._asyncResolve.isUndefined else {
-                            // Not inside an async function — fallback
+                        guard !ctx._asyncResolve.isUndefined, !fb.isGenerator else {
+                            // Not inside an async function — fallback.
+                            // Async *generator* bodies are excluded on purpose:
+                            // their frame belongs to the generator object, and
+                            // suspending it through the async-function state
+                            // would hand the enclosing async activation's
+                            // resolve/reject (whatever is in ctx right now) to
+                            // a completely different frame.
+                            val.freeValue()
                             buf[sp] = .undefined; sp += 1
                             pc += 1
                             break
@@ -10429,26 +10442,43 @@ struct JeffJSInterpreter {
                             ctx._asyncReject = cap.reject
                             ctx._asyncCapPromise = cap.promise
                         }
-                        // Capture stack, vars, args from buf
-                        var stackSnap = [JeffJSValue]()
-                        for i in spBase..<sp { stackSnap.append(buf[i]) }
+                        // Capture stack, vars, args from buf. The value stack
+                        // MOVES into the saved state (the slots are cleared and
+                        // sp rewound): the frame epilogue below frees whatever is
+                        // still on the stack, which used to free the temporaries
+                        // the suspended state kept pointing at (`out.push(await p)`).
+                        let stackCount = sp - spBase
+                        var stackSnap = [JeffJSValue](repeating: .undefined, count: stackCount)
+                        for i in 0..<stackCount { stackSnap[i] = buf[spBase + i]; buf[spBase + i] = .undefined }
+                        sp = spBase
                         var varSnap = [JeffJSValue]()
                         for i in 0..<frame.varCount { varSnap.append(buf[varBase + i]) }
                         var argSnap = [JeffJSValue]()
                         for i in 0..<min(varBase, bufCapacity) { argSnap.append(buf[i]) }
                         jeffJS_syncBufToFrame(frame, buf, varBase)
 
+                        // The saved state OWNS the function object and `this`
+                        // (QuickJS: async_func_init dups func_obj/this_obj into
+                        // js_async_function_state). Nothing else keeps them alive
+                        // across the suspension: an IIFE `(async () => ...)()`
+                        // drops the caller's only reference as soon as the call
+                        // returns the promise, so resuming touched a freed (and
+                        // possibly pool-recycled) function object.
                         let saved = GeneratorSavedState(
-                            pc: pc + 1, sp: sp - spBase,
+                            pc: pc + 1, sp: stackCount,
                             stack: stackSnap, varBuf: varSnap,
-                            argBuf: argSnap, funcObj: mFuncObj,
-                            thisVal: frame.thisVal,
+                            argBuf: argSnap, funcObj: mFuncObj.dupValue(),
+                            thisVal: frame.thisVal.dupValue(),
                             capturedVarRefs: frame.liveVarRefs)
 
+                        // The awaited promise moves into the state too: its only
+                        // reference may be the stack temporary popped above, and
+                        // it must outlive the suspension to deliver the reaction.
                         let stateID = ctx.storeAsyncState(JeffJSContext.AsyncSavedEntry(
                             saved: saved,
                             resolve: ctx._asyncResolve.dupValue(),
-                            reject: ctx._asyncReject.dupValue()))
+                            reject: ctx._asyncReject.dupValue(),
+                            awaited: val))
 
                         // Native continuation: no JS function objects per await.
                         JeffJSBuiltinPromise.performPromiseThen(
@@ -10461,6 +10491,7 @@ struct JeffJSInterpreter {
                             })
 
                         ctx._asyncSuspended = true
+                        asyncSuspendedHere = true
                         retVal = .undefined
                         break dispatchLoop
                     }
@@ -10486,19 +10517,28 @@ struct JeffJSInterpreter {
                         case .fulfilled:
                             // Dup: the promise owns its result (borrowed push over-freed)
                             buf[sp] = tpData.promiseResult.dupValue(); sp += 1
+                            val.freeValue()   // the popped thenable
+                            tempPromise.freeValue()
                         case .rejected:
                             ctx.throwValue(tpData.promiseResult.dupValue())
+                            val.freeValue()   // the popped thenable
+                            tempPromise.freeValue()
                             retVal = .exception
                             break dispatchLoop
                         case .pending:
                             buf[sp] = .undefined; sp += 1
+                            val.freeValue()   // the popped thenable
+                            tempPromise.freeValue()
                         }
                     } else {
                         // Fallback: push the original value
                         buf[sp] = val; sp += 1
+                        tempPromise.freeValue()
                     }
+                    thenMethod.freeValue()
                 } else {
                     // Not a thenable: await on non-Promise is identity.
+                    thenMethod.freeValue()
                     buf[sp] = val; sp += 1
                 }
                 pc += 1
@@ -11683,6 +11723,14 @@ struct JeffJSInterpreter {
                   let genObj = generatorObject.toObject(),
                   case .generatorData(let genData) = genObj.payload,
                   genData.state == .executing {
+            var i = 0
+            while i < spBase { buf[i].freeValue(); i += 1 }
+        } else if fb.isAsyncFunc, !fb.isGenerator, !frame.hasLiveVarRefs,
+                  !asyncSuspendedHere {
+            // The async function ran to completion (either without ever
+            // suspending or on its last resumption): it owns its arguments
+            // (jeffJS_calleeTakesArgs) and its locals, and the saved state that
+            // handed them back on resume is gone.
             var i = 0
             while i < spBase { buf[i].freeValue(); i += 1 }
         }
