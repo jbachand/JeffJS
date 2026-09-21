@@ -40,12 +40,16 @@ final class JeffJSStorageBridge {
         let global = ctx.getGlobalObject()
         let storageObj = ctx.newPlainObject()
 
-        // get(namespace, key) -> string | ""
+        // get(namespace, key) -> string | null
+        // NOTE: a missing key MUST return JS `null` (not ""), matching JavaScriptCore
+        // and the Web Storage spec: `JSON.parse(localStorage.getItem(k))` on a missing
+        // key must yield null rather than throwing "unexpected end of data".
+        // A stored empty string still returns "".
         ctx.setPropertyFunc(obj: storageObj, name: "get", fn: { [weak self] ctx, thisVal, args in
-            guard let self else { return ctx.newStringValue("") }
+            guard let self else { return JeffJSValue.null }
             let ns = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
             let key = self.extractString(ctx: ctx, args: args, index: 1) ?? ""
-            let value = self.get(ns, key) ?? ""
+            guard let value = self.get(ns, key) else { return JeffJSValue.null }
             return ctx.newStringValue(value)
         }, length: 2)
 
