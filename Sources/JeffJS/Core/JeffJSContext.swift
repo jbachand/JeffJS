@@ -140,9 +140,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// object built with that count, then every later one is put on the
     /// shape directly and its slots appended, instead of paying N + 3
     /// property adds through the transition table.
-    /// Transition shapes for `arguments` objects, keyed by
-    /// (argc << 16) | (mappedCount << 1) | mapped.
-    var argumentsShapes: [Int: JeffJSShape] = [:]
+    /// Transition shapes for `arguments` objects, indexed by
+    /// argc * 18 + mappedCount * 2 + (mapped ? 1 : 0) for argc, mappedCount <= 8.
+    var argumentsShapes: [JeffJSShape?] = Array(repeating: nil, count: 9 * 18)
     /// Array.prototype.values — cached because it's also used as %ArrayIteratorPrototype%[@@iterator].
     var arrayProtoValues: JeffJSValue
     /// Array.prototype.push — cached object pointer for interpreter fast-path identity check.

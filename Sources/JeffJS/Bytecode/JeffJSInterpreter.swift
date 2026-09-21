@@ -647,8 +647,8 @@ extension JeffJSContext {
                                : JeffJSClassID.arguments.rawValue
             let iterFn: JeffJSValue = arrayProtoValues.isFunction ? arrayProtoValues.dupValue() : .undefined
             let fixedCount = 3   // length, callee, @@iterator (both kinds)
-            let shapeKey = (argc << 16) | (mappedCount << 1) | (mapped ? 1 : 0)
-            if argc <= 8,
+            let shapeKey = argc * 18 + mappedCount * 2 + (mapped ? 1 : 0)
+            if argc <= 8, mappedCount <= 8,
                let shape = argumentsShapes[shapeKey],
                shape.isHashed, shape.propCount == argc + fixedCount,
                o.propValues.count == 0, let old = o.shape {
@@ -701,7 +701,7 @@ extension JeffJSContext {
             }
             _ = definePropertyValue(obj: argsObj, atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue,
                                     value: iterFn, flags: wc)
-            if argc <= 8, let sh = o.shape, sh.isHashed,
+            if argc <= 8, mappedCount <= 8, let sh = o.shape, sh.isHashed,
                sh.propCount == argc + fixedCount, o.propValues.count == sh.propCount {
                 sh.refCount += 1   // the context keeps the shape alive
                 argumentsShapes[shapeKey] = sh
@@ -6106,6 +6106,7 @@ struct JeffJSInterpreter {
         // one static-let accessor per call shows up at 250k calls/sec.
         let rt = ctx.rt
         let traceOps = rt.cfgTraceOpcodes
+        let traceLast = jeffJSTraceLast   // register copy: read per opcode below
         let inlineCallsEnabled = rt.cfgUseInlineCalls
         let traceHitThreshold = rt.cfgTraceHitThreshold
 
@@ -6226,7 +6227,7 @@ struct JeffJSInterpreter {
         /// (their refs move, exactly as the old copy-based path did).
 
         // ---- Generator resumption: restore saved state ----
-        if var saved = resumeState {
+        if let saved = resumeState {
             pc = saved.pc
             // Restore varBuf/argBuf from saved state
             frame.varBuf = saved.varBuf
@@ -6271,7 +6272,6 @@ struct JeffJSInterpreter {
                     frame.liveVarRefs.append(vr)
                     frame.hasLiveVarRefs = true
                 }
-                saved.capturedVarRefs = []
             }
 
             // Result object produced by advancing a `yield*` delegated
@@ -6529,7 +6529,8 @@ struct JeffJSInterpreter {
             opcodeCount += 1
             #endif
 
-            if jeffJSTraceLast { jeffJS_recordLastOp(fb, pc, bc[pc], sp - spBase) }
+            if traceOps || traceLast {
+            if traceLast { jeffJS_recordLastOp(fb, pc, bc[pc], sp - spBase) }
             if traceOps {
                 var extra = ""
                 if op == .put_loc || op == .put_loc0 || op == .put_loc1 || op == .put_loc2 || op == .put_loc3
@@ -6556,6 +6557,7 @@ struct JeffJSInterpreter {
                 }
                 if op == .return_ && sp > spBase { extra = " TOS=bits=0x\(String(buf[sp-1].bits, radix: 16))/\(buf[sp-1].toInt32())" }
                 print("[TRACE] pc=\(pc) op=\(op) sp=\(sp)\(extra)")
+            }
             }
 
             #if DEBUG
