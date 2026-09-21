@@ -153,6 +153,7 @@ enum JeffJSFetchBodyExtractor {
     ///   * `{ __blobParts: [...], type }`      -> concatenated parts, `type`
     ///   * `{ __formEntries: [...] }`          -> multipart/form-data
     ///   * `{ __urlSearchParams: "a=b&c=d" }`  -> form-urlencoded
+    ///   * URLSearchParams (`{ __uspEntries: [[k,v], ...] }`) -> form-urlencoded
     ///   * anything else                        -> `String(value)`
     static func extract(ctx: JeffJSContext, value: JeffJSValue) -> JeffJSFetchBodyData? {
         if value.isUndefined || value.isNull { return nil }
@@ -168,6 +169,17 @@ enum JeffJSFetchBodyExtractor {
         }
 
         if value.isObject {
+            // The engine's own URLSearchParams: an array of [name, value]
+            // pairs under `__uspEntries`. Serialise it here rather than
+            // letting it fall through to String(value).
+            let uspEntries = ctx.getPropertyStr(obj: value, name: JeffJSStdLib.uspEntriesSlot)
+            defer { uspEntries.freeValue() }
+            if uspEntries.isObject {
+                let query = JeffJSStdLib.uspSerialize(JeffJSStdLib.uspReadEntries(ctx, value))
+                return JeffJSFetchBodyData(
+                    bytes: Array(query.utf8),
+                    contentType: "application/x-www-form-urlencoded;charset=UTF-8")
+            }
             // FormData-like: `__formEntries`, or the host app's `_entries`
             // ([{ name, value, filename }]).
             let entries = ctx.getPropertyStr(obj: value, name: "__formEntries")
@@ -248,7 +260,11 @@ enum JeffJSFetchBodyExtractor {
             } else if part.isObject {
                 let nested = ctx.getPropertyStr(obj: part, name: "__blobParts")
                 defer { nested.freeValue() }
-                if nested.isObject {
+                let altNested = ctx.getPropertyStr(obj: part, name: "parts")
+                defer { altNested.freeValue() }
+                let nestedParts: JeffJSValue? = nested.isObject ? nested
+                    : (altNested.isObject && looksLikeBlob(ctx: ctx, part) ? altNested : nil)
+                if let nested = nestedParts {
                     out.append(contentsOf: blobBytes(ctx: ctx, parts: nested))
                 } else {
                     out.append(contentsOf: Array((ctx.toSwiftString(part) ?? "").utf8))
@@ -302,7 +318,14 @@ enum JeffJSFetchBodyExtractor {
             } else if valueVal.isObject {
                 let parts = ctx.getPropertyStr(obj: valueVal, name: "__blobParts")
                 defer { parts.freeValue() }
-                if parts.isObject {
+                // The host app's Blob keeps its pieces in `parts` (guarded by
+                // the Blob-ish `size`/`type` fields, as `extract` does), so a
+                // file part built from one is not sent as "[object Object]".
+                let altParts = ctx.getPropertyStr(obj: valueVal, name: "parts")
+                defer { altParts.freeValue() }
+                let blobPartList: JeffJSValue? = parts.isObject ? parts
+                    : (altParts.isObject && looksLikeBlob(ctx: ctx, valueVal) ? altParts : nil)
+                if let parts = blobPartList {
                     partBytes = blobBytes(ctx: ctx, parts: parts)
                     if partType.isEmpty {
                         let bt = ctx.getPropertyStr(obj: valueVal, name: "type")

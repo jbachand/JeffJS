@@ -887,154 +887,514 @@ struct JeffJSStdLib {
             return ctx.throwTypeError("Failed to construct 'URL': Invalid URL")
         }
 
-        // Build the URL object
+        // Build the URL object. `search` and `href` are accessors over the
+        // live `searchParams`, so a mutation there shows up immediately — and
+        // no back-pointer is needed (a url <-> params cycle would never be
+        // collected, object cycles are not traced).
         let obj = ctx.newPlainObject()
+        urlPopulate(ctx: ctx, obj: obj, url: url, components: components)
 
-        let absoluteString = url.absoluteString
-        _ = ctx.setPropertyStr(obj: obj, name: "href",
-                               value: JeffJSValue.makeString(JeffJSString(swiftString: absoluteString)))
-        _ = ctx.setPropertyStr(obj: obj, name: "origin",
-                               value: JeffJSValue.makeString(JeffJSString(swiftString: "\(components.scheme ?? "")://\(components.host ?? "")\(components.port.map { ":\($0)" } ?? "")")))
-        _ = ctx.setPropertyStr(obj: obj, name: "protocol",
-                               value: JeffJSValue.makeString(JeffJSString(swiftString: (components.scheme ?? "") + ":")))
-        _ = ctx.setPropertyStr(obj: obj, name: "host",
-                               value: JeffJSValue.makeString(JeffJSString(swiftString: components.host ?? "")))
-        _ = ctx.setPropertyStr(obj: obj, name: "hostname",
-                               value: JeffJSValue.makeString(JeffJSString(swiftString: components.host ?? "")))
-        _ = ctx.setPropertyStr(obj: obj, name: "port",
-                               value: JeffJSValue.makeString(JeffJSString(swiftString: components.port.map(String.init) ?? "")))
-        _ = ctx.setPropertyStr(obj: obj, name: "pathname",
-                               value: JeffJSValue.makeString(JeffJSString(swiftString: components.path)))
-        _ = ctx.setPropertyStr(obj: obj, name: "search",
-                               value: JeffJSValue.makeString(JeffJSString(swiftString: components.query.map { "?\($0)" } ?? "")))
-        _ = ctx.setPropertyStr(obj: obj, name: "hash",
-                               value: JeffJSValue.makeString(JeffJSString(swiftString: components.fragment.map { "#\($0)" } ?? "")))
-        _ = ctx.setPropertyStr(obj: obj, name: "username",
-                               value: JeffJSValue.makeString(JeffJSString(swiftString: components.user ?? "")))
-        _ = ctx.setPropertyStr(obj: obj, name: "password",
-                               value: JeffJSValue.makeString(JeffJSString(swiftString: components.password ?? "")))
-
-        // toString() returns the href
+        // toString() / toJSON() return the href
         ctx.setPropertyFunc(obj: obj, name: "toString", fn: { ctx, this, _ in
             return ctx.getPropertyStr(obj: this, name: "href")
         }, length: 0)
-
-        // toJSON() returns the href
         ctx.setPropertyFunc(obj: obj, name: "toJSON", fn: { ctx, this, _ in
             return ctx.getPropertyStr(obj: this, name: "href")
         }, length: 0)
 
-        // searchParams property
+        ctx.setPropertyGetSet(obj: obj, atom: ctx.newAtom("search"),
+                              getter: urlSearchGetter, setter: urlSearchSetter)
+        ctx.setPropertyGetSet(obj: obj, atom: ctx.newAtom("href"),
+                              getter: urlHrefGetter, setter: urlHrefSetter)
+        return obj
+    }
+
+    /// Href minus query and fragment; `href` is rebuilt from this plus the
+    /// live search and hash.
+    static let urlBaseSlot = "__urlBase"
+
+    /// Fill in the plain data fields of a URL object (everything but the
+    /// `search`/`href` accessors, which are installed once by the ctor).
+    private static func urlPopulate(ctx: JeffJSContext, obj: JeffJSValue,
+                                    url: URL, components: URLComponents) {
+        func put(_ name: String, _ value: String) {
+            _ = ctx.setPropertyStr(obj: obj, name: name, value: ctx.newStringValue(value))
+        }
+        var base = url.absoluteString
+        if let h = base.firstIndex(of: "#") { base = String(base[..<h]) }
+        if let q = base.firstIndex(of: "?") { base = String(base[..<q]) }
+
+        put(urlBaseSlot, base)
+        put("origin", "\(components.scheme ?? "")://\(components.host ?? "")\(components.port.map { ":\($0)" } ?? "")")
+        put("protocol", (components.scheme ?? "") + ":")
+        put("host", components.host ?? "")
+        put("hostname", components.host ?? "")
+        put("port", components.port.map(String.init) ?? "")
+        put("pathname", components.path)
+        put("hash", components.fragment.map { "#\($0)" } ?? "")
+        put("username", components.user ?? "")
+        put("password", components.password ?? "")
+
         let searchParams = buildSearchParams(ctx: ctx, query: components.query ?? "")
         _ = ctx.setPropertyStr(obj: obj, name: "searchParams", value: searchParams)
+    }
 
-        return obj
+    /// `url.search` — serialised from the live searchParams.
+    static func urlSearchGetter(ctx: JeffJSContext, this: JeffJSValue,
+                                args: [JeffJSValue]) -> JeffJSValue {
+        let sp = ctx.getPropertyStr(obj: this, name: "searchParams")
+        defer { sp.freeValue() }
+        guard sp.isObject else { return ctx.newStringValue("") }
+        let query = uspSerialize(uspReadEntries(ctx, sp))
+        return ctx.newStringValue(query.isEmpty ? "" : "?" + query)
+    }
+
+    static func urlSearchSetter(ctx: JeffJSContext, this: JeffJSValue,
+                                args: [JeffJSValue]) -> JeffJSValue {
+        let sp = ctx.getPropertyStr(obj: this, name: "searchParams")
+        defer { sp.freeValue() }
+        guard sp.isObject else { return .undefined }
+        let raw = args.count >= 1 ? (ctx.toSwiftString(args[0]) ?? "") : ""
+        uspWriteEntries(ctx, sp, uspParse(raw))
+        return .undefined
+    }
+
+    /// `url.href` — base + live search + hash.
+    static func urlHrefGetter(ctx: JeffJSContext, this: JeffJSValue,
+                              args: [JeffJSValue]) -> JeffJSValue {
+        let baseVal = ctx.getPropertyStr(obj: this, name: urlBaseSlot)
+        defer { baseVal.freeValue() }
+        let searchVal = urlSearchGetter(ctx: ctx, this: this, args: [])
+        defer { searchVal.freeValue() }
+        let hashVal = ctx.getPropertyStr(obj: this, name: "hash")
+        defer { hashVal.freeValue() }
+        return ctx.newStringValue((ctx.toSwiftString(baseVal) ?? "")
+                                  + (ctx.toSwiftString(searchVal) ?? "")
+                                  + (ctx.toSwiftString(hashVal) ?? ""))
+    }
+
+    static func urlHrefSetter(ctx: JeffJSContext, this: JeffJSValue,
+                              args: [JeffJSValue]) -> JeffJSValue {
+        guard args.count >= 1 else { return .undefined }
+        let str = ctx.toSwiftString(args[0]) ?? ""
+        guard let url = URL(string: str),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: true) else {
+            return .undefined
+        }
+        urlPopulate(ctx: ctx, obj: this, url: url, components: components)
+        return .undefined
+    }
+
+    // MARK: - URLSearchParams
+    //
+    // The entry list lives in an internal `__uspEntries` slot as an array of
+    // [name, value] pairs. It is deliberately NOT called `_entries`: the host
+    // app's FormData polyfill uses that name for a different shape
+    // ([{ name, value }]), and the fetch bridge sniffs request bodies by
+    // shape, so a URLSearchParams body was being sent as multipart/form-data.
+
+    /// Internal slot names.
+    static let uspEntriesSlot = "__uspEntries"
+    /// `application/x-www-form-urlencoded` decoding: `+` is a space and
+    /// `%XX` escapes are UTF-8 bytes.
+    static func uspFormDecode(_ s: String) -> String {
+        var bytes: [UInt8] = []
+        var it = Array(s.utf8)
+        var i = 0
+        while i < it.count {
+            let b = it[i]
+            if b == UInt8(ascii: "+") {
+                bytes.append(UInt8(ascii: " "))
+                i += 1
+            } else if b == UInt8(ascii: "%"), i + 2 < it.count,
+                      let hi = hexDigitValue(it[i + 1]), let lo = hexDigitValue(it[i + 2]) {
+                bytes.append(hi << 4 | lo)
+                i += 3
+            } else {
+                bytes.append(b)
+                i += 1
+            }
+        }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    private static func hexDigitValue(_ b: UInt8) -> UInt8? {
+        switch b {
+        case UInt8(ascii: "0")...UInt8(ascii: "9"): return b - UInt8(ascii: "0")
+        case UInt8(ascii: "a")...UInt8(ascii: "f"): return b - UInt8(ascii: "a") + 10
+        case UInt8(ascii: "A")...UInt8(ascii: "F"): return b - UInt8(ascii: "A") + 10
+        default: return nil
+        }
+    }
+
+    /// `application/x-www-form-urlencoded` serialisation (WHATWG URL 5.2):
+    /// space becomes `+`, `*-._` and alphanumerics stay, everything else is
+    /// percent-encoded from its UTF-8 bytes.
+    static func uspFormEncode(_ s: String) -> String {
+        var out = ""
+        for b in Array(s.utf8) {
+            switch b {
+            case UInt8(ascii: "0")...UInt8(ascii: "9"),
+                 UInt8(ascii: "a")...UInt8(ascii: "z"),
+                 UInt8(ascii: "A")...UInt8(ascii: "Z"),
+                 UInt8(ascii: "*"), UInt8(ascii: "-"), UInt8(ascii: "."), UInt8(ascii: "_"):
+                out.append(Character(UnicodeScalar(b)))
+            case UInt8(ascii: " "):
+                out.append("+")
+            default:
+                out += String(format: "%%%02X", Int(b))
+            }
+        }
+        return out
+    }
+
+    /// Parse `a=1&a=2&b=%20x` (a leading `?` is ignored) into name/value pairs.
+    static func uspParse(_ query: String) -> [(String, String)] {
+        var stripped = query
+        if stripped.hasPrefix("?") { stripped.removeFirst() }
+        if stripped.isEmpty { return [] }
+        var out: [(String, String)] = []
+        for pair in stripped.split(separator: "&", omittingEmptySubsequences: true) {
+            let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            let name = uspFormDecode(String(parts[0]))
+            let value = parts.count > 1 ? uspFormDecode(String(parts[1])) : ""
+            out.append((name, value))
+        }
+        return out
+    }
+
+    static func uspSerialize(_ entries: [(String, String)]) -> String {
+        entries.map { uspFormEncode($0.0) + "=" + uspFormEncode($0.1) }.joined(separator: "&")
+    }
+
+    /// Read the internal entry list.
+    static func uspReadEntries(_ ctx: JeffJSContext, _ this: JeffJSValue) -> [(String, String)] {
+        let arr = ctx.getPropertyStr(obj: this, name: uspEntriesSlot)
+        defer { arr.freeValue() }
+        guard arr.isObject else { return [] }
+        var out: [(String, String)] = []
+        let len = Int(ctx.getArrayLength(arr))
+        for i in 0..<max(0, len) {
+            let pair = ctx.getPropertyByIndex(obj: arr, index: UInt32(i))
+            defer { pair.freeValue() }
+            guard pair.isObject else { continue }
+            let k = ctx.getPropertyByIndex(obj: pair, index: 0)
+            defer { k.freeValue() }
+            let v = ctx.getPropertyByIndex(obj: pair, index: 1)
+            defer { v.freeValue() }
+            out.append((ctx.toSwiftString(k) ?? "", ctx.toSwiftString(v) ?? ""))
+        }
+        return out
+    }
+
+    /// Replace the internal entry list and push the result into the owning URL.
+    static func uspWriteEntries(_ ctx: JeffJSContext, _ this: JeffJSValue,
+                                _ entries: [(String, String)]) {
+        let arr = ctx.newArray()
+        for (i, e) in entries.enumerated() {
+            let pair = ctx.newArray()
+            ctx.setPropertyByIndex(obj: pair, index: 0, value: ctx.newStringValue(e.0))
+            ctx.setPropertyByIndex(obj: pair, index: 1, value: ctx.newStringValue(e.1))
+            ctx.setPropertyByIndex(obj: arr, index: UInt32(i), value: pair)
+        }
+        _ = ctx.setPropertyStr(obj: this, name: uspEntriesSlot, value: arr)
     }
 
     /// Build a URLSearchParams object from a query string.
     private static func buildSearchParams(ctx: JeffJSContext, query: String) -> JeffJSValue {
-        let obj = ctx.newPlainObject()
-        var entries: [(String, String)] = []
+        return makeSearchParams(ctx: ctx, entries: uspParse(query))
+    }
 
-        // Parse query string
-        let stripped = query.hasPrefix("?") ? String(query.dropFirst()) : query
-        if !stripped.isEmpty {
-            for pair in stripped.split(separator: "&", omittingEmptySubsequences: false) {
-                let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-                let key = String(parts[0]).removingPercentEncoding ?? String(parts[0])
-                let value = parts.count > 1 ? (String(parts[1]).removingPercentEncoding ?? String(parts[1])) : ""
-                entries.append((key, value))
-            }
-        }
+    /// Slot on the global holding the shared URLSearchParams method table.
+    static let uspProtoSlot = "__uspProto"
 
-        // Store entries as internal data
-        let entriesArray = ctx.newArray()
-        for (i, (key, value)) in entries.enumerated() {
+    /// The prototype every URLSearchParams instance in this context shares.
+    /// Hanging all fifteen methods off each instance cost fifteen function
+    /// objects per construction and leaked every one of them (setPropertyFunc
+    /// defines through definePropertyValue, which dups the value rather than
+    /// consuming it). Returns an owned reference.
+    private static func uspPrototype(ctx: JeffJSContext) -> JeffJSValue {
+        let global = ctx.getGlobalObject()
+        defer { global.freeValue() }
+        let cached = ctx.getPropertyStr(obj: global, name: uspProtoSlot)
+        if cached.isObject { return cached }
+        cached.freeValue()
+
+        let proto = ctx.newPlainObject()
+        ctx.setPropertyFunc(obj: proto, name: "append", fn: urlSearchParamsAppend, length: 2)
+        ctx.setPropertyFunc(obj: proto, name: "get", fn: urlSearchParamsGet, length: 1)
+        ctx.setPropertyFunc(obj: proto, name: "getAll", fn: urlSearchParamsGetAll, length: 1)
+        ctx.setPropertyFunc(obj: proto, name: "has", fn: urlSearchParamsHas, length: 1)
+        ctx.setPropertyFunc(obj: proto, name: "set", fn: urlSearchParamsSet, length: 2)
+        ctx.setPropertyFunc(obj: proto, name: "delete", fn: urlSearchParamsDelete, length: 1)
+        ctx.setPropertyFunc(obj: proto, name: "sort", fn: urlSearchParamsSort, length: 0)
+        ctx.setPropertyFunc(obj: proto, name: "keys", fn: urlSearchParamsKeys, length: 0)
+        ctx.setPropertyFunc(obj: proto, name: "values", fn: urlSearchParamsValues, length: 0)
+        ctx.setPropertyFunc(obj: proto, name: "entries", fn: urlSearchParamsEntries, length: 0)
+        ctx.setPropertyFunc(obj: proto, name: "forEach", fn: urlSearchParamsForEach, length: 1)
+        ctx.setPropertyFunc(obj: proto, name: "toString", fn: urlSearchParamsToString, length: 0)
+        // The engine maps a symbol key to the atom named after its
+        // description, so this is the real `[Symbol.iterator]` slot.
+        ctx.setPropertyFunc(obj: proto, name: "Symbol.iterator", fn: urlSearchParamsEntries, length: 0)
+        ctx.setPropertyGetSet(obj: proto, atom: ctx.newAtom("size"),
+                              getter: { c, t, _ in .newInt32(Int32(uspReadEntries(c, t).count)) },
+                              setter: { _, _, _ in .undefined })
+
+        let atom = ctx.newAtom(uspProtoSlot)
+        _ = ctx.definePropertyValue(obj: global, atom: atom, value: proto,
+                                    flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+        ctx.rt.freeAtom(atom)
+        return proto
+    }
+
+    /// Build a URLSearchParams object over a ready-made entry list.
+    static func makeSearchParams(ctx: JeffJSContext, entries: [(String, String)]) -> JeffJSValue {
+        let proto = uspPrototype(ctx: ctx)
+        defer { proto.freeValue() }
+        let obj = ctx.newObjectWithProto(proto)
+
+        let arr = ctx.newArray()
+        for (i, e) in entries.enumerated() {
             let pair = ctx.newArray()
-            _ = ctx.setPropertyByIndex(obj: pair, index: 0,
-                                       value: JeffJSValue.makeString(JeffJSString(swiftString: key)))
-            _ = ctx.setPropertyByIndex(obj: pair, index: 1,
-                                       value: JeffJSValue.makeString(JeffJSString(swiftString: value)))
-            _ = ctx.setPropertyByIndex(obj: entriesArray, index: UInt32(i), value: pair)
+            ctx.setPropertyByIndex(obj: pair, index: 0, value: ctx.newStringValue(e.0))
+            ctx.setPropertyByIndex(obj: pair, index: 1, value: ctx.newStringValue(e.1))
+            ctx.setPropertyByIndex(obj: arr, index: UInt32(i), value: pair)
         }
-        _ = ctx.setPropertyStr(obj: obj, name: "_entries", value: entriesArray)
-
-        // get(name) -> first value or null
-        ctx.setPropertyFunc(obj: obj, name: "get", fn: urlSearchParamsGet, length: 1)
-        // has(name) -> boolean
-        ctx.setPropertyFunc(obj: obj, name: "has", fn: urlSearchParamsHas, length: 1)
-        // toString()
-        ctx.setPropertyFunc(obj: obj, name: "toString", fn: urlSearchParamsToString, length: 0)
-
+        _ = ctx.setPropertyStr(obj: obj, name: uspEntriesSlot, value: arr)
         return obj
     }
 
-    /// new URLSearchParams(init?)
+    /// new URLSearchParams(init?) — a query string, another URLSearchParams,
+    /// an iterable of [name, value] pairs, or a plain object.
     static func urlSearchParamsConstructor(ctx: JeffJSContext, this: JeffJSValue,
                                            args: [JeffJSValue]) -> JeffJSValue {
-        let query: String
-        if args.count >= 1 && args[0].isString, let s = args[0].stringValue {
-            query = s.toSwiftString()
-        } else {
-            query = ""
+        guard args.count >= 1, !args[0].isUndefined, !args[0].isNull else {
+            return makeSearchParams(ctx: ctx, entries: [])
         }
-        return buildSearchParams(ctx: ctx, query: query)
+        let initVal = args[0]
+
+        if initVal.isString {
+            return buildSearchParams(ctx: ctx, query: ctx.toSwiftString(initVal) ?? "")
+        }
+
+        if initVal.isObject {
+            // Another URLSearchParams (or anything carrying our slot).
+            let existing = ctx.getPropertyStr(obj: initVal, name: uspEntriesSlot)
+            let isExisting = existing.isObject
+            existing.freeValue()
+            if isExisting {
+                return makeSearchParams(ctx: ctx, entries: uspReadEntries(ctx, initVal))
+            }
+
+            // An iterable of pairs (array of arrays, a Map, ...).
+            let iterFn = ctx.getPropertyStr(obj: initVal, name: "Symbol.iterator")
+            defer { iterFn.freeValue() }
+            if iterFn.isFunction {
+                var entries: [(String, String)] = []
+                let iter = ctx.call(iterFn, this: initVal, args: [])
+                defer { iter.freeValue() }
+                if iter.isException { return .exception }
+                let nextFn = ctx.getPropertyStr(obj: iter, name: "next")
+                defer { nextFn.freeValue() }
+                if nextFn.isFunction {
+                    var guardCount = 0
+                    while guardCount < 1_000_000 {
+                        guardCount += 1
+                        let res = ctx.call(nextFn, this: iter, args: [])
+                        if res.isException { return .exception }
+                        let doneVal = ctx.getPropertyStr(obj: res, name: "done")
+                        let done = ctx.toBool(doneVal)
+                        doneVal.freeValue()
+                        if done { res.freeValue(); break }
+                        let pair = ctx.getPropertyStr(obj: res, name: "value")
+                        res.freeValue()
+                        defer { pair.freeValue() }
+                        let k = ctx.getPropertyByIndex(obj: pair, index: 0)
+                        defer { k.freeValue() }
+                        let v = ctx.getPropertyByIndex(obj: pair, index: 1)
+                        defer { v.freeValue() }
+                        entries.append((ctx.toSwiftString(k) ?? "", ctx.toSwiftString(v) ?? ""))
+                    }
+                    return makeSearchParams(ctx: ctx, entries: entries)
+                }
+            }
+
+            // A plain record: own enumerable string keys.
+            var entries: [(String, String)] = []
+            let keys = ctx.getOwnPropertyNames(initVal, flags: JS_GPN_STRING_MASK)
+            defer { keys.freeValue() }
+            if !keys.isException {
+                let len = Int(ctx.getArrayLength(keys))
+                for i in 0..<max(0, len) {
+                    let key = ctx.getPropertyByIndex(obj: keys, index: UInt32(i))
+                    defer { key.freeValue() }
+                    let val = ctx.getProperty(obj: initVal, key: key)
+                    defer { val.freeValue() }
+                    entries.append((ctx.toSwiftString(key) ?? "", ctx.toSwiftString(val) ?? ""))
+                }
+            }
+            return makeSearchParams(ctx: ctx, entries: entries)
+        }
+
+        return buildSearchParams(ctx: ctx, query: ctx.toSwiftString(initVal) ?? "")
+    }
+
+    private static func uspArgString(_ ctx: JeffJSContext, _ args: [JeffJSValue], _ i: Int) -> String {
+        guard args.count > i else { return "undefined" }
+        return ctx.toSwiftString(args[i]) ?? ""
+    }
+
+    /// URLSearchParams.append(name, value)
+    static func urlSearchParamsAppend(ctx: JeffJSContext, this: JeffJSValue,
+                                      args: [JeffJSValue]) -> JeffJSValue {
+        var entries = uspReadEntries(ctx, this)
+        entries.append((uspArgString(ctx, args, 0), uspArgString(ctx, args, 1)))
+        uspWriteEntries(ctx, this, entries)
+        return .undefined
     }
 
     /// URLSearchParams.get(name) -> string | null
     static func urlSearchParamsGet(ctx: JeffJSContext, this: JeffJSValue,
                                    args: [JeffJSValue]) -> JeffJSValue {
         guard args.count >= 1 else { return .null }
-        let nameStr: String
-        if args[0].isString, let s = args[0].stringValue {
-            nameStr = s.toSwiftString()
-        } else {
-            return .null
-        }
-
-        let entries = ctx.getPropertyStr(obj: this, name: "_entries")
-        if entries.isUndefined { return .null }
-
-        let len = ctx.getArrayLength(entries)
-        for i in 0..<len {
-            let pair = ctx.getPropertyByIndex(obj: entries, index: UInt32(i))
-            let key = ctx.getPropertyByIndex(obj: pair, index: 0)
-            if key.isString, let s = key.stringValue, s.toSwiftString() == nameStr {
-                return ctx.getPropertyByIndex(obj: pair, index: 1)
-            }
+        let name = uspArgString(ctx, args, 0)
+        for (k, v) in uspReadEntries(ctx, this) where k == name {
+            return ctx.newStringValue(v)
         }
         return .null
+    }
+
+    /// URLSearchParams.getAll(name) -> string[]
+    static func urlSearchParamsGetAll(ctx: JeffJSContext, this: JeffJSValue,
+                                      args: [JeffJSValue]) -> JeffJSValue {
+        let name = uspArgString(ctx, args, 0)
+        let arr = ctx.newArray()
+        var n: UInt32 = 0
+        for (k, v) in uspReadEntries(ctx, this) where k == name {
+            ctx.setPropertyByIndex(obj: arr, index: n, value: ctx.newStringValue(v))
+            n += 1
+        }
+        return arr
     }
 
     /// URLSearchParams.has(name) -> boolean
     static func urlSearchParamsHas(ctx: JeffJSContext, this: JeffJSValue,
                                    args: [JeffJSValue]) -> JeffJSValue {
-        let result = urlSearchParamsGet(ctx: ctx, this: this, args: args)
-        return result.isNull ? .JS_FALSE : .JS_TRUE
+        guard args.count >= 1 else { return .JS_FALSE }
+        let name = uspArgString(ctx, args, 0)
+        return uspReadEntries(ctx, this).contains { $0.0 == name } ? .JS_TRUE : .JS_FALSE
+    }
+
+    /// URLSearchParams.set(name, value) — replaces the first match in place
+    /// and drops the rest.
+    static func urlSearchParamsSet(ctx: JeffJSContext, this: JeffJSValue,
+                                   args: [JeffJSValue]) -> JeffJSValue {
+        let name = uspArgString(ctx, args, 0)
+        let value = uspArgString(ctx, args, 1)
+        var out: [(String, String)] = []
+        var replaced = false
+        for (k, v) in uspReadEntries(ctx, this) {
+            if k == name {
+                if !replaced { out.append((name, value)); replaced = true }
+            } else {
+                out.append((k, v))
+            }
+        }
+        if !replaced { out.append((name, value)) }
+        uspWriteEntries(ctx, this, out)
+        return .undefined
+    }
+
+    /// URLSearchParams.delete(name [, value])
+    static func urlSearchParamsDelete(ctx: JeffJSContext, this: JeffJSValue,
+                                      args: [JeffJSValue]) -> JeffJSValue {
+        let name = uspArgString(ctx, args, 0)
+        let hasValue = args.count >= 2 && !args[1].isUndefined
+        let value = hasValue ? uspArgString(ctx, args, 1) : ""
+        let out = uspReadEntries(ctx, this).filter { !($0.0 == name && (!hasValue || $0.1 == value)) }
+        uspWriteEntries(ctx, this, out)
+        return .undefined
+    }
+
+    /// URLSearchParams.sort() — stable sort on the name, by code unit.
+    static func urlSearchParamsSort(ctx: JeffJSContext, this: JeffJSValue,
+                                    args: [JeffJSValue]) -> JeffJSValue {
+        let entries = uspReadEntries(ctx, this)
+        let sorted = entries.enumerated()
+            .sorted { a, b in
+                let ka = Array(a.element.0.utf16), kb = Array(b.element.0.utf16)
+                if ka == kb { return a.offset < b.offset }
+                return ka.lexicographicallyPrecedes(kb)
+            }
+            .map { $0.element }
+        uspWriteEntries(ctx, this, sorted)
+        return .undefined
+    }
+
+    /// Wrap a list of values in a real JS iterator by handing back an array
+    /// iterator (`[...].values()`), which already implements the protocol.
+    private static func uspIterator(_ ctx: JeffJSContext, _ values: [JeffJSValue]) -> JeffJSValue {
+        let arr = ctx.newArray()
+        for (i, v) in values.enumerated() {
+            ctx.setPropertyByIndex(obj: arr, index: UInt32(i), value: v)
+        }
+        let valuesFn = ctx.getPropertyStr(obj: arr, name: "values")
+        defer { valuesFn.freeValue() }
+        if valuesFn.isFunction {
+            let it = ctx.call(valuesFn, this: arr, args: [])
+            arr.freeValue()
+            return it
+        }
+        return arr
+    }
+
+    /// URLSearchParams.keys()
+    static func urlSearchParamsKeys(ctx: JeffJSContext, this: JeffJSValue,
+                                    args: [JeffJSValue]) -> JeffJSValue {
+        return uspIterator(ctx, uspReadEntries(ctx, this).map { ctx.newStringValue($0.0) })
+    }
+
+    /// URLSearchParams.values()
+    static func urlSearchParamsValues(ctx: JeffJSContext, this: JeffJSValue,
+                                      args: [JeffJSValue]) -> JeffJSValue {
+        return uspIterator(ctx, uspReadEntries(ctx, this).map { ctx.newStringValue($0.1) })
+    }
+
+    /// URLSearchParams.entries() — also the `[Symbol.iterator]` slot.
+    static func urlSearchParamsEntries(ctx: JeffJSContext, this: JeffJSValue,
+                                       args: [JeffJSValue]) -> JeffJSValue {
+        let pairs = uspReadEntries(ctx, this).map { e -> JeffJSValue in
+            let pair = ctx.newArray()
+            ctx.setPropertyByIndex(obj: pair, index: 0, value: ctx.newStringValue(e.0))
+            ctx.setPropertyByIndex(obj: pair, index: 1, value: ctx.newStringValue(e.1))
+            return pair
+        }
+        return uspIterator(ctx, pairs)
+    }
+
+    /// URLSearchParams.forEach(callback [, thisArg])
+    static func urlSearchParamsForEach(ctx: JeffJSContext, this: JeffJSValue,
+                                       args: [JeffJSValue]) -> JeffJSValue {
+        guard args.count >= 1, args[0].isFunction else {
+            return ctx.throwTypeError("URLSearchParams.forEach: callback is not a function")
+        }
+        let thisArg = args.count >= 2 ? args[1] : JeffJSValue.undefined
+        for (k, v) in uspReadEntries(ctx, this) {
+            let value = ctx.newStringValue(v)
+            let key = ctx.newStringValue(k)
+            let r = ctx.call(args[0], this: thisArg, args: [value, key, this])
+            value.freeValue()
+            key.freeValue()
+            if r.isException { return .exception }
+            r.freeValue()
+        }
+        return .undefined
     }
 
     /// URLSearchParams.toString() -> string
     static func urlSearchParamsToString(ctx: JeffJSContext, this: JeffJSValue,
                                         args: [JeffJSValue]) -> JeffJSValue {
-        let entries = ctx.getPropertyStr(obj: this, name: "_entries")
-        if entries.isUndefined {
-            return JeffJSValue.makeString(JeffJSString(swiftString: ""))
-        }
-
-        var parts: [String] = []
-        let len = ctx.getArrayLength(entries)
-        for i in 0..<len {
-            let pair = ctx.getPropertyByIndex(obj: entries, index: UInt32(i))
-            let key = ctx.getPropertyByIndex(obj: pair, index: 0)
-            let value = ctx.getPropertyByIndex(obj: pair, index: 1)
-            if let k = key.stringValue, let v = value.stringValue {
-                let encodedKey = k.toSwiftString().addingPercentEncoding(withAllowedCharacters: CharacterSet.urlQueryAllowed) ?? k.toSwiftString()
-                let encodedValue = v.toSwiftString().addingPercentEncoding(withAllowedCharacters: CharacterSet.urlQueryAllowed) ?? v.toSwiftString()
-                parts.append("\(encodedKey)=\(encodedValue)")
-            }
-        }
-
-        return JeffJSValue.makeString(JeffJSString(swiftString: parts.joined(separator: "&")))
+        return ctx.newStringValue(uspSerialize(uspReadEntries(ctx, this)))
     }
 
     // MARK: - structuredClone

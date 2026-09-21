@@ -350,12 +350,14 @@ extension JeffJSParser {
             emitScopePutVarInit(fieldsInitAtom, scopeLevel: fd.curScope)
         }
 
-        // Wire up ctorFunc.prototype = proto (non-enumerable, like every
-        // property a class definition creates).
+        // Wire up ctorFunc.prototype = proto. Bit 3 makes it non-enumerable
+        // like every property a class definition creates; bit 4 marks it as
+        // the class's own `prototype`, which is also non-writable and
+        // non-configurable (ES2023 15.7.14 step 12).
         emitOp(.dup2)                                // ..., [sc,] ctorFunc, proto, ctorFunc, proto
         emitOp(.define_method)
         emitAtom(getAtom("prototype"))
-        emitU8(8)                                    // ..., [sc,] ctorFunc, proto, ctorFunc
+        emitU8(8 | 16)                               // ..., [sc,] ctorFunc, proto, ctorFunc
         emitOp(.drop)                                // ..., [sc,] ctorFunc, proto
 
         // Wire up proto.constructor = ctorFunc. define_method also makes the

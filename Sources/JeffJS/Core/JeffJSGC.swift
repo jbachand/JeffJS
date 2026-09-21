@@ -537,6 +537,10 @@ func markObject(_ rt: JeffJSRuntime,
         if let child = gd.asyncState.thisVal.toGCObjectHeader() { markFunc(rt, child) }
         if let child = gd.asyncState.resolveFunc.toGCObjectHeader() { markFunc(rt, child) }
         if let child = gd.asyncState.rejectFunc.toGCObjectHeader() { markFunc(rt, child) }
+    case .typedArray(let ta):
+        // A typed array / DataView owns its ArrayBuffer object: a real edge,
+        // otherwise the collector cannot see the buffer as reachable.
+        if let buf = ta.buffer { markFunc(rt, buf) }
     case .promiseData(let pd):
         if let child = pd.promiseResult.toGCObjectHeader() { markFunc(rt, child) }
         for reaction in pd.promiseFulfillReactions {
@@ -692,6 +696,18 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
         let n = Int(count)
         var i = 0
         while i < n && i < vals.count { freeValue(rt, vals[i]); i += 1 }
+    }
+    // A typed array / DataView owns a reference to its ArrayBuffer object
+    // (taken in typedArrayAdoptBuffer, or inherited from the buffer's own
+    // creation reference) — release it here, or every buffer ever viewed
+    // outlives the runtime.
+    if case .typedArray(let ta) = savedPayload, let buf = ta.buffer {
+        ta.buffer = nil
+        if buf.refCount > 0 {
+            if JeffJSGCObjectHeader.trackRefcounts { JeffJSGCObjectHeader.trackFree(buf) }
+            buf.refCount -= 1
+            if buf.refCount == 0 { freeGCObjectAtZeroRefcount(rt, buf) }
+        }
     }
     _ = savedPayload  // ensure ARC release happens
 

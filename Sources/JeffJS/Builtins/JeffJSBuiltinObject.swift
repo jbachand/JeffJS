@@ -85,8 +85,16 @@ extension JeffJSContext {
         if key.isString, let s = key.stringValue {
             let atom = rt.findAtom(s.toSwiftString())
             defer { rt.freeAtom(atom) }
+            if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
+                materializeFunctionPrototype(jsObj)
+            }
             let val = jsObj.getOwnPropertyValue(atom: atom)
-            return val.isUndefined ? 0 : 1
+            if !val.isUndefined { return 1 }
+            // A property whose value *is* `undefined` reads exactly like an
+            // absent one, so `({z: undefined}).hasOwnProperty('z')` answered
+            // false. Ask the shape instead.
+            let (shapeProp, _) = jeffJS_findOwnProperty(obj: jsObj, atom: atom)
+            return shapeProp != nil ? 1 : 0
         }
         return 0
     }
@@ -142,6 +150,9 @@ extension JeffJSContext {
         if key.isString, let s = key.stringValue {
             let atom = rt.findAtom(s.toSwiftString())
             defer { rt.freeAtom(atom) }
+            if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
+                materializeFunctionPrototype(jsObj)
+            }
             let (shapeProp, prop) = jeffJS_findOwnProperty(obj: jsObj, atom: atom)
             guard let shapeProp = shapeProp, let prop = prop else { return .undefined }
 
@@ -152,13 +163,22 @@ extension JeffJSContext {
                 _ = setPropertyStr(obj: desc, name: "writable",
                                    value: JeffJSValue.newBool(shapeProp.flags.contains(.writable)))
             case .getset(let getter, let setter):
+                // The descriptor OWNS the accessor it stores: `makeObject`
+                // alone only takes a Swift retain, so freeing the descriptor
+                // released a reference nobody had taken and left the accessor
+                // a zombie (`Object.getOwnPropertyDescriptor(o, 'x')` as a
+                // discarded expression stripped the getter off `o`).
+                // Recycled + dup, never makeObject + dup: a second Unmanaged
+                // retain is never balanced.
                 if let getter = getter {
-                    _ = setPropertyStr(obj: desc, name: "get", value: JeffJSValue.makeObject(getter))
+                    _ = setPropertyStr(obj: desc, name: "get",
+                                       value: JeffJSValue.makeObjectRecycled(getter).dupValue())
                 } else {
                     _ = setPropertyStr(obj: desc, name: "get", value: .undefined)
                 }
                 if let setter = setter {
-                    _ = setPropertyStr(obj: desc, name: "set", value: JeffJSValue.makeObject(setter))
+                    _ = setPropertyStr(obj: desc, name: "set",
+                                       value: JeffJSValue.makeObjectRecycled(setter).dupValue())
                 } else {
                     _ = setPropertyStr(obj: desc, name: "set", value: .undefined)
                 }
@@ -1409,9 +1429,15 @@ struct JeffJSBuiltinObject {
 
         var obj = ctx.toObject(this)
         if obj.isException { return obj }
+        // Every value below is owned: the ToObject result, each prototype the
+        // walk steps onto, the property key and each descriptor object. The
+        // walk used to drop all of them, so one __lookupGetter__ pinned the
+        // whole prototype chain it crossed.
+        defer { ctx.freeValue(obj) }
 
         let key = ctx.toPropertyKey(prop)
         if key.isException { return key }
+        defer { ctx.freeValue(key) }
 
         // Walk the prototype chain
         while true {
@@ -1419,6 +1445,7 @@ struct JeffJSBuiltinObject {
             if desc.isException { return desc }
 
             if !desc.isUndefined {
+                defer { ctx.freeValue(desc) }
                 let getter = ctx.getProperty(obj: desc, atom: JSAtomID.get)
                 if getter.isException { return getter }
                 if !getter.isUndefined {
@@ -1434,6 +1461,7 @@ struct JeffJSBuiltinObject {
             if proto.isNull {
                 return .undefined
             }
+            ctx.freeValue(obj)
             obj = proto
         }
     }
@@ -1445,9 +1473,15 @@ struct JeffJSBuiltinObject {
 
         var obj = ctx.toObject(this)
         if obj.isException { return obj }
+        // Every value below is owned: the ToObject result, each prototype the
+        // walk steps onto, the property key and each descriptor object. The
+        // walk used to drop all of them, so one __lookupGetter__ pinned the
+        // whole prototype chain it crossed.
+        defer { ctx.freeValue(obj) }
 
         let key = ctx.toPropertyKey(prop)
         if key.isException { return key }
+        defer { ctx.freeValue(key) }
 
         // Walk the prototype chain
         while true {
@@ -1455,6 +1489,7 @@ struct JeffJSBuiltinObject {
             if desc.isException { return desc }
 
             if !desc.isUndefined {
+                defer { ctx.freeValue(desc) }
                 let setter = ctx.getProperty(obj: desc, atom: JSAtomID.set)
                 if setter.isException { return setter }
                 if !setter.isUndefined {
@@ -1468,6 +1503,7 @@ struct JeffJSBuiltinObject {
             if proto.isNull {
                 return .undefined
             }
+            ctx.freeValue(obj)
             obj = proto
         }
     }

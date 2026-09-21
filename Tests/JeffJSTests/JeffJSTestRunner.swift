@@ -218,6 +218,8 @@ struct JeffJSTestRunner {
             ("Proxy", { $0.testProxy() }),
             ("Symbol", { $0.testSymbol() }),
             ("TypedArrays", { $0.testTypedArrays() }),
+            ("TypedArrayOwnership", { $0.testTypedArrayOwnership() }),
+            ("WebAPIGaps", { $0.testWebAPIGaps() }),
             ("Modules", { $0.testModules() }),
             ("LexicalScoping", { $0.testLexicalScopingBugs() }),
             ("ES262CriticalSubset", { $0.testES262CriticalSubset() }),
@@ -2523,6 +2525,196 @@ extension JeffJSTestRunner {
         evalCheck(ctx, "Int8Array.BYTES_PER_ELEMENT", expectInt: 1)
         evalCheck(ctx, "Int32Array.BYTES_PER_ELEMENT", expectInt: 4)
         evalCheck(ctx, "Float64Array.BYTES_PER_ELEMENT", expectInt: 8)
+    }
+
+    // MARK: - TypedArrayOwnership
+
+    /// A typed array / DataView keeps its ArrayBuffer alive. Before these, the
+    /// view stored a borrowed reference, so the buffer died with the last
+    /// value that named it and the view silently became zero-length/detached.
+    mutating func testTypedArrayOwnership() {
+        let (rt, ctx) = makeCtx()
+
+        // The buffer's only other reference is a local that dies with the call.
+        evalCheck(ctx, "function f(){ var ab = new ArrayBuffer(4); return new Uint8Array(ab); } f().length",
+                  expectInt: 4)
+        evalCheck(ctx, "new Uint8Array(new ArrayBuffer(8)).length", expectInt: 8)
+        evalCheck(ctx, "new Uint8Array(new ArrayBuffer(8)).buffer.byteLength", expectInt: 8)
+        evalCheck(ctx, "new Uint8Array([1,2,3]).buffer.byteLength", expectInt: 3)
+
+        // DataView over a buffer whose typed array is the only owner.
+        evalCheck(ctx, "new DataView(new Uint8Array([1,2,3]).buffer).getUint8(0)", expectInt: 1)
+        evalCheck(ctx, "function g(){ var ab = new ArrayBuffer(4); return new DataView(ab); } g().byteLength",
+                  expectInt: 4)
+
+        // subarray shares the buffer with the view it came from.
+        evalCheckBool(ctx, """
+            var u = new Uint8Array([1,2,3,4]);
+            var s = u.subarray(1);
+            s[0] = 99;
+            s.buffer === u.buffer && u[1] === 99 && s.length === 3
+            """, expect: true)
+        evalCheck(ctx, "function h(){ return new Uint8Array(new ArrayBuffer(8)).subarray(2); } h().length",
+                  expectInt: 6)
+
+        // slice / set / copyWithin / from / of all produce usable buffers.
+        evalCheck(ctx, "new Uint8Array(new ArrayBuffer(8)).slice(1,4).buffer.byteLength", expectInt: 3)
+        evalCheck(ctx, """
+            var t = new Uint8Array(new ArrayBuffer(4));
+            t.set(new Uint8Array([7,8]), 1);
+            t[2]
+            """, expectInt: 8)
+        evalCheck(ctx, """
+            var c = new Uint8Array([1,2,3,4]);
+            c.copyWithin(0, 2);
+            c[0]
+            """, expectInt: 3)
+        evalCheck(ctx, "Uint8Array.from([1,2,3]).buffer.byteLength", expectInt: 3)
+        evalCheck(ctx, "Uint8Array.of(1,2,3,4).buffer.byteLength", expectInt: 4)
+
+        // A view built on the buffer of a discarded view still reads the data.
+        evalCheck(ctx, """
+            function mk(){ var a = new Uint8Array([5,6,7,8]); return a.buffer; }
+            new Uint8Array(mk())[3]
+            """, expectInt: 8)
+
+        _ = rt
+    }
+
+    // MARK: - WebAPIGaps
+
+    /// Small spec gaps that browser-targeted code trips over.
+    mutating func testWebAPIGaps() {
+        let (rt, ctx) = makeCtx()
+        // The shared test context does not install the stdlib intrinsics.
+        JeffJSStdLib.addURL(ctx: ctx)
+
+        // An own property whose value is `undefined` is still an own property.
+        evalCheckBool(ctx, "({z: undefined}).hasOwnProperty('z')", expect: true)
+        evalCheckBool(ctx, "Object.hasOwn({z: undefined}, 'z')", expect: true)
+        evalCheckBool(ctx, "'z' in {z: undefined}", expect: true)
+        evalCheckBool(ctx, "({z: undefined}).hasOwnProperty('nope')", expect: false)
+        evalCheckBool(ctx, """
+            var d = Object.getOwnPropertyDescriptor({z: undefined}, 'z');
+            d !== undefined && ('value' in d) && d.value === undefined && d.writable === true
+            """, expect: true)
+        evalCheckBool(ctx, """
+            var d = Reflect.getOwnPropertyDescriptor({z: undefined}, 'z');
+            d !== undefined && ('value' in d) && d.value === undefined
+            """, expect: true)
+        evalCheckBool(ctx, "Object.getOwnPropertyDescriptor({z: undefined}, 'nope') === undefined",
+                      expect: true)
+
+        // ToBoolean(symbol) is true — only the seven falsy values are false.
+        evalCheck(ctx, "Symbol.iterator ? 1 : 0", expectInt: 1)
+        evalCheckBool(ctx, "!!Symbol()", expect: true)
+        evalCheckBool(ctx, "!Symbol.iterator", expect: false)
+        evalCheckBool(ctx, "(function(){ var s = Symbol('x'); if (s) { return true; } return false; })()",
+                      expect: true)
+
+        // A class's `prototype` is non-writable, non-enumerable and
+        // non-configurable; an ordinary function's is writable only.
+        evalCheckBool(ctx, """
+            var d = Object.getOwnPropertyDescriptor(class {}, 'prototype');
+            d.writable === false && d.enumerable === false && d.configurable === false
+            """, expect: true)
+        evalCheckBool(ctx, """
+            class K {}
+            var d = Object.getOwnPropertyDescriptor(K.prototype, 'constructor');
+            d.writable === true && d.enumerable === false && d.configurable === true
+            """, expect: true)
+        evalCheckBool(ctx, """
+            var d = Object.getOwnPropertyDescriptor(function(){}, 'prototype');
+            d !== undefined && d.writable === true && d.enumerable === false && d.configurable === false
+            """, expect: true)
+        evalCheckBool(ctx, "(function(){}).hasOwnProperty('prototype')", expect: true)
+        // Sloppy-mode writes to a non-writable property are a silent no-op,
+        // not an error.
+        evalCheckBool(ctx, """
+            class L {}
+            var before = L.prototype;
+            L.prototype = 5;
+            L.prototype === before
+            """, expect: true)
+        evalCheckBool(ctx, "var fr = Object.freeze({a:1}); fr.a = 2; fr.a === 1", expect: true)
+
+        // URLSearchParams: parsing, the full method set, and a live
+        // url.searchParams.
+        evalCheckStr(ctx, """
+            var p = new URLSearchParams("a=1&a=2&b=%20x&c=d+e");
+            [p.get("a"), p.getAll("a").join(","), p.get("b"), p.get("c"),
+             String(p.get("zz")), String(p.has("a")), String(p.has("zz")), String(p.size)].join("|")
+            """, expect: "1|1,2| x|d e|null|true|false|4")
+        evalCheckStr(ctx, """
+            var p = new URLSearchParams("a=1");
+            p.append("a", "2"); p.append("b", "x y");
+            var s1 = p.toString();
+            p.set("a", "9");
+            var s2 = p.toString();
+            p.delete("b");
+            [s1, s2, p.toString(), String(p.size)].join("|")
+            """, expect: "a=1&a=2&b=x+y|a=9&b=x+y|a=9|1")
+        evalCheckStr(ctx, "new URLSearchParams({x: '1', y: 'two words'}).toString()",
+                     expect: "x=1&y=two+words")
+        evalCheckStr(ctx, "new URLSearchParams([['k','v'],['k2','v2']]).toString()",
+                     expect: "k=v&k2=v2")
+        evalCheckStr(ctx, "new URLSearchParams(new Map([['a','1'],['b','2']])).toString()",
+                     expect: "a=1&b=2")
+        evalCheckStr(ctx, """
+            var src = new URLSearchParams("a=1");
+            var copy = new URLSearchParams(src);
+            copy.append("b", "2");
+            src.toString() + "|" + copy.toString()
+            """, expect: "a=1|a=1&b=2")
+        evalCheckStr(ctx, "var s = new URLSearchParams('c=3&a=1&b=2'); s.sort(); s.toString()",
+                     expect: "a=1&b=2&c=3")
+        evalCheckStr(ctx, """
+            var p = new URLSearchParams("x=1&y=2");
+            var acc = [];
+            p.forEach(function(v, k){ acc.push(k + "=" + v); });
+            var it = [];
+            for (var e of p) { it.push(e[0] + ":" + e[1]); }
+            [[...p.keys()].join(","), [...p.values()].join(","), acc.join("&"), it.join(",")].join("|")
+            """, expect: "x,y|1,2|x=1&y=2|x:1,y:2")
+        evalCheckBool(ctx, "typeof new URLSearchParams('a=1')[Symbol.iterator] === 'function'",
+                      expect: true)
+        evalCheckStr(ctx, """
+            var u = new URL("https://ex.com/p?a=1#frag");
+            var before = u.search + " " + u.href;
+            u.searchParams.append("b", "2 3");
+            var after = u.search + " " + u.href;
+            u.searchParams.delete("a"); u.searchParams.delete("b");
+            [before, after, u.search + "|" + u.href].join(" / ")
+            """, expect: "?a=1 https://ex.com/p?a=1#frag / ?a=1&b=2+3 https://ex.com/p?a=1&b=2+3#frag / |https://ex.com/p#frag")
+        evalCheckStr(ctx, """
+            var u = new URL("https://ex.com/p");
+            u.search = "?z=9";
+            u.searchParams.get("z") + "|" + u.search + "|" + u.href
+            """, expect: "9|?z=9|https://ex.com/p?z=9")
+        // The internal slot is `__uspEntries`, not the host app's `_entries`
+        // FormData name.
+        evalCheckBool(ctx, """
+            var p = new URLSearchParams("a=1");
+            p._entries === undefined && Array.isArray(p.__uspEntries)
+            """, expect: true)
+
+        // __lookupGetter__/__lookupSetter__ walk the prototype chain.
+        evalCheckBool(ctx, """
+            var base = { get gg(){ return 1; } };
+            var child = Object.create(base);
+            typeof child.__lookupGetter__('gg') === 'function' &&
+              child.__lookupGetter__('nope') === undefined &&
+              child.__lookupSetter__('gg') === undefined
+            """, expect: true)
+        evalCheck(ctx, """
+            var b2 = { get v(){ return 7; } };
+            var c2 = Object.create(Object.create(b2));
+            var n = 0;
+            for (var i = 0; i < 50; i++) { if (c2.__lookupGetter__('v')) n++; }
+            n
+            """, expectInt: 50)
+
+        _ = rt
     }
 
     // MARK: - Modules
