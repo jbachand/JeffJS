@@ -681,6 +681,10 @@ struct JeffJSBuiltinFunction {
         jeffJS_addProperty(ctx: ctx, obj: proto, atom: name,
                            flags: [.configurable, .getset])
         // For a getter-only property, we store it as a getset with no setter
+        // The accessor slot is a counted edge (freeObject releases it), so the
+        // getter needs the ARC retain `makeObject` would have taken; this one is
+        // built by hand.
+        _ = Unmanaged.passRetained(getterObj)
         let propIdx = proto.propValues.count - 1
         if propIdx >= 0 {
             proto.setPropEntry(at: propIdx, .getset(getter: getterObj, setter: nil))

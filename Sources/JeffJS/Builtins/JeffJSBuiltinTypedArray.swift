@@ -1408,6 +1408,10 @@ func jeffJS_addGetterProperty(
     let atom = ctx.rt.findAtom(name)
     jeffJS_addProperty(ctx: ctx, obj: proto, atom: atom, flags: [.configurable, .getset])
     let propIdx = proto.propValues.count - 1
+    // The accessor slot is a counted edge (freeObject releases it), so the
+    // getter needs the ARC retain `makeObject` would have taken; this one is
+    // built by hand.
+    _ = Unmanaged.passRetained(getterObj)
     if propIdx >= 0 {
         proto.setPropEntry(at: propIdx, .getset(getter: getterObj, setter: nil))
     }
