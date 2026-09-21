@@ -163,13 +163,22 @@ extension JeffJSContext {
                 _ = setPropertyStr(obj: desc, name: "writable",
                                    value: JeffJSValue.newBool(shapeProp.flags.contains(.writable)))
             case .getset(let getter, let setter):
+                // The descriptor OWNS the accessor it stores: `makeObject`
+                // alone only takes a Swift retain, so freeing the descriptor
+                // released a reference nobody had taken and left the accessor
+                // a zombie (`Object.getOwnPropertyDescriptor(o, 'x')` as a
+                // discarded expression stripped the getter off `o`).
+                // Recycled + dup, never makeObject + dup: a second Unmanaged
+                // retain is never balanced.
                 if let getter = getter {
-                    _ = setPropertyStr(obj: desc, name: "get", value: JeffJSValue.makeObject(getter))
+                    _ = setPropertyStr(obj: desc, name: "get",
+                                       value: JeffJSValue.makeObjectRecycled(getter).dupValue())
                 } else {
                     _ = setPropertyStr(obj: desc, name: "get", value: .undefined)
                 }
                 if let setter = setter {
-                    _ = setPropertyStr(obj: desc, name: "set", value: JeffJSValue.makeObject(setter))
+                    _ = setPropertyStr(obj: desc, name: "set",
+                                       value: JeffJSValue.makeObjectRecycled(setter).dupValue())
                 } else {
                     _ = setPropertyStr(obj: desc, name: "set", value: .undefined)
                 }
