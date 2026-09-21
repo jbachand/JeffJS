@@ -8587,6 +8587,12 @@ struct JeffJSInterpreter {
                 let target = buf[sp - 1]
                 let ok = ctx.copyDataProperties(target: target, source: source,
                                                  excludeList: excludeList)
+                // The opcode owns both popped operands: copyDataProperties
+                // dups whatever it keeps. Without this every `{...o}` and
+                // every object-rest pattern pinned its source for the life of
+                // the runtime.
+                source.freeValue()
+                excludeList.freeValue()
                 if !ok {
                     retVal = .exception
                     break dispatchLoop
