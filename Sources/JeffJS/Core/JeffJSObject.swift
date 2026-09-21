@@ -204,6 +204,29 @@ final class TraceBlockInfo {
     }
 }
 
+/// The UTF-8 text of one script, shared by every function compiled from it.
+///
+/// QuickJS copies each function's own source span into the function bytecode
+/// (`JSFunctionDef.source` / `source_len`). Here the span stays a
+/// (offset, length) pair into this one buffer, so a script's functions cost
+/// 24 bytes each instead of a private copy of their text, and the buffer
+/// lives exactly as long as some function from that script is alive.
+final class JeffJSSourceText {
+    let bytes: [UInt8]
+
+    init(bytes: [UInt8]) { self.bytes = bytes }
+    init(_ s: String) { self.bytes = Array(s.utf8) }
+
+    var count: Int { return bytes.count }
+
+    /// Decode the [start, start+len) byte range as a Swift string.
+    func slice(start: Int, len: Int) -> String? {
+        guard len >= 0, start >= 0, start &+ len <= bytes.count else { return nil }
+        if len == 0 { return "" }
+        return String(decoding: bytes[start ..< (start &+ len)], as: UTF8.self)
+    }
+}
+
 /// Forward reference for `JeffJSFunctionBytecode`.
 class JeffJSFunctionBytecode {
     var refCount: Int = 1
@@ -319,6 +342,29 @@ class JeffJSFunctionBytecode {
     /// Populated by JeffJSCompiler.fuseBasicBlocks() after bytecode compilation.
     /// nil until fuseBasicBlocks runs (saves memory for functions with no loops).
     var traceBlocks: [Int: TraceBlockInfo]?
+
+    // MARK: - Function source text (Function.prototype.toString)
+    //
+    // These stay LAST. Declaring them earlier pushes `icEntries` / `bcPtrFast`
+    // — read on every property-access and every opcode — 24 bytes further into
+    // the object, which cost 11% on the whole real-world suite (measured).
+
+    /// The whole script this function was compiled from (shared with every
+    /// other function of that script, and retained for as long as any of them
+    /// is alive). nil when the source is unavailable (bytecode with no
+    /// recorded source).
+    var sourceText: JeffJSSourceText? = nil
+    /// Byte offset of this function's source span in `sourceText`.
+    var sourceStart: Int32 = 0
+    /// Byte length of the span; -1 when no span was recorded.
+    var sourceLen: Int32 = -1
+
+    /// The function's own source text, exactly as written (QuickJS
+    /// `js_function_toString`). nil when it was not recorded.
+    var sourceSpanText: String? {
+        guard sourceLen >= 0, let src = sourceText else { return nil }
+        return src.slice(start: Int(sourceStart), len: Int(sourceLen))
+    }
 }
 
 // MARK: - Enums

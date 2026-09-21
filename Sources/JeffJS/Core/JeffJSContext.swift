@@ -1851,7 +1851,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             }
 
             let paramList = params.joined(separator: ",")
-            let source = "(function anonymous(\(paramList)) { \(body) })"
+            // Byte-for-byte the header QuickJS synthesizes, so the result's
+            // `toString()` reads `function anonymous(a\n) {\n<body>\n}`.
+            let source = "(function anonymous(\(paramList)\n) {\n\(body)\n})"
             let result = self.eval(input: source, filename: "<Function>", evalFlags: JS_EVAL_TYPE_GLOBAL)
             return result
         }, name: "Function", length: 1)
@@ -2599,6 +2601,12 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         let fd = JeffJSFunctionDefCompiler()
         fd.filename = rt.findAtom(filename)
         fd.source = input
+        // One UTF-8 copy of the script, shared by every function compiled
+        // from it; the parser records a (start, end) span per function so
+        // Function.prototype.toString can return the original text.
+        fd.sourceText = JeffJSSourceText(bytes: parseState.buf)
+        fd.sourceStart = 0
+        fd.sourceEnd = parseState.buf.count
         if isStrict || isModule {
             fd.jsMode = JS_MODE_STRICT
         }

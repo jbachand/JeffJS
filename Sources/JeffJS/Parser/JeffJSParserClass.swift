@@ -42,6 +42,12 @@ final class JeffJSClassFieldsCtx {
 
     /// Private names already declared in this class (name atom -> var kind).
     var privateKinds: [JSAtom: Int] = [:]
+
+    /// The function definition that ends up as the class constructor (the
+    /// synthesized default one, or the explicit `constructor` method once
+    /// parseClassBody finds it).  Its `toString` is the whole class text, so
+    /// its source span is only known after the closing brace.
+    weak var ctorFd: JeffJSFunctionDefCompiler?
 }
 
 extension JeffJSParser {
@@ -212,6 +218,8 @@ extension JeffJSParser {
 
     /// Parse a class definition (declaration or expression).
     func parseClassDef(isExpression: Bool) {
+        // A class constructor's source text is the whole `class ... { ... }`.
+        let classStart = s.token.ptr
         expect(JSTokenType.TOK_CLASS.rawValue)
 
         var className: JSAtom = 0
@@ -265,6 +273,7 @@ extension JeffJSParser {
                 defaultCtorFd.superCallAllowed = true
             }
             fd.childFunctions.append(defaultCtorFd)
+            cf.ctorFd = defaultCtorFd
 
             let savedFd = fd
             fd = defaultCtorFd
@@ -416,6 +425,9 @@ extension JeffJSParser {
 
         popScope(scopeIdx)
         expect(0x7D) // '}'
+        if let ctorFd = cf.ctorFd {
+            recordSource(ctorFd, from: classStart)
+        }
 
         if !isExpression && className != 0 {
             let varIdx = defineVar(className, isConst: true, isLexical: true)
@@ -467,6 +479,10 @@ extension JeffJSParser {
                 parseClassStaticBlock(cf: cf)
                 continue
             }
+
+            // First byte of this member's source text. QuickJS excludes the
+            // `static` prefix but keeps `async` / `*` / `get` / `set`.
+            let memberStart = s.token.ptr
 
             // Check for 'async' — [no LineTerminator here] between async and method name
             if isIdent("async") {
@@ -591,12 +607,19 @@ extension JeffJSParser {
                 }
             }
             fd.childFunctions.append(methodFd)
+            if isConstructor {
+                // The class span is stamped on it once the class body closes.
+                cf.ctorFd = methodFd
+            }
 
             let (mDefaults, mRest, mDstructs) = parseFormalParameters(childFd: methodFd)
             expect(0x29) // ')'
             expect(0x7B) // '{'
             parseFunctionBody(childFd: methodFd, defaults: mDefaults, rest: mRest, destructs: mDstructs)
             expect(0x7D) // '}'
+            if !isConstructor {
+                recordSource(methodFd, from: memberStart)
+            }
 
             let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
             emitFClosure(cpoolIdx)

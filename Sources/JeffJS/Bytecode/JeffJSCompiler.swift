@@ -144,6 +144,19 @@ class JeffJSFunctionDefCompiler {
     var lineNum: Int = 1
     var source: String?
 
+    /// Source span [sourceStart, sourceEnd) of this function in the script's
+    /// UTF-8 buffer, recorded by the parser (QuickJS `fd->source` /
+    /// `fd->source_len`). -1 when nothing was recorded.
+    var sourceStart: Int = -1
+    var sourceEnd: Int = -1
+    /// The whole script text. Set on the top-level definition only; every
+    /// nested function reads it through its parent chain.
+    private var ownSourceText: JeffJSSourceText?
+    var sourceText: JeffJSSourceText? {
+        get { return ownSourceText ?? parent?.sourceText }
+        set { ownSourceText = newValue }
+    }
+
     // -- Bytecode under construction --
     var byteCode: DynBuf = DynBuf()
 
@@ -3705,6 +3718,14 @@ struct JeffJSCompiler {
         // location in Error stacks.
         if fb.lineNum == 0 { fb.lineNum = fd.firstLine }
         if fb.colNum == 0 { fb.colNum = fd.firstCol }
+
+        // Function source span for Function.prototype.toString. The script
+        // text is shared; only the (offset, length) pair is per function.
+        fb.sourceText = fd.sourceText
+        if fd.sourceStart >= 0 && fd.sourceEnd >= fd.sourceStart {
+            fb.sourceStart = Int32(truncatingIfNeeded: fd.sourceStart)
+            fb.sourceLen = Int32(truncatingIfNeeded: fd.sourceEnd - fd.sourceStart)
+        }
 
         // Debug info
         // A nested function inherits its parent's filename but not its source

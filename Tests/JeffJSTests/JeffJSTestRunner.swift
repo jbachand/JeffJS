@@ -289,6 +289,7 @@ struct JeffJSTestRunner {
             ("ModulesAndImports", { $0.testModulesAndImportPatterns() }),
             ("InterpreterGaps", { $0.testInterpreterGaps() }),
             ("MappedArguments", { $0.testMappedArguments() }),
+            ("FunctionToString", { $0.testFunctionToString() }),
         ]
     }
 
@@ -11867,6 +11868,175 @@ extension JeffJSTestRunner {
                      expect: "Cannot set properties of undefined (setting 'n')")
         evalCheckStr(ctx, "var o8c = {}; try { o8c.nope(); } catch (e) { e.message }",
                      expect: "undefined is not a function")
+    }
+
+    // =========================================================================
+    // MARK: - Function.prototype.toString
+    // =========================================================================
+
+    /// `Function.prototype.toString` returns the exact source text of every
+    /// bytecode function (QuickJS `js_function_toString` reading
+    /// `JSFunctionDef.source`). Expected values below were taken from
+    /// `/opt/homebrew/bin/qjs` verbatim.
+    mutating func testFunctionToString() {
+        let (rt, ctx) = makeCtx()
+
+        // --- Function declarations / expressions ---------------------------
+        evalCheckStr(ctx, "function fts1(){ return 1; } fts1.toString()",
+                     expect: "function fts1(){ return 1; }")
+        evalCheckBool(ctx, "function fts1b(){ return 1; } fts1b.toString().indexOf('return 1') > 0",
+                      expect: true)
+        // Whitespace and comments inside the span are preserved verbatim.
+        evalCheckStr(ctx, "var fts2 = function   (  a , b ) { /*c*/ return a+b }   ; fts2.toString()",
+                     expect: "function   (  a , b ) { /*c*/ return a+b }")
+        evalCheckStr(ctx, "var fts3 = function ftsInner(){ /*x*/ }; fts3.toString()",
+                     expect: "function ftsInner(){ /*x*/ }")
+        evalCheckStr(ctx, "(function*(){yield 1}).toString()", expect: "function*(){yield 1}")
+        evalCheckStr(ctx, "(async function foo(){}).toString()", expect: "async function foo(){}")
+        evalCheckStr(ctx, "(async function*(){}).toString()", expect: "async function*(){}")
+        evalCheckStr(ctx, "function ftsOuter(){ return function ftsIn(){ return 2 } } ftsOuter().toString()",
+                     expect: "function ftsIn(){ return 2 }")
+
+        // --- Arrows --------------------------------------------------------
+        evalCheckStr(ctx, "(x=>x*2).toString()", expect: "x=>x*2")
+        evalCheckStr(ctx, "((a,b)=>{return a}).toString()", expect: "(a,b)=>{return a}")
+        evalCheckStr(ctx, "(()=>{}).toString()", expect: "()=>{}")
+        evalCheckStr(ctx, "(async (a)=>a).toString()", expect: "async (a)=>a")
+        evalCheckStr(ctx, "(([a,b])=>a).toString()", expect: "([a,b])=>a")
+        evalCheckStr(ctx, "(function(a = (b)=>b, ...r){}).toString()",
+                     expect: "function(a = (b)=>b, ...r){}")
+        // The span starts at the parameter list, comments included.
+        evalCheckStr(ctx, "var fts4 = (a) /* cmt */ => a; fts4.toString()",
+                     expect: "(a) /* cmt */ => a")
+        // Nested arrows each keep their own span.
+        evalCheckStr(ctx, "var fts5 = a => b => a + b; fts5.toString() + '|' + fts5(1).toString()",
+                     expect: "a => b => a + b|b => a + b")
+
+        // --- Object literal methods and accessors --------------------------
+        evalCheckStr(ctx, "({ m(){ return 2 } }).m.toString()", expect: "m(){ return 2 }")
+        evalCheckStr(ctx, "({ *g(){} }).g.toString()", expect: "*g(){}")
+        evalCheckStr(ctx, "({ async am(){} }).am.toString()", expect: "async am(){}")
+        evalCheckStr(ctx, "({ ar: ()=>3 }).ar.toString()", expect: "()=>3")
+        evalCheckStr(ctx, "({ f: function(){return 9} }).f.toString()", expect: "function(){return 9}")
+        evalCheckStr(ctx, "Object.getOwnPropertyDescriptor({ get x(){ return 1 } }, 'x').get.toString()",
+                     expect: "get x(){ return 1 }")
+        evalCheckStr(ctx, "Object.getOwnPropertyDescriptor({ set y(v){} }, 'y').set.toString()",
+                     expect: "set y(v){}")
+        evalCheckStr(ctx, "({ ['k'+1](){return 5} }).k1.toString()", expect: "['k'+1](){return 5}")
+
+        // --- Classes -------------------------------------------------------
+        // A class constructor stringifies as the whole class definition.
+        evalCheckStr(ctx, "(class A { m(){} }).toString()", expect: "class A { m(){} }")
+        evalCheckBool(ctx, "(class A2 { m(){} }).toString().indexOf('class A2') === 0", expect: true)
+        evalCheckStr(ctx, "class FtsD { constructor(a) { this.a=a } } FtsD.toString()",
+                     expect: "class FtsD { constructor(a) { this.a=a } }")
+        evalCheckStr(ctx, "class FtsD2 { constructor(a) { this.a=a } } FtsD2.prototype.constructor.toString()",
+                     expect: "class FtsD2 { constructor(a) { this.a=a } }")
+        evalCheckStr(ctx, "class FtsE extends Object { constructor(){super()} } FtsE.toString()",
+                     expect: "class FtsE extends Object { constructor(){super()} }")
+        evalCheckStr(ctx, "(class A3 { m(){} }).prototype.m.toString()", expect: "m(){}")
+        // `static` is not part of a method's span; `get` / `async` / `*` are.
+        evalCheckStr(ctx, "class FtsC { static s(){ return 1 } } FtsC.s.toString()",
+                     expect: "s(){ return 1 }")
+        evalCheckStr(ctx, "class FtsC2 { async *ag(){} } FtsC2.prototype.ag.toString()",
+                     expect: "async *ag(){}")
+        evalCheckStr(ctx, "class FtsC3 { static get sg(){return 2} } Object.getOwnPropertyDescriptor(FtsC3,'sg').get.toString()",
+                     expect: "get sg(){return 2}")
+        evalCheckStr(ctx, "class FtsC4 { ['c'+'k'](){} } FtsC4.prototype.ck.toString()",
+                     expect: "['c'+'k'](){}")
+
+        // --- Native, bound and Function-constructor functions --------------
+        evalCheckBool(ctx, "/\\[native code\\]/.test(Function.prototype.toString.call(Math.max))",
+                      expect: true)
+        evalCheckBool(ctx, "/\\[native code\\]/.test(Function.prototype.toString.call(JSON.parse))",
+                      expect: true)
+        evalCheckBool(ctx, "function ftsB(){} /\\[native code\\]/.test(ftsB.bind(null).toString())",
+                      expect: true)
+        // QuickJS synthesizes `function anonymous(<params>\n) {\n<body>\n}`.
+        evalCheckStr(ctx, "new Function('a','return a*2').toString()",
+                     expect: "function anonymous(a\n) {\nreturn a*2\n}")
+        evalCheckBool(ctx, "new Function('a','return a*2').toString().indexOf('return a*2') > 0",
+                      expect: true)
+        evalCheckStr(ctx, "new Function('a','b','return 1').toString()",
+                     expect: "function anonymous(a,b\n) {\nreturn 1\n}")
+        evalCheckStr(ctx, "new Function().toString()", expect: "function anonymous(\n) {\n\n}")
+        // Round-trips: the synthesized text re-parses to the same function.
+        evalCheck(ctx, "eval('(' + new Function('a','return a*2').toString() + ')')(21)", expectInt: 42)
+        evalCheck(ctx, "function ftsR(a){ return a + 1; } eval('(' + ftsR.toString() + ')')(41)",
+                  expectInt: 42)
+        // Indirect eval keeps its own source buffer alive.
+        evalCheckStr(ctx, "(0,eval)('(function(){return 42})').toString()",
+                     expect: "function(){return 42}")
+
+        // --- Bytecode cache round trip -------------------------------------
+        testFunctionToStringBytecodeRoundTrip(rt: rt, ctx: ctx)
+    }
+
+    /// Compile → serialize → deserialize → the source spans (and therefore
+    /// `toString()`) must be identical, so a cache hit is indistinguishable
+    /// from a fresh compile.
+    private mutating func testFunctionToStringBytecodeRoundTrip(rt: JeffJSRuntime, ctx: JeffJSContext) {
+        let src = """
+        var rtA = function alpha(a){ return a + 1; };
+        var rtB = (b) => b * 2;
+        var rtC = class Beta { m(){ return 3 } };
+        var rtD = { get g(){ return 4 }, async *h(){} };
+        """
+        let ps = JeffJSParseState(source: src, filename: "<fts-roundtrip>", ctx: ctx)
+        let fd = JeffJSFunctionDefCompiler()
+        fd.filename = rt.findAtom("<fts-roundtrip>")
+        fd.source = src
+        fd.sourceText = JeffJSSourceText(bytes: ps.buf)
+        fd.sourceStart = 0
+        fd.sourceEnd = ps.buf.count
+        let parser = JeffJSParser(s: ps, fd: fd)
+        parser.parseProgram()
+        assert(!parser.hasError, "bytecode round trip: parse failed")
+        guard let fb = JeffJSCompiler.createFunction(ctx: ctx, fd: fd) else {
+            assert(false, "bytecode round trip: compile failed")
+            return
+        }
+        let before = Self.collectSourceSpans(fb)
+        assert(before.contains("function alpha(a){ return a + 1; }"),
+               "bytecode round trip: missing span before serialization, got \(before)")
+        assert(before.contains("(b) => b * 2") && before.contains("class Beta { m(){ return 3 } }")
+                && before.contains("get g(){ return 4 }") && before.contains("async *h(){}"),
+               "bytecode round trip: incomplete spans before serialization, got \(before)")
+
+        let bytes = JeffJSBytecodeSerializer.serialize(fb, rt: rt)
+        guard let fb2 = JeffJSBytecodeDeserializer.deserialize(bytes, rt: rt, ctx: ctx) else {
+            assert(false, "bytecode round trip: deserialization failed")
+            return
+        }
+        let after = Self.collectSourceSpans(fb2)
+        assert(before == after,
+               "bytecode round trip: spans differ\nbefore: \(before)\nafter:  \(after)")
+
+        // And through the real cache path: the second eval of the same source
+        // is served from the serialized bytecode.
+        let code = "(function ftsCache(z){ return z + 5; }).toString() + '|' + ((w)=>w).toString()"
+        let first = ctx.eval(input: code, filename: "<fts-cache>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+        let firstStr = ctx.toSwiftString(first) ?? ""
+        first.freeValue()
+        let second = ctx.eval(input: code, filename: "<fts-cache>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+        let secondStr = ctx.toSwiftString(second) ?? ""
+        second.freeValue()
+        assert(firstStr == "function ftsCache(z){ return z + 5; }|(w)=>w",
+               "cache round trip: first eval gave '\(firstStr)'")
+        assert(firstStr == secondStr,
+               "cache round trip: second eval gave '\(secondStr)', expected '\(firstStr)'")
+    }
+
+    /// Every function source span in a bytecode tree, parent first.
+    private static func collectSourceSpans(_ fb: JeffJSFunctionBytecode) -> [String] {
+        var out: [String] = []
+        if let s = fb.sourceSpanText { out.append(s) }
+        for v in fb.cpool {
+            if let child = v.toFunctionBytecode() {
+                out.append(contentsOf: collectSourceSpans(child))
+            }
+        }
+        return out
     }
 
     mutating func runAPITests() -> String {

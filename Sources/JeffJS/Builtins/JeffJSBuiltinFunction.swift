@@ -137,7 +137,10 @@ struct JeffJSBuiltinFunction {
         // (function anonymous(paramStr) { bodyStr\n})
         // The newline before the closing brace ensures a trailing // comment in
         // body doesn't eat the closing brace.
-        let source = "(\(funcPrefix) anonymous(\(paramStr)) {\n\(bodyStr)\n})\(funcSuffix)"
+        // The newline after the parameter list matches QuickJS byte for byte,
+        // so `toString()` of the result reads
+        // `function anonymous(a\n) {\n<body>\n}` there and here.
+        let source = "(\(funcPrefix) anonymous(\(paramStr)\n) {\n\(bodyStr)\n})\(funcSuffix)"
 
         // Evaluate the constructed source in the global scope.
         // QuickJS calls JS_EvalInternal here with the realm of the new.target.
@@ -305,23 +308,16 @@ struct JeffJSBuiltinFunction {
 
         switch obj.payload {
         case .bytecodeFunc(let functionBytecode, _, _):
-            // Bytecode function — try to return the original source.
-            // If debug info is available, reconstruct from bytecode source.
-            // Otherwise, use the synthetic format.
-            if let bc = functionBytecode, bc.hasDebug {
-                // QuickJS stores the source in debug info; reconstruct a basic form
-                let name = getFunctionName(obj: obj)
-                let isGen = bc.isGenerator
-                let isAsync = bc.isAsyncFunc
-                var prefix = ""
-                if isAsync { prefix += "async " }
-                prefix += "function"
-                if isGen { prefix += "*" }
-                let result = "\(prefix) \(name)() { [bytecode] }"
-                return JeffJSValue.makeString(JeffJSString(swiftString: result))
+            // Bytecode function — the parser recorded the source span of every
+            // function it compiled (QuickJS `JSFunctionDef.source`), so return
+            // the original text verbatim: `function f(){ ... }`, `x=>x`,
+            // `get x(){ ... }`, `class A { ... }`, `async *g(){ ... }`.
+            if let src = functionBytecode?.sourceSpanText {
+                return JeffJSValue.makeString(JeffJSString(swiftString: src))
             }
 
-            // No debug info — use the standard format
+            // No recorded source (stripped or synthesized bytecode) — QuickJS
+            // falls back to the native-code form here too.
             let name = getFunctionName(obj: obj)
             let result = "function \(name)() { [native code] }"
             return JeffJSValue.makeString(JeffJSString(swiftString: result))

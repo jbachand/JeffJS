@@ -16,7 +16,7 @@ import Foundation
 /// Magic bytes: "JFBC" (JeffJS Function ByteCode)
 private let JFBC_MAGIC: UInt32 = 0x4A46_4243
 /// Version 2: adds atom table for cross-runtime portability
-private let JFBC_VERSION: UInt8 = 4   // 4: function nameAtom (lazy `name` own property)
+private let JFBC_VERSION: UInt8 = 5   // 5: per-function source span + the script text (Function.prototype.toString)
 
 /// Constant pool entry tags
 private let CPOOL_UNDEFINED: UInt8 = 0
@@ -224,6 +224,17 @@ struct JeffJSBytecodeSerializer {
             s.writeString(str)
         }
 
+        // The script text, once for the whole function tree. Every function's
+        // (start, len) above indexes into it, so a cache hit reproduces the
+        // exact same `toString()` output as a fresh compile.
+        if let src = fb.sourceText {
+            s.writeU8(1)
+            s.writeU32(UInt32(src.bytes.count))
+            s.buf.append(contentsOf: src.bytes)
+        } else {
+            s.writeU8(0)
+        }
+
         return s.buf
     }
 
@@ -275,6 +286,10 @@ struct JeffJSBytecodeSerializer {
         writeU16(fb.closureVarCount)
         writeU32(UInt32(fb.lineNum))
         writeU32(UInt32(fb.colNum))
+        // Source span for Function.prototype.toString; the text itself is
+        // written once for the whole tree, after the atom table.
+        writeU32(UInt32(bitPattern: fb.sourceStart))
+        writeU32(UInt32(bitPattern: fb.sourceLen))
 
         // Bytecode bytes — rewrite atom operands to table indices
         if let rt {
@@ -386,6 +401,8 @@ struct JeffJSBytecodeDeserializer {
     private let data: [UInt8]
     private var pos: Int = 0
     private var remapper: AtomRemapper?
+    /// Script text shared by every function in this blob (trailer, v5+).
+    private var sourceText: JeffJSSourceText?
     /// Needed to rebuild tagged-template objects; without one, bytecode
     /// containing a tagged template fails to deserialize (cache miss).
     private var ctx: JeffJSContext?
@@ -402,6 +419,9 @@ struct JeffJSBytecodeDeserializer {
             // Version 2+: read atom table from end, build remapper
             d.remapper = d.buildRemapper(rt: rt)
         }
+
+        // v5 trailer: the script text, shared by every function below.
+        d.sourceText = d.readTrailingSource()
 
         d.pos = 0
         return d.readFunctionBytecode()
@@ -437,6 +457,29 @@ struct JeffJSBytecodeDeserializer {
         return AtomRemapper(indexToAtom: indexToAtom)
     }
 
+    /// Skip the function tree and the atom table to reach the shared script
+    /// text written by the serializer, and decode it.
+    private func readTrailingSource() -> JeffJSSourceText? {
+        var p = 0
+        guard skipFunctionBytecode(data: data, pos: &p) else { return nil }
+        guard p + 3 < data.count else { return nil }
+        let atomCount = Int(readU32LE(data, p))
+        p += 4
+        for _ in 0..<atomCount {
+            guard p + 3 < data.count else { return nil }
+            let strLen = Int(readU32LE(data, p))
+            p += 4 + strLen
+            guard p <= data.count else { return nil }
+        }
+        guard p < data.count, data[p] == 1 else { return nil }
+        p += 1
+        guard p + 3 < data.count else { return nil }
+        let srcLen = Int(readU32LE(data, p))
+        p += 4
+        guard p + srcLen <= data.count else { return nil }
+        return JeffJSSourceText(bytes: Array(data[p ..< (p + srcLen)]))
+    }
+
     /// Read U32 at a specific position without advancing pos.
     private func readU32At(_ p: Int) -> UInt32 {
         readU32LE(data, p)
@@ -446,8 +489,8 @@ struct JeffJSBytecodeDeserializer {
     private func skipFunctionBytecode(data: [UInt8], pos: inout Int) -> Bool {
         // Magic(4) + Version(1) + Flags(2) + argCount(2) + varCount(2) +
         // definedArgCount(2) + nameAtom(4) + stackSize(2) + closureVarCount(2) +
-        // lineNum(4) + colNum(4)
-        let headerSize = 4 + 1 + 2 + 2 + 2 + 2 + 4 + 2 + 2 + 4 + 4
+        // lineNum(4) + colNum(4) + sourceStart(4) + sourceLen(4)
+        let headerSize = 4 + 1 + 2 + 2 + 2 + 2 + 4 + 2 + 2 + 4 + 4 + 4 + 4
         guard pos + headerSize <= data.count else { return false }
         pos += headerSize
 
@@ -561,7 +604,7 @@ struct JeffJSBytecodeDeserializer {
     private mutating func readFunctionBytecode() -> JeffJSFunctionBytecode? {
         // Header
         guard let magic = readU32(), magic == JFBC_MAGIC else { return nil }
-        guard let version = readU8(), version == 4 else { return nil }   // older layouts lack the function nameAtom
+        guard let version = readU8(), version == 5 else { return nil }   // older layouts lack the function source span
         guard let flags = readU16() else { return nil }
         guard let argCount = readU16() else { return nil }
         guard let varCount = readU16() else { return nil }
@@ -571,6 +614,8 @@ struct JeffJSBytecodeDeserializer {
         guard let closureVarCount = readU16() else { return nil }
         guard let lineNum = readU32() else { return nil }
         guard let colNum = readU32() else { return nil }
+        guard let sourceStartRaw = readU32() else { return nil }
+        guard let sourceLenRaw = readU32() else { return nil }
 
         // Bytecode bytes
         guard var bytecode = readBytes() else { return nil }
@@ -639,6 +684,9 @@ struct JeffJSBytecodeDeserializer {
         fb.colNum = Int(colNum)
         fb.fileName = fileName
         fb.cpool = cpool
+        fb.sourceText = sourceText
+        fb.sourceStart = Int32(bitPattern: sourceStartRaw)
+        fb.sourceLen = Int32(bitPattern: sourceLenRaw)
         unpackFlags(flags, into: fb)
         fb.closureVarsList = closureVars
         fb.selfRefVarIdx = Int(Int32(bitPattern: selfRefRaw))
@@ -774,7 +822,7 @@ final class JeffJSBytecodeCache {
     ///   - JeffJSCompiler.swift (resolveLabels, resolveVariables, peephole)
     ///   - JeffJSOpcodes.swift (opcode additions/changes)
     ///   - JeffJSInterpreter.swift (only if opcode semantics change)
-    static let compilerVersion: UInt64 = 9  // 2026-09-21: define_method flag byte (bit 3 = enumerable, bit 4 = class prototype), lazy function name/length, NamedEvaluation set_name
+    static let compilerVersion: UInt64 = 10  // 2026-09-21: per-function source span + script text in JFBC v5 (Function.prototype.toString)
 
     /// Lazily-initialized disk cache directory.
     /// Automatically clears cached .jfbc files when the app binary changes (new build).

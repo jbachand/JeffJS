@@ -207,6 +207,13 @@ final class JeffJSParser {
     /// template call.
     var inTemplateExpr: Bool = false
 
+    /// Byte offset of the first token of the AssignmentExpression currently
+    /// being parsed.  An ArrowFunction *is* an AssignmentExpression, so this
+    /// is exactly the start of its source span (QuickJS passes the same
+    /// pointer down as `js_parse_function_decl2`'s `ptr` argument).  Saved and
+    /// restored around every nested parseAssignExpr, so the innermost one wins.
+    var exprStartPtr: Int = 0
+
     // -- Error state --
     var hasError: Bool = false
 
@@ -2805,6 +2812,9 @@ final class JeffJSParser {
     func parseFunctionDef(isExpression: Bool, isArrow: Bool) {
         var isGenerator = false
         var isAsync = false
+        // First byte of the function's source text (`async` / `function` / the
+        // arrow's parameter list).
+        let srcStart = isArrow ? exprStartPtr : s.token.ptr
 
         if !isArrow {
             // Check for 'async'. For function declarations, newlines before
@@ -2885,7 +2895,7 @@ final class JeffJSParser {
 
         if isArrow {
             // Arrow function: parameters are already parsed
-            parseArrowFunctionBody(childFd: childFd, isAsync: isAsync)
+            parseArrowFunctionBody(childFd: childFd, isAsync: isAsync, srcStart: srcStart)
         } else {
             // Regular function
             expect(0x28) // '('
@@ -2894,6 +2904,10 @@ final class JeffJSParser {
             expect(0x7B) // '{'
             parseFunctionBody(childFd: childFd, defaults: defaults, rest: rest, destructs: dstructs)
             expect(0x7D) // '}'
+            // The span ends just past the closing '}' (QuickJS records
+            // `s->buf_ptr - ptr` before consuming it); `lastPtr` is the end of
+            // the token `expect` just consumed.
+            recordSource(childFd, from: srcStart)
         }
 
         // Emit closure creation in parent
@@ -3232,7 +3246,11 @@ final class JeffJSParser {
     func parseArrowFunctionBody(childFd: JeffJSFunctionDefCompiler, isAsync: Bool,
                                 defaults: [JeffJSSavedDefaultParam] = [],
                                 rest: JeffJSRestParamInfo? = nil,
-                                destructs: [JeffJSSavedDestructParam] = []) {
+                                destructs: [JeffJSSavedDestructParam] = [],
+                                srcStart: Int = -1) {
+        // The arrow's source starts at the first token of the enclosing
+        // AssignmentExpression unless the caller knows better.
+        let arrowStart = srcStart >= 0 ? srcStart : exprStartPtr
         let savedFd = fd
         let savedInFlagArrow = inFlag
         let savedFinallyScopesArrow = finallyScopes
@@ -3347,10 +3365,21 @@ final class JeffJSParser {
             emitOp(isAsync ? .return_async : .return_)
         }
 
+        recordSource(childFd, from: arrowStart)
+
         fd = savedFd
         inFlag = savedInFlagArrow
         finallyScopes = savedFinallyScopesArrow
         curBlockEnvIdx = savedBlockEnvIdxArrow
+    }
+
+    /// Record the source span of `child` as [from, end of the last consumed
+    /// token).  `s.lastPtr` is the byte offset just past the previous token,
+    /// which is where QuickJS ends a function's source text.
+    func recordSource(_ child: JeffJSFunctionDefCompiler, from start: Int) {
+        guard start >= 0, s.lastPtr > start, s.lastPtr <= s.bufLen else { return }
+        child.sourceStart = start
+        child.sourceEnd = s.lastPtr
     }
 
     /// Skip a destructuring pattern without emitting bytecode (for parameters).
@@ -3613,6 +3642,12 @@ final class JeffJSParser {
     func parseAssignExpr() {
         guard enterRecursion() else { return }
         defer { leaveRecursion() }
+
+        // Record where this AssignmentExpression starts; if it turns out to be
+        // an arrow function this is the first byte of its source text.
+        let savedExprStart = exprStartPtr
+        exprStartPtr = s.token.ptr
+        defer { exprStartPtr = savedExprStart }
 
         // Check for yield
         if tok == JSTokenType.TOK_YIELD.rawValue {
@@ -5800,6 +5835,9 @@ final class JeffJSParser {
 
     /// Parse a single property definition in an object literal.
     func parsePropertyDefinition() {
+        // First byte of the property definition: a method / accessor's source
+        // text starts at `async` / `*` / `get` / `set` / the property name.
+        let memberStart = s.token.ptr
         // Spread: ...expr
         if tok == JSTokenType.TOK_ELLIPSIS.rawValue {
             next()
@@ -5947,6 +5985,7 @@ final class JeffJSParser {
             expect(0x7B) // '{'
             parseFunctionBody(childFd: methodFd, defaults: omDefaults, rest: omRest, destructs: omDstructs)
             expect(0x7D) // '}'
+            recordSource(methodFd, from: memberStart)
 
             let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
             emitFClosure(cpoolIdx)
@@ -5976,6 +6015,7 @@ final class JeffJSParser {
             expect(0x7B) // '{'
             parseFunctionBody(childFd: methodFd, defaults: gsDefaults, rest: gsRest, destructs: gsDstructs)
             expect(0x7D) // '}'
+            recordSource(methodFd, from: memberStart)
 
             let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
             emitFClosure(cpoolIdx)
