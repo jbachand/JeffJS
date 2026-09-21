@@ -184,6 +184,18 @@ class JeffJSFunctionDefCompiler {
     var lastLineNum: Int = 1
     var lastColNum: Int = 1
     var lastPC: Int = 0
+    // Separate running state for the pc2line/pc2col delta encoders. They used
+    // to share lastLineNum/lastColNum/lastPC with the parser's emitLineNum,
+    // which had already advanced them to the *end* of the function — so every
+    // delta was computed against the wrong base and every frame in an Error
+    // stack reported line 1.
+    /// First source line/column of this function's body (see compile()).
+    var firstLine: Int = 0
+    var firstCol: Int = 0
+    var pc2EncLine: Int = 1
+    var pc2EncCol: Int = 1
+    var pc2EncLinePC: Int = 0
+    var pc2EncColPC: Int = 0
     var lastColPC: Int = 0
     /// line_num events recorded during label resolution (pre-compaction
     /// positions); encoded into pc2line/pc2col after NOP compaction.
@@ -2078,6 +2090,12 @@ struct JeffJSCompiler {
         // addresses and the line/column tables.
         // ------------------------------------------------------------------
         let pcMap = compactNops(fd: fd, bc: &bc)
+        // The pc2line delta encoder drops an entry whose delta is zero (the
+        // common case for a one-line body), so remember the first position.
+        if let first = fd.pc2Events.first {
+            fd.firstLine = first.line
+            fd.firstCol = first.col
+        }
         for e in fd.pc2Events {
             let np = e.pc < pcMap.count ? pcMap[e.pc] : bc.len
             addPC2Line(fd: fd, pc: np, lineNum: e.line)
@@ -2995,8 +3013,8 @@ struct JeffJSCompiler {
     /// Uses the QuickJS pc2line delta encoding.
     private static func addPC2Line(fd: JeffJSFunctionDefCompiler,
                                     pc: Int, lineNum: Int) {
-        let pcDelta = pc - fd.lastPC
-        let lineDelta = lineNum - fd.lastLineNum
+        let pcDelta = pc - fd.pc2EncLinePC
+        let lineDelta = lineNum - fd.pc2EncLine
 
         // Encode using QuickJS's compact delta format
         if pcDelta == 0 && lineDelta == 0 { return }
@@ -3014,16 +3032,16 @@ struct JeffJSCompiler {
             putSLEB128(&fd.pc2lineBuf, Int32(lineDelta))
         }
 
-        fd.lastPC = pc
-        fd.lastLineNum = lineNum
+        fd.pc2EncLinePC = pc
+        fd.pc2EncLine = lineNum
     }
 
     /// Add a PC-to-column mapping for debug info.
     /// Uses the same delta encoding as pc2line.
     private static func addPC2Col(fd: JeffJSFunctionDefCompiler,
                                    pc: Int, colNum: Int) {
-        let pcDelta = pc - fd.lastColPC
-        let colDelta = colNum - fd.lastColNum
+        let pcDelta = pc - fd.pc2EncColPC
+        let colDelta = colNum - fd.pc2EncCol
 
         if pcDelta == 0 && colDelta == 0 { return }
 
@@ -3038,8 +3056,8 @@ struct JeffJSCompiler {
             putSLEB128(&fd.pc2colBuf, Int32(colDelta))
         }
 
-        fd.lastColPC = pc
-        fd.lastColNum = colNum
+        fd.pc2EncColPC = pc
+        fd.pc2EncCol = colNum
     }
 
     // =========================================================================
@@ -3452,8 +3470,15 @@ struct JeffJSCompiler {
         fb.cpool = fd.cpool
         fb.cpoolCountValue = fd.cpool.count
 
+        // The function's own first source position, used as the fallback
+        // location in Error stacks.
+        if fb.lineNum == 0 { fb.lineNum = fd.firstLine }
+        if fb.colNum == 0 { fb.colNum = fd.firstCol }
+
         // Debug info
-        if fd.source != nil || fd.pc2lineBuf.len > 0 {
+        // A nested function inherits its parent's filename but not its source
+        // text, so key the debug info on having *either*.
+        if fd.source != nil || fd.pc2lineBuf.len > 0 || fd.filename != 0 {
             fb.hasDebugInfo = true
             fb.hasDebug = true
             fb.debugFilenameAtom = fd.filename

@@ -10676,6 +10676,48 @@ extension JeffJSTestRunner {
             var d = new Der6(1, 2);
             d.x === 1 && d.y === 2 && d instanceof Base6 && Object.keys(Der6).length === 0
         """, expect: true)
+
+        // --- 8. Error stacks and error messages ----------------------------
+        // `stack` was just the header: rt.currentStackFrame, which
+        // buildBacktrace walked, is never assigned. It now walks the live
+        // interpreter chain (ctx.currentFrame).
+        // (Written without `.*` — the regexp engine mis-backtracks a greedy
+        // dot-star followed by a literal, which is a separate pre-existing bug.)
+        evalCheckBool(ctx, """
+            function inner8() { return new Error('boom').stack; }
+            function outer8() { return inner8(); }
+            var lines = outer8().split('\\n');
+            function frameOK(line, name) {
+                return line.indexOf('    at ' + name + ' (') === 0 &&
+                       /:[0-9]+:[0-9]+\\)$/.test(line);
+            }
+            lines[0] === 'Error: boom' && lines.length >= 3 &&
+            frameOK(lines[1], 'inner8') && frameOK(lines[2], 'outer8')
+        """, expect: true)
+        // A thrown builtin error carries frames too.
+        evalCheckBool(ctx, """
+            function thrower8() { null.x; }
+            var ok = false;
+            try { thrower8(); } catch (e) {
+                var l = e.stack.split('\\n')[1];
+                ok = l.indexOf('    at thrower8 (') === 0 && /:[0-9]+:[0-9]+\\)$/.test(l);
+            }
+            ok
+        """, expect: true)
+        // Messages name the property actually being read — the old heuristic
+        // appended the last unrelated get_field atom
+        // ("'navigator.x' is undefined") and a " at file:line" suffix.
+        evalCheckStr(ctx, "var u8; try { u8.x; } catch (e) { e.message }",
+                     expect: "Cannot read properties of undefined (reading 'x')")
+        evalCheckStr(ctx, "try { null.y; } catch (e) { e.message }",
+                     expect: "Cannot read properties of null (reading 'y')")
+        evalCheckStr(ctx, "var o8 = {}; try { o8.a.b; } catch (e) { e.message }",
+                     expect: "Cannot read properties of undefined (reading 'b')")
+        // Writing through a null/undefined base throws in sloppy mode too.
+        evalCheckStr(ctx, "var o8b = {}; try { o8b.m.n = 1; } catch (e) { e.message }",
+                     expect: "Cannot set properties of undefined (setting 'n')")
+        evalCheckStr(ctx, "var o8c = {}; try { o8c.nope(); } catch (e) { e.message }",
+                     expect: "undefined is not a function")
     }
 
     mutating func runAPITests() -> String {

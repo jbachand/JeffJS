@@ -398,98 +398,22 @@ struct JeffJSBuiltinError {
                                 filename: String, lineNum: Int, flags: Int) {
         guard let errObj = getObject(obj) else { return }
 
-        let rt = ctx.rt
+        // Header: "ErrorName: message" (or just "ErrorName").
+        let nameVal = errObj.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_name.rawValue)
+        var errorName = filename.isEmpty ? "Error" : filename
+        if nameVal.isString, let s = nameVal.stringValue { errorName = s.toSwiftString() }
 
-        // Build the header: "ErrorName: message" or just "ErrorName"
-        var stackStr = ""
+        var message = ""
+        let msgVal = errObj.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_message.rawValue)
+        if msgVal.isString, let s = msgVal.stringValue { message = s.toSwiftString() }
 
-        // Get the error name
-        let nameVal = errObj.getOwnPropertyValue(
-            atom: JeffJSAtomID.JS_ATOM_name.rawValue)
-        var errorName = "Error"
-        if !nameVal.isUndefined {
-            if nameVal.isString, let s = nameVal.stringValue {
-                errorName = s.toSwiftString()
-            }
-        }
-        stackStr += errorName
+        // The frames come from the interpreter's live activation chain
+        // (ctx.currentFrame). `rt.currentStackFrame`, which this used to walk,
+        // is never assigned, so every stack was just the header line.
+        let stackStr = ctx.buildStackTrace(errorName: errorName, message: message,
+                                           skipFrames: (flags & JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL) != 0 ? 1 : 0,
+                                           includeSourceSnippet: false)
 
-        // Get the message
-        let msgVal = errObj.getOwnPropertyValue(
-            atom: JeffJSAtomID.JS_ATOM_message.rawValue)
-        if !msgVal.isUndefined {
-            if msgVal.isString, let s = msgVal.stringValue {
-                let msgStr = s.toSwiftString()
-                if !msgStr.isEmpty {
-                    stackStr += ": \(msgStr)"
-                }
-            }
-        }
-
-        // Add the throw location
-        if !filename.isEmpty {
-            stackStr += "\n    at \(filename)"
-            if lineNum > 0 {
-                stackStr += ":\(lineNum)"
-            }
-        }
-
-        // Walk the stack frames
-        let skipFirst = (flags & JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL) != 0
-        var frame = rt.currentStackFrame
-        var frameIndex = 0
-
-        while let sf = frame {
-            if skipFirst && frameIndex == 0 {
-                frame = sf.prevFrame
-                frameIndex += 1
-                continue
-            }
-
-            // Get function name from the stack frame's curFunc
-            var funcName = "<anonymous>"
-            if let funcObj = getObject(sf.curFunc) {
-                let fnNameVal = funcObj.getOwnPropertyValue(
-                    atom: JeffJSAtomID.JS_ATOM_name.rawValue)
-                if fnNameVal.isString, let s = fnNameVal.stringValue {
-                    let n = s.toSwiftString()
-                    if !n.isEmpty { funcName = n }
-                }
-
-                // Try to get filename and line from bytecode
-                if case .bytecodeFunc(let bc, _, _) = funcObj.payload,
-                   let bc = bc {
-                    let fn = bc.fileName?.toSwiftString() ?? "<unknown>"
-                    // Use PC-based line/col for accurate location within the function
-                    if let fb = bc as? JeffJSFunctionBytecodeCompiled {
-                        let pc = fb.bytecodeLen > 0 ? max(0, min(sf.curPC, fb.bytecodeLen - 1)) : 0
-                        let ln = fb.debugPc2lineBuf.isEmpty ? bc.lineNum : fb.lineForPC(pc)
-                        let col = fb.debugPc2colBuf.isEmpty ? bc.colNum : fb.colForPC(pc)
-                        if col > 0 {
-                            stackStr += "\n    at \(funcName) (\(fn):\(ln):\(col))"
-                        } else {
-                            stackStr += "\n    at \(funcName) (\(fn):\(ln))"
-                        }
-                    } else {
-                        let ln = bc.lineNum
-                        let col = bc.colNum
-                        stackStr += "\n    at \(funcName) (\(fn):\(ln):\(col))"
-                    }
-                } else {
-                    stackStr += "\n    at \(funcName) (native)"
-                }
-            } else {
-                stackStr += "\n    at \(funcName)"
-            }
-
-            frame = sf.prevFrame
-            frameIndex += 1
-
-            // Safety limit on stack trace depth
-            if frameIndex > 100 { break }
-        }
-
-        // Set the "stack" property on the error object
         jeffJS_addProperty(ctx: ctx, obj: errObj,
                            atom: JeffJSAtomID.JS_ATOM_stack.rawValue,
                            flags: [.writable, .configurable])

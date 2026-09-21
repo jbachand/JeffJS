@@ -294,16 +294,8 @@ extension JeffJSContext {
             else if funcVal.isInt { desc = String(funcVal.toInt32()) }
             else if funcVal.isBool { desc = funcVal.toBool() ? "true" : "false" }
             else { desc = toSwiftString(funcVal) ?? "\(funcVal.tag)" }
-            // Build context hint from current stack frame
-            var hint = ""
-            if let frame = self.currentFrame,
-               let curFn = frame.curFunc.toObject(),
-               case .bytecodeFunc(let fbOpt, _, _) = curFn.payload,
-               let fb = fbOpt {
-                let fname = fb.fileName?.toSwiftString() ?? "?"
-                hint = " at \(fname):\(fb.lineNum) pc=\(frame.curPC)"
-            }
-            return throwTypeError(message: "\(desc) is not a function\(hint)")
+            // The call site belongs in the error's `stack`, not in its message.
+            return throwTypeError(message: "\(desc) is not a function")
         }
         // Hot path: plain bytecode function — skip the payload-enum matches
         // below (each one copies the payload, retaining FB + varRefs array).
@@ -470,15 +462,7 @@ extension JeffJSContext {
         guard case .bytecodeFunc = obj.payload else {
             // Not a callable type (plain object, array, etc.)
             let desc = toSwiftString(funcVal) ?? "[object]"
-            var hint = ""
-            if let frame = self.currentFrame,
-               let curFn = frame.curFunc.toObject(),
-               case .bytecodeFunc(let fbOpt, _, _) = curFn.payload,
-               let fb = fbOpt {
-                let fname = fb.fileName?.toSwiftString() ?? "?"
-                hint = " at \(fname):\(fb.lineNum) pc=\(frame.curPC)"
-            }
-            return throwTypeError(message: "\(desc) is not a function\(hint)")
+            return throwTypeError(message: "\(desc) is not a function")
         }
         return JeffJSInterpreter.callInternal(ctx: self, funcObj: funcVal,
                                                thisVal: thisVal, args: args, flags: 0)
@@ -2667,6 +2651,7 @@ private func executeFastTrace(
             pc += 1
 
         case .call, .call0, .call1, .call2, .call3:
+            frame.curPC = pc   // so Error stacks can name this frame's line
             let argc: Int
             let instrSize: Int
             switch op {
@@ -2778,6 +2763,7 @@ private func executeFastTrace(
             }
 
         case .call_method:
+            frame.curPC = pc   // so Error stacks can name this frame's line
             let argc = Int(readU16(bc, pc + 1))
             // Array.prototype.push fast path (mirrors the main loop) so
             // `arr.push(x)` loops stay in the trace.
@@ -6921,6 +6907,7 @@ struct JeffJSInterpreter {
             // -----------------------------------------------------------------
 
             case .call, .call0, .call1, .call2, .call3:
+                frame.curPC = pc   // so Error stacks can name this frame's line
                 // --- Optimizations applied here ---
                 // (a) For call0/call1/call2/call3: avoid allocating an args array;
                 //     use fixed-size stack reads or empty literal.
@@ -7150,6 +7137,7 @@ struct JeffJSInterpreter {
                 }
 
             case .call_method:
+                frame.curPC = pc   // so Error stacks can name this frame's line
                 var argc = Int(readU16(bc, pc + 1))
                 // ── Function.prototype.call intrinsic ───────────────────
                 // f.call(thisArg, a, b) becomes a direct call of f with
@@ -7494,6 +7482,7 @@ struct JeffJSInterpreter {
                 continue dispatchLoop
 
             case .call_constructor:
+                frame.curPC = pc   // so Error stacks can name this frame's line
                 ctx.lastGetFieldAtom = 0
                 let argc = Int(readU16(bc, pc + 1))
                 var callArgs = [JeffJSValue](repeating: .undefined, count: argc)
@@ -7985,29 +7974,13 @@ struct JeffJSInterpreter {
                 // actually-following call removes that churn from hot read loops and
                 // balances the reference.
                 let nextIsCall = (pc + 5) < bcLen && isCallOpcodeByte(bc[pc + 5])
-                // Early check: property access on null/undefined with location info
+                // Property access on null/undefined. The location goes in the
+                // error's `stack` (built from the live frame chain), not in the
+                // message — the message must read like every other engine's.
                 if obj.isNullOrUndefined {
+                    frame.curPC = pc
                     let propName = ctx.rt.atomToString(atom) ?? "?"
-                    let compiled = fb as? JeffJSFunctionBytecodeCompiled
-                    let fnameAtom = compiled?.debugFilenameAtom ?? 0
-                    let fname = fnameAtom > 0 ? (ctx.rt.atomToString(fnameAtom) ?? "?") : (fb.fileName?.toSwiftString() ?? "?")
-                    let line = compiled?.lineForPC(pc) ?? fb.lineNum
-                    // Walk the call stack for a full trace
-                    var trace: [String] = ["\(fname):\(line) pc=\(pc)"]
-                    var walkFrame = frame.prevFrame
-                    while let f = walkFrame, trace.count < 8 {
-                        if let fObj = f.curFunc.toObject(),
-                           case .bytecodeFunc(let wfb, _, _) = fObj.payload,
-                           let wf = wfb {
-                            let wCompiled = wf as? JeffJSFunctionBytecodeCompiled
-                            let wFnameAtom = wCompiled?.debugFilenameAtom ?? 0
-                            let wFname = wFnameAtom > 0 ? (ctx.rt.atomToString(wFnameAtom) ?? "?") : (wf.fileName?.toSwiftString() ?? "?")
-                            let wLine = wCompiled?.lineForPC(f.curPC) ?? wf.lineNum
-                            trace.append("\(wFname):\(wLine) pc=\(f.curPC)")
-                        }
-                        walkFrame = f.prevFrame
-                    }
-                    _ = ctx.throwTypeError(message: "Cannot read properties of \(obj.isNull ? "null" : "undefined") (reading '\(propName)') at \(fname):\(line)")
+                    _ = ctx.throwTypeError(message: "Cannot read properties of \(obj.isNull ? "null" : "undefined") (reading '\(propName)')")
                     retVal = .exception; break dispatchLoop
                 }
                 // Inline cache fast path: shape-matched direct property read

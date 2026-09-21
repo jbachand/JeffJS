@@ -2774,8 +2774,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 msgStr = self.toSwiftString(args[0]) ?? ""
                 _ = self.setPropertyStr(obj: errObj, name: "message", value: self.newStringValue(msgStr))
             }
-            // Set stack property
-            let stackStr = msgStr.isEmpty ? "Error" : "Error: \(msgStr)"
+            // `stack` carries the call site: header + one "at fn (file:line:col)"
+            // line per live interpreter frame. It used to be just the header.
+            let stackStr = self.buildStackTrace(errorName: "Error", message: msgStr,
+                                                includeSourceSnippet: false)
             _ = self.setPropertyStr(obj: errObj, name: "stack", value: self.newStringValue(stackStr))
             return errObj
         }, name: "Error", length: 1)
@@ -2821,8 +2823,8 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                     msgStr = self.toSwiftString(args[0]) ?? ""
                     _ = self.setPropertyStr(obj: errObj, name: "message", value: self.newStringValue(msgStr))
                 }
-                // Set stack property
-                let stackStr = msgStr.isEmpty ? capturedName : "\(capturedName): \(msgStr)"
+                let stackStr = self.buildStackTrace(errorName: capturedName, message: msgStr,
+                                                    includeSourceSnippet: false)
                 _ = self.setPropertyStr(obj: errObj, name: "stack", value: self.newStringValue(stackStr))
                 return errObj
             }, name: name, length: 1)
@@ -3999,12 +4001,13 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 }
             }
             if obj.isNullOrUndefined {
+                // The message names the property being read, nothing else. It
+                // used to append " — '<lastGetFieldAtom>.x' is undefined",
+                // where the "last get_field atom" was whatever unrelated
+                // property had been read last ("'navigator.x' is undefined"
+                // for `var u; u.x`). The call site is in `stack`.
                 let atomStr = rt.atomToString(atom) ?? "?"
-                // Include the last variable/field that produced the undefined value
-                let prevAtom = prevGetFieldAtom
-                let varHint = prevAtom > 0 ? (rt.atomToString(prevAtom) ?? "") : ""
-                let hint = varHint.isEmpty ? "" : " — '\(varHint).\(atomStr)' is undefined"
-                return throwTypeError(message: "Cannot read properties of \(obj.isNull ? "null" : "undefined") (reading '\(atomStr)')\(hint)")
+                return throwTypeError(message: "Cannot read properties of \(obj.isNull ? "null" : "undefined") (reading '\(atomStr)')")
             }
             return .JS_UNDEFINED
         }
@@ -4187,16 +4190,20 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         flags: Int
     ) -> Int {
         guard let jsObj = obj.toObject() else {
-            if (flags & JS_PROP_THROW) != 0 {
+            // Writing through a null/undefined base always throws, in sloppy
+            // mode too (ES §13.15.2 / PutValue step 5) — `o.m.n = 1` used to
+            // fail silently and leave `e.message` undefined.
+            if obj.isNullOrUndefined || (flags & JS_PROP_THROW) != 0 {
                 let propName = rt.atomToString(atom) ?? "?"
                 let desc: String
                 if obj.isUndefined { desc = "undefined" }
                 else if obj.isNull { desc = "null" }
-                else if obj.isInt { desc = "int(\(obj.toInt32()))" }
+                else if obj.isInt { desc = "\(obj.toInt32())" }
                 else if obj.isBool { desc = obj.toBool() ? "true" : "false" }
-                else { desc = "tag(\(obj.tag))" }
-                _ = throwTypeError(message: "cannot set property '\(propName)' of \(desc)")
+                else { desc = "\(obj.tag)" }
+                _ = throwTypeError(message: "Cannot set properties of \(desc) (setting '\(propName)')")
             }
+            value.freeValue()
             return -1
         }
 
@@ -4406,12 +4413,16 @@ public final class JeffJSContext: JeffJSTokenizerContext {
 
     /// Creates and throws an error of the given type.
     /// Build a stack trace string by walking the call frame chain.
-    func buildStackTrace(errorName: String, message: String) -> String {
+    func buildStackTrace(errorName: String, message: String,
+                         skipFrames: Int = 0,
+                         includeSourceSnippet: Bool = true) -> String {
         var lines: [String] = []
         let header = message.isEmpty ? errorName : "\(errorName): \(message)"
         lines.append(header)
 
         var frame = currentFrame
+        var skipped = 0
+        while skipped < skipFrames, let f = frame { frame = f.prevFrame; skipped += 1 }
         var depth = 0
         while let f = frame, depth < 16 {
             depth += 1
@@ -4419,11 +4430,15 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                case .bytecodeFunc(let bytecodeOpt, _, _) = obj.payload,
                let fb = bytecodeOpt as? JeffJSFunctionBytecodeCompiled {
                 let pc = fb.bytecodeLen > 0 ? max(0, min(f.curPC, fb.bytecodeLen - 1)) : 0
-                let lineNum = fb.debugPc2lineBuf.isEmpty ? 0 : fb.lineForPC(pc)
-                let colNum = fb.debugPc2colBuf.isEmpty ? 0 : fb.colForPC(pc)
+                // Fall back to the function's own line/column when the
+                // pc2line table is empty (a body that never changes line).
+                var lineNum = fb.debugPc2lineBuf.isEmpty ? 0 : fb.lineForPC(pc)
+                var colNum = fb.debugPc2colBuf.isEmpty ? 0 : fb.colForPC(pc)
+                if lineNum <= 0 { lineNum = fb.lineNum }
+                if colNum <= 0 { colNum = fb.colNum }
                 let filename = fb.debugFilenameAtom != 0
                     ? (rt.atomToString(fb.debugFilenameAtom) ?? "<unknown>")
-                    : "<anonymous>"
+                    : (fb.fileName?.toSwiftString() ?? "<anonymous>")
                 let funcName = fb.funcNameAtom != 0
                     ? (rt.atomToString(fb.funcNameAtom) ?? "")
                     : ""
@@ -4435,13 +4450,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 } else {
                     location = filename
                 }
-                if funcName.isEmpty {
-                    lines.append("    at \(location)")
-                } else {
-                    lines.append("    at \(funcName) (\(location))")
-                }
+                lines.append("    at \(funcName.isEmpty ? "<anonymous>" : funcName) (\(location))")
                 // Add source snippet for the innermost frame
-                if lines.count == 2, lineNum > 0, let (snippet, _) = fb.sourceSnippet(forLine: lineNum) {
+                if includeSourceSnippet, lines.count == 2, lineNum > 0,
+                   let (snippet, _) = fb.sourceSnippet(forLine: lineNum) {
                     lines.append("    > \(snippet)")
                 }
             }
