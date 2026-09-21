@@ -520,6 +520,21 @@ final class JeffJSDOMBridge {
             return self.wrapElement(node, ctx: ctx)
         }, name: "get currentScript", length: 0)
         ctx.setPropertyGetSet(obj: doc, name: "currentScript", getter: currentScriptGetter, setter: nil)
+
+        // The host pushes the executing <script> by node id. Going through JS
+        // (rather than a Swift entry point) keeps the host compiling against any
+        // engine revision: it feature-tests the function before calling it.
+        ctx.setPropertyFunc(obj: doc, name: "__setCurrentScriptByID", fn: { [weak self] ctx, _, args in
+            guard let self else { return JeffJSValue.undefined }
+            let raw = args.first.flatMap { ctx.toSwiftString($0) } ?? ""
+            guard let uuid = UUID(uuidString: raw) else {
+                self.currentScriptNode = nil
+                return JeffJSValue.undefined
+            }
+            self.currentScriptNode = self.nodeRegistry[uuid]
+                ?? self.findElement(in: self.root, where: { $0.id == uuid })
+            return JeffJSValue.undefined
+        }, length: 1)
     }
 
     // MARK: - document.implementation / detached documents
