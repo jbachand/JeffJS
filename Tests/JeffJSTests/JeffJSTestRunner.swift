@@ -10442,6 +10442,36 @@ extension JeffJSTestRunner {
             t
             """, expectInt: 24)
 
+        // --- 2. Object rest --------------------------------------------
+        evalCheckStr(ctx, "var { x, ...r } = { x: 1, y: 2, z: 3 }; x + '|' + JSON.stringify(r)",
+                     expect: "1|{\"y\":2,\"z\":3}")
+        evalCheckStr(ctx, """
+            function f({ a, ...rest }) { return a + '|' + JSON.stringify(rest); }
+            f({ a: 1, b: 2, c: 3 })
+            """, expect: "1|{\"b\":2,\"c\":3}")
+        evalCheckStr(ctx, """
+            var { p: { q, ...inner }, ...outer } = { p: { q: 1, z: 2 }, w: 3 };
+            q + '|' + JSON.stringify(inner) + '|' + JSON.stringify(outer)
+            """, expect: "1|{\"z\":2}|{\"w\":3}")
+        evalCheckStr(ctx, "var { ...all } = { a: 1 }; JSON.stringify(all)", expect: "{\"a\":1}")
+        evalCheckStr(ctx, "var rr; ({ q1: rr, ...r2 } = { q1: 9, y: 8 }); rr + '|' + JSON.stringify(r2)",
+                     expect: "9|{\"y\":8}")
+        // Computed keys are excluded from the rest object (and read the right
+        // property: the source used to be dropped before the key expression).
+        evalCheckStr(ctx, "var kk = 'b'; var { [kk]: bv } = { a: 1, b: 2 }; String(bv)", expect: "2")
+        evalCheckStr(ctx, """
+            var n0 = 0; var { ['k' + n0]: v, ...r3 } = { k0: 1, k1: 2 };
+            v + '|' + JSON.stringify(r3)
+            """, expect: "1|{\"k1\":2}")
+        evalCheckStr(ctx, "var { x1 = 5, ...r4 } = { y1: 2 }; x1 + '|' + JSON.stringify(r4)",
+                     expect: "5|{\"y1\":2}")
+        evalCheckStr(ctx, """
+            (function () { try { throw { a: 1, b: 2 }; } catch ({ a, ...r }) { return a + '|' + JSON.stringify(r); } })()
+            """, expect: "1|{\"b\":2}")
+        evalCheckStr(ctx, "var g = ({ a, ...r }) => a + '|' + JSON.stringify(r); g({ a: 1, b: 2 })",
+                     expect: "1|{\"b\":2}")
+        evalCheckStr(ctx, "const { ca, ...cr } = { ca: 1, cb: 2 }; ca + '|' + JSON.stringify(cr)",
+                     expect: "1|{\"cb\":2}")
     }
 
     mutating func runAPITests() -> String {

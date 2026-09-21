@@ -6472,28 +6472,58 @@ final class JeffJSParser {
                                   isLexical: Bool, isConst: Bool) {
         expect(0x7B) // '{'
 
+        // Keys bound so far. A trailing `...rest` must exclude them, so static
+        // keys are remembered as atoms and computed keys are stashed in
+        // anonymous locals as they are evaluated (the values are needed at
+        // runtime, and the pattern is parsed in one pass).
+        var excludedAtoms: [JSAtom] = []
+        var excludedSlots: [Int] = []
+
         while tok != 0x7D && tok != JSTokenType.TOK_EOF.rawValue && !shouldAbort {
             if tok == JSTokenType.TOK_ELLIPSIS.rawValue {
-                // Rest element
+                // Rest element: a fresh object with every own enumerable
+                // property of the source except the ones already bound.
                 next()
-                emitOp(.copy_data_properties)
-                emitU8(0)
 
-                if tok == JSTokenType.TOK_IDENT.rawValue {
-                    let varName = s.token.identAtom
-                    next()
-                    if kind == .assignment {
-                        emitScopePutVar(varName, scopeLevel: fd.curScope)
-                    } else {
-                        let varIdx = defineVar(varName, isConst: isConst, isLexical: isLexical)
-                        if isLexical {
-                            emitOp(.put_loc_check_init)
-                        } else {
-                            emitOp(.put_loc)
-                        }
-                        emitU16(UInt16(varIdx))
-                    }
+                guard tok == JSTokenType.TOK_IDENT.rawValue else {
+                    syntaxError("rest element in object pattern must be an identifier")
+                    return
                 }
+                let varName = s.token.identAtom
+                next()
+
+                // Stack: [src] -> [src, target, src, excludeList]
+                emitOp(.dup)      // keep `src` for the trailing drop
+                emitOp(.object)   // the rest object
+                emitOp(.swap)
+                emitOp(.object)   // the exclusion list
+                for atom in excludedAtoms {
+                    emitOp(.undefined)
+                    emitDefineField(atom)
+                }
+                for slot in excludedSlots {
+                    emitOp(.dup)
+                    emitOp(.get_loc)
+                    emitU16(UInt16(slot))
+                    emitOp(.undefined)
+                    emitOp(.put_array_el)
+                }
+                emitOp(.copy_data_properties)
+                emitU8(1) // an exclusion list is present
+                // Stack: [src, target]
+
+                if kind == .assignment {
+                    emitScopePutVar(varName, scopeLevel: fd.curScope)
+                } else {
+                    let varIdx = defineVar(varName, isConst: isConst, isLexical: isLexical)
+                    if isLexical {
+                        emitOp(.put_loc_check_init)
+                    } else {
+                        emitOp(.put_loc)
+                    }
+                    emitU16(UInt16(varIdx))
+                }
+                // Stack: [src]
                 break
             }
 
@@ -6504,8 +6534,17 @@ final class JeffJSParser {
             if tok == 0x5B { // '[' computed
                 isComputed = true
                 next()
+                // `src` has to be under the key for get_array_el, so it is
+                // duplicated before the key expression runs.
+                emitOp(.dup)
                 parseAssignExpr()
                 expect(0x5D) // ']'
+                // Stash the key: a later `...rest` has to exclude it.
+                let keySlot = defineVar(0, isConst: false, isLexical: false)
+                emitOp(.dup)
+                emitOp(.put_loc)
+                emitU16(UInt16(keySlot))
+                excludedSlots.append(keySlot)
             } else if tok == JSTokenType.TOK_IDENT.rawValue {
                 propAtom = s.token.identAtom
                 next()
@@ -6523,15 +6562,19 @@ final class JeffJSParser {
                 syntaxError("expected property name in destructuring")
                 return
             }
+            if !isComputed { excludedAtoms.append(propAtom) }
+
+            // Stack: [src] (static key) or [src, src, key] (computed key)
+            // -> [src, value]
+            if isComputed {
+                emitOp(.get_array_el)
+            } else {
+                emitOp(.dup)
+                emitGetField(propAtom)
+            }
 
             if tok == 0x3A { // ':' -- different binding name
                 next()
-                emitOp(.dup)
-                if isComputed {
-                    emitOp(.get_array_el)
-                } else {
-                    emitGetField(propAtom)
-                }
 
                 if tok == 0x5B || tok == 0x7B {
                     parseNestedDestructuringElement(kind: kind, isLexical: isLexical, isConst: isConst)
@@ -6565,15 +6608,13 @@ final class JeffJSParser {
                     }
                 } else {
                     syntaxError("expected identifier or pattern")
+                    return
                 }
+            } else if isComputed {
+                syntaxError("computed property name in a pattern needs a binding")
+                return
             } else {
                 // Shorthand: { x } or { x = default }
-                emitOp(.dup)
-                if !isComputed {
-                    emitGetField(propAtom)
-                } else {
-                    emitOp(.get_array_el)
-                }
 
                 // Default value
                 if tok == 0x3D { // '='
