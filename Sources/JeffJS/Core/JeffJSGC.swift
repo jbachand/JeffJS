@@ -937,6 +937,8 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     // A Map/Set/WeakMap/WeakSet owns a counted reference to every key and
     // value it stores (see `jeffJS_mapStateFree`).
     if case .mapState(let ms) = savedPayload { jeffJS_mapStateFree(ms) }
+    // A promise owns its settled value and every reaction still queued on it.
+    if case .promiseData(let pd) = savedPayload { jeffJS_promiseDataFree(pd) }
     if case .typedArray(let ta) = savedPayload, let buf = ta.buffer {
         ta.buffer = nil
         if buf.refCount > 0 {
