@@ -356,6 +356,16 @@ struct JeffJSPropertyFlags: OptionSet {
     static let throwFlag    = JeffJSPropertyFlags(rawValue: 1 << 14)
     static let noAdd        = JeffJSPropertyFlags(rawValue: 1 << 16)
     static let noExotic     = JeffJSPropertyFlags(rawValue: 1 << 17)
+
+    /// The 2-bit type field (normal / getset / varref / autoinit). `contains`
+    /// is the wrong test for it: `.autoinit` contains both `.getset` and
+    /// `.varref` bits.
+    @inline(__always) var propType: UInt32 { rawValue & JeffJSPropertyFlags.tmask.rawValue }
+    /// A plain data slot: its value lives in `propValues`, so the inline
+    /// caches may read and write it directly.
+    @inline(__always) var isPlainData: Bool { propType == 0 }
+    @inline(__always) var isGetSet: Bool { propType == JeffJSPropertyFlags.getset.rawValue }
+    @inline(__always) var isVarRef: Bool { propType == JeffJSPropertyFlags.varref.rawValue }
 }
 
 // MARK: - C function type

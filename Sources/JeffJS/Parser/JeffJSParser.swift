@@ -533,9 +533,15 @@ final class JeffJSParser {
         fd.argumentsProloguePos = -1
 
         var prefix = [UInt8]()
-        // special_object(1) — narrow opcode + u8 kind (mapped arguments)
+        // special_object(kind) — narrow opcode + u8 kind. Only a sloppy
+        // function with a simple parameter list gets the MAPPED arguments
+        // object (indices alias the parameters, `callee` is the function);
+        // strict mode or any default / rest / destructured parameter makes it
+        // unmapped, with `callee` poisoned.
+        let mappedArgs = (fd.jsMode & JS_MODE_STRICT) == 0 && fd.hasSimpleParameterList
         prefix.append(UInt8(truncatingIfNeeded: JeffJSOpcode.special_object.rawValue))
-        prefix.append(1)
+        prefix.append(mappedArgs ? UInt8(SpecialObjectType.mappedArguments.rawValue)
+                                 : UInt8(SpecialObjectType.arguments.rawValue))
         // scope_put_var_init(argumentsAtom, scope) — wide opcode (>= 256)
         prefix.append(0)
         prefix.append(UInt8(truncatingIfNeeded: JeffJSOpcode.scope_put_var_init.rawValue - 256))

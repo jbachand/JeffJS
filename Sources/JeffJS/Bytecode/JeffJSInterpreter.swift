@@ -552,38 +552,94 @@ extension JeffJSContext {
 
     // MARK: - Object Creation Stubs
 
+    /// Var-ref for argument slot `i` of `frame`, shared with any closure that
+    /// already captured it. Mapped `arguments` slots alias the live parameter
+    /// through these, exactly as a closure variable does; the frame epilogue
+    /// detaches them (copying the value in) when the function returns.
+    func jeffJS_argVarRef(_ frame: JeffJSStackFrame, _ i: Int) -> JeffJSVarRef {
+        if let existing = frame.liveVarRefs.first(where: {
+            $0.isArg && $0.varIdx == UInt16(i) && !$0.isDetached
+        }) { return existing }
+        let vr = JeffJSVarRef(isDetached: false, isArg: true, varIdx: UInt16(i), parentFrame: frame)
+        // Generator / async frames re-acquire their buffer on resume, so they
+        // keep the frame-based lookup (same rule as createClosure).
+        let fb = frame.curFunc.toObject()?.fbFast
+        if let b = frame.buf, i < frame.bufVarBase,
+           !(fb?.isGenerator ?? false), !(fb?.isAsyncFunc ?? false) {
+            vr.slot = b + i
+        }
+        frame.liveVarRefs.append(vr)
+        frame.hasLiveVarRefs = true
+        return vr
+    }
+
     /// Creates a special object (arguments, mapped arguments, etc.) based on kind.
     func newSpecialObject(kind: UInt8, frame: JeffJSStackFrame) -> JeffJSValue {
         switch SpecialObjectType(rawValue: kind) {
         case .arguments, .mappedArguments:
-            // Arguments objects of one kind and count all share one transition
-            // shape (indices, length[, callee], @@iterator). After the first,
-            // creation is one object plus slot appends; the old path paid N + 3
-            // property adds through the transition table every time.
+            // Sloppy functions with a simple parameter list get a MAPPED
+            // arguments object: indices below the formal parameter count are
+            // var-ref slots aliasing the live argument, and `callee` is the
+            // function. Strict functions (and any non-simple parameter list)
+            // get an unmapped one whose `callee` is the %ThrowTypeError%
+            // poison accessor. Both carry the Arguments class so
+            // `Object.prototype.toString` reports "[object Arguments]".
+            //
+            // Arguments objects of one kind, argc and mapped count share one
+            // transition shape; after the first, creation is one object plus
+            // slot appends.
             let mapped = kind == SpecialObjectType.mappedArguments.rawValue
             let argc = frame.argBuf.count
-            let fixedCount = mapped ? 3 : 2
+            var mappedCount = 0
+            if mapped, let fb = frame.curFunc.toObject()?.fbFast {
+                mappedCount = min(argc, Int(fb.argCount))
+            }
             let argsObj = newObject()
             guard let o = argsObj.toObject() else { return argsObj }
+            o.classID = mapped ? JeffJSClassID.mappedArguments.rawValue
+                               : JeffJSClassID.arguments.rawValue
             let iterFn: JeffJSValue = arrayProtoValues.isFunction ? arrayProtoValues.dupValue() : .undefined
-            if argc < argumentsShapesMapped.count,
-               let shape = (mapped ? argumentsShapesMapped : argumentsShapesStrict)[argc],
+            let fixedCount = 3   // length, callee, @@iterator (both kinds)
+            let shapeKey = (argc << 16) | (mappedCount << 1) | (mapped ? 1 : 0)
+            if argc <= 8,
+               let shape = argumentsShapes[shapeKey],
                shape.isHashed, shape.propCount == argc + fixedCount,
                o.propValues.count == 0, let old = o.shape {
                 shape.refCount += 1
                 o.shape = shape
                 jeffJS_leaveShape(rt, old)
-                for a in frame.argBuf { o.appendDataValue(a.dupValue()) }
+                for i in 0 ..< argc {
+                    if i < mappedCount {
+                        o.appendProp(.varRef(jeffJS_argVarRef(frame, i)))
+                    } else {
+                        o.appendDataValue(frame.argBuf[i].dupValue())
+                    }
+                }
                 o.appendDataValue(.newInt32(Int32(argc)))                  // length
-                if mapped { o.appendDataValue(frame.curFunc.dupValue()) }  // callee
+                if mapped {
+                    o.appendDataValue(frame.curFunc.dupValue())            // callee
+                } else if let tte = throwTypeError.toObject() {
+                    _ = throwTypeError.dupValue()                          // getter
+                    _ = throwTypeError.dupValue()                          // setter
+                    o.appendProp(.getset(getter: tte, setter: tte))        // callee (poison)
+                } else {
+                    o.appendDataValue(.undefined)
+                }
                 o.appendDataValue(iterFn)                                  // @@iterator
                 return argsObj
             }
-            // First object of this kind and count: build it property by
+            // First object of this kind/argc/mappedCount: build it property by
             // property (length, callee and @@iterator non-enumerable, as the
             // spec has them) and remember the resulting transition shape.
-            for (i, arg) in frame.argBuf.enumerated() {
-                _ = setPropertyUint32(obj: argsObj, index: UInt32(i), value: arg.dupValue())
+            for i in 0 ..< argc {
+                if i < mappedCount {
+                    let atom = rt.newAtomUInt32(UInt32(i))
+                    jeffJS_objectAddShapeProperty(self, o, atom: atom,
+                                                  flags: JeffJSPropertyFlags([.cWE, .varref]).rawValue)
+                    o.appendProp(.varRef(jeffJS_argVarRef(frame, i)))
+                } else {
+                    _ = setPropertyUint32(obj: argsObj, index: UInt32(i), value: frame.argBuf[i].dupValue())
+                }
             }
             let wc = JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE
             _ = definePropertyValue(obj: argsObj, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
@@ -591,13 +647,17 @@ extension JeffJSContext {
             if mapped {
                 _ = definePropertyValue(obj: argsObj, atom: JeffJSAtomID.JS_ATOM_callee.rawValue,
                                         value: frame.curFunc.dupValue(), flags: wc)
+            } else {
+                _ = defineProperty(obj: argsObj, atom: JeffJSAtomID.JS_ATOM_callee.rawValue,
+                                   value: .undefined, getter: throwTypeError, setter: throwTypeError,
+                                   flags: JS_PROP_GETSET | JS_PROP_HAS_GET | JS_PROP_HAS_SET)
             }
             _ = definePropertyValue(obj: argsObj, atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue,
                                     value: iterFn, flags: wc)
-            if argc < argumentsShapesMapped.count, let sh = o.shape, sh.isHashed,
+            if argc <= 8, let sh = o.shape, sh.isHashed,
                sh.propCount == argc + fixedCount, o.propValues.count == sh.propCount {
                 sh.refCount += 1   // the context keeps the shape alive
-                if mapped { argumentsShapesMapped[argc] = sh } else { argumentsShapesStrict[argc] = sh }
+                argumentsShapes[shapeKey] = sh
             }
             return argsObj
         case .thisVal:
@@ -1201,7 +1261,7 @@ extension JeffJSContext {
             let idx = jeffJS_findOwnPropertyIndex(obj: gObj, atom: atom)
             if idx >= 0 {
                 if let shape = gObj.shape, idx < gObj.propCount,
-                   !shape.prop[idx].flags.contains(.getset),
+                   shape.prop[idx].flags.isPlainData,
                    gObj.extra(at: idx) == nil {
                     return gObj.dataValue(at: idx).dupValue()
                 }
@@ -1233,7 +1293,7 @@ extension JeffJSContext {
             let idx = jeffJS_findOwnPropertyIndex(obj: gObj, atom: atom)
             if idx >= 0, idx < gObj.propCount {
                 let f = shape.prop[idx].flags
-                if !f.contains(.getset), f.contains(.writable),
+                if f.isPlainData, f.contains(.writable),
                    gObj.extra(at: idx) == nil {
                     let old = gObj.propValues[idx]
                     gObj.propValues[idx] = val
@@ -1598,6 +1658,7 @@ extension JeffJSContext {
             guard i < srcObj.propCount else { continue }
             switch srcObj.propEntry(at: i) {
             case .value(let val): pending.append((atom, val.dupValue()))
+            case .varRef(let vr): pending.append((atom, vr.pvalue.dupValue()))
             case .getset: pending.append((atom, nil))   // read with [[Get]] below
             default: break
             }
@@ -3193,7 +3254,7 @@ private func executeFastTrace(
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
                entry.propOffset < gShape.prop.count,
                gShape.prop[entry.propOffset].flags.contains(.writable),
-               !gShape.prop[entry.propOffset].flags.contains(.getset),
+               gShape.prop[entry.propOffset].flags.isPlainData,
                gObj.extra(at: entry.propOffset) == nil {
                 let chained = isStoreOpcode(bc, pc + 5, bcLen)
                 let val: JeffJSValue
@@ -4466,7 +4527,7 @@ private func executeFastTraceLean(
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
                entry.propOffset < gShape.prop.count,
                gShape.prop[entry.propOffset].flags.contains(.writable),
-               !gShape.prop[entry.propOffset].flags.contains(.getset),
+               gShape.prop[entry.propOffset].flags.isPlainData,
                gObj.extra(at: entry.propOffset) == nil {
                 let chained = isStoreOpcode(bc, pc + 5, bcLen)
                 let val: JeffJSValue
@@ -7780,7 +7841,7 @@ struct JeffJSInterpreter {
                 // Cache plain data slots for the next read
                 if let gObj = ctx.globalObj.obj, let gShape = gObj.shape {
                     if let idx = findShapeProperty(gShape, atom), idx < gObj.propCount,
-                       !gShape.prop[idx].flags.contains(.getset),
+                       gShape.prop[idx].flags.isPlainData,
                        gShape.prop[idx].flags.contains(.writable) {
                         fb.getIC().update(pc, shape: gShape, propOffset: idx)
                     }
@@ -7801,7 +7862,7 @@ struct JeffJSInterpreter {
                        entry.propOffset >= 0, entry.propOffset < gObj.propCount,
                        entry.propOffset < gShape.prop.count,
                        gShape.prop[entry.propOffset].flags.contains(.writable),
-                       !gShape.prop[entry.propOffset].flags.contains(.getset),
+                       gShape.prop[entry.propOffset].flags.isPlainData,
                        gObj.extra(at: entry.propOffset) == nil {
                         let old = gObj.dataValue(at: entry.propOffset)
                         gObj.asClass.propValues[entry.propOffset] = val
@@ -7817,7 +7878,7 @@ struct JeffJSInterpreter {
                 }
                 if let gObj = ctx.globalObj.obj, let gShape = gObj.shape {
                     if let idx = findShapeProperty(gShape, atom), idx < gObj.propCount,
-                       !gShape.prop[idx].flags.contains(.getset),
+                       gShape.prop[idx].flags.isPlainData,
                        gShape.prop[idx].flags.contains(.writable) {
                         fb.getIC().update(pc, shape: gShape, propOffset: idx)
                     }

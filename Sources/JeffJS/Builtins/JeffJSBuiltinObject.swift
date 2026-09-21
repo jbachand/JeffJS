@@ -156,6 +156,11 @@ extension JeffJSContext {
                 } else {
                     _ = setPropertyStr(obj: desc, name: "set", value: .undefined)
                 }
+            case .varRef(let vr):
+                // Mapped arguments slot: reports as the aliased value.
+                _ = setPropertyStr(obj: desc, name: "value", value: vr.pvalue.dupValue())
+                _ = setPropertyStr(obj: desc, name: "writable",
+                                   value: JeffJSValue.newBool(shapeProp.flags.contains(.writable)))
             default:
                 break
             }

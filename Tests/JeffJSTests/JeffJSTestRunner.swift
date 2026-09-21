@@ -10518,6 +10518,36 @@ extension JeffJSTestRunner {
         evalCheckException(ctx, """
             (0, eval)('function wsf() { "use strict"; with ({}) {} }')
             """)
+
+        // --- 6. arguments object ----------------------------------------
+        // The arguments object was always the "mapped" flavour, never
+        // actually mapped (values were copied), was a plain Object, and
+        // `callee` was the function even in strict mode.
+        evalCheck(ctx, "function am1(a) { arguments[0] = 2; return a; } am1(1)", expectInt: 2)
+        evalCheck(ctx, "function am2(a) { a = 3; return arguments[0]; } am2(1)", expectInt: 3)
+        evalCheckStr(ctx, "function am3(a) { return Object.prototype.toString.call(arguments); } am3(1)",
+                     expect: "[object Arguments]")
+        // Strict functions get an unmapped arguments object.
+        evalCheck(ctx, "function as1(a) { 'use strict'; arguments[0] = 2; return a; } as1(1)", expectInt: 1)
+        evalCheck(ctx, "function as2(a) { 'use strict'; return arguments[0]; } as2(5)", expectInt: 5)
+        evalCheckException(ctx, "function as3(a) { 'use strict'; return arguments.callee; } as3(1)")
+        evalCheckBool(ctx, "function am4(a) { return arguments.callee === am4; } am4(1)", expect: true)
+        // A non-simple parameter list is unmapped too.
+        evalCheck(ctx, "function an1(a = 1) { arguments[0] = 9; return a; } an1(5)", expectInt: 5)
+        // The mapping survives the usual consumers.
+        evalCheck(ctx, "function am5(a, b) { return arguments.length; } am5(1, 2, 3)", expectInt: 3)
+        evalCheckStr(ctx, "function am6(a) { return Array.prototype.slice.call(arguments).join(); } am6(1, 2, 3)",
+                     expect: "1,2,3")
+        evalCheckStr(ctx, "function am7(a) { return [...arguments].join(); } am7(1, 2)", expect: "1,2")
+        evalCheckStr(ctx, "function am8(a) { return JSON.stringify(arguments); } am8(1, 2)", expect: "{\"0\":1,\"1\":2}")
+        evalCheckStr(ctx, "function am9(a) { return Object.keys(arguments).join(); } am9(1, 2)", expect: "0,1")
+        evalCheck(ctx, "function amA(a) { return Object.getOwnPropertyDescriptor(arguments, '0').value; } amA(4)",
+                  expectInt: 4)
+        evalCheck(ctx, "function amB(a) { return ({ ...arguments })[0]; } amB(6)", expectInt: 6)
+        evalCheckStr(ctx, "function amC(a) { delete arguments[0]; return a + '/' + arguments[0]; } amC(1)",
+                     expect: "1/undefined")
+        // The object outlives the frame: the slot detaches with its value.
+        evalCheck(ctx, "function amD(a) { a = 7; return arguments; } amD(1)[0]", expectInt: 7)
     }
 
     mutating func runAPITests() -> String {
