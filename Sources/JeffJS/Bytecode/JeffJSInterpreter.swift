@@ -7623,10 +7623,19 @@ struct JeffJSInterpreter {
                         vr.value = vr.pvalue.dupValue(); vr.isDetached = true; vr.parentFrame = nil; vr.slot = nil
                     }
                 }
+                // Release this frame's variable slots, exactly as return_ does:
+                // a tail call is the frame's last act, so nothing else will ever
+                // free them. Missing this leaked every local of a frame that
+                // ended in `return f(...)` -- most visibly the `arguments`
+                // object, whose binding is a local slot.
+                do { var i = varBase; let n = spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
                 ctx.currentFrame = frame.prevFrame
                 rt.releaseFrame(frame)
                 if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
                 let tcSaved = rt.inlinePop()
+                // ... and the callee/receiver/args the caller pushed for this
+                // frame, which live in the caller's stack region.
+                do { var p = tcSaved.sp; let e = tcSaved.spTop; while p < e { tcSaved.buf[p].freeValueFast(); p += 1 } }
                 pc = tcSaved.pc; sp = tcSaved.sp
                 buf = tcSaved.buf; bufCapacity = tcSaved.bufCapacity
                 varBase = tcSaved.varBase; spBase = tcSaved.spBase
@@ -7675,10 +7684,14 @@ struct JeffJSInterpreter {
                         vr.value = vr.pvalue.dupValue(); vr.isDetached = true; vr.parentFrame = nil; vr.slot = nil
                     }
                 }
+                // See tail_call: the frame's variable slots and the caller's
+                // callee/receiver/args slots are ours to release here.
+                do { var i = varBase; let n = spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
                 ctx.currentFrame = frame.prevFrame
                 rt.releaseFrame(frame)
                 if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
                 let tcmSaved = rt.inlinePop()
+                do { var p = tcmSaved.sp; let e = tcmSaved.spTop; while p < e { tcmSaved.buf[p].freeValueFast(); p += 1 } }
                 pc = tcmSaved.pc; sp = tcmSaved.sp
                 buf = tcmSaved.buf; bufCapacity = tcmSaved.bufCapacity
                 varBase = tcmSaved.varBase; spBase = tcmSaved.spBase
@@ -11384,11 +11397,21 @@ struct JeffJSInterpreter {
                             vr.parentFrame = nil; vr.slot = nil
                         }
                     }
+                    // Same epilogue as return_: the unwound frame's variable
+                    // slots are nobody else's to free (the caller-stack scan
+                    // below only walks down from the restored sp, so it never
+                    // reaches them), and without this every local of a frame
+                    // an exception passed through leaked -- `arguments` most
+                    // of all.
+                    do { var i = varBase; let n = spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
                     ctx.currentFrame = frame.prevFrame
                     rt.releaseFrame(frame)
                     if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
                     // Restore caller state
                     let saved = rt.inlinePop()
+                    // The callee/receiver/args the caller pushed for this frame
+                    // sit above the restored sp; release them here.
+                    do { var p = saved.sp; let e = saved.spTop; while p < e { saved.buf[p].freeValueFast(); p += 1 } }
                     pc = saved.pc
                     sp = saved.sp
                     buf = saved.buf
