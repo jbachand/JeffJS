@@ -218,6 +218,7 @@ struct JeffJSTestRunner {
             ("Proxy", { $0.testProxy() }),
             ("Symbol", { $0.testSymbol() }),
             ("TypedArrays", { $0.testTypedArrays() }),
+            ("TypedArrayOwnership", { $0.testTypedArrayOwnership() }),
             ("Modules", { $0.testModules() }),
             ("LexicalScoping", { $0.testLexicalScopingBugs() }),
             ("ES262CriticalSubset", { $0.testES262CriticalSubset() }),
@@ -2521,6 +2522,60 @@ extension JeffJSTestRunner {
         evalCheck(ctx, "Int8Array.BYTES_PER_ELEMENT", expectInt: 1)
         evalCheck(ctx, "Int32Array.BYTES_PER_ELEMENT", expectInt: 4)
         evalCheck(ctx, "Float64Array.BYTES_PER_ELEMENT", expectInt: 8)
+    }
+
+    // MARK: - TypedArrayOwnership
+
+    /// A typed array / DataView keeps its ArrayBuffer alive. Before these, the
+    /// view stored a borrowed reference, so the buffer died with the last
+    /// value that named it and the view silently became zero-length/detached.
+    mutating func testTypedArrayOwnership() {
+        let (rt, ctx) = makeCtx()
+
+        // The buffer's only other reference is a local that dies with the call.
+        evalCheck(ctx, "function f(){ var ab = new ArrayBuffer(4); return new Uint8Array(ab); } f().length",
+                  expectInt: 4)
+        evalCheck(ctx, "new Uint8Array(new ArrayBuffer(8)).length", expectInt: 8)
+        evalCheck(ctx, "new Uint8Array(new ArrayBuffer(8)).buffer.byteLength", expectInt: 8)
+        evalCheck(ctx, "new Uint8Array([1,2,3]).buffer.byteLength", expectInt: 3)
+
+        // DataView over a buffer whose typed array is the only owner.
+        evalCheck(ctx, "new DataView(new Uint8Array([1,2,3]).buffer).getUint8(0)", expectInt: 1)
+        evalCheck(ctx, "function g(){ var ab = new ArrayBuffer(4); return new DataView(ab); } g().byteLength",
+                  expectInt: 4)
+
+        // subarray shares the buffer with the view it came from.
+        evalCheckBool(ctx, """
+            var u = new Uint8Array([1,2,3,4]);
+            var s = u.subarray(1);
+            s[0] = 99;
+            s.buffer === u.buffer && u[1] === 99 && s.length === 3
+            """, expect: true)
+        evalCheck(ctx, "function h(){ return new Uint8Array(new ArrayBuffer(8)).subarray(2); } h().length",
+                  expectInt: 6)
+
+        // slice / set / copyWithin / from / of all produce usable buffers.
+        evalCheck(ctx, "new Uint8Array(new ArrayBuffer(8)).slice(1,4).buffer.byteLength", expectInt: 3)
+        evalCheck(ctx, """
+            var t = new Uint8Array(new ArrayBuffer(4));
+            t.set(new Uint8Array([7,8]), 1);
+            t[2]
+            """, expectInt: 8)
+        evalCheck(ctx, """
+            var c = new Uint8Array([1,2,3,4]);
+            c.copyWithin(0, 2);
+            c[0]
+            """, expectInt: 3)
+        evalCheck(ctx, "Uint8Array.from([1,2,3]).buffer.byteLength", expectInt: 3)
+        evalCheck(ctx, "Uint8Array.of(1,2,3,4).buffer.byteLength", expectInt: 4)
+
+        // A view built on the buffer of a discarded view still reads the data.
+        evalCheck(ctx, """
+            function mk(){ var a = new Uint8Array([5,6,7,8]); return a.buffer; }
+            new Uint8Array(mk())[3]
+            """, expectInt: 8)
+
+        _ = rt
     }
 
     // MARK: - Modules

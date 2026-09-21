@@ -493,6 +493,49 @@ func jsSharedArrayBuffer_growable(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) 
     return .newBool(ab.data.capacity > ab.byteLength)
 }
 
+// MARK: - Buffer ownership
+//
+// A typed array / DataView owns exactly one JS reference to its ArrayBuffer
+// object; `freeObject` releases it when the view dies. Before that, the view
+// stored a *borrowed* reference: `function f(){ var ab = new ArrayBuffer(4);
+// return new Uint8Array(ab); }` came back with length 0 because the Round 9
+// caller released the constructor argument the moment the constructor
+// returned, and internally created buffers were never released at all.
+
+/// Adopt a freshly created buffer object. It already carries the +1 JS
+/// reference `jeffJS_createObject` gave it, but it is never handed out as a
+/// `JeffJSValue`, so nothing has taken the `Unmanaged` retain that
+/// `freeGCObject` releases at the end of its life — take it here, or
+/// releasing the buffer over-releases a never-retained allocation
+/// (`new Uint8Array(2);` as a statement crashed on the spot).
+@inline(__always)
+func typedArrayAdoptNewBuffer(_ ta: JeffJSTypedArray, _ bufObj: JeffJSObject) {
+    _ = JeffJSValue.makeObject(bufObj)
+    ta.buffer = bufObj
+}
+
+/// Adopt a buffer the caller only lends us — a constructor argument, or the
+/// buffer another view already owns. The object has been boxed before, so it
+/// needs the JS reference only. Bump the refcount directly rather than
+/// through `JeffJSValue.makeObject(...).dupValue()`: that would take a second
+/// `Unmanaged` retain which nothing ever releases.
+@inline(__always)
+func typedArrayAdoptBuffer(_ ta: JeffJSTypedArray, _ bufObj: JeffJSObject) {
+    ta.buffer = bufObj
+    bufObj.refCount += 1
+    if JeffJSGCObjectHeader.trackRefcounts { JeffJSGCObjectHeader.trackDup(bufObj) }
+}
+
+/// Hand the caller its own reference to the buffer object (Round 9: every
+/// returned value is owned). `JeffJSValue.makeObject` would take a second
+/// `Unmanaged` retain that nothing releases — the object's ARC retain was
+/// taken the first time it was boxed and is released when its JS refcount
+/// reaches zero, which cannot happen while the value returned here holds one.
+@inline(__always)
+func typedArrayBufferValue(_ buf: JeffJSObject) -> JeffJSValue {
+    return JeffJSValue.makeObjectRecycled(buf).dupValue()
+}
+
 // MARK: - TypedArray Constructor (generic)
 
 /// Create a typed array from: length, another typed array, an array-like, or (buffer, offset, length).
@@ -513,7 +556,7 @@ func jsTypedArray_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
         let ab = JeffJSArrayBuffer(byteLength: 0)
         let bufObj = jeffJS_createObject(ctx: ctx, proto: nil, classID: UInt16(JeffJSClassID.arrayBuffer.rawValue))
         bufObj.payload = JeffJSObjectPayload.arrayBuffer(ab)
-        ta.buffer = bufObj
+        typedArrayAdoptNewBuffer(ta, bufObj)
         ta.length = 0
         ta.byteLength = 0
         ta.byteOffset = 0
@@ -546,7 +589,7 @@ func jsTypedArray_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
             length = remaining / info.bytesPerElement
         }
 
-        ta.buffer = srcObj
+        typedArrayAdoptBuffer(ta, srcObj)
         ta.byteOffset = byteOff
         ta.byteLength = length * info.bytesPerElement
         ta.length = length
@@ -558,7 +601,7 @@ func jsTypedArray_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
         let ab = JeffJSArrayBuffer(byteLength: byteLen)
         let bufObj = jeffJS_createObject(ctx: ctx, proto: nil, classID: UInt16(JeffJSClassID.arrayBuffer.rawValue))
         bufObj.payload = JeffJSObjectPayload.arrayBuffer(ab)
-        ta.buffer = bufObj
+        typedArrayAdoptNewBuffer(ta, bufObj)
         ta.byteOffset = 0
         ta.byteLength = byteLen
         ta.length = length
@@ -583,7 +626,7 @@ func jsTypedArray_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
             info.writeElement(&ab.data, offset: i * info.bytesPerElement, value: elem)
         }
 
-        ta.buffer = bufObj
+        typedArrayAdoptNewBuffer(ta, bufObj)
         ta.byteOffset = 0
         ta.byteLength = byteLen
         ta.length = srcLen
@@ -592,7 +635,7 @@ func jsTypedArray_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
         let ab = JeffJSArrayBuffer(byteLength: 0)
         let bufObj = jeffJS_createObject(ctx: ctx, proto: nil, classID: UInt16(JeffJSClassID.arrayBuffer.rawValue))
         bufObj.payload = JeffJSObjectPayload.arrayBuffer(ab)
-        ta.buffer = bufObj
+        typedArrayAdoptNewBuffer(ta, bufObj)
         ta.length = 0
         ta.byteLength = 0
         ta.byteOffset = 0
@@ -623,7 +666,7 @@ func jsTypedArray_buffer(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJS
     if case .typedArray(let ta) = obj.payload, let buf = ta.buffer {
         // The buffer stays owned by the typed array: hand the caller its own
         // reference (Round 9 — the caller releases every value it receives).
-        return JeffJSValue.makeObject(buf).dupValue()
+        return typedArrayBufferValue(buf)
     }
     return .undefined
 }
@@ -710,7 +753,7 @@ func jsTypedArray_slice(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [J
     let newObj = jeffJS_createObject(ctx: ctx, proto: sliceProto, classID: UInt16(ta.classID))
     let newTA = JeffJSTypedArray()
     newTA.classID = ta.classID
-    newTA.buffer = newBufObj
+    typedArrayAdoptNewBuffer(newTA, newBufObj)
     newTA.byteOffset = 0
     newTA.byteLength = newByteLen
     newTA.length = count
@@ -738,7 +781,7 @@ func jsTypedArray_subarray(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
     let newObj = jeffJS_createObject(ctx: ctx, proto: subProto, classID: UInt16(ta.classID))
     let newTA = JeffJSTypedArray()
     newTA.classID = ta.classID
-    newTA.buffer = ta.buffer
+    if let srcBuf = ta.buffer { typedArrayAdoptBuffer(newTA, srcBuf) }
     newTA.byteOffset = ta.byteOffset + start * info.bytesPerElement
     newTA.byteLength = count * info.bytesPerElement
     newTA.length = count
@@ -926,7 +969,7 @@ func jsDataView_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 
     let obj = jeffJS_createObject(ctx: ctx, proto: nil, classID: UInt16(JeffJSClassID.dataView.rawValue))
     let ta = JeffJSTypedArray()
-    ta.buffer = bufObj
+    typedArrayAdoptBuffer(ta, bufObj)
     ta.byteOffset = byteOff
     ta.byteLength = byteLen
     ta.length = byteLen
@@ -1196,7 +1239,7 @@ func jsDataView_setFloat16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
 func jsDataView_buffer(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
     guard let obj = thisVal.toObject(), obj.classID == JeffJSClassID.dataView.rawValue,
           case .typedArray(let ta) = obj.payload, let buf = ta.buffer else { return .undefined }
-    return JeffJSValue.makeObject(buf).dupValue()
+    return typedArrayBufferValue(buf)
 }
 
 func jsDataView_byteLength(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
@@ -1287,7 +1330,7 @@ func jsTypedArray_from(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
     let obj = jeffJS_createObject(ctx: ctx, proto: fromProto, classID: UInt16(classID))
     let ta = JeffJSTypedArray()
     ta.classID = classID
-    ta.buffer = bufObj
+    typedArrayAdoptNewBuffer(ta, bufObj)
     ta.byteOffset = 0
     ta.byteLength = byteLen
     ta.length = count
@@ -1322,7 +1365,7 @@ func jsTypedArray_of(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
     let obj = jeffJS_createObject(ctx: ctx, proto: ofProto, classID: UInt16(classID))
     let ta = JeffJSTypedArray()
     ta.classID = classID
-    ta.buffer = bufObj
+    typedArrayAdoptNewBuffer(ta, bufObj)
     ta.byteOffset = 0
     ta.byteLength = byteLen
     ta.length = count
