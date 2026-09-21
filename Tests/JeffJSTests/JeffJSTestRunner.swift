@@ -299,6 +299,7 @@ struct JeffJSTestRunner {
             ("YieldStarLazy", { $0.testYieldStarLazy() }),
             ("PerIterationLet", { $0.testPerIterationLetScope() }),
             ("BuiltinSubclassing", { $0.testBuiltinSubclassing() }),
+            ("RegExpAlternation", { $0.testRegExpAlternation() }),
             ("ReflectConstructNewTarget", { $0.testReflectConstructNewTarget() }),
             ("ClassFields", { $0.testClassFields() }),
         ]
@@ -10268,6 +10269,113 @@ extension JeffJSTestRunner {
             };
             count(10)
         """, expectInt: 10)
+    }
+
+    /// Alternation inside a quantified group.
+    ///
+    /// The `+` loop in the regex compiler jumped back to `loopTop - 1` (one byte
+    /// short of the loop head) and used the lazy split direction for greedy
+    /// quantifiers, so anything whose body was not a single char/class opcode --
+    /// i.e. anything containing an alternation -- matched at most one iteration.
+    /// The VM also kept push_char_pos counters on the *backtracking* stack, so a
+    /// split emitted between push_char_pos and check_advance shadowed the
+    /// counter and the zero-advance check silently became a no-op.
+    /// This broke Sizzle's identifier regex and therefore every jQuery selector.
+    mutating func testRegExpAlternation() {
+        let (_, ctx) = makeCtx()
+
+        // --- the plain repros -------------------------------------------------
+        evalCheckBool(ctx, #"/^(?:x|[a-z])+$/.test("abc")"#, expect: true)
+        evalCheckBool(ctx, #"/^(?:a|b)+$/.test("ab")"#, expect: true)
+        evalCheckBool(ctx, #"/^(a|b)+$/.test("ab")"#, expect: true)
+        evalCheckBool(ctx, #"/^(?:ab|c)+$/.test("cab")"#, expect: true)
+        evalCheckBool(ctx, #"/^(?:[a-z]|x)+$/.test("abc")"#, expect: true)
+        evalCheckStr(ctx, #"String(/(?:x|[a-z])+/.exec("abc"))"#, expect: "abc")
+
+        // --- greedy must consume every iteration, lazy must stop at one -------
+        evalCheckStr(ctx, #"String(/(?:ab)+/.exec("ababab"))"#, expect: "ababab")
+        evalCheckStr(ctx, #"String(/(ab)+/.exec("ababab"))"#, expect: "ababab,ab")
+        evalCheckStr(ctx, #"String(/(?:ab)+?/.exec("ababab"))"#, expect: "ab")
+        evalCheckStr(ctx, #"String(/(?:a|b)+?c/.exec("abac"))"#, expect: "abac")
+        evalCheckStr(ctx, #"String(/^(?:a|b)+?$/.exec("aab"))"#, expect: "aab")
+        evalCheckStr(ctx, #"String(/(?:a|b)*?c/.exec("abc"))"#, expect: "abc")
+
+        // --- nested quantified alternations with captures ---------------------
+        evalCheckStr(ctx, #"String(/^((a|b)c)+$/.exec("acbc"))"#, expect: "acbc,bc,b")
+        evalCheckStr(ctx, #"String(/((a)|(b))+/.exec("ab"))"#, expect: "ab,b,,b")
+        evalCheckStr(ctx, #"String(/^(?:(a)|(b))+$/.exec("ab"))"#, expect: "ab,,b")
+        evalCheckStr(ctx, #"String(/^(?:(a|b)+)$/.exec("ab"))"#, expect: "ab,b")
+        evalCheckStr(ctx, #"String(/(?:(?:a|b)+c)+/.exec("abcabc"))"#, expect: "abcabc")
+        evalCheckStr(ctx, #"String(/(?:a|b)+(?=c)/.exec("abc"))"#, expect: "ab")
+
+        // --- per-iteration capture reset (save_reset, undone on backtrack) ----
+        evalCheckStr(ctx, #"String(/(?:(a)|b)+/.exec("ab"))"#, expect: "ab,")
+        evalCheckStr(ctx, #"String(/(?:(a)|b)*/.exec("ab"))"#, expect: "ab,")
+        evalCheckStr(ctx, #"String(/(?:a(b)?)+/.exec("aba"))"#, expect: "aba,")
+        evalCheckStr(ctx, #"String(/(x)?(?:a|b)+/.exec("ab"))"#, expect: "ab,")
+
+        // --- zero-width iterations must terminate, not spin ------------------
+        evalCheckBool(ctx, #"/^(?:|a)+$/.test("aaa")"#, expect: true)
+        evalCheckBool(ctx, #"/^(?:a|)+$/.test("aaa")"#, expect: true)
+        evalCheckBool(ctx, #"/^(?:a*)+$/.test("aaa")"#, expect: true)
+        evalCheckBool(ctx, #"/^(?:x*|[a-z])+$/.test("abc")"#, expect: true)
+        evalCheckBool(ctx, #"/^(?:x?|[a-z])+$/.test("abc")"#, expect: true)
+        evalCheckBool(ctx, #"/^(?:xy*?|[a-z])+$/.test("xyyab")"#, expect: true)
+        evalCheckStr(ctx, #"String(/^(?:x*|[a-z])+$/.exec("abc"))"#, expect: "abc")
+
+        // --- backreferences inside the quantified alternation -----------------
+        evalCheckStr(ctx, #"String(/(a)(?:\1b)+/.exec("aabab"))"#, expect: "aabab,a")
+        evalCheckStr(ctx, #"String(/^(?:(a)\1?)+$/.exec("aaa"))"#, expect: "aaa,a")
+
+        // --- braces / flags / global ------------------------------------------
+        evalCheckStr(ctx, #"String(/(?:a|b){2,3}/.exec("abab"))"#, expect: "aba")
+        evalCheckStr(ctx, #"String(/(?:a|b){2,}/.exec("abab"))"#, expect: "abab")
+        evalCheckStr(ctx, #"String(/(?:a{1,2}|b)+/.exec("aab"))"#, expect: "aab")
+        evalCheckStr(ctx, #"String("abcabc".match(/(?:a|b|c)+/g))"#, expect: "abcabc")
+        evalCheckStr(ctx, #""aaa".replace(/(?:a|b)+/g, "X")"#, expect: "X")
+        evalCheckBool(ctx, #"/^(?:a|b)+$/i.test("AB")"#, expect: true)
+        evalCheckBool(ctx, #"/^(?:a|b)+$/u.test("ab")"#, expect: true)
+        evalCheckBool(ctx, #"/^(?:a|ab)+$/.test("abab")"#, expect: true)
+        evalCheckStr(ctx, #"String(/(?:ab|b)+/.exec("bab"))"#, expect: "bab")
+
+        // --- Sizzle / jQuery selector engine ----------------------------------
+        // `identifier` is `(?:\\[\da-fA-F]{1,6}\s*?|\\[^\r\n\f]|[\w-]|[^\0-\x7f])+`;
+        // every jQuery selector parse goes through it, and while it matched
+        // nothing threes.day died with
+        // `Syntax error, unrecognized expression: [data-dismiss="alert"]`.
+        let sizzle = #"""
+            var whitespace = "[\\x20\\t\\r\\n\\f]*";
+            var identifier = "(?:\\\\[\\da-fA-F]{1,6}" + whitespace +
+                "?|\\\\[^\\r\\n\\f]|[\\w-]|[^\0-\\x7f])+";
+            var attributes = "\\[" + whitespace + "(" + identifier + ")(?:" +
+                whitespace + "([*^$|!~]?=)" + whitespace +
+                "(?:'((?:\\\\.|[^\\\\'])*)'|\"((?:\\\\.|[^\\\\\"])*)\"|(" +
+                identifier + "))|)" + whitespace + "\\]";
+            var pseudos = ":(" + identifier + ")(?:\\((('((?:\\\\.|[^\\\\'])*)'|" +
+                "\"((?:\\\\.|[^\\\\\"])*)\")|((?:\\\\.|[^\\\\()[\\]]|" +
+                attributes + ")*)|.*)\\)|)";
+            var rcombinators = new RegExp("^" + whitespace + "([>+~]|" +
+                whitespace + ")" + whitespace);
+
+            """#
+        evalCheckBool(ctx, sizzle +
+            #"new RegExp("^(?:" + identifier + ")$").test("data-dismiss")"#, expect: true)
+        evalCheckBool(ctx, sizzle +
+            #"new RegExp("^" + attributes).test('[data-dismiss="alert"]')"#, expect: true)
+        evalCheckStr(ctx, sizzle +
+            #"String(new RegExp("^" + attributes).exec('[data-dismiss="alert"]'))"#,
+            expect: #"[data-dismiss="alert"],data-dismiss,=,,alert,"#)
+        evalCheckBool(ctx, sizzle +
+            #"new RegExp("^(" + identifier + "|[*])").test("div")"#, expect: true)
+        evalCheckStr(ctx, sizzle +
+            #"String(new RegExp("^\\.(" + identifier + ")").exec(".alert"))"#,
+            expect: ".alert,alert")
+        evalCheckStr(ctx, sizzle +
+            #"String(new RegExp("^" + pseudos).exec(":not(.x)"))"#,
+            expect: ":not(.x),not,.x,,,,.x,,,,,")
+        evalCheckBool(ctx, sizzle + #"rcombinators.test(" > ")"#, expect: true)
+        evalCheckBool(ctx, sizzle +
+            #"new RegExp("^" + whitespace + "," + whitespace).test(" , ")"#, expect: true)
     }
 
     mutating func testBuiltinSubclassing() {
