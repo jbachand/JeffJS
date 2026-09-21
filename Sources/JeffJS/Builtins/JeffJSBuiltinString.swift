@@ -102,8 +102,12 @@ extension JeffJSContext {
     }
 
     /// Symbol.description.
+    /// ES2023 20.4.3.3.1 SymbolDescriptiveString — "Symbol(<description>)".
+    /// It used to answer the literal "Symbol()" for every symbol, so
+    /// `String(Symbol('k'))` lost the description.
     func symbolDescriptiveString(_ val: JeffJSValue) -> JeffJSValue {
-        return newStringValue("Symbol()")
+        guard val.isSymbol else { return newStringValue("Symbol()") }
+        return newStringValue("Symbol(\(getSymbolDescription(val)))")
     }
 
     /// Set a function property keyed by a well-known symbol.
@@ -556,8 +560,12 @@ struct JeffJSBuiltinString {
         if args.isEmpty {
             s = ctx.newStringValue("")
         } else {
-            // If called as constructor and the argument is a Symbol, convert via Symbol description
-            if newTarget.isObject && args[0].isSymbol {
+            // ES2023 22.1.1.1 step 2: it is the *function* call `String(sym)`
+            // that answers SymbolDescriptiveString; `new String(sym)` falls
+            // through to ToString and throws. The test was the wrong way
+            // round, so `String(Symbol('k'))` threw and `[sym].map(String)`
+            // with it.
+            if newTarget.isUndefined && args[0].isSymbol {
                 let desc = ctx.symbolDescriptiveString(args[0])
                 if desc.isException { return .exception }
                 s = desc

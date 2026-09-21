@@ -1569,12 +1569,28 @@ final class JeffJSDOMBridge {
             return JeffJSValue.undefined
         }, length: 1)
 
-        // -- content (read-only, <template> only) --
+        // -- content (a DocumentFragment on <template>, the reflected
+        //    attribute everywhere else) --
+        // `<meta name=… content=…>` is the common case: apple.com's global
+        // header reads `meta.content` off every `meta[name^="globalnav-"]`,
+        // and an undefined there took `.replace` down with it.
         ctx.setPropertyFunc(obj: el, name: "__get_content", fn: { [weak self] ctx, thisVal, _ in
-            guard let self, let targetNode = self.extractNode(from: thisVal),
-                  targetNode.tagName == "template" else { return JeffJSValue.undefined }
-            return self.wrapElement(self.templateFragment(for: targetNode), ctx: ctx)
+            guard let self, let targetNode = self.extractNode(from: thisVal) else {
+                return JeffJSValue.undefined
+            }
+            if targetNode.tagName == "template" {
+                return self.wrapElement(self.templateFragment(for: targetNode), ctx: ctx)
+            }
+            return ctx.newStringValue(targetNode.attributes["content"] ?? "")
         }, length: 0)
+
+        ctx.setPropertyFunc(obj: el, name: "__set_content", fn: { [weak self] ctx, thisVal, args in
+            guard let self, let targetNode = self.extractNode(from: thisVal),
+                  targetNode.tagName != "template" else { return JeffJSValue.undefined }
+            targetNode.setAttribute(name: "content", value: self.extractString(ctx: ctx, args: args, index: 0) ?? "")
+            self.notifyMutation(for: targetNode)
+            return JeffJSValue.undefined
+        }, length: 1)
 
         // -- id (read-write) --
         ctx.setPropertyFunc(obj: el, name: "__get_id", fn: { [weak self] ctx, thisVal, _ in
@@ -1887,6 +1903,48 @@ final class JeffJSDOMBridge {
             return JeffJSValue.undefined
         }, length: 1)
 
+        // -- Plain string reflections (HTML "reflect" IDL attributes) --
+        // Each is `el.<x>` <-> the `<x>` content attribute, the same shape as
+        // src/href/rel above. Without them `meta.name`, `img.alt`,
+        // `input.placeholder` … all read as undefined, and real page code does
+        // `el.name.replace(...)` on them without a guard.
+        for reflected in ["name", "alt", "title", "placeholder"] {
+            ctx.setPropertyFunc(obj: el, name: "__get_\(reflected)", fn: { [weak self] ctx, thisVal, _ in
+                guard let self, let targetNode = self.extractNode(from: thisVal) else {
+                    return ctx.newStringValue("")
+                }
+                return ctx.newStringValue(targetNode.attributes[reflected] ?? "")
+            }, length: 0)
+            ctx.setPropertyFunc(obj: el, name: "__set_\(reflected)", fn: { [weak self] ctx, thisVal, args in
+                guard let self, let targetNode = self.extractNode(from: thisVal) else {
+                    return JeffJSValue.undefined
+                }
+                targetNode.setAttribute(name: reflected,
+                                        value: self.extractString(ctx: ctx, args: args, index: 0) ?? "")
+                self.notifyMutation(for: targetNode)
+                return JeffJSValue.undefined
+            }, length: 1)
+        }
+
+        // -- type (reflected, with the HTML defaults the attribute omits) --
+        ctx.setPropertyFunc(obj: el, name: "__get_type", fn: { [weak self] ctx, thisVal, _ in
+            guard let self, let targetNode = self.extractNode(from: thisVal) else {
+                return ctx.newStringValue("")
+            }
+            if let t = targetNode.attributes["type"] { return ctx.newStringValue(t) }
+            switch targetNode.tagName {
+            case "input":  return ctx.newStringValue("text")
+            case "button": return ctx.newStringValue("submit")
+            default:       return ctx.newStringValue("")
+            }
+        }, length: 0)
+        ctx.setPropertyFunc(obj: el, name: "__set_type", fn: { [weak self] ctx, thisVal, args in
+            guard let self, let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+            targetNode.setAttribute(name: "type", value: self.extractString(ctx: ctx, args: args, index: 0) ?? "")
+            self.notifyMutation(for: targetNode)
+            return JeffJSValue.undefined
+        }, length: 1)
+
         // -- Geometry accessors (offset*/client*/scroll*) --
         registerElementGeometryAccessors(on: el, ctx: ctx)
     }
@@ -1902,7 +1960,8 @@ final class JeffJSDOMBridge {
     private func installElementPropertyShim(on el: JeffJSValue, ctx: JeffJSContext) {
         let props: [(String, Bool)] = [
             ("textContent", true), ("innerText", true), ("innerHTML", true), ("outerHTML", true),
-            ("content", false), ("classList", false), ("relList", false), ("rel", true),
+            ("content", true), ("classList", false), ("relList", false), ("rel", true),
+            ("name", true), ("alt", true), ("title", true), ("placeholder", true), ("type", true),
             ("id", true), ("className", true), ("value", true),
             ("checked", true), ("hidden", true), ("src", true), ("href", true),
             ("nodeValue", true), ("data", true), ("isConnected", false),

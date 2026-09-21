@@ -89,18 +89,22 @@ extension JeffJSContext {
     func hasOwnProperty(_ obj: JeffJSValue, key: JeffJSValue) -> Int32 {
         guard let jsObj = obj.toObject() else { return 0 }
         let atom: UInt32
+        var ownedAtom = true
         if key.isInt, key.toInt32() >= 0 {
             atom = rt.newAtomUInt32(UInt32(key.toInt32()))
         } else if key.isString, let s = key.stringValue {
             atom = rt.findAtom(s.toSwiftString())
         } else if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
-            atom = rt.findAtom(symStr.toSwiftString())
+            // A symbol's own (immortal) atom — NOT the atom of its
+            // description, or `({a: 1}).hasOwnProperty(Symbol('a'))` is true.
+            atom = rt.symbolAtom(for: symStr)
+            ownedAtom = false
         } else if let str = toSwiftString(key) {
             atom = rt.findAtom(str)
         } else {
             return 0
         }
-        defer { rt.freeAtom(atom) }
+        defer { if ownedAtom { rt.freeAtom(atom) } }
         if hasOwnPropertyAtom(jsObj, atom) { return 1 }
         if let idx = rt.atomToUInt32(atom) {
             let alt = (atom & JS_ATOM_TAG_INT) != 0 ? rt.findAtom(String(idx))
@@ -261,7 +265,13 @@ extension JeffJSContext {
     /// Implements Object.defineProperty descriptor processing.
     /// Handles both data descriptors ({value, writable}) and accessor
     /// descriptors ({get, set}).
-    func definePropertyFromDescriptor(_ obj: JeffJSValue, key: JeffJSValue, desc: JeffJSValue) -> JeffJSValue {
+    /// - Parameter shouldThrow: true for `Object.defineProperty` and friends,
+    ///   which throw when the definition is refused; false for
+    ///   `Reflect.defineProperty`, which answers `false` instead (ES2023
+    ///   28.1.3). A refusal used to be dropped on the floor entirely, so
+    ///   defining over a frozen object reported success and changed nothing.
+    func definePropertyFromDescriptor(_ obj: JeffJSValue, key: JeffJSValue, desc: JeffJSValue,
+                                      shouldThrow: Bool = true) -> JeffJSValue {
         guard let jsObj = obj.toObject() else {
             return throwTypeError(message: "not an object")
         }
@@ -299,6 +309,7 @@ extension JeffJSContext {
             // descriptor actually carries: the ones it omits keep whatever
             // the existing property had (ES2023 10.1.6.3 ValidateAndApply).
             var flags: UInt32 = UInt32(JS_PROP_GETSET | JS_PROP_DEFINE_PROPERTY)
+            if shouldThrow { flags |= UInt32(JS_PROP_THROW) }
             if descriptorHas(desc, "configurable") { flags |= UInt32(JS_PROP_HAS_CONFIGURABLE) }
             if descriptorHas(desc, "enumerable")   { flags |= UInt32(JS_PROP_HAS_ENUMERABLE) }
             if hasGetter { flags |= UInt32(JS_PROP_HAS_GET) }
@@ -317,14 +328,16 @@ extension JeffJSContext {
             // Define the accessor property
             let getVal: JeffJSValue = getter != nil ? JeffJSValue.makeObject(getter!) : .undefined
             let setVal: JeffJSValue = setter != nil ? JeffJSValue.makeObject(setter!) : .undefined
-            _ = defineProperty(obj: obj, atom: atom, value: .undefined,
-                               getter: getVal, setter: setVal,
-                               flags: Int(flags))
+            let r = defineProperty(obj: obj, atom: atom, value: .undefined,
+                                   getter: getVal, setter: setVal,
+                                   flags: Int(flags))
+            if r < 0 { return shouldThrow ? .exception : .JS_FALSE }
         } else {
             // Data descriptor: { value, writable, configurable, enumerable }
             let val = getPropertyStr(obj: desc, name: "value")
 
             var flags = JS_PROP_DEFINE_PROPERTY
+            if shouldThrow { flags |= JS_PROP_THROW }
             if descriptorHas(desc, "configurable") { flags |= JS_PROP_HAS_CONFIGURABLE }
             if descriptorHas(desc, "enumerable")   { flags |= JS_PROP_HAS_ENUMERABLE }
             if descriptorHas(desc, "writable")     { flags |= JS_PROP_HAS_WRITABLE }
@@ -343,7 +356,8 @@ extension JeffJSContext {
                 flags |= JS_PROP_WRITABLE
             }
 
-            _ = defineProperty(obj: obj, atom: atom, value: val, flags: flags)
+            let r = defineProperty(obj: obj, atom: atom, value: val, flags: flags)
+            if r < 0 { return shouldThrow ? .exception : .JS_FALSE }
         }
         return obj
     }
@@ -502,8 +516,19 @@ extension JeffJSContext {
         guard let obj = val.toObject() else {
             return throwTypeError(message: "not an object")
         }
+        materializeDeferredOwnProps(obj)
         obj.extensible = false
         return .undefined
+    }
+
+    /// A function's `name`/`length`/`prototype` exist lazily: they are only
+    /// added to the shape on first touch. Once the object is non-extensible
+    /// that add is refused, so `Object.freeze(f)` before anything read `f.name`
+    /// left the function permanently nameless. Every caller that is about to
+    /// clear `extensible` materialises them first.
+    func materializeDeferredOwnProps(_ jsObj: JeffJSObject) {
+        if jsObj.needsLazyNameLength { materializeFunctionNameLength(jsObj) }
+        if jsObj.needsLazyPrototype { materializeFunctionPrototype(jsObj) }
     }
 
     /// Call a function value (thisArg variant).
@@ -552,6 +577,7 @@ extension JeffJSContext {
         guard let jsObj = obj.toObject() else {
             return throwTypeError(message: "not an object")
         }
+        materializeDeferredOwnProps(jsObj)
         jsObj.extensible = false
         prepareShapeUpdate(self, jsObj)   // flags are per-object: unshare first
         if let shape = jsObj.shape {
@@ -847,7 +873,13 @@ struct JeffJSBuiltinObject {
 
             if !desc.isUndefined {
                 let ret = ctx.setProperty(obj: result, key: key, value: desc)
-                if ret < 0 { return .exception }
+                // Never hand back JS_EXCEPTION without an exception object:
+                // the unwind then reports whatever the next global read finds.
+                if ret < 0 {
+                    return ctx.rt.currentException.isNull
+                        ? ctx.throwTypeError("cannot copy own property descriptor")
+                        : .exception
+                }
             }
         }
 

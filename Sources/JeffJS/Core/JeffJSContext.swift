@@ -829,6 +829,36 @@ public final class JeffJSContext: JeffJSTokenizerContext {
 
     // MARK: - Property Operations (Atom-keyed)
 
+    /// Resolves a property-key *value* (string, number, symbol, …) to the atom
+    /// the property is actually stored under.
+    ///
+    /// A symbol is `mkPtr(tag: .symbol, ptr: JeffJSString)` and has to go
+    /// through `symbolAtom(for:)`: interning its *description* instead makes
+    /// `o[Symbol("a")]` collide with `o.a`, and answering nil for symbols makes
+    /// every key-driven builtin (Object.defineProperties,
+    /// Object.getOwnPropertyDescriptors, Reflect.get/set/has/…) silently skip
+    /// symbol-keyed properties.
+    ///
+    /// - Returns: the atom plus whether the caller owns a reference to it
+    ///   (symbol atoms are immortal and must not be freed), or nil when the key
+    ///   could not be converted — a pending exception may be set.
+    func propertyKeyAtom(_ key: JeffJSValue) -> (atom: UInt32, owned: Bool)? {
+        if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
+            return (rt.symbolAtom(for: symStr), false)
+        }
+        if key.isInt, key.toInt32() >= 0 {
+            return (rt.newAtomUInt32(UInt32(bitPattern: key.toInt32())), true)
+        }
+        if key.isString, let s = key.stringValue {
+            return (rt.findAtom(jsString: s), true)
+        }
+        let strVal = JeffJSTypeConvert.toString(ctx: self, val: key)
+        if strVal.isException { return nil }
+        defer { freeValue(strVal) }
+        guard let s = strVal.stringValue else { return nil }
+        return (rt.findAtom(jsString: s), true)
+    }
+
     /// Gets a property from an object using an atom key.
     /// Mirrors `JS_GetProperty()` from QuickJS.
     ///
@@ -899,6 +929,53 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         return result
     }
 
+    /// ES2023 10.1.6.3 ValidateAndApplyPropertyDescriptor, the
+    /// non-configurable half: answers false when the new descriptor would
+    /// change something a non-configurable property is not allowed to change.
+    private func validateRedefinition(_ jsObj: JeffJSObject, idx: Int,
+                                      cur: JeffJSPropertyFlags,
+                                      value: JeffJSValue,
+                                      getter: JeffJSValue, setter: JeffJSValue,
+                                      flags: Int) -> Bool {
+        // configurable: false -> true is never allowed.
+        if (flags & JS_PROP_HAS_CONFIGURABLE) != 0, (flags & JS_PROP_CONFIGURABLE) != 0 {
+            return false
+        }
+        // enumerable may not flip.
+        if (flags & JS_PROP_HAS_ENUMERABLE) != 0,
+           ((flags & JS_PROP_ENUMERABLE) != 0) != cur.contains(.enumerable) {
+            return false
+        }
+        let wantsAccessor = (flags & JS_PROP_TMASK) == JS_PROP_GETSET
+        let isAccessor: Bool
+        if case .getset = jsObj.propEntry(at: idx) { isAccessor = true } else { isAccessor = cur.isGetSet }
+        // A generic descriptor (attributes only) never changes the kind.
+        let isGeneric = !wantsAccessor && (flags & JS_PROP_HAS_VALUE) == 0
+            && (flags & JS_PROP_HAS_WRITABLE) == 0
+        if isGeneric { return true }
+        if wantsAccessor != isAccessor { return false }
+        if isAccessor {
+            var curGet: JeffJSObject? = nil, curSet: JeffJSObject? = nil
+            if case .getset(let g, let st) = jsObj.propEntry(at: idx) { curGet = g; curSet = st }
+            if (flags & JS_PROP_HAS_GET) != 0, getter.toObject() !== curGet { return false }
+            if (flags & JS_PROP_HAS_SET) != 0, setter.toObject() !== curSet { return false }
+            return true
+        }
+        // Data property.
+        if cur.contains(.writable) { return true }
+        if (flags & JS_PROP_HAS_WRITABLE) != 0, (flags & JS_PROP_WRITABLE) != 0 { return false }
+        if (flags & JS_PROP_HAS_VALUE) != 0 {
+            var curValue: JeffJSValue = .undefined
+            switch jsObj.propEntry(at: idx) {
+            case .value(let v): curValue = v
+            case .varRef(let vr): curValue = vr.pvalue
+            default: break
+            }
+            if !sameValue(curValue, value) { return false }
+        }
+        return true
+    }
+
     /// Defines a property with full descriptor control.
     /// Mirrors `JS_DefineProperty()` from QuickJS.
     ///
@@ -932,13 +1009,11 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // otherwise the materialiser would later overwrite the new descriptor.
         if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
 
-        // Check extensibility
-        if !jsObj.extensible {
-            if (flags & JS_PROP_THROW) != 0 {
-                _ = throwTypeError(message: "object is not extensible")
-            }
-            return -1
-        }
+        // Extensibility is checked only when a *new* property would be added
+        // (ES2023 10.1.6.3 step 2): redefining a property that already exists
+        // is legal on a non-extensible object, so
+        // `Object.defineProperty(Object.seal({x:1}), 'x', {value:2})` must
+        // work. The check now sits just above jeffJS_addProperty below.
 
         // Determine property type flags for the shape
         let typeFlags: JeffJSPropertyFlags
@@ -966,6 +1041,20 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 if (flags & JS_PROP_HAS_CONFIGURABLE) == 0, cur.contains(.configurable) { propFlags.insert(.configurable) }
                 if (flags & JS_PROP_HAS_WRITABLE) == 0,     cur.contains(.writable)     { propFlags.insert(.writable) }
                 if (flags & JS_PROP_HAS_ENUMERABLE) == 0,   cur.contains(.enumerable)   { propFlags.insert(.enumerable) }
+
+                // ValidateAndApplyPropertyDescriptor's rejection rules: a
+                // non-configurable property may not be reshaped. Without this
+                // a frozen object silently accepted
+                // `Object.defineProperty(o, 'x', {value: 2})`.
+                if !cur.contains(.configurable),
+                   !validateRedefinition(jsObj, idx: idx, cur: cur,
+                                         value: value, getter: getter, setter: setter,
+                                         flags: flags) {
+                    if (flags & JS_PROP_THROW) != 0 {
+                        _ = throwTypeError(message: "property is not configurable")
+                    }
+                    return -1
+                }
             }
 
             // Mapped `arguments` slot: ES2023 10.4.4.2 — a data descriptor
@@ -1043,6 +1132,14 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 }
             }
             return 1
+        }
+
+        // A brand-new property needs an extensible target.
+        if !jsObj.extensible {
+            if (flags & JS_PROP_THROW) != 0 {
+                _ = throwTypeError(message: "object is not extensible")
+            }
+            return -1
         }
 
         // Add new property atomically via jeffJS_addProperty (keeps shape.prop and obj.propValues in sync)
@@ -3733,31 +3830,20 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             let target = args[0]
             let key = args[1]
             let desc = args[2]
-            if let keyStr = self.toSwiftString(key) {
-                let atom = self.rt.findAtom(keyStr)
-                // Extract value from descriptor
-                let value = desc.isObject ? self.getPropertyStr(obj: desc, name: "value") : .JS_UNDEFINED
-                // Extract flags from descriptor
-                var flags = JS_PROP_HAS_VALUE | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE | JS_PROP_ENUMERABLE
-                if desc.isObject {
-                    let writableVal = self.getPropertyStr(obj: desc, name: "writable")
-                    if !writableVal.isUndefined && !writableVal.toBool() {
-                        flags &= ~JS_PROP_WRITABLE
-                    }
-                    let enumVal = self.getPropertyStr(obj: desc, name: "enumerable")
-                    if !enumVal.isUndefined && !enumVal.toBool() {
-                        flags &= ~JS_PROP_ENUMERABLE
-                    }
-                    let configVal = self.getPropertyStr(obj: desc, name: "configurable")
-                    if !configVal.isUndefined && !configVal.toBool() {
-                        flags &= ~JS_PROP_CONFIGURABLE
-                    }
-                }
-                let result = self.defineProperty(obj: target, atom: atom, value: value, flags: flags)
-                self.rt.freeAtom(atom)
-                return .newBool(result >= 0)
-            }
-            return .JS_FALSE
+            // Share Object.defineProperty's descriptor reader: the hand-rolled
+            // copy here ignored get/set entirely, defaulted the omitted
+            // attributes to true instead of false, and accepted a non-object
+            // descriptor. It also stringified the key, so symbol keys landed
+            // on the atom of their description.
+            let keyVal = self.toPropertyKey(key)
+            if keyVal.isException { return keyVal }
+            defer { self.freeValue(keyVal) }
+            // A bad descriptor still throws (ES2023 28.1.3); a refused
+            // definition (non-configurable / non-extensible) answers false.
+            let result = self.definePropertyFromDescriptor(target, key: keyVal, desc: desc,
+                                                           shouldThrow: false)
+            if result.isException { return .exception }
+            return .newBool(!result.isBool || result.toBool())
         }, name: "defineProperty", length: 3)
         _ = setPropertyStr(obj: reflectObj, name: "defineProperty", value: reflDefineProperty)
 
@@ -3770,14 +3856,12 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             guard args[0].isObject else {
                 return self.throwTypeError(message: "Reflect.deleteProperty: target must be an object")
             }
-            if let keyStr = self.toSwiftString(args[1]) {
-                let atom = self.rt.findAtom(keyStr)
-                if let targetObj = args[0].toObject() {
-                    _ = jeffJS_deleteProperty(ctx: self, obj: targetObj, atom: atom)
-                }
-                self.rt.freeAtom(atom)
-            }
-            return .JS_TRUE
+            guard let (atom, owned) = self.propertyKeyAtom(args[1]) else { return .exception }
+            defer { if owned { self.rt.freeAtom(atom) } }
+            guard let targetObj = args[0].toObject() else { return .JS_FALSE }
+            // The result is [[Delete]]'s answer: a non-configurable property
+            // stays and Reflect.deleteProperty reports false.
+            return .newBool(jeffJS_deleteProperty(ctx: self, obj: targetObj, atom: atom))
         }, name: "deleteProperty", length: 2)
         _ = setPropertyStr(obj: reflectObj, name: "deleteProperty", value: reflDeleteProperty)
 
@@ -3791,13 +3875,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 return self.throwTypeError(message: "Reflect.get: target must be an object")
             }
             let receiver = args.count >= 3 ? args[2] : args[0]
-            if let keyStr = self.toSwiftString(args[1]) {
-                let atom = self.rt.findAtom(keyStr)
-                let result = self.getPropertyInternal(obj: args[0], atom: atom, receiver: receiver)
-                self.rt.freeAtom(atom)
-                return result
-            }
-            return .JS_UNDEFINED
+            guard let (atom, owned) = self.propertyKeyAtom(args[1]) else { return .exception }
+            defer { if owned { self.rt.freeAtom(atom) } }
+            return self.getPropertyInternal(obj: args[0], atom: atom, receiver: receiver)
         }, name: "get", length: 2)
         _ = setPropertyStr(obj: reflectObj, name: "get", value: reflGet)
 
@@ -3837,13 +3917,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             guard args[0].isObject else {
                 return self.throwTypeError(message: "Reflect.has: target must be an object")
             }
-            if let keyStr = self.toSwiftString(args[1]) {
-                let atom = self.rt.findAtom(keyStr)
-                let result = self.hasProperty(obj: args[0], atom: atom)
-                self.rt.freeAtom(atom)
-                return .newBool(result)
-            }
-            return .JS_FALSE
+            guard let (atom, owned) = self.propertyKeyAtom(args[1]) else { return .exception }
+            defer { if owned { self.rt.freeAtom(atom) } }
+            return .newBool(self.hasProperty(obj: args[0], atom: atom))
         }, name: "has", length: 2)
         _ = setPropertyStr(obj: reflectObj, name: "has", value: reflHas)
 
@@ -3931,13 +4007,15 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             guard args[0].isObject else {
                 return self.throwTypeError(message: "Reflect.set: target must be an object")
             }
-            if let keyStr = self.toSwiftString(args[1]) {
-                let atom = self.rt.findAtom(keyStr)
-                let result = self.setPropertyInternal(obj: args[0], atom: atom, value: args[2].dupValue(), flags: 0)
-                self.rt.freeAtom(atom)
-                return .newBool(result >= 0)
-            }
-            return .JS_TRUE
+            guard let (atom, owned) = self.propertyKeyAtom(args[1]) else { return .exception }
+            defer { if owned { self.rt.freeAtom(atom) } }
+            // setPropertyInternal answers 1 = written, 0 = refused (no throw
+            // without JS_PROP_THROW), -1 = error. Reflect.set reports the
+            // refusal as false rather than swallowing it.
+            let result = self.setPropertyInternal(obj: args[0], atom: atom,
+                                                  value: args[2].dupValue(), flags: 0)
+            if result < 0 { return self.rt.currentException.isNull ? .JS_FALSE : .exception }
+            return .newBool(result > 0)
         }, name: "set", length: 3)
         _ = setPropertyStr(obj: reflectObj, name: "set", value: reflSet)
 
