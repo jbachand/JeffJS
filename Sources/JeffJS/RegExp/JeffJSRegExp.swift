@@ -2972,6 +2972,17 @@ final class REVirtualMachine {
                 if count < qmin {
                     if !backtrack(&pc, &pos) { return false }
                 } else {
+                    // The loop above ate as much as it could.  If whatever
+                    // follows the quantifier fails, the greedy run has to give
+                    // characters back one at a time down to `qmin` -- QuickJS
+                    // pushes a single RE_EXEC_STATE_GREEDY_QUANT state that
+                    // re-pushes itself with count-1 on every backtrack, and
+                    // `backtrack()` does the same here (entry.extra > 0).
+                    // Without it `/a.*b/` could never match "aXXb".
+                    if count > qmin {
+                        pushGreedyQuantState(resumePC: afterPC, pos: pos,
+                                             giveBacks: Int32(truncatingIfNeeded: count - qmin))
+                    }
                     pc = afterPC
                 }
 
@@ -3056,6 +3067,34 @@ final class REVirtualMachine {
         stack.append(BacktrackEntry(pc: pc, pos: pos, snapOff: off, snapLen: len))
     }
 
+    /// Push the "give back one character" state of a `simple_greedy_quant`.
+    /// `giveBacks` is how many iterations above the quantifier's minimum the
+    /// greedy loop managed to eat; each backtrack returns one of them.
+    @inline(__always)
+    func pushGreedyQuantState(resumePC: Int, pos: Int, giveBacks: Int32) {
+        let off = valueSnapshots.count
+        let len = valueStack.count
+        if len > 0 {
+            valueSnapshots.append(contentsOf: valueStack)
+        }
+        var entry = BacktrackEntry(pc: resumePC, pos: pos, snapOff: off, snapLen: len)
+        entry.extra = giveBacks
+        stack.append(entry)
+    }
+
+    /// Step one character back, the way QuickJS's PREV_CHAR does: a surrogate
+    /// pair counts as one character only when the `u` flag is on, which is
+    /// exactly how the greedy loop consumed it.
+    @inline(__always)
+    private func prevCharPos(_ pos: Int) -> Int {
+        guard pos > 0 else { return 0 }
+        if flags.isUnicode {
+            let (_, w) = getCharBefore(pos)
+            return pos - max(w, 1)
+        }
+        return pos - 1
+    }
+
     @inline(__always)
     func pushValue(_ val: Int32) {
         valueStack.append(val)
@@ -3090,6 +3129,19 @@ final class REVirtualMachine {
             }
             if valueSnapshots.count > off {
                 valueSnapshots.removeLast(valueSnapshots.count - off)
+            }
+            if entry.extra > 0 {
+                // simple_greedy_quant: hand one character back to the rest of
+                // the pattern, and keep the state around (with one fewer
+                // give-back left) so the next failure hands back another.
+                let newPos = prevCharPos(entry.pos)
+                if entry.extra > 1 {
+                    pushGreedyQuantState(resumePC: entry.pc, pos: newPos,
+                                         giveBacks: entry.extra - 1)
+                }
+                pc = entry.pc
+                pos = newPos
+                return true
             }
             pc = entry.pc
             pos = entry.pos

@@ -304,6 +304,7 @@ struct JeffJSTestRunner {
             ("PerIterationLet", { $0.testPerIterationLetScope() }),
             ("BuiltinSubclassing", { $0.testBuiltinSubclassing() }),
             ("RegExpAlternation", { $0.testRegExpAlternation() }),
+            ("RegExpBacktrack", { $0.testRegExpBacktrack() }),
             ("ReflectConstructNewTarget", { $0.testReflectConstructNewTarget() }),
             ("ClassFields", { $0.testClassFields() }),
             ("BuiltinGaps", { $0.testBuiltinGaps() }),
@@ -10744,6 +10745,121 @@ extension JeffJSTestRunner {
         evalCheckBool(ctx, sizzle + #"rcombinators.test(" > ")"#, expect: true)
         evalCheckBool(ctx, sizzle +
             #"new RegExp("^" + whitespace + "," + whitespace).test(" , ")"#, expect: true)
+    }
+
+    /// Greedy quantifiers with a single char/class body compile to the
+    /// `simple_greedy_quant` fast path, and that opcode ate as much as it could
+    /// and then never pushed a backtracking state -- so it could not give a
+    /// character back when whatever followed the loop failed.  `/a.*b/` could
+    /// not match "aXXb", `/at x \(.*\)/` could not match "at x (foo)", and
+    /// Sizzle's combinator regex could not match " form".  QuickJS pushes one
+    /// RE_EXEC_STATE_GREEDY_QUANT state that re-pushes itself with count-1 on
+    /// every backtrack; the VM now does the same.
+    mutating func testRegExpBacktrack() {
+        let (_, ctx) = makeCtx()
+
+        // --- the plain repros -------------------------------------------------
+        evalCheckBool(ctx, #"/at x \(.*\)/.test("at x (foo)")"#, expect: true)
+        evalCheckStr(ctx, #"String(/a.*b/.exec("aXXb"))"#, expect: "aXXb")
+        evalCheckStr(ctx, #"String(/(.*)c/.exec("abcabc"))"#, expect: "abcabc,abcab")
+        evalCheckStr(ctx, #"String(/^.*$/.exec("hello"))"#, expect: "hello")
+        evalCheckStr(ctx, #"String(/.*/.exec("abc"))"#, expect: "abc")
+        evalCheckStr(ctx, #"String(/.+?x/.exec("aaax"))"#, expect: "aaax")
+        evalCheckStr(ctx, #"String(/(a+)+b/.exec("aaab"))"#, expect: "aaab,aaa")
+        evalCheckStr(ctx, #"String(/[^)]*\)/.exec("ab)cd"))"#, expect: "ab)")
+        evalCheckStr(ctx, #"String(/\((.*?)\)/.exec("(a)(b)"))"#, expect: "(a),a")
+        evalCheckStr(ctx, #"String(/[a-z]*x/.exec("abcx"))"#, expect: "abcx")
+
+        // --- give back one char at a time until the tail matches --------------
+        evalCheckStr(ctx, #"String(/a.*b.*c/.exec("aXbXcXbXc"))"#, expect: "aXbXcXbXc")
+        evalCheckStr(ctx, #"String(/a*a/.exec("aaa"))"#, expect: "aaa")
+        evalCheckStr(ctx, #"String(/a*ab/.exec("aaab"))"#, expect: "aaab")
+        evalCheckStr(ctx, #"String(/\d+3/.exec("12345"))"#, expect: "123")
+        evalCheckStr(ctx, #"String(/[0-9]*[0-9]/.exec("123"))"#, expect: "123")
+        evalCheckStr(ctx, #"String(/.*[0-9]/.exec("a1b2c"))"#, expect: "a1b2")
+        evalCheckStr(ctx, #"String(/<(.*)>/.exec("<a><b>"))"#, expect: "<a><b>,a><b")
+        evalCheckStr(ctx, #"String(/(.*)(\d+)/.exec("abc123"))"#, expect: "abc123,abc12,3")
+        evalCheckStr(ctx, #"String(/.*(a.*b)/.exec("xaybazb"))"#, expect: "xaybazb,azb")
+        evalCheckStr(ctx, #"String(/(?:.*)x(.*)/.exec("axbxc"))"#, expect: "axbxc,c")
+        evalCheckStr(ctx, #"String(/^(.*),(.*)$/.exec("a,b,c"))"#, expect: "a,b,c,a,b,c")
+        evalCheckStr(ctx, #"String(/(.*)\1/.exec("abcabc"))"#, expect: "abcabc,abc")
+        evalCheckStr(ctx, #"String(/(a*)(a*)b/.exec("aaab"))"#, expect: "aaab,aaa,")
+        evalCheckStr(ctx, #"String(/^a*(ab)?b/.exec("aaab"))"#, expect: "aaab,")
+        evalCheckStr(ctx, #"String(/(a|b)*c/.exec("ababc"))"#, expect: "ababc,b")
+
+        // --- the loop must not give back past its minimum ---------------------
+        evalCheckStr(ctx, #"String(/a.{2,}b/.exec("aXXXb"))"#, expect: "aXXXb")
+        evalCheckStr(ctx, #"String(/a.{2,3}b/.exec("aXXXXb"))"#, expect: "null")
+        evalCheckStr(ctx, #"String(/.{0,3}z/.exec("abcdz"))"#, expect: "bcdz")
+        evalCheckStr(ctx, #"String(/x[^y]*yz/.exec("xayaybyz"))"#, expect: "null")
+        evalCheckStr(ctx, #"String(/x*/.exec("yyy"))"#, expect: "")
+
+        // --- anchors, lookahead and the dotall / multiline flags --------------
+        evalCheckStr(ctx, #"String(/a.*$/.exec("abc"))"#, expect: "abc")
+        evalCheckStr(ctx, #"String(/a.*$/m.exec("abc\ndef"))"#, expect: "abc")
+        evalCheckStr(ctx, #"String(/\s*$/.exec("a  "))"#, expect: "  ")
+        evalCheckStr(ctx, #"String(/.*(?=b)/.exec("aabaa"))"#, expect: "aa")
+        evalCheckStr(ctx, #"String(/.*(?!a)/.exec("aaa"))"#, expect: "aaa")
+        evalCheckStr(ctx, #"String(/^[\s\S]*b/.exec("a\nb\nb"))"#, expect: "a\nb\nb")
+        evalCheckStr(ctx, #"String(/a.*b/s.exec("a\nXb"))"#, expect: "a\nXb")
+        evalCheckStr(ctx, #"String(/^.*$/s.exec("a\nb"))"#, expect: "a\nb")
+
+        // --- lazy quantifiers keep their own (working) behaviour --------------
+        evalCheckStr(ctx, #"String(/.*?b/.exec("aabab"))"#, expect: "aab")
+        evalCheckStr(ctx, #"String(/^.*?(b)/.exec("aabab"))"#, expect: "aab,b")
+
+        // --- flags: i, u, g, and the string methods built on exec -------------
+        evalCheckStr(ctx, #"String(/A*a/i.exec("AAa"))"#, expect: "AAa")
+        evalCheckStr(ctx, #"String(/[a-c]*C/i.exec("abcC"))"#, expect: "abcC")
+        evalCheckStr(ctx, #"String(/^.*b$/u.exec("axxb"))"#, expect: "axxb")
+        evalCheckStr(ctx, #"String(/[a-z]*z/u.exec("abcz"))"#, expect: "abcz")
+        evalCheckBool(ctx, #"/.*é/.test("café!")"#, expect: true)
+        evalCheckStr(ctx, #""a1b2".replace(/.*(\d)/, "[$1]")"#, expect: "[2]")
+        evalCheckStr(ctx, #""aaa".replace(/a*/g, "X")"#, expect: "XX")
+        evalCheckStr(ctx, #"String("abcabc".match(/.*c/g))"#, expect: "abcabc")
+        evalCheckStr(ctx, #"var r = /.*x/g; r.exec("aaxbbx"); String(r.exec("aaxbbx"))"#,
+                     expect: "null")
+        evalCheckStr(ctx, #"String(/".*"/.exec('say "hi" now "x"'))"#,
+                     expect: #""hi" now "x""#)
+        evalCheckStr(ctx, #"String(/\w*\.\w+/.exec("name.ext"))"#, expect: "name.ext")
+        evalCheckStr(ctx, #"String(/.+\/.+/.exec("a/b/c"))"#, expect: "a/b/c")
+        evalCheckStr(ctx, #"String(/\s*<\/(\w+)>/.exec("  </div>"))"#,
+                     expect: "  </div>,div")
+
+        // --- Sizzle's combinator regex ----------------------------------------
+        // `^ws*([>+~]|ws)ws*` against " form": the leading class `*` eats the
+        // space and has to hand it back to the alternation.  Returning null
+        // here left jQuery unable to tokenize any descendant selector.
+        evalCheckStr(ctx, #"String(/[\x20\t]*([>+~]|[\x20\t])[\x20\t]*/.exec(" form"))"#,
+                     expect: " , ")
+        let sizzleWS = #"""
+            var whitespace = "[\\x20\\t\\r\\n\\f]";
+            var rcombinators = new RegExp("^" + whitespace + "*([>+~]|" +
+                whitespace + ")" + whitespace + "*");
+
+            """#
+        evalCheckStr(ctx, sizzleWS + #"String(rcombinators.exec(" form"))"#, expect: " , ")
+        evalCheckStr(ctx, sizzleWS + #"String(rcombinators.exec(" > form"))"#, expect: " > ,>")
+        evalCheckStr(ctx, sizzleWS + #"String(rcombinators.exec("  ~  form"))"#,
+                     expect: "  ~  ,~")
+        evalCheckStr(ctx, sizzleWS + #"String(rcombinators.exec("form"))"#, expect: "null")
+        // The descendant-combinator tokenizer loop itself ("p.dropdown form"
+        // has to consume down to the empty string).
+        evalCheckStr(ctx, sizzleWS + #"""
+            var identifier = "(?:\\\\[\\da-fA-F]{1,6}[\\x20\\t\\r\\n\\f]?|" +
+                "\\\\[^\\r\\n\\f]|[\\w-]|[^\0-\\x7f])+";
+            var rtag = new RegExp("^(" + identifier + "|[*])");
+            var rclass = new RegExp("^\\.(" + identifier + ")");
+            var soFar = ".dropdown form", out = [], guard = 0;
+            while (soFar && guard++ < 20) {
+                var m = rcombinators.exec(soFar);
+                if (m) { soFar = soFar.slice(m[0].length); out.push("SPACE"); continue; }
+                m = rclass.exec(soFar) || rtag.exec(soFar);
+                if (!m) break;
+                soFar = soFar.slice(m[0].length); out.push(m[0]);
+            }
+            soFar.length + ":" + out.join("|")
+            """#, expect: "0:.dropdown|SPACE|form")
     }
 
     mutating func testBuiltinSubclassing() {
