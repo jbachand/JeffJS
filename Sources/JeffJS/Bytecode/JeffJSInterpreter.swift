@@ -7601,7 +7601,16 @@ struct JeffJSInterpreter {
                     if newCount > 0 {
                         // Update the length property in-place (prop[0] == "length").
                         arrObj.asClass.setPropEntry(at: 0, .value(.newInt32(Int32(newCount))))
-                        // Pop arg, funcVal, thisObj; push new length
+                        // Pop arg, funcVal, thisObj; push new length. The
+                        // element's reference moved into the array, but the
+                        // callee and the receiver are still the stack's to
+                        // release — the trace interpreter's copy of this fast
+                        // path does it and this one did not, so every
+                        // `arr.push(<temporary>)` added a reference to the
+                        // array itself. The array then outlived the runtime
+                        // and took every element it held with it.
+                        buf[sp - 2].freeValue()   // Array.prototype.push
+                        buf[sp - 3].freeValue()   // the array
                         sp -= 3
                         buf[sp] = .newInt32(Int32(newCount)); sp += 1
                         pc += 3
@@ -8571,9 +8580,10 @@ struct JeffJSInterpreter {
                             }
                         }
                     }
-                    // Fallback: just resolve push function quickly
-                    let pushVal = JeffJSValue.makeObject(ctx.arrayProtoPushObj!)
-                    buf[sp] = pushVal.dupValue(); sp += 1
+                    // Fallback: just resolve push function quickly. Borrowed,
+                    // not `makeObject`: that takes an ARC retain the refcount
+                    // knows nothing about and nobody ever gives back.
+                    buf[sp] = JeffJSValue.borrowedObject(ctx.arrayProtoPushObj!).dupValue(); sp += 1
                     pc += 5
                     continue dispatchLoop
                 }
