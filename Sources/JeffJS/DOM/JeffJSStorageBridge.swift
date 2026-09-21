@@ -26,6 +26,11 @@ final class JeffJSStorageBridge {
 
     private let scope: String
     private let defaults = UserDefaults.standard
+    /// sessionStorage is scoped to the page session and must not survive a relaunch
+    /// (browsers give each tab a fresh one). Anything persisted here would linger
+    /// forever, so the session namespace lives in memory for the bridge's lifetime.
+    private var sessionValues: [String: String] = [:]
+    private func isSession(_ namespace: String) -> Bool { namespace == "session_storage" || namespace == "session" }
 
     // MARK: - Init
 
@@ -100,18 +105,22 @@ final class JeffJSStorageBridge {
     // MARK: - Storage Operations (mirrors JSStorageBridge)
 
     func get(_ namespace: String, _ key: String) -> String? {
-        defaults.string(forKey: storageKey(namespace: namespace, key: key))
+        if isSession(namespace) { return sessionValues[key] }
+        return defaults.string(forKey: storageKey(namespace: namespace, key: key))
     }
 
     func set(_ namespace: String, _ key: String, _ value: String) {
+        if isSession(namespace) { sessionValues[key] = value; return }
         defaults.set(value, forKey: storageKey(namespace: namespace, key: key))
     }
 
     func remove(_ namespace: String, _ key: String) {
+        if isSession(namespace) { sessionValues[key] = nil; return }
         defaults.removeObject(forKey: storageKey(namespace: namespace, key: key))
     }
 
     func clear(_ namespace: String) {
+        if isSession(namespace) { sessionValues.removeAll(); return }
         let prefix = "\(scope).\(namespace)."
         for key in defaults.dictionaryRepresentation().keys where key.hasPrefix(prefix) {
             defaults.removeObject(forKey: key)
@@ -119,6 +128,7 @@ final class JeffJSStorageBridge {
     }
 
     func keys(_ namespace: String) -> [String] {
+        if isSession(namespace) { return sessionValues.keys.sorted() }
         let prefix = "\(scope).\(namespace)."
         return defaults.dictionaryRepresentation().keys
             .filter { $0.hasPrefix(prefix) }
