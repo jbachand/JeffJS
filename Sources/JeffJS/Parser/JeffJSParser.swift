@@ -1226,6 +1226,17 @@ final class JeffJSParser {
         // at the end. We replace ALL drops in tail position to handle both
         // branches of if/else.
         if patchCompletionDrops() {
+            // The patched drops became `nip`, which replaces the completion
+            // value sitting at the bottom of the operand stack. That slot is
+            // seeded with `undefined` here so a branch that never runs (or a
+            // loop body that runs zero times) still leaves exactly one value
+            // for `return_`: `if (false) { o.x = 1; }` used to reach the
+            // return with an empty stack.
+            let undefByte = UInt8(truncatingIfNeeded: JeffJSOpcode.undefined.rawValue)
+            fd.byteCode.buf.insert(undefByte, at: 0)
+            fd.byteCode.len += 1
+            fd.bodyBytecodeStart += 1
+            fd.hoistedFuncDeclRanges = fd.hoistedFuncDeclRanges.map { ($0.0 + 1, $0.1 + 1) }
             emitOp(.return_)
             return
         }
@@ -1282,7 +1293,7 @@ final class JeffJSParser {
         }
 
         let dropOp = JeffJSOpcode.drop
-        let nopByte = UInt8(truncatingIfNeeded: JeffJSOpcode.nop.rawValue)
+        let nipByte = UInt8(truncatingIfNeeded: JeffJSOpcode.nip.rawValue)
         var found = false
 
         // Work-list of instruction indices to process as "tail".
@@ -1295,8 +1306,11 @@ final class JeffJSParser {
             let (ipos, iop, _) = instructions[i]
 
             if iop == dropOp {
-                // Replace this drop with nop
-                fd.byteCode.buf[ipos] = nopByte
+                // Replace this drop with `nip`: it overwrites the completion
+                // value below it instead of discarding the statement value,
+                // so the stack depth is the same on every path (and a tail
+                // drop inside a loop no longer grows the stack per iteration).
+                fd.byteCode.buf[ipos] = nipByte
                 found = true
                 // Predecessor is also in tail position
                 if i > 0 && !tailIndices.contains(i - 1) {
@@ -4109,7 +4123,9 @@ final class JeffJSParser {
                         s.lastTokenType = savedLhsLastTokenType
 
                         // Parse the destructuring pattern in assignment mode
-                        parseDestructuringBinding(kind: .assignment)
+                        // `({a} = o)` / `[a] = arr` are expressions whose
+                        // value is the RHS: leave it on the stack.
+                        parseDestructuringBinding(kind: .assignment, leaveSource: true)
 
                         // Restore to after RHS
                         s.bufPtr = afterRhsBufPtr
@@ -4762,6 +4778,27 @@ final class JeffJSParser {
     func parseCallExpr() {
         parseNewExpr()
 
+        // Optional chaining short-circuits the WHOLE rest of the chain, not
+        // just the one link: `a?.b.c()` must evaluate to undefined when `a` is
+        // nullish rather than reading `.c` off undefined and calling it. One
+        // pair of labels per chain; the epilogue is emitted at every exit.
+        var optNullLabel = -1
+        var optNull2Label = -1   // same, with a receiver below the base
+        var optEndLabel = -1
+        defer {
+            if optNullLabel >= 0 {
+                emitGoto(optEndLabel)
+                if optNull2Label >= 0 {
+                    emitLabel(optNull2Label)
+                    emitOp(.drop)   // discard the receiver of `o.m?.()`
+                }
+                emitLabel(optNullLabel)
+                emitOp(.drop)       // discard the null/undefined base
+                emitOp(.undefined)  // ... the chain's value is undefined
+                emitLabel(optEndLabel)
+            }
+        }
+
         while !shouldAbort {
             switch tok {
             case 0x28: // '(' -- function call
@@ -4867,10 +4904,12 @@ final class JeffJSParser {
                     if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
                         emitOp(.push_this); emitOp(.swap); pendingMethodCall = true
                     }
-                } else if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
-                    // obj[key](...) / obj[key]`..`: keep the receiver so the call is a method call
-                    // (QuickJS get_array_el2 + call_method); a plain call passed
-                    // `this` = undefined.
+                } else if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue
+                            || (tok == JSTokenType.TOK_OPTIONAL_CHAIN.rawValue
+                                && s.simpleNextToken() == 0x28) {
+                    // obj[key](...) / obj[key]`..` / obj[key]?.(): keep the receiver so
+                    // the call is a method call (QuickJS get_array_el2 +
+                    // call_method); a plain call passed `this` = undefined.
                     emitOp(.get_array_el2)
                     pendingMethodCall = true
                 } else {
@@ -4903,10 +4942,13 @@ final class JeffJSParser {
                         emitOp(.push_this); emitOp(.swap)
                         pendingMethodCall = true
                         emitGetField(fieldAtom)
-                    } else if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
-                        // obj.m(...) / obj.m`..`: keep the receiver for call_method right here.
-                        // The later get_field+call rewrite pass loses the receiver
-                        // when the arguments contain branches (`o.m(c ? a : b)`).
+                    } else if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue
+                                || (tok == JSTokenType.TOK_OPTIONAL_CHAIN.rawValue
+                                    && s.simpleNextToken() == 0x28) {
+                        // obj.m(...) / obj.m`..` / obj.m?.(): keep the receiver for
+                        // call_method right here. The later get_field+call rewrite
+                        // pass loses the receiver when the arguments contain
+                        // branches (`o.m(c ? a : b)`).
                         emitOp(.get_field2)
                         emitAtom(fieldAtom)
                         pendingMethodCall = true
@@ -4925,11 +4967,24 @@ final class JeffJSParser {
 
             case JSTokenType.TOK_OPTIONAL_CHAIN.rawValue: // '?.'
                 next()
-                let nullishLabel = newLabel()
-                let endLabel = newLabel()
+                lastExprWasSuper = false
+                lastExprWasSuperProp = false
+                // `o.m?.()` keeps o as the receiver (get_field2 emitted by the
+                // '.' case); the nullish branch then has one extra slot.
+                let optWasMethod = pendingMethodCall && tok == 0x28
+                pendingMethodCall = false
+                if optNullLabel < 0 {
+                    optNullLabel = newLabel()
+                    optEndLabel = newLabel()
+                }
+                var optNullTarget = optNullLabel
+                if optWasMethod {
+                    if optNull2Label < 0 { optNull2Label = newLabel() }
+                    optNullTarget = optNull2Label
+                }
                 emitOp(.dup)
                 emitOp(.is_undefined_or_null)
-                emitIfTrue(nullishLabel)
+                emitIfTrue(optNullTarget)
 
                 if tok == 0x28 { // '?.(args)'
                     next()
@@ -4940,27 +4995,33 @@ final class JeffJSParser {
                         if tok == 0x2C { next() }
                     }
                     expect(0x29)
-                    emitCall(argc)
+                    if optWasMethod { emitCallMethod(argc) } else { emitCall(argc) }
                 } else if tok == 0x5B { // '?.[expr]'
                     next()
                     parseExpression()
                     expect(0x5D)
-                    emitOp(.get_array_el)
-                } else if tok == JSTokenType.TOK_IDENT.rawValue {
-                    let fieldAtom = s.token.identAtom
+                    if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
+                        emitOp(.get_array_el2)   // keep the receiver for the call
+                        pendingMethodCall = true
+                    } else {
+                        emitOp(.get_array_el)
+                    }
+                } else if tok == JSTokenType.TOK_IDENT.rawValue || isKeywordToken(tok) {
+                    let fieldAtom: JSAtom
+                    if tok == JSTokenType.TOK_IDENT.rawValue {
+                        fieldAtom = s.token.identAtom
+                    } else {
+                        fieldAtom = getAtom(keywordTokenName(tok))
+                    }
                     next()
-                    emitGetField(fieldAtom)
-                } else if isKeywordToken(tok) {
-                    let kwName = keywordTokenName(tok)
-                    let fieldAtom = getAtom(kwName)
-                    next()
-                    emitGetField(fieldAtom)
+                    if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
+                        emitOp(.get_field2)      // keep the receiver for the call
+                        emitAtom(fieldAtom)
+                        pendingMethodCall = true
+                    } else {
+                        emitGetField(fieldAtom)
+                    }
                 }
-                emitGoto(endLabel)
-                emitLabel(nullishLabel)
-                emitOp(.drop)       // discard null/undefined obj
-                emitOp(.undefined)  // result is undefined
-                emitLabel(endLabel)
 
             case JSTokenType.TOK_TEMPLATE.rawValue: // tagged template
                 // Inside a substitution the tokenizer never yields
@@ -6318,13 +6379,35 @@ final class JeffJSParser {
     // =========================================================================
 
     /// Parse a destructuring binding pattern and emit bytecode.
+    /// `leaveSource` is set only for the top level of a destructuring
+    /// ASSIGNMENT expression: `({a} = o)` evaluates to `o`, so the source has
+    /// to stay on the stack as the expression's value. Nested patterns always
+    /// consume the value they were handed.
     func parseDestructuringBinding(kind: DestructuringKind,
                                    isLexical: Bool = false,
-                                   isConst: Bool = false) {
+                                   isConst: Bool = false,
+                                   leaveSource: Bool = false) {
+        if leaveSource {
+            // The source is stashed in a temporary and pushed again after the
+            // pattern, rather than kept underneath it: that keeps the
+            // pattern's last store from sitting directly in front of the
+            // consumer's store, which the chained-assignment lookahead in the
+            // interpreter (isStoreOpcode) would read as `a = b = v`.
+            let tmp = defineVar(0)
+            emitOp(.dup)
+            emitOp(.put_loc)
+            emitU16(UInt16(tmp))
+            parseDestructuringBinding(kind: kind, isLexical: isLexical, isConst: isConst)
+            emitOp(.get_loc)
+            emitU16(UInt16(tmp))
+            return
+        }
         if tok == 0x5B { // '['
-            parseArrayDestructuring(kind: kind, isLexical: isLexical, isConst: isConst)
+            parseArrayDestructuring(kind: kind, isLexical: isLexical, isConst: isConst,
+                                    leaveSource: leaveSource)
         } else if tok == 0x7B { // '{'
-            parseObjectDestructuring(kind: kind, isLexical: isLexical, isConst: isConst)
+            parseObjectDestructuring(kind: kind, isLexical: isLexical, isConst: isConst,
+                                     leaveSource: leaveSource)
         } else {
             syntaxError("expected destructuring pattern")
         }
@@ -6405,10 +6488,13 @@ final class JeffJSParser {
 
     /// Parse array destructuring: [a, b, ...rest] = expr
     func parseArrayDestructuring(kind: DestructuringKind,
-                                 isLexical: Bool, isConst: Bool) {
+                                 isLexical: Bool, isConst: Bool,
+                                 leaveSource: Bool = false) {
         expect(0x5B) // '['
 
-        // The value to destructure should be on the stack
+        // The value to destructure should be on the stack. for_of_start
+        // consumes it, so an assignment expression keeps a copy as its value.
+        if leaveSource { emitOp(.dup) }
         emitOp(.for_of_start) // create iterator
 
         var idx = 0
@@ -6549,7 +6635,8 @@ final class JeffJSParser {
 
     /// Parse object destructuring: {a, b: c, ...rest} = expr
     func parseObjectDestructuring(kind: DestructuringKind,
-                                  isLexical: Bool, isConst: Bool) {
+                                  isLexical: Bool, isConst: Bool,
+                                  leaveSource: Bool = false) {
         expect(0x7B) // '{'
 
         // Keys bound so far. A trailing `...rest` must exclude them, so static
@@ -6726,7 +6813,8 @@ final class JeffJSParser {
         }
 
         expect(0x7D) // '}'
-        emitOp(.drop) // drop the original object from the stack
+        // The source stays only as the value of an assignment expression.
+        if !leaveSource { emitOp(.drop) }
     }
 
     // =========================================================================

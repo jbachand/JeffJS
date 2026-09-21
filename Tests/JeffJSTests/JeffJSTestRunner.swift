@@ -10548,6 +10548,41 @@ extension JeffJSTestRunner {
                      expect: "1/undefined")
         // The object outlives the frame: the slot detaches with its value.
         evalCheck(ctx, "function amD(a) { a = 7; return arguments; } amD(1)[0]", expectInt: 7)
+
+        // --- 4. Bugs found bisecting adsbygoogle.js --------------------
+        // a) Optional chaining short-circuited one link only, so the rest of
+        //    the chain ran on undefined (`b.h()?.h()` called undefined).
+        evalCheckStr(ctx, "var oc1 = { h: function () { return null; } }; String(!!oc1.h()?.h())", expect: "false")
+        evalCheckStr(ctx, "var oc2 = { a: null }; String(oc2.a?.b.c)", expect: "undefined")
+        evalCheckStr(ctx, "var oc3 = { a: null }; String(oc3.a?.b())", expect: "undefined")
+        evalCheckStr(ctx, "var oc4 = { a: null }; String(oc4.a?.[0]())", expect: "undefined")
+        evalCheckStr(ctx, "var oc5 = null; String(oc5?.a.b.c.d())", expect: "undefined")
+        evalCheckStr(ctx, "function ocf() { return undefined; } String(ocf()?.x.y())", expect: "undefined")
+        evalCheck(ctx, "var oc6 = { a: { b: { c: 3 } } }; oc6?.a.b.c", expectInt: 3)
+        evalCheckStr(ctx, "var ocC = 0; function ocs() { ocC++; return 1; } var oc7 = null; oc7?.a[ocs()]; String(ocC)", expect: "0")
+        // ... and an optional call keeps its receiver.
+        evalCheck(ctx, "var oc8 = { v: 1, m: function () { return this.v; } }; oc8.m?.()", expectInt: 1)
+        evalCheck(ctx, "var oc9 = { a: { v: 9, b: function () { return this.v; } } }; oc9.a?.b()", expectInt: 9)
+        // b) A destructuring ASSIGNMENT is an expression whose value is the
+        //    RHS; it used to leave nothing on the stack ("VM stack underflow:
+        //    op=drop"), and its store landed next to the consumer's store,
+        //    which the chained-assignment lookahead read as `a = b = v`.
+        evalCheckStr(ctx, """
+            var da1, db1; var dr1 = ({ a: da1, b: db1 } = { a: 1, b: 2 });
+            JSON.stringify(dr1) + '|' + da1 + '|' + db1
+            """, expect: "{\"a\":1,\"b\":2}|1|2")
+        evalCheckStr(ctx, """
+            var dc1, dd1; var dr2 = ([dc1, dd1] = [1, 2]); JSON.stringify(dr2)
+            """, expect: "[1,2]")
+        evalCheckBool(ctx, """
+            (function () { var o = { a: 1, b: 2 }; var x, y; var r = ({ a: x, b: y } = o); return r === o; })()
+            """, expect: true)
+        // c) A program's completion value has to exist on every path: an `if`
+        //    whose body produces one but is not taken reached `return` with an
+        //    empty stack.
+        evalCheckStr(ctx, "String((0, eval)('var ce = {}; if (false) { ce.x = 1; }'))", expect: "undefined")
+        evalCheckStr(ctx, "String((0, eval)('if (true) { 7; }'))", expect: "7")
+        evalCheckStr(ctx, "String((0, eval)('if (false) 1; else 2;'))", expect: "2")
     }
 
     mutating func runAPITests() -> String {

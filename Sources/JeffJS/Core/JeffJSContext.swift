@@ -3967,6 +3967,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 let prevAtom = prevGetFieldAtom
                 let varHint = prevAtom > 0 ? (rt.atomToString(prevAtom) ?? "") : ""
                 let hint = varHint.isEmpty ? "" : " — '\(varHint).\(atomStr)' is undefined"
+                jeffJS_dumpLastOps(self)
                 return throwTypeError(message: "Cannot read properties of \(obj.isNull ? "null" : "undefined") (reading '\(atomStr)')\(hint)")
             }
             return .JS_UNDEFINED

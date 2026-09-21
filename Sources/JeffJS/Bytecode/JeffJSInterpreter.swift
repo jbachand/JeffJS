@@ -147,6 +147,34 @@ func jeffJS_pop(_ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: inout Int, _ spB
     return buf[sp]
 }
 
+nonisolated(unsafe) let jeffJSNoTrace = ProcessInfo.processInfo.environment["JEFFJS_NO_TRACE"] != nil
+
+// JEFFJS_TRACE_LAST=1: keep the last 128 (function, pc, opcode) triples the
+// main dispatch loop executed, and print them when a diagnostic asks.
+nonisolated(unsafe) let jeffJSTraceLast = ProcessInfo.processInfo.environment["JEFFJS_TRACE_LAST"] != nil
+nonisolated(unsafe) var jeffJSLastOps = [(fb: JeffJSFunctionBytecode?, pc: Int, op: UInt8, sp: Int)](repeating: (nil, 0, 0, 0), count: 128)
+nonisolated(unsafe) var jeffJSLastOpsIdx = 0
+@inline(never)
+func jeffJS_recordLastOp(_ fb: JeffJSFunctionBytecode, _ pc: Int, _ op: UInt8, _ sp: Int) {
+    jeffJSLastOps[jeffJSLastOpsIdx & 127] = (fb, pc, op, sp)
+    jeffJSLastOpsIdx &+= 1
+}
+func jeffJS_dumpLastOps(_ ctx: JeffJSContext) {
+    guard jeffJSTraceLast else { return }
+    var out = "[JeffJS] last executed opcodes (oldest first):\n"
+    let n = min(jeffJSLastOpsIdx, 128)
+    for k in 0 ..< n {
+        let e = jeffJSLastOps[(jeffJSLastOpsIdx - n + k) & 127]
+        guard let fb = e.fb else { continue }
+        let name = jeffJSGetOpcodeInfo(e.op)?.name ?? "?\(e.op)"
+        let fn = ctx.rt.atomToString((fb as? JeffJSFunctionBytecodeCompiled)?.funcNameAtom ?? 0) ?? "<anon>"
+        let line = (fb as? JeffJSFunctionBytecodeCompiled).map {
+            $0.debugPc2lineBuf.isEmpty ? fb.lineNum : $0.lineForPC(e.pc)
+        } ?? fb.lineNum
+        out += "  \(fn)@\(line) pc=\(e.pc) sp=\(e.sp) \(name)\n"
+    }
+    FileHandle.standardError.write(out.data(using: .utf8)!)
+}
 nonisolated(unsafe) var jeffJS_underflowReports = 0
 
 @inline(never)
@@ -162,7 +190,18 @@ func jeffJS_reportStackUnderflow(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytec
         opName = raw == 0 && pc + 1 < fb.bytecodeLen ? "wide:\(fb.bytecode[pc + 1])" : (jeffJSGetOpcodeInfo(raw)?.name ?? "?\(raw)")
     } else { opName = "?" }
     let fname = ctx.rt.atomToString((fb as? JeffJSFunctionBytecodeCompiled)?.funcNameAtom ?? 0) ?? "<anon>"
-    FileHandle.standardError.write("[JeffJS] VM stack underflow: op=\(opName) pc=\(pc) sp=\(sp) spBase=\(spBase) in \(fname)\n".data(using: .utf8)!)
+    if ProcessInfo.processInfo.environment["JEFFJS_UNDERFLOW_DUMP"] != nil,
+       let c = fb as? JeffJSFunctionBytecodeCompiled {
+        FileHandle.standardError.write(JeffJSCompiler.dumpFunctionBytecode(fb: c).data(using: .utf8)!)
+        if let src = c.debugSourceStr {
+            FileHandle.standardError.write("SOURCE: \(src.prefix(400))\n".data(using: .utf8)!)
+        }
+    }
+    var where_ = ""
+    if let c = fb as? JeffJSFunctionBytecodeCompiled, !c.debugPc2lineBuf.isEmpty {
+        where_ = " line=\(c.lineForPC(pc))"
+    }
+    FileHandle.standardError.write("[JeffJS] VM stack underflow: op=\(opName) pc=\(pc) sp=\(sp) spBase=\(spBase) in \(fname)\(where_)\n".data(using: .utf8)!)
 }
 
 /// Branch-condition fast path: comparison opcodes push exact JS_TRUE/JS_FALSE
@@ -296,13 +335,21 @@ extension JeffJSContext {
             else { desc = toSwiftString(funcVal) ?? "\(funcVal.tag)" }
             // Build context hint from current stack frame
             var hint = ""
-            if let frame = self.currentFrame,
-               let curFn = frame.curFunc.toObject(),
-               case .bytecodeFunc(let fbOpt, _, _) = curFn.payload,
-               let fb = fbOpt {
-                let fname = fb.fileName?.toSwiftString() ?? "?"
-                hint = " at \(fname):\(fb.lineNum) pc=\(frame.curPC)"
+            var f: JeffJSStackFrame? = self.currentFrame
+            var depth = 0
+            while let frame = f, depth < 4 {
+                if let curFn = frame.curFunc.toObject(), let fb = curFn.fbFast {
+                    let fname = fb.fileName?.toSwiftString() ?? "?"
+                    let line = (fb as? JeffJSFunctionBytecodeCompiled).map {
+                        $0.debugPc2lineBuf.isEmpty ? fb.lineNum : $0.lineForPC(frame.curPC)
+                    } ?? fb.lineNum
+                    hint += depth == 0 ? " at \(fname):\(line) pc=\(frame.curPC)"
+                                       : " <- \(fname):\(line)"
+                    depth += 1
+                }
+                f = frame.prevFrame
             }
+            jeffJS_dumpLastOps(self)
             return throwTypeError(message: "\(desc) is not a function\(hint)")
         }
         // Hot path: plain bytecode function — skip the payload-enum matches
@@ -6203,6 +6250,10 @@ struct JeffJSInterpreter {
             // iterator (next/throw forwarded from the outer generator's
             // caller); handled uniformly after the switch.
             var delegatedResult: JeffJSValue? = nil
+            // The delegated result came from the inner iterator's return():
+            // if it reports done, the OUTER generator performs a return
+            // completion too (is_return = true after yield_star).
+            var delegatedFromReturn = false
             switch resumeCompletionType {
             case 1:
                 if fb.isGenerator && !fb.isAsyncFunc && !saved.isInitialYield &&
@@ -6219,34 +6270,29 @@ struct JeffJSInterpreter {
                     // run there), then resume the outer generator with
                     // [value, true] so its own finally blocks run too.
                     let iter = saved.delegatedIter
-                    var doneValue = resumeValue
-                    var failed = false
                     let retM = ctx.getProperty(obj: iter, atom: ctx.iterReturnAtom)
                     if retM.isException {
-                        failed = true
+                        iter.freeValue()
+                        retVal = .exception   // dispatch loop runs the generator's handlers
                     } else if retM.isFunction {
                         let res = ctx.callFunction(retM, thisVal: iter, args: [resumeValue])
                         retM.freeValue()
                         if res.isException {
-                            failed = true
-                        } else if !res.isObject {
-                            _ = ctx.throwTypeError(message: "iterator result is not an object")
-                            failed = true
+                            iter.freeValue()
+                            retVal = .exception
                         } else {
-                            // (If the inner return() reports done:false the spec
-                            // re-yields its value; that pathological case is
-                            // treated as done here.)
-                            doneValue = ctx.iteratorGetValue(result: res)
-                            res.freeValue()
+                            // Handled below exactly like next()/throw(): a
+                            // result with done:false re-yields its value and
+                            // keeps the delegation alive (spec 27.5.3.7 7.c).
+                            delegatedResult = res
+                            delegatedFromReturn = true
                         }
                     } else {
+                        // No inner return(): the delegation ends here and the
+                        // outer generator performs its own return completion.
                         retM.freeValue()
-                    }
-                    iter.freeValue()   // the delegation is over either way
-                    if failed {
-                        retVal = .exception   // dispatch loop runs the generator's handlers
-                    } else {
-                        buf[sp] = doneValue; sp += 1
+                        iter.freeValue()
+                        buf[sp] = resumeValue.dupValue(); sp += 1
                         buf[sp] = .newBool(true); sp += 1
                         pc += 1   // saved.pc points at the yield_star opcode: skip it
                     }
@@ -6340,7 +6386,8 @@ struct JeffJSInterpreter {
                         iter.freeValue()   // the delegation is over
                         buf[sp] = value; sp += 1
                         if fb.isGenerator && !fb.isAsyncFunc {
-                            buf[sp] = .newBool(false); sp += 1   // is_return flag for the check after yield_star
+                            // is_return flag for the check after yield_star
+                            buf[sp] = .newBool(delegatedFromReturn); sp += 1
                         }
                         pc += 1  // skip past yield_star
                     } else {
@@ -6403,14 +6450,14 @@ struct JeffJSInterpreter {
         // Fast-trace entry at activation start (and at catch handlers after an
         // exception): the trace is the primary interpreter; this loop is the
         // fallback for whatever it cannot run.
-        if !retVal.isException, resumeState == nil, fb.traceLean, pc < bcLen {
+        if !retVal.isException, resumeState == nil, fb.traceLean, pc < bcLen, !jeffJSNoTrace {
             let r = executeFastTraceLean(bc: bc, bcLen: bcLen, entryPC: 0, exitPC: bcLen, startPC: pc,
                                          buf: buf, varBase: varBase, sp: &sp, ctx: ctx, cpool: fb.cpool,
                                          stackLimit: bufCapacity, icEntries: fb.icEntries)
             if r == -1 { retVal = .exception } else { pc = r }
         }
         if !retVal.isException, resumeState == nil, fb.traceEntryEnabled, !fb.traceLean,
-           !fb.isGenerator, !fb.isAsyncFunc, pc < bcLen {
+           !fb.isGenerator, !fb.isAsyncFunc, pc < bcLen, !jeffJSNoTrace {
             let fbIdBefore = ObjectIdentifier(fb)
             var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
             let resumePC = executeFastTrace(state: &hot, startPC: pc, ctx: ctx, rt: rt, inlineBase: inlineBase)
@@ -6453,6 +6500,7 @@ struct JeffJSInterpreter {
             opcodeCount += 1
             #endif
 
+            if jeffJSTraceLast { jeffJS_recordLastOp(fb, pc, bc[pc], sp - spBase) }
             if traceOps {
                 var extra = ""
                 if op == .put_loc || op == .put_loc0 || op == .put_loc1 || op == .put_loc2 || op == .put_loc3
@@ -9586,9 +9634,15 @@ struct JeffJSInterpreter {
                     break dispatchLoop
                 }
                 let nextMethod = ctx.getProperty(obj: iter, atom: ctx.iterNextAtom)
+                // Middle slot: a catch-offset sentinel of 0 (QuickJS
+                // JS_NewCatchOffset(0)). It marks the three slots as an
+                // iterator record so the exception unwinder can call the
+                // iterator's return() when the loop body throws; a real catch
+                // handler never sits at pc 0.
                 buf[sp] = iter; sp += 1
-                buf[sp] = obj; sp += 1
+                buf[sp] = .newCatchOffset(0); sp += 1
                 buf[sp] = nextMethod; sp += 1
+                obj.freeValue()
                 pc += 1
 
             case .for_await_of_start:
@@ -9602,8 +9656,9 @@ struct JeffJSInterpreter {
                 }
                 let nextMethod = ctx.getProperty(obj: iter, atom: ctx.iterNextAtom)
                 buf[sp] = iter; sp += 1
-                buf[sp] = obj; sp += 1
+                buf[sp] = .newCatchOffset(0); sp += 1   // iterator-record marker
                 buf[sp] = nextMethod; sp += 1
+                obj.freeValue()
                 pc += 1
 
             case .for_in_next:
@@ -11114,6 +11169,18 @@ struct JeffJSInterpreter {
                 let entry = buf[sp]
                 if entry.isCatchOffset {
                     let catchAddr = Int(entry.toInt32())
+                    if catchAddr == 0 {
+                        // Iterator record left by for_of_start: [iter, marker,
+                        // method]. The method above it has already been freed;
+                        // close the iterator and keep unwinding.
+                        if sp > spBase {
+                            sp -= 1
+                            let iterVal = buf[sp]
+                            jeffJS_closeIteratorForUnwind(ctx, iterVal)
+                            iterVal.freeValue()
+                        }
+                        continue
+                    }
                     let excVal = ctx.getException()
                     buf[sp] = excVal; sp += 1
                     pc = catchAddr
@@ -11162,6 +11229,18 @@ struct JeffJSInterpreter {
                         let entry = buf[sp]
                         if entry.isCatchOffset {
                             let catchAddr = Int(entry.toInt32())
+                            if catchAddr == 0 {
+                                // Iterator record left by for_of_start: [iter, marker,
+                                // method]. The method above it has already been freed;
+                                // close the iterator and keep unwinding.
+                                if sp > spBase {
+                                    sp -= 1
+                                    let iterVal = buf[sp]
+                                    jeffJS_closeIteratorForUnwind(ctx, iterVal)
+                                    iterVal.freeValue()
+                                }
+                                continue
+                            }
                             let excVal = ctx.getException()
                             buf[sp] = excVal; sp += 1
                             pc = catchAddr
@@ -11290,6 +11369,19 @@ struct JeffJSInterpreter {
 /// inside callInternal would capture `frame`/`buf`/`varBase` by reference and
 /// pin those hot locals to memory.
 @inline(never)
+/// Close an iterator record found while unwinding an exception. The pending
+/// exception is preserved across `return()` (which may itself throw; QuickJS
+/// swallows that error, as the spec requires for a throw completion).
+private func jeffJS_closeIteratorForUnwind(_ ctx: JeffJSContext, _ iter: JeffJSValue) {
+    guard iter.isObject else { return }
+    let rt = ctx.rt
+    let pending = rt.currentException
+    rt.currentException = .null
+    ctx.iteratorClose(iter: iter, isThrow: true)
+    if !rt.currentException.isNull { rt.currentException.freeValue() }
+    rt.currentException = pending
+}
+
 private func jeffJS_syncBufToFrame(_ frame: JeffJSStackFrame, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {
     // The frame arrays are materialised lazily: the call paths no
     // longer fill argBuf/varBuf per call (that array churn dominated
