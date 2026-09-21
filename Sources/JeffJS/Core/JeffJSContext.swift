@@ -1164,17 +1164,30 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 jsObj.setPropEntry(at: idx, .value(.undefined))
             }
 
-            // Update the value slot
+            // Update the value slot. Whatever the slot already held is a
+            // counted reference (a data value, or the getter/setter pair that
+            // was dup'd when the accessor was installed) and `setPropEntry`
+            // overwrites it in place, so capture it first and release it once
+            // the replacement is installed. Redefining a property used to leak
+            // the old one outright: `class C {}` leaked its constructor and two
+            // objects per evaluation, because installing `C.prototype` first
+            // materialised the lazy `prototype` — whose `constructor` back-ref
+            // then pinned the class forever.
             if idx < jsObj.propValues.count {
+                var oldData = JeffJSValue.undefined
+                var oldGetter: JeffJSObject? = nil
+                var oldSetter: JeffJSObject? = nil
+                if let e = jsObj.extra(at: idx) {
+                    if e.kind == .getset { oldGetter = e.getter; oldSetter = e.setter }
+                    // .varRef is handled above; .autoInit owns no counted value.
+                } else {
+                    oldData = jsObj.propValues[idx]
+                }
                 if (flags & JS_PROP_TMASK) == JS_PROP_GETSET {
                     // Merge getter/setter: when defining only the getter or only the
                     // setter on an existing accessor, keep the other half intact.
-                    var existingGetter: JeffJSObject? = nil
-                    var existingSetter: JeffJSObject? = nil
-                    if case .getset(let eg, let es) = jsObj.propEntry(at: idx) {
-                        existingGetter = eg
-                        existingSetter = es
-                    }
+                    let existingGetter = oldGetter
+                    let existingSetter = oldSetter
                     let newGetter: JeffJSObject?
                     let newSetter: JeffJSObject?
                     if (flags & JS_PROP_HAS_GET) != 0 {
@@ -1182,12 +1195,14 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                         newGetter = getter.toObject()
                     } else {
                         newGetter = existingGetter
+                        oldGetter = nil   // carried over, not replaced
                     }
                     if (flags & JS_PROP_HAS_SET) != 0 {
                         if !setter.isUndefined { _ = setter.dupValue() }
                         newSetter = setter.toObject()
                     } else {
                         newSetter = existingSetter
+                        oldSetter = nil   // carried over, not replaced
                     }
                     jsObj.setPropEntry(at: idx, .getset(getter: newGetter, setter: newSetter))
                 } else if (flags & JS_PROP_DEFINE_PROPERTY) != 0,
@@ -1196,6 +1211,8 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                     // the existing value survives.
                     if case .getset = jsObj.propEntry(at: idx) {
                         jsObj.setPropEntry(at: idx, .value(.undefined))
+                    } else {
+                        oldData = .undefined   // untouched, still the slot's
                     }
                 } else {
                     jsObj.setPropEntry(at: idx, .value(value.dupValue()))
@@ -1205,6 +1222,11 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                     prepareShapeUpdate(self, jsObj)
                     if let s = jsObj.shape, idx < s.prop.count { s.prop[idx].flags = propFlags }
                 }
+                // Last: a cascading free must not run while the slot or the
+                // shape is half-updated.
+                oldData.freeValue()
+                if let g = oldGetter { JeffJSValue.borrowedObject(g).freeValue() }
+                if let st = oldSetter { JeffJSValue.borrowedObject(st).freeValue() }
             }
             return 1
         }

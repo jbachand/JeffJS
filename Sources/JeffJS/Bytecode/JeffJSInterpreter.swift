@@ -4022,6 +4022,7 @@ private func executeFastTrace(
         case .lnot:
             let val = buf[sp - 1]
             buf[sp - 1] = jeffJS_fastToBool(val) ? .JS_FALSE : .JS_TRUE
+            val.freeValue()   // the operand was the stack's; `!obj` is not free
             pc += 1
 
         case .typeof_:
@@ -4035,7 +4036,9 @@ private func executeFastTrace(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI32(bc, pc + 1))
-            if !jeffJS_fastToBool(cond) {
+            let branchTaken = !jeffJS_fastToBool(cond)
+            cond.freeValue()   // popped: an object condition is a reference
+            if branchTaken {
                 let target = pc + 5 + offset
                 if target < 0 || target >= bcLen {
                     resume = target; break traceLoop // loop exit
@@ -4057,7 +4060,9 @@ private func executeFastTrace(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI32(bc, pc + 1))
-            if jeffJS_fastToBool(cond) {
+            let branchTaken = jeffJS_fastToBool(cond)
+            cond.freeValue()   // popped: an object condition is a reference
+            if branchTaken {
                 let target = pc + 5 + offset
                 if target < 0 || target >= bcLen {
                     resume = target; break traceLoop // loop exit
@@ -4079,7 +4084,9 @@ private func executeFastTrace(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI8(bc, pc + 1))
-            if !jeffJS_fastToBool(cond) {
+            let branchTaken = !jeffJS_fastToBool(cond)
+            cond.freeValue()   // popped: an object condition is a reference
+            if branchTaken {
                 let target = pc + 2 + offset
                 if target < 0 || target >= bcLen {
                     resume = target; break traceLoop
@@ -4134,7 +4141,9 @@ private func executeFastTrace(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI8(bc, pc + 1))
-            if jeffJS_fastToBool(cond) {
+            let branchTaken = jeffJS_fastToBool(cond)
+            cond.freeValue()   // popped: an object condition is a reference
+            if branchTaken {
                 let target = pc + 2 + offset
                 if target < 0 || target >= bcLen {
                     resume = target; break traceLoop
@@ -5292,6 +5301,7 @@ private func executeFastTraceLean(
         case .lnot:
             let val = buf[sp - 1]
             buf[sp - 1] = jeffJS_fastToBool(val) ? .JS_FALSE : .JS_TRUE
+            val.freeValue()   // the operand was the stack's; `!obj` is not free
             pc += 1
 
         case .typeof_:
@@ -5305,7 +5315,9 @@ private func executeFastTraceLean(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI32(bc, pc + 1))
-            if !jeffJS_fastToBool(cond) {
+            let branchTaken = !jeffJS_fastToBool(cond)
+            cond.freeValue()   // popped: an object condition is a reference
+            if branchTaken {
                 let target = pc + 5 + offset
                 if target < entryPC || target >= exitPC {
                     ctx.interruptCounter = interrupt; return target // loop exit
@@ -5328,7 +5340,9 @@ private func executeFastTraceLean(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI32(bc, pc + 1))
-            if jeffJS_fastToBool(cond) {
+            let branchTaken = jeffJS_fastToBool(cond)
+            cond.freeValue()   // popped: an object condition is a reference
+            if branchTaken {
                 let target = pc + 5 + offset
                 if target < entryPC || target >= exitPC {
                     ctx.interruptCounter = interrupt; return target // loop exit
@@ -5351,7 +5365,9 @@ private func executeFastTraceLean(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI8(bc, pc + 1))
-            if !jeffJS_fastToBool(cond) {
+            let branchTaken = !jeffJS_fastToBool(cond)
+            cond.freeValue()   // popped: an object condition is a reference
+            if branchTaken {
                 let target = pc + 2 + offset
                 if target < entryPC || target >= exitPC {
                     ctx.interruptCounter = interrupt; return target
@@ -5408,7 +5424,9 @@ private func executeFastTraceLean(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI8(bc, pc + 1))
-            if jeffJS_fastToBool(cond) {
+            let branchTaken = jeffJS_fastToBool(cond)
+            cond.freeValue()   // popped: an object condition is a reference
+            if branchTaken {
                 let target = pc + 2 + offset
                 if target < entryPC || target >= exitPC {
                     ctx.interruptCounter = interrupt; return target
@@ -7601,7 +7619,16 @@ struct JeffJSInterpreter {
                     if newCount > 0 {
                         // Update the length property in-place (prop[0] == "length").
                         arrObj.asClass.setPropEntry(at: 0, .value(.newInt32(Int32(newCount))))
-                        // Pop arg, funcVal, thisObj; push new length
+                        // Pop arg, funcVal, thisObj; push new length. The
+                        // element's reference moved into the array, but the
+                        // callee and the receiver are still the stack's to
+                        // release — the trace interpreter's copy of this fast
+                        // path does it and this one did not, so every
+                        // `arr.push(<temporary>)` added a reference to the
+                        // array itself. The array then outlived the runtime
+                        // and took every element it held with it.
+                        buf[sp - 2].freeValue()   // Array.prototype.push
+                        buf[sp - 3].freeValue()   // the array
                         sp -= 3
                         buf[sp] = .newInt32(Int32(newCount)); sp += 1
                         pc += 3
@@ -8571,9 +8598,10 @@ struct JeffJSInterpreter {
                             }
                         }
                     }
-                    // Fallback: just resolve push function quickly
-                    let pushVal = JeffJSValue.makeObject(ctx.arrayProtoPushObj!)
-                    buf[sp] = pushVal.dupValue(); sp += 1
+                    // Fallback: just resolve push function quickly. Borrowed,
+                    // not `makeObject`: that takes an ARC retain the refcount
+                    // knows nothing about and nobody ever gives back.
+                    buf[sp] = JeffJSValue.borrowedObject(ctx.arrayProtoPushObj!).dupValue(); sp += 1
                     pc += 5
                     continue dispatchLoop
                 }
@@ -8946,6 +8974,13 @@ struct JeffJSInterpreter {
                 ctx.setHomeObject(funcVal: funcVal, homeObj: obj)
                 let ok = ctx.defineMethod(obj: obj, atom: atom, funcVal: funcVal,
                                            flags: methodFlags)
+                // `defineProperty` dups what it stores (value and getter/setter
+                // alike); the pop above handed us the stack's reference, so the
+                // method function is ours to release. Without this every object
+                // literal method, getter and setter — and every class body
+                // member, which compiles to the same opcode — pinned its
+                // function for the life of the runtime.
+                funcVal.freeValue()
                 if !ok {
                     retVal = .exception
                     break dispatchLoop
@@ -8960,6 +8995,11 @@ struct JeffJSInterpreter {
                 ctx.setHomeObject(funcVal: funcVal, homeObj: obj)
                 let ok = ctx.defineMethodComputed(obj: obj, key: key, funcVal: funcVal,
                                                    flags: methodFlags)
+                // Both operands were popped, so both are ours: the key is only
+                // read to intern an atom and the function is dup'd by
+                // `defineProperty`.
+                funcVal.freeValue()
+                key.freeValue()
                 if !ok {
                     retVal = .exception
                     break dispatchLoop

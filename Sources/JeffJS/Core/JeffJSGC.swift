@@ -878,14 +878,30 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     obj.arrowThisVal = nil
 
     // Release each property value. Data values are manually refcounted;
-    // getset/autoInit refs are released by ARC when `savedExtra` drops at the
-    // end of scope; a detached varRef's captured value is freed explicitly.
+    // an accessor's getter/setter are too (`defineProperty` dups them, and
+    // `markObject` marks them as counted edges) even though the slot stores
+    // them as ARC references; a detached varRef's captured value is freed
+    // explicitly; autoInit refs are ARC-only.
     for i in 0..<savedValues.count {
         // propExtra is lazily allocated: empty means every slot is plain data.
         if i < savedExtra.count, let e = savedExtra[i] {
-            if e.kind == .varRef, let vr = e.varRef, vr.isDetached {
-                freeValue(rt, vr.value)
-                vr.value = .undefined
+            switch e.kind {
+            case .varRef:
+                if let vr = e.varRef, vr.isDetached {
+                    freeValue(rt, vr.value)
+                    vr.value = .undefined
+                }
+            case .getset:
+                // Dropping only the ARC reference left the manual count one
+                // too high, so every object literal getter/setter (and every
+                // accessor installed through Object.defineProperty) outlived
+                // the object that owned it.
+                let g = e.getter, st = e.setter
+                e.getter = nil; e.setter = nil
+                if let g { freeValue(rt, .borrowedObject(g)) }
+                if let st { freeValue(rt, .borrowedObject(st)) }
+            case .autoInit:
+                break
             }
         } else {
             freeValue(rt, savedValues[i])
@@ -918,6 +934,11 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     // (taken in typedArrayAdoptBuffer, or inherited from the buffer's own
     // creation reference) — release it here, or every buffer ever viewed
     // outlives the runtime.
+    // A Map/Set/WeakMap/WeakSet owns a counted reference to every key and
+    // value it stores (see `jeffJS_mapStateFree`).
+    if case .mapState(let ms) = savedPayload { jeffJS_mapStateFree(ms) }
+    // A promise owns its settled value and every reaction still queued on it.
+    if case .promiseData(let pd) = savedPayload { jeffJS_promiseDataFree(pd) }
     if case .typedArray(let ta) = savedPayload, let buf = ta.buffer {
         ta.buffer = nil
         if buf.refCount > 0 {

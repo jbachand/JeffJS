@@ -847,3 +847,107 @@ Found, not fixed:
   ~30%: the collector rescans a heap the leak keeps large.
 - **Rest parameters leak too** (`function f(a, ...rest)`: ~5 objects per call
   retained), same shape of bug.
+
+## Round 11 — eight refcount leaks (memory)
+
+Round 10 left two "found, not fixed" entries and guessed at their cause. Both
+guesses were wrong, and looking for them turned up six more. Every one is the
+same mistake in a different place: a reference was taken and never given back,
+so the object stayed on the GC list forever and the cycle collector — which
+sees an unaccounted count as an external root — dutifully reported it as
+reachable. That is why the collector "agreed they were reachable": it was
+right, and the extra reference was the bug.
+
+The method used was a 20 000-iteration allocate-and-drop loop per shape with
+`__gc()` and `__gcStats().liveObjects` on either side; a leak is a delta that
+scales with the iteration count. `JEFFJS_TRACK_RC=1`'s per-class breakdown
+then says *which* object, and its average refcount says how many counts too
+many. `Tests/JeffJSTests/RefcountLeakTests.swift` is that loop as a test.
+
+- **`if (obj)` was the expensive one, not `arr.push(obj)`.** Neither trace
+  interpreter released the condition `if_false` / `if_true` / their 8-bit
+  forms / `lnot` pop off the stack (the main dispatch loop always did). An
+  `i < n` loop test is a bool and costs nothing; `if (node)`, `if (!a || !b)`
+  and `!o` on an object each added a permanent reference to that object. A
+  100-pass build-and-diff of a 5 000-node `createElement` tree ended with
+  **2 478 690 live objects and 880 MB RSS — a whole tree leaked per pass, by
+  the `if (!a || !b)` in `diff`** — and now ends with 28 098 (the one tree
+  still referenced) and 41 MB.
+- **The push fast path kept the array, not the element.** The main loop's
+  `arr.push(x)` fast path popped three slots and released none; the element's
+  reference legitimately moves into the array, but the callee and the receiver
+  were the stack's. So the *array* became immortal and took everything in it
+  with it. `arr.push(localVar)` was fine — that shape takes the fused
+  get_field+push path, which does release the receiver — which is why Round 10
+  read the leak as being about what was pushed.
+- **`define_method` never released the function it stored.** `defineProperty`
+  dups what it installs, so the popped function was the opcode's to release.
+  Every object-literal method, getter and setter, and every class-body member,
+  pinned its function; the function's `homeObject` back-reference then pinned
+  the literal.
+- **An accessor's getter and setter are counted edges.** `markObject` already
+  marked them as such, but `freeObject` dropped only the property slot's ARC
+  reference. Two hand-rolled prototype getters (TypedArray, Function) build
+  their function with a bare `JeffJSObject()` and needed the ARC retain
+  `makeObject` would have taken.
+- **Redefining a property dropped the old value on the floor.**
+  `setPropEntry` stores in place and releases nothing. `class C {}` hit it
+  through the lazy `prototype`: installing `C.prototype` first materialises
+  the constructor's own, and that orphaned object's `constructor` back-
+  reference held the class forever — five objects per class evaluation.
+- **`Object.defineProperty` never released the descriptor it read.** Every
+  `getPropertyStr` in `definePropertyFromDescriptor` hands back a reference
+  the function owns; none of `value` / `get` / `set` / `configurable` /
+  `enumerable` / `writable` were released. `Object.defineProperties` dropped
+  every (key, descriptor) pair it collected, and `__defineGetter__` /
+  `__defineSetter__` leaked the key and the throwaway descriptor.
+- **A dead Map/Set/WeakMap/WeakSet kept every key and value.**
+  `mapStateInsert` dups both and `clear()`/`delete()` release them, but
+  nothing did when the collection itself died.
+- **Promise reactions were never released.** `.then(f)` builds a fulfill *and*
+  a reject reaction; whichever one can no longer run was dropped without
+  release, the reaction job released neither what it captured nor its dup of
+  the settlement value, and a promise that died still pending took its queued
+  reactions with it.
+
+**Rest parameters do not leak** — `function f(a, ...rest)` in a 200k loop is
+flat on the Round 10 tip. Round 10's reading of that measurement was the
+`if (!x)` in the test harness, not the `rest` opcode.
+
+**Cost.** bench/realworld.js geomean 1.025x of the same-worktree base, best
+of five alternating runs; `vdom-build-diff` 1.010x. Exactly two kernels are
+more than 4% slower, `closure-creation` (1.64x) and `tree-walk` (1.32x), and
+without those two the geomean is 1.005x. Both are deallocation the leaks were
+skipping, not new overhead:
+
+- `closure-creation` is 1.64x when its 100 000 closures are dropped at the end
+  of the kernel and **1.00x when the identical array is kept alive in a
+  global** — same allocation, same calls, minus the teardown.
+- `tree-walk` splits into build 27 -> 29 ms and walk 25 -> 24 ms; the whole
+  56 -> 70 ms is freeing the previous pass's 65 538-object tree, which the tip
+  leaked (and its RSS is 109 -> 53 MB).
+- The condition release itself is ~1% on a 20M-iteration bool-condition loop
+  and ~7% on an artificial 5M-iteration `if (obj)` loop that does nothing else.
+
+What the leaks were costing, per kernel run: `vdom-build-diff` +118 772 live
+objects (now +5), RSS 124 -> 49 MB; `tree-walk` +65 538 (now +5), RSS
+109 -> 53 MB. The 100-pass re-render microbenchmark is 2308 -> 2434 ms for
+2 478 690 -> 28 098 live objects and 880 -> 41 MB RSS. Per-object free is
+~300 ns, which is now the thing worth optimising: with nothing leaking, the
+suite spends real time in `freeObject`.
+
+Found, not fixed:
+- **`obj.proto` is dup'd but never released.** `newObjectProto`,
+  `Object.create` and `setPrototypeOf` give the prototype a JS retain
+  (Round 9), `freeObject` deliberately does not release `obj.proto` and
+  `markObject` deliberately does not mark it (Round 10) — so every object
+  created with an explicit prototype pins it forever. It is O(1) per
+  prototype, not per instance, so a React app pays it once per class; it
+  shows up as 2 objects per iteration only when the constructor itself is
+  created in the loop. Fixing it means making `obj.proto` a fully counted
+  edge, which is an audit of ~25 assignment sites where a missing dup is an
+  over-free, so it is its own change.
+- `Object.getOwnPropertyDescriptor(o, "g").get.name` is `"g"`; qjs says
+  `"get g"`. Pre-existing.
+- `({}).__defineGetter__` is not installed on `Object.prototype` (the builtin
+  exists, the property does not), so the call throws. Pre-existing.

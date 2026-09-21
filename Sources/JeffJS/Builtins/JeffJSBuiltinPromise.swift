@@ -47,6 +47,31 @@ struct JeffJSPromiseReaction {
         self.resultPromise = resultPromise
         self.isFulfill = isFulfill
     }
+
+    /// A reaction owns its handler and its result promise from the moment
+    /// `performPromiseThen` builds it. Exactly one of three things happens to
+    /// it: the reaction job consumes it, the promise settles the other way and
+    /// drops it, or the promise dies still pending. All three release here.
+    func release() {
+        handler.freeValue()
+        resultPromise.freeValue()
+    }
+}
+
+/// Release everything a promise still owns, for `freeObject`: its settled
+/// value and any reaction queued on a promise that dies still pending.
+/// `new Promise(function () {}).then(f)` used to pin `f` and the derived
+/// promise for the life of the runtime.
+func jeffJS_promiseDataFree(_ d: JeffJSPromiseData) {
+    let fulfill = d.promiseFulfillReactions
+    let reject = d.promiseRejectReactions
+    let result = d.promiseResult
+    d.promiseFulfillReactions = []
+    d.promiseRejectReactions = []
+    d.promiseResult = .undefined
+    for r in fulfill { r.release() }
+    for r in reject { r.release() }
+    result.freeValue()
 }
 
 // MARK: - Promise Data
@@ -933,6 +958,7 @@ struct JeffJSBuiltinPromise {
             promiseData.isHandled = true
             enqueueReactionJob(ctx: ctx, reaction: fulfillReaction,
                                argument: promiseData.promiseResult)
+            rejectReaction.release()   // settled the other way: never runs
 
         case .rejected:
             // Already rejected — enqueue a microtask for the reject reaction
@@ -944,6 +970,7 @@ struct JeffJSBuiltinPromise {
             promiseData.isHandled = true
             enqueueReactionJob(ctx: ctx, reaction: rejectReaction,
                                argument: promiseData.promiseResult)
+            fulfillReaction.release()  // settled the other way: never runs
         }
 
         return JeffJSValue.undefined
@@ -1009,11 +1036,14 @@ struct JeffJSBuiltinPromise {
         // Save the reactions before clearing
         let reactions = promiseData.promiseFulfillReactions
 
-        // Transition state
+        // Transition state. The reject list can never run now, so it is
+        // released rather than merely dropped.
+        let discarded = promiseData.promiseRejectReactions
         promiseData.promiseState = .fulfilled
         promiseData.promiseResult = value.dupValue()
         promiseData.promiseFulfillReactions = []
         promiseData.promiseRejectReactions = []
+        for r in discarded { r.release() }
 
         // Trigger reactions
         triggerPromiseReactions(ctx: ctx, reactions: reactions, argument: value)
@@ -1033,10 +1063,12 @@ struct JeffJSBuiltinPromise {
 
         let reactions = promiseData.promiseRejectReactions
 
+        let discarded = promiseData.promiseFulfillReactions
         promiseData.promiseState = .rejected
         promiseData.promiseResult = reason.dupValue()
         promiseData.promiseFulfillReactions = []
         promiseData.promiseRejectReactions = []
+        for r in discarded { r.release() }
 
         // Track unhandled rejection
         if !promiseData.isHandled {
@@ -1167,6 +1199,8 @@ struct JeffJSBuiltinPromise {
                 nativeArg.freeValue()
                 return JeffJSValue.undefined
             }, args: [])
+            reaction.release()   // an await continuation carries neither, but
+                                 // the reaction still owns whatever it holds
             return
         }
 
@@ -1207,6 +1241,11 @@ struct JeffJSBuiltinPromise {
             }
 
             jobCtx.freeValue(handlerResult)
+            // The job took over the reaction's references (and dup'd the
+            // settlement value for itself); nothing else will release them.
+            handler.freeValue()
+            resultPromise.freeValue()
+            argDup.freeValue()
             return JeffJSValue.undefined
         }, args: [])
     }

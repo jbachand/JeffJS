@@ -252,6 +252,34 @@ private func mapStateClear(_ s: JeffJSMapState) {
     s.recordListSentinel.initSentinel()
 }
 
+/// Release everything a Map/Set/WeakMap/WeakSet still holds, for `freeObject`.
+/// The `JeffJSMapState` itself is an ARC class that the payload drops on its
+/// own, but each record's key and value are manually refcounted
+/// (`mapStateInsert` dups both), and nothing released them when the collection
+/// died: `new Map().set(k, o)` in a loop pinned every `o` for the life of the
+/// runtime, even though `map.clear()` on a surviving map freed the same
+/// records. The table is emptied before anything is released so a cascading
+/// free that re-enters the map sees a consistent, empty state.
+func jeffJS_mapStateFree(_ s: JeffJSMapState) {
+    guard !s.records.isEmpty else { return }
+    var pending: [JeffJSValue] = []
+    pending.reserveCapacity(s.count * 2)
+    for rec in s.records where !rec.empty {
+        pending.append(rec.key)
+        pending.append(rec.value)
+        rec.key = .undefined
+        rec.value = .undefined
+        rec.empty = true
+        rec.link.remove()
+    }
+    s.records.removeAll()
+    s.hashTable = [Int](repeating: -1, count: JS_MAP_INITIAL_HASH_SIZE)
+    s.hashSize = JS_MAP_INITIAL_HASH_SIZE
+    s.count = 0
+    s.recordListSentinel.initSentinel()
+    for v in pending { v.freeValue() }
+}
+
 // MARK: - Get Map State from JS Object
 
 /// Extract the JeffJSMapState payload from a value, verifying correct class ID.
