@@ -220,6 +220,8 @@ public final class JeffJSEnvironment {
         // 11. Register fetch bridge
         let fetchBridge = JeffJSFetchBridge(userAgent: configuration.userAgent)
         fetchBridge.baseURL = configuration.baseURL
+        // Cookie jar for credentials: "same-origin"/"include".
+        fetchBridge.storageBridge = storageBridge
         fetchBridge.onConsoleLog = { [weak self] level, message in
             self?.onConsoleMessage?(level, message)
         }

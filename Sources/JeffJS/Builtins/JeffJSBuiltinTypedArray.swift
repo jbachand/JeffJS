@@ -621,7 +621,9 @@ func jsTypedArray_at(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Jeff
 func jsTypedArray_buffer(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
     guard let obj = thisVal.toObject() else { return .undefined }
     if case .typedArray(let ta) = obj.payload, let buf = ta.buffer {
-        return .makeObject(buf)
+        // The buffer stays owned by the typed array: hand the caller its own
+        // reference (Round 9 — the caller releases every value it receives).
+        return JeffJSValue.makeObject(buf).dupValue()
     }
     return .undefined
 }
@@ -1194,7 +1196,7 @@ func jsDataView_setFloat16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
 func jsDataView_buffer(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
     guard let obj = thisVal.toObject(), obj.classID == JeffJSClassID.dataView.rawValue,
           case .typedArray(let ta) = obj.payload, let buf = ta.buffer else { return .undefined }
-    return .makeObject(buf)
+    return JeffJSValue.makeObject(buf).dupValue()
 }
 
 func jsDataView_byteLength(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
