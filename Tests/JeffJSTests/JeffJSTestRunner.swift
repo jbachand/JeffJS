@@ -10472,6 +10472,24 @@ extension JeffJSTestRunner {
                      expect: "1|{\"b\":2}")
         evalCheckStr(ctx, "const { ca, ...cr } = { ca: 1, cb: 2 }; ca + '|' + JSON.stringify(cr)",
                      expect: "1|{\"cb\":2}")
+
+        // --- 3. class X extends null ------------------------------------
+        // The heritage used to be read with an unconditional get_field, so
+        // `extends null` threw on null.prototype.
+        evalCheckStr(ctx, "class N1 extends null {}; typeof N1", expect: "function")
+        evalCheckBool(ctx, "class N2 extends null {}; Object.getPrototypeOf(N2.prototype) === null", expect: true)
+        evalCheckBool(ctx, "class N3 extends null {}; Object.getPrototypeOf(N3) === Function.prototype", expect: true)
+        evalCheckBool(ctx, """
+            class N4 extends null { constructor() { return Object.create(N4.prototype); } }
+            new N4() instanceof N4
+            """, expect: true)
+        evalCheckException(ctx, "class N5 extends null {}; new N5()")
+        evalCheckBool(ctx, "var N6 = class extends null {}; Object.getPrototypeOf(N6.prototype) === null", expect: true)
+        // Ordinary heritage is unaffected.
+        evalCheckBool(ctx, """
+            class B1 { m() { return 1; } } class D1 extends B1 {}
+            new D1().m() === 1 && Object.getPrototypeOf(D1) === B1
+            """, expect: true)
     }
 
     mutating func runAPITests() -> String {
