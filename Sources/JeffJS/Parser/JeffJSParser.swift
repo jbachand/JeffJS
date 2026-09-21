@@ -188,6 +188,10 @@ final class JeffJSParser {
     var lastExprWasSuperProp: Bool = false
     /// `obj[key]` was kept as [obj, value] because a call follows: emit call_method.
     var pendingMethodCall: Bool = false
+
+    /// Counter for the synthetic class-scope variables (computed field keys,
+    /// deferred static initializers). Unique per compilation unit.
+    var syntheticClassVarCounter: Int = 0
     /// True while parsing an interpolated expression inside a template literal
     /// (`${...}`).  Prevents `parseCallExpr` from treating the next
     /// TOK_TEMPLATE (produced when the tokenizer hits `}`) as a tagged
@@ -605,6 +609,21 @@ final class JeffJSParser {
         emitU16(UInt16(scopeLevel))
     }
 
+    /// Emit a scope_get_private_field opcode (`obj.#x`). The compiler resolves
+    /// it against the class-scope variable holding the private name.
+    func emitScopeGetPrivateField(_ atom: JSAtom, scopeLevel: Int = -1) {
+        emitOp(.scope_get_private_field)
+        emitAtom(atom)
+        emitU16(UInt16(scopeLevel < 0 ? fd.curScope : scopeLevel))
+    }
+
+    /// Emit a scope_put_private_field opcode (`obj.#x = v`).
+    func emitScopePutPrivateField(_ atom: JSAtom, scopeLevel: Int = -1) {
+        emitOp(.scope_put_private_field)
+        emitAtom(atom)
+        emitU16(UInt16(scopeLevel < 0 ? fd.curScope : scopeLevel))
+    }
+
     // MARK: - Token helpers
 
     /// Returns the string name for a keyword token type.
@@ -684,7 +703,8 @@ final class JeffJSParser {
         var lastGetPos: Int? = nil
         while pos < end {
             guard let op = peekOpcodeAt(pos) else { break }
-            if op == .scope_get_var || op == .get_field || op == .get_array_el {
+            if op == .scope_get_var || op == .get_field || op == .get_array_el ||
+               op == .scope_get_private_field {
                 lastGetOp = op
                 lastGetPos = pos
             }
@@ -706,6 +726,25 @@ final class JeffJSParser {
     /// store-back opcode so the incremented value is written back to the variable.
     /// Without this, `++n` reads n, increments on the stack, but never stores back.
     func emitPrefixUpdateStore(from start: Int, to end: Int) {
+        // ++obj.#x — rewind the read (and the inc/dec that follows it) and
+        // re-emit with the object kept for the store.
+        if let op = peekOpcodeAt(end), op == .inc || op == .dec {
+            let (privOp, privPos) = findLastGetOpcode(from: start, to: end)
+            if privOp == .scope_get_private_field, let pos = privPos {
+                let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
+                let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
+                let scopeLevel = Int(readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4))
+                fd.byteCode.len = pos                        // [obj]
+                emitOp(.dup)                                 // [obj, obj]
+                emitScopeGetPrivateField(atom, scopeLevel: scopeLevel)  // [obj, old]
+                emitOp(op)                                   // [obj, new]
+                emitOp(.dup)                                 // [obj, new, new]
+                emitOp(.perm3)                               // [new, obj, new]
+                emitScopePutPrivateField(atom, scopeLevel: scopeLevel)  // [new]
+                return
+            }
+        }
+
         // Scan the bytecode emitted by the unary expression to find the last GET
         // opcode and emit the matching SET opcode.
         var pos = start
@@ -1117,8 +1156,7 @@ final class JeffJSParser {
         case .superElem:
             emitOp(.put_super_value)
         case .privateField:
-            emitOp(.put_private_field)
-            emitAtom(info.atom)
+            emitScopePutPrivateField(info.atom, scopeLevel: info.scopeLevel)
         }
     }
 
@@ -3047,6 +3085,12 @@ final class JeffJSParser {
             fd.argumentsPrologueScope = fd.curScope
         }
 
+        // A base-class constructor runs the instance field initializers
+        // before its own body (QuickJS emit_class_field_init).
+        if fd.emitFieldInitAtBodyStart {
+            emitClassFieldInit()
+        }
+
         // Mark body start for function declaration hoisting
         fd.bodyBytecodeStart = fd.byteCode.len
 
@@ -3222,359 +3266,6 @@ final class JeffJSParser {
             if depth == 0 && tok == 0x2C { break } // ','
             next()
         }
-    }
-
-    // =========================================================================
-    // MARK: - Class Declaration
-    // =========================================================================
-
-    /// Parse: class Identifier [extends Expression] ClassBody
-    func parseClassDeclaration() {
-        parseClassDef(isExpression: false)
-    }
-
-    /// Parse a class definition (declaration or expression).
-    func parseClassDef(isExpression: Bool) {
-        expect(JSTokenType.TOK_CLASS.rawValue)
-
-        var className: JSAtom = 0
-        if tok == JSTokenType.TOK_IDENT.rawValue {
-            className = s.token.identAtom
-            next()
-        } else if !isExpression {
-            syntaxError("expected class name")
-            return
-        }
-
-        // Heritage clause
-        var hasExtends = false
-        if tok == JSTokenType.TOK_EXTENDS.rawValue {
-            hasExtends = true
-            next()
-            parseAssignExpr() // superclass expression -- pushes it on stack
-        }
-
-        // Class body
-        expect(0x7B) // '{'
-        let scopeIdx = pushScope()
-
-        // Create a default constructor first.  If parseClassBody finds an
-        // explicit constructor it will replace this one on the stack.
-        do {
-            let defaultCtorFd = JeffJSFunctionDefCompiler()
-            defaultCtorFd.parent = fd
-            defaultCtorFd.funcName = className
-            defaultCtorFd.newTargetAllowed = true
-            if hasExtends {
-                defaultCtorFd.isDerivedClassConstructor = true
-                defaultCtorFd.superCallAllowed = true
-            }
-            fd.childFunctions.append(defaultCtorFd)
-
-            let savedFd = fd
-            fd = defaultCtorFd
-            if hasExtends {
-                // constructor(...args) { super(...args); }
-                // `this` is uninitialised until super() returns (QuickJS
-                // semantics): construct the parent with our new.target and
-                // bind the result as `this`.
-                emitOp(.undefined)       // dummy popped by get_super
-                emitOp(.get_super)       // [parentCtor]
-                emitOp(.special_object)
-                emitU8(SpecialObjectType.newTarget.rawValue)   // [parentCtor, newTarget]
-                emitOp(.rest)
-                emitU16(0)               // [parentCtor, newTarget, argsArray]
-                emitOp(.apply_constructor)
-                emitU16(0)               // [result]
-                emitOp(.init_this)       // [this]
-                emitOp(.drop)
-            }
-            emitOp(.return_undef)
-            fd = savedFd
-
-            let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
-            emitFClosure(cpoolIdx)
-        }
-
-        // Build prototype object.
-        // For extends: stack has superclass; build proto with
-        //              proto.__proto__ = superclass.prototype.
-        //              Keep superclass below ctor+proto for later __proto__ setup.
-        // For no extends: build a plain object as proto.
-        if hasExtends {
-            // Stack: ..., superclass, ctorFunc
-            emitOp(.swap)                            // ..., ctorFunc, superclass
-            emitOp(.dup)                             // ..., ctorFunc, superclass, superclass
-            emitGetField(getAtom("prototype"))       // ..., ctorFunc, superclass, superclass.prototype
-            emitOp(.object)                          // ..., ctorFunc, superclass, superclass.prototype, proto
-            emitOp(.swap)                            // ..., ctorFunc, superclass, proto, superclass.prototype
-            emitOp(.set_proto)                       // ..., ctorFunc, superclass, proto
-            //                                          (proto.__proto__ = superclass.prototype)
-            // Move superclass below ctorFunc.
-            emitOp(.rot3l)                           // ..., superclass, proto, ctorFunc
-            emitOp(.swap)                            // ..., superclass, ctorFunc, proto
-        } else {
-            // Stack: ..., ctorFunc
-            emitOp(.object)                          // ..., ctorFunc, proto
-        }
-
-        // Stack (extends): ..., superclass, ctorFunc, proto
-        // Stack (base):    ..., ctorFunc, proto
-        //
-        // parseClassBody always has ctorFunc below proto.  If an explicit
-        // constructor is found, it replaces the default ctorFunc in place.
-        parseClassBody(className: className, hasExtends: hasExtends)
-
-        // Stack (extends): ..., superclass, ctorFunc, proto
-        // Stack (base):    ..., ctorFunc, proto
-
-        // Wire up ctorFunc.prototype = proto
-        emitOp(.dup2)                                // ..., [sc,] ctorFunc, proto, ctorFunc, proto
-        emitPutField(getAtom("prototype"))           // ..., [sc,] ctorFunc, proto   (ctorFunc.prototype = proto)
-
-        // Wire up proto.constructor = ctorFunc
-        emitOp(.dup2)                                // ..., [sc,] ctorFunc, proto, ctorFunc, proto
-        emitOp(.swap)                                // ..., [sc,] ctorFunc, proto, proto, ctorFunc
-        emitPutField(getAtom("constructor"))         // ..., [sc,] ctorFunc, proto   (proto.constructor = ctorFunc)
-
-        // Set the constructor's name
-        if className != 0 {
-            emitOp(.swap)                            // ..., [sc,] proto, ctorFunc
-            emitOp(.set_name)
-            emitAtom(className)                      // ..., [sc,] proto, ctorFunc   (ctorFunc.name = className)
-            emitOp(.swap)                            // ..., [sc,] ctorFunc, proto
-        }
-
-        // Drop proto, keep ctorFunc
-        emitOp(.drop)                                // ..., [sc,] ctorFunc
-
-        if hasExtends {
-            // Set ctorFunc.__proto__ = superclass (for super() and static inheritance)
-            // Stack: ..., superclass, ctorFunc
-            emitOp(.swap)                            // ..., ctorFunc, superclass
-            emitOp(.set_proto)                       // ..., ctorFunc   (ctorFunc.__proto__ = superclass)
-        }
-
-        popScope(scopeIdx)
-        expect(0x7D) // '}'
-
-        if !isExpression && className != 0 {
-            let varIdx = defineVar(className, isConst: true, isLexical: true)
-            emitScopePutVarInit(className, scopeLevel: fd.curScope)
-            _ = varIdx
-        }
-    }
-
-    /// Parse the body of a class (between { }).
-    /// On entry the stack has: ..., [superclass,] ctorFunc, proto.
-    /// ctorFunc is the default constructor created by parseClassDef.
-    /// If an explicit constructor method is found, it replaces ctorFunc.
-    /// On exit the stack is: ..., [superclass,] ctorFunc, proto.
-    @discardableResult
-    func parseClassBody(className: JSAtom, hasExtends: Bool) -> Bool {
-        let constructorAtom = getAtom("constructor")
-        var ctorFound = false
-
-        while tok != 0x7D && tok != JSTokenType.TOK_EOF.rawValue && !shouldAbort {
-            if tok == 0x3B { // ';' -- empty member
-                next()
-                continue
-            }
-
-            var isStatic = false
-            var isComputed = false
-            var isAsync = false
-            var isGenerator = false
-            var propKind: PropertyKind = .method
-
-            // Check for 'static'
-            if tok == JSTokenType.TOK_STATIC.rawValue {
-                isStatic = true
-                next()
-            }
-
-            // Check for 'async' — [no LineTerminator here] between async and method name
-            if isIdent("async") {
-                let nextTok = s.simpleNextToken()
-                if nextTok != 0x28 && nextTok != 0x3D && // not method() or =
-                   nextTok != 0x3B && nextTok != 0x7D {  // not ; or }
-                    let savedBufPtr = s.bufPtr
-                    let savedLineNum = s.lineNum
-                    let savedToken = s.token
-                    let savedGotLF = s.gotLF
-                    let savedLastLineNum = s.lastLineNum
-                    let savedLastPtr = s.lastPtr
-                    let savedTemplateNest = s.templateNestLevel
-                    let savedLastTokenType = s.lastTokenType
-
-                    next() // consume 'async'
-                    if !s.gotLF {
-                        isAsync = true
-                    } else {
-                        // LF between async and method name — backtrack
-                        s.bufPtr = savedBufPtr
-                        s.lineNum = savedLineNum
-                        s.token = savedToken
-                        s.gotLF = savedGotLF
-                        s.lastLineNum = savedLastLineNum
-                        s.lastPtr = savedLastPtr
-                        s.templateNestLevel = savedTemplateNest
-                        s.lastTokenType = savedLastTokenType
-                    }
-                }
-            }
-
-            // Check for generator '*'
-            if tok == 0x2A { // '*'
-                isGenerator = true
-                next()
-            }
-
-            // Check for getter/setter
-            if isIdent("get") && !isGenerator && !isAsync {
-                let nextTok = s.simpleNextToken()
-                if nextTok != 0x28 { // not get()
-                    propKind = .getter
-                    next()
-                }
-            } else if isIdent("set") && !isGenerator && !isAsync {
-                let nextTok = s.simpleNextToken()
-                if nextTok != 0x28 { // not set()
-                    propKind = .setter
-                    next()
-                }
-            }
-
-            // Parse property name
-            var propAtom: JSAtom = 0
-            if tok == 0x5B { // '[' computed property
-                isComputed = true
-                next()
-                parseAssignExpr()
-                expect(0x5D) // ']'
-                emitOp(.to_propkey)
-            } else if tok == JSTokenType.TOK_IDENT.rawValue ||
-                      tok == JSTokenType.TOK_STRING.rawValue {
-                if tok == JSTokenType.TOK_IDENT.rawValue {
-                    propAtom = s.token.identAtom
-                } else {
-                    propAtom = getAtom(s.token.strValue)
-                }
-                next()
-            } else if tok == JSTokenType.TOK_NUMBER.rawValue {
-                propAtom = getAtom(String(format: "%.0f", s.token.numValue))
-                next()
-            } else if tok == JSTokenType.TOK_PRIVATE_NAME.rawValue {
-                propAtom = s.token.identAtom
-                next()
-            } else if isKeywordToken(tok) {
-                // Keywords are valid as method/property names in classes
-                let kwName = keywordTokenName(tok)
-                propAtom = getAtom(kwName)
-                next()
-            } else {
-                syntaxError("expected property name")
-                return ctorFound
-            }
-
-            // Check for field (no parentheses after name)
-            if tok != 0x28 && propKind == .method { // not a method
-                // Class field
-                if tok == 0x3D { // '=' initializer
-                    next()
-                    parseAssignExpr()
-                } else {
-                    emitOp(.undefined)
-                }
-                if isComputed {
-                    emitOp(.define_array_el)
-                } else {
-                    emitDefineField(propAtom)
-                }
-                expectSemicolon()
-                continue
-            }
-
-            // Detect whether this is the class constructor
-            let isConstructor = !isStatic && !isComputed && propAtom == constructorAtom && propKind == .method
-
-            // Parse method
-            expect(0x28) // '('
-
-            let methodFd = JeffJSFunctionDefCompiler()
-            methodFd.parent = fd
-            methodFd.funcName = propAtom
-            if isGenerator {
-                methodFd.funcKind = isAsync
-                    ? JSFunctionKindEnum.JS_FUNC_ASYNC_GENERATOR.rawValue
-                    : JSFunctionKindEnum.JS_FUNC_GENERATOR.rawValue
-            } else if isAsync {
-                methodFd.funcKind = JSFunctionKindEnum.JS_FUNC_ASYNC.rawValue
-            }
-            if isConstructor {
-                methodFd.newTargetAllowed = true
-                methodFd.funcName = className
-                if hasExtends {
-                    methodFd.isDerivedClassConstructor = true
-                    methodFd.superCallAllowed = true
-                }
-            }
-            fd.childFunctions.append(methodFd)
-
-            let (mDefaults, mRest, mDstructs) = parseFormalParameters(childFd: methodFd)
-            expect(0x29) // ')'
-            expect(0x7B) // '{'
-            parseFunctionBody(childFd: methodFd, defaults: mDefaults, rest: mRest, destructs: mDstructs)
-            expect(0x7D) // '}'
-
-            let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
-            emitFClosure(cpoolIdx)
-
-            if isConstructor {
-                // Replace the current ctorFunc (default or previous) with
-                // the explicit constructor.
-                // Stack: ..., ctorFunc, proto, newCtorFunc
-                emitOp(.rot3l)   // ..., proto, newCtorFunc, ctorFunc
-                emitOp(.drop)    // ..., proto, newCtorFunc
-                emitOp(.swap)    // ..., newCtorFunc, proto
-                ctorFound = true
-            } else {
-                // Regular method -- define it on proto (or ctor for static).
-                if isStatic {
-                    // For static methods, define on the constructor.
-                    // Stack: ..., ctorFunc, proto, methodFunc
-                    // Rearrange so ctorFunc is below methodFunc for define_method.
-                    emitOp(.rot3l)   // ..., proto, methodFunc, ctorFunc
-                    emitOp(.swap)    // ..., proto, ctorFunc, methodFunc
-                    if isComputed {
-                        emitOp(.define_method_computed)
-                        let mf: UInt8 = (propKind == .getter ? 2 : 0) |
-                                        (propKind == .setter ? 4 : 0)
-                        emitU8(mf)
-                    } else {
-                        emitOp(.define_method)
-                        emitAtom(propAtom)
-                        let mf: UInt8 = (propKind == .getter ? 2 : 0) |
-                                        (propKind == .setter ? 4 : 0)
-                        emitU8(mf)
-                    }
-                    // Stack: ..., proto, ctorFunc
-                    emitOp(.swap)    // ..., ctorFunc, proto
-                } else if isComputed {
-                    emitOp(.define_method_computed)
-                    let methodFlags: UInt8 = (propKind == .getter ? 2 : 0) |
-                                             (propKind == .setter ? 4 : 0)
-                    emitU8(methodFlags)
-                } else {
-                    emitOp(.define_method)
-                    emitAtom(propAtom)
-                    let methodFlags: UInt8 = (propKind == .getter ? 2 : 0) |
-                                             (propKind == .setter ? 4 : 0)
-                    emitU8(methodFlags)
-                }
-            }
-        }
-        return ctorFound
     }
 
     // =========================================================================
@@ -4055,7 +3746,17 @@ final class JeffJSParser {
                 let lhsEnd = fd.byteCode.len
                 let (lastGetOp, lastGetPos) = findLastGetOpcode(from: lhsBcStart, to: lhsEnd)
 
-                if lastGetOp == .scope_get_var, let pos = lastGetPos {
+                if lastGetOp == .scope_get_private_field, let pos = lastGetPos {
+                    // obj.#x = expr: rewind the private read, leaving [obj].
+                    let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
+                    let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
+                    let scopeLevel = readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4)
+                    fd.byteCode.len = pos    // stack: [obj]
+                    parseAssignExpr()        // stack: [obj, val]
+                    emitOp(.dup)             // [obj, val, val]
+                    emitOp(.perm3)           // [val, obj, val]
+                    emitScopePutPrivateField(atom, scopeLevel: Int(scopeLevel))  // [val]
+                } else if lastGetOp == .scope_get_var, let pos = lastGetPos {
                     let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
                     let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
                     let scopeLevel = readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4)
@@ -4105,7 +3806,39 @@ final class JeffJSParser {
                 let lhsOp = peekOpcodeAt(lhsBcStart)
                 let endLabel = newLabel()
 
-                if lhsOp == .scope_get_var {
+                let (logGetOp, logGetPos) = findLastGetOpcode(from: lhsBcStart, to: fd.byteCode.len)
+                if logGetOp == .scope_get_private_field, let pos = logGetPos {
+                    // obj.#x ??= y — rewind to just after the object.
+                    let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
+                    let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
+                    let scopeLevel = Int(readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4))
+                    let doneLabel = newLabel()
+                    fd.byteCode.len = pos                       // [obj]
+                    emitOp(.dup)                                // [obj, obj]
+                    emitScopeGetPrivateField(atom, scopeLevel: scopeLevel)  // [obj, old]
+                    emitOp(.dup)                                // [obj, old, old]
+                    switch assignOp {
+                    case .land:
+                        emitIfFalse(endLabel)
+                    case .lor:
+                        emitIfTrue(endLabel)
+                    case .nullishCoalescing:
+                        emitOp(.is_undefined_or_null)
+                        emitOp(.lnot)
+                        emitIfTrue(endLabel)
+                    default:
+                        break
+                    }
+                    emitOp(.drop)                               // [obj]
+                    parseAssignExpr()                           // [obj, val]
+                    emitOp(.dup)                                // [obj, val, val]
+                    emitOp(.perm3)                              // [val, obj, val]
+                    emitScopePutPrivateField(atom, scopeLevel: scopeLevel)  // [val]
+                    emitGoto(doneLabel)
+                    emitLabel(endLabel)                         // [obj, old]
+                    emitOp(.nip)                                // [old]
+                    emitLabel(doneLabel)
+                } else if lhsOp == .scope_get_var {
                     // --- Variable LHS: x ??= y ---
                     let opcodeSize = fd.byteCode.buf[lhsBcStart] == 0 ? 2 : 1
                     let atom = readU32FromBuf(fd.byteCode.buf, lhsBcStart + opcodeSize)
@@ -4182,7 +3915,20 @@ final class JeffJSParser {
                     // like flags['lanes'] |= 1, the first opcode is scope_get_var
                     // (for 'flags') but the last is get_array_el.
                     let (compOp, compPos) = findLastGetOpcode(from: lhsBcStart, to: fd.byteCode.len)
-                    if compOp == .get_array_el, let pos = compPos {
+                    if compOp == .scope_get_private_field, let pos = compPos {
+                        // obj.#x += rhs
+                        let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
+                        let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
+                        let scopeLevel = Int(readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4))
+                        fd.byteCode.len = pos                        // [obj]
+                        emitOp(.dup)                                 // [obj, obj]
+                        emitScopeGetPrivateField(atom, scopeLevel: scopeLevel)  // [obj, old]
+                        parseAssignExpr()                            // [obj, old, rhs]
+                        emitBinaryOp(forAssignOp: assignOp)          // [obj, new]
+                        emitOp(.dup)                                 // [obj, new, new]
+                        emitOp(.perm3)                               // [new, obj, new]
+                        emitScopePutPrivateField(atom, scopeLevel: scopeLevel)  // [new]
+                    } else if compOp == .get_array_el, let pos = compPos {
                         fd.byteCode.len = pos     // rewind past get_array_el; stack: [obj, key]
                         emitOp(.dup2)              // [obj, key, obj, key]
                         emitOp(.get_array_el)      // [obj, key, old_value]
@@ -4410,7 +4156,23 @@ final class JeffJSParser {
 
     /// Parse: ShiftExpr [('<'|'>'|'<='|'>='|'instanceof'|'in') ShiftExpr]*
     func parseRelationalExpr() {
-        parseShiftExpr()
+        // `#x in obj`: a private name is only valid as the left operand of
+        // `in` (a brand check).
+        if tok == JSTokenType.TOK_PRIVATE_NAME.rawValue {
+            let nameAtom = s.token.identAtom
+            next()
+            if tok != JSTokenType.TOK_IN.rawValue || !inFlag {
+                syntaxError("invalid use of a private name")
+                return
+            }
+            next()
+            parseShiftExpr()
+            emitOp(.scope_in_private_field)
+            emitAtom(nameAtom)
+            emitU16(UInt16(fd.curScope))
+        } else {
+            parseShiftExpr()
+        }
 
         while !shouldAbort {
             switch tok {
@@ -4575,6 +4337,10 @@ final class JeffJSParser {
                 // Stack already has [obj, key] before get_array_el.
                 fd.byteCode.len = pos  // rewind: stack has [obj, key]
                 emitOp(.delete_)
+            } else if lastOp == .scope_get_private_field {
+                // `delete obj.#x` is an early SyntaxError.
+                syntaxError("cannot delete a private member")
+                return
             } else if lastOp == .scope_get_var, let pos = lastPos {
                 // delete variable -- use scope_delete_var
                 let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
@@ -4633,7 +4399,19 @@ final class JeffJSParser {
                 emitOp(isInc ? .post_inc : .post_dec)
                 // Stack: [old_value, new_value]
 
-                if lastGetOp == .scope_get_var, let pos = lastGetPos {
+                if lastGetOp == .scope_get_private_field, let pos = lastGetPos {
+                    // obj.#x++ : rewind past the read and the post_inc/dec.
+                    let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
+                    let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
+                    let scopeLevel = Int(readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4))
+                    fd.byteCode.len = pos                        // [obj]
+                    emitOp(.dup)                                 // [obj, obj]
+                    emitScopeGetPrivateField(atom, scopeLevel: scopeLevel)  // [obj, old]
+                    emitOp(isInc ? .post_inc : .post_dec)        // [obj, old, new]
+                    emitOp(.rot3l)                               // [old, new, obj]
+                    emitOp(.swap)                                // [old, obj, new]
+                    emitScopePutPrivateField(atom, scopeLevel: scopeLevel)  // [old]
+                } else if lastGetOp == .scope_get_var, let pos = lastGetPos {
                     let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
                     let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
                     let scopeLevel = readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4)
@@ -4754,6 +4532,9 @@ final class JeffJSParser {
                     // Bind the constructed object as `this` and leave it as
                     // the value of the `super(...)` expression (ES semantics).
                     emitOp(.init_this)
+                    // A derived class initialises its instance fields as soon
+                    // as super() returns, before the rest of the body.
+                    emitClassFieldInit()
                 } else if isMethodCall {
                     // [receiver, func, args...]: obj[key](...) and super.m(...)
                     if hasSpread {
@@ -4836,8 +4617,14 @@ final class JeffJSParser {
                 } else if tok == JSTokenType.TOK_PRIVATE_NAME.rawValue {
                     let fieldAtom = s.token.identAtom
                     next()
-                    emitOp(.get_private_field)
-                    emitAtom(fieldAtom)
+                    if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
+                        // obj.#m(...): keep the receiver for call_method. The
+                        // private-method form of scope_get_private_field
+                        // consumes the object it brand-checks.
+                        emitOp(.dup)
+                        pendingMethodCall = true
+                    }
+                    emitScopeGetPrivateField(fieldAtom)
                 } else {
                     syntaxError("expected property name after '.'")
                     return

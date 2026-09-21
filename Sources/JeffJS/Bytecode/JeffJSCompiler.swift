@@ -113,6 +113,12 @@ class JeffJSFunctionDefCompiler {
     var funcName: JSAtom = 0
     var hasSimpleParameterList: Bool = true
     var isDerivedClassConstructor: Bool = false
+    /// Base-class constructor: run the instance field initializers before the
+    /// body (a derived constructor runs them right after `super()` returns).
+    var emitFieldInitAtBodyStart: Bool = false
+    /// Set when resolveVariables hit an unrecoverable error (an undeclared
+    /// private name); createFunction then fails the compilation.
+    var resolveError: Bool = false
     var hasPrototype: Bool = false
     var needHomeObject: Bool = false
     var isDirectOrIndirectEval: Bool = false
@@ -532,12 +538,10 @@ struct JeffJSCompiler {
             case .scope_get_private_field:
                 let atom = readU32(fd.byteCode.buf, operandBase)
                 let scopeLevel = Int(readU16(fd.byteCode.buf, operandBase + 4))
-                let (resolvedOp, varIdx) = resolveScopePrivateField(
-                    ctx: ctx, fd: fd, name: atom, scopeLevel: scopeLevel
-                )
-                rewriteScopeAccess(fd: fd, pos: pos, origSize: instrSize,
-                                   newOp: resolvedOp, varIdx: varIdx,
-                                   atom: atom, accessType: .getPrivate)
+                rewriteScopePrivateAccess(ctx: ctx, fd: fd, pos: pos,
+                                          origSize: instrSize, name: atom,
+                                          scopeLevel: scopeLevel,
+                                          accessType: .getPrivate)
 
             // -----------------------------------------------------------------
             // scope_put_private_field(atom, scope_level)
@@ -545,12 +549,10 @@ struct JeffJSCompiler {
             case .scope_put_private_field:
                 let atom = readU32(fd.byteCode.buf, operandBase)
                 let scopeLevel = Int(readU16(fd.byteCode.buf, operandBase + 4))
-                let (resolvedOp, varIdx) = resolveScopePrivateField(
-                    ctx: ctx, fd: fd, name: atom, scopeLevel: scopeLevel
-                )
-                rewriteScopeAccess(fd: fd, pos: pos, origSize: instrSize,
-                                   newOp: resolvedOp, varIdx: varIdx,
-                                   atom: atom, accessType: .putPrivate)
+                rewriteScopePrivateAccess(ctx: ctx, fd: fd, pos: pos,
+                                          origSize: instrSize, name: atom,
+                                          scopeLevel: scopeLevel,
+                                          accessType: .putPrivate)
 
             // -----------------------------------------------------------------
             // scope_in_private_field(atom, scope_level)
@@ -558,12 +560,10 @@ struct JeffJSCompiler {
             case .scope_in_private_field:
                 let atom = readU32(fd.byteCode.buf, operandBase)
                 let scopeLevel = Int(readU16(fd.byteCode.buf, operandBase + 4))
-                let (resolvedOp, varIdx) = resolveScopePrivateField(
-                    ctx: ctx, fd: fd, name: atom, scopeLevel: scopeLevel
-                )
-                rewriteScopeAccess(fd: fd, pos: pos, origSize: instrSize,
-                                   newOp: resolvedOp, varIdx: varIdx,
-                                   atom: atom, accessType: .inPrivate)
+                rewriteScopePrivateAccess(ctx: ctx, fd: fd, pos: pos,
+                                          origSize: instrSize, name: atom,
+                                          scopeLevel: scopeLevel,
+                                          accessType: .inPrivate)
 
             // -----------------------------------------------------------------
             // close_loc -- drop it when the variable cannot be captured.
@@ -616,6 +616,7 @@ struct JeffJSCompiler {
                         let extraBytes = Array(tdzBytes[instrSize...])
                         fd.byteCode.buf.insert(contentsOf: extraBytes, at: pos + instrSize)
                         fd.byteCode.len += extraBytes.count
+                        noteInsertion(fd: fd, at: pos + instrSize, count: extraBytes.count)
                     }
 
                     pos += max(totalTdzBytes, instrSize)
@@ -694,6 +695,7 @@ struct JeffJSCompiler {
                         let extraBytes = Array(closeLocBytes[instrSize...])
                         fd.byteCode.buf.insert(contentsOf: extraBytes, at: pos + instrSize)
                         fd.byteCode.len += extraBytes.count
+                        noteInsertion(fd: fd, at: pos + instrSize, count: extraBytes.count)
                     }
 
                     // Advance pos past all the close_loc opcodes plus any
@@ -714,7 +716,7 @@ struct JeffJSCompiler {
             addEvalVariables(ctx: ctx, fd: fd)
         }
 
-        return true
+        return (!fd.resolveError)
     }
 
     // MARK: Scope Access Type
@@ -820,43 +822,175 @@ struct JeffJSCompiler {
 
     /// Resolve a scope private field reference.
     /// Private fields are captured through the closure chain.
+    /// Resolve a private name (`#x`) to the class-scope variable that holds
+    /// its private symbol (fields) or its closure (methods/accessors).
+    /// Returns the load opcode, the variable index and the variable kind.
     static func resolveScopePrivateField(ctx: JeffJSContext,
                                           fd: JeffJSFunctionDefCompiler,
                                           name: JSAtom,
-                                          scopeLevel: Int) -> (opcode: JeffJSOpcode, varIdx: Int) {
-        // Search local variables
-        for i in (0 ..< fd.vars.count).reversed() {
-            if fd.vars[i].varName == name &&
-               fd.vars[i].varKind >= JSVarKindEnum.JS_VAR_PRIVATE_FIELD.rawValue {
-                return (.get_var_ref, i)
-            }
+                                          scopeLevel: Int)
+        -> (opcode: JeffJSOpcode, varIdx: Int, varKind: Int) {
+        // Local variables of this function, innermost scope first.
+        if let (i, vd) = findPrivateVar(fd: fd, name: name, scopeLevel: scopeLevel) {
+            fd.vars[i].isCaptured = true
+            return (.get_loc, i, vd.varKind)
         }
 
-        // Search parent functions
+        // Enclosing functions: captured through the closure chain.
         var parentFd = fd.parent
         var curFd = fd
         while let p = parentFd {
-            for i in (0 ..< p.vars.count).reversed() {
-                if p.vars[i].varName == name &&
-                   p.vars[i].varKind >= JSVarKindEnum.JS_VAR_PRIVATE_FIELD.rawValue {
-                    p.vars[i].isCaptured = true
-                    let closureIdx = getClosureVar(
-                        ctx: ctx, s: curFd, fd: p,
-                        isLocal: true, isArg: false,
-                        varIdx: i, varName: name,
-                        isConst: p.vars[i].isConst,
-                        isLexical: p.vars[i].isLexical,
-                        varKind: p.vars[i].varKind
-                    )
-                    return (.get_var_ref, closureIdx)
-                }
+            if let (i, vd) = findPrivateVar(fd: p, name: name,
+                                            scopeLevel: curFd.definedScopeLevel) {
+                p.vars[i].isCaptured = true
+                let closureIdx = getClosureVar(
+                    ctx: ctx, s: fd, fd: p,
+                    isLocal: true, isArg: false,
+                    varIdx: i, varName: name,
+                    isConst: vd.isConst,
+                    isLexical: vd.isLexical,
+                    varKind: vd.varKind
+                )
+                return (.get_var_ref, closureIdx, vd.varKind)
             }
             curFd = p
             parentFd = p.parent
         }
 
-        // Should not happen -- private field must exist
-        return (.nop, 0)
+        // Not found: the parser rejects `this.#x` outside a class that
+        // declares `#x`, so this only happens for broken bytecode.
+        return (.nop, 0, 0)
+    }
+
+    /// Scope-aware lookup of a private-name variable.
+    private static func findPrivateVar(fd: JeffJSFunctionDefCompiler,
+                                        name: JSAtom,
+                                        scopeLevel: Int) -> (Int, JeffJSVarDef)? {
+        var scope = scopeLevel
+        while scope >= 0 && scope < fd.scopes.count {
+            var varIdx = fd.scopes[scope].first
+            while varIdx >= 0 && varIdx < fd.vars.count {
+                if fd.vars[varIdx].varName == name &&
+                   fd.vars[varIdx].varKind >= JSVarKindEnum.JS_VAR_PRIVATE_FIELD.rawValue {
+                    return (varIdx, fd.vars[varIdx])
+                }
+                varIdx = fd.vars[varIdx].scopeNext
+            }
+            scope = fd.scopes[scope].parent
+        }
+        return nil
+    }
+
+    /// Byte encoding of an opcode (wide opcodes take the 0x00 prefix form).
+    private static func opcodeBytes(_ op: JeffJSOpcode) -> [UInt8] {
+        if op.rawValue > 255 { return [0, UInt8(op.rawValue - 256)] }
+        return [UInt8(op.rawValue)]
+    }
+
+    /// Rewrite scope_{get,put,in}_private_field into the real opcode sequence.
+    ///
+    /// QuickJS resolve_scope_private_field: the private name variable is
+    /// loaded first, then
+    ///   * a field  -> get_private_field / put_private_field
+    ///   * a method -> check_brand (+ nip for a read)
+    ///   * an accessor -> check_brand + call_method on the getter/setter.
+    static func rewriteScopePrivateAccess(ctx: JeffJSContext,
+                                          fd: JeffJSFunctionDefCompiler,
+                                          pos: Int,
+                                          origSize: Int,
+                                          name: JSAtom,
+                                          scopeLevel: Int,
+                                          accessType: ScopeAccessType) {
+        let (loadOp, varIdx, varKind) = resolveScopePrivateField(
+            ctx: ctx, fd: fd, name: name, scopeLevel: scopeLevel)
+        var seq: [UInt8] = []
+
+        func loadBytes(_ op: JeffJSOpcode, _ idx: Int) -> [UInt8] {
+            return opcodeBytes(op) + [UInt8(idx & 0xFF), UInt8((idx >> 8) & 0xFF)]
+        }
+        func throwPrivateAccess() -> [UInt8] {
+            var b = opcodeBytes(.throw_error)
+            b += [UInt8(name & 0xFF), UInt8((name >> 8) & 0xFF),
+                  UInt8((name >> 16) & 0xFF), UInt8((name >> 24) & 0xFF)]
+            b += [ThrowErrorType.privateAccess.rawValue]
+            return b
+        }
+
+        let isAccessor = varKind == JSVarKindEnum.JS_VAR_PRIVATE_GETTER_SETTER.rawValue ||
+                         varKind == JSVarKindEnum.JS_VAR_PRIVATE_GETTER.rawValue ||
+                         varKind == JSVarKindEnum.JS_VAR_PRIVATE_SETTER.rawValue
+
+        if loadOp == .nop {
+            // QuickJS rejects a private name with no declaring class at parse
+            // time; this pass is the first place the class scopes are known.
+            _ = ctx.throwSyntaxError(
+                message: "private name '\(ctx.atomToSwiftString(name))' is not declared in an enclosing class")
+            fd.resolveError = true
+            seq = throwPrivateAccess()
+        } else if accessType == .inPrivate {
+            // obj -> bool: a field compares the symbol, a method/accessor the
+            // brand of its home object.
+            seq = loadBytes(loadOp, varIdx) + opcodeBytes(.private_in)
+        } else if isAccessor {
+            // Accessors live in a dedicated <get:#x> / <set:#x> variable.
+            let wantSetter = (accessType == .putPrivate)
+            let base = ctx.atomToSwiftString(name)
+            let accessorName = ctx.findAtom((wantSetter ? "<set:" : "<get:") + base + ">")
+            let (aOp, aIdx, _) = resolveScopePrivateField(
+                ctx: ctx, fd: fd, name: accessorName, scopeLevel: scopeLevel)
+            ctx.rt.freeAtom(accessorName)
+            if aOp == .nop {
+                // No getter for a read / no setter for a write.
+                seq = throwPrivateAccess()
+            } else if wantSetter {
+                // obj val -> ()
+                seq = opcodeBytes(.swap)                     // val obj
+                seq += loadBytes(aOp, aIdx)                  // val obj setter
+                seq += opcodeBytes(.check_brand)
+                seq += opcodeBytes(.rot3l)                   // obj setter val
+                seq += opcodeBytes(.call_method) + [1, 0]    // result
+                seq += opcodeBytes(.drop)
+            } else {
+                // obj -> value
+                seq = loadBytes(aOp, aIdx)                   // obj getter
+                seq += opcodeBytes(.check_brand)
+                seq += opcodeBytes(.call_method) + [0, 0]
+            }
+        } else if varKind == JSVarKindEnum.JS_VAR_PRIVATE_METHOD.rawValue {
+            if accessType == .putPrivate {
+                seq = throwPrivateAccess()
+            } else {
+                // obj -> method (brand-checked against the home object)
+                seq = loadBytes(loadOp, varIdx)
+                seq += opcodeBytes(.check_brand)
+                seq += opcodeBytes(.nip)
+            }
+        } else {
+            // Plain private field.
+            seq = loadBytes(loadOp, varIdx)
+            seq += opcodeBytes(accessType == .putPrivate ? .put_private_field
+                                                         : .get_private_field)
+        }
+        writeSequence(fd: fd, pos: pos, origSize: origSize, bytes: seq)
+    }
+
+    /// Overwrite `origSize` bytes at `pos` with `bytes`, padding with NOPs or
+    /// inserting the overflow (same strategy as the enter_scope rewrite).
+    private static func writeSequence(fd: JeffJSFunctionDefCompiler,
+                                      pos: Int, origSize: Int, bytes: [UInt8]) {
+        let overwrite = min(bytes.count, origSize)
+        for i in 0 ..< overwrite {
+            if pos + i < fd.byteCode.buf.count { fd.byteCode.buf[pos + i] = bytes[i] }
+        }
+        if bytes.count > origSize {
+            let extra = Array(bytes[origSize...])
+            fd.byteCode.buf.insert(contentsOf: extra, at: pos + origSize)
+            fd.byteCode.len += extra.count
+            noteInsertion(fd: fd, at: pos + origSize, count: extra.count)
+        } else {
+            padWithNops(&fd.byteCode.buf, from: pos + overwrite,
+                        count: origSize - overwrite)
+        }
     }
 
     // MARK: captureVar
@@ -1261,6 +1395,27 @@ struct JeffJSCompiler {
             padWithNops(&fd.byteCode.buf, from: pos + newSize, count: origSize - newSize)
         default:
             padWithNops(&fd.byteCode.buf, from: pos + newSize, count: origSize - newSize)
+        }
+    }
+
+    /// Record that `count` bytes were inserted at `insertPos` during
+    /// resolveVariables: byte offsets recorded by the parser (the hoisted
+    /// function-declaration ranges, the body start, the TDZ init positions)
+    /// have to move with them, or the hoisting pass later cuts a moved range
+    /// out of the middle of an instruction.
+    static func noteInsertion(fd: JeffJSFunctionDefCompiler, at insertPos: Int, count: Int) {
+        guard count > 0 else { return }
+        if fd.bodyBytecodeStart > insertPos { fd.bodyBytecodeStart += count }
+        if !fd.hoistedFuncDeclRanges.isEmpty {
+            fd.hoistedFuncDeclRanges = fd.hoistedFuncDeclRanges.map {
+                ($0.0 >= insertPos ? $0.0 + count : $0.0,
+                 $0.1 >= insertPos ? $0.1 + count : $0.1)
+            }
+        }
+        if !fd.tdzInitPos.isEmpty {
+            for (k, v) in fd.tdzInitPos where v >= insertPos {
+                fd.tdzInitPos[k] = v + count
+            }
         }
     }
 

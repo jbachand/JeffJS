@@ -1,0 +1,66 @@
+BAD Intl.NumberFormat -> false
+BAD Intl.DateTimeFormat -> false
+BAD class fields -> false
+SyntaxError: <eval>:1:29: expected property name in destructuring
+  (function(){ var {a=1,b:{c}={c:2}}={}; return a===1&&c===2; })
+                              ^
+ERR destructuring defaults -> <eval>:1:29: expected property name in destructuring
+  (function(){ var {a=1,b:{c}={c:2}}={}; return a===1&&c===2; })
+                              ^
+BAD Symbol desc collision -> false
+BAD fn.name/length -> false
+BAD arrow fn name -> false
+BAD class method enumerable -> false
+ERR matchAll -> object is not iterable
+BAD Reflect.construct newTarget -> false
+BAD BigInt -> false
+BAD label break -> false
+BAD arguments alias sloppy -> false
+ERR tagged template -> Cannot read properties of undefined (reading 'join') — 'message.join' is undefined
+BAD for-of return on throw -> false
+BAD delete arr hole -> false
+BAD for-in string -> false
+ERR getOwnPropertyDescriptor arr -> Cannot read properties of undefined (reading 'value') at ?:0
+BAD Function toString -> false
+BAD class extends builtin -> false
+ERR computed class member -> not a constructor
+ERR with statement sloppy -> q is not defined
+BAD regex replace fn $<name> -> false
+ERR template literal nested -> xy is not a function at ?:0 pc=0
+BAD class static field -> false
+[JeffJS] VM stack underflow: op=get_private_field pc=1 sp=1 spBase=1 in p
+ERR class private field -> cannot read private field
+[JeffJS] VM stack underflow: op=get_private_field pc=1 sp=1 spBase=1 in q
+ERR class private method -> cannot read private field
+BAD computed static field -> false
+BAD label continue -> false
+BAD tagged raw -> false
+ERR nested template -> xy is not a function at ?:0 pc=0
+ERR template in template braces -> undefined is not a function at ?:0 pc=0
+BAD extends Error message -> false
+BAD extends Error super ctor -> false
+ERR extends Map -> incompatible receiver
+BAD extends Promise -> false
+BAD Date slash -> false
+BAD BigInt literal -> false
+BAD BigInt pow -> false
+BAD regex $<name> replace -> false
+BAD Function toString user -> false
+BAD numeric separators -> false
+BAD Object spread getter -> false
+ERR String.raw -> cannot convert null or undefined to object
+BAD closure captures generator local after yield -> false
+SyntaxError: <eval>:1:22: expected '(' but got 'await'
+  (async()=>{ for await (const x of []) {} })
+                       ^
+ERR for await syntax -> <eval>:1:22: expected '(' but got 'await'
+  (async()=>{ for await (const x of []) {} })
+                       ^
+BAD Error.stack has a frame -> false
+SyntaxError: <eval>:1:28: expected property name
+  (class { static z; static { this.z = 5; } }).z
+                             ^
+ERR class static block -> <eval>:1:28: expected property name
+  (class { static z; static { this.z = 5; } }).z
+                             ^
+DONE

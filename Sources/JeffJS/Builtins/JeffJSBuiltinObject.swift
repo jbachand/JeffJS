@@ -346,6 +346,10 @@ extension JeffJSContext {
                         }
                     }
                 } else if let entry = rt.atomArray[Int(atom)] {
+                    // A class private name (`#x`) is an atom of its own type
+                    // and is invisible to reflection (QuickJS skips
+                    // JS_ATOM_TYPE_PRIVATE in JS_GetOwnPropertyNamesInternal).
+                    if entry.atomType == .JS_ATOM_TYPE_PRIVATE { continue }
                     let isSymbol = entry.atomType == .JS_ATOM_TYPE_SYMBOL ||
                                    entry.atomType == .JS_ATOM_TYPE_GLOBAL_SYMBOL
                     if isSymbol {

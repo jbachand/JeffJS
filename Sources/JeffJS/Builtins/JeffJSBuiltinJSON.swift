@@ -1202,8 +1202,13 @@ extension JeffJSContext {
                     if let idx = rt.atomToUInt32(atom) {
                         intKeys.append((idx, String(idx)))
                     }
-                } else if let name = rt.atomToString(atom) {
-                    stringKeys.append(name)
+                } else if let entry = rt.atomArray[Int(atom)],
+                          entry.atomType != .JS_ATOM_TYPE_PRIVATE,
+                          entry.atomType != .JS_ATOM_TYPE_SYMBOL,
+                          entry.atomType != .JS_ATOM_TYPE_GLOBAL_SYMBOL {
+                    // Symbol keys and class private names (`#x`) are never
+                    // serialized.
+                    stringKeys.append(entry.str)
                 }
             }
         }
