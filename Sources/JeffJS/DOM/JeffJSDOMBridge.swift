@@ -110,6 +110,10 @@ final class JeffJSDOMBridge {
     /// shared prototype, leaving `el.classList.add` undefined).
     private var classListCache: [UUID: JeffJSValue] = [:]
 
+    /// Per-node `relList` wrappers, keyed by `DOMNode.id`. Same lifetime rules
+    /// as `classListCache`.
+    private var relListCache: [UUID: JeffJSValue] = [:]
+
     /// Detached documents handed out by `document.implementation.createHTMLDocument`
     /// and `DOMParser.parseFromString`, keyed by their root `DOMNode.id`.
     /// Non-empty only on pages that ask for one, so the `ownerDocument` walk in
@@ -166,6 +170,8 @@ final class JeffJSDOMBridge {
 
         for (_, v) in classListCache { v.freeValue() }
         classListCache.removeAll()
+        for (_, v) in relListCache { v.freeValue() }
+        relListCache.removeAll()
         for (_, v) in detachedDocuments { v.freeValue() }
         detachedDocuments.removeAll()
         detachedDocumentRoots.removeAll()
@@ -233,6 +239,9 @@ final class JeffJSDOMBridge {
         nodeRegistry.removeValue(forKey: nodeID)
         elementScrollPositions.removeValue(forKey: nodeID)
         if let cachedList = classListCache.removeValue(forKey: nodeID) {
+            cachedList.freeValue()
+        }
+        if let cachedList = relListCache.removeValue(forKey: nodeID) {
             cachedList.freeValue()
         }
         templateContent.removeValue(forKey: nodeID)
@@ -387,7 +396,7 @@ final class JeffJSDOMBridge {
             guard let self, let className = self.extractString(ctx: ctx, args: args, index: 0) else {
                 return self?.wrapElementArray([], ctx: ctx) ?? JeffJSValue.null
             }
-            let classes = className.split(whereSeparator: \.isWhitespace).map(String.init).filter { !$0.isEmpty }
+            let classes = DOMNode.splitASCIIWhitespace(className)
             guard !classes.isEmpty else { return self.wrapElementArray([], ctx: ctx) }
             let nodes = self.allElementDescendants(of: self.root).filter { node in
                 let nodeClasses = node.classList
@@ -1269,7 +1278,7 @@ final class JeffJSDOMBridge {
                 return self?.wrapElementArray([], ctx: ctx) ?? JeffJSValue.null
             }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.null }
-            let classes = className.split(whereSeparator: \.isWhitespace).map(String.init).filter { !$0.isEmpty }
+            let classes = DOMNode.splitASCIIWhitespace(className)
             guard !classes.isEmpty else { return self.wrapElementArray([], ctx: ctx) }
             let nodes = self.allElementDescendants(of: targetNode).filter { n in
                 let nc = n.classList
@@ -1856,6 +1865,28 @@ final class JeffJSDOMBridge {
             return list
         }, length: 0)
 
+        // -- relList sub-object (<a rel>, <link rel>, <area rel>) --
+        ctx.setPropertyFunc(obj: el, name: "__get_relList", fn: { [weak self] ctx, thisVal, _ in
+            guard let self else { return ctx.newObject() }
+            guard let targetNode = self.extractNode(from: thisVal) else { return ctx.newObject() }
+            if let cached = self.relListCache[targetNode.id] { return cached.dupValue() }
+            let list = self.buildTokenListObject(for: targetNode, attribute: "rel", ctx: ctx)
+            self.relListCache[targetNode.id] = list.dupValue()
+            return list
+        }, length: 0)
+
+        // -- rel (read-write string reflection) --
+        ctx.setPropertyFunc(obj: el, name: "__get_rel", fn: { [weak self] ctx, thisVal, _ in
+            guard let self, let targetNode = self.extractNode(from: thisVal) else { return ctx.newStringValue("") }
+            return ctx.newStringValue(targetNode.attributes["rel"] ?? "")
+        }, length: 0)
+        ctx.setPropertyFunc(obj: el, name: "__set_rel", fn: { [weak self] ctx, thisVal, args in
+            guard let self, let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+            targetNode.setAttribute(name: "rel", value: self.extractString(ctx: ctx, args: args, index: 0) ?? "")
+            self.notifyMutation(for: targetNode)
+            return JeffJSValue.undefined
+        }, length: 1)
+
         // -- Geometry accessors (offset*/client*/scroll*) --
         registerElementGeometryAccessors(on: el, ctx: ctx)
     }
@@ -1871,7 +1902,7 @@ final class JeffJSDOMBridge {
     private func installElementPropertyShim(on el: JeffJSValue, ctx: JeffJSContext) {
         let props: [(String, Bool)] = [
             ("textContent", true), ("innerText", true), ("innerHTML", true), ("outerHTML", true),
-            ("content", false), ("classList", false),
+            ("content", false), ("classList", false), ("relList", false), ("rel", true),
             ("id", true), ("className", true), ("value", true),
             ("checked", true), ("hidden", true), ("src", true), ("href", true),
             ("nodeValue", true), ("data", true), ("isConnected", false),
@@ -2345,18 +2376,23 @@ final class JeffJSDOMBridge {
     // MARK: - ClassList Sub-Object
 
     private func buildClassListObject(for node: DOMNode, ctx: JeffJSContext) -> JeffJSValue {
+        buildTokenListObject(for: node, attribute: "class", ctx: ctx)
+    }
+
+    /// A `DOMTokenList` over any token-list attribute (`class` -> `classList`,
+    /// `rel` -> `relList`, ...). Tokens split on ASCII whitespace per HTML, so
+    /// `class="\n\tfoo\n\tbar"` is two tokens and empty runs are dropped.
+    private func buildTokenListObject(for node: DOMNode, attribute: String, ctx: JeffJSContext) -> JeffJSValue {
         let obj = ctx.newObject()
 
         // Document order is significant (`className` round-trips through CSS and
         // through code that string-matches it), so the list keeps insertion order
         // instead of the alphabetical sort the first implementation used.
         func tokens() -> [String] {
-            (node.attributes["class"] ?? "")
-                .split(whereSeparator: \.isWhitespace)
-                .map(String.init)
+            DOMNode.orderedTokenSet(node.attributes[attribute] ?? "")
         }
         func store(_ list: [String]) {
-            node.setAttribute(name: "class", value: list.joined(separator: " "))
+            node.setAttribute(name: attribute, value: list.joined(separator: " "))
         }
 
         // add(cls, ...)
@@ -2440,8 +2476,49 @@ final class JeffJSDOMBridge {
         }, length: 1)
 
         ctx.setPropertyFunc(obj: obj, name: "toString", fn: { ctx, _, _ in
-            ctx.newStringValue(node.attributes["class"] ?? "")
+            ctx.newStringValue(node.attributes[attribute] ?? "")
         }, length: 0)
+
+        // forEach(callback, thisArg)
+        ctx.setPropertyFunc(obj: obj, name: "forEach", fn: { ctx, thisVal, args in
+            guard let callback = args.first, callback.isObject else { return JeffJSValue.undefined }
+            let thisArg = args.count > 1 ? args[1] : JeffJSValue.undefined
+            for (i, token) in tokens().enumerated() {
+                let r = ctx.call(callback, this: thisArg, args: [
+                    ctx.newStringValue(token), .newInt32(Int32(i)), thisVal.dupValue()
+                ])
+                r.freeValue()
+            }
+            return JeffJSValue.undefined
+        }, length: 1)
+
+        // Iterable: values()/keys()/entries()/[Symbol.iterator]
+        func tokenArray() -> JeffJSValue {
+            let arr = ctx.newArray()
+            for (i, token) in tokens().enumerated() {
+                _ = ctx.setPropertyUint32(obj: arr, index: UInt32(i), value: ctx.newStringValue(token))
+            }
+            return arr
+        }
+        ctx.setPropertyFunc(obj: obj, name: "values", fn: { ctx, _, _ in
+            ctx.createArrayIterator(obj: tokenArray(), kind: 1)
+        }, length: 0)
+        ctx.setPropertyFunc(obj: obj, name: "keys", fn: { ctx, _, _ in
+            ctx.createArrayIterator(obj: tokenArray(), kind: 0)
+        }, length: 0)
+        ctx.setPropertyFunc(obj: obj, name: "entries", fn: { ctx, _, _ in
+            ctx.createArrayIterator(obj: tokenArray(), kind: 2)
+        }, length: 0)
+        let iterFn = ctx.newCFunction({ ctx, _, _ in
+            ctx.createArrayIterator(obj: tokenArray(), kind: 1)
+        }, name: "[Symbol.iterator]", length: 0)
+        _ = ctx.setProperty(obj: obj, atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue, value: iterFn)
+
+        // supports(token) — DOMTokenList.supports; only defined for attributes
+        // with a known token set, which we do not model, so report true.
+        ctx.setPropertyFunc(obj: obj, name: "supports", fn: { _, _, _ in
+            .newBool(true)
+        }, length: 1)
 
         // `length` and `value` are live accessors — the list object is cached per
         // element, so a snapshot taken at build time would go stale on the first
@@ -2451,11 +2528,11 @@ final class JeffJSDOMBridge {
         ctx.setPropertyGetSet(obj: obj, name: "length", getter: lengthGetter, setter: nil)
 
         let valueGetter = ctx.newCFunction({ ctx, _, _ in
-            ctx.newStringValue(node.attributes["class"] ?? "")
+            ctx.newStringValue(node.attributes[attribute] ?? "")
         }, name: "get value", length: 0)
         let valueSetter = ctx.newCFunction({ [weak self] ctx, _, args in
             guard let self, let v = ctx.toSwiftString(args.first ?? .undefined) else { return .undefined }
-            node.setAttribute(name: "class", value: v)
+            node.setAttribute(name: attribute, value: v)
             self.notifyMutation(for: node)
             return .undefined
         }, name: "set value", length: 1)

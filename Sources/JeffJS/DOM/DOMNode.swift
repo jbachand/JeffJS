@@ -69,6 +69,10 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
 
     /// Cached class list, invalidated when the `class` attribute changes.
     private var _cachedClassList: Set<String>?
+    /// Cached ordered class tokens (document order, duplicates removed).
+    private var _cachedClassNames: [String]?
+    /// Cached ASCII-lowercased tag name, for case-insensitive HTML type selectors.
+    private var _cachedLowercasedTagName: String??
 
     private init(nodeType: NodeType, tagName: String?, attributes: [String: String], textContent: String?) {
         self.nodeType = nodeType
@@ -79,17 +83,110 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
 
     /// Invalidate cached classList when class attribute may have changed.
     private func invalidateClassListIfNeeded(_ name: String) {
-        if name == "class" { _cachedClassList = nil }
+        if name == "class" {
+            _cachedClassList = nil
+            _cachedClassNames = nil
+        }
     }
+
+    // MARK: - ASCII Whitespace Token Splitting (HTML "space characters")
+
+    /// The HTML spec's ASCII whitespace set: space, tab, LF, FF, CR.
+    /// Deliberately *not* `Character.isWhitespace`, which also treats NBSP and
+    /// other Unicode spaces as separators — those are ordinary class-name
+    /// characters as far as HTML is concerned.
+    @inline(__always)
+    public static func isASCIIWhitespace(_ scalar: Unicode.Scalar) -> Bool {
+        scalar == " " || scalar == "\t" || scalar == "\n" || scalar == "\u{0C}" || scalar == "\r"
+    }
+
+    /// Whitespace test for a `Character`. Note that "\r\n" is a *single*
+    /// Swift Character (a CRLF grapheme cluster), so comparing against "\r" or
+    /// "\n" alone silently fails — hence the scalar-level check.
+    @inline(__always)
+    public static func isASCIIWhitespace(_ ch: Character) -> Bool {
+        guard let first = ch.unicodeScalars.first else { return false }
+        return isASCIIWhitespace(first)
+    }
+
+    /// Splits a token-list attribute value on ASCII whitespace, dropping empty
+    /// tokens. `"\n\tfoo\n\tbar"` -> `["foo", "bar"]`.
+    /// Works on Unicode scalars so CRLF splits as two separators rather than
+    /// surviving as part of a token.
+    public static func splitASCIIWhitespace(_ value: String) -> [String] {
+        var result: [String] = []
+        var current = String.UnicodeScalarView()
+        for scalar in value.unicodeScalars {
+            if isASCIIWhitespace(scalar) {
+                if !current.isEmpty {
+                    result.append(String(current))
+                    current = String.UnicodeScalarView()
+                }
+            } else {
+                current.append(scalar)
+            }
+        }
+        if !current.isEmpty { result.append(String(current)) }
+        return result
+    }
+
+    /// Ordered set of tokens (duplicates removed, first occurrence wins) — the
+    /// DOM's `DOMTokenList` semantics.
+    public static func orderedTokenSet(_ value: String) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for token in splitASCIIWhitespace(value) where seen.insert(token).inserted {
+            result.append(token)
+        }
+        return result
+    }
+
+    /// The parsed token list of any token-list attribute (`class`, `rel`,
+    /// `headers`, `sandbox`, `itemprop`, ...).
+    public func tokenList(for attribute: String) -> [String] {
+        if attribute == "class" { return classNames }
+        return Self.orderedTokenSet(attributes[attribute.lowercased()] ?? "")
+    }
+
+    /// `rel` as a token list (`relList`).
+    public var relList: [String] { tokenList(for: "rel") }
+
+    /// `headers` as a token list.
+    public var headersList: [String] { tokenList(for: "headers") }
+
+    /// Attributes the DOM exposes as a `DOMTokenList`.
+    public static let tokenListAttributes: Set<String> = [
+        "class", "rel", "headers", "sandbox", "itemprop", "ping", "for"
+    ]
 
     // MARK: - Computed Properties
 
     public var classList: Set<String> {
         if let cached = _cachedClassList { return cached }
         guard let cls = attributes["class"] else { return [] }
-        let result = Set(cls.split(separator: " ").map(String.init))
+        let result = Set(Self.splitASCIIWhitespace(cls))
         _cachedClassList = result
         return result
+    }
+
+    /// Ordered, de-duplicated class tokens — the order `classList.item(i)` and
+    /// `classList[i]` must report.
+    public var classNames: [String] {
+        if let cached = _cachedClassNames { return cached }
+        guard let cls = attributes["class"] else { return [] }
+        let result = Self.orderedTokenSet(cls)
+        _cachedClassNames = result
+        return result
+    }
+
+    /// ASCII-lowercased tag name, cached. HTML type selectors match
+    /// case-insensitively, but elements created with `preserveCase` (SVG's
+    /// `linearGradient`, `clipPath`, ...) keep their authored spelling.
+    public var lowercasedTagName: String? {
+        if let cached = _cachedLowercasedTagName { return cached }
+        let value = tagName?.lowercased()
+        _cachedLowercasedTagName = .some(value)
+        return value
     }
 
     public var idAttribute: String? {
@@ -263,52 +360,71 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
     /// `Element.matches(selector)` — true when this element itself matches any
     /// selector in the list. Unlike the old parent-scoped implementation this
     /// works on detached nodes (jQuery's `parseHTML`/`filter` rely on it).
-    public func matchesSelector(_ selector: String) -> Bool {
+    ///
+    /// `:scope` inside the selector refers to `scope` when given, otherwise to
+    /// the element itself (what `Element.matches` does per Selectors 4).
+    public func matchesSelector(_ selector: String, scope: DOMNode? = nil) -> Bool {
         guard nodeType == .element else { return false }
         let list = CSSSelectorParser.parse(selector)
         guard !list.selectors.isEmpty else { return false }
-        return list.selectors.contains { CSSSelectorMatcher.matches($0, node: self) }
+        let context = CSSMatchContext(scope: scope ?? self)
+        return list.selectors.contains {
+            // Pseudo-element selectors never match an element via the DOM
+            // querying APIs (`p::before` matches nothing), though the style
+            // resolver still uses them to find originating elements.
+            $0.pseudoElement == nil && CSSSelectorMatcher.matches($0, node: self, context: context)
+        }
     }
 
     /// `Element.closest(selector)` — nearest self-or-ancestor element matching.
+    /// `:scope` refers to the element `closest` was called on.
     public func closestMatching(_ selector: String) -> DOMNode? {
+        let list = CSSSelectorParser.parse(selector)
+        guard !list.selectors.isEmpty else { return nil }
+        let context = CSSMatchContext(scope: self)
         var cursor: DOMNode? = nodeType == .element ? self : parent
         while let node = cursor {
-            if node.nodeType == .element, node.matchesSelector(selector) { return node }
+            if node.nodeType == .element,
+               list.selectors.contains(where: {
+                   $0.pseudoElement == nil && CSSSelectorMatcher.matches($0, node: node, context: context)
+               }) {
+                return node
+            }
             cursor = node.parent
         }
         return nil
     }
 
+    /// `querySelectorAll` — descendants of this node, in document order.
+    /// The node itself is never part of the result (matching WebKit), but it is
+    /// the `:scope` for relative selectors such as `:scope > a`.
     public func querySelectorAll(_ selector: String) -> [DOMNode] {
         let selectorList = CSSSelectorParser.parse(selector)
         guard !selectorList.selectors.isEmpty else { return [] }
+        let candidates = selectorList.selectors.filter { $0.pseudoElement == nil }
+        guard !candidates.isEmpty else { return [] }
+        let context = CSSMatchContext(scope: self)
 
         var results: [DOMNode] = []
-        for node in allDescendantElements() {
-            if selectorList.selectors.contains(where: { CSSSelectorMatcher.matches($0, node: node) }) {
+        forEachDescendantElement { node in
+            if candidates.contains(where: { CSSSelectorMatcher.matches($0, node: node, context: context) }) {
                 results.append(node)
             }
         }
         return results
     }
 
-    private func allDescendantElements() -> [DOMNode] {
+    /// Pre-order (document order) walk over descendant elements.
+    func forEachDescendantElement(_ body: (DOMNode) -> Void) {
+        for child in children {
+            if child.nodeType == .element { body(child) }
+            child.forEachDescendantElement(body)
+        }
+    }
+
+    func allDescendantElements() -> [DOMNode] {
         var result: [DOMNode] = []
-
-        func traverse(_ node: DOMNode) {
-            for child in node.children {
-                if child.nodeType == .element {
-                    result.append(child)
-                }
-                traverse(child)
-            }
-        }
-
-        if nodeType == .element {
-            result.append(self)
-        }
-        traverse(self)
+        forEachDescendantElement { result.append($0) }
         return result
     }
 
@@ -347,4 +463,107 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
         guard let tag = tagName else { return false }
         return Self.blockElements.contains(tag)
     }
+}
+
+// MARK: - Host-Settable Interaction State
+
+/// The document-level state the host (the app / renderer) owns and the selector
+/// engine only reads: which element the pointer is over, which has focus, which
+/// is being activated, the URL fragment `:target` resolves against, and which
+/// custom elements have been defined.
+///
+/// The app sets these as the user interacts, then re-runs its style pass:
+///
+///     DOMNode.hoveredNode = elementUnderFinger
+///     DOMNode.focusedNode = textField
+///     DOMNode.targetFragment = url.fragment
+///
+/// Everything is nil/empty by default, so `:hover`/`:focus`/`:target` simply
+/// never match until the host opts in.
+public final class DOMInteractionState: @unchecked Sendable {
+    public static let shared = DOMInteractionState()
+
+    private let lock = NSLock()
+    private weak var _hovered: DOMNode?
+    private weak var _focused: DOMNode?
+    private weak var _active: DOMNode?
+    private var _focusVisible: Bool = true
+    private var _targetFragment: String?
+    private var _definedCustomElements: Set<String> = []
+
+    public var hovered: DOMNode? {
+        get { lock.lock(); defer { lock.unlock() }; return _hovered }
+        set { lock.lock(); _hovered = newValue; lock.unlock() }
+    }
+    public var focused: DOMNode? {
+        get { lock.lock(); defer { lock.unlock() }; return _focused }
+        set { lock.lock(); _focused = newValue; lock.unlock() }
+    }
+    public var active: DOMNode? {
+        get { lock.lock(); defer { lock.unlock() }; return _active }
+        set { lock.lock(); _active = newValue; lock.unlock() }
+    }
+    /// Whether the current focus should also match `:focus-visible`
+    /// (keyboard-style focus). Defaults to true.
+    public var focusVisible: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _focusVisible }
+        set { lock.lock(); _focusVisible = newValue; lock.unlock() }
+    }
+    /// The URL fragment (without `#`) that `:target` matches.
+    public var targetFragment: String? {
+        get { lock.lock(); defer { lock.unlock() }; return _targetFragment }
+        set { lock.lock(); _targetFragment = newValue; lock.unlock() }
+    }
+    /// Custom element names registered with `customElements.define` — they are
+    /// the only hyphenated tag names that match `:defined`.
+    public var definedCustomElements: Set<String> {
+        get { lock.lock(); defer { lock.unlock() }; return _definedCustomElements }
+        set { lock.lock(); _definedCustomElements = newValue; lock.unlock() }
+    }
+
+    public func reset() {
+        lock.lock()
+        _hovered = nil
+        _focused = nil
+        _active = nil
+        _focusVisible = true
+        _targetFragment = nil
+        _definedCustomElements = []
+        lock.unlock()
+    }
+}
+
+extension DOMNode {
+    /// Element the pointer is over. `:hover` matches it and its ancestors.
+    public static var hoveredNode: DOMNode? {
+        get { DOMInteractionState.shared.hovered }
+        set { DOMInteractionState.shared.hovered = newValue }
+    }
+    /// Focused element. `:focus` matches it; `:focus-within` matches it and its ancestors.
+    public static var focusedNode: DOMNode? {
+        get { DOMInteractionState.shared.focused }
+        set { DOMInteractionState.shared.focused = newValue }
+    }
+    /// Element being activated (finger/mouse down). `:active` matches it and its ancestors.
+    public static var activeNode: DOMNode? {
+        get { DOMInteractionState.shared.active }
+        set { DOMInteractionState.shared.active = newValue }
+    }
+    /// Whether the focused element also matches `:focus-visible`.
+    public static var focusVisible: Bool {
+        get { DOMInteractionState.shared.focusVisible }
+        set { DOMInteractionState.shared.focusVisible = newValue }
+    }
+    /// URL fragment (without `#`) used by `:target`.
+    public static var targetFragment: String? {
+        get { DOMInteractionState.shared.targetFragment }
+        set { DOMInteractionState.shared.targetFragment = newValue }
+    }
+    /// Names registered via `customElements.define`, used by `:defined`.
+    public static var definedCustomElements: Set<String> {
+        get { DOMInteractionState.shared.definedCustomElements }
+        set { DOMInteractionState.shared.definedCustomElements = newValue }
+    }
+    /// Clears all host-settable selector state (hover/focus/active/target/defined).
+    public static func resetInteractionState() { DOMInteractionState.shared.reset() }
 }
