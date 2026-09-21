@@ -4076,7 +4076,7 @@ private func executeFastTraceLean(
                 if take {
                     let offset = Int(Int8(bitPattern: bc[pc + 5]))
                     let target = pc + 6 + offset
-                    if target < 0 || target >= bcLen { ctx.interruptCounter = interrupt; return target }
+                    if target < entryPC || target >= exitPC { ctx.interruptCounter = interrupt; return target }
                     if offset < 0 {
                         interrupt -= 1
                         if interrupt <= 0 {
@@ -4088,10 +4088,12 @@ private func executeFastTraceLean(
                     pc = target
                 } else {
                     pc += 6
+                    if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
                 }
             } else {
                 buf[sp] = cond ? .JS_TRUE : .JS_FALSE; sp += 1
                 pc += 4
+                if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
             }
 
         case .cmp_loc_loc:
@@ -4113,7 +4115,7 @@ private func executeFastTraceLean(
                 if take {
                     let offset = Int(Int8(bitPattern: bc[pc + 5]))
                     let target = pc + 6 + offset
-                    if target < 0 || target >= bcLen { ctx.interruptCounter = interrupt; return target }
+                    if target < entryPC || target >= exitPC { ctx.interruptCounter = interrupt; return target }
                     if offset < 0 {
                         interrupt -= 1
                         if interrupt <= 0 {
@@ -4125,10 +4127,12 @@ private func executeFastTraceLean(
                     pc = target
                 } else {
                     pc += 6
+                    if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
                 }
             } else {
                 buf[sp] = cond ? .JS_TRUE : .JS_FALSE; sp += 1
                 pc += 4
+                if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
             }
 
         case .arith_loc_loc:
@@ -5045,6 +5049,7 @@ private func executeFastTraceLean(
                 pc = target
             } else {
                 pc += 5
+                if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
             }
 
         case .if_true:
@@ -5067,6 +5072,7 @@ private func executeFastTraceLean(
                 pc = target
             } else {
                 pc += 5
+                if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
             }
 
         case .if_false8:
@@ -5089,6 +5095,7 @@ private func executeFastTraceLean(
                 pc = target
             } else {
                 pc += 2
+                if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
             }
 
         case .cmp_if8, .cmp_if:
@@ -5122,6 +5129,7 @@ private func executeFastTraceLean(
                 pc = target
             } else {
                 pc += cbSize
+                if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
             }
 
         case .if_true8:
@@ -5144,6 +5152,7 @@ private func executeFastTraceLean(
                 pc = target
             } else {
                 pc += 2
+                if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
             }
 
         case .goto_:

@@ -284,6 +284,7 @@ struct JeffJSTestRunner {
             ("NumericPropertyKeys", { $0.testNumericPropertyKeys() }),
             ("TraceBlocks", { $0.testTraceBlocks() }),
             ("ModulesAndImports", { $0.testModulesAndImportPatterns() }),
+            ("InterpreterGaps", { $0.testInterpreterGaps() }),
         ]
     }
 
@@ -10416,6 +10417,31 @@ extension JeffJSTestRunner {
             function Bd() { this.b = 1; } var BB = Bd.bind(null);
             var o = new BB(); o.b === 1 && o instanceof Bd && Reflect.construct(BB, []) instanceof Bd
         """, expect: true)
+    }
+
+    // MARK: - Interpreter gaps
+
+    /// Regressions for interpreter/codegen gaps found by differential testing
+    /// against qjs. Each block is one fixed bug.
+    mutating func testInterpreterGaps() {
+        let (rt, ctx) = makeCtx()
+        _ = rt
+
+        // --- 1. Fast-trace region bounds ---------------------------------
+        // The lean trace's conditional-branch handlers only checked the jump
+        // target against bcLen, never the fall-through, so a loop whose last
+        // instruction is a backward branch ran past exitPC (DEBUG assert,
+        // out-of-bounds bytecode read in release).
+        evalCheck(ctx, "var n = 0; for (var i = 0; i < 3; i++) { n++; } n", expectInt: 3)
+        evalCheck(ctx, "var i = 0; while (i < 5) i++; i", expectInt: 5)
+        evalCheck(ctx, "var s = 0, j = 0; do { s += j; j++; } while (j < 4); s", expectInt: 6)
+        evalCheck(ctx, """
+            function add3(a, b, c) { return a + b + c; }
+            var args = [1, 2, 3], t = 0;
+            for (var k = 0; k < 4; k++) t += add3(...args);
+            t
+            """, expectInt: 24)
+
     }
 
     mutating func runAPITests() -> String {
