@@ -409,6 +409,30 @@ final class FetchBridgeTests: XCTestCase {
         XCTAssertTrue(out.contains("\"rawBytes\":true"), out)
     }
 
+    /// The host app's own Blob/FormData polyfills use `parts` / `_entries`
+    /// instead of `__blobParts` / `__formEntries`; both shapes are accepted.
+    @MainActor
+    func testHostAppBlobAndFormDataShapes() async throws {
+        try skipIfNoServer()
+        let env = makeEnvironment()
+        let out = await runJS(env, """
+        var blobLike = { parts: ['ab', new Uint8Array([0, 255])], type: 'application/x-app', size: 4 };
+        var formLike = { _entries: [{ name: 'f', value: 'v' }] };
+        fetch('\(base)/echo', { method: 'POST', body: blobLike })
+          .then(function(r){ return r.arrayBuffer().then(function(b){
+            var u = new Uint8Array(b);
+            return fetch('\(base)/echo', { method: 'POST', body: formLike })
+              .then(function(r2){ return r2.text().then(function(t){
+                globalThis.__out = Array.prototype.join.call(u, ',') + '|' +
+                                   r.headers.get('content-type') + '|' +
+                                   (t.indexOf('name="f"') >= 0) + ',' + (t.indexOf('v') >= 0) + '|' +
+                                   (r2.headers.get('content-type') || '').split(';')[0];
+              }); });
+          }); }).catch(function(e){ globalThis.__out = 'ERR ' + e; });
+        """)
+        XCTAssertEqual(out, "97,98,0,255|application/x-app|true,true|multipart/form-data")
+    }
+
     // MARK: redirects
 
     @MainActor
@@ -639,6 +663,7 @@ final class FetchBridgeTests: XCTestCase {
         step();
         """, timeout: 120)
         XCTAssertEqual(out, "done:\(iterations)")
+        XCTAssertEqual(env.fetchBridge?.activeCount, 0, "every request must be retired")
         // Tear the runtime down so a JEFFJS_TRACK_RC=1 run reports what the
         // fetch path actually retains past teardown (should not scale with the
         // loop size).

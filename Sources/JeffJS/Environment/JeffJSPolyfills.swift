@@ -571,78 +571,79 @@ public enum JeffJSPolyfills {
       window.FormData = JFormData;
     }
 
-    // ---- Headers view over the native header map
-    function __makeHeaders(map) {
-      var hdr = { _map: {} };
+    // ---- Headers view over the native header map (methods live on the
+    // prototype so a response costs one object, not a dozen closures).
+    function JHeaders(map) {
+      this._map = {};
       for (var hk in map) {
-        if (map.hasOwnProperty(hk)) hdr._map[String(hk).toLowerCase()] = String(map[hk]);
+        if (map.hasOwnProperty(hk)) this._map[String(hk).toLowerCase()] = String(map[hk]);
       }
-      hdr.get = function(n) { var v = this._map[String(n).toLowerCase()]; return v !== undefined ? v : null; };
-      hdr.has = function(n) { return String(n).toLowerCase() in this._map; };
-      hdr.forEach = function(cb) { for (var k in this._map) { if (this._map.hasOwnProperty(k)) cb(this._map[k], k, this); } };
-      hdr.entries = function() { var a = []; for (var k in this._map) { if (this._map.hasOwnProperty(k)) a.push([k, this._map[k]]); } return a; };
-      hdr.keys = function() { var a = []; for (var k in this._map) { if (this._map.hasOwnProperty(k)) a.push(k); } return a; };
-      hdr.values = function() { var a = []; for (var k in this._map) { if (this._map.hasOwnProperty(k)) a.push(this._map[k]); } return a; };
-      hdr.set = function(n, v) { this._map[String(n).toLowerCase()] = String(v); };
-      hdr.append = function(n, v) { var k = String(n).toLowerCase(); this._map[k] = this._map[k] ? this._map[k] + ', ' + String(v) : String(v); };
-      hdr.delete = function(n) { delete this._map[String(n).toLowerCase()]; };
-      return hdr;
     }
+    JHeaders.prototype.get = function(n) { var v = this._map[String(n).toLowerCase()]; return v !== undefined ? v : null; };
+    JHeaders.prototype.has = function(n) { return String(n).toLowerCase() in this._map; };
+    JHeaders.prototype.forEach = function(cb) { for (var k in this._map) { if (this._map.hasOwnProperty(k)) cb(this._map[k], k, this); } };
+    JHeaders.prototype.entries = function() { var a = []; for (var k in this._map) { if (this._map.hasOwnProperty(k)) a.push([k, this._map[k]]); } return a; };
+    JHeaders.prototype.keys = function() { var a = []; for (var k in this._map) { if (this._map.hasOwnProperty(k)) a.push(k); } return a; };
+    JHeaders.prototype.values = function() { var a = []; for (var k in this._map) { if (this._map.hasOwnProperty(k)) a.push(this._map[k]); } return a; };
+    JHeaders.prototype.set = function(n, v) { this._map[String(n).toLowerCase()] = String(v); };
+    JHeaders.prototype.append = function(n, v) { var k = String(n).toLowerCase(); this._map[k] = this._map[k] ? this._map[k] + ', ' + String(v) : String(v); };
+    JHeaders.prototype.delete = function(n) { delete this._map[String(n).toLowerCase()]; };
+    window.__makeHeaders = function(map) { return new JHeaders(map); };
 
     // ---- Response built from the native payload object (bytes end to end).
+    function JResponse(p) {
+      var statusCode = Number(p.status || 0);
+      this.status = statusCode;
+      this.statusText = String(p.statusText || '');
+      this.ok = statusCode >= 200 && statusCode < 300;
+      this.headers = new JHeaders(p.headers || {});
+      this.url = String(p.url || '');
+      this.redirected = !!p.redirected;
+      this.type = String(p.type || 'basic');
+      this.bodyUsed = false;
+      this._payload = p;
+      this._bytes = p.bodyBytes || null;
+      this._textCache = undefined;
+    }
+    JResponse.prototype._text = function() {
+      if (this._textCache === undefined) {
+        this._textCache = (typeof this._payload.bodyText === 'function')
+          ? this._payload.bodyText()
+          : String(this._payload.body || '');
+      }
+      return this._textCache;
+    };
+    JResponse.prototype.text = function() { this.bodyUsed = true; return Promise.resolve(this._text()); };
+    JResponse.prototype.json = function() {
+      this.bodyUsed = true;
+      try { return Promise.resolve(JSON.parse(this._text())); }
+      catch (e) { return Promise.reject(e); }
+    };
+    JResponse.prototype.arrayBuffer = function() {
+      this.bodyUsed = true;
+      return Promise.resolve(this._bytes || __nativeFetch.encodeUTF8(this._text()));
+    };
+    JResponse.prototype.bytes = function() {
+      return this.arrayBuffer().then(function(b) { return new Uint8Array(b); });
+    };
+    JResponse.prototype.blob = function() {
+      this.bodyUsed = true;
+      var buf = this._bytes || __nativeFetch.encodeUTF8(this._text());
+      return Promise.resolve(new Blob([buf], {
+        type: this.headers.get('content-type') || String(this._payload.mimeType || '')
+      }));
+    };
+    JResponse.prototype.clone = function() {
+      var c = new JResponse(this._payload);
+      c._textCache = this._textCache;
+      return c;
+    };
+    window.Response = window.Response || JResponse;
+
     // `payload` is the bridge's 4th callback argument; `legacy` is the parsed
     // JSON string payload, used only when the native object is unavailable.
     window.__buildFetchResponse = function(payload, legacy) {
-      var p = payload || legacy || {};
-      var statusCode = Number(p.status || 0);
-      var hdr = __makeHeaders(p.headers || {});
-      var resp = {
-        status: statusCode,
-        statusText: String(p.statusText || ''),
-        ok: statusCode >= 200 && statusCode < 300,
-        headers: hdr,
-        url: String(p.url || ''),
-        redirected: !!p.redirected,
-        type: String(p.type || 'basic'),
-        bodyUsed: false,
-        _payload: p,
-        _bytes: p.bodyBytes || null,
-        _textCache: undefined,
-        _text: function() {
-          if (this._textCache === undefined) {
-            this._textCache = (typeof this._payload.bodyText === 'function')
-              ? this._payload.bodyText()
-              : String(this._payload.body || '');
-          }
-          return this._textCache;
-        },
-        text: function() { this.bodyUsed = true; return Promise.resolve(this._text()); },
-        json: function() {
-          this.bodyUsed = true;
-          var t = this._text();
-          try { return Promise.resolve(JSON.parse(t)); }
-          catch (e) { return Promise.reject(e); }
-        },
-        arrayBuffer: function() {
-          this.bodyUsed = true;
-          if (this._bytes) return Promise.resolve(this._bytes);
-          return Promise.resolve(__nativeFetch.encodeUTF8(this._text()));
-        },
-        bytes: function() {
-          var self = this;
-          return this.arrayBuffer().then(function(b) { return new Uint8Array(b); });
-        },
-        blob: function() {
-          this.bodyUsed = true;
-          var buf = this._bytes || __nativeFetch.encodeUTF8(this._text());
-          return Promise.resolve(new Blob([buf], { type: hdr.get('content-type') || String(p.mimeType || '') }));
-        },
-        clone: function() {
-          var c = {}; for (var k in this) c[k] = this[k];
-          c.bodyUsed = false; return c;
-        }
-      };
-      return resp;
+      return new JResponse(payload || legacy || {});
     };
 
     window.__fetchPending = {};

@@ -168,20 +168,32 @@ enum JeffJSFetchBodyExtractor {
         }
 
         if value.isObject {
-            // FormData-like
+            // FormData-like: `__formEntries`, or the host app's `_entries`
+            // ([{ name, value, filename }]).
             let entries = ctx.getPropertyStr(obj: value, name: "__formEntries")
             defer { entries.freeValue() }
             if entries.isObject {
                 return multipart(ctx: ctx, entries: entries)
             }
-            // Blob-like
+            let altEntries = ctx.getPropertyStr(obj: value, name: "_entries")
+            defer { altEntries.freeValue() }
+            if altEntries.isObject, looksLikeFormEntries(ctx: ctx, altEntries) {
+                return multipart(ctx: ctx, entries: altEntries)
+            }
+            // Blob-like: `__blobParts`, or the host app's `parts` (guarded by
+            // the Blob-ish `size`/`type` properties so a random object with a
+            // `parts` field is not mistaken for a Blob).
             let parts = ctx.getPropertyStr(obj: value, name: "__blobParts")
             defer { parts.freeValue() }
-            if parts.isObject {
+            let altParts = ctx.getPropertyStr(obj: value, name: "parts")
+            defer { altParts.freeValue() }
+            let blobParts: JeffJSValue? = parts.isObject ? parts
+                : (altParts.isObject && looksLikeBlob(ctx: ctx, value) ? altParts : nil)
+            if let blobParts {
                 let typeVal = ctx.getPropertyStr(obj: value, name: "type")
                 defer { typeVal.freeValue() }
                 let type = ctx.toSwiftString(typeVal) ?? ""
-                return JeffJSFetchBodyData(bytes: blobBytes(ctx: ctx, parts: parts),
+                return JeffJSFetchBodyData(bytes: blobBytes(ctx: ctx, parts: blobParts),
                                            contentType: type.isEmpty ? nil : type)
             }
             // URLSearchParams-like
@@ -198,6 +210,28 @@ enum JeffJSFetchBodyExtractor {
         let s = ctx.toSwiftString(value) ?? ""
         return JeffJSFetchBodyData(bytes: Array(s.utf8),
                                    contentType: "text/plain;charset=UTF-8")
+    }
+
+    /// `{ _entries: [{ name, value }] }` — the FormData shape used by the
+    /// host app's own polyfill.
+    private static func looksLikeFormEntries(ctx: JeffJSContext, _ entries: JeffJSValue) -> Bool {
+        guard ctx.getArrayLength(entries) > 0 else { return false }
+        let first = ctx.getPropertyUint32(obj: entries, index: 0)
+        defer { first.freeValue() }
+        guard first.isObject else { return false }
+        let name = ctx.getPropertyStr(obj: first, name: "name")
+        defer { name.freeValue() }
+        return !name.isUndefined
+    }
+
+    /// `{ parts: [...], size|type }` — the Blob shape used by the host app.
+    private static func looksLikeBlob(ctx: JeffJSContext, _ value: JeffJSValue) -> Bool {
+        let size = ctx.getPropertyStr(obj: value, name: "size")
+        defer { size.freeValue() }
+        if !size.isUndefined { return true }
+        let type = ctx.getPropertyStr(obj: value, name: "type")
+        defer { type.freeValue() }
+        return type.isString
     }
 
     /// Flatten `__blobParts` (strings, ArrayBuffers, TypedArrays, nested blobs).

@@ -17,13 +17,34 @@
 //            payloadObject | null, errorName | null)
 //
 // `payloadObject` (new, preferred) is a native object:
-//   { ok, status, statusText, url, redirected, type, headers, headerList,
+//   { ok, status, statusText, url, redirected, type, headers,
 //     bodyBytes: ArrayBuffer, byteLength, mimeType, charset,
 //     bodyText(): string, body: string (legacy, "" for binary) }
 //
 // `payloadJSON` keeps the historical string shape
-//   { ok, status, statusText, url, redirected, type, headers, body }
+//   { ok, status, statusText, url, redirected, type, headers, byteLength, body }
 // so existing JS glue keeps working while it migrates to bytes.
+//
+// Request options (object form — the JSON-string form still works and adds
+// `bodyBase64` for bytes):
+//   { method, headers: { name: value } | [[name, value], ...],
+//     body: String | ArrayBuffer | TypedArray | DataView
+//           | { __blobParts: [...], type } | { parts: [...], type, size }
+//           | { __formEntries: [{ name, value, filename, type }] } | { _entries: [...] }
+//           | { __urlSearchParams: "a=b&c=d" },
+//     credentials: "omit" | "same-origin" (default) | "include",
+//     mode: "cors" (default) | "no-cors" | "same-origin",
+//     cache: "default" | "no-store" | "reload" | "no-cache" | "force-cache" | "only-if-cached",
+//     redirect: "follow" (default) | "manual" | "error",
+//     signalId: String,          // pair with __nativeFetch.abortSignal(id)
+//     responseType: String }     // XHR hint, echoed back untouched
+//
+// XHR responseType mapping (the JS side picks the field it needs):
+//   ""/"text"     -> payload.bodyText()
+//   "arraybuffer" -> payload.bodyBytes
+//   "blob"        -> new Blob([payload.bodyBytes], { type: payload.mimeType })
+//   "json"        -> JSON.parse(payload.bodyText())
+//   "document"    -> payload.bodyText() (the host app parses it)
 //
 // Follows the same patterns as JeffJSDOMBridge for native function registration.
 
@@ -928,21 +949,11 @@ final class JeffJSFetchBridge {
 
         // headers: { lowercase-name: value }, set-cookie values joined with "\n"
         let headersObj = ctx.newPlainObject()
-        let headerList = ctx.newArray()
-        var idx: UInt32 = 0
         for (k, v) in result.headers.sorted(by: { $0.key < $1.key }) {
             let hv = ctx.newStringValue(v)
             _ = ctx.setPropertyStr(obj: headersObj, name: k, value: hv)
-            let pair = ctx.newArray()
-            let kk = ctx.newStringValue(k)
-            let vv = ctx.newStringValue(v)
-            ctx.setPropertyByIndex(obj: pair, index: 0, value: kk)
-            ctx.setPropertyByIndex(obj: pair, index: 1, value: vv)
-            ctx.setPropertyByIndex(obj: headerList, index: idx, value: pair)
-            idx += 1
         }
         _ = ctx.setPropertyStr(obj: obj, name: "headers", value: headersObj)
-        _ = ctx.setPropertyStr(obj: obj, name: "headerList", value: headerList)
 
         // bodyBytes: a real ArrayBuffer.
         let buffer = ctx.newArrayBufferValue(bytes: result.bytes)
