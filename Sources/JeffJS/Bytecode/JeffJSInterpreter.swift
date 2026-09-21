@@ -4022,6 +4022,7 @@ private func executeFastTrace(
         case .lnot:
             let val = buf[sp - 1]
             buf[sp - 1] = jeffJS_fastToBool(val) ? .JS_FALSE : .JS_TRUE
+            val.freeValue()   // the operand was the stack's; `!obj` is not free
             pc += 1
 
         case .typeof_:
@@ -4035,7 +4036,9 @@ private func executeFastTrace(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI32(bc, pc + 1))
-            if !jeffJS_fastToBool(cond) {
+            let branchTaken = !jeffJS_fastToBool(cond)
+            cond.freeValue()   // popped: an object condition is a reference
+            if branchTaken {
                 let target = pc + 5 + offset
                 if target < 0 || target >= bcLen {
                     resume = target; break traceLoop // loop exit
@@ -4057,7 +4060,9 @@ private func executeFastTrace(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI32(bc, pc + 1))
-            if jeffJS_fastToBool(cond) {
+            let branchTaken = jeffJS_fastToBool(cond)
+            cond.freeValue()   // popped: an object condition is a reference
+            if branchTaken {
                 let target = pc + 5 + offset
                 if target < 0 || target >= bcLen {
                     resume = target; break traceLoop // loop exit
@@ -4079,7 +4084,9 @@ private func executeFastTrace(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI8(bc, pc + 1))
-            if !jeffJS_fastToBool(cond) {
+            let branchTaken = !jeffJS_fastToBool(cond)
+            cond.freeValue()   // popped: an object condition is a reference
+            if branchTaken {
                 let target = pc + 2 + offset
                 if target < 0 || target >= bcLen {
                     resume = target; break traceLoop
@@ -4134,7 +4141,9 @@ private func executeFastTrace(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI8(bc, pc + 1))
-            if jeffJS_fastToBool(cond) {
+            let branchTaken = jeffJS_fastToBool(cond)
+            cond.freeValue()   // popped: an object condition is a reference
+            if branchTaken {
                 let target = pc + 2 + offset
                 if target < 0 || target >= bcLen {
                     resume = target; break traceLoop
@@ -5292,6 +5301,7 @@ private func executeFastTraceLean(
         case .lnot:
             let val = buf[sp - 1]
             buf[sp - 1] = jeffJS_fastToBool(val) ? .JS_FALSE : .JS_TRUE
+            val.freeValue()   // the operand was the stack's; `!obj` is not free
             pc += 1
 
         case .typeof_:
@@ -5305,7 +5315,9 @@ private func executeFastTraceLean(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI32(bc, pc + 1))
-            if !jeffJS_fastToBool(cond) {
+            let branchTaken = !jeffJS_fastToBool(cond)
+            cond.freeValue()   // popped: an object condition is a reference
+            if branchTaken {
                 let target = pc + 5 + offset
                 if target < entryPC || target >= exitPC {
                     ctx.interruptCounter = interrupt; return target // loop exit
@@ -5328,7 +5340,9 @@ private func executeFastTraceLean(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI32(bc, pc + 1))
-            if jeffJS_fastToBool(cond) {
+            let branchTaken = jeffJS_fastToBool(cond)
+            cond.freeValue()   // popped: an object condition is a reference
+            if branchTaken {
                 let target = pc + 5 + offset
                 if target < entryPC || target >= exitPC {
                     ctx.interruptCounter = interrupt; return target // loop exit
@@ -5351,7 +5365,9 @@ private func executeFastTraceLean(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI8(bc, pc + 1))
-            if !jeffJS_fastToBool(cond) {
+            let branchTaken = !jeffJS_fastToBool(cond)
+            cond.freeValue()   // popped: an object condition is a reference
+            if branchTaken {
                 let target = pc + 2 + offset
                 if target < entryPC || target >= exitPC {
                     ctx.interruptCounter = interrupt; return target
@@ -5408,7 +5424,9 @@ private func executeFastTraceLean(
             sp -= 1
             let cond = buf[sp]
             let offset = Int(readI8(bc, pc + 1))
-            if jeffJS_fastToBool(cond) {
+            let branchTaken = jeffJS_fastToBool(cond)
+            cond.freeValue()   // popped: an object condition is a reference
+            if branchTaken {
                 let target = pc + 2 + offset
                 if target < entryPC || target >= exitPC {
                     ctx.interruptCounter = interrupt; return target
