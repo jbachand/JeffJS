@@ -3479,7 +3479,18 @@ final class JeffJSParser {
 
             // Check for field (no parentheses after name)
             if tok != 0x28 && propKind == .method { // not a method
-                // Class field
+                // Class field. Stack here: ..., ctorFunc, proto[, key].
+                // A static field is defined on the constructor, an instance
+                // field on the prototype, so a static member needs the ctor
+                // moved above the prototype for the define below.
+                if isStatic {
+                    if isComputed {
+                        emitOp(.rot3l)   // ..., proto, key, ctorFunc
+                        emitOp(.swap)    // ..., proto, ctorFunc, key
+                    } else {
+                        emitOp(.swap)    // ..., proto, ctorFunc
+                    }
+                }
                 if tok == 0x3D { // '=' initializer
                     next()
                     parseAssignExpr()
@@ -3488,8 +3499,12 @@ final class JeffJSParser {
                 }
                 if isComputed {
                     emitOp(.define_array_el)
+                    emitOp(.drop)        // discard the next-index it pushes
                 } else {
                     emitDefineField(propAtom)
+                }
+                if isStatic {
+                    emitOp(.swap)        // restore ..., ctorFunc, proto
                 }
                 expectSemicolon()
                 continue

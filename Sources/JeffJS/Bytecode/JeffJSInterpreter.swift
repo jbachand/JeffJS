@@ -863,6 +863,11 @@ extension JeffJSContext {
         let desc = rt.atomToString(atom) ?? ""
         let atomStr = JeffJSString(swiftString: desc)
         atomStr.atomType = JSAtomType.symbol.rawValue
+        if isPrivate {
+            // The property key of a private name is a unique private atom,
+            // never the description string (a public `x` must not alias `#x`).
+            atomStr.cachedAtom = rt.newPrivateAtom(desc)
+        }
         return JeffJSValue.mkPtr(tag: .symbol, ptr: atomStr)
     }
 
@@ -1001,77 +1006,125 @@ extension JeffJSContext {
         return result
     }
 
-    // MARK: - Brand / Private Field Stubs
+    // MARK: - Brand / Private Fields
 
-    /// Checks if an object has a private brand.
-    /// Private brands are used by the spec to enforce that private field access
-    /// only works on instances that were constructed by the right class.
-    /// The brand is stored as a symbol-keyed property on the object.
-    func checkBrand(obj: JeffJSValue, brand: JeffJSValue) -> Bool {
-        guard let jsObj = obj.toObject() else { return false }
-        // Check if the object has the brand symbol as a property
-        if brand.isSymbol, let symStr = brand.toPtr() as? JeffJSString {
-            let key = symStr.toSwiftString()
-            let atom = rt.findAtom(key)
-            let has = hasProperty(obj: obj, atom: atom)
-            rt.freeAtom(atom)
-            return has
-        }
-        // If brand is not a symbol, this is likely a class without private fields;
-        // return true to allow access
-        return true
+    /// Property-key atom of a private symbol (owned reference), or 0 when the
+    /// value is not a private symbol. Private symbols carry their unique
+    /// `JS_ATOM_TYPE_PRIVATE` atom in `cachedAtom` (see `newSymbolFromAtom`).
+    @inline(__always)
+    func privateKeyAtom(_ field: JeffJSValue) -> UInt32 {
+        guard field.isSymbol, let symStr = field.toPtr() as? JeffJSString,
+              symStr.cachedAtom != 0 else { return 0 }
+        return rt.findAtom(jsString: symStr)
     }
 
-    /// Adds a private brand to an object.
-    /// Marks the object as being an instance of the class that owns the private fields.
-    func addBrand(obj: JeffJSValue, brand: JeffJSValue) {
-        if brand.isSymbol, let symStr = brand.toPtr() as? JeffJSString {
-            let key = symStr.toSwiftString()
-            let atom = rt.findAtom(key)
-            _ = setProperty(obj: obj, atom: atom, value: .newBool(true))
-            rt.freeAtom(atom)
-            // Don't free atom — setProperty stores it in the shape.
-        }
+    /// The hidden key under which a home object (class prototype or
+    /// constructor) stores its private brand symbol.
+    func privateBrandKeyAtom() -> UInt32 {
+        if privateBrandAtom == 0 { privateBrandAtom = rt.newPrivateAtom("<brand>") }
+        return privateBrandAtom
     }
 
-    /// Gets a private field value from an object.
-    /// Private fields are stored as symbol-keyed properties.
+    /// Brand symbol of a home object, creating it on first use when `create`.
+    private func homeObjectBrand(_ home: JeffJSObject, create: Bool) -> JeffJSValue? {
+        let homeVal = JeffJSValue.makeObjectRecycled(home)
+        let key = privateBrandKeyAtom()
+        if case .value(let v)? = getOwnProperty(obj: homeVal, atom: key) {
+            return v
+        }
+        guard create else { return nil }
+        let brand = newSymbolFromAtom(privateBrandKeyAtom(), isPrivate: true)
+        _ = definePropertyValue(obj: homeVal, atom: key, value: brand.dupValue(),
+                                 flags: JS_PROP_CONFIGURABLE)
+        // The property holds a reference; the returned value is borrowed.
+        brand.freeValue()
+        return brand
+    }
+
+    /// `check_brand`: verify that `obj` was branded by the home object of the
+    /// private method `funcVal` (QuickJS `JS_CheckBrand`).
+    func checkBrand(obj: JeffJSValue, funcVal: JeffJSValue) -> Bool {
+        guard obj.isObject, let funcObj = funcVal.toObject(),
+              case .bytecodeFunc(_, _, let homeObj) = funcObj.payload,
+              let home = homeObj,
+              let brand = homeObjectBrand(home, create: false) else { return false }
+        let brandAtom = privateKeyAtom(brand)
+        if brandAtom == 0 { return false }
+        let has = getOwnProperty(obj: obj, atom: brandAtom) != nil
+        rt.freeAtom(brandAtom)
+        return has
+    }
+
+    /// `add_brand`: brand `obj` with the private brand of `homeObj`
+    /// (QuickJS `JS_AddBrand`). Called at the start of the instance fields
+    /// initializer (home = prototype) and the static initializer (home = ctor).
+    func addBrand(obj: JeffJSValue, homeObj: JeffJSValue) {
+        guard let home = homeObj.toObject(),
+              let brand = homeObjectBrand(home, create: true) else { return }
+        let brandAtom = privateKeyAtom(brand)
+        if brandAtom == 0 { return }
+        if getOwnProperty(obj: obj, atom: brandAtom) == nil {
+            _ = definePropertyValue(obj: obj, atom: brandAtom, value: .newBool(true),
+                                     flags: JS_PROP_CONFIGURABLE)
+        }
+        rt.freeAtom(brandAtom)
+    }
+
+    /// Gets a private field value from an object (own private property only).
     func getPrivateField(obj: JeffJSValue, field: JeffJSValue) -> JeffJSValue {
-        if field.isSymbol, let symStr = field.toPtr() as? JeffJSString {
-            let key = symStr.toSwiftString()
-            let atom = rt.findAtom(key)
-            let val = getProperty(obj: obj, atom: atom)
-            rt.freeAtom(atom)
-            return val
+        let atom = privateKeyAtom(field)
+        if atom == 0 { return throwTypeError(message: "cannot read private field") }
+        defer { rt.freeAtom(atom) }
+        guard obj.isObject, getOwnProperty(obj: obj, atom: atom) != nil else {
+            return throwTypeError(message: "cannot read private member \(privateFieldName(field)) from an object whose class did not declare it")
         }
-        _ = throwTypeError(message: "cannot read private field")
-        return .exception
+        return getProperty(obj: obj, atom: atom)
     }
 
-    /// Sets a private field value on an object.
+    /// Sets a private field value on an object (the field must already exist).
     func putPrivateField(obj: JeffJSValue, field: JeffJSValue, val: JeffJSValue) -> Bool {
-        if field.isSymbol, let symStr = field.toPtr() as? JeffJSString {
-            let key = symStr.toSwiftString()
-            let atom = rt.findAtom(key)
-            let ok = setProperty(obj: obj, atom: atom, value: val) >= 0
-            rt.freeAtom(atom)
-            // Don't free atom — setProperty stores it in the shape.
-            return ok
+        let atom = privateKeyAtom(field)
+        if atom == 0 { _ = throwTypeError(message: "cannot write private field"); return false }
+        defer { rt.freeAtom(atom) }
+        guard obj.isObject, getOwnProperty(obj: obj, atom: atom) != nil else {
+            _ = throwTypeError(message: "cannot write private member \(privateFieldName(field)) to an object whose class did not declare it")
+            return false
         }
-        _ = throwTypeError(message: "cannot write private field")
-        return false
+        return setProperty(obj: obj, atom: atom, value: val) >= 0
     }
 
     /// Defines a new private field on an object.
-    func definePrivateField(obj: JeffJSValue, field: JeffJSValue, val: JeffJSValue) {
-        if field.isSymbol, let symStr = field.toPtr() as? JeffJSString {
-            let key = symStr.toSwiftString()
-            let atom = rt.findAtom(key)
-            _ = definePropertyValue(obj: obj, atom: atom, value: val,
-                                     flags: JS_PROP_C_W_E)
-            rt.freeAtom(atom)
-            // Don't free atom — definePropertyValue stores it in the shape.
+    func definePrivateField(obj: JeffJSValue, field: JeffJSValue, val: JeffJSValue) -> Bool {
+        let atom = privateKeyAtom(field)
+        if atom == 0 { _ = throwTypeError(message: "cannot define private field"); return false }
+        defer { rt.freeAtom(atom) }
+        guard obj.isObject else {
+            _ = throwTypeError(message: "cannot define private field on a non-object"); return false
         }
+        if getOwnProperty(obj: obj, atom: atom) != nil {
+            _ = throwTypeError(message: "private member \(privateFieldName(field)) is already defined")
+            return false
+        }
+        return definePropertyValue(obj: obj, atom: atom, value: val, flags: JS_PROP_C_W_E) >= 0
+    }
+
+    /// `#x in obj`: `key` is either the private symbol of a field or the
+    /// function of a private method/accessor (then it is a brand check).
+    func privateIn(obj: JeffJSValue, key: JeffJSValue) -> JeffJSValue {
+        guard obj.isObject else {
+            return throwTypeError(message: "invalid 'in' operand")
+        }
+        if key.isObject { return .newBool(checkBrand(obj: obj, funcVal: key)) }
+        let atom = privateKeyAtom(key)
+        if atom == 0 { return .newBool(false) }
+        let has = getOwnProperty(obj: obj, atom: atom) != nil
+        rt.freeAtom(atom)
+        return .newBool(has)
+    }
+
+    private func privateFieldName(_ field: JeffJSValue) -> String {
+        if let symStr = field.toPtr() as? JeffJSString { return symStr.toSwiftString() }
+        return "#<private>"
     }
 
     // MARK: - Async Function Support
@@ -1549,6 +1602,22 @@ extension JeffJSContext {
             }
             return .newUInt32(nextIdx)
         }
+        // Non-integer key (computed class field `[k] = v`): define an own
+        // data property, like QuickJS's OP_define_array_el on a property key.
+        let key = toPropertyKey(idx)
+        if key.isException { return .exception }
+        let atom: UInt32
+        if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
+            atom = rt.findAtom(jsString: symStr)
+        } else if let str = key.stringValue {
+            atom = rt.findAtom(jsString: str)
+        } else {
+            key.freeValue()
+            return .newInt32(0)
+        }
+        key.freeValue()
+        _ = definePropertyValue(obj: obj, atom: atom, value: val, flags: JS_PROP_C_W_E)
+        rt.freeAtom(atom)
         return .newInt32(0)
     }
 
@@ -1837,7 +1906,8 @@ extension JeffJSContext {
                 if let idx = rt.atomToUInt32(atom) { intKeys.append(idx) }
             } else if let entry = rt.atomArray[Int(atom)],
                       entry.atomType != .JS_ATOM_TYPE_SYMBOL,
-                      entry.atomType != .JS_ATOM_TYPE_GLOBAL_SYMBOL {
+                      entry.atomType != .JS_ATOM_TYPE_GLOBAL_SYMBOL,
+                      entry.atomType != .JS_ATOM_TYPE_PRIVATE {
                 keys.append(atomToString(atom))
             }
         }
@@ -6475,6 +6545,17 @@ struct JeffJSInterpreter {
                             }
                             pc += 2
                             continue dispatchLoop
+                        case .private_in:
+                            // obj key -> bool
+                            let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                            let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                            let res = ctx.privateIn(obj: obj, key: key)
+                            key.freeValue()
+                            obj.freeValue()
+                            if res.isException { retVal = .exception; break dispatchLoop }
+                            buf[sp] = res; sp += 1
+                            pc += 2
+                            continue dispatchLoop
                         case .with_get_var, .with_put_var, .with_delete_var,
                              .with_make_ref, .with_get_ref, .with_get_ref_undef:
                             // Evicted to the wide range (see JeffJSOpcode). Skip
@@ -6817,6 +6898,18 @@ struct JeffJSInterpreter {
             case .swap:
                 let a = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let b = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 buf[sp] = a; sp += 1; buf[sp] = b; sp += 1
+                pc += 1
+
+            case .private_in:
+                // Wide opcode: normally dispatched through the 0x00 prefix
+                // path; handled here too so the switch stays exhaustive.
+                let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let res = ctx.privateIn(obj: obj, key: key)
+                key.freeValue()
+                obj.freeValue()
+                if res.isException { retVal = .exception; break dispatchLoop }
+                buf[sp] = res; sp += 1
                 pc += 1
 
             case .swap2:
@@ -7621,19 +7714,24 @@ struct JeffJSInterpreter {
                 pc += 1
 
             case .check_brand:
-                let brand = buf[sp - 1]
+                // obj func -> obj func: `func` is a private method/accessor
+                // whose home object carries the brand.
+                let funcVal = buf[sp - 1]
                 let obj = buf[sp - 2]
-                if !ctx.checkBrand(obj: obj, brand: brand) {
-                    _ = ctx.throwTypeError(message: "private member access denied")
+                if !ctx.checkBrand(obj: obj, funcVal: funcVal) {
+                    _ = ctx.throwTypeError(message: "invalid brand on object")
                     retVal = .exception
                     break dispatchLoop
                 }
                 pc += 1
 
             case .add_brand:
-                let brand = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                // obj home_obj -> ()
+                let homeObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                ctx.addBrand(obj: obj, brand: brand)
+                ctx.addBrand(obj: obj, homeObj: homeObj)
+                homeObj.freeValue()
+                obj.freeValue()
                 pc += 1
 
             case .return_async:
@@ -8198,32 +8296,59 @@ struct JeffJSInterpreter {
                 pc += 5
 
             case .get_private_field:
-                let field = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                // get_private_field(atom): obj -> val. The private name is an
+                // inline atom (`#x`), never a public property name, so a plain
+                // property read cannot collide with a public `x`. Private
+                // methods live on the home object, hence the prototype walk.
+                let atom = readU32(bc, pc + 1)
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                let val = ctx.getPrivateField(obj: obj, field: field)
+                var val: JeffJSValue
+                if !obj.isObject || !ctx.hasProperty(obj: obj, atom: atom) {
+                    let name = ctx.rt.atomToString(atom) ?? "#<private>"
+                    val = ctx.throwTypeError(message: "cannot read private member \(name) from an object whose class did not declare it")
+                } else {
+                    val = ctx.getProperty(obj: obj, atom: atom)
+                }
+                obj.freeValue()
                 if val.isException {
                     retVal = .exception
                     break dispatchLoop
                 }
                 buf[sp] = val; sp += 1
-                pc += 1
+                pc += 5
 
             case .put_private_field:
+                // put_private_field(atom): obj val -> ()
+                let atom = readU32(bc, pc + 1)
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                let field = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                let ok = ctx.putPrivateField(obj: obj, field: field, val: val)
+                var ok = obj.isObject && ctx.hasProperty(obj: obj, atom: atom)
+                if !ok {
+                    let name = ctx.rt.atomToString(atom) ?? "#<private>"
+                    _ = ctx.throwTypeError(message: "cannot write private member \(name) to an object whose class did not declare it")
+                } else {
+                    ok = ctx.setProperty(obj: obj, atom: atom, value: val) >= 0
+                }
+                obj.freeValue()
                 if !ok {
                     retVal = .exception
                     break dispatchLoop
                 }
-                pc += 1
+                pc += 5
 
             case .define_private_field:
+                // obj field val -> ()
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let field = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                ctx.definePrivateField(obj: obj, field: field, val: val)
+                let ok = ctx.definePrivateField(obj: obj, field: field, val: val)
+                val.freeValue()
+                field.freeValue()
+                obj.freeValue()
+                if !ok {
+                    retVal = .exception
+                    break dispatchLoop
+                }
                 pc += 1
 
             // -----------------------------------------------------------------

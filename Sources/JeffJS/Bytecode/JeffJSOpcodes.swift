@@ -489,6 +489,7 @@ enum JeffJSOpcode: UInt16, CaseIterable {
     case swap2                   // swap top 2 pairs   (never emitted; parked in the wide range)
     case dup1                    // duplicate top and second element   (never emitted; parked in the wide range)
     case init_this               // super(...) result -> frame this (derived class constructors; wide range)
+    case private_in              // `#x in obj`: obj key(private symbol | private method) -> bool
 }
 
 // MARK: - Opcode Info Table
@@ -726,11 +727,12 @@ let jeffJSOpcodeInfo: [OpcodeInfo] = [
     // put_field: obj val -> (obj.prop = val)
     OpcodeInfo(name: "put_field",        size: 5, nPop: 2,  nPush: 0,  format: .atom),
 
-    // get_private_field: obj -> val
-    OpcodeInfo(name: "get_private_field",size: 1, nPop: 2,  nPush: 1,  format: .none),
+    // get_private_field(atom): obj -> val   (the parser emits the private
+    // name as an inline atom, like get_field)
+    OpcodeInfo(name: "get_private_field",size: 5, nPop: 1,  nPush: 1,  format: .atom),
 
-    // put_private_field: obj val -> ()
-    OpcodeInfo(name: "put_private_field",size: 1, nPop: 3,  nPush: 0,  format: .none),
+    // put_private_field(atom): obj val -> ()
+    OpcodeInfo(name: "put_private_field",size: 5, nPop: 2,  nPush: 0,  format: .atom),
 
     // define_private_field: obj val -> ()
     OpcodeInfo(name: "define_private_field", size: 1, nPop: 3, nPush: 0, format: .none),
@@ -1261,6 +1263,7 @@ let jeffJSOpcodeInfo: [OpcodeInfo] = [
     OpcodeInfo(name: "dup1",             size: 1, nPop: 2,  nPush: 3,  format: .none),
     // init_this: pop the parent constructor's result, bind it as `this`, push it back
     OpcodeInfo(name: "init_this",        size: 1, nPop: 1,  nPush: 1,  format: .none),
+    OpcodeInfo(name: "private_in",       size: 1, nPop: 2,  nPush: 1,  format: .none),
 ]
 
 // MARK: - Opcode Lookup Helpers
@@ -1437,6 +1440,7 @@ enum ThrowErrorType: UInt8 {
     case invalidOrDestructuring = 3   // invalid destructuring target
     case notDefined             = 4   // variable not defined
     case constAssign            = 5   // assignment to const variable
+    case privateAccess          = 6   // invalid private member read/write (message is the atom)
 }
 
 // MARK: - Compile-time Assertions
