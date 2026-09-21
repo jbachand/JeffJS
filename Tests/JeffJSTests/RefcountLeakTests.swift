@@ -113,6 +113,32 @@ final class RefcountLeakTests: XCTestCase {
         assertFlat("never settles", "for (var i=0;i<$N;i++){ new Promise(function(){}).then(function(v){ return v }); }")
     }
 
+    func testBranchConditionsDoNotRetainTheirOperand() {
+        // Neither trace interpreter released the condition `if_false`,
+        // `if_true` and `lnot` pop. A bool condition costs nothing; an object
+        // one is a reference, and `if (node)` / `if (!a || !b)` is what a
+        // virtual-DOM diff is made of.
+        assertFlat("if (obj)",   "function d(o){ if (o) return 1; return 0 } var s=0; for (var i=0;i<$N;i++) s+=d({x:i});")
+        assertFlat("if (!obj)",  "function d(o){ if (!o) return 0; return 1 } var s=0; for (var i=0;i<$N;i++) s+=d({x:i});")
+        assertFlat("!! in expr", "var s=0; for (var i=0;i<$N;i++){ var o={x:i}; s += !!o ? 1 : 0; o=null; }")
+        assertFlat("|| chain",   "function d(a,b){ if (!a || !b) return 0; return 1 } var s=0; for (var i=0;i<$N;i++) s+=d({x:i},{y:i});")
+        // The whole re-render shape: build a small tree, diff it against the
+        // previous one, drop the previous one. Every pass used to leak a tree.
+        assertFlat("build and diff a tree", """
+            function ce(t,p,c){ return { type:t, props:p, children:c } }
+            function build(seed){ var cells=[];
+              for (var j=0;j<8;j++) (function(j){ cells.push(ce("td",{ c:"c"+j, onClick:function(){ return j+seed } },null)) })(j);
+              return ce("tr",{ key:seed },cells) }
+            function diff(a,b,out){ if (!a || !b) { out.push(1); return }
+              if (a.type !== b.type) { out.push(2); return }
+              var ca=a.children||[], cb=b.children||[];
+              for (var i=0;i<ca.length;i++) diff(ca[i],cb[i],out) }
+            var prev = build(0);
+            for (var i=0;i<$N;i++){ var next=build(i); var out=[]; diff(prev,next,out); prev=next; }
+            prev = null;
+            """, slack: 512)
+    }
+
     func testCommonRenderShapesStayFlat() {
         let rows = "var src=[{id:1,n:'a'},{id:2,n:'b'},{id:3,n:'c'}];"
         assertFlat("map spread",   rows + "for (var i=0;i<$N;i++){ var r=src.map(function(x){ return {...x} }); r=null; }")
