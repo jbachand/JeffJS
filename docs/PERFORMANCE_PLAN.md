@@ -813,6 +813,29 @@ collected now.
   481/942/1864 MB and are now 109/111/110 MB — flat. `JeffJSEnvironment.runGC()`
   and `gcStatistics` are public; the CLI exposes `__gc()` / `__gcStats()`.
 
+### testSuspectGroups: a freed runtime handed to the next group
+
+`EngineTests/testSuspectGroups` trapped in `findHashedShapeProto` when
+ErrorHandling ran after ES262CriticalSubset. Four test groups end with
+`ctx.rt.free()` on the *shared* runtime and leave `JeffJSTestRunner`'s cached
+`_sharedRt`/`_sharedCtx` pointing at it, so the next group's `makeCtx()`
+hands back a context whose runtime has been torn down. `runAllTests` hides it
+by calling `cleanupSharedContext()` between groups; `testSuspectGroups` runs
+them back to back and does not. They now tear down through
+`cleanupSharedContext()`, which frees the context *before* the runtime and
+drops the cache.
+
+The engine side was two invariant repairs, so that an out-of-order teardown
+degrades instead of trapping:
+- `JeffJSRuntime.free()` leaves `shapeHashSize` behind when it empties
+  `shapeHash`, and every shape lookup guards on `shapeHashSize > 0` and then
+  indexes the array. That is an out-of-range trap, not a miss. The size is
+  reset with the table.
+- `clearGCState` now runs in dependency order — JS objects, then var-refs,
+  then shapes — instead of interleaving the three in one pass, and holds a
+  strong snapshot while it works: emptying one object drops ARC references
+  that can deallocate another header in the same list.
+
 Found, not fixed:
 - **`arr.push(o)` leaks `o` when `o` holds a function.** 40 000 iterations of
   `arr.push({ type: "d", onClick: function () { return i; } })` followed by

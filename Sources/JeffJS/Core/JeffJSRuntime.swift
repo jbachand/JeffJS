@@ -794,9 +794,15 @@ final class JeffJSRuntime {
         classArray = []
         classCount = 0
 
-        // Free shapes
+        // Free shapes. `shapeHashSize` must go with the table: every lookup
+        // guards on `shapeHashSize > 0` and then indexes `shapeHash`, so
+        // leaving the size behind turns any later use of the runtime into an
+        // out-of-range trap inside findHashedShapeProto instead of a clean
+        // miss. (A freed runtime should not be used again, but a test group or
+        // a host that frees out of order must not take the process down.)
         shapeHash = []
         shapeHashCount = 0
+        shapeHashSize = 0
 
         // Clear exception
         currentException = .null

@@ -7594,7 +7594,11 @@ extension JeffJSTestRunner {
             inst instanceof ns.Foo
             """, expect: true)
 
-        ctx.rt.free()
+        // The shared runtime is torn down here, so the cached context must go
+        // with it: `makeCtx()` would otherwise hand the next group a context
+        // whose runtime has been freed (its shape table, atoms and GC lists
+        // are gone), which is what made testSuspectGroups trap.
+        JeffJSTestRunner.cleanupSharedContext()
     }
 
     // MARK: - Modules and Import Patterns
@@ -9074,7 +9078,11 @@ extension JeffJSTestRunner {
             test()
             """, expect: true)
 
-        ctx.rt.free()
+        // The shared runtime is torn down here, so the cached context must go
+        // with it: `makeCtx()` would otherwise hand the next group a context
+        // whose runtime has been freed (its shape table, atoms and GC lists
+        // are gone), which is what made testSuspectGroups trap.
+        JeffJSTestRunner.cleanupSharedContext()
     }
 
     // MARK: - test262 Critical Subset
@@ -10008,7 +10016,11 @@ extension JeffJSTestRunner {
             assert.sameValue(undefined == false, false, 'undefined != false');
             """, name: "test262/equality/abstract-edge-cases")
 
-        ctx.rt.free()
+        // The shared runtime is torn down here, so the cached context must go
+        // with it: `makeCtx()` would otherwise hand the next group a context
+        // whose runtime has been freed (its shape table, atoms and GC lists
+        // are gone), which is what made testSuspectGroups trap.
+        JeffJSTestRunner.cleanupSharedContext()
     }
 
     mutating func testES262CriticalSubsetPart2() {
@@ -10572,7 +10584,11 @@ extension JeffJSTestRunner {
             }
             """, name: "test262/String/replace/S15.5.4.11_A1_T11")
 
-        ctx.rt.free()
+        // The shared runtime is torn down here, so the cached context must go
+        // with it: `makeCtx()` would otherwise hand the next group a context
+        // whose runtime has been freed (its shape table, atoms and GC lists
+        // are gone), which is what made testSuspectGroups trap.
+        JeffJSTestRunner.cleanupSharedContext()
     }
 
     // MARK: - Spec Compliance Tests (previously unimplemented features)
