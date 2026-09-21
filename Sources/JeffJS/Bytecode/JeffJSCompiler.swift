@@ -1686,7 +1686,10 @@ struct JeffJSCompiler {
                 }
                 if op == .push_const, let ar = fusedArithSubOp(n) {
                     let k = readU32(srcBuf, pos + 1)
-                    if k < 256 {
+                    // arith_const8 is a Number-only superinstruction; a BigInt
+                    // constant has to keep its generic push_const + op form.
+                    let kIsBigInt = Int(k) < fd.cpool.count && fd.cpool[Int(k)].isBigInt
+                    if k < 256 && !kIsBigInt {
                         bc.putOpcode(JeffJSOpcode.arith_const8.rawValue)
                         bc.putU8(ar); bc.putU8(UInt8(k))
                         pos = nextPos + 1

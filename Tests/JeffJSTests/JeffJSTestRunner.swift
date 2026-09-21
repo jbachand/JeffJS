@@ -3381,59 +3381,238 @@ extension JeffJSTestRunner {
 
     // MARK: - BigInt
 
+    /// Every expectation below was diffed against `qjs` (quickjs-ng) output,
+    /// except the two marked cases: `BigInt.asUintN(64, -1n)` (qjs returns
+    /// -1n, which contradicts the spec and JavaScriptCore) and
+    /// `toLocaleString` grouping (implementation-defined; JeffJS groups like
+    /// its own Number.prototype.toLocaleString).
     mutating func testBigInt() {
         let (rt, ctx) = makeCtx()
         // Shared context — don't free per-test
 
-        // NOTE: BigInt literal syntax (42n) is not yet fully supported.
-        // The parser currently treats `42n` as a regular number `42`.
-        // These tests reflect current behavior rather than spec.
+        // -- Literals and typeof --
+        evalCheckStr(ctx, "typeof 1n", expect: "bigint")
+        evalCheckStr(ctx, "typeof BigInt", expect: "function")
+        evalCheckStr(ctx, "typeof Object(1n)", expect: "object")
+        evalCheckStr(ctx, "String(1n)", expect: "1")
+        evalCheckStr(ctx, "String(0n)", expect: "0")
+        evalCheckStr(ctx, "String(-0n)", expect: "0")
+        evalCheckStr(ctx, "String(0x1fn)", expect: "31")
+        evalCheckStr(ctx, "String(0o777n)", expect: "511")
+        evalCheckStr(ctx, "String(0b1011n)", expect: "11")
+        evalCheckStr(ctx, "String(1_000_000n)", expect: "1000000")
+        evalCheckStr(ctx, "String(0x_ff_ffn)", expect: "65535")
+        evalCheckStr(ctx, "String(123456789012345678901234567890n)",
+                     expect: "123456789012345678901234567890")
+        evalCheckStr(ctx, "String(9007199254740993n)", expect: "9007199254740993")
+        evalCheckException(ctx, "1.5n")
+        evalCheckException(ctx, "1e3n")
+        evalCheckException(ctx, "01n")
 
-        // typeof with BigInt literal — currently returns "number" since
-        // the parser doesn't distinguish the `n` suffix yet.
-        evalCheckStr(ctx, "typeof 42n", expect: "number")
+        // -- Arithmetic --
+        evalCheckStr(ctx, "String(2n**64n)", expect: "18446744073709551616")
+        evalCheckStr(ctx, "String(2n**128n)",
+                     expect: "340282366920938463463374607431768211456")
+        evalCheckStr(ctx, "String(1n+2n)", expect: "3")
+        evalCheckStr(ctx, "String(-5n+3n)", expect: "-2")
+        evalCheckStr(ctx, "String(10n-20n)", expect: "-10")
+        evalCheckStr(ctx, "String(123456789n*987654321n)", expect: "121932631112635269")
+        evalCheckStr(ctx, "String((2n**100n)*(2n**100n))",
+                     expect: "1606938044258990275541962092341162602522202993782792835301376")
+        evalCheckStr(ctx, "String(7n/2n)", expect: "3")
+        evalCheckStr(ctx, "String(-7n/2n)", expect: "-3")
+        evalCheckStr(ctx, "String(7n/-2n)", expect: "-3")
+        evalCheckStr(ctx, "String(-7n/-2n)", expect: "3")
+        evalCheckStr(ctx, "String(7n%3n)", expect: "1")
+        evalCheckStr(ctx, "String(-7n%3n)", expect: "-1")
+        evalCheckStr(ctx, "String(7n%-3n)", expect: "1")
+        evalCheckStr(ctx, "String((2n**100n)/(3n**20n))", expect: "363558641556578823726")
+        evalCheckStr(ctx, "String((2n**100n)%(3n**20n))", expect: "1957707250")
+        evalCheckStr(ctx, "String(2n**0n)", expect: "1")
+        evalCheckStr(ctx, "String(0n**0n)", expect: "1")
+        evalCheckStr(ctx, "String((-2n)**3n)", expect: "-8")
+        evalCheckStr(ctx, "String((-2n)**4n)", expect: "16")
+        evalCheckStr(ctx, "String(-(2n**64n))", expect: "-18446744073709551616")
 
-        // BigInt arithmetic — works as regular number arithmetic
-        evalCheckBool(ctx, "1n + 2n === 3n", expect: true)
-        evalCheckBool(ctx, "10n - 4n === 6n", expect: true)
-        evalCheckBool(ctx, "3n * 7n === 21n", expect: true)
-        evalCheckBool(ctx, "15n / 3n === 5n", expect: true)
-        evalCheckBool(ctx, "17n % 5n === 2n", expect: true)
-        evalCheckBool(ctx, "2n ** 10n === 1024n", expect: true)
+        // -- Bitwise --
+        evalCheckStr(ctx, "String(~5n)", expect: "-6")
+        evalCheckStr(ctx, "String(~-1n)", expect: "0")
+        evalCheckStr(ctx, "String(~(2n**64n))", expect: "-18446744073709551617")
+        evalCheckStr(ctx, "String(5n&3n)", expect: "1")
+        evalCheckStr(ctx, "String(-5n&3n)", expect: "3")
+        evalCheckStr(ctx, "String(5n|3n)", expect: "7")
+        evalCheckStr(ctx, "String(-5n|-3n)", expect: "-1")
+        evalCheckStr(ctx, "String(5n^3n)", expect: "6")
+        evalCheckStr(ctx, "String(-5n^3n)", expect: "-8")
+        evalCheckStr(ctx, "String(1n<<64n)", expect: "18446744073709551616")
+        evalCheckStr(ctx, "String(-1n<<64n)", expect: "-18446744073709551616")
+        evalCheckStr(ctx, "String((2n**64n)>>32n)", expect: "4294967296")
+        evalCheckStr(ctx, "String(-5n>>1n)", expect: "-3")
+        evalCheckStr(ctx, "String(-1n>>100n)", expect: "-1")
+        evalCheckStr(ctx, "String(5n>>-2n)", expect: "20")
 
-        // BigInt comparison — works as regular number comparison
-        evalCheckBool(ctx, "1n < 2n", expect: true)
-        evalCheckBool(ctx, "2n > 1n", expect: true)
-        evalCheckBool(ctx, "1n <= 1n", expect: true)
-        evalCheckBool(ctx, "1n >= 1n", expect: true)
-        evalCheckBool(ctx, "1n === 1n", expect: true)
-        evalCheckBool(ctx, "1n !== 2n", expect: true)
+        // -- Comparison and equality --
+        evalCheckBool(ctx, "1n<2n", expect: true)
+        evalCheckBool(ctx, "2n<1n", expect: false)
+        evalCheckBool(ctx, "1n<=1n", expect: true)
+        evalCheckBool(ctx, "2n>1.5", expect: true)
+        evalCheckBool(ctx, "1n<1.5", expect: true)
+        evalCheckBool(ctx, "2n>NaN", expect: false)
+        evalCheckBool(ctx, "2n<NaN", expect: false)
+        evalCheckBool(ctx, "(2n**64n)>Number.MAX_SAFE_INTEGER", expect: true)
+        evalCheckBool(ctx, "9007199254740993n>9007199254740992", expect: true)
+        evalCheckBool(ctx, "1n==1", expect: true)
+        evalCheckBool(ctx, "1n===1", expect: false)
+        evalCheckBool(ctx, "1n!==1", expect: true)
+        evalCheckBool(ctx, "1n===1n", expect: true)
+        evalCheckBool(ctx, "(2n**70n)===(2n**70n)", expect: true)
+        evalCheckBool(ctx, "1n=='1'", expect: true)
+        evalCheckBool(ctx, "1n=='0x1'", expect: true)
+        evalCheckBool(ctx, "1n==''", expect: false)
+        evalCheckBool(ctx, "0n==''", expect: true)
+        evalCheckBool(ctx, "1n==true", expect: true)
+        evalCheckBool(ctx, "0n==false", expect: true)
+        evalCheckBool(ctx, "1n==null", expect: false)
+        evalCheckBool(ctx, "1n==undefined", expect: false)
+        evalCheck(ctx, "[1n,2n].indexOf(2n)", expectInt: 1)
+        evalCheckBool(ctx, "[1n].includes(1n)", expect: true)
+        evalCheck(ctx, "new Set([1n,1n,2n]).size", expectInt: 2)
+        evalCheckStr(ctx, "var m=new Map(); m.set(2n**70n,'a'); m.get(2n**70n)", expect: "a")
+        evalCheckBool(ctx, "Object.is(1n,1n)", expect: true)
+        evalCheckBool(ctx, "Object.is(1n,1)", expect: false)
 
-        // BigInt and Number mixing — since BigInt literals are parsed as
-        // numbers, mixing doesn't throw; it's just regular addition.
-        evalCheck(ctx, "1n + 1", expectInt: 2)
-        evalCheck(ctx, "1 + 1n", expectInt: 2)
+        // -- Truthiness --
+        evalCheckStr(ctx, "1n?'t':'f'", expect: "t")
+        evalCheckStr(ctx, "0n?'t':'f'", expect: "f")
+        evalCheckBool(ctx, "!0n", expect: true)
+        evalCheckBool(ctx, "!1n", expect: false)
 
-        // Equality — since both are numbers, they are equal
-        evalCheckBool(ctx, "1n == 1", expect: true)
-        evalCheckBool(ctx, "1n === 1", expect: true) // same type (number)
-
-        // BigInt bitwise — works as regular bitwise
-        evalCheckBool(ctx, "(5n & 3n) === 1n", expect: true)
-        evalCheckBool(ctx, "(5n | 3n) === 7n", expect: true)
-        evalCheckBool(ctx, "(5n ^ 3n) === 6n", expect: true)
-
-        // BigInt unary
-        evalCheckBool(ctx, "-42n === -(42n)", expect: true)
-
-        // BigInt to string
-        evalCheckStr(ctx, "String(42n)", expect: "42")
-
-        // Regression: BigInt() of a value outside Int32's range used to trap
-        // the process in mkShortBigInt (`Int32(val)` on an Int64 out of range).
+        // -- toString / conversions --
+        evalCheckStr(ctx, "`${-42n}`", expect: "-42")
+        evalCheckStr(ctx, "(255n).toString(16)", expect: "ff")
+        evalCheckStr(ctx, "(255n).toString(2)", expect: "11111111")
+        evalCheckStr(ctx, "(255n).toString(36)", expect: "73")
+        evalCheckStr(ctx, "(2n**100n).toString(16)", expect: "10000000000000000000000000")
+        evalCheckStr(ctx, "(-(2n**100n)).toString(32)", expect: "-100000000000000000000")
+        evalCheckStr(ctx, "[1n,2n].join('-')", expect: "1-2")
+        evalCheckStr(ctx, "1n+'a'", expect: "1a")
+        evalCheckStr(ctx, "'a'+1n", expect: "a1")
+        evalCheckDouble(ctx, "Number(1n)", expect: 1, tolerance: 0)
+        evalCheckDouble(ctx, "Number(2n**64n)", expect: 18446744073709551616, tolerance: 0)
+        evalCheckStr(ctx, "String(BigInt(42))", expect: "42")
         evalCheckStr(ctx, "String(BigInt(-2147483649))", expect: "-2147483649")
         evalCheckStr(ctx, "String(BigInt(2147483648))", expect: "2147483648")
         evalCheckStr(ctx, "String(BigInt(-1e15))", expect: "-1000000000000000")
+        evalCheckStr(ctx, "String(BigInt(1e21))", expect: "1000000000000000000000")
+        evalCheckStr(ctx, "String(BigInt('-9007199254740993'))", expect: "-9007199254740993")
+        evalCheckStr(ctx, "String(BigInt('0x10'))", expect: "16")
+        evalCheckStr(ctx, "String(BigInt('0b101'))", expect: "5")
+        evalCheckStr(ctx, "String(BigInt('0o17'))", expect: "15")
+        evalCheckStr(ctx, "String(BigInt('  12  '))", expect: "12")
+        evalCheckStr(ctx, "String(BigInt(''))", expect: "0")
+        evalCheckStr(ctx, "String(BigInt(' '))", expect: "0")
+        evalCheckStr(ctx, "String(BigInt(true))", expect: "1")
+        evalCheckStr(ctx, "String(BigInt(false))", expect: "0")
+        evalCheck(ctx, "parseInt('123n')", expectInt: 123)
+
+        // -- asIntN / asUintN --
+        evalCheckStr(ctx, "String(BigInt.asIntN(8,255n))", expect: "-1")
+        evalCheckStr(ctx, "String(BigInt.asUintN(8,-1n))", expect: "255")
+        evalCheckStr(ctx, "String(BigInt.asIntN(64,2n**63n))", expect: "-9223372036854775808")
+        // Spec + JavaScriptCore; qjs answers -1n here.
+        evalCheckStr(ctx, "String(BigInt.asUintN(64,-1n))", expect: "18446744073709551615")
+        evalCheckStr(ctx, "String(BigInt.asIntN(0,5n))", expect: "0")
+        evalCheckStr(ctx, "String(BigInt.asIntN(3,10n))", expect: "2")
+        evalCheckStr(ctx, "String(BigInt.asUintN(3,10n))", expect: "2")
+        evalCheckStr(ctx, "String(BigInt.asIntN(128,2n**128n-1n))", expect: "-1")
+
+        // -- Prototype and tags --
+        evalCheckStr(ctx, "Object.prototype.toString.call(1n)", expect: "[object BigInt]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(Object(1n))", expect: "[object BigInt]")
+        evalCheckBool(ctx, "(1n).constructor===BigInt", expect: true)
+        evalCheckStr(ctx, "String(BigInt.prototype.valueOf.call(1n))", expect: "1")
+        evalCheckStr(ctx, "String(Object(1n).valueOf())", expect: "1")
+        evalCheckStr(ctx, "typeof (1n).toString", expect: "function")
+        // Implementation-defined; JeffJS groups like Number.prototype.toLocaleString.
+        evalCheckStr(ctx, "(1234567n).toLocaleString()", expect: "1,234,567")
+
+        // -- TypeErrors / RangeErrors --
+        evalCheckException(ctx, "1n+1")
+        evalCheckException(ctx, "1+1n")
+        evalCheckException(ctx, "1n-1")
+        evalCheckException(ctx, "1n*2")
+        evalCheckException(ctx, "1n/2")
+        evalCheckException(ctx, "1n%2")
+        evalCheckException(ctx, "1n**2")
+        evalCheckException(ctx, "+1n")
+        evalCheckException(ctx, "1n>>>1n")
+        evalCheckException(ctx, "1n&1")
+        evalCheckException(ctx, "1n/0n")
+        evalCheckException(ctx, "1n%0n")
+        evalCheckException(ctx, "2n**-1n")
+        evalCheckException(ctx, "Math.abs(1n)")
+        evalCheckException(ctx, "Math.max(1n,2n)")
+        evalCheckException(ctx, "JSON.stringify(1n)")
+        evalCheckException(ctx, "JSON.stringify([1n])")
+        evalCheckException(ctx, "new BigInt(1)")
+        evalCheckException(ctx, "BigInt(1.5)")
+        evalCheckException(ctx, "BigInt(NaN)")
+        evalCheckException(ctx, "BigInt(Infinity)")
+        evalCheckException(ctx, "BigInt('1n')")
+        evalCheckException(ctx, "BigInt('abc')")
+        evalCheckException(ctx, "BigInt(null)")
+        evalCheckException(ctx, "BigInt(undefined)")
+        evalCheckException(ctx, "BigInt(Symbol())")
+        evalCheckStr(ctx, "JSON.stringify({a:1})", expect: "{\"a\":1}")
+
+        // -- Loops, compound assignment, ++/-- --
+        evalCheckStr(ctx, "var n=0n; for(var i=0;i<100;i++) n++; String(n)", expect: "100")
+        evalCheckStr(ctx, "var n2=2n**64n; n2++; String(n2)", expect: "18446744073709551617")
+        evalCheckStr(ctx, "var n3=1n; n3+=2n; String(n3)", expect: "3")
+        evalCheckStr(ctx, "var n4=5n; n4--; --n4; String(n4)", expect: "3")
+        evalCheckStr(ctx, "var s=0n; for(var i=1n;i<=20n;i++) s+=i*i; String(s)", expect: "2870")
+        evalCheckStr(ctx, "var f=1n; for(var i=1n;i<=30n;i++) f*=i; String(f)",
+                     expect: "265252859812191058636308480000000")
+        evalCheckException(ctx, "var b=1n; b+=1;")
+
+        // -- Property keys --
+        evalCheck(ctx, "var o={}; o[1n]=5; o[1]", expectInt: 5)
+        evalCheck(ctx, "({1n:2})[1]", expectInt: 2)
+
+        // -- BigInt64Array / BigUint64Array / DataView --
+        evalCheckStr(ctx, "var a=new BigInt64Array(2); a[0]=-1n; String(a[0])", expect: "-1")
+        evalCheckStr(ctx, "var a2=new BigUint64Array(2); a2[0]=-1n; String(a2[0])",
+                     expect: "18446744073709551615")
+        evalCheckStr(ctx, "var a3=new BigInt64Array(1); a3[0]=2n**63n-1n; String(a3[0])",
+                     expect: "9223372036854775807")
+        evalCheckException(ctx, "var a4=new BigInt64Array(1); a4[0]=1;")
+        evalCheckStr(ctx, "var d=new DataView(new ArrayBuffer(8)); d.setBigInt64(0,-2n); String(d.getBigInt64(0))",
+                     expect: "-2")
+        evalCheckStr(ctx, "var d2=new DataView(new ArrayBuffer(8)); d2.setBigUint64(0,2n**64n-1n); String(d2.getBigUint64(0))",
+                     expect: "18446744073709551615")
+        evalCheckException(ctx, "var d3=new DataView(new ArrayBuffer(8)); d3.setBigInt64(0,1);")
+        evalCheckStr(ctx, "typeof BigInt64Array", expect: "function")
+
+        // -- ToPrimitive / ToNumeric through objects --
+        evalCheckStr(ctx, "String({valueOf(){return 2n}}*3n)", expect: "6")
+        evalCheckStr(ctx, "String({valueOf(){return 2n}}+3n)", expect: "5")
+        evalCheckBool(ctx, "({valueOf(){return 2n}})>1n", expect: true)
+        evalCheckStr(ctx, "String({[Symbol.toPrimitive](){return 5n}}-1n)", expect: "4")
+        evalCheckBool(ctx, "Object(1n)==1n", expect: true)
+        evalCheckBool(ctx, "1n instanceof Object", expect: false)
+        evalCheckStr(ctx, "JSON.parse('1', function(k,v){return typeof v})", expect: "number")
+        evalCheckStr(ctx, "[3n,1n,2n].sort().join()", expect: "1,2,3")
+        evalCheckStr(ctx, "String([1n,[2n]])", expect: "1,2")
+        evalCheckStr(ctx, "({}).toString.call(BigInt.prototype)", expect: "[object BigInt]")
+        evalCheckStr(ctx, "String(2n**3n**2n)", expect: "512")
+        evalCheckStr(ctx, "String(-(2n**63n))", expect: "-9223372036854775808")
+        evalCheckStr(ctx, "String(BigInt.asIntN(32, 2n**31n))", expect: "-2147483648")
+        evalCheckBool(ctx, "0n === -0n", expect: true)
+        evalCheckBool(ctx, "1n > '0'", expect: true)
+        evalCheckBool(ctx, "'2' > 1n", expect: true)
+        evalCheckStr(ctx, "(0n).toString(2)", expect: "0")
+        evalCheckException(ctx, "(1n).toString(37)")
+        evalCheckStr(ctx, "Array.from({length:3},function(_,i){return BigInt(i)}).join()", expect: "0,1,2")
 
         // Regression: ToUint32 on a typed-array store is modular, not a
         // trapping `UInt32(Double)` conversion.

@@ -164,12 +164,7 @@ extension JeffJSContext {
         }
         if x.isObject { return x.toObject() === y.toObject() }
         if x.isSymbol { return x.heapRef === y.heapRef }
-        if x.isBigInt {
-            if let b1 = x.toBigInt(), let b2 = y.toBigInt() {
-                return b1 === b2 || (b1.sign == b2.sign && b1.limbs == b2.limbs)
-            }
-            return false
-        }
+        if x.isBigInt { return y.isBigInt && JeffJSBigIntOps.equal(x, y) }
         return false
     }
 

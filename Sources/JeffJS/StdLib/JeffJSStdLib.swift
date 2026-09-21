@@ -216,6 +216,9 @@ struct JeffJSStdLib {
                 parts.append(arg.toBool() ? "true" : "false")
             } else if arg.isInt {
                 parts.append(String(arg.toInt32()))
+            } else if arg.isBigInt {
+                // QuickJS's console prints the literal form, with the suffix.
+                parts.append(JeffJSBigIntOps.toSwiftString(arg) + "n")
             } else if arg.isFloat64 {
                 // Int64(d) traps for anything outside Int64's range, so
                 // console.log(1e300) used to kill the process; and Swift's

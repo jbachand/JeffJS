@@ -118,8 +118,12 @@ extension JeffJSContext {
         return Double.nan
     }
 
-    /// ToNumeric coercion. For now, delegates to toNumber-like behavior.
+    /// ToNumeric coercion — BigInts survive, everything else becomes a Number.
     func toNumeric(_ val: JeffJSValue) -> JeffJSValue {
+        if val.isBigInt { return val }
+        // Only an object can turn into a BigInt through ToPrimitive; keep the
+        // string/number path on the original (faster) conversion.
+        if val.isObject { return toNumericValue(val) }
         return toNumber(val)
     }
 
@@ -134,10 +138,11 @@ extension JeffJSContext {
         return false
     }
 
-    /// Convert BigInt to Float64 (approximate).
+    /// Convert BigInt to Float64 (`Number(1n)`); rounds like ToNumber would.
     func bigIntToFloat64(_ val: JeffJSValue) -> Double {
         if val.isInt { return Double(val.toInt32()) }
         if val.isFloat64 { return val.toFloat64() }
+        if val.isBigInt { return JeffJSBigIntOps.toDouble(val) }
         return Double.nan
     }
 
@@ -1061,211 +1066,102 @@ struct JeffJSBuiltinBoolean {
 
 struct JeffJSBuiltinBigInt {
 
-    // MARK: - Helpers
-
-    /// Extract the BigInt value from `this`, handling both primitive BigInts
-    /// and BigInt wrapper objects.
+    /// `this` as a BigInt primitive, unwrapping a `BigInt` wrapper object.
+    /// Returns `.exception` (without throwing) when `this` is neither.
     private static func thisBigIntValue(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
-        if this.isBigInt || this.isShortBigInt {
-            return this.dupValue()   // the caller releases this argument; the result is a new reference
-        }
-        if this.isObject {
-            if this.toObject() != nil {
-                let data = ctx.getObjectData(this)
-                if data.isBigInt || data.isShortBigInt {
-                    return data
-                }
-            }
+        if this.isBigInt { return this }
+        if this.isObject, let obj = this.toObject() {
+            // Wrappers built by `Object(1n)` store the primitive in
+            // `primitiveValue`; `new Number()`-style builtins use the
+            // `.objectData` payload. Accept both.
+            let pv = obj.primitiveValue
+            if pv.isBigInt { return pv }
+            let data = ctx.getObjectData(this)
+            if data.isBigInt { return data }
         }
         return .exception
     }
 
-    /// Convert a BigInt value to a Swift Int64 (truncating for large values).
-    private static func bigIntToInt64(_ val: JeffJSValue) -> Int64 {
-        if val.isInt { return Int64(val.toInt32()) }
-        if val.isBigInt, let bi = val.toBigInt() {
-            let magnitude = bi.limbs.first ?? 0
-            let result = Int64(bitPattern: magnitude)
-            return bi.sign ? -result : result
-        }
-        return 0
-    }
-
-    /// Convert a BigInt value to a Swift UInt64 (truncating for large values).
-    private static func bigIntToUInt64(_ val: JeffJSValue) -> UInt64 {
-        if val.isInt { return UInt64(bitPattern: Int64(val.toInt32())) }
-        if val.isBigInt, let bi = val.toBigInt() {
-            let magnitude = bi.limbs.first ?? 0
-            return bi.sign ? UInt64(bitPattern: -Int64(bitPattern: magnitude)) : magnitude
-        }
-        return 0
-    }
-
-    /// Convert an unsigned integer to a string in the given radix (2-36).
-    private static func uint64ToString(_ value: UInt64, radix: Int) -> String {
-        if value == 0 { return "0" }
-        let digits = "0123456789abcdefghijklmnopqrstuvwxyz"
-        let digitsArray = Array(digits)
-        var result = [Character]()
-        var v = value
-        let r = UInt64(radix)
-        while v > 0 {
-            result.append(digitsArray[Int(v % r)])
-            v /= r
-        }
-        result.reverse()
-        return String(result)
-    }
-
     // MARK: - BigInt.prototype.toString(radix?)
 
-    /// `BigInt.prototype.toString([radix])`
     static func toString(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let bigVal = thisBigIntValue(ctx: ctx, this: this)
         if bigVal.isException {
-            return ctx.throwTypeError("BigInt.prototype.toString requires that 'this' be a BigInt")
+            return ctx.throwTypeError(message: "BigInt.prototype.toString requires that 'this' be a BigInt")
         }
-
         var radix = 10
         if !args.isEmpty && !args[0].isUndefined {
             let r = ctx.toInteger(args[0])
             if r.isException { return .exception }
             radix = ctx.extractInt(r)
             if radix < 2 || radix > 36 {
-                return ctx.throwRangeError("toString() radix must be between 2 and 36")
+                return ctx.throwRangeError(message: "toString() radix must be between 2 and 36")
             }
         }
-
-        // Handle int values (shortBigInt promoted to int in NaN-boxed mode)
-        if bigVal.isInt {
-            let v = Int64(bigVal.toInt32())
-            if radix == 10 { return ctx.newStringValue(String(v)) }
-            let negative = v < 0
-            let magnitude = negative ? UInt64(bitPattern: -v) : UInt64(bitPattern: v)
-            var str = uint64ToString(magnitude, radix: radix)
-            if negative { str = "-" + str }
-            return ctx.newStringValue(str)
-        }
-
-        // Handle heap BigInt
-        if let bi = bigVal.toBigInt() {
-            if bi.limbs.isEmpty || (bi.limbs.count == 1 && bi.limbs[0] == 0) {
-                return ctx.newStringValue("0")
-            }
-            let magnitude = bi.limbs.first ?? 0
-            if radix == 10 {
-                if bi.sign {
-                    return ctx.newStringValue("-" + String(magnitude))
-                }
-                return ctx.newStringValue(String(magnitude))
-            }
-            var str = uint64ToString(magnitude, radix: radix)
-            if bi.sign { str = "-" + str }
-            return ctx.newStringValue(str)
-        }
-
-        return ctx.newStringValue("0")
+        return JeffJSBigIntOps.toStringValue(ctx: ctx, bigVal, radix: radix)
     }
 
     // MARK: - BigInt.prototype.valueOf()
 
-    /// `BigInt.prototype.valueOf()`
     static func valueOf(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let bigVal = thisBigIntValue(ctx: ctx, this: this)
         if bigVal.isException {
-            return ctx.throwTypeError("BigInt.prototype.valueOf requires that 'this' be a BigInt")
+            return ctx.throwTypeError(message: "BigInt.prototype.valueOf requires that 'this' be a BigInt")
         }
-        return bigVal
+        return bigVal.dupValue()
     }
 
     // MARK: - BigInt.prototype.toLocaleString()
 
-    /// `BigInt.prototype.toLocaleString()` — delegates to toString for now.
     static func toLocaleString(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        return toString(ctx: ctx, this: this, args: args)
+        let bigVal = thisBigIntValue(ctx: ctx, this: this)
+        if bigVal.isException {
+            return ctx.throwTypeError(message: "BigInt.prototype.toLocaleString requires that 'this' be a BigInt")
+        }
+        // Group the digits like Number.prototype.toLocaleString does.
+        let digits = JeffJSBigIntOps.toSwiftString(bigVal)
+        var body = Substring(digits)
+        var sign = ""
+        if body.hasPrefix("-") { sign = "-"; body = body.dropFirst() }
+        var grouped = ""
+        for (i, c) in body.enumerated() {
+            if i > 0 && (body.count - i) % 3 == 0 { grouped.append(",") }
+            grouped.append(c)
+        }
+        return ctx.newStringValue(sign + grouped)
     }
 
-    // MARK: - BigInt.asIntN(bits, bigint)
+    // MARK: - BigInt.asIntN / asUintN
 
-    /// `BigInt.asIntN(bits, bigint)` — Truncate a BigInt to fit in a signed integer of the given bit width.
+    private static func bitsArg(ctx: JeffJSContext, _ args: [JeffJSValue]) -> Int? {
+        let bitsVal = ctx.toInteger(args.isEmpty ? .undefined : args[0])
+        if bitsVal.isException { return nil }
+        let bits = ctx.extractInt(bitsVal)
+        if bits < 0 || bits > (1 << 24) {
+            _ = ctx.throwRangeError(message: "Invalid bit width")
+            return nil
+        }
+        return bits
+    }
+
+    /// `BigInt.asIntN(bits, bigint)`
     static func asIntN(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard args.count >= 2 else {
-            return ctx.throwTypeError("BigInt.asIntN requires 2 arguments")
-        }
-
-        let bitsVal = ctx.toInteger(args[0])
-        if bitsVal.isException { return .exception }
-        let bits = ctx.extractInt(bitsVal)
-        if bits < 0 {
-            return ctx.throwRangeError("Invalid bit width")
-        }
-
-        let bigVal = args[1]
-        guard bigVal.isBigInt || bigVal.isShortBigInt else {
-            return ctx.throwTypeError("Cannot convert non-BigInt to BigInt")
-        }
-
-        if bits == 0 {
-            return JeffJSValue.mkShortBigInt(0)
-        }
-
-        let value = bigIntToInt64(bigVal)
-
-        if bits >= 64 {
-            // No truncation needed for values that fit in Int64
-            return JeffJSValue.mkShortBigInt(value)
-        }
-
-        // Truncate to `bits` width and sign-extend
-        let mask = bits == 64 ? UInt64.max : (UInt64(1) << bits) - 1
-        let truncated = UInt64(bitPattern: value) & mask
-        // Sign extend: check the sign bit
-        let signBit = UInt64(1) << (bits - 1)
-        let result: Int64
-        if truncated & signBit != 0 {
-            // Negative: extend sign bits
-            result = Int64(bitPattern: truncated | ~mask)
-        } else {
-            result = Int64(bitPattern: truncated)
-        }
-        return JeffJSValue.mkShortBigInt(result)
+        guard let bits = bitsArg(ctx: ctx, args) else { return .exception }
+        let v = ctx.toBigIntValue(args.count > 1 ? args[1] : .undefined)
+        if v.isException { return .exception }
+        defer { v.freeValue() }
+        if bits == 0 { return JeffJSValue.newBigInt(0) }
+        return JeffJSValue.newBigInt(JBigInt.asIntN(bits, v.bigIntValue))
     }
 
-    // MARK: - BigInt.asUintN(bits, bigint)
-
-    /// `BigInt.asUintN(bits, bigint)` — Truncate a BigInt to fit in an unsigned integer of the given bit width.
+    /// `BigInt.asUintN(bits, bigint)`
     static func asUintN(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard args.count >= 2 else {
-            return ctx.throwTypeError("BigInt.asUintN requires 2 arguments")
-        }
-
-        let bitsVal = ctx.toInteger(args[0])
-        if bitsVal.isException { return .exception }
-        let bits = ctx.extractInt(bitsVal)
-        if bits < 0 {
-            return ctx.throwRangeError("Invalid bit width")
-        }
-
-        let bigVal = args[1]
-        guard bigVal.isBigInt || bigVal.isShortBigInt else {
-            return ctx.throwTypeError("Cannot convert non-BigInt to BigInt")
-        }
-
-        if bits == 0 {
-            return JeffJSValue.mkShortBigInt(0)
-        }
-
-        let value = bigIntToUInt64(bigVal)
-
-        if bits >= 64 {
-            // No truncation needed for values that fit in UInt64
-            return JeffJSValue.mkShortBigInt(Int64(bitPattern: value))
-        }
-
-        // Truncate to `bits` width (unsigned, no sign extension)
-        let mask = (UInt64(1) << bits) - 1
-        let result = value & mask
-        return JeffJSValue.mkShortBigInt(Int64(bitPattern: result))
+        guard let bits = bitsArg(ctx: ctx, args) else { return .exception }
+        let v = ctx.toBigIntValue(args.count > 1 ? args[1] : .undefined)
+        if v.isException { return .exception }
+        defer { v.freeValue() }
+        if bits == 0 { return JeffJSValue.newBigInt(0) }
+        return JeffJSValue.newBigInt(JBigInt.asUintN(bits, v.bigIntValue))
     }
 }
 

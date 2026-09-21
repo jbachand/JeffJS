@@ -32,6 +32,9 @@ private let CPOOL_FUNCTION: UInt8 = 8
 /// string (or undefined) and the raw string as nested cpool entries. Rebuilt
 /// as a frozen array with a frozen `raw` array (JeffJSContext.newTemplateObject).
 private let CPOOL_TEMPLATE: UInt8 = 9
+/// BigInt literal: sign byte, then u32 limb count and that many u32 limbs
+/// (little-endian magnitude, the JBigInt layout).
+private let CPOOL_BIGINT: UInt8 = 10
 
 // MARK: - Flag Packing
 
@@ -337,6 +340,12 @@ struct JeffJSBytecodeSerializer {
         } else if val.isInt {
             writeU8(CPOOL_INT32)
             writeU32(UInt32(bitPattern: val.toInt32()))
+        } else if val.isBigInt {
+            let b = val.bigIntValue
+            writeU8(CPOOL_BIGINT)
+            writeU8(b.negative ? 1 : 0)
+            writeU32(UInt32(b.mag.count))
+            for limb in b.mag { writeU32(limb) }
         } else if val.isNumber {
             writeU8(CPOOL_FLOAT64)
             writeU64(val.bits)
@@ -494,6 +503,10 @@ struct JeffJSBytecodeDeserializer {
             pos += 4
         case CPOOL_FLOAT64:
             pos += 8
+        case CPOOL_BIGINT:
+            guard pos + 4 < data.count else { return false }
+            let limbs = Int(readU32LE(data, pos + 1))
+            pos += 5 + limbs * 4
         case CPOOL_STRING8:
             guard pos + 3 < data.count else { return false }
             let len = Int(readU32LE(data, pos))
@@ -669,6 +682,16 @@ struct JeffJSBytecodeDeserializer {
             guard let bits = readU64() else { return nil }
             return .newFloat64(Double(bitPattern: bits))
 
+        case CPOOL_BIGINT:
+            guard let signByte = readU8(), let count = readU32() else { return nil }
+            var mag: [UInt32] = []
+            mag.reserveCapacity(Int(count))
+            for _ in 0..<Int(count) {
+                guard let limb = readU32() else { return nil }
+                mag.append(limb)
+            }
+            return JeffJSValue.newBigInt(JBigInt(negative: signByte != 0, mag: mag))
+
         case CPOOL_BOOL_FALSE:
             return .newBool(false)
 
@@ -774,7 +797,7 @@ final class JeffJSBytecodeCache {
     ///   - JeffJSCompiler.swift (resolveLabels, resolveVariables, peephole)
     ///   - JeffJSOpcodes.swift (opcode additions/changes)
     ///   - JeffJSInterpreter.swift (only if opcode semantics change)
-    static let compilerVersion: UInt64 = 9  // 2026-09-21: define_method flag byte (bit 3 = enumerable, bit 4 = class prototype), lazy function name/length, NamedEvaluation set_name
+    static let compilerVersion: UInt64 = 10  // 2026-09-21: real BigInt (n-suffix literals, CPOOL_BIGINT constant-pool entries, BigInt-aware arithmetic opcodes)
 
     /// Lazily-initialized disk cache directory.
     /// Automatically clears cached .jfbc files when the app binary changes (new build).

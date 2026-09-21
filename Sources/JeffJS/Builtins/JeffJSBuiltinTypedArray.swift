@@ -96,11 +96,7 @@ struct TypedArrayElementInfo {
                     | (UInt64(data[offset + 6]) << 48)
                     | (UInt64(data[offset + 7]) << 56)
             if !littleEndian { raw = raw.byteSwapped }
-            let bi = JeffJSBigInt()
-            bi.sign = Int64(bitPattern: raw) < 0
-            bi.limbs = [raw]
-            bi.len = 1
-            return .makeBigInt(bi)
+            return .newBigInt(Int64(bitPattern: raw))
 
         case JeffJSClassID.bigUint64Array.rawValue:
             var raw = UInt64(data[offset])
@@ -112,11 +108,7 @@ struct TypedArrayElementInfo {
                     | (UInt64(data[offset + 6]) << 48)
                     | (UInt64(data[offset + 7]) << 56)
             if !littleEndian { raw = raw.byteSwapped }
-            let bi = JeffJSBigInt()
-            bi.sign = false
-            bi.limbs = [raw]
-            bi.len = 1
-            return .makeBigInt(bi)
+            return .newBigInt(JBigInt(raw))
 
         default:
             return .undefined
@@ -203,12 +195,13 @@ struct TypedArrayElementInfo {
             }
 
         case JeffJSClassID.bigInt64Array.rawValue, JeffJSClassID.bigUint64Array.rawValue:
+            // The caller has already run ToBigInt, so a non-BigInt here means
+            // an internal store; keep it lossless rather than writing zero.
             var raw: UInt64 = 0
-            if let bi = value.toBigInt() {
-                raw = bi.limbs.first ?? 0
-                if bi.sign && classID == JeffJSClassID.bigInt64Array.rawValue {
-                    raw = UInt64(bitPattern: -Int64(bitPattern: raw))
-                }
+            if value.isBigInt {
+                raw = value.bigIntValue.lowUInt64
+            } else if value.isInt {
+                raw = UInt64(bitPattern: Int64(value.toInt32()))
             }
             if !littleEndian { raw = raw.byteSwapped }
             for i in 0..<8 {
@@ -1003,6 +996,7 @@ private func dataViewGet(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 /// Generic DataView set method.
 private func dataViewSet(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                          _ argv: [JeffJSValue], bytesPerElement: Int,
+                         bigIntElement: Bool = false,
                          writer: (inout [UInt8], Int, JeffJSValue, Bool) -> Void) -> JeffJSValue {
     guard let obj = thisVal.toObject(), obj.classID == JeffJSClassID.dataView.rawValue,
           case .typedArray(let ta) = obj.payload,
@@ -1020,7 +1014,16 @@ private func dataViewSet(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                        (argv[2].isBool ? argv[2].toBool() : true)
 
     var data = ab.data
-    writer(&data, ta.byteOffset + byteOffset, argv[1], littleEndian)
+    var v = argv[1]
+    var ownedV = false
+    if bigIntElement {
+        // setBigInt64 / setBigUint64 run ToBigInt on the value.
+        let b = ctx.toBigIntValue(v)
+        if b.isException { return .exception }
+        v = b; ownedV = true
+    }
+    writer(&data, ta.byteOffset + byteOffset, v, littleEndian)
+    if ownedV { v.freeValue() }
     ab.data = data
     return .undefined
 }
@@ -1093,8 +1096,7 @@ func jsDataView_getBigInt64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv
         var raw: UInt64 = 0
         for i in 0..<8 { raw |= UInt64(data[off + i]) << (i * 8) }
         if !le { raw = raw.byteSwapped }
-        let bi = JeffJSBigInt(); bi.sign = Int64(bitPattern: raw) < 0; bi.limbs = [raw]; bi.len = 1
-        return .makeBigInt(bi)
+        return .newBigInt(Int64(bitPattern: raw))
     }
 }
 
@@ -1103,8 +1105,7 @@ func jsDataView_getBigUint64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ arg
         var raw: UInt64 = 0
         for i in 0..<8 { raw |= UInt64(data[off + i]) << (i * 8) }
         if !le { raw = raw.byteSwapped }
-        let bi = JeffJSBigInt(); bi.sign = false; bi.limbs = [raw]; bi.len = 1
-        return .makeBigInt(bi)
+        return .newBigInt(JBigInt(raw))
     }
 }
 
@@ -1200,17 +1201,16 @@ func jsDataView_setFloat64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
 }
 
 func jsDataView_setBigInt64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
-    return dataViewSet(ctx, thisVal, argv, bytesPerElement: 8) { data, off, val, le in
-        var raw: UInt64 = 0
-        if let bi = val.toBigInt() { raw = bi.limbs.first ?? 0; if bi.sign { raw = UInt64(bitPattern: -Int64(bitPattern: raw)) } }
+    return dataViewSet(ctx, thisVal, argv, bytesPerElement: 8, bigIntElement: true) { data, off, val, le in
+        var raw: UInt64 = val.isBigInt ? val.bigIntValue.lowUInt64 : 0
         if !le { raw = raw.byteSwapped }
         for i in 0..<8 { data[off + i] = UInt8((raw >> (i * 8)) & 0xFF) }
     }
 }
 
 func jsDataView_setBigUint64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
-    return dataViewSet(ctx, thisVal, argv, bytesPerElement: 8) { data, off, val, le in
-        var raw: UInt64 = val.toBigInt()?.limbs.first ?? 0
+    return dataViewSet(ctx, thisVal, argv, bytesPerElement: 8, bigIntElement: true) { data, off, val, le in
+        var raw: UInt64 = val.isBigInt ? val.bigIntValue.lowUInt64 : 0
         if !le { raw = raw.byteSwapped }
         for i in 0..<8 { data[off + i] = UInt8((raw >> (i * 8)) & 0xFF) }
     }

@@ -125,6 +125,14 @@ func jeffJS_arithGeneric(_ ctx: JeffJSContext, _ ar: UInt8, _ lhs: JeffJSValue, 
         lhs.freeValue(); rhs.freeValue()
         return r.isException ? nil : r
     }
+    if lhs.isBigInt || rhs.isBigInt || lhs.isObject || rhs.isObject {
+        // 1 sub, 2 mul, 3 and, 4 or, 5 xor
+        let op: JeffJSBigIntBinOp = ar == 1 ? .sub : ar == 2 ? .mul
+            : ar == 3 ? .and : ar == 4 ? .or : .xor
+        let r = JeffJSOperators.jsArith(ctx: ctx, op: op, lhs: lhs, rhs: rhs)
+        lhs.freeValue(); rhs.freeValue()
+        return r.isException ? nil : r
+    }
     let (a, ok1) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lhs)
     let (b, ok2) = JeffJSTypeConvert.toNumber(ctx: ctx, val: rhs)
     lhs.freeValue(); rhs.freeValue()
@@ -2007,6 +2015,7 @@ extension JeffJSContext {
         if val.isBool { return newString(val.toBool() ? "true" : "false") }
         if val.isNull { return newString("null") }
         if val.isUndefined { return newString("undefined") }
+        if val.isBigInt { return newString(JeffJSBigIntOps.toSwiftString(val)) }
         // For objects, ToPrimitive(hint string) then ToString
         return JeffJSTypeConvert.toString(ctx: self, val: val)
     }
@@ -5648,6 +5657,9 @@ struct JeffJSTypeConvert {
             _ = ctx.throwTypeError(message: "Cannot convert a Symbol value to a string")
             return .exception
         }
+        if val.isBigInt {
+            return ctx.newString(JeffJSBigIntOps.toSwiftString(val))
+        }
         return ctx.newString("undefined")
     }
 
@@ -5684,6 +5696,7 @@ struct JeffJSTypeConvert {
         // Symbols are truthy — ToBoolean is false only for the seven falsy
         // values, and `Symbol.iterator ? 1 : 0` used to take the else branch.
         if val.isSymbol { return true }
+        if val.isBigInt { return !val.bigIntIsZero }
         return false
     }
 
@@ -5780,11 +5793,64 @@ struct JeffJSOperators {
             ls.freeValue(); rs.freeValue()
             return r
         }
+        if lp.isBigInt || rp.isBigInt {
+            return bigIntBinary(ctx: ctx, op: .add, lp, rp)
+        }
         let (a, ok1) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lp)
         if !ok1 { return .exception }
         let (b, ok2) = JeffJSTypeConvert.toNumber(ctx: ctx, val: rp)
         if !ok2 { return .exception }
         return .newFloat64(a + b)
+    }
+
+    // MARK: BigInt-aware arithmetic
+
+    /// The BigInt half of a binary operator: both operands must be BigInts,
+    /// mixing with a Number is a TypeError (ES 6.1.6.2 and friends).
+    static func bigIntBinary(ctx: JeffJSContext, op: JeffJSBigIntBinOp,
+                             _ a: JeffJSValue, _ b: JeffJSValue) -> JeffJSValue {
+        guard a.isBigInt && b.isBigInt else {
+            return ctx.throwTypeError(message: "Cannot mix BigInt and other types, use explicit conversions")
+        }
+        return JeffJSBigIntOps.binary(ctx: ctx, op: op, a, b)
+    }
+
+    /// Generic `-`, `*`, `/`, `%`, `**`, `&`, `|`, `^`, `<<`, `>>` for the
+    /// operands the opcode fast paths rejected. Does ToNumeric once per side
+    /// (ToPrimitive is not repeated), so BigInt-valued objects work too.
+    static func jsArith(ctx: JeffJSContext, op: JeffJSBigIntBinOp,
+                        lhs: JeffJSValue, rhs: JeffJSValue) -> JeffJSValue {
+        let lp = ctx.toNumericValue(lhs)
+        if lp.isException { return .exception }
+        let rp = ctx.toNumericValue(rhs)
+        if rp.isException { lp.freeValue(); return .exception }
+        defer { lp.freeValue(); rp.freeValue() }
+        if lp.isBigInt || rp.isBigInt {
+            return bigIntBinary(ctx: ctx, op: op, lp, rp)
+        }
+        let a = lp.isInt ? Double(lp.toInt32()) : lp.toFloat64()
+        let b = rp.isInt ? Double(rp.toInt32()) : rp.toFloat64()
+        switch op {
+        case .add: return .newFloat64(a + b)
+        case .sub: return .newFloat64(a - b)
+        case .mul: return .newFloat64(a * b)
+        case .div: return .newFloat64(a / b)
+        case .mod:
+            let r = a.truncatingRemainder(dividingBy: b)
+            return .newFloat64(r)
+        case .pow: return .newFloat64(pow(a, b))
+        case .and: return .newInt32(JeffJSTypeConvert.doubleToInt32(a) & JeffJSTypeConvert.doubleToInt32(b))
+        case .or:  return .newInt32(JeffJSTypeConvert.doubleToInt32(a) | JeffJSTypeConvert.doubleToInt32(b))
+        case .xor: return .newInt32(JeffJSTypeConvert.doubleToInt32(a) ^ JeffJSTypeConvert.doubleToInt32(b))
+        case .shl:
+            let x = JeffJSTypeConvert.doubleToInt32(a)
+            let sh = UInt32(bitPattern: JeffJSTypeConvert.doubleToInt32(b)) & 31
+            return .newInt32(Int32(bitPattern: UInt32(bitPattern: x) << sh))
+        case .sar:
+            let x = JeffJSTypeConvert.doubleToInt32(a)
+            let sh = UInt32(bitPattern: JeffJSTypeConvert.doubleToInt32(b)) & 31
+            return .newInt32(x >> Int32(sh))
+        }
     }
 
     // MARK: Equality
@@ -5804,6 +5870,31 @@ struct JeffJSOperators {
         // null == undefined
         if (lhs.isNull && rhs.isUndefined) || (lhs.isUndefined && rhs.isNull) {
             return (true, true)
+        }
+        // BigInt == anything (ES 7.2.15 steps 6-13)
+        if lhs.isBigInt || rhs.isBigInt {
+            let big = lhs.isBigInt ? lhs : rhs
+            let other = lhs.isBigInt ? rhs : lhs
+            if other.isBigInt { return (JeffJSBigIntOps.equal(lhs, rhs), true) }
+            if other.isNull || other.isUndefined || other.isSymbol { return (false, true) }
+            if other.isString {
+                guard let s = ctx.toSwiftString(other),
+                      let b = jeffJS_stringToBigInt(s) else { return (false, true) }
+                return (JBigInt.compare(big.bigIntValue, b) == 0, true)
+            }
+            if other.isBool {
+                return (JeffJSBigIntOps.compareWithDouble(big, other.toBool() ? 1 : 0) == 0, true)
+            }
+            if other.isNumber {
+                let d = other.isInt ? Double(other.toInt32()) : other.toFloat64()
+                return (JeffJSBigIntOps.compareWithDouble(big, d) == 0, true)
+            }
+            if other.isObject {
+                let op = JeffJSTypeConvert.toPrimitive(ctx: ctx, val: other, hint: HINT_NONE)
+                if op.isException { return (false, false) }
+                return jsEq(ctx: ctx, lhs: big, rhs: op)
+            }
+            return (false, true)
         }
         // Number == String -> toNumber(String)
         if lhs.isNumber && rhs.isString {
@@ -5856,6 +5947,7 @@ struct JeffJSOperators {
             // Reference identity
             return lhs == rhs
         }
+        if lhs.isBigInt { return JeffJSBigIntOps.equal(lhs, rhs) }
         return false
     }
 
@@ -5869,6 +5961,9 @@ struct JeffJSOperators {
             if lhs.isFloat64 && rhs.isInt {
                 return lhs.toFloat64() == Double(rhs.toInt32())
             }
+            // short vs heap BigInt (only reachable from a non-canonical
+            // value, e.g. one built by a BigInt64Array read)
+            if lhs.isBigInt && rhs.isBigInt { return JeffJSBigIntOps.equal(lhs, rhs) }
             return false
         }
         return jsStrictEqSameType(lhs: lhs, rhs: rhs)
@@ -5918,12 +6013,42 @@ struct JeffJSOperators {
             }
             return (JS_CMP_GE, true)
         }
+        if lp.isBigInt || rp.isBigInt {
+            guard let c = bigIntRelational(ctx: ctx, lp, rp) else {
+                return (JS_CMP_UNORDERED, true)
+            }
+            return (c < 0 ? JS_CMP_LT : JS_CMP_GE, true)
+        }
         let (a, ok1) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lp)
         if !ok1 { return (JS_CMP_GE, false) }
         let (b, ok2) = JeffJSTypeConvert.toNumber(ctx: ctx, val: rp)
         if !ok2 { return (JS_CMP_GE, false) }
         if a.isNaN || b.isNaN { return (JS_CMP_UNORDERED, true) }
         return (a < b ? JS_CMP_LT : JS_CMP_GE, true)
+    }
+
+    /// Relational comparison where at least one side is a BigInt.
+    /// nil == unordered (NaN, or a string that is not a BigInt literal).
+    static func bigIntRelational(ctx: JeffJSContext,
+                                 _ lp: JeffJSValue, _ rp: JeffJSValue) -> Int? {
+        if lp.isBigInt && rp.isBigInt { return JeffJSBigIntOps.compare(lp, rp) }
+        if lp.isBigInt {
+            if rp.isString {
+                guard let s = ctx.toSwiftString(rp), let b = jeffJS_stringToBigInt(s) else { return nil }
+                return JBigInt.compare(lp.bigIntValue, b)
+            }
+            let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: rp)
+            if !ok { return nil }
+            return JeffJSBigIntOps.compareWithDouble(lp, d)
+        }
+        if lp.isString {
+            guard let s = ctx.toSwiftString(lp), let b = jeffJS_stringToBigInt(s) else { return nil }
+            return JBigInt.compare(b, rp.bigIntValue)
+        }
+        let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lp)
+        if !ok { return nil }
+        guard let c = JeffJSBigIntOps.compareWithDouble(rp, d) else { return nil }
+        return -c
     }
 
     // MARK: instanceof
@@ -10390,10 +10515,9 @@ struct JeffJSInterpreter {
                     else if v == Int32.min { buf[sp] = .newFloat64(-Double(v)); sp += 1 }
                     else { buf[sp] = .newInt32(-v); sp += 1 }
                 } else {
-                    let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: val)
-                    val.freeValue()
-                    if !ok { retVal = .exception; break dispatchLoop }
-                    buf[sp] = .newFloat64(-d); sp += 1
+                    let r = jeffJS_negSlow(ctx, val)
+                    if r.isException { retVal = .exception; break dispatchLoop }
+                    buf[sp] = r; sp += 1
                 }
                 pc += 1
 
@@ -10402,10 +10526,9 @@ struct JeffJSInterpreter {
                 if val.isNumber {
                     buf[sp] = val; sp += 1
                 } else {
-                    let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: val)
-                    val.freeValue()
-                    if !ok { retVal = .exception; break dispatchLoop }
-                    buf[sp] = .newFloat64(d); sp += 1
+                    let r = jeffJS_plusSlow(ctx, val)
+                    if r.isException { retVal = .exception; break dispatchLoop }
+                    buf[sp] = r; sp += 1
                 }
                 pc += 1
 
@@ -10416,10 +10539,10 @@ struct JeffJSInterpreter {
                     if v == Int32.max { buf[sp] = .newFloat64(Double(v) + 1); sp += 1 }
                     else { buf[sp] = .newInt32(v + 1); sp += 1 }
                 } else {
-                    let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: val)
-                    val.freeValue()
-                    if !ok { retVal = .exception; break dispatchLoop }
-                    buf[sp] = .newFloat64(d + 1); sp += 1
+                    let n = jeffJS_toNumericSlow(ctx, val)
+                    if n.isException { retVal = .exception; break dispatchLoop }
+                    let r = jeffJS_incDecValue(n, 1); n.freeValue()
+                    buf[sp] = r; sp += 1
                 }
                 pc += 1
 
@@ -10430,10 +10553,10 @@ struct JeffJSInterpreter {
                     if v == Int32.min { buf[sp] = .newFloat64(Double(v) - 1); sp += 1 }
                     else { buf[sp] = .newInt32(v - 1); sp += 1 }
                 } else {
-                    let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: val)
-                    val.freeValue()
-                    if !ok { retVal = .exception; break dispatchLoop }
-                    buf[sp] = .newFloat64(d - 1); sp += 1
+                    let n = jeffJS_toNumericSlow(ctx, val)
+                    if n.isException { retVal = .exception; break dispatchLoop }
+                    let r = jeffJS_incDecValue(n, -1); n.freeValue()
+                    buf[sp] = r; sp += 1
                 }
                 pc += 1
 
@@ -10445,11 +10568,11 @@ struct JeffJSInterpreter {
                     if v == Int32.max { buf[sp] = .newFloat64(Double(v) + 1); sp += 1 }
                     else { buf[sp] = .newInt32(v + 1); sp += 1 }
                 } else {
-                    let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: val)
-                    val.freeValue()
-                    if !ok { retVal = .exception; break dispatchLoop }
-                    buf[sp] = .newFloat64(d); sp += 1
-                    buf[sp] = .newFloat64(d + 1); sp += 1
+                    let n = jeffJS_toNumericSlow(ctx, val)
+                    if n.isException { retVal = .exception; break dispatchLoop }
+                    let r = jeffJS_incDecValue(n, 1)
+                    buf[sp] = n; sp += 1
+                    buf[sp] = r; sp += 1
                 }
                 pc += 1
 
@@ -10461,11 +10584,11 @@ struct JeffJSInterpreter {
                     if v == Int32.min { buf[sp] = .newFloat64(Double(v) - 1); sp += 1 }
                     else { buf[sp] = .newInt32(v - 1); sp += 1 }
                 } else {
-                    let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: val)
-                    val.freeValue()
-                    if !ok { retVal = .exception; break dispatchLoop }
-                    buf[sp] = .newFloat64(d); sp += 1
-                    buf[sp] = .newFloat64(d - 1); sp += 1
+                    let n = jeffJS_toNumericSlow(ctx, val)
+                    if n.isException { retVal = .exception; break dispatchLoop }
+                    let r = jeffJS_incDecValue(n, -1)
+                    buf[sp] = n; sp += 1
+                    buf[sp] = r; sp += 1
                 }
                 pc += 1
 
@@ -10475,10 +10598,10 @@ struct JeffJSInterpreter {
                 if val.isInt && val.toInt32() != Int32.max {
                     buf[varBase + idx] = .newInt32(val.toInt32() + 1)
                 } else {
-                    let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: val)
-                    val.freeValue()
-                    if !ok { retVal = .exception; break dispatchLoop }
-                    buf[varBase + idx] = .newFloat64(d + 1)
+                    let n = jeffJS_toNumericSlow(ctx, val)
+                    if n.isException { retVal = .exception; break dispatchLoop }
+                    let r = jeffJS_incDecValue(n, 1); n.freeValue()
+                    buf[varBase + idx] = r
                 }
                 pc += 2
 
@@ -10488,19 +10611,22 @@ struct JeffJSInterpreter {
                 if val.isInt && val.toInt32() != Int32.min {
                     buf[varBase + idx] = .newInt32(val.toInt32() - 1)
                 } else {
-                    let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: val)
-                    val.freeValue()
-                    if !ok { retVal = .exception; break dispatchLoop }
-                    buf[varBase + idx] = .newFloat64(d - 1)
+                    let n = jeffJS_toNumericSlow(ctx, val)
+                    if n.isException { retVal = .exception; break dispatchLoop }
+                    let r = jeffJS_incDecValue(n, -1); n.freeValue()
+                    buf[varBase + idx] = r
                 }
                 pc += 2
 
             case .not:
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                let (i, ok) = JeffJSTypeConvert.toInt32(ctx: ctx, val: val)
-                val.freeValue()
-                if !ok { retVal = .exception; break dispatchLoop }
-                buf[sp] = .newInt32(~i); sp += 1
+                if val.isNumber {
+                    buf[sp] = .newInt32(~jeffJS_traceToInt32(val)); sp += 1
+                } else {
+                    let r = jeffJS_bitNotSlow(ctx, val)
+                    if r.isException { retVal = .exception; break dispatchLoop }
+                    buf[sp] = r; sp += 1
+                }
                 pc += 1
 
             case .lnot:
@@ -10561,11 +10687,9 @@ struct JeffJSInterpreter {
                     let (r, overflow) = lhs.toInt32().subtractingReportingOverflow(rhs.toInt32())
                     buf[sp] = overflow ? .newFloat64(Double(lhs.toInt32()) - Double(rhs.toInt32())) : .newInt32(r); sp += 1
                 } else {
-                    let (a, ok1) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lhs)
-                    let (b, ok2) = JeffJSTypeConvert.toNumber(ctx: ctx, val: rhs)
-                    lhs.freeValue(); rhs.freeValue()
-                    if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                    buf[sp] = .newFloat64(a - b); sp += 1
+                    let r = jeffJS_arithSlow(ctx, .sub, lhs, rhs)
+                    if r.isException { retVal = .exception; break dispatchLoop }
+                    buf[sp] = r; sp += 1
                 }
                 pc += 1
 
@@ -10580,21 +10704,23 @@ struct JeffJSInterpreter {
                         buf[sp] = .newFloat64(Double(a) * Double(b)); sp += 1
                     }
                 } else {
-                    let (a, ok1) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lhs)
-                    let (b, ok2) = JeffJSTypeConvert.toNumber(ctx: ctx, val: rhs)
-                    lhs.freeValue(); rhs.freeValue()
-                    if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                    buf[sp] = .newFloat64(a * b); sp += 1
+                    let r = jeffJS_arithSlow(ctx, .mul, lhs, rhs)
+                    if r.isException { retVal = .exception; break dispatchLoop }
+                    buf[sp] = r; sp += 1
                 }
                 pc += 1
 
             case .div:
                 let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                let (a, ok1) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lhs)
-                let (b, ok2) = JeffJSTypeConvert.toNumber(ctx: ctx, val: rhs)
-                lhs.freeValue(); rhs.freeValue()
-                if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                buf[sp] = .newFloat64(a / b); sp += 1
+                if lhs.isNumber && rhs.isNumber {
+                    let a = lhs.isInt ? Double(lhs.toInt32()) : lhs.toFloat64()
+                    let b = rhs.isInt ? Double(rhs.toInt32()) : rhs.toFloat64()
+                    buf[sp] = .newFloat64(a / b); sp += 1
+                } else {
+                    let r = jeffJS_arithSlow(ctx, .div, lhs, rhs)
+                    if r.isException { retVal = .exception; break dispatchLoop }
+                    buf[sp] = r; sp += 1
+                }
                 pc += 1
 
             case .mod:
@@ -10609,21 +10735,22 @@ struct JeffJSInterpreter {
                         buf[sp] = .newFloat64(Double(a).truncatingRemainder(dividingBy: Double(b))); sp += 1
                     }
                 } else {
-                    let (a, ok1) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lhs)
-                    let (b, ok2) = JeffJSTypeConvert.toNumber(ctx: ctx, val: rhs)
-                    lhs.freeValue(); rhs.freeValue()
-                    if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                    buf[sp] = .newFloat64(a.truncatingRemainder(dividingBy: b)); sp += 1
+                    let r = jeffJS_arithSlow(ctx, .mod, lhs, rhs)
+                    if r.isException { retVal = .exception; break dispatchLoop }
+                    buf[sp] = r; sp += 1
                 }
                 pc += 1
 
             case .pow:
                 let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                let (a, ok1) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lhs)
-                let (b, ok2) = JeffJSTypeConvert.toNumber(ctx: ctx, val: rhs)
-                lhs.freeValue(); rhs.freeValue()
-                if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                buf[sp] = .newFloat64(pow(a, b)); sp += 1
+                if lhs.isNumber && rhs.isNumber {
+                    buf[sp] = .newFloat64(pow(lhs.isInt ? Double(lhs.toInt32()) : lhs.toFloat64(),
+                                              rhs.isInt ? Double(rhs.toInt32()) : rhs.toFloat64())); sp += 1
+                } else {
+                    let r = jeffJS_arithSlow(ctx, .pow, lhs, rhs)
+                    if r.isException { retVal = .exception; break dispatchLoop }
+                    buf[sp] = r; sp += 1
+                }
                 pc += 1
 
             // -----------------------------------------------------------------
@@ -10637,11 +10764,14 @@ struct JeffJSInterpreter {
                     pc += 1
                     continue dispatchLoop
                 }
-                let (a, ok1) = JeffJSTypeConvert.toInt32(ctx: ctx, val: lhs)
-                let (b, ok2) = JeffJSTypeConvert.toInt32(ctx: ctx, val: rhs)
-                lhs.freeValue(); rhs.freeValue()
-                if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                buf[sp] = .newInt32(a << (b & 0x1F)); sp += 1
+                if lhs.isNumber && rhs.isNumber {
+                    let a = jeffJS_traceToInt32(lhs), b = jeffJS_traceToInt32(rhs)
+                    buf[sp] = .newInt32(a << (b & 0x1F)); sp += 1
+                } else {
+                    let r = jeffJS_arithSlow(ctx, .shl, lhs, rhs)
+                    if r.isException { retVal = .exception; break dispatchLoop }
+                    buf[sp] = r; sp += 1
+                }
                 pc += 1
 
             case .sar:
@@ -10651,22 +10781,26 @@ struct JeffJSInterpreter {
                     pc += 1
                     continue dispatchLoop
                 }
-                let (a, ok1) = JeffJSTypeConvert.toInt32(ctx: ctx, val: lhs)
-                let (b, ok2) = JeffJSTypeConvert.toInt32(ctx: ctx, val: rhs)
-                lhs.freeValue(); rhs.freeValue()
-                if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                buf[sp] = .newInt32(a >> (b & 0x1F)); sp += 1
+                if lhs.isNumber && rhs.isNumber {
+                    let a = jeffJS_traceToInt32(lhs), b = jeffJS_traceToInt32(rhs)
+                    buf[sp] = .newInt32(a >> (b & 0x1F)); sp += 1
+                } else {
+                    let r = jeffJS_arithSlow(ctx, .sar, lhs, rhs)
+                    if r.isException { retVal = .exception; break dispatchLoop }
+                    buf[sp] = r; sp += 1
+                }
                 pc += 1
 
             case .shr:
                 let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                let (a32, ok1) = JeffJSTypeConvert.toInt32(ctx: ctx, val: lhs)
-                let (b, ok2) = JeffJSTypeConvert.toInt32(ctx: ctx, val: rhs)
-                lhs.freeValue(); rhs.freeValue()
-                if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                let ua = UInt32(bitPattern: a32)
-                let result = ua >> (UInt32(b & 0x1F))
-                buf[sp] = .newUInt32(result); sp += 1
+                if lhs.isNumber && rhs.isNumber {
+                    let ua = UInt32(bitPattern: jeffJS_traceToInt32(lhs))
+                    buf[sp] = .newUInt32(ua >> (UInt32(bitPattern: jeffJS_traceToInt32(rhs)) & 0x1F)); sp += 1
+                } else {
+                    let r = jeffJS_shrSlow(ctx, lhs, rhs)
+                    if r.isException { retVal = .exception; break dispatchLoop }
+                    buf[sp] = r; sp += 1
+                }
                 pc += 1
 
             // -----------------------------------------------------------------
@@ -10795,11 +10929,14 @@ struct JeffJSInterpreter {
                     pc += 1
                     continue dispatchLoop
                 }
-                let (a, ok1) = JeffJSTypeConvert.toInt32(ctx: ctx, val: lhs)
-                let (b, ok2) = JeffJSTypeConvert.toInt32(ctx: ctx, val: rhs)
-                lhs.freeValue(); rhs.freeValue()
-                if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                buf[sp] = .newInt32(a & b); sp += 1
+                if lhs.isNumber && rhs.isNumber {
+                    let a = jeffJS_traceToInt32(lhs), b = jeffJS_traceToInt32(rhs)
+                    buf[sp] = .newInt32(a & b); sp += 1
+                } else {
+                    let r = jeffJS_arithSlow(ctx, .and, lhs, rhs)
+                    if r.isException { retVal = .exception; break dispatchLoop }
+                    buf[sp] = r; sp += 1
+                }
                 pc += 1
 
             case .xor:
@@ -10809,11 +10946,14 @@ struct JeffJSInterpreter {
                     pc += 1
                     continue dispatchLoop
                 }
-                let (a, ok1) = JeffJSTypeConvert.toInt32(ctx: ctx, val: lhs)
-                let (b, ok2) = JeffJSTypeConvert.toInt32(ctx: ctx, val: rhs)
-                lhs.freeValue(); rhs.freeValue()
-                if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                buf[sp] = .newInt32(a ^ b); sp += 1
+                if lhs.isNumber && rhs.isNumber {
+                    let a = jeffJS_traceToInt32(lhs), b = jeffJS_traceToInt32(rhs)
+                    buf[sp] = .newInt32(a ^ b); sp += 1
+                } else {
+                    let r = jeffJS_arithSlow(ctx, .xor, lhs, rhs)
+                    if r.isException { retVal = .exception; break dispatchLoop }
+                    buf[sp] = r; sp += 1
+                }
                 pc += 1
 
             case .or:
@@ -10823,11 +10963,14 @@ struct JeffJSInterpreter {
                     pc += 1
                     continue dispatchLoop
                 }
-                let (a, ok1) = JeffJSTypeConvert.toInt32(ctx: ctx, val: lhs)
-                let (b, ok2) = JeffJSTypeConvert.toInt32(ctx: ctx, val: rhs)
-                lhs.freeValue(); rhs.freeValue()
-                if !ok1 || !ok2 { retVal = .exception; break dispatchLoop }
-                buf[sp] = .newInt32(a | b); sp += 1
+                if lhs.isNumber && rhs.isNumber {
+                    let a = jeffJS_traceToInt32(lhs), b = jeffJS_traceToInt32(rhs)
+                    buf[sp] = .newInt32(a | b); sp += 1
+                } else {
+                    let r = jeffJS_arithSlow(ctx, .or, lhs, rhs)
+                    if r.isException { retVal = .exception; break dispatchLoop }
+                    buf[sp] = r; sp += 1
+                }
                 pc += 1
 
             // -----------------------------------------------------------------
@@ -10999,10 +11142,9 @@ struct JeffJSInterpreter {
                         buf[varBase + idx] = .newFloat64(Double(val.toInt32()) + Double(addend))
                     }
                 } else {
-                    let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: val)
-                    val.freeValue()
-                    if !ok { retVal = .exception; break dispatchLoop }
-                    buf[varBase + idx] = .newFloat64(d + Double(addend))
+                    let r = jeffJS_arithSlow(ctx, .add, val, .newInt32(addend))
+                    if r.isException { retVal = .exception; break dispatchLoop }
+                    buf[varBase + idx] = r
                 }
                 pc += 6
 
@@ -11756,4 +11898,82 @@ struct JeffJSKeySeen {
         if list.count > Self.promoteAt { set = Set(list) }
         return true
     }
+}
+
+// MARK: - BigInt-aware slow paths for the main dispatch loop
+
+/// Slow path for `- * / % ** & | ^ << >>` when the int fast path missed.
+/// Consumes both operands; returns `.exception` after throwing.
+/// Out-of-line on purpose: inlining these arms into the main dispatch switch
+/// costs ~2x on every call-heavy kernel.
+@inline(never)
+func jeffJS_arithSlow(_ ctx: JeffJSContext, _ op: JeffJSBigIntBinOp,
+                      _ lhs: JeffJSValue, _ rhs: JeffJSValue) -> JeffJSValue {
+    let r = JeffJSOperators.jsArith(ctx: ctx, op: op, lhs: lhs, rhs: rhs)
+    lhs.freeValue(); rhs.freeValue()
+    return r
+}
+
+/// `>>>` slow path — BigInts have no unsigned shift.
+@inline(never)
+func jeffJS_shrSlow(_ ctx: JeffJSContext, _ lhs: JeffJSValue, _ rhs: JeffJSValue) -> JeffJSValue {
+    defer { lhs.freeValue(); rhs.freeValue() }
+    if lhs.isBigInt || rhs.isBigInt {
+        return ctx.throwTypeError(message: "BigInts have no unsigned right shift, use >> instead")
+    }
+    let (a32, ok1) = JeffJSTypeConvert.toInt32(ctx: ctx, val: lhs)
+    let (b, ok2) = JeffJSTypeConvert.toInt32(ctx: ctx, val: rhs)
+    if !ok1 || !ok2 { return .exception }
+    return .newUInt32(UInt32(bitPattern: a32) >> UInt32(b & 0x1F))
+}
+
+/// ToNumeric for the unary opcodes: a Number or a BigInt (owned), or
+/// `.exception`. Consumes `val`.
+@inline(never)
+func jeffJS_toNumericSlow(_ ctx: JeffJSContext, _ val: JeffJSValue) -> JeffJSValue {
+    let n = ctx.toNumericValue(val)
+    val.freeValue()
+    return n
+}
+
+/// `++` / `--` on an already-numeric value (borrows it).
+@inline(never)
+func jeffJS_incDecValue(_ n: JeffJSValue, _ delta: Int64) -> JeffJSValue {
+    if n.isBigInt { return JeffJSBigIntOps.addInt(n, delta) }
+    let d = n.isInt ? Double(n.toInt32()) : n.toFloat64()
+    return .newFloat64(d + Double(delta))
+}
+
+/// Unary `-` slow path. Consumes `val`.
+@inline(never)
+func jeffJS_negSlow(_ ctx: JeffJSContext, _ val: JeffJSValue) -> JeffJSValue {
+    let n = jeffJS_toNumericSlow(ctx, val)
+    if n.isException { return .exception }
+    if n.isBigInt {
+        let r = JeffJSBigIntOps.negate(n); n.freeValue(); return r
+    }
+    return .newFloat64(-(n.isInt ? Double(n.toInt32()) : n.toFloat64()))
+}
+
+/// Unary `+` slow path — a TypeError on BigInts. Consumes `val`.
+@inline(never)
+func jeffJS_plusSlow(_ ctx: JeffJSContext, _ val: JeffJSValue) -> JeffJSValue {
+    if val.isBigInt {
+        val.freeValue()
+        return ctx.throwTypeError(message: "Cannot convert a BigInt value to a number")
+    }
+    let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: val)
+    val.freeValue()
+    return ok ? .newFloat64(d) : .exception
+}
+
+/// Unary `~` slow path. Consumes `val`.
+@inline(never)
+func jeffJS_bitNotSlow(_ ctx: JeffJSContext, _ val: JeffJSValue) -> JeffJSValue {
+    if val.isBigInt {
+        let r = JeffJSBigIntOps.bitwiseNot(val); val.freeValue(); return r
+    }
+    let (i, ok) = JeffJSTypeConvert.toInt32(ctx: ctx, val: val)
+    val.freeValue()
+    return ok ? .newInt32(~i) : .exception
 }

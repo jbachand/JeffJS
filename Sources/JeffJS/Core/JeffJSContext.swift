@@ -1593,6 +1593,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         if val.isSymbol {
             return true
         }
+        // BigInt: only 0n is falsy
+        if val.isBigInt {
+            return !val.bigIntIsZero
+        }
         return false
     }
 
@@ -1647,8 +1651,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             return throwTypeError(message: "Cannot convert a Symbol value to a string")
         }
         if val.isBigInt {
-            // Would format the BigInt digits
-            return newStringValue("0n")
+            return newStringValue(JeffJSBigIntOps.toSwiftString(val))
         }
         return newStringValue("undefined")
     }
@@ -3258,6 +3261,31 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             return .newInt32(Int32(u == 0 ? 32 : u.leadingZeroBitCount))
         }, name: "clz32", length: 1)
         _ = setPropertyStr(obj: mathObj, name: "clz32", value: mathClz32)
+
+        // Math takes Numbers only — ToNumber(BigInt) is a TypeError. These
+        // builtins all funnel through `toFloat64`, which can only answer with
+        // a Double, so the check goes at the call boundary.
+        for name in ["abs", "floor", "ceil", "round", "max", "min", "pow",
+                     "atan2", "hypot", "imul", "clz32", "sqrt", "sin", "cos",
+                     "tan", "log", "log2", "log10", "exp", "trunc", "sign",
+                     "cbrt", "atan", "asin", "acos", "fround", "expm1",
+                     "log1p", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh"] {
+            let fn = getPropertyStr(obj: mathObj, name: name)
+            guard let fnObj = fn.toObject(),
+                  case .cFunc(_, .generic(let inner), let len, _, _) = fnObj.payload else {
+                fn.freeValue(); continue
+            }
+            // Re-wrap the underlying closure, not the function object: the
+            // guard costs one tag test, no extra JS call.
+            let guarded = newCFunction({ ctx, thisVal, args in
+                for v in args where v.isBigInt {
+                    return ctx.throwTypeError(message: "Cannot convert a BigInt value to a number")
+                }
+                return inner(ctx, thisVal, args)
+            }, name: name, length: Int(len))
+            fn.freeValue()
+            _ = setPropertyStr(obj: mathObj, name: name, value: guarded)
+        }
     }
 
     /// Adds String constructor and prototype methods.
@@ -3475,80 +3503,43 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         let bigIntProto = newObjectClass(classID: JSClassID.JS_CLASS_OBJECT.rawValue)
         classProto[JSClassID.JS_CLASS_BIG_INT.rawValue] = bigIntProto
 
-        // BigInt(value) constructor — converts argument to BigInt
-        let bigIntCtor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            if args.isEmpty {
-                return JeffJSValue.mkShortBigInt(0)
-            }
-            let arg = args[0]
-            // Already a BigInt: return as-is
-            if arg.isBigInt || arg.isShortBigInt {
-                return arg.dupValue()   // the caller releases this argument; the result is a new reference
-            }
-            // Number -> BigInt (must be an integer)
-            if arg.isInt {
-                return JeffJSValue.mkShortBigInt(Int64(arg.toInt32()))
-            }
-            if arg.isFloat64 {
-                let d = arg.toFloat64()
-                if d.isNaN || d.isInfinite || d != Foundation.floor(d) {
-                    return self.throwRangeError("Cannot convert non-integer to BigInt")
+        // BigInt(value) — ES 21.2.1.1. Not a constructor: `new BigInt(1n)`
+        // is a TypeError.
+        // constructorOrFunc so `new BigInt(1)` can be rejected.
+        let bigIntCtorObj = JeffJSObject()
+        bigIntCtorObj.classID = JSClassID.JS_CLASS_C_FUNCTION.rawValue
+        bigIntCtorObj.extensible = true
+        bigIntCtorObj.isConstructor = false
+        bigIntCtorObj.payload = .cFunc(
+            realm: self,
+            cFunction: .constructorOrFunc({ [weak self] ctx, thisVal, args, isNew in
+                guard let self = self else { return .exception }
+                if isNew {
+                    return self.throwTypeError(message: "BigInt is not a constructor")
                 }
-                if d > Double(Int64.max) || d < Double(Int64.min) {
-                    return self.throwRangeError("BigInt value out of Int64 range")
+                if args.isEmpty {
+                    return self.throwTypeError(message: "Cannot convert undefined to a BigInt")
                 }
-                return JeffJSValue.mkShortBigInt(Int64(d))
-            }
-            // Boolean -> BigInt
-            if arg.isBool {
-                return JeffJSValue.mkShortBigInt(arg.toBool() ? 1 : 0)
-            }
-            // String -> BigInt
-            if arg.isString, let s = arg.stringValue {
-                let str = s.toSwiftString().trimmingCharacters(in: .whitespaces)
-                if str.isEmpty {
-                    return self.throwSyntaxError("Cannot convert empty string to BigInt")
-                }
-                // Handle hex (0x), octal (0o), binary (0b) prefixes
-                var parseStr = str
-                var radix = 10
-                if str.hasPrefix("0x") || str.hasPrefix("0X") {
-                    parseStr = String(str.dropFirst(2))
-                    radix = 16
-                } else if str.hasPrefix("0o") || str.hasPrefix("0O") {
-                    parseStr = String(str.dropFirst(2))
-                    radix = 8
-                } else if str.hasPrefix("0b") || str.hasPrefix("0B") {
-                    parseStr = String(str.dropFirst(2))
-                    radix = 2
-                }
-                var negative = false
-                if parseStr.hasPrefix("-") {
-                    negative = true
-                    parseStr = String(parseStr.dropFirst())
-                } else if parseStr.hasPrefix("+") {
-                    parseStr = String(parseStr.dropFirst())
-                }
-                if let value = UInt64(parseStr, radix: radix) {
-                    let result = negative ? -Int64(bitPattern: value) : Int64(bitPattern: value)
-                    return JeffJSValue.mkShortBigInt(result)
-                }
-                return self.throwSyntaxError("Cannot convert \(str) to BigInt")
-            }
-            return self.throwTypeError("Cannot convert to BigInt")
-        }, name: "BigInt", length: 1)
+                return self.bigIntConstructorValue(args[0])
+            }),
+            length: 1,
+            cproto: UInt8(JS_CFUNC_CONSTRUCTOR_OR_FUNC),
+            magic: 0
+        )
+        let fProtoObj = functionProto.isObject ? functionProto.toObject() : nil
+        bigIntCtorObj.shape = jeffJS_rootShape(self, proto: fProtoObj)
+        bigIntCtorObj.proto = fProtoObj
+        let bigIntCtor = JeffJSValue.makeObject(bigIntCtorObj)
+        _ = setPropertyStr(obj: bigIntCtor, name: "name", value: newStringValue("BigInt"))
+        _ = setPropertyStr(obj: bigIntCtor, name: "length", value: .newInt32(1))
 
-        // BigInt.prototype.toString(radix?)
         if let protoObj = bigIntProto.toObject() {
-            jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "toString", length: 1) { ctx, this, args in
+            jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "toString", length: 0) { ctx, this, args in
                 return JeffJSBuiltinBigInt.toString(ctx: ctx, this: this, args: args)
             }
-            // BigInt.prototype.valueOf()
             jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "valueOf", length: 0) { ctx, this, args in
                 return JeffJSBuiltinBigInt.valueOf(ctx: ctx, this: this, args: args)
             }
-            // BigInt.prototype.toLocaleString()
             jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "toLocaleString", length: 0) { ctx, this, args in
                 return JeffJSBuiltinBigInt.toLocaleString(ctx: ctx, this: this, args: args)
             }
@@ -3567,6 +3558,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             return JeffJSBuiltinBigInt.asUintN(ctx: self, this: thisVal, args: args)
         }, name: "asUintN", length: 2)
         _ = setPropertyStr(obj: bigIntCtor, name: "asUintN", value: asUintNFn)
+
+        // BigInt.prototype / .constructor
+        _ = setPropertyStr(obj: bigIntCtor, name: "prototype", value: bigIntProto.dupValue())
+        _ = setPropertyStr(obj: bigIntProto, name: "constructor", value: bigIntCtor.dupValue())
 
         _ = setPropertyStr(obj: globalObj, name: "BigInt", value: bigIntCtor)
     }
@@ -4097,6 +4092,13 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                     return getPropertyInternal(obj: proto, atom: atom, receiver: receiver)
                 }
             }
+            // BigInt auto-boxing: (1n).toString() etc.
+            if obj.isBigInt {
+                let proto = classProto[JSClassID.JS_CLASS_BIG_INT.rawValue]
+                if proto.isObject {
+                    return getPropertyInternal(obj: proto, atom: atom, receiver: receiver)
+                }
+            }
             // Symbol auto-boxing: Symbol('foo').description etc.
             if obj.isSymbol {
                 let proto = classProto[JSClassID.JS_CLASS_SYMBOL.rawValue]
@@ -4411,9 +4413,19 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                         return 0
                     }
                     if idx < ta.length, let info = typedArrayInfo(forClassID: ta.classID) {
+                        var toStore = value
+                        if info.isBigInt {
+                            // ES 10.4.5.16: BigInt arrays run ToBigInt, so a
+                            // Number store is a TypeError.
+                            let b = toBigIntValue(value)
+                            if b.isException { value.freeValue(); return -1 }
+                            value.freeValue()
+                            toStore = b
+                        }
                         info.writeElement(&ab.data,
                                           offset: ta.byteOffset + Int(idx) * info.bytesPerElement,
-                                          value: value)
+                                          value: toStore)
+                        if info.isBigInt { toStore.freeValue() }
                         return 1
                     }
                     // Out of bounds — silently ignore per spec
@@ -5194,6 +5206,9 @@ extension JeffJSContext {
             return sa.len == sb.len && jeffJS_stringCompare(s1: sa, s2: sb) == 0
         }
         if a.isObject && b.isObject { return a.toObject() === b.toObject() }
+        if a.isBigInt || b.isBigInt {
+            return a.isBigInt && b.isBigInt && JeffJSBigIntOps.equal(a, b)
+        }
         if !JeffJSValue.sameTag(a, b) { return false }
         return a == b
     }

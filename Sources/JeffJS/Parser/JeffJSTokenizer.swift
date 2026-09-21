@@ -25,6 +25,10 @@ struct JeffJSToken {
 
     // -- Numeric literal data --
     var numValue: Double = 0
+    /// Non-nil when the literal carried the BigInt `n` suffix (`123n`).
+    /// `numValue` is left as the (possibly lossy) double so the property-name
+    /// paths keep working.
+    var bigIntValue: JBigInt? = nil
 
     // -- String / template literal data --
     var strValue: String = ""
@@ -54,6 +58,7 @@ struct JeffJSToken {
         type = 0
         ptr = 0
         numValue = 0
+        bigIntValue = nil
         strValue = ""
         strSeparator = "\0"
         templateRawStart = 0
@@ -1374,8 +1379,23 @@ extension JeffJSParseState {
                 return false
             }
             bufPtr += 1
-            // For now, parse BigInt as a regular number (full BigInt support comes later)
             let numStr = extractNumberString(startPtr, bufPtr - 1)
+            guard let b = JBigInt.parse(digits: Array(numStr.utf8), radix: 10) else {
+                syntaxError("invalid BigInt literal")
+                return false
+            }
+            if numStr.utf8.count > 1 && numStr.utf8.first == 0x30 {
+                syntaxError("BigInt literal cannot have a leading zero")
+                return false
+            }
+            if bufPtr < bufLen {
+                let (nextCP, _) = decodeUTF8()
+                if jeffJS_isIdentFirst(nextCP) {
+                    syntaxError("identifier starts immediately after numeric literal")
+                    return false
+                }
+            }
+            token.bigIntValue = b
             token.numValue = Double(numStr) ?? 0
             token.type = JSTokenType.TOK_NUMBER.rawValue
             return true
@@ -1407,7 +1427,10 @@ extension JeffJSParseState {
         }
 
         // BigInt suffix
+        var isBig = false
+        var digitEnd = bufPtr
         if bufPtr < bufLen && buf[bufPtr] == 0x6E { // 'n'
+            isBig = true
             bufPtr += 1
         }
 
@@ -1420,8 +1443,19 @@ extension JeffJSParseState {
             }
         }
 
-        let hexStr = extractNumberString(digitStart, bufPtr)
+        if !isBig { digitEnd = bufPtr }
+        let hexStr = extractNumberString(digitStart, digitEnd)
         let cleaned = hexStr.replacingOccurrences(of: "_", with: "")
+        if isBig {
+            guard let b = JBigInt.parse(digits: Array(cleaned.utf8), radix: 16) else {
+                syntaxError("invalid BigInt literal")
+                return false
+            }
+            token.bigIntValue = b
+            token.numValue = b.asDouble
+            token.type = JSTokenType.TOK_NUMBER.rawValue
+            return true
+        }
         if let val = UInt64(cleaned, radix: 16) {
             token.numValue = Double(val)
         } else {
@@ -1452,7 +1486,9 @@ extension JeffJSParseState {
         }
 
         // BigInt suffix
-        if bufPtr < bufLen && buf[bufPtr] == 0x6E { bufPtr += 1 }
+        var isBig = false
+        var digitEnd = bufPtr
+        if bufPtr < bufLen && buf[bufPtr] == 0x6E { isBig = true; bufPtr += 1 }
 
         if bufPtr < bufLen {
             let (nextCP, _) = decodeUTF8()
@@ -1462,8 +1498,19 @@ extension JeffJSParseState {
             }
         }
 
-        let octStr = extractNumberString(digitStart, bufPtr)
+        if !isBig { digitEnd = bufPtr }
+        let octStr = extractNumberString(digitStart, digitEnd)
         let cleaned = octStr.replacingOccurrences(of: "_", with: "")
+        if isBig {
+            guard let b = JBigInt.parse(digits: Array(cleaned.utf8), radix: 8) else {
+                syntaxError("invalid BigInt literal")
+                return false
+            }
+            token.bigIntValue = b
+            token.numValue = b.asDouble
+            token.type = JSTokenType.TOK_NUMBER.rawValue
+            return true
+        }
         if let val = UInt64(cleaned, radix: 8) {
             token.numValue = Double(val)
         } else {
@@ -1493,7 +1540,9 @@ extension JeffJSParseState {
         }
 
         // BigInt suffix
-        if bufPtr < bufLen && buf[bufPtr] == 0x6E { bufPtr += 1 }
+        var isBig = false
+        var digitEnd = bufPtr
+        if bufPtr < bufLen && buf[bufPtr] == 0x6E { isBig = true; bufPtr += 1 }
 
         if bufPtr < bufLen {
             let (nextCP, _) = decodeUTF8()
@@ -1503,8 +1552,19 @@ extension JeffJSParseState {
             }
         }
 
-        let binStr = extractNumberString(digitStart, bufPtr)
+        if !isBig { digitEnd = bufPtr }
+        let binStr = extractNumberString(digitStart, digitEnd)
         let cleaned = binStr.replacingOccurrences(of: "_", with: "")
+        if isBig {
+            guard let b = JBigInt.parse(digits: Array(cleaned.utf8), radix: 2) else {
+                syntaxError("invalid BigInt literal")
+                return false
+            }
+            token.bigIntValue = b
+            token.numValue = b.asDouble
+            token.type = JSTokenType.TOK_NUMBER.rawValue
+            return true
+        }
         if let val = UInt64(cleaned, radix: 2) {
             token.numValue = Double(val)
         } else {
