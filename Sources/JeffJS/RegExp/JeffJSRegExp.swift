@@ -999,6 +999,70 @@ private final class RECompiler {
         }
     }
 
+    /// Port of QuickJS `re_check_advance()`.  Returns 1 when the compiled atom
+    /// always consumes at least one character, 0 when it may match the empty
+    /// string (or when the body contains control flow we cannot reason about).
+    ///
+    /// Only bodies that may match empty need the push_char_pos / check_advance
+    /// pair, and ECMAScript's RepeatMatcher applies that check only once the
+    /// quantifier's `min` is exhausted -- so `x+` must run its first,
+    /// mandatory iteration without it (`/(?:b*|c)+/` matches "" in qjs).
+    private func reCheckAdvance(_ buf: [UInt8]) -> Int {
+        var sawChar = false
+        var pos = 0
+        var hasBackRef = false
+        var captureBitmap = [UInt8](repeating: 0, count: 256)
+        while pos < buf.count {
+            guard let op = JeffJSRegExpOpcode(rawValue: buf[pos]) else { return 0 }
+            var len = lreOpcodeSize(op)
+            switch op {
+            case .range:
+                guard pos + 2 < buf.count else { return 0 }
+                len += Int(UInt16(buf[pos + 1]) | (UInt16(buf[pos + 2]) << 8)) * 4
+                sawChar = true
+            case .range32:
+                guard pos + 2 < buf.count else { return 0 }
+                len += Int(UInt16(buf[pos + 1]) | (UInt16(buf[pos + 2]) << 8)) * 8
+                sawChar = true
+            case .char_, .char32, .dot, .any:
+                sawChar = true
+            case .lineStart, .lineEnd, .pushI32, .pushCharPos, .drop,
+                 .wordBoundary, .notWordBoundary, .prev:
+                break
+            case .saveStart, .saveEnd:
+                guard pos + 1 < buf.count else { return 0 }
+                captureBitmap[Int(buf[pos + 1])] |= 1
+            case .saveReset:
+                guard pos + 2 < buf.count else { return 0 }
+                let start = Int(buf[pos + 1])
+                let cnt = Int(buf[pos + 2])
+                var g = start
+                while g < start + cnt && g < 256 { captureBitmap[g] |= 1; g += 1 }
+            case .backReference, .backwardBackReference:
+                guard pos + 1 < buf.count else { return 0 }
+                captureBitmap[Int(buf[pos + 1])] |= 2
+                hasBackRef = true
+            default:
+                // split / goto / loop / lookahead: cannot predict the outcome.
+                return 0
+            }
+            pos += len
+        }
+        if hasBackRef {
+            // A back reference to a group captured by this same body may be empty.
+            for b in captureBitmap where b == 3 { return 0 }
+        }
+        return sawChar ? 1 : 0
+    }
+
+    /// Emit `save_reset` for the groups the atom body owns, if it has any.
+    private func emitAtomCaptureReset(_ atomCaptures: Int, _ hasCaptures: Bool) {
+        guard hasCaptures else { return }
+        bc.emitOp(.saveReset)
+        bc.emit(UInt8(atomCaptures & 0xFF))
+        bc.emit(UInt8((captureCount - atomCaptures) & 0xFF))
+    }
+
     func emitQuantifier(atomStart: Int, atomCaptures: Int, min: Int32, max: Int32, lazy: Bool) {
         if min == 1 && max == 1 { return } // {1} is a no-op
 
@@ -1044,10 +1108,13 @@ private final class RECompiler {
                 splitPos = bc.emitSplitNextFirst()
             }
 
-            // Push char pos for empty-check.
-            bc.emitOp(.pushCharPos)
+            // Push char pos for the empty-check -- only bodies that can match
+            // the empty string need one.
+            let needsEmptyCheck = reCheckAdvance(atomBody) != 1
+            if needsEmptyCheck { bc.emitOp(.pushCharPos) }
+            emitAtomCaptureReset(atomCaptures, hasCaptures)
             bc.code.append(contentsOf: atomBody)
-            bc.emitOp(.checkAdvance)
+            if needsEmptyCheck { bc.emitOp(.checkAdvance) }
 
             // Loop back.
             let loopPos = bc.emitGoto()
@@ -1056,18 +1123,40 @@ private final class RECompiler {
             bc.patchJump(splitPos)
         } else if min == 1 && max == Int32.max {
             // + (or +?)
-            let loopTop = bc.count
-            bc.emitOp(.pushCharPos)
-            bc.code.append(contentsOf: atomBody)
-            bc.emitOp(.checkAdvance)
-
-            let splitPos: Int
-            if lazy {
-                splitPos = bc.emitSplitGotoFirst()
+            if reCheckAdvance(atomBody) == 1 {
+                // The body always consumes, so no iteration can be empty and the
+                // loop can stay compact: body, then a split back to the top.
+                //
+                // The split's jump target is `loopTop`, an opcode position, and
+                // the VM computes target = splitPos + 4 + offset (splitPos is the
+                // offset field, one byte past the opcode).  This used to subtract
+                // one byte too many and landed *before* the loop head.
+                //
+                // Greedy means "prefer another iteration": jump back first and
+                // keep "fall through / exit" as the backtrack alternative, i.e.
+                // split_goto_first.  Lazy is the mirror image.  These two were
+                // swapped, which made every greedy `x+` behave lazily.
+                let loopTop = bc.count
+                emitAtomCaptureReset(atomCaptures, hasCaptures)
+                bc.code.append(contentsOf: atomBody)
+                let splitPos = lazy ? bc.emitSplitNextFirst() : bc.emitSplitGotoFirst()
+                bc.patchI32(splitPos, Int32(loopTop - splitPos - 4))
             } else {
-                splitPos = bc.emitSplitNextFirst()
+                // The body may match empty.  The first iteration is mandatory and
+                // must run *without* the zero-advance check, so emit it unrolled
+                // and follow it with a plain `*` loop.
+                emitAtomCaptureReset(atomCaptures, hasCaptures)
+                bc.code.append(contentsOf: atomBody)
+
+                let splitPos = lazy ? bc.emitSplitGotoFirst() : bc.emitSplitNextFirst()
+                bc.emitOp(.pushCharPos)
+                emitAtomCaptureReset(atomCaptures, hasCaptures)
+                bc.code.append(contentsOf: atomBody)
+                bc.emitOp(.checkAdvance)
+                let loopPos = bc.emitGoto()
+                bc.patchI32(loopPos, Int32(splitPos - loopPos - 4 - 1))
+                bc.patchJump(splitPos)
             }
-            bc.patchI32(splitPos, Int32(loopTop - splitPos - 4 - 1))
         } else if min == 0 && max == 1 {
             // ? (or ??)
             let splitPos: Int
@@ -1076,17 +1165,18 @@ private final class RECompiler {
             } else {
                 splitPos = bc.emitSplitNextFirst()
             }
+            emitAtomCaptureReset(atomCaptures, hasCaptures)
             bc.code.append(contentsOf: atomBody)
             bc.patchJump(splitPos)
         } else {
-            // General {n,m}
+            // General {n,m}.  The mandatory copies never get the zero-advance
+            // check; only the optional ones (where RepeatMatcher's `min` is
+            // already 0) do, and only when the body can match empty at all.
+            let needsEmptyCheck = reCheckAdvance(atomBody) != 1
+
             // Emit min required copies.
             for _ in 0 ..< min {
-                if hasCaptures {
-                    bc.emitOp(.saveReset)
-                    bc.emit(UInt8(atomCaptures & 0xFF))
-                    bc.emit(UInt8((captureCount - atomCaptures) & 0xFF))
-                }
+                emitAtomCaptureReset(atomCaptures, hasCaptures)
                 bc.code.append(contentsOf: atomBody)
             }
 
@@ -1098,14 +1188,10 @@ private final class RECompiler {
                 } else {
                     splitPos = bc.emitSplitNextFirst()
                 }
-                bc.emitOp(.pushCharPos)
-                if hasCaptures {
-                    bc.emitOp(.saveReset)
-                    bc.emit(UInt8(atomCaptures & 0xFF))
-                    bc.emit(UInt8((captureCount - atomCaptures) & 0xFF))
-                }
+                if needsEmptyCheck { bc.emitOp(.pushCharPos) }
+                emitAtomCaptureReset(atomCaptures, hasCaptures)
                 bc.code.append(contentsOf: atomBody)
-                bc.emitOp(.checkAdvance)
+                if needsEmptyCheck { bc.emitOp(.checkAdvance) }
                 let loopPos = bc.emitGoto()
                 bc.patchI32(loopPos, Int32(splitPos - loopPos - 4 - 1))
                 bc.patchJump(splitPos)
@@ -1119,12 +1205,10 @@ private final class RECompiler {
                     } else {
                         splitPos = bc.emitSplitNextFirst()
                     }
-                    if hasCaptures {
-                        bc.emitOp(.saveReset)
-                        bc.emit(UInt8(atomCaptures & 0xFF))
-                        bc.emit(UInt8((captureCount - atomCaptures) & 0xFF))
-                    }
+                    if needsEmptyCheck { bc.emitOp(.pushCharPos) }
+                    emitAtomCaptureReset(atomCaptures, hasCaptures)
                     bc.code.append(contentsOf: atomBody)
+                    if needsEmptyCheck { bc.emitOp(.checkAdvance) }
                     bc.patchJump(splitPos)
                 }
             }
@@ -2258,6 +2342,21 @@ final class REVirtualMachine {
     var stepCount: Int = 0
     let stepLimit: Int = 10_000_000  // safety limit
 
+    /// Counter stack for push_char_pos / push_i32 (QuickJS's `stack[]`).
+    /// It is deliberately *separate* from the backtracking stack: in QuickJS a
+    /// pushed state snapshots this stack, so a split emitted between a
+    /// push_char_pos and its check_advance must not shadow the pushed value.
+    var valueStack: ContiguousArray<Int32>
+    /// LIFO arena holding the `valueStack` snapshot of every live split state.
+    var valueSnapshots: ContiguousArray<Int32>
+    /// Lowest `valueStack` index the current (sub-)execution may pop.
+    var valueFloor: Int = 0
+    /// False while both counter stacks are known to be empty.  `reset()` runs
+    /// once per start offset of an unanchored scan, and only patterns with a
+    /// generic quantifier loop ever touch them, so this flag keeps the common
+    /// case down to a single field read.
+    var valueStacksDirty: Bool = false
+
     struct BacktrackEntry {
         var pc: Int
         var pos: Int
@@ -2275,13 +2374,15 @@ final class REVirtualMachine {
             self.extra = 0
         }
 
-        // Split/goto backtrack (no capture restore)
+        // Split/goto backtrack (no capture restore).
+        // For these entries (pc >= 0) `captureVal`/`captureIdx` are reused to
+        // record where this state's valueStack snapshot lives in the arena.
         @inline(__always)
-        init(pc: Int, pos: Int) {
+        init(pc: Int, pos: Int, snapOff: Int, snapLen: Int) {
             self.pc = pc
             self.pos = pos
-            self.captureIdx = -1
-            self.captureVal = 0
+            self.captureIdx = Int32(snapLen)
+            self.captureVal = snapOff
             self.extra = 0
         }
 
@@ -2319,6 +2420,9 @@ final class REVirtualMachine {
         // Initialise captures to -1 (unmatched).
         self.captures = ContiguousArray<Int>(repeating: -1, count: captureCount * 2)
         self.stack = ContiguousArray<BacktrackEntry>()
+        self.valueStack = ContiguousArray<Int32>()
+        self.valueSnapshots = ContiguousArray<Int32>()
+        self.valueFloor = 0
         self.stack.reserveCapacity(32)   // grows geometrically; 1024 entries (40 KB) per exec was the exec cost
     }
 
@@ -2332,6 +2436,12 @@ final class REVirtualMachine {
             captures[i] = -1
         }
         stack.removeAll(keepingCapacity: true)
+        if valueStacksDirty {
+            valueStack.removeAll(keepingCapacity: true)
+            valueSnapshots.removeAll(keepingCapacity: true)
+            valueStacksDirty = false
+        }
+        valueFloor = 0
     }
 
     // MARK: Top-level exec
@@ -2421,6 +2531,9 @@ final class REVirtualMachine {
     func run(pc initialPC: Int, pos initialPos: Int) -> Bool {
         var pc = initialPC
         var pos = initialPos
+        // The counter stacks are cleared by `init` and by `reset()`, which every
+        // caller runs before `exec()`; clearing them again here would cost two
+        // array calls per start offset of an unanchored scan.
         stack.removeAll(keepingCapacity: true)
 
         // Use unsafe buffer pointers for the hot loop to avoid bounds checking.
@@ -2603,11 +2716,20 @@ final class REVirtualMachine {
                 let start = Int(bcBuf[pc + 1])
                 let count = Int(bcBuf[pc + 2])
                 // Reset captures in range [start, start+count) to -1.
+                // QuickJS snapshots the whole capture array in push_state, so a
+                // reset is undone when the engine backtracks past it; here each
+                // clobbered slot gets its own restore entry.
                 for g in start ..< start + count {
                     let si = g * 2
                     let ei = g * 2 + 1
-                    if si < captures.count { captures[si] = -1 }
-                    if ei < captures.count { captures[ei] = -1 }
+                    if si < captures.count, captures[si] != -1 {
+                        stack.append(BacktrackEntry(pc: -1, pos: pos, captureIdx: Int32(si), captureVal: captures[si]))
+                        captures[si] = -1
+                    }
+                    if ei < captures.count, captures[ei] != -1 {
+                        stack.append(BacktrackEntry(pc: -1, pos: pos, captureIdx: Int32(ei), captureVal: captures[ei]))
+                        captures[ei] = -1
+                    }
                 }
                 pc += 3
 
@@ -2711,13 +2833,9 @@ final class REVirtualMachine {
                 pc += 1
 
             case OP_CHECK_ADVANCE:
-                if let savedPos = popValue() {
-                    if pos == Int(savedPos) {
-                        // No progress — fail this branch to prevent infinite loop.
-                        if !backtrack(&pc, &pos) { return false }
-                    } else {
-                        pc += 1
-                    }
+                if let savedPos = popValue(), pos == Int(savedPos) {
+                    // No progress — fail this branch to prevent infinite loop.
+                    if !backtrack(&pc, &pos) { return false }
                 } else {
                     pc += 1
                 }
@@ -2888,6 +3006,14 @@ final class REVirtualMachine {
         // gets a clean stack so backtrack() cannot pop parent entries.
         let savedStack = stack
         let savedCaptures = captures
+        // The counter stacks are *not* copied: a sub-execution only ever pushes
+        // above the parent's entries, so remembering the two lengths (and
+        // stopping pops at the floor) is enough -- and avoids two COW
+        // allocations per sub-execution, which simple_greedy_quant runs a lot of.
+        let savedValueCount = valueStack.count
+        let savedSnapCount = valueSnapshots.count
+        let savedFloor = valueFloor
+        valueFloor = savedValueCount
         stack.removeAll(keepingCapacity: true)
 
         var pc = startPC
@@ -2900,6 +3026,13 @@ final class REVirtualMachine {
 
         // Restore parent stack.
         stack = savedStack
+        if valueStack.count > savedValueCount {
+            valueStack.removeLast(valueStack.count - savedValueCount)
+        }
+        if valueSnapshots.count > savedSnapCount {
+            valueSnapshots.removeLast(valueSnapshots.count - savedSnapCount)
+        }
+        valueFloor = savedFloor
         if !result {
             captures = savedCaptures
         }
@@ -2912,30 +3045,32 @@ final class REVirtualMachine {
 
     @inline(__always)
     func pushState(pc: Int, pos: Int) {
-        stack.append(BacktrackEntry(pc: pc, pos: pos))
+        // Snapshot the counter stack, QuickJS-style (push_state memcpy's it).
+        // The snapshots are pushed and popped in the same LIFO order as the
+        // states themselves, so the arena stays a plain stack.
+        let off = valueSnapshots.count
+        let len = valueStack.count
+        if len > 0 {
+            valueSnapshots.append(contentsOf: valueStack)
+        }
+        stack.append(BacktrackEntry(pc: pc, pos: pos, snapOff: off, snapLen: len))
     }
 
     @inline(__always)
     func pushValue(_ val: Int32) {
-        stack.append(BacktrackEntry(value: val))
+        valueStack.append(val)
+        valueStacksDirty = true
     }
 
     @discardableResult
     @inline(__always)
     func popValue() -> Int32? {
-        if let last = stack.last, last.pc == -2 {
-            stack.removeLast()
-            return last.extra
-        }
+        if valueStack.count > valueFloor { return valueStack.removeLast() }
         return nil
     }
 
     func backtrack(_ pc: inout Int, _ pos: inout Int) -> Bool {
         while let entry = stack.popLast() {
-            if entry.pc == -2 {
-                // Value entry, skip.
-                continue
-            }
             if entry.pc == -1 {
                 // Capture restore entry — restore the single slot and keep searching.
                 let idx = Int(entry.captureIdx)
@@ -2944,7 +3079,18 @@ final class REVirtualMachine {
                 }
                 continue
             }
-            // Real backtrack entry — restore position and resume.
+            // Real backtrack entry — restore position, counter stack and resume.
+            let off = entry.captureVal
+            let len = Int(entry.captureIdx)
+            if len == 0 {
+                if !valueStack.isEmpty { valueStack.removeAll(keepingCapacity: true) }
+            } else {
+                valueStack.removeAll(keepingCapacity: true)
+                valueStack.append(contentsOf: valueSnapshots[off ..< off + len])
+            }
+            if valueSnapshots.count > off {
+                valueSnapshots.removeLast(valueSnapshots.count - off)
+            }
             pc = entry.pc
             pos = entry.pos
             return true
