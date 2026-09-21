@@ -928,7 +928,8 @@ extension JeffJSParseState {
                         return false
                     }
                     bufPtr += 2
-                    result.append(UInt8((d1 << 4) | d2))
+                    // result is UTF-8: \x80-\xFF must be encoded, not appended raw
+                    JeffJSParseState.appendUTF8((d1 << 4) | d2, to: &result)
                 case 0x75: // 'u' — unicode escape
                     let cp = parseUnicodeEscape()
                     guard cp != UInt32.max && cp <= 0x10FFFF else {
@@ -1077,7 +1078,7 @@ extension JeffJSParseState {
                        case let d1 = hexDigitValue(buf[bufPtr]), d1 != UInt32.max,
                        case let d2 = hexDigitValue(buf[bufPtr + 1]), d2 != UInt32.max {
                         bufPtr += 2
-                        result.append(UInt8((d1 << 4) | d2))
+                        JeffJSParseState.appendUTF8((d1 << 4) | d2, to: &result)
                     } else {
                         noteTemplateEscapeError("invalid hex escape in template literal", at: escPos)
                     }

@@ -10274,6 +10274,12 @@ extension JeffJSTestRunner {
         // super() constructs the parent with new.target: builtin parents
         // allocate the right class and use the subclass prototype.
         evalCheckStr(ctx, "class E extends Error {}; new E('m').message", expect: "m")
+        // \xNN escapes above 0x7F must be UTF-8 encoded into the literal buffer
+        // (a raw byte made the whole literal decode to "": threes.day's 347 KB
+        // JSON literal with \xe1 evaluated to an empty string).
+        evalCheckStr(ctx, "'a\\xe1b'", expect: "a\u{e1}b")
+        evalCheckStr(ctx, "`q\\xe4` + '\\x41'", expect: "q\u{e4}A")
+        evalCheckBool(ctx, "'\\xe1\\xff'.length === 2 && '\\xff'.charCodeAt(0) === 255", expect: true)
         evalCheckBool(ctx, """
             class E2 extends Error { constructor(m) { super(m); this.name = 'E2'; } }
             var e = new E2('msg');
