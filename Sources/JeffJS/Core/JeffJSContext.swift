@@ -946,6 +946,50 @@ public final class JeffJSContext: JeffJSTokenizerContext {
 
         // Check if property already exists — if so, update it in place
         if let shape = jsObj.shape, let idx = findShapeProperty(shape, atom) ?? shape.prop.firstIndex(where: { $0.atom == atom && $0.atom != 0 }) {
+            // Partial descriptor (Object.defineProperty with only some of
+            // value/writable/enumerable/configurable): the attributes the
+            // descriptor omits keep their current value. Only callers that
+            // set the JS_PROP_HAS_* attribute bits opt in — internal callers
+            // passing bare JS_PROP_* flags keep overwriting all three.
+            if idx < shape.prop.count, (flags & JS_PROP_DEFINE_PROPERTY) != 0 {
+                let cur = shape.prop[idx].flags
+                if (flags & JS_PROP_HAS_CONFIGURABLE) == 0, cur.contains(.configurable) { propFlags.insert(.configurable) }
+                if (flags & JS_PROP_HAS_WRITABLE) == 0,     cur.contains(.writable)     { propFlags.insert(.writable) }
+                if (flags & JS_PROP_HAS_ENUMERABLE) == 0,   cur.contains(.enumerable)   { propFlags.insert(.enumerable) }
+            }
+
+            // Mapped `arguments` slot: ES2023 10.4.4.2 — a data descriptor
+            // writes through to the aliased parameter and the slot STAYS
+            // mapped; it is unmapped only when the new descriptor makes it
+            // non-writable or turns it into an accessor.
+            if idx < shape.prop.count, shape.prop[idx].flags.isVarRef,
+               let e = jsObj.extra(at: idx), e.kind == .varRef, let vr = e.varRef {
+                if (flags & JS_PROP_TMASK) != JS_PROP_GETSET {
+                    if (flags & JS_PROP_HAS_VALUE) != 0 {
+                        let oldVal = vr.pvalue
+                        vr.pvalue = value.dupValue()
+                        oldVal.freeValue()
+                    }
+                    if propFlags.contains(.writable) {
+                        // Still mapped: keep the var-ref slot, refresh the
+                        // shape's attribute bits only.
+                        propFlags.insert(.varref)
+                    } else {
+                        // Now non-writable: detach the mapping, snapshotting
+                        // the live parameter into a plain data slot.
+                        jsObj.setPropEntry(at: idx, .value(vr.pvalue.dupValue()))
+                    }
+                    if idx < shape.prop.count, shape.prop[idx].flags != propFlags {
+                        prepareShapeUpdate(self, jsObj)
+                        if let sh = jsObj.shape, idx < sh.prop.count { sh.prop[idx].flags = propFlags }
+                    }
+                    return 1
+                }
+                // Accessor descriptor: drop the mapping, then fall through to
+                // the ordinary getter/setter install below.
+                jsObj.setPropEntry(at: idx, .value(.undefined))
+            }
+
             // Update the value slot
             if idx < jsObj.propValues.count {
                 if (flags & JS_PROP_TMASK) == JS_PROP_GETSET {
@@ -972,6 +1016,13 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                         newSetter = existingSetter
                     }
                     jsObj.setPropEntry(at: idx, .getset(getter: newGetter, setter: newSetter))
+                } else if (flags & JS_PROP_DEFINE_PROPERTY) != 0,
+                          (flags & JS_PROP_HAS_VALUE) == 0 {
+                    // Attribute-only descriptor (e.g. `{writable:false}`):
+                    // the existing value survives.
+                    if case .getset = jsObj.propEntry(at: idx) {
+                        jsObj.setPropEntry(at: idx, .value(.undefined))
+                    }
                 } else {
                     jsObj.setPropEntry(at: idx, .value(value.dupValue()))
                 }

@@ -287,6 +287,7 @@ struct JeffJSTestRunner {
             ("TraceBlocks", { $0.testTraceBlocks() }),
             ("ModulesAndImports", { $0.testModulesAndImportPatterns() }),
             ("InterpreterGaps", { $0.testInterpreterGaps() }),
+            ("MappedArguments", { $0.testMappedArguments() }),
         ]
     }
 
@@ -10889,6 +10890,175 @@ extension JeffJSTestRunner {
 
     /// Regressions for interpreter/codegen gaps found by differential testing
     /// against qjs. Each block is one fixed bug.
+    /// Mapped `arguments` (ES2023 10.4.4): every generic path — apply,
+    /// Reflect.apply, spread, slice/Array.from, bind, JSON, Object.* and
+    /// hasOwnProperty — must read a mapped slot through its var-ref instead
+    /// of seeing the `.undefined` that lives in the data slot. Regression
+    /// group for `g.apply(null, arguments)` passing `undefined` once the
+    /// function declared a formal parameter.
+    mutating func testMappedArguments() {
+        let (rt, ctx) = makeCtx()
+        _ = rt
+
+        evalCheck(ctx, "function maG(a, b) { return a; }; 0", expectInt: 0)
+
+        // --- 1. apply / Reflect.apply / bind with `arguments` -------------
+        // No formal parameter: every index is an ordinary data slot.
+        evalCheck(ctx, "function maA1() { return maG.apply(null, arguments); } maA1(5)", expectInt: 5)
+        // WITH a formal parameter index 0 is a var-ref slot — the regression.
+        evalCheck(ctx, "function maA2(s) { return maG.apply(null, arguments); } maA2(5)", expectInt: 5)
+        evalCheck(ctx, "function maA3(s) { return Reflect.apply(maG, null, arguments); } maA3(5)", expectInt: 5)
+        evalCheck(ctx, "var maO = { m: function () { return maG.apply(this, arguments); } }; maO.m(7)", expectInt: 7)
+        evalCheck(ctx, "function maA4(s) { return maG.bind(null).apply(null, arguments); } maA4(6)", expectInt: 6)
+        evalCheck(ctx, """
+            function maA5(s) {
+              return Function.prototype.bind.apply(maG, [null].concat(Array.prototype.slice.call(arguments)))();
+            }
+            maA5(4)
+            """, expectInt: 4)
+        evalCheck(ctx, "function maA6(s) { return Math.max.apply(null, arguments); } maA6(1, 3, 2)", expectInt: 3)
+        evalCheckStr(ctx, "function maA7(s) { return String.fromCharCode.apply(null, arguments); } maA7(65, 66)",
+                     expect: "AB")
+        evalCheckStr(ctx, "function maA8(s) { return Array.prototype.concat.apply([], arguments).join(); } maA8(1, 2)",
+                     expect: "1,2")
+        // Reading the same mapped slot twice must give the same live value.
+        evalCheckBool(ctx, """
+            (function maA9(s) { var a = maG.apply(null, arguments), b = maG.apply(null, arguments);
+                                return a === b && a === s; })(8)
+            """, expect: true)
+        evalCheck(ctx, "function maA10(s) { var f = () => maG.apply(null, arguments); return f(); } maA10(11)",
+                  expectInt: 11)
+        evalCheck(ctx, "\"use strict\"; function maA11(s) { return maG.apply(null, arguments); } maA11(5)",
+                  expectInt: 5)
+        // The JSON.parse wrapper every minified bundle installs.
+        evalCheck(ctx, """
+            var maOrig = JSON.parse;
+            var maWrap = function (s) { return maOrig.apply(this, arguments); };
+            maWrap('{"a":1}').a
+            """, expectInt: 1)
+        evalCheck(ctx, """
+            var maSaved = JSON.parse;
+            JSON.parse = function (s) { return maSaved.apply(this, arguments); };
+            var maR = JSON.parse('{"a":2}').a; JSON.parse = maSaved; maR
+            """, expectInt: 2)
+        evalCheck(ctx, """
+            var maSaved2 = JSON.parse, maN = 0;
+            JSON.parse = function (s) { maN++; if (maN <= 3) String(s).slice(0, 40); return maSaved2.apply(this, arguments); };
+            var maR2 = JSON.parse('{"a":3}').a; JSON.parse = maSaved2; maR2
+            """, expectInt: 3)
+        evalCheck(ctx, """
+            var maOrig3 = JSON.parse;
+            var maWrap3 = function (s) { return maOrig3.apply(this, arguments); };
+            maWrap3('{"a":"' + 'x'.repeat(40000) + '"}').a.length
+            """, expectInt: 40000)
+
+        // --- 2. spread / slice / Array.from / iteration -------------------
+        evalCheck(ctx, "function maS1(s) { return maG(...arguments); } maS1(9)", expectInt: 9)
+        evalCheckStr(ctx, "function maS2(s) { return [...arguments].join(); } maS2(1, 2)", expect: "1,2")
+        evalCheckStr(ctx, "function maS3(s, u) { return Array.prototype.slice.call(arguments).join(); } maS3(1, 2)",
+                     expect: "1,2")
+        evalCheckStr(ctx, "function maS4(s, u) { return Array.from(arguments).join(); } maS4(1, 2)", expect: "1,2")
+        evalCheckStr(ctx, "function maS5(s) { return Array.from(arguments, function (x) { return x * 2; }).join(); } maS5(3)",
+                     expect: "6")
+        evalCheckStr(ctx, "function maS6(s, u) { return Array.prototype.join.call(arguments, ','); } maS6(1, 2)",
+                     expect: "1,2")
+        evalCheckStr(ctx, """
+            function maS7(s, u) { return Array.prototype.map.call(arguments, function (x) { return x + 1; }).join(); }
+            maS7(1, 2)
+            """, expect: "2,3")
+        evalCheckStr(ctx, "function maS8(s, u) { var o = []; for (var x of arguments) o.push(x); return o.join(); } maS8(1, 2)",
+                     expect: "1,2")
+        evalCheck(ctx, """
+            function maCtor(a) { this.v = a; }
+            function maS9(s) { return new (Function.prototype.bind.apply(maCtor, [null].concat(Array.prototype.slice.call(arguments))))().v; }
+            maS9(3)
+            """, expectInt: 3)
+
+        // --- 3. reflection over a mapped object ---------------------------
+        evalCheckStr(ctx, "function maR1(s) { return JSON.stringify(arguments); } maR1(1)", expect: "{\"0\":1}")
+        evalCheckStr(ctx, "function maR2(s, u) { return Object.keys(arguments).join(); } maR2(1, 2)", expect: "0,1")
+        evalCheckStr(ctx, "function maR3(s, u) { return Object.values(arguments).join(); } maR3(1, 2)", expect: "1,2")
+        evalCheckStr(ctx, "function maR4(s) { return JSON.stringify(Object.entries(arguments)); } maR4(7)",
+                     expect: "[[\"0\",7]]")
+        evalCheckStr(ctx, "function maR5(s, u) { return JSON.stringify(Object.assign({}, arguments)); } maR5(1, 2)",
+                     expect: "{\"0\":1,\"1\":2}")
+        evalCheckStr(ctx, "function maR6(s) { return JSON.stringify({ ...arguments }); } maR6(1)", expect: "{\"0\":1}")
+        evalCheckBool(ctx, "(function maR7(s) { return Object.getOwnPropertyDescriptor(arguments, 0).value === 1; })(1)",
+                      expect: true)
+        evalCheckBool(ctx, "(function maR8(s) { return Object.prototype.hasOwnProperty.call(arguments, 0); })(1)",
+                      expect: true)
+        evalCheckBool(ctx, "(function maR9() { return Object.prototype.hasOwnProperty.call(arguments, 0); })(1)",
+                      expect: true)
+        evalCheckBool(ctx, "(function maR10(s) { return (0 in arguments) && !(1 in arguments); })(1)", expect: true)
+        evalCheckStr(ctx, "function maR11(s, u) { var k = []; for (var i in arguments) k.push(i); return k.join(); } maR11(1, 2)",
+                     expect: "0,1")
+        evalCheckStr(ctx, "function maR12(s) { return Object.prototype.toString.call(arguments); } maR12(1)",
+                     expect: "[object Arguments]")
+        evalCheckBool(ctx, "function maR14(s) { return arguments.callee === maR14; } maR14(1)", expect: true)
+        // hasOwnProperty on an indexed key is the same code path for arrays.
+        evalCheckBool(ctx, "[1].hasOwnProperty(0)", expect: true)
+        evalCheckBool(ctx, "[1].hasOwnProperty(1)", expect: false)
+
+        // --- 4. the mapping itself ----------------------------------------
+        evalCheck(ctx, "function maM1(a) { arguments[0] = 2; return a; } maM1(1)", expectInt: 2)
+        evalCheck(ctx, "function maM2(a) { a = 3; return arguments[0]; } maM2(1)", expectInt: 3)
+        evalCheck(ctx, "function maM3(s) { var f = () => arguments[0]; s = 4; return f(); } maM3(1)", expectInt: 4)
+        evalCheck(ctx, "function maM4(s) { return arguments.length; } maM4(1, 2, 3)", expectInt: 3)
+        evalCheck(ctx, "function maM5(s) { s = 7; return arguments; } maM5(1)[0]", expectInt: 7)
+        evalCheck(ctx, "function maM6(s) { s = 7; return arguments; } maM6(1).length", expectInt: 1)
+        evalCheck(ctx, "function maM7() { return (function () { return arguments.length; })(1, 2); } maM7()", expectInt: 2)
+        // `delete` unmaps.
+        evalCheckStr(ctx, "function maM8(s) { delete arguments[0]; s = 5; return String(arguments[0]) + '|' + (0 in arguments); } maM8(1)",
+                     expect: "undefined|false")
+        // A data descriptor writes THROUGH and stays mapped...
+        evalCheckStr(ctx, """
+            function maM9(s) { Object.defineProperty(arguments, 0, { value: 9 }); var a = s; s = 11; return a + '|' + arguments[0]; }
+            maM9(1)
+            """, expect: "9|11")
+        evalCheckStr(ctx, """
+            function maM10(s) { return JSON.stringify(Object.getOwnPropertyDescriptor(arguments, 0)); }
+            maM10(1)
+            """, expect: "{\"value\":1,\"writable\":true,\"enumerable\":true,\"configurable\":true}")
+        // ...writable:false unmaps, keeping the value it had at that point.
+        evalCheckStr(ctx, """
+            function maM11(s) { Object.defineProperty(arguments, 0, { value: 9, writable: false }); s = 11; return s + '|' + arguments[0]; }
+            maM11(1)
+            """, expect: "11|9")
+        // ...and an accessor descriptor unmaps too.
+        evalCheckStr(ctx, """
+            function maM12(s) { Object.defineProperty(arguments, 0, { get: function () { return 42; } }); s = 11; return s + '|' + arguments[0]; }
+            maM12(1)
+            """, expect: "11|42")
+        // A partial descriptor leaves the other attributes alone (the general
+        // rule the mapped case depends on).
+        evalCheckStr(ctx, """
+            var maPD = { a: 1 }; Object.defineProperty(maPD, 'a', { value: 9 });
+            JSON.stringify(Object.getOwnPropertyDescriptor(maPD, 'a'))
+            """, expect: "{\"value\":9,\"writable\":true,\"enumerable\":true,\"configurable\":true}")
+        evalCheckStr(ctx, """
+            var maPD2 = { a: 1 }; Object.defineProperty(maPD2, 'a', { writable: false });
+            JSON.stringify(Object.getOwnPropertyDescriptor(maPD2, 'a'))
+            """, expect: "{\"value\":1,\"writable\":false,\"enumerable\":true,\"configurable\":true}")
+        evalCheckStr(ctx, """
+            var maPD3 = {}; Object.defineProperty(maPD3, 'a', { value: 1 });
+            JSON.stringify(Object.getOwnPropertyDescriptor(maPD3, 'a'))
+            """, expect: "{\"value\":1,\"writable\":false,\"enumerable\":false,\"configurable\":false}")
+
+        // --- 5. unmapped objects stay unmapped ----------------------------
+        evalCheck(ctx, "function maU1(s, ...r) { arguments[0] = 2; return s; } maU1(1)", expectInt: 1)
+        evalCheck(ctx, "function maU2(s, u = 2) { arguments[0] = 5; return s; } maU2(1)", expectInt: 1)
+        // (a program-level "use strict" prologue does not yet reach nested
+        //  function declarations — a separate parser gap — so scope it to the
+        //  function, which is how minified strict bundles write it anyway.)
+        evalCheck(ctx, "function maU3(s) { \"use strict\"; arguments[0] = 2; return s; } maU3(1)", expectInt: 1)
+        evalCheckBool(ctx, """
+            (function () { "use strict"; function maU4(s) { try { return arguments.callee, false; } catch (e) { return e instanceof TypeError; } } return maU4(1); })()
+            """, expect: true)
+        // Extra arguments past the formal parameters are never mapped.
+        evalCheckStr(ctx, "function maU5(s) { arguments[1] = 9; return maG.apply(null, [arguments[0], arguments[1]]).toString() + '|' + arguments[1]; } maU5(1, 2)",
+                     expect: "1|9")
+    }
+
     mutating func testInterpreterGaps() {
         let (rt, ctx) = makeCtx()
         _ = rt
