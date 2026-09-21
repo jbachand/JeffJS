@@ -69,12 +69,15 @@ extension JeffJSContext {
     }
 
     /// JS_SetPrototypeOf equivalent.
-    /// obj.proto is the single source of truth; its setter auto-syncs shape.proto.
+    /// The setter re-shapes the object and moves the shape's one counted
+    /// reference onto the new prototype, so nothing is dup'd here.
     @discardableResult
     func setPrototypeOf(_ obj: JeffJSValue, proto: JeffJSValue) -> Bool {
         guard let jsObj = obj.toObject() else { return false }
-        if jsObj.shape == nil { jsObj.shape = JeffJSShape() }
-        if let p = proto.toObject(), p !== jsObj.proto { _ = proto.dupValue() }   // the object keeps its prototype alive
+        if jsObj.shape == nil {
+            // Tracked, so the collector can see the shape -> proto edge.
+            jsObj.shape = createShape(self, proto: nil, hashSize: 0, propSize: 0)
+        }
         jsObj.proto = proto.toObject()
         return true
     }
@@ -734,7 +737,9 @@ struct JeffJSBuiltinObject {
             return ctx.throwTypeError("Object prototype may only be an Object or null")
         }
 
-        if proto.isObject { _ = proto.dupValue() }   // the new object keeps its prototype alive
+        // No dup: the prototype's root shape owns its one reference, and
+        // every `Object.create(p)` after the first shares that shape. Dup'ing
+        // per object added a count to `p` that nothing ever released.
         let obj = ctx.newObjectWithProto(proto)
         if obj.isException { return obj }
 

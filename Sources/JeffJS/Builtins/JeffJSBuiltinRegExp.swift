@@ -985,7 +985,7 @@ func js_regexp_Symbol_matchAll(
     let iterProtoVal = ctx.regexpStringIteratorProto()
     let iterObj = jeffJS_createObject(ctx: ctx, proto: iterProtoVal.toObject(),
                                        classID: UInt16(JeffJSClassID.stringIterator.rawValue))
-    if let p = iterProtoVal.toObject(), p === iterObj.proto { _ = iterProtoVal.dupValue() }
+    // No per-object dup: the iterator prototype's root shape owns its count.
     iterObj.payload = .opaque(iterData)
 
     return JeffJSValue.makeObject(iterObj)

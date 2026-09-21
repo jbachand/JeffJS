@@ -55,7 +55,11 @@ final class JeffJSShape: JeffJSGCObjectHeader {
     var shapeHashNext: JeffJSShape? = nil
 
     /// The prototype object that this shape was created for.
-    /// Strong reference — shapes must keep their proto alive for GC correctness.
+    /// The shape owns **one counted reference** to it (see
+    /// `jeffJS_shapeSetProto`): taken by `createShape` / `cloneShapeRT` /
+    /// the `obj.proto` setter, released by `freeShape`, marked by
+    /// `markChildren`. Write it through `jeffJS_shapeSetProto`, never
+    /// directly, or the count and the pointer stop agreeing.
     var proto: JeffJSObject? = nil
 
     // ---- inline property table ----
@@ -109,6 +113,35 @@ final class JeffJSShape: JeffJSGCObjectHeader {
     }
 }
 
+// MARK: - Prototype ownership
+//
+// **Shapes own their prototype, objects do not.** A shape holds exactly one
+// counted reference to `shape.proto`, taken when the shape is created (or when
+// its prototype is replaced) and given back by `freeShape`; `markChildren`
+// marks it, so it is a real GC edge. `obj.storedProto` is an uncounted mirror
+// of `obj.shape!.proto` kept for the prototype-chain walk — the object's
+// reference is paid for by the owner count it holds on its shape, which
+// `markObject` marks for the same reason.
+//
+// This is quickjs's model: `js_new_shape` does one `JS_DupValue(proto)` per
+// shape, `js_free_shape` releases it, `JS_SetPrototypeInternal` re-shapes and
+// swaps the reference, and `mark_children` reaches `sh->proto` through
+// `js_shape_mark`. Before this, every *object* built with an explicit
+// prototype took a reference that nothing ever released (`Object.create(p)`
+// 100 000 times added 100 000 permanent counts to `p`), while `shape.proto`
+// was an uncounted ARC alias — two half-models of the same edge, which is
+// also where the `RegExp.prototype` shape bug (829f9b2) came from.
+
+/// Install `newProto` as `shape`'s prototype, taking the single counted
+/// reference a shape owns and releasing the one it held.
+func jeffJS_shapeSetProto(_ shape: JeffJSShape, _ newProto: JeffJSObject?) {
+    let old = shape.proto
+    if old === newProto { return }
+    if let p = newProto { _ = JeffJSValue.borrowedObject(p).dupValue() }
+    shape.proto = newProto
+    if let o = old { JeffJSValue.borrowedObject(o).freeValue() }
+}
+
 // MARK: - Shape creation / cloning
 
 /// Create a new, empty shape for an object with the given prototype.
@@ -122,6 +155,8 @@ func createShape(_ ctx: JeffJSContext,
                  hashSize: Int,
                  propSize: Int) -> JeffJSShape {
     let shape = JeffJSShape(proto: proto, hashSize: hashSize, propSize: propSize)
+    // The shape owns its prototype (one count per shape, freed by freeShape).
+    if let p = proto { _ = JeffJSValue.borrowedObject(p).dupValue() }
     shape.hash = shapeInitialHash(proto)
     addGCObject(ctx.rt, shape)
     return shape
@@ -137,6 +172,8 @@ func cloneShape(_ ctx: JeffJSContext, _ shape: JeffJSShape) -> JeffJSShape {
 /// `cloneShape` for callers that only have the runtime (object proto setter).
 func cloneShapeRT(_ rt: JeffJSRuntime, _ shape: JeffJSShape) -> JeffJSShape {
     let s = JeffJSShape()
+    // The clone is a second owner of the prototype: one count per shape.
+    if let p = shape.proto { _ = JeffJSValue.borrowedObject(p).dupValue() }
     s.proto = shape.proto
     s.propSize = shape.propSize
     s.propCount = shape.propCount
@@ -164,9 +201,18 @@ func cloneShapeRT(_ rt: JeffJSRuntime, _ shape: JeffJSShape) -> JeffJSShape {
 // is what lets the interpreter's inline caches hit across objects and turns
 // object creation into one allocation instead of a shape + two arrays each.
 //
-// Ownership: `shape.refCount` counts the objects currently on the shape.
+// Ownership: `shape.refCount` counts the objects currently on the shape (plus
+// any context-level cache that holds one deliberately), and `markObject` marks
+// that edge, so a shape whose owners are all garbage is not mistaken for a
+// root and its prototype collects with them.
 // Hashed shapes stay alive in the runtime table even at zero owners (bounded
-// by `shapes.maxHashed`); unhashed (private) shapes are freed at zero.
+// by `shapes.maxHashed`); unhashed (private) shapes are freed at zero. A
+// zero-owner hashed shape therefore still holds its prototype's count: the
+// collector sees that count is not rooted and frees the prototype anyway,
+// leaving the cached shape pointing at a dead object it can never match
+// against again (nothing can name the prototype any more). The alternative —
+// freeing hashed shapes at zero owners, as quickjs does — cannot work here
+// while the inline caches key on raw shape addresses.
 // Any in-place mutation other than appending a property (delete, flag
 // change, prototype change) must go through `prepareShapeUpdate`, which gives
 // the object a private copy first. Mirrors QuickJS `find_hashed_shape_proto`

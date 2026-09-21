@@ -160,4 +160,67 @@ final class RefcountLeakTests: XCTestCase {
         assertFlat("class instance with arrow field",
                    "class C { constructor(){ this.n=1 } m = () => this.n } for (var i=0;i<$N;i++){ var c=new C(); c.m(); c=null; }")
     }
+
+    // MARK: - The prototype is owned by the shape, exactly once
+
+    /// `newObjectProto` / `Object.create` / `setPrototypeOf` used to give the
+    /// prototype a per-*object* reference that `freeObject` never gave back,
+    /// so `Object.create(p)` added one permanent count to `p` per call and
+    /// every instance pinned its class. The reference now belongs to the
+    /// shape (one per shape, released by `freeShape`, marked by the
+    /// collector), which is what quickjs does.
+    func testPrototypesAreOwnedByTheirShape() {
+        assertFlat("Object.create shared proto",
+                   "var p={x:1}; for (var i=0;i<$N;i++){ var o=Object.create(p); o=null; }")
+        assertFlat("Object.create then extend",
+                   "var p={x:1}; for (var i=0;i<$N;i++){ var o=Object.create(p); o.y=i; o=null; }")
+        assertFlat("Object.create(null)",
+                   "for (var i=0;i<$N;i++){ var o=Object.create(null); o.k=i; o=null; }")
+        // A fresh prototype per iteration: the object moves onto a private
+        // shape, which is freed with it and releases the prototype.
+        assertFlat("Object.setPrototypeOf fresh proto",
+                   "for (var i=0;i<$N;i++){ var o={}; Object.setPrototypeOf(o,{a:i}); o=null; }")
+        assertFlat("Reflect.setPrototypeOf fresh proto",
+                   "for (var i=0;i<$N;i++){ var o={}; Reflect.setPrototypeOf(o,{a:i}); o=null; }")
+        assertFlat("__proto__ assignment",
+                   "var p={a:1}; for (var i=0;i<$N;i++){ var o={}; o.__proto__=p; o=null; }")
+        assertFlat("__proto__ = null",
+                   "for (var i=0;i<$N;i++){ var o={a:i}; o.__proto__=null; o=null; }")
+        // `set_proto` popped the prototype and let the shape dup it, so the
+        // stack's reference was dropped on the floor: `class B extends A`
+        // pinned both `A` and `A.prototype`, four objects per evaluation.
+        assertFlat("class hierarchy dropped",
+                   "for (var i=0;i<$N;i++){ class A { m(){return 1} } class B extends A { n(){return 2} } }")
+        assertFlat("instances of a shared class",
+                   "class A { constructor(){ this.x=1 } } class B extends A { }" +
+                   "for (var i=0;i<$N;i++){ var b=new B(); b=null; }")
+        assertFlat("constructor with a prototype property",
+                   "function F(){ this.a=1 } F.prototype.m=function(){ return 1 };" +
+                   "for (var i=0;i<$N;i++){ var o=new F(); o.m(); o=null; }")
+        assertFlat("subclassed builtin",
+                   "class L extends Array { } for (var i=0;i<$N;i++){ var a=new L(); a.push(i); a=null; }")
+    }
+
+    /// The headline case, stated directly: a prototype that 100 000 objects
+    /// were created from must die with them. Before, `p` reached the end of
+    /// the run with a refcount of 100 001.
+    func testAPrototypeDiesWithItsInstances() {
+        let rt = JeffJSRuntime()
+        let ctx = rt.newContext()
+        defer { ctx.free(); rt.free() }
+        let setup = ctx.eval(input: """
+            var p = { x: 1 };
+            var w = new WeakRef(p);
+            for (var i = 0; i < 100000; i++) { Object.create(p); }
+            p = null;
+            """, filename: "<proto-weakref>", evalFlags: 0)
+        XCTAssertFalse(setup.isException, "setup threw")
+        setup.freeValue()
+        runGC(rt)
+        let alive = ctx.eval(input: "w.deref() !== undefined",
+                             filename: "<proto-weakref-check>", evalFlags: 0)
+        XCTAssertFalse(alive.isException, "check threw")
+        XCTAssertFalse(alive.toBool(), "the prototype outlived its 100 000 instances")
+        alive.freeValue()
+    }
 }

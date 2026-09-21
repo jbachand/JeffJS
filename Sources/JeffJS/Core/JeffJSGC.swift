@@ -405,19 +405,17 @@ func gcDecrefChild(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
 /// True when `header` takes part in trial deletion, i.e. it is on one of the
 /// runtime's GC lists (see `gcListIndex`).
 ///
-/// Only shapes are ever added to `rt.gcObjects` (`addGCObject` has exactly two
-/// call sites, both in JeffJSShape.swift); JSObjects, function bytecodes and
-/// var-refs are plain refcounted values. Trial deletion must therefore stay
-/// inside the tracked sub-graph: an edge to an *untracked* node is not a
-/// counted reference in this port — `freeShape` explicitly does NOT release
-/// `shape.proto` ("ARC strong ref, not a NaN-boxed value"), and neither does
-/// `obj.proto` — so decrementing it here removes a reference nobody added.
-/// The scan phase could not put it back either, because an untracked node is
-/// never a scan root, so a prototype whose only remaining shapes were
-/// zero-owner cached shapes lost one refcount per GC and was then freed by the
-/// next dup/free pair (RegExp.prototype losing all 15 of its properties after
-/// a single chained `RegExp.prototype.x` read). The Metal collector already
-/// works this way: it only records children it can map to a tracked index.
+/// Objects built while the intrinsics are installed are deliberately left off
+/// the list (see `JeffJSObject.init`), and so are pooled objects while they are
+/// parked. Trial deletion must therefore stay inside the tracked sub-graph: an
+/// untracked node is never a scan root, so a count taken off it here could
+/// never be put back, and the next dup/free pair would free a live object.
+/// That is how `RegExp.prototype` lost all 15 of its properties after a single
+/// chained `RegExp.prototype.x` read: the shape -> proto edge was decremented
+/// on an untracked prototype once per GC. The decrement is fine now that the
+/// edge is counted (`jeffJS_shapeSetProto`) *and* guarded by this predicate.
+/// The Metal collector already works this way: it only records children it can
+/// map to a tracked index.
 @inline(__always)
 func isGCTracked(_ header: JeffJSGCObjectHeader) -> Bool {
     return header.gcListIndex != -1
@@ -634,22 +632,24 @@ typealias JeffJSMarkFunc = (_ rt: JeffJSRuntime, _ child: JeffJSGCObjectHeader) 
 ///
 /// * Marking an edge that was never counted (an ARC-only strong reference)
 ///   removes a reference nobody added: the child's count goes one too low on
-///   every collection and the next `freeValue` frees a live object. This is
-///   what `obj.proto` / `shape.proto` are — `freeShape` deliberately does not
-///   release `shape.proto` ("ARC strong ref, not a NaN-boxed value") and
-///   `freeObject` does not release `obj.proto`, so prototypes are *not* GC
-///   edges here. It costs nothing: a prototype's counted references come from
-///   the constructor's `prototype` property and from `ctx.classProto`, both of
-///   which are marked, so a dead class still collects.
+///   every collection and the next `freeValue` frees a live object.
 /// * *Not* marking a counted edge is always safe — the child keeps a
 ///   reference the collector cannot account for, so it looks externally
 ///   rooted and is rescued. Conservative: it leaks, it never over-frees.
 ///
-/// Edges that are currently ARC-only and therefore deliberately skipped:
-/// `obj.proto`, `shape.proto`, closure var-refs (`varRefsFast` / the
-/// `.bytecodeFunc` payload and `JeffJSPropertyExtra.varRef` — see
-/// `JeffJSVarRef`, "kept alive by their varRefs arrays (ARC)"), the function
-/// bytecode constant pool (the FB is not a GC node), and `homeObject`.
+/// The prototype chain is a counted edge and is marked, as quickjs marks
+/// `sh->proto` through `js_shape_mark`: it hangs off the **shape**, which owns
+/// the one reference (`jeffJS_shapeSetProto`, released by `freeShape`), and
+/// the object reaches it through the owner count it holds on that shape
+/// (marked by `markObject`). `obj.storedProto` is an uncounted mirror of
+/// `obj.shape!.proto` and must *not* be marked as well — that would be the
+/// same edge twice.
+///
+/// Edges that are ARC-only and therefore deliberately skipped: `obj.proto`
+/// (the mirror), closure var-refs (`varRefsFast` / the `.bytecodeFunc`
+/// payload and `JeffJSPropertyExtra.varRef` — see `JeffJSVarRef`, "kept alive
+/// by their varRefs arrays (ARC)"), the function bytecode constant pool (the
+/// FB is not a GC node), a shape's transition `parent`, and `homeObject`.
 func markChildren(_ rt: JeffJSRuntime,
                   _ header: JeffJSGCObjectHeader,
                   _ markFunc: JeffJSMarkFunc) {
@@ -658,9 +658,10 @@ func markChildren(_ rt: JeffJSRuntime,
         let obj = unsafeBitCast(header, to: JeffJSObject.self)
         markObject(rt, obj, markFunc)
     case .shape:
-        // A shape's only reference is `proto`, which is an uncounted ARC
-        // strong reference (see freeShape) — nothing to trial-delete.
-        break
+        // A shape's one counted reference is its prototype (quickjs's
+        // js_shape_mark). `parent` is an ARC-only prefix witness.
+        let shape = unsafeBitCast(header, to: JeffJSShape.self)
+        if let p = shape.proto { markFunc(rt, p) }
     case .varRef:
         // Only detached var-refs are listed; their value is a counted edge
         // (`close_loc` dups it, freeGCObjectChildren releases it).
@@ -683,10 +684,17 @@ func markChildren(_ rt: JeffJSRuntime,
 func markObject(_ rt: JeffJSRuntime,
                 _ obj: JeffJSObject,
                 _ markFunc: JeffJSMarkFunc) {
-    // Shapes are refcounted but never swept by the collector (hashed shapes
-    // stay cached at refCount 0 — see freeObject), and a shape's own `proto`
-    // edge is uncounted, so a shape can never be part of a collectable cycle.
-    // Trial-deleting the obj -> shape edge would only perturb the cache.
+    // 0. The shape. `shape.refCount` counts the objects sitting on it, so it
+    // is a counted edge like any other (quickjs: `mark_func(rt, &p->shape->
+    // header)`), and it is the edge through which the prototype is reached.
+    // Without it a shape whose owners are all garbage still looks like a root,
+    // rescues its prototype, and with it the whole dead class: `class B
+    // extends A {}` dropped in a loop would never collect, because
+    // `B.prototype`'s shape holds `A.prototype`.
+    // The collector never *frees* a shape (hashed ones stay cached at zero
+    // owners for the inline caches, which key on raw shape addresses), it only
+    // stops treating them as roots.
+    if let sh = obj.shape { markFunc(rt, sh) }
 
     // 1. Property values (split storage: data values + rare-case boxes).
     let n = obj.propValues.count
@@ -972,9 +980,14 @@ func freeShape(_ rt: JeffJSRuntime, _ shape: JeffJSShape) {
         removeHashedShape(rt, shape)
     }
 
-    // Shapes store protos as ARC strong refs, not NaN-boxed values.
-    // Just nil the reference — ARC handles the release.
-    shape.proto = nil
+    // The shape owns one counted reference to its prototype (quickjs's
+    // js_free_shape releases sh->proto the same way). Dropping only the ARC
+    // reference here is what left every prototype pinned by the dup that
+    // created the shape.
+    jeffJS_shapeSetProto(shape, nil)
+    // The transition parent is a strong reference held only to prove a
+    // property prefix; a freed shape must not keep a chain of them alive.
+    shape.parent = nil
 
     // Reset the bookkeeping along with the arrays. A freed shape can still be
     // reached through stale references; stale propCount/propHashMask with

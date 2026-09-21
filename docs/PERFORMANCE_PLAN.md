@@ -946,8 +946,80 @@ Found, not fixed:
   shows up as 2 objects per iteration only when the constructor itself is
   created in the loop. Fixing it means making `obj.proto` a fully counted
   edge, which is an audit of ~25 assignment sites where a missing dup is an
-  over-free, so it is its own change.
+  over-free, so it is its own change. *(Fixed in Round 12: the reference
+  belongs to the shape, one per shape.)*
 - `Object.getOwnPropertyDescriptor(o, "g").get.name` is `"g"`; qjs says
   `"get g"`. Pre-existing.
 - `({}).__defineGetter__` is not installed on `Object.prototype` (the builtin
   exists, the property does not), so the call throws. Pre-existing.
+
+## Round 12 — one owner for the prototype (memory)
+
+`obj.proto` was half of two models at once: `newObjectProto` / `Object.create`
+/ `setPrototypeOf` took a JS reference *per object* that `freeObject` never
+gave back, while `shape.proto` was an uncounted ARC alias that the collector
+was told to ignore. So `Object.create(p)` run 100 000 times added 100 000
+permanent counts to `p`, every instance pinned its class, and a dead class
+hierarchy could only be collected by luck. The shape bug behind the
+`RegExp.prototype` repair (829f9b2) was the same confusion from the other end.
+
+**Shapes own the prototype, exactly one reference each** — quickjs's model
+(`js_new_shape` dups, `js_free_shape` releases, `JS_SetPrototypeInternal`
+re-shapes and swaps, `mark_children` reaches it through `js_shape_mark`).
+`jeffJS_shapeSetProto` is the only writer; `createShape` and `cloneShapeRT`
+take the reference, `freeShape` gives it back, `markChildren` marks it.
+`obj.storedProto` stays as the uncounted mirror the prototype-chain walk
+reads, and the object's claim on it is the owner count it already holds on
+its shape. Because every `obj.proto = x` goes through the setter, which
+re-shapes (`prepareShapeUpdate`) and then swaps the shape's reference, all
+~35 assignment sites — `Reflect.setPrototypeOf` and the proxy fall-through,
+which never dup'd, and `Object.create` / `newObjectProto` / `setPrototypeOf` /
+`newObjectPrimitive` / the `matchAll` iterator, which dup'd per object — are
+correct without touching any of them; the five stale dups were deleted.
+
+- **`markObject` marks the shape** (quickjs: `mark_func(rt, &p->shape->
+  header)`). Without it the prototype edge would hang off a node the
+  collector treats as a permanent root: `shape.refCount` counts the objects
+  on the shape, and those objects can all be garbage. `class B extends A {}`
+  dropped in a loop leaked 4 objects per evaluation for exactly that reason.
+  The collector still never *frees* a shape — hashed shapes stay cached at
+  zero owners because the inline caches key on raw shape addresses — it only
+  stops mistaking them for roots.
+- **Three places dropped an owned prototype on the floor**, all invisible
+  while `setPrototypeOf` dup'd for them: the `set_proto` opcode (which is how
+  `class B extends A` sets both `B.prototype.__proto__` and `B.__proto__` —
+  4 objects per class), `init_ctor`'s `getProperty(F, "prototype")`, and
+  `defineClass`'s heritage and parent prototype.
+- **A zero-owner hashed shape still holds its prototype's count**, so a
+  prototype that is otherwise garbage is freed by the collector rather than by
+  refcounting, and the cached shape is left pointing at a dead object that
+  nothing can ever name again (it is inert: the shape table compares proto
+  identity, and no live object can be on that shape). The tidy alternative —
+  freeing hashed shapes at zero owners, as quickjs does — would recycle shape
+  addresses that the inline caches compare by pointer.
+- **Results** (`__gcStats().liveObjects` around 20k-iteration loops, and
+  `JEFFJS_TRACK_RC=1` at exit). 100k `Object.create(p)` + 50k
+  `setPrototypeOf` + 50k `class D extends Base`: 65 652 leaked objects and
+  53 620 live at exit -> 3 149 and 3 628, which is the engine's own root set;
+  the 100 000 instances' prototype now dies with them (`WeakRef.deref()` is
+  `undefined` after `__gc()`, where it used to survive the runtime).
+  Per iteration: `Object.create(shared)` 1 -> 0, `setPrototypeOf` 2 -> 0,
+  `class A/class B extends A/new B()` 12 -> 0, `new F()` 2 -> 0.
+  `Tests/JeffJSTests/RefcountLeakTests.swift` has eleven new cases plus the
+  WeakRef one.
+- **Cost.** bench/realworld.js geomean 1.000x of a same-worktree base
+  (`class-hierarchy` 1.009x, `polymorphic-access` 1.004x, `getter-setter`
+  1.004x, `object-assign-create` 0.988x, worst kernel +2%); bench/kernels.js
+  1.003x (`method-call` 1.006x, `prop-get-set` 1.010x). The dup and release
+  are per *shape*, not per object, so the allocation path is untouched.
+
+Found, not fixed:
+- **An accessor setter never releases its value argument.** `o.s = {…}` on a
+  property with a setter — any setter, including `__proto__` — leaves one
+  reference on the assigned object. Identical before this round; a plain
+  method call with the same argument is flat.
+- **The hashed shape cache grows with distinct prototypes.** A loop that
+  builds a fresh prototype (or a fresh class *and* instantiates it) parks one
+  hashed root shape per prototype, up to `shapes.maxHashed` (16 384), and
+  those shapes are never evicted. It is bounded and pre-existing, but it is
+  what a per-iteration "leak" of ~0.74 objects in those loops actually is.

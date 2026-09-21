@@ -796,7 +796,8 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         let obj = JeffJSObject()
         obj.classID = JSClassID.JS_CLASS_OBJECT.rawValue
         let protoObj = proto.isObject ? proto.toObject() : nil
-        if protoObj != nil { _ = proto.dupValue() }   // the object keeps its prototype alive
+        // No dup here: the shape owns the prototype's one reference, taken by
+        // createShape when this prototype's root shape was first built.
         obj.shape = jeffJS_rootShape(self, proto: protoObj)
         obj.proto = protoObj
         obj.extensible = true
@@ -1948,8 +1949,8 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         if classID < classProto.count {
             let proto = classProto[classID]
             if proto.isObject {
+                // The setter takes the shape's reference; no dup here.
                 obj.proto = proto.toObject()
-                _ = proto.dupValue()
             }
         }
 
@@ -5149,25 +5150,37 @@ extension JeffJSObject {
     // stored properties defined directly on JeffJSObject in JeffJSObject.swift.
     // Do NOT redeclare them here.
 
-    /// The prototype of this object.
-    /// This is the single source of truth for the prototype. On write, it also
-    /// updates `shape.proto` so the two never go out of sync.
+    /// The prototype of this object: the value every prototype-chain walk
+    /// reads, mirrored from `shape.proto`, which owns the one counted
+    /// reference (see `jeffJS_shapeSetProto`). Writing it is quickjs's
+    /// `JS_SetPrototypeInternal`: give the object a private shape if it is
+    /// sharing one, then swap the shape's reference. The caller does **not**
+    /// dup the prototype — the shape does it here.
     var proto: JeffJSObject? {
         get { return _proto }
         set {
             _proto = newValue
-            // Keep shape.proto in sync. A shared (hashed) shape belongs to
-            // every object with this prototype, so changing the prototype of
-            // one object must move it onto a private copy first.
-            if let s = shape {
-                if s.isHashed, s.proto !== newValue,
+            guard let s = shape else {
+                // No shape means nowhere to keep the count. Every creation
+                // path assigns the shape first; this is the belt-and-braces
+                // case (a hand-built object handed to `setPrototypeOf`).
+                if newValue != nil,
                    let rt = ownerRuntime ?? JeffJSGCObjectHeader.activeRuntime {
-                    prepareShapeUpdateRT(rt, self)
-                    shape?.proto = newValue
-                } else {
-                    s.proto = newValue
+                    let ns = JeffJSShape()          // refCount 1: this object
+                    addGCObject(rt, ns)
+                    shape = ns
+                    jeffJS_shapeSetProto(ns, newValue)
                 }
+                return
             }
+            if s.proto === newValue { return }
+            // A shared shape (hashed, or several owners) describes every object
+            // with that prototype, so this object needs its own copy first.
+            if s.isHashed || s.refCount > 1,
+               let rt = ownerRuntime ?? JeffJSGCObjectHeader.activeRuntime {
+                prepareShapeUpdateRT(rt, self)
+            }
+            if let s2 = shape { jeffJS_shapeSetProto(s2, newValue) }
         }
     }
 

@@ -1730,8 +1730,8 @@ extension JeffJSContext {
         } else {
             return true
         }
-        // obj.proto is the single source of truth; its setter auto-syncs shape.proto.
-        if let p = protoObj, p !== jsObj.proto { _ = proto.dupValue() }   // the object keeps its prototype alive
+        // The setter re-shapes and moves the shape's counted reference onto
+        // the new prototype; nothing to dup here.
         jsObj.proto = protoObj
         return true
     }
@@ -1939,6 +1939,9 @@ extension JeffJSContext {
             } else {
                 proto = newObject()
             }
+            // Owned by this function (the new prototype's own reference is
+            // held by its shape).
+            parentProto.freeValue()
         }
 
         // C.prototype: non-writable, non-enumerable, non-configurable (ES §15.7.14).
@@ -8119,6 +8122,9 @@ struct JeffJSInterpreter {
                     // If .prototype is not an object, use the default Object.prototype
                     newObj = ctx.newObject()
                 }
+                // `getProperty` hands back an owned reference and the new
+                // object's prototype reference belongs to its shape.
+                protoVal.freeValue()
                 buf[sp] = newObj; sp += 1
                 pc += 1
 
@@ -8917,6 +8923,11 @@ struct JeffJSInterpreter {
                 let proto = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = buf[sp - 1]
                 let ok = ctx.setPrototypeOf(obj: obj, proto: proto)
+                // The shape takes its own reference to the prototype, so the
+                // popped one is ours to release. `class B extends A` runs this
+                // twice (`B.prototype.__proto__` and `B.__proto__`) and used to
+                // pin both `A` and `A.prototype` — four objects per class.
+                proto.freeValue()
                 if !ok {
                     retVal = .exception
                     break dispatchLoop
@@ -9013,6 +9024,9 @@ struct JeffJSInterpreter {
                 let ctorFunc = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let (ctor, proto) = ctx.defineClass(atom: atom, flags: classFlags,
                                                       heritage: heritage, ctorFunc: ctorFunc)
+                // `defineClass` only reads the heritage (it moves `ctorFunc`
+                // into its result); the popped reference is ours.
+                heritage.freeValue()
                 if ctor.isException {
                     retVal = .exception
                     break dispatchLoop
@@ -9031,6 +9045,8 @@ struct JeffJSInterpreter {
                 let (ctor, proto) = ctx.defineClassComputed(key: key, flags: classFlags,
                                                              heritage: heritage,
                                                              ctorFunc: ctorFunc)
+                // Only the heritage is dropped here: `key` is pushed back.
+                heritage.freeValue()
                 if ctor.isException {
                     retVal = .exception
                     break dispatchLoop
