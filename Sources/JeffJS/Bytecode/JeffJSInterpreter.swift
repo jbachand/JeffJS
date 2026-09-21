@@ -8946,6 +8946,13 @@ struct JeffJSInterpreter {
                 ctx.setHomeObject(funcVal: funcVal, homeObj: obj)
                 let ok = ctx.defineMethod(obj: obj, atom: atom, funcVal: funcVal,
                                            flags: methodFlags)
+                // `defineProperty` dups what it stores (value and getter/setter
+                // alike); the pop above handed us the stack's reference, so the
+                // method function is ours to release. Without this every object
+                // literal method, getter and setter — and every class body
+                // member, which compiles to the same opcode — pinned its
+                // function for the life of the runtime.
+                funcVal.freeValue()
                 if !ok {
                     retVal = .exception
                     break dispatchLoop
@@ -8960,6 +8967,11 @@ struct JeffJSInterpreter {
                 ctx.setHomeObject(funcVal: funcVal, homeObj: obj)
                 let ok = ctx.defineMethodComputed(obj: obj, key: key, funcVal: funcVal,
                                                    flags: methodFlags)
+                // Both operands were popped, so both are ours: the key is only
+                // read to intern an atom and the function is dup'd by
+                // `defineProperty`.
+                funcVal.freeValue()
+                key.freeValue()
                 if !ok {
                     retVal = .exception
                     break dispatchLoop
