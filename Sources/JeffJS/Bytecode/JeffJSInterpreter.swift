@@ -1848,8 +1848,20 @@ extension JeffJSContext {
     /// the object's own cached list is returned as is. Otherwise the list is
     /// built level by level with the usual shadowing rules.
     func forInKeyList(obj: JeffJSValue) -> JeffJSForInKeyList {
+        // `for (k in "abc")` enumerates the index keys of the primitive string
+        // (ES §10.4.3). toObject() on a primitive used to return nil here, so
+        // the loop body never ran.
+        if obj.isString, let s = obj.stringValue {
+            var keys: [JeffJSValue] = []
+            keys.reserveCapacity(s.len)
+            for i in 0 ..< s.len { keys.append(intKeyString(i)) }
+            return JeffJSForInKeyList(keys: keys)
+        }
         guard let root = obj.toObject() else { return JeffJSForInKeyList(keys: []) }   // null / undefined
-        if let rootShape = root.shape, root.arraySnapshot() == nil {
+        // A String wrapper's index keys are not shape properties: it must take
+        // the general path below.
+        if let rootShape = root.shape, root.arraySnapshot() == nil,
+           root.classID != JSClassID.JS_CLASS_STRING.rawValue {
             var protosEmpty = true
             var p = root.proto
             while let cur = p {
@@ -1875,6 +1887,13 @@ extension JeffJSContext {
         while let cur = current {
             intKeys.removeAll(keepingCapacity: true)
             strKeys.removeAll(keepingCapacity: true)
+            // String exotic objects expose their characters as index keys.
+            if cur.classID == JSClassID.JS_CLASS_STRING.rawValue {
+                let pv = cur.primitiveValue
+                if pv.isString, let s = pv.stringValue {
+                    for i in 0 ..< s.len { intKeys.append(UInt32(i)) }
+                }
+            }
             // Fast-array elements are not shape properties: enumerate their
             // indices (present, i.e. not a hole) first.
             if let snap = cur.arraySnapshot() {

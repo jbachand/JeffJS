@@ -326,9 +326,9 @@ extension JeffJSContext {
                 for i in 0 ..< s.len {
                     intKeys.append((UInt32(i), intKeyString(i)))
                 }
-                if !enumOnly {
-                    stringKeys.append(newStringValue("length"))
-                }
+                // "length" is also a real shape property on the wrapper, so
+                // the shape walk below appends it — don't emit it twice.
+                _ = enumOnly
             }
         }
 

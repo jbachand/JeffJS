@@ -10566,6 +10566,32 @@ extension JeffJSTestRunner {
             var a = new Date('Dec 25, 1995 13:30:00'), b = new Date('Jul 4, 1996 13:30:00');
             a.getHours() === 13 && b.getHours() === 13
         """, expect: true)
+
+        // --- 4b. matchAll, groups prototype, /u, for-in over strings -------
+        // The matchAll iterator had a nil prototype: no next, not iterable.
+        evalCheckBool(ctx, "[...'aa'.matchAll(/a/g)].length === 2", expect: true)
+        evalCheckBool(ctx, """
+            var ms = [...'a1b2'.matchAll(/(?<L>[a-z])(?<D>\\d)/g)];
+            ms.length === 2 && ms[0].groups.L === 'a' && ms[1].groups.D === '2' &&
+            ms[0].index === 0 && ms[1].index === 2
+        """, expect: true)
+        evalCheckBool(ctx, "typeof 'aa'.matchAll(/a/g).next === 'function'", expect: true)
+        evalCheckStr(ctx, """
+            var r = ''; for (var m of 'xyx'.matchAll(/x/g)) r += m.index; r
+        """, expect: "02")
+        // `groups` has a null prototype (ES2018), so a group named
+        // "toString" cannot shadow Object.prototype.
+        evalCheckBool(ctx, "Object.getPrototypeOf('a'.match(/(?<x>a)/).groups) === null", expect: true)
+        // /u must consume a whole surrogate pair.
+        evalCheckBool(ctx, "'\u{1F600}'.match(/./u)[0].length === 2 && '\u{1F600}'.match(/./)[0].length === 1",
+                      expect: true)
+        evalCheckStr(ctx, "'a\u{1F600}b'.match(/./gu).join('|')", expect: "a|\u{1F600}|b")
+        evalCheckStr(ctx, "'\u{1F600}'.replace(/./u, 'X')", expect: "X")
+        // for-in over a primitive string and a String wrapper.
+        evalCheckStr(ctx, "var r = ''; for (var k in 'abc') r += k; r", expect: "012")
+        evalCheckStr(ctx, "var r = ''; for (var k in new String('ab')) r += k; r", expect: "01")
+        evalCheckStr(ctx, "var r = ''; for (var k in '') r += k; r", expect: "")
+        evalCheckStr(ctx, "Object.getOwnPropertyNames(new String('ab')).join()", expect: "0,1,length")
     }
 
     mutating func runAPITests() -> String {

@@ -337,7 +337,9 @@ func js_regexp_exec(
         var hasNamedGroup = false
         for name in groupNames { if name != nil { hasNamedGroup = true; break } }
         if hasNamedGroup {
-            let groupsObj = ctx.newObject()
+            // Per ES2018 the `groups` object has a *null* prototype, so a group
+            // named "toString"/"constructor" cannot shadow Object.prototype.
+            let groupsObj = ctx.newObjectProto(proto: .null)
             for i in 0..<groupNames.count {
                 if let name = groupNames[i] {
                     // groupNames[i] corresponds to arrayValues[i] (both include group 0)
@@ -827,13 +829,21 @@ private func js_regexp_globalMatchFast(
 
     // 2. Convert the input string to [UInt32] ONCE.
     let isUnicode = (flags & LRE_FLAG_UNICODE) != 0 || (flags & LRE_FLAG_UNICODE_SETS) != 0
+    // UTF-16 code units in both modes (see js_regexp_execInternal): the match
+    // ranges index the JS string, and the substrings below are rebuilt from
+    // these units — decoded code points truncated astral characters to their
+    // low surrogate.
     let inputCodeUnits: [UInt32]
-    if isUnicode {
-        let s = inputStr.toSwiftString()
-        inputCodeUnits = Array(s.unicodeScalars.map { $0.value })
+    if let c = inputStr.codeUnits32 {
+        inputCodeUnits = c
     } else {
-        let s = inputStr.toSwiftString()
-        inputCodeUnits = Array(s.utf16.map { UInt32($0) })
+        var c = [UInt32](); c.reserveCapacity(inputStr.len)
+        switch inputStr.storage {
+        case .str8(let b): for u in b { c.append(UInt32(u)) }
+        case .str16(let b): for u in b { c.append(UInt32(u)) }
+        }
+        inputStr.codeUnits32 = c
+        inputCodeUnits = c
     }
 
     // 3. Build the flags for the regex VM.
@@ -969,8 +979,13 @@ func js_regexp_Symbol_matchAll(
         done: false
     )
 
-    let iterObj = jeffJS_createObject(ctx: ctx, proto: nil,
+    // %RegExpStringIteratorPrototype% carries next() and [Symbol.iterator];
+    // this object used to be created with a nil prototype, so the result of
+    // `"aa".matchAll(/a/g)` was not iterable at all.
+    let iterProtoVal = ctx.regexpStringIteratorProto()
+    let iterObj = jeffJS_createObject(ctx: ctx, proto: iterProtoVal.toObject(),
                                        classID: UInt16(JeffJSClassID.stringIterator.rawValue))
+    if let p = iterProtoVal.toObject(), p === iterObj.proto { _ = iterProtoVal.dupValue() }
     iterObj.payload = .opaque(iterData)
 
     return JeffJSValue.makeObject(iterObj)
@@ -1605,29 +1620,25 @@ private func js_regexp_execInternal(
     // Input as UInt32 code units, converted once per string and cached on it:
     // split/replace/global match run one exec per match (or per position),
     // and re-encoding the whole input each time made them quadratic.
+    // Always UTF-16 code units, in unicode mode too: capture offsets are
+    // indices into the JS string, and the caller slices the original
+    // JeffJSString with them. Feeding the VM decoded code points made
+    // `"a\u{1F600}b".match(/./gu)` report three matches whose middle one
+    // sliced the wrong half of the surrogate pair ("" instead of the emoji).
+    // The VM decodes surrogate pairs itself when the `u`/`v` flag is set
+    // (REVirtualMachine.getCharUnicodeFast), so `/./u` still consumes a whole
+    // astral character — it just advances `pos` by two units.
     let inputCodeUnits: [UInt32]
-    let isUnicode = (flags & LRE_FLAG_UNICODE) != 0 || (flags & LRE_FLAG_UNICODE_SETS) != 0
-    if isUnicode {
-        if let c = inputStr.codePoints32 {
-            inputCodeUnits = c
-        } else {
-            let s = inputStr.toSwiftString()
-            let c = Array(s.unicodeScalars.map { $0.value })
-            inputStr.codePoints32 = c
-            inputCodeUnits = c
-        }
+    if let c = inputStr.codeUnits32 {
+        inputCodeUnits = c
     } else {
-        if let c = inputStr.codeUnits32 {
-            inputCodeUnits = c
-        } else {
-            var c = [UInt32](); c.reserveCapacity(inputStr.len)
-            switch inputStr.storage {
-            case .str8(let b): for u in b { c.append(UInt32(u)) }
-            case .str16(let b): for u in b { c.append(UInt32(u)) }
-            }
-            inputStr.codeUnits32 = c
-            inputCodeUnits = c
+        var c = [UInt32](); c.reserveCapacity(inputStr.len)
+        switch inputStr.storage {
+        case .str8(let b): for u in b { c.append(UInt32(u)) }
+        case .str16(let b): for u in b { c.append(UInt32(u)) }
         }
+        inputStr.codeUnits32 = c
+        inputCodeUnits = c
     }
 
     var regexpFlags = JeffJSRegExpFlags()
@@ -1960,4 +1971,40 @@ func js_initRegExp(ctx: JeffJSContext) {
     // JS_DefinePropertyValueStr does not yet exist in JeffJS, so we
     // record the intent here and the setup will be completed when the
     // context infrastructure is in place.
+}
+
+
+// MARK: - %RegExpStringIteratorPrototype%
+
+extension JeffJSContext {
+    /// The RegExp String Iterator prototype, created on first use and cached in
+    /// `classProto[JS_CLASS_REGEXP_STRING_ITERATOR]`. It inherits
+    /// %IteratorPrototype% (for the `map`/`filter`/... helpers) and carries
+    /// `next` plus `[Symbol.iterator]`.
+    func regexpStringIteratorProto() -> JeffJSValue {
+        let idx = Int(JSClassID.JS_CLASS_REGEXP_STRING_ITERATOR.rawValue)
+        while classProto.count <= idx { classProto.append(.undefined) }
+        if classProto[idx].isObject { return classProto[idx] }
+
+        let proto = iteratorProto.isObject ? newObjectProto(proto: iteratorProto) : newObject()
+        let nextFn = newCFunction({ ctx, this, args in
+            return js_regexp_string_iterator_next(ctx: ctx, this: this, argv: args)
+        }, name: "next", length: 0)
+        let nextAtom = rt.findAtom("next")
+        _ = definePropertyValue(obj: proto, atom: nextAtom,
+                                value: nextFn,
+                                flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+        let selfIterFn = newCFunction({ _, this, _ in this.dupValue() },
+                                      name: "[Symbol.iterator]", length: 0)
+        _ = definePropertyValue(obj: proto,
+                                atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue,
+                                value: selfIterFn,
+                                flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+        _ = definePropertyValue(obj: proto,
+                                atom: JeffJSAtomID.JS_ATOM_Symbol_toStringTag.rawValue,
+                                value: newStringValue("RegExp String Iterator"),
+                                flags: JS_PROP_CONFIGURABLE)
+        classProto[idx] = proto
+        return proto
+    }
 }
