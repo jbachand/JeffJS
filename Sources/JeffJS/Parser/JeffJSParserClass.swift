@@ -65,6 +65,10 @@ extension JeffJSParser {
         child.superAllowed = true
         child.needHomeObject = true
         child.jsMode = fd.jsMode | JS_MODE_STRICT
+        // A field initializer written inside a `with` body still resolves
+        // identifiers against the with object (the class body itself is not
+        // a strict-mode boundary for the enclosing `with`).
+        child.withVarStack = fd.withVarStack
         return child
     }
 
@@ -298,9 +302,21 @@ extension JeffJSParser {
         if hasExtends {
             // Stack: ..., superclass, ctorFunc
             emitOp(.swap)                            // ..., ctorFunc, superclass
+            // `class X extends null` is legal: the proto parent is null, not
+            // null.prototype (which would throw), and the constructor keeps
+            // %Function.prototype% as its own [[Prototype]] (see below).
+            let protoParentNull = newLabel()
+            let protoParentDone = newLabel()
+            emitOp(.dup)                             // ..., ctorFunc, superclass, superclass
+            emitOp(.is_null)                         // ..., ctorFunc, superclass, isNull
+            emitIfTrue(protoParentNull)
             emitOp(.dup)                             // ..., ctorFunc, superclass, superclass
             emitGetField(getAtom("prototype"))       // ..., ctorFunc, superclass, superclass.prototype
-            emitOp(.object)                          // ..., ctorFunc, superclass, superclass.prototype, proto
+            emitGoto(protoParentDone)
+            emitLabel(protoParentNull)
+            emitOp(.push_null)                       // ..., ctorFunc, superclass, null
+            emitLabel(protoParentDone)
+            emitOp(.object)                          // ..., ctorFunc, superclass, protoParent, proto
             emitOp(.swap)                            // ..., ctorFunc, superclass, proto, superclass.prototype
             emitOp(.set_proto)                       // ..., ctorFunc, superclass, proto
             //                                          (proto.__proto__ = superclass.prototype)
@@ -367,7 +383,17 @@ extension JeffJSParser {
             // Set ctorFunc.__proto__ = superclass (for super() and static inheritance)
             // Stack: ..., superclass, ctorFunc
             emitOp(.swap)                            // ..., ctorFunc, superclass
+            // `extends null`: the constructor keeps %Function.prototype%.
+            let ctorProtoSkip = newLabel()
+            emitOp(.dup)                             // ..., ctorFunc, superclass, superclass
+            emitOp(.is_null)                         // ..., ctorFunc, superclass, isNull
+            emitIfTrue(ctorProtoSkip)
             emitOp(.set_proto)                       // ..., ctorFunc   (ctorFunc.__proto__ = superclass)
+            let ctorProtoDone = newLabel()
+            emitGoto(ctorProtoDone)
+            emitLabel(ctorProtoSkip)
+            emitOp(.drop)                            // ..., ctorFunc
+            emitLabel(ctorProtoDone)
         }
 
         // The inner class binding is initialised before any static

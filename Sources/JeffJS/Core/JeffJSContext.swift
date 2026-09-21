@@ -144,8 +144,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// object built with that count, then every later one is put on the
     /// shape directly and its slots appended, instead of paying N + 3
     /// property adds through the transition table.
-    var argumentsShapesMapped: [JeffJSShape?] = Array(repeating: nil, count: 9)
-    var argumentsShapesStrict: [JeffJSShape?] = Array(repeating: nil, count: 9)
+    /// Transition shapes for `arguments` objects, indexed by
+    /// argc * 18 + mappedCount * 2 + (mapped ? 1 : 0) for argc, mappedCount <= 8.
+    var argumentsShapes: [JeffJSShape?] = Array(repeating: nil, count: 9 * 18)
     /// Array.prototype.values — cached because it's also used as %ArrayIteratorPrototype%[@@iterator].
     var arrayProtoValues: JeffJSValue
     /// Array.prototype.push — cached object pointer for interpreter fast-path identity check.
@@ -3977,6 +3978,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 let prevAtom = prevGetFieldAtom
                 let varHint = prevAtom > 0 ? (rt.atomToString(prevAtom) ?? "") : ""
                 let hint = varHint.isEmpty ? "" : " — '\(varHint).\(atomStr)' is undefined"
+                jeffJS_dumpLastOps(self)
                 return throwTypeError(message: "Cannot read properties of \(obj.isNull ? "null" : "undefined") (reading '\(atomStr)')\(hint)")
             }
             return .JS_UNDEFINED
@@ -4087,6 +4089,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 if e.kind == .getset, let getterObj = e.getter {
                     let getterVal = JeffJSValue.makeObject(getterObj)
                     return callFunction(getterVal, thisVal: receiver, args: [])
+                }
+                // Mapped arguments: the slot aliases a live parameter.
+                if e.kind == .varRef, let vr = e.varRef {
+                    return vr.pvalue.dupValue()
                 }
                 return .JS_UNDEFINED
             }
@@ -4259,7 +4265,16 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         let exIdx = jeffJS_findOwnPropertyIndex(obj: jsObj, atom: atom)
         if exIdx >= 0, let exShape = jsObj.shape, exIdx < jsObj.propValues.count {
             let exFlags = exShape.prop[exIdx].flags
-            if exFlags.contains(.getset) {
+            if exFlags.isVarRef {
+                // Mapped arguments: write through to the live parameter slot.
+                if let e = jsObj.extra(at: exIdx), e.kind == .varRef, let vr = e.varRef {
+                    let oldVal = vr.pvalue
+                    vr.pvalue = value
+                    oldVal.freeValue()
+                    return 1
+                }
+            }
+            if exFlags.isGetSet {
                 // Accessor property — call the setter
                 if let e = jsObj.extra(at: exIdx), e.kind == .getset, let setterObj = e.setter {
                     let setterVal = JeffJSValue.makeObject(setterObj)

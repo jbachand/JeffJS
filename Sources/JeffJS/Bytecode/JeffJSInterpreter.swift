@@ -147,6 +147,34 @@ func jeffJS_pop(_ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: inout Int, _ spB
     return buf[sp]
 }
 
+nonisolated(unsafe) let jeffJSNoTrace = ProcessInfo.processInfo.environment["JEFFJS_NO_TRACE"] != nil
+
+// JEFFJS_TRACE_LAST=1: keep the last 128 (function, pc, opcode) triples the
+// main dispatch loop executed, and print them when a diagnostic asks.
+nonisolated(unsafe) let jeffJSTraceLast = ProcessInfo.processInfo.environment["JEFFJS_TRACE_LAST"] != nil
+nonisolated(unsafe) var jeffJSLastOps = [(fb: JeffJSFunctionBytecode?, pc: Int, op: UInt8, sp: Int)](repeating: (nil, 0, 0, 0), count: 128)
+nonisolated(unsafe) var jeffJSLastOpsIdx = 0
+@inline(never)
+func jeffJS_recordLastOp(_ fb: JeffJSFunctionBytecode, _ pc: Int, _ op: UInt8, _ sp: Int) {
+    jeffJSLastOps[jeffJSLastOpsIdx & 127] = (fb, pc, op, sp)
+    jeffJSLastOpsIdx &+= 1
+}
+func jeffJS_dumpLastOps(_ ctx: JeffJSContext) {
+    guard jeffJSTraceLast else { return }
+    var out = "[JeffJS] last executed opcodes (oldest first):\n"
+    let n = min(jeffJSLastOpsIdx, 128)
+    for k in 0 ..< n {
+        let e = jeffJSLastOps[(jeffJSLastOpsIdx - n + k) & 127]
+        guard let fb = e.fb else { continue }
+        let name = jeffJSGetOpcodeInfo(e.op)?.name ?? "?\(e.op)"
+        let fn = ctx.rt.atomToString((fb as? JeffJSFunctionBytecodeCompiled)?.funcNameAtom ?? 0) ?? "<anon>"
+        let line = (fb as? JeffJSFunctionBytecodeCompiled).map {
+            $0.debugPc2lineBuf.isEmpty ? fb.lineNum : $0.lineForPC(e.pc)
+        } ?? fb.lineNum
+        out += "  \(fn)@\(line) pc=\(e.pc) sp=\(e.sp) \(name)\n"
+    }
+    FileHandle.standardError.write(out.data(using: .utf8)!)
+}
 nonisolated(unsafe) var jeffJS_underflowReports = 0
 
 @inline(never)
@@ -162,7 +190,18 @@ func jeffJS_reportStackUnderflow(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytec
         opName = raw == 0 && pc + 1 < fb.bytecodeLen ? "wide:\(fb.bytecode[pc + 1])" : (jeffJSGetOpcodeInfo(raw)?.name ?? "?\(raw)")
     } else { opName = "?" }
     let fname = ctx.rt.atomToString((fb as? JeffJSFunctionBytecodeCompiled)?.funcNameAtom ?? 0) ?? "<anon>"
-    FileHandle.standardError.write("[JeffJS] VM stack underflow: op=\(opName) pc=\(pc) sp=\(sp) spBase=\(spBase) in \(fname)\n".data(using: .utf8)!)
+    if ProcessInfo.processInfo.environment["JEFFJS_UNDERFLOW_DUMP"] != nil,
+       let c = fb as? JeffJSFunctionBytecodeCompiled {
+        FileHandle.standardError.write(JeffJSCompiler.dumpFunctionBytecode(fb: c).data(using: .utf8)!)
+        if let src = c.debugSourceStr {
+            FileHandle.standardError.write("SOURCE: \(src.prefix(400))\n".data(using: .utf8)!)
+        }
+    }
+    var where_ = ""
+    if let c = fb as? JeffJSFunctionBytecodeCompiled, !c.debugPc2lineBuf.isEmpty {
+        where_ = " line=\(c.lineForPC(pc))"
+    }
+    FileHandle.standardError.write("[JeffJS] VM stack underflow: op=\(opName) pc=\(pc) sp=\(sp) spBase=\(spBase) in \(fname)\(where_)\n".data(using: .utf8)!)
 }
 
 /// Branch-condition fast path: comparison opcodes push exact JS_TRUE/JS_FALSE
@@ -296,13 +335,21 @@ extension JeffJSContext {
             else { desc = toSwiftString(funcVal) ?? "\(funcVal.tag)" }
             // Build context hint from current stack frame
             var hint = ""
-            if let frame = self.currentFrame,
-               let curFn = frame.curFunc.toObject(),
-               case .bytecodeFunc(let fbOpt, _, _) = curFn.payload,
-               let fb = fbOpt {
-                let fname = fb.fileName?.toSwiftString() ?? "?"
-                hint = " at \(fname):\(fb.lineNum) pc=\(frame.curPC)"
+            var f: JeffJSStackFrame? = self.currentFrame
+            var depth = 0
+            while let frame = f, depth < 4 {
+                if let curFn = frame.curFunc.toObject(), let fb = curFn.fbFast {
+                    let fname = fb.fileName?.toSwiftString() ?? "?"
+                    let line = (fb as? JeffJSFunctionBytecodeCompiled).map {
+                        $0.debugPc2lineBuf.isEmpty ? fb.lineNum : $0.lineForPC(frame.curPC)
+                    } ?? fb.lineNum
+                    hint += depth == 0 ? " at \(fname):\(line) pc=\(frame.curPC)"
+                                       : " <- \(fname):\(line)"
+                    depth += 1
+                }
+                f = frame.prevFrame
             }
+            jeffJS_dumpLastOps(self)
             return throwTypeError(message: "\(desc) is not a function\(hint)")
         }
         // Hot path: plain bytecode function — skip the payload-enum matches
@@ -552,38 +599,94 @@ extension JeffJSContext {
 
     // MARK: - Object Creation Stubs
 
+    /// Var-ref for argument slot `i` of `frame`, shared with any closure that
+    /// already captured it. Mapped `arguments` slots alias the live parameter
+    /// through these, exactly as a closure variable does; the frame epilogue
+    /// detaches them (copying the value in) when the function returns.
+    func jeffJS_argVarRef(_ frame: JeffJSStackFrame, _ i: Int) -> JeffJSVarRef {
+        if let existing = frame.liveVarRefs.first(where: {
+            $0.isArg && $0.varIdx == UInt16(i) && !$0.isDetached
+        }) { return existing }
+        let vr = JeffJSVarRef(isDetached: false, isArg: true, varIdx: UInt16(i), parentFrame: frame)
+        // Generator / async frames re-acquire their buffer on resume, so they
+        // keep the frame-based lookup (same rule as createClosure).
+        let fb = frame.curFunc.toObject()?.fbFast
+        if let b = frame.buf, i < frame.bufVarBase,
+           !(fb?.isGenerator ?? false), !(fb?.isAsyncFunc ?? false) {
+            vr.slot = b + i
+        }
+        frame.liveVarRefs.append(vr)
+        frame.hasLiveVarRefs = true
+        return vr
+    }
+
     /// Creates a special object (arguments, mapped arguments, etc.) based on kind.
     func newSpecialObject(kind: UInt8, frame: JeffJSStackFrame) -> JeffJSValue {
         switch SpecialObjectType(rawValue: kind) {
         case .arguments, .mappedArguments:
-            // Arguments objects of one kind and count all share one transition
-            // shape (indices, length[, callee], @@iterator). After the first,
-            // creation is one object plus slot appends; the old path paid N + 3
-            // property adds through the transition table every time.
+            // Sloppy functions with a simple parameter list get a MAPPED
+            // arguments object: indices below the formal parameter count are
+            // var-ref slots aliasing the live argument, and `callee` is the
+            // function. Strict functions (and any non-simple parameter list)
+            // get an unmapped one whose `callee` is the %ThrowTypeError%
+            // poison accessor. Both carry the Arguments class so
+            // `Object.prototype.toString` reports "[object Arguments]".
+            //
+            // Arguments objects of one kind, argc and mapped count share one
+            // transition shape; after the first, creation is one object plus
+            // slot appends.
             let mapped = kind == SpecialObjectType.mappedArguments.rawValue
             let argc = frame.argBuf.count
-            let fixedCount = mapped ? 3 : 2
+            var mappedCount = 0
+            if mapped, let fb = frame.curFunc.toObject()?.fbFast {
+                mappedCount = min(argc, Int(fb.argCount))
+            }
             let argsObj = newObject()
             guard let o = argsObj.toObject() else { return argsObj }
+            o.classID = mapped ? JeffJSClassID.mappedArguments.rawValue
+                               : JeffJSClassID.arguments.rawValue
             let iterFn: JeffJSValue = arrayProtoValues.isFunction ? arrayProtoValues.dupValue() : .undefined
-            if argc < argumentsShapesMapped.count,
-               let shape = (mapped ? argumentsShapesMapped : argumentsShapesStrict)[argc],
+            let fixedCount = 3   // length, callee, @@iterator (both kinds)
+            let shapeKey = argc * 18 + mappedCount * 2 + (mapped ? 1 : 0)
+            if argc <= 8, mappedCount <= 8,
+               let shape = argumentsShapes[shapeKey],
                shape.isHashed, shape.propCount == argc + fixedCount,
                o.propValues.count == 0, let old = o.shape {
                 shape.refCount += 1
                 o.shape = shape
                 jeffJS_leaveShape(rt, old)
-                for a in frame.argBuf { o.appendDataValue(a.dupValue()) }
+                for i in 0 ..< argc {
+                    if i < mappedCount {
+                        o.appendProp(.varRef(jeffJS_argVarRef(frame, i)))
+                    } else {
+                        o.appendDataValue(frame.argBuf[i].dupValue())
+                    }
+                }
                 o.appendDataValue(.newInt32(Int32(argc)))                  // length
-                if mapped { o.appendDataValue(frame.curFunc.dupValue()) }  // callee
+                if mapped {
+                    o.appendDataValue(frame.curFunc.dupValue())            // callee
+                } else if let tte = throwTypeError.toObject() {
+                    _ = throwTypeError.dupValue()                          // getter
+                    _ = throwTypeError.dupValue()                          // setter
+                    o.appendProp(.getset(getter: tte, setter: tte))        // callee (poison)
+                } else {
+                    o.appendDataValue(.undefined)
+                }
                 o.appendDataValue(iterFn)                                  // @@iterator
                 return argsObj
             }
-            // First object of this kind and count: build it property by
+            // First object of this kind/argc/mappedCount: build it property by
             // property (length, callee and @@iterator non-enumerable, as the
             // spec has them) and remember the resulting transition shape.
-            for (i, arg) in frame.argBuf.enumerated() {
-                _ = setPropertyUint32(obj: argsObj, index: UInt32(i), value: arg.dupValue())
+            for i in 0 ..< argc {
+                if i < mappedCount {
+                    let atom = rt.newAtomUInt32(UInt32(i))
+                    jeffJS_objectAddShapeProperty(self, o, atom: atom,
+                                                  flags: JeffJSPropertyFlags([.cWE, .varref]).rawValue)
+                    o.appendProp(.varRef(jeffJS_argVarRef(frame, i)))
+                } else {
+                    _ = setPropertyUint32(obj: argsObj, index: UInt32(i), value: frame.argBuf[i].dupValue())
+                }
             }
             let wc = JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE
             _ = definePropertyValue(obj: argsObj, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
@@ -591,13 +694,17 @@ extension JeffJSContext {
             if mapped {
                 _ = definePropertyValue(obj: argsObj, atom: JeffJSAtomID.JS_ATOM_callee.rawValue,
                                         value: frame.curFunc.dupValue(), flags: wc)
+            } else {
+                _ = defineProperty(obj: argsObj, atom: JeffJSAtomID.JS_ATOM_callee.rawValue,
+                                   value: .undefined, getter: throwTypeError, setter: throwTypeError,
+                                   flags: JS_PROP_GETSET | JS_PROP_HAS_GET | JS_PROP_HAS_SET)
             }
             _ = definePropertyValue(obj: argsObj, atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue,
                                     value: iterFn, flags: wc)
-            if argc < argumentsShapesMapped.count, let sh = o.shape, sh.isHashed,
+            if argc <= 8, mappedCount <= 8, let sh = o.shape, sh.isHashed,
                sh.propCount == argc + fixedCount, o.propValues.count == sh.propCount {
                 sh.refCount += 1   // the context keeps the shape alive
-                if mapped { argumentsShapesMapped[argc] = sh } else { argumentsShapesStrict[argc] = sh }
+                argumentsShapes[shapeKey] = sh
             }
             return argsObj
         case .thisVal:
@@ -1263,7 +1370,7 @@ extension JeffJSContext {
             let idx = jeffJS_findOwnPropertyIndex(obj: gObj, atom: atom)
             if idx >= 0 {
                 if let shape = gObj.shape, idx < gObj.propCount,
-                   !shape.prop[idx].flags.contains(.getset),
+                   shape.prop[idx].flags.isPlainData,
                    gObj.extra(at: idx) == nil {
                     return gObj.dataValue(at: idx).dupValue()
                 }
@@ -1295,7 +1402,7 @@ extension JeffJSContext {
             let idx = jeffJS_findOwnPropertyIndex(obj: gObj, atom: atom)
             if idx >= 0, idx < gObj.propCount {
                 let f = shape.prop[idx].flags
-                if !f.contains(.getset), f.contains(.writable),
+                if f.isPlainData, f.contains(.writable),
                    gObj.extra(at: idx) == nil {
                     let old = gObj.propValues[idx]
                     gObj.propValues[idx] = val
@@ -1680,6 +1787,7 @@ extension JeffJSContext {
             guard i < srcObj.propCount else { continue }
             switch srcObj.propEntry(at: i) {
             case .value(let val): pending.append((atom, val.dupValue()))
+            case .varRef(let vr): pending.append((atom, vr.pvalue.dupValue()))
             case .getset: pending.append((atom, nil))   // read with [[Get]] below
             default: break
             }
@@ -3285,7 +3393,7 @@ private func executeFastTrace(
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
                entry.propOffset < gShape.prop.count,
                gShape.prop[entry.propOffset].flags.contains(.writable),
-               !gShape.prop[entry.propOffset].flags.contains(.getset),
+               gShape.prop[entry.propOffset].flags.isPlainData,
                gObj.extra(at: entry.propOffset) == nil {
                 let chained = isStoreOpcode(bc, pc + 5, bcLen)
                 let val: JeffJSValue
@@ -4168,7 +4276,7 @@ private func executeFastTraceLean(
                 if take {
                     let offset = Int(Int8(bitPattern: bc[pc + 5]))
                     let target = pc + 6 + offset
-                    if target < 0 || target >= bcLen { ctx.interruptCounter = interrupt; return target }
+                    if target < entryPC || target >= exitPC { ctx.interruptCounter = interrupt; return target }
                     if offset < 0 {
                         interrupt -= 1
                         if interrupt <= 0 {
@@ -4180,10 +4288,12 @@ private func executeFastTraceLean(
                     pc = target
                 } else {
                     pc += 6
+                    if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
                 }
             } else {
                 buf[sp] = cond ? .JS_TRUE : .JS_FALSE; sp += 1
                 pc += 4
+                if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
             }
 
         case .cmp_loc_loc:
@@ -4205,7 +4315,7 @@ private func executeFastTraceLean(
                 if take {
                     let offset = Int(Int8(bitPattern: bc[pc + 5]))
                     let target = pc + 6 + offset
-                    if target < 0 || target >= bcLen { ctx.interruptCounter = interrupt; return target }
+                    if target < entryPC || target >= exitPC { ctx.interruptCounter = interrupt; return target }
                     if offset < 0 {
                         interrupt -= 1
                         if interrupt <= 0 {
@@ -4217,10 +4327,12 @@ private func executeFastTraceLean(
                     pc = target
                 } else {
                     pc += 6
+                    if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
                 }
             } else {
                 buf[sp] = cond ? .JS_TRUE : .JS_FALSE; sp += 1
                 pc += 4
+                if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
             }
 
         case .arith_loc_loc:
@@ -4554,7 +4666,7 @@ private func executeFastTraceLean(
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
                entry.propOffset < gShape.prop.count,
                gShape.prop[entry.propOffset].flags.contains(.writable),
-               !gShape.prop[entry.propOffset].flags.contains(.getset),
+               gShape.prop[entry.propOffset].flags.isPlainData,
                gObj.extra(at: entry.propOffset) == nil {
                 let chained = isStoreOpcode(bc, pc + 5, bcLen)
                 let val: JeffJSValue
@@ -5137,6 +5249,7 @@ private func executeFastTraceLean(
                 pc = target
             } else {
                 pc += 5
+                if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
             }
 
         case .if_true:
@@ -5159,6 +5272,7 @@ private func executeFastTraceLean(
                 pc = target
             } else {
                 pc += 5
+                if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
             }
 
         case .if_false8:
@@ -5181,6 +5295,7 @@ private func executeFastTraceLean(
                 pc = target
             } else {
                 pc += 2
+                if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
             }
 
         case .cmp_if8, .cmp_if:
@@ -5214,6 +5329,7 @@ private func executeFastTraceLean(
                 pc = target
             } else {
                 pc += cbSize
+                if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
             }
 
         case .if_true8:
@@ -5236,6 +5352,7 @@ private func executeFastTraceLean(
                 pc = target
             } else {
                 pc += 2
+                if pc >= exitPC { ctx.interruptCounter = interrupt; return pc }   // fall-through leaves the region
             }
 
         case .goto_:
@@ -6081,6 +6198,7 @@ struct JeffJSInterpreter {
         // one static-let accessor per call shows up at 250k calls/sec.
         let rt = ctx.rt
         let traceOps = rt.cfgTraceOpcodes
+        let traceLast = jeffJSTraceLast   // register copy: read per opcode below
         let inlineCallsEnabled = rt.cfgUseInlineCalls
         let traceHitThreshold = rt.cfgTraceHitThreshold
 
@@ -6221,10 +6339,41 @@ struct JeffJSInterpreter {
             // Sync restored frame arrays into buf
             jeffJS_syncFrameToBuf(frame, buf, varBase)
 
+            // Re-attach the var-refs closures took on this generator's slots.
+            if !saved.capturedVarRefs.isEmpty {
+                for vr in saved.capturedVarRefs {
+                    guard vr.isDetached else { continue }
+                    let idx = Int(vr.varIdx)
+                    let slot: Int
+                    if vr.isArg {
+                        guard idx < varBase else { continue }
+                        slot = idx
+                    } else {
+                        slot = varBase + idx
+                    }
+                    guard slot >= 0, slot < bufCapacity else { continue }
+                    // A write through the detached ref while the generator was
+                    // suspended wins over the value restored from the saved
+                    // frame arrays; both hold a reference, so free the loser.
+                    buf[slot].freeValue()
+                    buf[slot] = vr.value
+                    vr.value = .undefined
+                    vr.isDetached = false
+                    vr.parentFrame = frame
+                    vr.slot = nil   // generator frames re-acquire their buffer
+                    frame.liveVarRefs.append(vr)
+                    frame.hasLiveVarRefs = true
+                }
+            }
+
             // Result object produced by advancing a `yield*` delegated
             // iterator (next/throw forwarded from the outer generator's
             // caller); handled uniformly after the switch.
             var delegatedResult: JeffJSValue? = nil
+            // The delegated result came from the inner iterator's return():
+            // if it reports done, the OUTER generator performs a return
+            // completion too (is_return = true after yield_star).
+            var delegatedFromReturn = false
             switch resumeCompletionType {
             case 1:
                 if fb.isGenerator && !fb.isAsyncFunc && !saved.isInitialYield &&
@@ -6241,34 +6390,29 @@ struct JeffJSInterpreter {
                     // run there), then resume the outer generator with
                     // [value, true] so its own finally blocks run too.
                     let iter = saved.delegatedIter
-                    var doneValue = resumeValue
-                    var failed = false
                     let retM = ctx.getProperty(obj: iter, atom: ctx.iterReturnAtom)
                     if retM.isException {
-                        failed = true
+                        iter.freeValue()
+                        retVal = .exception   // dispatch loop runs the generator's handlers
                     } else if retM.isFunction {
                         let res = ctx.callFunction(retM, thisVal: iter, args: [resumeValue])
                         retM.freeValue()
                         if res.isException {
-                            failed = true
-                        } else if !res.isObject {
-                            _ = ctx.throwTypeError(message: "iterator result is not an object")
-                            failed = true
+                            iter.freeValue()
+                            retVal = .exception
                         } else {
-                            // (If the inner return() reports done:false the spec
-                            // re-yields its value; that pathological case is
-                            // treated as done here.)
-                            doneValue = ctx.iteratorGetValue(result: res)
-                            res.freeValue()
+                            // Handled below exactly like next()/throw(): a
+                            // result with done:false re-yields its value and
+                            // keeps the delegation alive (spec 27.5.3.7 7.c).
+                            delegatedResult = res
+                            delegatedFromReturn = true
                         }
                     } else {
+                        // No inner return(): the delegation ends here and the
+                        // outer generator performs its own return completion.
                         retM.freeValue()
-                    }
-                    iter.freeValue()   // the delegation is over either way
-                    if failed {
-                        retVal = .exception   // dispatch loop runs the generator's handlers
-                    } else {
-                        buf[sp] = doneValue; sp += 1
+                        iter.freeValue()
+                        buf[sp] = resumeValue.dupValue(); sp += 1
                         buf[sp] = .newBool(true); sp += 1
                         pc += 1   // saved.pc points at the yield_star opcode: skip it
                     }
@@ -6362,7 +6506,8 @@ struct JeffJSInterpreter {
                         iter.freeValue()   // the delegation is over
                         buf[sp] = value; sp += 1
                         if fb.isGenerator && !fb.isAsyncFunc {
-                            buf[sp] = .newBool(false); sp += 1   // is_return flag for the check after yield_star
+                            // is_return flag for the check after yield_star
+                            buf[sp] = .newBool(delegatedFromReturn); sp += 1
                         }
                         pc += 1  // skip past yield_star
                     } else {
@@ -6380,7 +6525,8 @@ struct JeffJSInterpreter {
                                 varBuf: frame.varBuf,
                                 argBuf: frame.argBuf,
                                 funcObj: mFuncObj,
-                                thisVal: thisVal)
+                                thisVal: thisVal,
+                                capturedVarRefs: frame.liveVarRefs)
                             newSaved.delegatedIter = iter
                             genData.savedState = newSaved
                             genData.state = .suspended_yield_star
@@ -6425,14 +6571,14 @@ struct JeffJSInterpreter {
         // Fast-trace entry at activation start (and at catch handlers after an
         // exception): the trace is the primary interpreter; this loop is the
         // fallback for whatever it cannot run.
-        if !retVal.isException, resumeState == nil, fb.traceLean, pc < bcLen {
+        if !retVal.isException, resumeState == nil, fb.traceLean, pc < bcLen, !jeffJSNoTrace {
             let r = executeFastTraceLean(bc: bc, bcLen: bcLen, entryPC: 0, exitPC: bcLen, startPC: pc,
                                          buf: buf, varBase: varBase, sp: &sp, ctx: ctx, cpool: fb.cpool,
                                          stackLimit: bufCapacity, icEntries: fb.icEntries)
             if r == -1 { retVal = .exception } else { pc = r }
         }
         if !retVal.isException, resumeState == nil, fb.traceEntryEnabled, !fb.traceLean,
-           !fb.isGenerator, !fb.isAsyncFunc, pc < bcLen {
+           !fb.isGenerator, !fb.isAsyncFunc, pc < bcLen, !jeffJSNoTrace {
             let fbIdBefore = ObjectIdentifier(fb)
             var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
             let resumePC = executeFastTrace(state: &hot, startPC: pc, ctx: ctx, rt: rt, inlineBase: inlineBase)
@@ -6475,6 +6621,8 @@ struct JeffJSInterpreter {
             opcodeCount += 1
             #endif
 
+            if traceOps || traceLast {
+            if traceLast { jeffJS_recordLastOp(fb, pc, bc[pc], sp - spBase) }
             if traceOps {
                 var extra = ""
                 if op == .put_loc || op == .put_loc0 || op == .put_loc1 || op == .put_loc2 || op == .put_loc3
@@ -6501,6 +6649,7 @@ struct JeffJSInterpreter {
                 }
                 if op == .return_ && sp > spBase { extra = " TOS=bits=0x\(String(buf[sp-1].bits, radix: 16))/\(buf[sp-1].toInt32())" }
                 print("[TRACE] pc=\(pc) op=\(op) sp=\(sp)\(extra)")
+            }
             }
 
             #if DEBUG
@@ -7891,7 +8040,7 @@ struct JeffJSInterpreter {
                 // Cache plain data slots for the next read
                 if let gObj = ctx.globalObj.obj, let gShape = gObj.shape {
                     if let idx = findShapeProperty(gShape, atom), idx < gObj.propCount,
-                       !gShape.prop[idx].flags.contains(.getset),
+                       gShape.prop[idx].flags.isPlainData,
                        gShape.prop[idx].flags.contains(.writable) {
                         fb.getIC().update(pc, shape: gShape, propOffset: idx)
                     }
@@ -7912,7 +8061,7 @@ struct JeffJSInterpreter {
                        entry.propOffset >= 0, entry.propOffset < gObj.propCount,
                        entry.propOffset < gShape.prop.count,
                        gShape.prop[entry.propOffset].flags.contains(.writable),
-                       !gShape.prop[entry.propOffset].flags.contains(.getset),
+                       gShape.prop[entry.propOffset].flags.isPlainData,
                        gObj.extra(at: entry.propOffset) == nil {
                         let old = gObj.dataValue(at: entry.propOffset)
                         gObj.asClass.propValues[entry.propOffset] = val
@@ -7928,7 +8077,7 @@ struct JeffJSInterpreter {
                 }
                 if let gObj = ctx.globalObj.obj, let gShape = gObj.shape {
                     if let idx = findShapeProperty(gShape, atom), idx < gObj.propCount,
-                       !gShape.prop[idx].flags.contains(.getset),
+                       gShape.prop[idx].flags.isPlainData,
                        gShape.prop[idx].flags.contains(.writable) {
                         fb.getIC().update(pc, shape: gShape, propOffset: idx)
                     }
@@ -8579,6 +8728,12 @@ struct JeffJSInterpreter {
                 let target = buf[sp - 1]
                 let ok = ctx.copyDataProperties(target: target, source: source,
                                                  excludeList: excludeList)
+                // The opcode owns both popped operands: copyDataProperties
+                // dups whatever it keeps. Without this every `{...o}` and
+                // every object-rest pattern pinned its source for the life of
+                // the runtime.
+                source.freeValue()
+                excludeList.freeValue()
                 if !ok {
                     retVal = .exception
                     break dispatchLoop
@@ -9655,9 +9810,15 @@ struct JeffJSInterpreter {
                     break dispatchLoop
                 }
                 let nextMethod = ctx.getProperty(obj: iter, atom: ctx.iterNextAtom)
+                // Middle slot: a catch-offset sentinel of 0 (QuickJS
+                // JS_NewCatchOffset(0)). It marks the three slots as an
+                // iterator record so the exception unwinder can call the
+                // iterator's return() when the loop body throws; a real catch
+                // handler never sits at pc 0.
                 buf[sp] = iter; sp += 1
-                buf[sp] = obj; sp += 1
+                buf[sp] = .newCatchOffset(0); sp += 1
                 buf[sp] = nextMethod; sp += 1
+                obj.freeValue()
                 pc += 1
 
             case .for_await_of_start:
@@ -9671,8 +9832,9 @@ struct JeffJSInterpreter {
                 }
                 let nextMethod = ctx.getProperty(obj: iter, atom: ctx.iterNextAtom)
                 buf[sp] = iter; sp += 1
-                buf[sp] = obj; sp += 1
+                buf[sp] = .newCatchOffset(0); sp += 1   // iterator-record marker
                 buf[sp] = nextMethod; sp += 1
+                obj.freeValue()
                 pc += 1
 
             case .for_in_next:
@@ -9883,7 +10045,8 @@ struct JeffJSInterpreter {
                         argBuf: frame.argBuf,
                         funcObj: mFuncObj,
                         thisVal: thisVal,
-                        isInitialYield: true)
+                        isInitialYield: true,
+                        capturedVarRefs: frame.liveVarRefs)
                     genData.state = .suspended_start
                 }
                 // Return undefined to the callFunction that initiated the generator.
@@ -9913,7 +10076,8 @@ struct JeffJSInterpreter {
                         varBuf: frame.varBuf,
                         argBuf: frame.argBuf,
                         funcObj: mFuncObj,
-                        thisVal: thisVal)
+                        thisVal: thisVal,
+                        capturedVarRefs: frame.liveVarRefs)
                     genData.state = .suspended_yield
                 }
                 retVal = val
@@ -9968,7 +10132,8 @@ struct JeffJSInterpreter {
                             varBuf: frame.varBuf,
                             argBuf: frame.argBuf,
                             funcObj: mFuncObj,
-                            thisVal: thisVal)
+                            thisVal: thisVal,
+                            capturedVarRefs: frame.liveVarRefs)
                         saved.delegatedIter = iter
                         genData.savedState = saved
                         genData.state = .suspended_yield_star
@@ -10093,7 +10258,8 @@ struct JeffJSInterpreter {
                             pc: pc + 1, sp: sp - spBase,
                             stack: stackSnap, varBuf: varSnap,
                             argBuf: argSnap, funcObj: mFuncObj,
-                            thisVal: frame.thisVal)
+                            thisVal: frame.thisVal,
+                            capturedVarRefs: frame.liveVarRefs)
 
                         let stateID = ctx.storeAsyncState(JeffJSContext.AsyncSavedEntry(
                             saved: saved,
@@ -11183,6 +11349,18 @@ struct JeffJSInterpreter {
                 let entry = buf[sp]
                 if entry.isCatchOffset {
                     let catchAddr = Int(entry.toInt32())
+                    if catchAddr == 0 {
+                        // Iterator record left by for_of_start: [iter, marker,
+                        // method]. The method above it has already been freed;
+                        // close the iterator and keep unwinding.
+                        if sp > spBase {
+                            sp -= 1
+                            let iterVal = buf[sp]
+                            jeffJS_closeIteratorForUnwind(ctx, iterVal)
+                            iterVal.freeValue()
+                        }
+                        continue
+                    }
                     let excVal = ctx.getException()
                     buf[sp] = excVal; sp += 1
                     pc = catchAddr
@@ -11231,6 +11409,18 @@ struct JeffJSInterpreter {
                         let entry = buf[sp]
                         if entry.isCatchOffset {
                             let catchAddr = Int(entry.toInt32())
+                            if catchAddr == 0 {
+                                // Iterator record left by for_of_start: [iter, marker,
+                                // method]. The method above it has already been freed;
+                                // close the iterator and keep unwinding.
+                                if sp > spBase {
+                                    sp -= 1
+                                    let iterVal = buf[sp]
+                                    jeffJS_closeIteratorForUnwind(ctx, iterVal)
+                                    iterVal.freeValue()
+                                }
+                                continue
+                            }
                             let excVal = ctx.getException()
                             buf[sp] = excVal; sp += 1
                             pc = catchAddr
@@ -11359,6 +11549,19 @@ struct JeffJSInterpreter {
 /// inside callInternal would capture `frame`/`buf`/`varBase` by reference and
 /// pin those hot locals to memory.
 @inline(never)
+/// Close an iterator record found while unwinding an exception. The pending
+/// exception is preserved across `return()` (which may itself throw; QuickJS
+/// swallows that error, as the spec requires for a throw completion).
+private func jeffJS_closeIteratorForUnwind(_ ctx: JeffJSContext, _ iter: JeffJSValue) {
+    guard iter.isObject else { return }
+    let rt = ctx.rt
+    let pending = rt.currentException
+    rt.currentException = .null
+    ctx.iteratorClose(iter: iter, isThrow: true)
+    if !rt.currentException.isNull { rt.currentException.freeValue() }
+    rt.currentException = pending
+}
+
 private func jeffJS_syncBufToFrame(_ frame: JeffJSStackFrame, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {
     // The frame arrays are materialised lazily: the call paths no
     // longer fill argBuf/varBuf per call (that array churn dominated

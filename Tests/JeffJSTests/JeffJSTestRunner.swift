@@ -284,6 +284,7 @@ struct JeffJSTestRunner {
             ("NumericPropertyKeys", { $0.testNumericPropertyKeys() }),
             ("TraceBlocks", { $0.testTraceBlocks() }),
             ("ModulesAndImports", { $0.testModulesAndImportPatterns() }),
+            ("InterpreterGaps", { $0.testInterpreterGaps() }),
         ]
     }
 
@@ -10547,6 +10548,260 @@ extension JeffJSTestRunner {
             for (var i = 0; i < 2; i++) { class L { n = i } fns.push(new L()); }
             C6.self === C6 && new C6().m() === C6 && fns[0].n === 0 && fns[1].n === 1
         """, expect: true)
+
+        // --- Class features crossed with the interpreter-gap fixes ---------
+        // Optional chaining reaches a private field: the brand check only runs
+        // on the non-nullish path, and the whole chain short-circuits.
+        evalCheckStr(ctx, """
+            class OC { #x = 5; static get(o) { return o?.#x; } #m() { return 7; }
+                       static call(o) { return o?.#m(); } }
+            [OC.get(new OC()), OC.get(null), OC.get(undefined),
+             OC.call(new OC()), OC.call(null)].join()
+        """, expect: "5,,,7,")
+        // Object rest (with its exclusion list) and private names in one class.
+        evalCheckBool(ctx, """
+            class RP { #v = 1; static tag; static { RP.tag = 'blk'; }
+                       split(o) { var k = 'c'; var { a, [k]: cc, ...rest } = o;
+                                  return [a, cc, JSON.stringify(rest), this.#v].join(); } }
+            new RP().split({ a: 1, b: 2, c: 3, d: 4 }) === '1,3,{\"b\":2,\"d\":4},1'
+                && RP.tag === 'blk'
+        """, expect: true)
+        // A class body is a completion value like any other expression, and a
+        // static block runs before it is produced.
+        evalCheck(ctx, "class SB { static z = 3; static { SB.w = SB.z + 1; } } SB.w", expectInt: 4)
+        // A field initializer inside a `with` body resolves against the with
+        // object (the initializer is a nested function, so it has to reach it
+        // through the closure).
+        evalCheck(ctx, """
+            var wscope = { wv: 10 };
+            with (wscope) { var WK = class { y = wv + 1; }; }
+            new WK().y
+            """, expectInt: 11)
+        // `extends null` still works next to class fields.
+        evalCheckBool(ctx, """
+            class EN extends null { }
+            Object.getPrototypeOf(EN.prototype) === null
+                && Object.getPrototypeOf(EN) === Function.prototype
+        """, expect: true)
+    }
+
+    // MARK: - Interpreter gaps
+
+    /// Regressions for interpreter/codegen gaps found by differential testing
+    /// against qjs. Each block is one fixed bug.
+    mutating func testInterpreterGaps() {
+        let (rt, ctx) = makeCtx()
+        _ = rt
+
+        // --- 1. Fast-trace region bounds ---------------------------------
+        // The lean trace's conditional-branch handlers only checked the jump
+        // target against bcLen, never the fall-through, so a loop whose last
+        // instruction is a backward branch ran past exitPC (DEBUG assert,
+        // out-of-bounds bytecode read in release).
+        evalCheck(ctx, "var n = 0; for (var i = 0; i < 3; i++) { n++; } n", expectInt: 3)
+        evalCheck(ctx, "var i = 0; while (i < 5) i++; i", expectInt: 5)
+        evalCheck(ctx, "var s = 0, j = 0; do { s += j; j++; } while (j < 4); s", expectInt: 6)
+        evalCheck(ctx, """
+            function add3(a, b, c) { return a + b + c; }
+            var args = [1, 2, 3], t = 0;
+            for (var k = 0; k < 4; k++) t += add3(...args);
+            t
+            """, expectInt: 24)
+
+        // --- 2. Object rest --------------------------------------------
+        evalCheckStr(ctx, "var { x, ...r } = { x: 1, y: 2, z: 3 }; x + '|' + JSON.stringify(r)",
+                     expect: "1|{\"y\":2,\"z\":3}")
+        evalCheckStr(ctx, """
+            function f({ a, ...rest }) { return a + '|' + JSON.stringify(rest); }
+            f({ a: 1, b: 2, c: 3 })
+            """, expect: "1|{\"b\":2,\"c\":3}")
+        evalCheckStr(ctx, """
+            var { p: { q, ...inner }, ...outer } = { p: { q: 1, z: 2 }, w: 3 };
+            q + '|' + JSON.stringify(inner) + '|' + JSON.stringify(outer)
+            """, expect: "1|{\"z\":2}|{\"w\":3}")
+        evalCheckStr(ctx, "var { ...all } = { a: 1 }; JSON.stringify(all)", expect: "{\"a\":1}")
+        evalCheckStr(ctx, "var rr; ({ q1: rr, ...r2 } = { q1: 9, y: 8 }); rr + '|' + JSON.stringify(r2)",
+                     expect: "9|{\"y\":8}")
+        // Computed keys are excluded from the rest object (and read the right
+        // property: the source used to be dropped before the key expression).
+        evalCheckStr(ctx, "var kk = 'b'; var { [kk]: bv } = { a: 1, b: 2 }; String(bv)", expect: "2")
+        evalCheckStr(ctx, """
+            var n0 = 0; var { ['k' + n0]: v, ...r3 } = { k0: 1, k1: 2 };
+            v + '|' + JSON.stringify(r3)
+            """, expect: "1|{\"k1\":2}")
+        evalCheckStr(ctx, "var { x1 = 5, ...r4 } = { y1: 2 }; x1 + '|' + JSON.stringify(r4)",
+                     expect: "5|{\"y1\":2}")
+        evalCheckStr(ctx, """
+            (function () { try { throw { a: 1, b: 2 }; } catch ({ a, ...r }) { return a + '|' + JSON.stringify(r); } })()
+            """, expect: "1|{\"b\":2}")
+        evalCheckStr(ctx, "var g = ({ a, ...r }) => a + '|' + JSON.stringify(r); g({ a: 1, b: 2 })",
+                     expect: "1|{\"b\":2}")
+        evalCheckStr(ctx, "const { ca, ...cr } = { ca: 1, cb: 2 }; ca + '|' + JSON.stringify(cr)",
+                     expect: "1|{\"cb\":2}")
+
+        // --- 3. class X extends null ------------------------------------
+        // The heritage used to be read with an unconditional get_field, so
+        // `extends null` threw on null.prototype.
+        evalCheckStr(ctx, "class N1 extends null {}; typeof N1", expect: "function")
+        evalCheckBool(ctx, "class N2 extends null {}; Object.getPrototypeOf(N2.prototype) === null", expect: true)
+        evalCheckBool(ctx, "class N3 extends null {}; Object.getPrototypeOf(N3) === Function.prototype", expect: true)
+        evalCheckBool(ctx, """
+            class N4 extends null { constructor() { return Object.create(N4.prototype); } }
+            new N4() instanceof N4
+            """, expect: true)
+        evalCheckException(ctx, "class N5 extends null {}; new N5()")
+        evalCheckBool(ctx, "var N6 = class extends null {}; Object.getPrototypeOf(N6.prototype) === null", expect: true)
+        // Ordinary heritage is unaffected.
+        evalCheckBool(ctx, """
+            class B1 { m() { return 1; } } class D1 extends B1 {}
+            new D1().m() === 1 && Object.getPrototypeOf(D1) === B1
+            """, expect: true)
+
+        // --- 7. with statement ------------------------------------------
+        // `with` parsed but emitted nothing: the body resolved identifiers
+        // as if the object were not there.
+        evalCheck(ctx, "var wo = { q: 5 }; (function () { with (wo) { return q; } })()", expectInt: 5)
+        evalCheckStr(ctx, """
+            var wo2 = { q: 5 }; var wq = 1;
+            (function () { with (wo2) { q = 7; } })(); wo2.q + '/' + wq
+            """, expect: "7/1")
+        evalCheckStr(ctx, """
+            var wo3 = {}; var wq3 = 1;
+            (function () { with (wo3) { wq3 = 7; } })(); (wo3.wq3 === undefined) + '/' + wq3
+            """, expect: "true/7")
+        evalCheck(ctx, "var wa = { a: 1 }; var wb = 2; (function () { with (wa) { return a + wb; } })()", expectInt: 3)
+        evalCheck(ctx, """
+            var w1 = { a: 1 }, w2 = { b: 2 };
+            (function () { with (w1) { with (w2) { return a + b; } } })()
+            """, expectInt: 3)
+        evalCheck(ctx, "var wi = { a: 1 }; with (wi) { a++; } wi.a", expectInt: 2)
+        evalCheck(ctx, "var wf = { f: function () { return 42; } }; (function () { with (wf) { return f(); } })()", expectInt: 42)
+        // Prototype properties are in scope; `var` still declares in the function.
+        evalCheck(ctx, "var wp = Object.create({ inh: 7 }); (function () { with (wp) { return inh; } })()", expectInt: 7)
+        evalCheckStr(ctx, "var wv = {}; (function () { with (wv) { var z9 = 9; } return z9 + '/' + (wv.z9 === undefined); })()",
+                     expect: "9/true")
+        evalCheckStr(ctx, "var wt = { n: 1 }; (function () { with (wt) { return typeof n; } })()", expect: "number")
+        evalCheckException(ctx, """
+            (0, eval)('function wsf() { "use strict"; with ({}) {} }')
+            """)
+
+        // --- 6. arguments object ----------------------------------------
+        // The arguments object was always the "mapped" flavour, never
+        // actually mapped (values were copied), was a plain Object, and
+        // `callee` was the function even in strict mode.
+        evalCheck(ctx, "function am1(a) { arguments[0] = 2; return a; } am1(1)", expectInt: 2)
+        evalCheck(ctx, "function am2(a) { a = 3; return arguments[0]; } am2(1)", expectInt: 3)
+        evalCheckStr(ctx, "function am3(a) { return Object.prototype.toString.call(arguments); } am3(1)",
+                     expect: "[object Arguments]")
+        // Strict functions get an unmapped arguments object.
+        evalCheck(ctx, "function as1(a) { 'use strict'; arguments[0] = 2; return a; } as1(1)", expectInt: 1)
+        evalCheck(ctx, "function as2(a) { 'use strict'; return arguments[0]; } as2(5)", expectInt: 5)
+        evalCheckException(ctx, "function as3(a) { 'use strict'; return arguments.callee; } as3(1)")
+        evalCheckBool(ctx, "function am4(a) { return arguments.callee === am4; } am4(1)", expect: true)
+        // A non-simple parameter list is unmapped too.
+        evalCheck(ctx, "function an1(a = 1) { arguments[0] = 9; return a; } an1(5)", expectInt: 5)
+        // The mapping survives the usual consumers.
+        evalCheck(ctx, "function am5(a, b) { return arguments.length; } am5(1, 2, 3)", expectInt: 3)
+        evalCheckStr(ctx, "function am6(a) { return Array.prototype.slice.call(arguments).join(); } am6(1, 2, 3)",
+                     expect: "1,2,3")
+        evalCheckStr(ctx, "function am7(a) { return [...arguments].join(); } am7(1, 2)", expect: "1,2")
+        evalCheckStr(ctx, "function am8(a) { return JSON.stringify(arguments); } am8(1, 2)", expect: "{\"0\":1,\"1\":2}")
+        evalCheckStr(ctx, "function am9(a) { return Object.keys(arguments).join(); } am9(1, 2)", expect: "0,1")
+        evalCheck(ctx, "function amA(a) { return Object.getOwnPropertyDescriptor(arguments, '0').value; } amA(4)",
+                  expectInt: 4)
+        evalCheck(ctx, "function amB(a) { return ({ ...arguments })[0]; } amB(6)", expectInt: 6)
+        evalCheckStr(ctx, "function amC(a) { delete arguments[0]; return a + '/' + arguments[0]; } amC(1)",
+                     expect: "1/undefined")
+        // The object outlives the frame: the slot detaches with its value.
+        evalCheck(ctx, "function amD(a) { a = 7; return arguments; } amD(1)[0]", expectInt: 7)
+
+        // --- 4. Bugs found bisecting adsbygoogle.js --------------------
+        // a) Optional chaining short-circuited one link only, so the rest of
+        //    the chain ran on undefined (`b.h()?.h()` called undefined).
+        evalCheckStr(ctx, "var oc1 = { h: function () { return null; } }; String(!!oc1.h()?.h())", expect: "false")
+        evalCheckStr(ctx, "var oc2 = { a: null }; String(oc2.a?.b.c)", expect: "undefined")
+        evalCheckStr(ctx, "var oc3 = { a: null }; String(oc3.a?.b())", expect: "undefined")
+        evalCheckStr(ctx, "var oc4 = { a: null }; String(oc4.a?.[0]())", expect: "undefined")
+        evalCheckStr(ctx, "var oc5 = null; String(oc5?.a.b.c.d())", expect: "undefined")
+        evalCheckStr(ctx, "function ocf() { return undefined; } String(ocf()?.x.y())", expect: "undefined")
+        evalCheck(ctx, "var oc6 = { a: { b: { c: 3 } } }; oc6?.a.b.c", expectInt: 3)
+        evalCheckStr(ctx, "var ocC = 0; function ocs() { ocC++; return 1; } var oc7 = null; oc7?.a[ocs()]; String(ocC)", expect: "0")
+        // ... and an optional call keeps its receiver.
+        evalCheck(ctx, "var oc8 = { v: 1, m: function () { return this.v; } }; oc8.m?.()", expectInt: 1)
+        evalCheck(ctx, "var oc9 = { a: { v: 9, b: function () { return this.v; } } }; oc9.a?.b()", expectInt: 9)
+        // b) A destructuring ASSIGNMENT is an expression whose value is the
+        //    RHS; it used to leave nothing on the stack ("VM stack underflow:
+        //    op=drop"), and its store landed next to the consumer's store,
+        //    which the chained-assignment lookahead read as `a = b = v`.
+        evalCheckStr(ctx, """
+            var da1, db1; var dr1 = ({ a: da1, b: db1 } = { a: 1, b: 2 });
+            JSON.stringify(dr1) + '|' + da1 + '|' + db1
+            """, expect: "{\"a\":1,\"b\":2}|1|2")
+        evalCheckStr(ctx, """
+            var dc1, dd1; var dr2 = ([dc1, dd1] = [1, 2]); JSON.stringify(dr2)
+            """, expect: "[1,2]")
+        evalCheckBool(ctx, """
+            (function () { var o = { a: 1, b: 2 }; var x, y; var r = ({ a: x, b: y } = o); return r === o; })()
+            """, expect: true)
+        // c) A program's completion value has to exist on every path: an `if`
+        //    whose body produces one but is not taken reached `return` with an
+        //    empty stack.
+        evalCheckStr(ctx, "String((0, eval)('var ce = {}; if (false) { ce.x = 1; }'))", expect: "undefined")
+        evalCheckStr(ctx, "String((0, eval)('if (true) { 7; }'))", expect: "7")
+        evalCheckStr(ctx, "String((0, eval)('if (false) 1; else 2;'))", expect: "2")
+
+        // --- 5. Iterator close / yield* / generator closures --------------
+        // for..of has to call the iterator's return() when the body throws,
+        // not only on break/return.
+        evalCheckBool(ctx, """
+            var closed = false;
+            var it = { [Symbol.iterator]() { return this; }, next() { return { value: 1, done: false }; },
+                       return() { closed = true; return { done: true }; } };
+            try { for (var x of it) { throw new Error('boom'); } } catch (e) {}
+            closed
+            """, expect: true)
+        evalCheckStr(ctx, """
+            var it2 = { [Symbol.iterator]() { return this; }, next() { return { value: 1, done: false }; },
+                        return() { return { done: true }; } };
+            try { for (var x2 of it2) { throw new Error('boom'); } } catch (e) { e.message }
+            """, expect: "boom")
+        // ... and when a suspended generator is closed inside the loop.
+        evalCheckBool(ctx, """
+            var closed3 = false;
+            var it3 = { [Symbol.iterator]() { return this; }, next() { return { value: 1, done: false }; },
+                        return() { closed3 = true; return { done: true }; } };
+            function* g3() { for (var v of it3) yield v; }
+            var i3 = g3(); i3.next(); i3.return(0); closed3
+            """, expect: true)
+        // yield*: an inner return() reporting done:false re-yields instead of
+        // ending the delegation.
+        evalCheckStr(ctx, """
+            var inner = { [Symbol.iterator]() { return this; }, next() { return { value: 1, done: false }; },
+                          return(v) { return { value: 'r', done: false }; } };
+            function* g4() { yield* inner; }
+            var i4 = g4(); i4.next(); var r4 = i4.return('x'); r4.value + '/' + r4.done
+            """, expect: "r/false")
+        // Closures over generator locals stay attached across a yield.
+        evalCheck(ctx, """
+            function* g5() { var x = 1; var f = () => x; yield; x = 2; yield f(); }
+            var i5 = g5(); i5.next(); i5.next().value
+            """, expectInt: 2)
+        evalCheck(ctx, """
+            function* g6() { var x = 1; var f = () => { x = 5; }; yield; f(); yield x; }
+            var i6 = g6(); i6.next(); i6.next().value
+            """, expectInt: 5)
+        // The ordinary paths still work.
+        evalCheckStr(ctx, """
+            var log7 = [];
+            function* g7() { try { yield 1; yield 2; } finally { log7.push('f'); } }
+            var i7 = g7(); i7.next(); i7.return(9); log7.join()
+            """, expect: "f")
+        evalCheckBool(ctx, """
+            var closed8 = false;
+            var it8 = { [Symbol.iterator]() { return this; }, next() { return { value: 1, done: false }; },
+                        return() { closed8 = true; return { done: true }; } };
+            for (var x8 of it8) break; closed8
+            """, expect: true)
     }
 
     mutating func runAPITests() -> String {
