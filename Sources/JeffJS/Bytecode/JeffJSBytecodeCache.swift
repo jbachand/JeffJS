@@ -16,7 +16,14 @@ import Foundation
 /// Magic bytes: "JFBC" (JeffJS Function ByteCode)
 private let JFBC_MAGIC: UInt32 = 0x4A46_4243
 /// Version 2: adds atom table for cross-runtime portability
-private let JFBC_VERSION: UInt8 = 5   // 5: per-function source span + the script text (Function.prototype.toString)
+/// 5: per-function source span + the script text (Function.prototype.toString)
+/// 6: atom-table entries are tagged (u8 kind: 0 = JS_ATOM_NULL, 1 = string),
+///    so the null atom no longer collapses onto the empty-string atom.
+private let JFBC_VERSION: UInt8 = 6
+
+/// Atom-table entry kinds (v6+).
+private let ATOM_ENTRY_NULL: UInt8 = 0
+private let ATOM_ENTRY_STRING: UInt8 = 1
 
 /// Constant pool entry tags
 private let CPOOL_UNDEFINED: UInt8 = 0
@@ -78,6 +85,93 @@ private func unpackFlags(_ flags: UInt16, into fb: JeffJSFunctionBytecode) {
     fb.backtrace                     = (flags & (1 << 14)) != 0
 }
 
+// MARK: - Opcode stream walking
+
+/// One decoded instruction: how wide the opcode itself is, how many bytes
+/// the whole instruction takes, and where its atom operand sits (if any).
+private struct DecodedInstruction {
+    let size: Int
+    let atomOffset: Int?
+}
+
+/// Decode the instruction at `pc` the way the interpreter does.
+///
+/// Final bytecode is NOT a flat stream of one-byte opcodes: every opcode
+/// whose raw value is >= 256 (`init_this`, `private_in`) is emitted as a
+/// `0x00` prefix followed by the low byte (see
+/// `JeffJSCompiler.readOpcodeFromBuf`). Reading `bc[pc]` directly decodes
+/// that prefix as OP_invalid (size 1), so the walk lands on the low byte
+/// and every following instruction is decoded at the wrong offset — atom
+/// operands past that point are neither collected on write nor remapped on
+/// read, and non-atom operand bytes get overwritten with table indices.
+/// That is silent, per-function bytecode corruption that only shows up once
+/// the blob is loaded into a runtime whose atom numbering differs from the
+/// one that compiled it (a precompiled `.jfbc`, or a disk cache written by
+/// an earlier process).
+private func decodeInstruction(_ bc: [UInt8], _ pc: Int) -> DecodedInstruction? {
+    guard pc < bc.count else { return nil }
+    let b0 = bc[pc]
+    let rawValue: Int
+    let opWidth: Int
+    if b0 != 0 {
+        rawValue = Int(b0)
+        opWidth = 1
+    } else {
+        guard pc + 1 < bc.count else { return nil }
+        rawValue = 256 + Int(bc[pc + 1])
+        opWidth = 2
+    }
+    guard rawValue < jeffJSOpcodeInfo.count else { return nil }
+    let info = jeffJSOpcodeInfo[rawValue]
+    let size = max(Int(info.size) + (opWidth - 1), 1)
+
+    let atomOffset: Int?
+    switch info.format {
+    case .atom, .atom_u8, .atom_u16, .atom_label_u8, .atom_label_u16:
+        atomOffset = pc + opWidth
+    default:
+        // Special case: get_loc8_get_field has loc8 at +1, atom at +2
+        if rawValue == Int(JeffJSOpcode.get_loc8_get_field.rawValue) {
+            atomOffset = pc + opWidth + 1
+        } else {
+            atomOffset = nil
+        }
+    }
+    return DecodedInstruction(size: size, atomOffset: atomOffset)
+}
+
+/// The instruction boundaries and atom-operand offsets the atom-table walker
+/// sees. Exposed for the bytecode-cache round-trip tests: this walk has to
+/// agree instruction-for-instruction with the interpreter's decode, and a
+/// disagreement is silent atom corruption rather than a crash, so it is worth
+/// asserting directly instead of hoping a snippet happens to expose it.
+enum JeffJSBytecodeWalk {
+
+    /// Offset of the first byte of every instruction in `bc`.
+    static func instructionBoundaries(_ bc: [UInt8]) -> [Int] {
+        var out: [Int] = []
+        var pc = 0
+        while pc < bc.count {
+            out.append(pc)
+            guard let instr = decodeInstruction(bc, pc) else { pc += 1; continue }
+            pc += instr.size
+        }
+        return out
+    }
+
+    /// Offset of every atom operand the writer rewrites and the reader remaps.
+    static func atomOperandOffsets(_ bc: [UInt8]) -> [Int] {
+        var out: [Int] = []
+        var pc = 0
+        while pc < bc.count {
+            guard let instr = decodeInstruction(bc, pc) else { pc += 1; continue }
+            if let off = instr.atomOffset, off + 3 < bc.count { out.append(off) }
+            pc += instr.size
+        }
+        return out
+    }
+}
+
 // MARK: - Atom Table Builder
 
 /// Collects atoms from bytecode and builds a remapping table.
@@ -88,15 +182,19 @@ private struct AtomTableBuilder {
 
     /// Maps runtime atom ID → index in the atom table
     private var atomToIndex: [UInt32: UInt32] = [:]
-    /// Ordered atom strings (index → string)
-    private(set) var atomStrings: [String] = []
+    /// Ordered atom entries (index → string, or nil for JS_ATOM_NULL).
+    ///
+    /// The null atom is NOT the empty-string atom: `atomToString(0)` has no
+    /// string to give, and writing it as `""` made it read back as the
+    /// empty-string atom — two distinct runtime atoms collapsing onto one
+    /// table slot, so a blob was not stable across deserialize → serialize.
+    private(set) var atomEntries: [String?] = []
 
     /// Register an atom, returning its table index.
     mutating func intern(_ atomID: UInt32, rt: JeffJSRuntime) -> UInt32 {
         if let existing = atomToIndex[atomID] { return existing }
-        let idx = UInt32(atomStrings.count)
-        let str = rt.atomToString(atomID) ?? ""
-        atomStrings.append(str)
+        let idx = UInt32(atomEntries.count)
+        atomEntries.append(atomID == JS_ATOM_NULL ? nil : (rt.atomToString(atomID) ?? ""))
         atomToIndex[atomID] = idx
         return idx
     }
@@ -109,35 +207,18 @@ private struct AtomTableBuilder {
         var pc = 0
 
         while pc < len {
-            let op = bc[pc]
-            guard let opcode = JeffJSOpcode(rawValue: UInt16(op)) else {
+            guard let instr = decodeInstruction(bc, pc) else {
                 // Unknown opcode — skip 1 byte (shouldn't happen in valid bytecode)
                 pc += 1
                 continue
             }
-            let info = jeffJSOpcodeInfo[Int(op)]
-
-            // Determine atom offset based on format
-            let atomOffset: Int?
-            switch info.format {
-            case .atom, .atom_u8, .atom_u16, .atom_label_u8, .atom_label_u16:
-                atomOffset = pc + 1
-            default:
-                // Special case: get_loc8_get_field has loc8 at +1, atom at +2
-                if opcode == .get_loc8_get_field {
-                    atomOffset = pc + 2
-                } else {
-                    atomOffset = nil
-                }
-            }
-
-            if let offset = atomOffset, offset + 3 < len {
+            if let offset = instr.atomOffset, offset + 3 < len {
                 let oldAtom = readU32LE(out, offset)
                 let newIdx = intern(oldAtom, rt: rt)
                 writeU32LE(&out, offset, newIdx)
             }
 
-            pc += Int(info.size)
+            pc += instr.size
         }
 
         return out
@@ -169,38 +250,26 @@ private struct AtomRemapper {
     let indexToAtom: [UInt32]
 
     /// Walk bytecode and replace table indices with runtime atom IDs.
+    /// Must decode instructions exactly the way `AtomTableBuilder`
+    /// rewrote them, wide (`0x00`-prefixed) opcodes included.
     func remapBytecode(_ bc: inout [UInt8]) {
         let len = bc.count
         var pc = 0
 
         while pc < len {
-            let op = bc[pc]
-            guard let opcode = JeffJSOpcode(rawValue: UInt16(op)) else {
+            guard let instr = decodeInstruction(bc, pc) else {
                 pc += 1
                 continue
             }
-            let info = jeffJSOpcodeInfo[Int(op)]
 
-            let atomOffset: Int?
-            switch info.format {
-            case .atom, .atom_u8, .atom_u16, .atom_label_u8, .atom_label_u16:
-                atomOffset = pc + 1
-            default:
-                if opcode == .get_loc8_get_field {
-                    atomOffset = pc + 2
-                } else {
-                    atomOffset = nil
-                }
-            }
-
-            if let offset = atomOffset, offset + 3 < len {
+            if let offset = instr.atomOffset, offset + 3 < len {
                 let tableIdx = readU32LE(bc, offset)
                 if tableIdx < indexToAtom.count {
                     writeU32LE(&bc, offset, indexToAtom[Int(tableIdx)])
                 }
             }
 
-            pc += Int(info.size)
+            pc += instr.size
         }
     }
 }
@@ -221,10 +290,15 @@ struct JeffJSBytecodeSerializer {
         s.writeFunctionBytecode(fb, rt: rt)
 
         // Append atom table at the end
-        let atoms = s.atomTable.atomStrings
+        let atoms = s.atomTable.atomEntries
         s.writeU32(UInt32(atoms.count))
-        for str in atoms {
-            s.writeString(str)
+        for entry in atoms {
+            if let str = entry {
+                s.writeU8(ATOM_ENTRY_STRING)
+                s.writeString(str)
+            } else {
+                s.writeU8(ATOM_ENTRY_NULL)
+            }
         }
 
         // The script text, once for the whole function tree. Every function's
@@ -452,6 +526,13 @@ struct JeffJSBytecodeDeserializer {
         var indexToAtom: [UInt32] = []
         indexToAtom.reserveCapacity(Int(atomCount))
         for _ in 0..<atomCount {
+            guard scanPos < data.count else { return nil }
+            let kind = data[scanPos]
+            scanPos += 1
+            if kind == ATOM_ENTRY_NULL {
+                indexToAtom.append(JS_ATOM_NULL)
+                continue
+            }
             guard scanPos + 3 < data.count else { return nil }
             let strLen = Int(readU32At(scanPos))
             scanPos += 4
@@ -475,6 +556,10 @@ struct JeffJSBytecodeDeserializer {
         let atomCount = Int(readU32LE(data, p))
         p += 4
         for _ in 0..<atomCount {
+            guard p < data.count else { return nil }
+            let kind = data[p]
+            p += 1
+            if kind == ATOM_ENTRY_NULL { continue }
             guard p + 3 < data.count else { return nil }
             let strLen = Int(readU32LE(data, p))
             p += 4 + strLen
@@ -617,7 +702,7 @@ struct JeffJSBytecodeDeserializer {
     private mutating func readFunctionBytecode() -> JeffJSFunctionBytecode? {
         // Header
         guard let magic = readU32(), magic == JFBC_MAGIC else { return nil }
-        guard let version = readU8(), version == 5 else { return nil }   // older layouts lack the function source span
+        guard let version = readU8(), version == JFBC_VERSION else { return nil }   // older layouts lack the function source span / tagged atom table
         guard let flags = readU16() else { return nil }
         guard let argCount = readU16() else { return nil }
         guard let varCount = readU16() else { return nil }
@@ -851,7 +936,15 @@ final class JeffJSBytecodeCache {
     //   10b (feat/bigint): CPOOL_BIGINT constant-pool entry kind (n-suffix literals,
     //       BigInt-aware arithmetic opcodes).
     // Both are present here, so neither 10 is a valid description of this format.
-    static let compilerVersion: UInt64 = 11  // 2026-09-21: 10a (function source spans, JFBC v5) + 10b (CPOOL_BIGINT)
+    // 12 = JFBC v6. Two fixes to the atom table, both of which change the bytes:
+    //   - the opcode walk that finds atom operands now decodes wide
+    //     (0x00-prefixed) opcodes, so atoms after an `init_this` /
+    //     `private_in` are collected and remapped instead of being left as
+    //     raw atom IDs of whichever runtime compiled the blob;
+    //   - atom-table entries carry a kind byte, so JS_ATOM_NULL (an
+    //     anonymous function's `name`) no longer reads back as the
+    //     empty-string atom.
+    static let compilerVersion: UInt64 = 12  // 2026-09-21: JFBC v6 (wide-opcode-aware atom walk, tagged atom table)
 
     /// Lazily-initialized disk cache directory.
     /// Automatically clears cached .jfbc files when the app binary changes (new build).
