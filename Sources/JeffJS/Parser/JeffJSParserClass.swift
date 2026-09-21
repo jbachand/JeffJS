@@ -350,14 +350,14 @@ extension JeffJSParser {
             emitScopePutVarInit(fieldsInitAtom, scopeLevel: fd.curScope)
         }
 
-        // Wire up ctorFunc.prototype = proto. Bit 3 makes it non-enumerable
-        // like every property a class definition creates; bit 4 marks it as
+        // Wire up ctorFunc.prototype = proto. Class members are never
+        // enumerable, so bit 3 (`enumerable`) stays clear; bit 4 marks it as
         // the class's own `prototype`, which is also non-writable and
         // non-configurable (ES2023 15.7.14 step 12).
         emitOp(.dup2)                                // ..., [sc,] ctorFunc, proto, ctorFunc, proto
         emitOp(.define_method)
         emitAtom(getAtom("prototype"))
-        emitU8(8 | 16)                               // ..., [sc,] ctorFunc, proto, ctorFunc
+        emitU8(DefineMethodFlags.classPrototype.rawValue)  // ..., ctorFunc, proto, ctorFunc
         emitOp(.drop)                                // ..., [sc,] ctorFunc, proto
 
         // Wire up proto.constructor = ctorFunc. define_method also makes the
@@ -367,7 +367,7 @@ extension JeffJSParser {
         emitOp(.swap)                                // ..., [sc,] ctorFunc, proto, proto, ctorFunc
         emitOp(.define_method)
         emitAtom(getAtom("constructor"))
-        emitU8(8)                                    // ..., [sc,] ctorFunc, proto, proto
+        emitU8(DefineMethodFlags.method.rawValue)    // ..., [sc,] ctorFunc, proto, proto
         emitOp(.drop)                                // ..., [sc,] ctorFunc, proto
 
         // Set the constructor's name
@@ -762,9 +762,11 @@ extension JeffJSParser {
     }
 
     /// Flags byte for `define_method` on a class member: the accessor kind
-    /// plus bit 3, which makes the property non-enumerable.
+    /// only. Bit 3 (`enumerable`) is deliberately clear — class members are
+    /// non-enumerable (ES §15.7.11); only object literals set it.
     func classMethodFlags(_ propKind: PropertyKind) -> UInt8 {
-        return (propKind == .getter ? 2 : 0) | (propKind == .setter ? 4 : 0) | 8
+        return (propKind == .getter ? DefineMethodFlags.getter.rawValue : 0) |
+               (propKind == .setter ? DefineMethodFlags.setter.rawValue : 0)
     }
 
     /// `static { ... }`: a synthetic function run once with `this` = the class.

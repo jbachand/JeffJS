@@ -468,6 +468,13 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             // it runs once during init instead of on every function call.
             ensureMathFixup()
 
+            // Phase 6: Symbol.toStringTag on every builtin prototype /
+            // namespace object (needs all intrinsics to exist first).
+            addIntrinsicToStringTags()
+
+            // Phase 7: builtin methods and statics are never enumerable.
+            addIntrinsicNonEnumerableBuiltins()
+
             intrinsicsAdded = true
             rt.initComplete = true
         }
@@ -921,6 +928,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         }
 
         guard let jsObj = obj.toObject() else { return -1 }
+        // A deferred own property must exist before it can be redefined,
+        // otherwise the materialiser would later overwrite the new descriptor.
+        if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
 
         // Check extensibility
         if !jsObj.extensible {
@@ -1126,6 +1136,16 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             }
         }
 
+        if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
+        // `delete a[i]` on a fast array punches a hole in the element storage
+        // (length is unchanged, `i in a` becomes false) — the element is not a
+        // shape property, so the code below would silently do nothing.
+        if jsObj.fastArray || jsObj.classID == JeffJSClassID.array.rawValue,
+           rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom),
+           jsObj.deleteArrayElement(idx) {
+            jsObj.shape?.enumKeyCache = nil
+            return true
+        }
         guard let shape = jsObj.shape else { return true }
 
         // Use hash-based lookup first, fall back to linear scan
@@ -1219,21 +1239,24 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // Fast path: check fast-array payload for integer-indexed access
         if jsObj.fastArray || jsObj.classID == JeffJSClassID.array.rawValue {
             if rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom) {
+                // A hole (from `delete a[i]`) is *absent*: `1 in a` is false.
                 if let storage = jsObj._fastArrayValues {
                     if idx < storage.count && Int(idx) < storage.values.count {
-                        return true
+                        return !storage.values[Int(idx)].isUninitialized
                     }
                 } else if let snap = jsObj.arraySnapshot() {
                     if Int(idx) < snap.count && Int(idx) < snap.values.count {
-                        return true
+                        return !snap.values[Int(idx)].isUninitialized
                     }
                 }
             }
         }
 
-        // Lazy function prototype counts as present
-        if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
-            return true
+        // Lazily created own properties count as present
+        if jsObj.lazyFlags != 0 {
+            if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue { return true }
+            if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) { return true }
+            if jsObj.pendingStack != nil, atom == JeffJSAtomID.JS_ATOM_stack.rawValue { return true }
         }
 
         // Check own properties via the shape hash table
@@ -1265,11 +1288,30 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// - Returns: The property descriptor, or nil if not found.
     func getOwnProperty(obj: JeffJSValue, atom: UInt32) -> JeffJSProperty? {
         guard let jsObj = obj.toObject() else { return nil }
+        if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
+        let (_, prop) = jeffJS_findOwnProperty(obj: jsObj, atom: atom)
+        return prop
+    }
+
+    /// True for the two atoms whose function own-properties are created lazily.
+    @inline(__always)
+    func jeffJS_isLazyFuncPropAtom(_ atom: UInt32) -> Bool {
+        return atom == JeffJSAtomID.JS_ATOM_name.rawValue
+            || atom == JeffJSAtomID.JS_ATOM_length.rawValue
+    }
+
+    /// Materialise any deferred own property of `jsObj` that `atom` names.
+    @inline(__always)
+    func jeffJS_materializeLazyProps(_ jsObj: JeffJSObject, _ atom: UInt32) {
         if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
             materializeFunctionPrototype(jsObj)
         }
-        let (_, prop) = jeffJS_findOwnProperty(obj: jsObj, atom: atom)
-        return prop
+        if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) {
+            materializeFunctionNameLength(jsObj)
+        }
+        if jsObj.pendingStack != nil, atom == JeffJSAtomID.JS_ATOM_stack.rawValue {
+            materializeErrorStack(jsObj)
+        }
     }
 
     // MARK: - Exception Handling
@@ -2837,9 +2879,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 msgStr = self.toSwiftString(args[0]) ?? ""
                 _ = self.setPropertyStr(obj: errObj, name: "message", value: self.newStringValue(msgStr))
             }
-            // Set stack property
-            let stackStr = msgStr.isEmpty ? "Error" : "Error: \(msgStr)"
-            _ = self.setPropertyStr(obj: errObj, name: "stack", value: self.newStringValue(stackStr))
+            // `stack` carries the call site: header + one "at fn (file:line:col)"
+            // line per live interpreter frame. The frames are captured now and
+            // the string is built on first read.
+            self.attachPendingStack(errObj, errorName: "Error", message: msgStr)
             return errObj
         }, name: "Error", length: 1)
         // Set Error.prototype on constructor and Error.prototype.constructor = Error
@@ -2884,9 +2927,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                     msgStr = self.toSwiftString(args[0]) ?? ""
                     _ = self.setPropertyStr(obj: errObj, name: "message", value: self.newStringValue(msgStr))
                 }
-                // Set stack property
-                let stackStr = msgStr.isEmpty ? capturedName : "\(capturedName): \(msgStr)"
-                _ = self.setPropertyStr(obj: errObj, name: "stack", value: self.newStringValue(stackStr))
+                self.attachPendingStack(errObj, errorName: capturedName, message: msgStr)
                 return errObj
             }, name: name, length: 1)
             // Set NativeError.prototype on constructor and NativeError.prototype.constructor = NativeError
@@ -3369,27 +3410,18 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         }, name: "keyFor", length: 1)
         _ = setPropertyStr(obj: symbolCtor, name: "keyFor", value: symbolKeyFor)
 
-        // Install well-known symbols as static properties on Symbol
-        let wellKnownSymbols: [(String, String)] = [
-            ("asyncIterator",      "Symbol.asyncIterator"),
-            ("hasInstance",        "Symbol.hasInstance"),
-            ("isConcatSpreadable", "Symbol.isConcatSpreadable"),
-            ("iterator",          "Symbol.iterator"),
-            ("match",             "Symbol.match"),
-            ("matchAll",          "Symbol.matchAll"),
-            ("replace",           "Symbol.replace"),
-            ("search",            "Symbol.search"),
-            ("split",             "Symbol.split"),
-            ("species",           "Symbol.species"),
-            ("toPrimitive",       "Symbol.toPrimitive"),
-            ("toStringTag",       "Symbol.toStringTag"),
-            ("unscopables",       "Symbol.unscopables"),
-        ]
-        for (name, desc) in wellKnownSymbols {
-            let symStr = JeffJSString(swiftString: desc)
+        // Install well-known symbols as static properties on Symbol.
+        // Each one is bound to its predefined JS_ATOM_Symbol_* id so that a
+        // well-known symbol used as a property key from JS reaches exactly the
+        // atom the engine's internal
+        // `getProperty(obj:atom: JS_ATOM_Symbol_toPrimitive)` lookups use, and
+        // so the atom is marked symbol-typed (kept out of for-in/Object.keys).
+        for wks in js_well_known_symbols {
+            let symStr = JeffJSString(swiftString: wks.description)
             symStr.atomType = JSAtomType.symbol.rawValue
+            rt.bindSymbolAtom(symStr, atom: wks.atomID)
             let symVal = JeffJSValue.mkPtr(tag: .symbol, ptr: symStr)
-            _ = setPropertyStr(obj: symbolCtor, name: name, value: symVal)
+            _ = setPropertyStr(obj: symbolCtor, name: wks.name, value: symVal)
         }
 
         _ = setPropertyStr(obj: globalObj, name: "Symbol", value: symbolCtor)
@@ -3834,6 +3866,8 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 return self.throwTypeError(message: "Reflect.ownKeys: target must be an object")
             }
             guard let targetObj = args[0].toObject() else { return .exception }
+            if targetObj.needsLazyNameLength { self.materializeFunctionNameLength(targetObj) }
+            if targetObj.needsLazyPrototype { self.materializeFunctionPrototype(targetObj) }
             var intKeys: [(UInt32, JeffJSValue)] = []
             var stringKeys: [JeffJSValue] = []
             var symbolKeys: [JeffJSValue] = []
@@ -3851,7 +3885,12 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                         let isSymbol = entry.atomType == .JS_ATOM_TYPE_SYMBOL ||
                                        entry.atomType == .JS_ATOM_TYPE_GLOBAL_SYMBOL
                         if isSymbol {
-                            symbolKeys.append(self.newStringValue(entry.str))
+                            // Real symbol values, not their descriptions.
+                            if let symStr = self.rt.symbolStringForAtom(atom) {
+                                symbolKeys.append(JeffJSValue.mkPtr(tag: .symbol, ptr: symStr.retain()))
+                            } else {
+                                symbolKeys.append(self.newStringValue(entry.str))
+                            }
                         } else {
                             stringKeys.append(self.newStringValue(entry.str))
                         }
@@ -4066,13 +4105,16 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 }
             }
             if obj.isNullOrUndefined {
+                // The message names the property being read, nothing else. It
+                // used to append " — '<lastGetFieldAtom>.x' is undefined",
+                // where the "last get_field atom" was whatever unrelated
+                // property had been read last ("'navigator.x' is undefined"
+                // for `var u; u.x`). The call site is in `stack`.
                 let atomStr = rt.atomToString(atom) ?? "?"
-                // Include the last variable/field that produced the undefined value
-                let prevAtom = prevGetFieldAtom
-                let varHint = prevAtom > 0 ? (rt.atomToString(prevAtom) ?? "") : ""
-                let hint = varHint.isEmpty ? "" : " — '\(varHint).\(atomStr)' is undefined"
+                // The identifier that produced the undefined value belongs in
+                // the error's `stack`, not glued onto its message.
                 jeffJS_dumpLastOps(self)
-                return throwTypeError(message: "Cannot read properties of \(obj.isNull ? "null" : "undefined") (reading '\(atomStr)')\(hint)")
+                return throwTypeError(message: "Cannot read properties of \(obj.isNull ? "null" : "undefined") (reading '\(atomStr)')")
             }
             return .JS_UNDEFINED
         }
@@ -4112,13 +4154,13 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 // Check ref-type fast storage first (populated by push fast path)
                 if let storage = jsObj._fastArrayValues {
                     if idx < storage.count, Int(idx) < storage.values.count {
-                        return storage.values[Int(idx)].dupValue()
+                        return storage.values[Int(idx)].arrayHoleAsUndefined.dupValue()
                     }
                     return .JS_UNDEFINED
                 }
                 if case .array(_, let vals, let count) = jsObj.payload {
                     if idx < count, Int(idx) < vals.count {
-                        return vals[Int(idx)].dupValue()
+                        return vals[Int(idx)].arrayHoleAsUndefined.dupValue()
                     }
                     return .JS_UNDEFINED
                 }
@@ -4169,9 +4211,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // Lazily materialize `F.prototype = { constructor: F }` for plain
         // function closures (creation deferred at closure time — most
         // closures never have their prototype read).
-        if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
-            materializeFunctionPrototype(jsObj)
-        }
+        if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
 
         // Check own properties via shape-based lookup (index form avoids
         // copying JeffJSProperty enums across the call boundary).
@@ -4256,17 +4296,46 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         flags: Int
     ) -> Int {
         guard let jsObj = obj.toObject() else {
-            if (flags & JS_PROP_THROW) != 0 {
+            // Writing through a null/undefined base always throws, in sloppy
+            // mode too (ES §13.15.2 / PutValue step 5) — `o.m.n = 1` used to
+            // fail silently and leave `e.message` undefined.
+            if obj.isNullOrUndefined || (flags & JS_PROP_THROW) != 0 {
                 let propName = rt.atomToString(atom) ?? "?"
                 let desc: String
                 if obj.isUndefined { desc = "undefined" }
                 else if obj.isNull { desc = "null" }
-                else if obj.isInt { desc = "int(\(obj.toInt32()))" }
+                else if obj.isInt { desc = "\(obj.toInt32())" }
                 else if obj.isBool { desc = obj.toBool() ? "true" : "false" }
-                else { desc = "tag(\(obj.tag))" }
-                _ = throwTypeError(message: "cannot set property '\(propName)' of \(desc)")
+                else { desc = "\(obj.tag)" }
+                _ = throwTypeError(message: "Cannot set properties of \(desc) (setting '\(propName)')")
             }
+            value.freeValue()
             return -1
+        }
+
+        // Deferred own properties.
+        if jsObj.lazyFlags != 0 {
+        if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
+            // `F.prototype = x` replaces the default `{ constructor: F }`
+            // object outright, so don't build it first: that pair's
+            // `constructor` slot deliberately holds an uncounted reference to
+            // F (it is how the cycle is broken), and releasing the discarded
+            // prototype would then over-release F. Define the property
+            // directly with the attributes the default would have had.
+            jsObj.needsLazyPrototype = false
+            let r = definePropertyValue(obj: obj, atom: atom, value: value,
+                                        flags: JS_PROP_WRITABLE)
+            value.freeValue()   // setPropertyInternal consumes; defineProperty dups
+            return r
+        }
+        // `name`/`length` are non-writable: the assignment has to see them.
+        if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) {
+            materializeFunctionNameLength(jsObj)
+        }
+        // An assignment to `stack` replaces the captured one outright.
+        if jsObj.pendingStack != nil, atom == JeffJSAtomID.JS_ATOM_stack.rawValue {
+            jsObj.setPendingStack(nil)
+        }
         }
 
         // Proxy intercept: if this object is a proxy, dispatch to handler.set trap
@@ -4465,12 +4534,89 @@ public final class JeffJSContext: JeffJSTokenizerContext {
 
     /// Creates and throws an error of the given type.
     /// Build a stack trace string by walking the call frame chain.
-    func buildStackTrace(errorName: String, message: String) -> String {
+    /// Snapshot the live activation chain: (function bytecode, pc) per frame.
+    /// This is all `stack` needs, and it costs one small array instead of
+    /// formatting a multi-line string on every `new Error()`.
+    func captureStackFrames(maxDepth: Int = 16) -> [(fb: JeffJSFunctionBytecode, pc: Int)] {
+        var out: [(fb: JeffJSFunctionBytecode, pc: Int)] = []
+        out.reserveCapacity(8)
+        var frame = currentFrame
+        while let f = frame, out.count < maxDepth {
+            if let obj = f.curFunc.toObject(),
+               case .bytecodeFunc(let fbOpt, _, _) = obj.payload,
+               let fb = fbOpt {
+                out.append((fb, f.curPC))
+            }
+            frame = f.prevFrame
+        }
+        return out
+    }
+
+    /// Attach the deferred `stack` of an error object: the frames are captured
+    /// now, the string is built on first read.
+    func attachPendingStack(_ errObj: JeffJSValue, errorName: String, message: String) {
+        guard let jsObj = errObj.toObject() else { return }
+        jsObj.setPendingStack(JeffJSPendingStack(errorName: errorName, message: message,
+                                                 frames: captureStackFrames()))
+    }
+
+    /// Format and install the deferred `stack` property.
+    func materializeErrorStack(_ jsObj: JeffJSObject) {
+        guard let pending = jsObj.pendingStack else { return }
+        jsObj.setPendingStack(nil)
+        let str = formatStackTrace(errorName: pending.errorName, message: pending.message,
+                                   frames: pending.frames)
+        let errVal = JeffJSValue.mkPtr(tag: .object, ptr: jsObj)
+        _ = definePropertyValue(obj: errVal, atom: JeffJSAtomID.JS_ATOM_stack.rawValue,
+                                value: newStringValue(str),
+                                flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+    }
+
+    /// Render captured frames as "Name: message" + one "    at fn (file:line:col)"
+    /// line per frame.
+    func formatStackTrace(errorName: String, message: String,
+                          frames: [(fb: JeffJSFunctionBytecode, pc: Int)]) -> String {
+        var lines: [String] = [message.isEmpty ? errorName : "\(errorName): \(message)"]
+        for (fbBase, rawPC) in frames {
+            guard let fb = fbBase as? JeffJSFunctionBytecodeCompiled else { continue }
+            let pc = fb.bytecodeLen > 0 ? max(0, min(rawPC, fb.bytecodeLen - 1)) : 0
+            var lineNum = fb.debugPc2lineBuf.isEmpty ? 0 : fb.lineForPC(pc)
+            var colNum = fb.debugPc2colBuf.isEmpty ? 0 : fb.colForPC(pc)
+            if lineNum <= 0 { lineNum = fb.lineNum }
+            if colNum <= 0 { colNum = fb.colNum }
+            let filename: String
+            if let c = fb.cachedDebugFilename { filename = c }
+            else {
+                filename = fb.debugFilenameAtom != 0
+                    ? (rt.atomToString(fb.debugFilenameAtom) ?? "<unknown>")
+                    : (fb.fileName?.toSwiftString() ?? "<anonymous>")
+                fb.cachedDebugFilename = filename
+            }
+            let funcName: String
+            if let c = fb.cachedFuncName { funcName = c }
+            else {
+                funcName = fb.funcNameAtom != 0 ? (rt.atomToString(fb.funcNameAtom) ?? "") : ""
+                fb.cachedFuncName = funcName
+            }
+            let location: String
+            if lineNum > 0 && colNum > 0 { location = "\(filename):\(lineNum):\(colNum)" }
+            else if lineNum > 0 { location = "\(filename):\(lineNum)" }
+            else { location = filename }
+            lines.append("    at \(funcName.isEmpty ? "<anonymous>" : funcName) (\(location))")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    func buildStackTrace(errorName: String, message: String,
+                         skipFrames: Int = 0,
+                         includeSourceSnippet: Bool = true) -> String {
         var lines: [String] = []
         let header = message.isEmpty ? errorName : "\(errorName): \(message)"
         lines.append(header)
 
         var frame = currentFrame
+        var skipped = 0
+        while skipped < skipFrames, let f = frame { frame = f.prevFrame; skipped += 1 }
         var depth = 0
         while let f = frame, depth < 16 {
             depth += 1
@@ -4478,14 +4624,26 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                case .bytecodeFunc(let bytecodeOpt, _, _) = obj.payload,
                let fb = bytecodeOpt as? JeffJSFunctionBytecodeCompiled {
                 let pc = fb.bytecodeLen > 0 ? max(0, min(f.curPC, fb.bytecodeLen - 1)) : 0
-                let lineNum = fb.debugPc2lineBuf.isEmpty ? 0 : fb.lineForPC(pc)
-                let colNum = fb.debugPc2colBuf.isEmpty ? 0 : fb.colForPC(pc)
-                let filename = fb.debugFilenameAtom != 0
-                    ? (rt.atomToString(fb.debugFilenameAtom) ?? "<unknown>")
-                    : "<anonymous>"
-                let funcName = fb.funcNameAtom != 0
-                    ? (rt.atomToString(fb.funcNameAtom) ?? "")
-                    : ""
+                // Fall back to the function's own line/column when the
+                // pc2line table is empty (a body that never changes line).
+                var lineNum = fb.debugPc2lineBuf.isEmpty ? 0 : fb.lineForPC(pc)
+                var colNum = fb.debugPc2colBuf.isEmpty ? 0 : fb.colForPC(pc)
+                if lineNum <= 0 { lineNum = fb.lineNum }
+                if colNum <= 0 { colNum = fb.colNum }
+                let filename: String
+                if let c = fb.cachedDebugFilename { filename = c }
+                else {
+                    filename = fb.debugFilenameAtom != 0
+                        ? (rt.atomToString(fb.debugFilenameAtom) ?? "<unknown>")
+                        : (fb.fileName?.toSwiftString() ?? "<anonymous>")
+                    fb.cachedDebugFilename = filename
+                }
+                let funcName: String
+                if let c = fb.cachedFuncName { funcName = c }
+                else {
+                    funcName = fb.funcNameAtom != 0 ? (rt.atomToString(fb.funcNameAtom) ?? "") : ""
+                    fb.cachedFuncName = funcName
+                }
                 var location: String
                 if lineNum > 0 && colNum > 0 {
                     location = "\(filename):\(lineNum):\(colNum)"
@@ -4494,13 +4652,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 } else {
                     location = filename
                 }
-                if funcName.isEmpty {
-                    lines.append("    at \(location)")
-                } else {
-                    lines.append("    at \(funcName) (\(location))")
-                }
+                lines.append("    at \(funcName.isEmpty ? "<anonymous>" : funcName) (\(location))")
                 // Add source snippet for the innermost frame
-                if lines.count == 2, lineNum > 0, let (snippet, _) = fb.sourceSnippet(forLine: lineNum) {
+                if includeSourceSnippet, lines.count == 2, lineNum > 0,
+                   let (snippet, _) = fb.sourceSnippet(forLine: lineNum) {
                     lines.append("    > \(snippet)")
                 }
             }
@@ -4526,13 +4681,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
 
         // Set stack property with source location from call frames
         // Guard against re-entrant / deeply nested errors that may corrupt frame state
-        let stackStr: String
-        if let _ = currentFrame {
-            stackStr = buildStackTrace(errorName: nameStr, message: message)
-        } else {
-            stackStr = message.isEmpty ? nameStr : "\(nameStr): \(message)"
-        }
-        _ = setPropertyStr(obj: errObj, name: "stack", value: newStringValue(stackStr))
+        attachPendingStack(errObj, errorName: nameStr, message: message)
 
         // Set prototype to the appropriate NativeError.prototype.
         // Look up the constructor from the global object and get its .prototype
@@ -5077,7 +5226,13 @@ extension JeffJSContext {
     }
 
     func setPropertyGetSet(obj: JeffJSValue, name: String, getter: JeffJSValue?, setter: JeffJSValue?) {
-        let atom = rt.findAtom(name)
+        setPropertyGetSet(obj: obj, atom: rt.findAtom(name), getter: getter, setter: setter)
+    }
+
+    /// Atom-keyed overload: well-known symbol accessors (`get [Symbol.species]`)
+    /// must pass the predefined JS_ATOM_Symbol_* id — symbol atoms are not
+    /// reachable by spelling.
+    func setPropertyGetSet(obj: JeffJSValue, atom: UInt32, getter: JeffJSValue?, setter: JeffJSValue?) {
         defer { rt.freeAtom(atom) }
         if let p = obj.toObject(), p.shape != nil {
             let idx = jeffJS_objectAddShapeProperty(self, p, atom: atom, flags: UInt32(JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_GETSET))
@@ -5091,7 +5246,13 @@ extension JeffJSContext {
     // -- Iterator helpers --
 
     func createArrayIterator(obj: JeffJSValue, kind: Int) -> JeffJSValue {
-        let iter = newObject()
+        // %ArrayIteratorPrototype% carries @@toStringTag ("Array Iterator") and
+        // the %IteratorPrototype% helpers; without it the ad-hoc iterator object
+        // inherits from Object.prototype and reports "[object Object]".
+        // Created with the prototype in place — re-prototyping afterwards cost
+        // a shape rebuild on every `[...arr]`.
+        let aiProto = classProto[JSClassID.JS_CLASS_ARRAY_ITERATOR.rawValue]
+        let iter = aiProto.isObject ? newObjectProto(proto: aiProto) : newObject()
         _ = setPropertyStr(obj: iter, name: "_target", value: obj)
         _ = setPropertyStr(obj: iter, name: "_index", value: .newInt32(0))
         _ = setPropertyStr(obj: iter, name: "_kind", value: .newInt32(Int32(kind)))
@@ -5164,6 +5325,14 @@ extension JeffJSContext {
 
     func getMethod(_ obj: JeffJSValue, name: String) -> JeffJSValue? {
         let val = getPropertyStr(obj: obj, name: name)
+        if val.isUndefined || val.isNull { return nil }
+        if !isCallable(val) { return nil }
+        return val
+    }
+
+    /// Atom-keyed GetMethod, for well-known symbol keys.
+    func getMethod(_ obj: JeffJSValue, atom: UInt32) -> JeffJSValue? {
+        let val = getProperty(obj: obj, atom: atom)
         if val.isUndefined || val.isNull { return nil }
         if !isCallable(val) { return nil }
         return val

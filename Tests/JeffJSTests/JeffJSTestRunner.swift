@@ -305,6 +305,7 @@ struct JeffJSTestRunner {
             ("RegExpAlternation", { $0.testRegExpAlternation() }),
             ("ReflectConstructNewTarget", { $0.testReflectConstructNewTarget() }),
             ("ClassFields", { $0.testClassFields() }),
+            ("BuiltinGaps", { $0.testBuiltinGaps() }),
         ]
     }
 
@@ -1066,13 +1067,10 @@ extension JeffJSTestRunner {
             apply(x => x * 2, 21)
             """, expectInt: 42)
 
-        // Function.length -- bytecode functions do not yet set .length property
-        // (only C functions do). Expect 0 until createClosure is updated.
-        evalCheck(ctx, "function f(a, b, c) {} f.length", expectInt: 0)
-
-        // Function.name -- bytecode functions do not yet set .name property
-        // (only C functions do). Expect undefined until createClosure is updated.
-        evalCheckUndefined(ctx, "function myFunc() {} myFunc.name")
+        // Function.length / .name on bytecode functions (materialised lazily
+        // on first own-property access).
+        evalCheck(ctx, "function f(a, b, c) {} f.length", expectInt: 3)
+        evalCheckStr(ctx, "function myFunc() {} myFunc.name", expect: "myFunc")
 
         // Function.bind
         evalCheck(ctx, """
@@ -11272,6 +11270,310 @@ extension JeffJSTestRunner {
                         return() { closed8 = true; return { done: true }; } };
             for (var x8 of it8) break; closed8
             """, expect: true)
+    }
+
+    // MARK: - BuiltinGaps
+
+    /// Builtin-semantics gaps that type-sniffing / polyfill-heavy libraries
+    /// depend on. One section per gap.
+    mutating func testBuiltinGaps() {
+        let (_, ctx) = makeCtx()
+
+        // --- 1. Symbol.toStringTag on builtin prototypes -------------------
+        // Object.prototype.toString.call(x) is how every type-sniffing library
+        // (Prism, lodash getTag, core-js) identifies builtins. Without the tags
+        // every one of these answered "[object Object]".
+        evalCheckStr(ctx, "Object.prototype.toString.call(new Map())", expect: "[object Map]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(new Set())", expect: "[object Set]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(new WeakMap())", expect: "[object WeakMap]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(new WeakSet())", expect: "[object WeakSet]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(Promise.resolve())", expect: "[object Promise]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(new ArrayBuffer(1))", expect: "[object ArrayBuffer]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(new DataView(new ArrayBuffer(1)))", expect: "[object DataView]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(new Uint8Array(1))", expect: "[object Uint8Array]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(new Float64Array(1))", expect: "[object Float64Array]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(Symbol('s'))", expect: "[object Symbol]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(Math)", expect: "[object Math]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(JSON)", expect: "[object JSON]")
+        evalCheckStr(ctx, "(function*(){})()[Symbol.toStringTag]", expect: "Generator")
+        evalCheckStr(ctx, "Object.prototype.toString.call(function*(){})", expect: "[object GeneratorFunction]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(async function(){})", expect: "[object AsyncFunction]")
+        evalCheckStr(ctx, "Object.prototype.toString.call([][Symbol.iterator]())", expect: "[object Array Iterator]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(new Map()[Symbol.iterator]())", expect: "[object Map Iterator]")
+        // The tags are non-enumerable and configurable, never writable.
+        evalCheckBool(ctx, """
+            var d = Object.getOwnPropertyDescriptor(Map.prototype, Symbol.toStringTag);
+            d.value === 'Map' && d.writable === false && d.enumerable === false && d.configurable === true
+        """, expect: true)
+        // A user @@toStringTag still wins over the builtin one.
+        evalCheckStr(ctx, """
+            class A { get [Symbol.toStringTag]() { return 'A'; } }
+            Object.prototype.toString.call(new A())
+        """, expect: "[object A]")
+
+        // --- 5. Symbols get their own atom kind ---------------------------
+        // `Symbol("s")` used to intern the *string* atom "s", so a symbol key
+        // and the string key of the same spelling were one property.
+        evalCheckBool(ctx, """
+            var o = {}; o[Symbol('s')] = 1;
+            o.s === undefined && o['s'] === undefined && Object.keys(o).length === 0
+        """, expect: true)
+        evalCheckBool(ctx, """
+            var o = {}; var s = Symbol('q'); o[s] = 1; o.q = 2;
+            o[s] === 1 && o.q === 2 &&
+            Object.keys(o).join() === 'q' &&
+            Object.getOwnPropertyNames(o).join() === 'q' &&
+            Object.getOwnPropertySymbols(o).length === 1 &&
+            Object.getOwnPropertySymbols(o)[0] === s &&
+            Reflect.ownKeys(o).length === 2 &&
+            JSON.stringify(o) === '{"q":2}'
+        """, expect: true)
+        evalCheckStr(ctx, """
+            var o = {}; o[Symbol('x')] = 1; o.a = 1; o.b = 2;
+            var r = ''; for (var k in o) r += k; r
+        """, expect: "ab")
+        // Well-known symbols keep their predefined atoms, so the engine's own
+        // lookups still match, and a symbol key survives `delete`/`in`.
+        evalCheckBool(ctx, """
+            var s = Symbol('k'); var o = {}; o[s] = 1;
+            var ok = (s in o) && o[s] === 1;
+            delete o[s];
+            ok && !(s in o) && Object.getOwnPropertySymbols(o).length === 0
+        """, expect: true)
+        evalCheckBool(ctx, """
+            Symbol.for('reg') === Symbol.for('reg') &&
+            Symbol.keyFor(Symbol.for('reg')) === 'reg' &&
+            Symbol('d') !== Symbol('d')
+        """, expect: true)
+        // The string spelling of a well-known symbol is a different key.
+        evalCheckBool(ctx, """
+            var o = {}; o['Symbol.iterator'] = 7;
+            o[Symbol.iterator] === undefined && o['Symbol.iterator'] === 7
+        """, expect: true)
+
+        // --- 4a. Own-property descriptors and array holes ------------------
+        evalCheckBool(ctx, """
+            var d = Object.getOwnPropertyDescriptor([1, 2], '0');
+            d.value === 1 && d.writable && d.enumerable && d.configurable
+        """, expect: true)
+        evalCheckBool(ctx, """
+            var s = Symbol('t'); var o = {}; o[s] = 5;
+            var d = Object.getOwnPropertyDescriptor(o, s);
+            d.value === 5 && d.writable && d.enumerable && d.configurable
+        """, expect: true)
+        // `delete a[1]` punches a hole: length unchanged, the index is gone.
+        evalCheckBool(ctx, """
+            var a = [1, 2, 3]; delete a[1];
+            !(1 in a) && a.length === 3 && a[1] === undefined &&
+            Object.keys(a).join() === '0,2' &&
+            (function () { var r = ''; for (var k in a) r += k; return r; })() === '02'
+        """, expect: true)
+        // An explicit undefined element is still present.
+        evalCheckBool(ctx, "var a = [1, undefined, 3]; (1 in a) && Object.keys(a).length === 3", expect: true)
+
+        // --- 2. GetSubstitution named groups ($<name>) ---------------------
+        // `$<name>` was parsed and then dropped, so every named-group
+        // replacement template produced an empty expansion.
+        evalCheckStr(ctx, "'2026-09'.replace(/(?<y>\\d+)-(?<m>\\d+)/, '$<m>/$<y>')", expect: "09/2026")
+        // A name that does not exist expands to "".
+        evalCheckStr(ctx, "'ab'.replace(/(?<a>a)/, '[$<zz>]')", expect: "[]b")
+        // With no named groups at all, `$<` stays literal (spec).
+        evalCheckStr(ctx, "'abc'.replace(/b/, '[$<x>]')", expect: "a[$<x>]c")
+        evalCheckStr(ctx, "'a1 a2'.replaceAll(/a(?<d>\\d)/g, '<$<d>>')", expect: "<1> <2>")
+        evalCheckStr(ctx, "'a1b2'.replace(/(?<d>\\d)/g, '$<d>$<d>')", expect: "a11b22")
+        // $<name> mixes with the numeric and $& forms.
+        evalCheckStr(ctx, "'2026-09'.replace(/(?<y>\\d+)-(?<m>\\d+)/, '$1|$2|$&|$<y>')",
+                     expect: "2026|09|2026-09|2026")
+
+        // --- 3. Legacy ("natural") Date parsing ----------------------------
+        // Foundation's DateFormatter list rejected all of these.
+        evalCheckStr(ctx, """
+            var d = new Date('09/20/2026');
+            [d.getFullYear(), d.getMonth(), d.getDate(), d.getHours()].join()
+        """, expect: "2026,8,20,0")
+        evalCheckStr(ctx, """
+            var d = new Date('Sep 20 2026');
+            [d.getFullYear(), d.getMonth(), d.getDate()].join()
+        """, expect: "2026,8,20")
+        evalCheckStr(ctx, """
+            var d = new Date('September 20, 2026 10:00:00');
+            [d.getFullYear(), d.getMonth(), d.getDate(), d.getHours(), d.getMinutes()].join()
+        """, expect: "2026,8,20,10,0")
+        evalCheckStr(ctx, """
+            var d = new Date('2026-09-20 10:00');
+            [d.getFullYear(), d.getMonth(), d.getDate(), d.getHours()].join()
+        """, expect: "2026,8,20,10")
+        // An explicit zone wins over local time.
+        evalCheckBool(ctx, "new Date('Sat Sep 20 2026 10:00:00 GMT-0400').getTime() === 1789912800000",
+                      expect: true)
+        evalCheckBool(ctx, "new Date('Sat, 20 Sep 2026 00:00:00 GMT').getTime() === Date.UTC(2026, 8, 20)",
+                      expect: true)
+        // A slash date must not be mistaken for the ISO year "2020".
+        evalCheckStr(ctx, "var d = new Date('2020/03/05'); [d.getFullYear(), d.getMonth(), d.getDate()].join()",
+                     expect: "2020,2,5")
+        evalCheckBool(ctx, "new Date('12/25/1995 1:30 PM').getHours() === 13", expect: true)
+        evalCheckBool(ctx, "isNaN(new Date('not a date').getTime())", expect: true)
+        // Local-time conversion uses the offset at that instant, not today's,
+        // so dates on the other side of a DST boundary keep their wall clock.
+        evalCheckBool(ctx, """
+            var a = new Date('Dec 25, 1995 13:30:00'), b = new Date('Jul 4, 1996 13:30:00');
+            a.getHours() === 13 && b.getHours() === 13
+        """, expect: true)
+
+        // --- 4b. matchAll, groups prototype, /u, for-in over strings -------
+        // The matchAll iterator had a nil prototype: no next, not iterable.
+        evalCheckBool(ctx, "[...'aa'.matchAll(/a/g)].length === 2", expect: true)
+        evalCheckBool(ctx, """
+            var ms = [...'a1b2'.matchAll(/(?<L>[a-z])(?<D>\\d)/g)];
+            ms.length === 2 && ms[0].groups.L === 'a' && ms[1].groups.D === '2' &&
+            ms[0].index === 0 && ms[1].index === 2
+        """, expect: true)
+        evalCheckBool(ctx, "typeof 'aa'.matchAll(/a/g).next === 'function'", expect: true)
+        evalCheckStr(ctx, """
+            var r = ''; for (var m of 'xyx'.matchAll(/x/g)) r += m.index; r
+        """, expect: "02")
+        // `groups` has a null prototype (ES2018), so a group named
+        // "toString" cannot shadow Object.prototype.
+        evalCheckBool(ctx, "Object.getPrototypeOf('a'.match(/(?<x>a)/).groups) === null", expect: true)
+        // /u must consume a whole surrogate pair.
+        evalCheckBool(ctx, "'\u{1F600}'.match(/./u)[0].length === 2 && '\u{1F600}'.match(/./)[0].length === 1",
+                      expect: true)
+        evalCheckStr(ctx, "'a\u{1F600}b'.match(/./gu).join('|')", expect: "a|\u{1F600}|b")
+        evalCheckStr(ctx, "'\u{1F600}'.replace(/./u, 'X')", expect: "X")
+        // for-in over a primitive string and a String wrapper.
+        evalCheckStr(ctx, "var r = ''; for (var k in 'abc') r += k; r", expect: "012")
+        evalCheckStr(ctx, "var r = ''; for (var k in new String('ab')) r += k; r", expect: "01")
+        evalCheckStr(ctx, "var r = ''; for (var k in '') r += k; r", expect: "")
+        evalCheckStr(ctx, "Object.getOwnPropertyNames(new String('ab')).join()", expect: "0,1,length")
+
+        // --- 7. Builtin and class members are non-enumerable ---------------
+        evalCheckBool(ctx, "Object.keys(class { m() {} }.prototype).length === 0", expect: true)
+        evalCheckBool(ctx, """
+            class K { m() {} get g() { return 1; } set g(v) {} static s() {} }
+            Object.keys(K.prototype).length === 0 && Object.keys(K).length === 0 &&
+            typeof K.prototype.m === 'function' && typeof K.s === 'function'
+        """, expect: true)
+        // Object-literal members stay enumerable.
+        evalCheckStr(ctx, "Object.keys({ m() {}, get g() { return 1; }, p: 1 }).join()", expect: "m,g,p")
+        // Class prototype/constructor attributes (ES §15.7.14).
+        evalCheckBool(ctx, """
+            class K2 {}
+            var dp = Object.getOwnPropertyDescriptor(K2, 'prototype');
+            var dc = Object.getOwnPropertyDescriptor(K2.prototype, 'constructor');
+            dp.writable === false && dp.enumerable === false && dp.configurable === false &&
+            dc.writable === true && dc.enumerable === false && dc.configurable === true
+        """, expect: true)
+        // Builtin methods and statics.
+        evalCheckBool(ctx, """
+            Object.keys(Function.prototype).length === 0 &&
+            Object.keys(Object.prototype).length === 0 &&
+            Object.keys(Array.prototype).length === 0 &&
+            Object.keys(RegExp.prototype).length === 0 &&
+            Object.keys(Error.prototype).length === 0 &&
+            Object.keys(Map.prototype).length === 0 &&
+            Object.keys(Promise.prototype).length === 0 &&
+            Object.keys(Math).length === 0 && Object.keys(JSON).length === 0 &&
+            typeof Function.prototype.call === 'function' && typeof Math.max === 'function'
+        """, expect: true)
+        // A plain function's lazy prototype pair keeps the right attributes.
+        evalCheckBool(ctx, """
+            function Fx() {}
+            var d = Object.getOwnPropertyDescriptor(Fx.prototype, 'constructor');
+            d.enumerable === false && d.writable === true && d.configurable === true &&
+            Object.keys(Fx.prototype).length === 0
+        """, expect: true)
+
+        // --- 6. Lazy function name / length -------------------------------
+        evalCheckStr(ctx, "function foo6(a, b) {} foo6.name + ',' + foo6.length", expect: "foo6,2")
+        evalCheckStr(ctx, "const bar6 = (a) => a; bar6.name + ',' + bar6.length", expect: "bar6,1")
+        evalCheckStr(ctx, "var fe6 = function (x) {}; fe6.name", expect: "fe6")
+        evalCheckStr(ctx, "var named6 = function inner6(x) {}; named6.name", expect: "inner6")
+        evalCheckStr(ctx, "class C6 { m6(a, b, c) {} } C6.name + ',' + C6.prototype.m6.name", expect: "C6,m6")
+        evalCheckStr(ctx, "({ meth6(a) {} }).meth6.name", expect: "meth6")
+        evalCheckStr(ctx, "(function () {}).name", expect: "")
+        // `length` stops at the first default and excludes the rest parameter.
+        evalCheckStr(ctx, """
+            function d6(a, b = 1, c) {} function r6(a, ...rest) {} function* g6(a) {}
+            [d6.length, r6.length, g6.length, (async function (a, b) {}).length].join()
+        """, expect: "1,1,1,2")
+        // Bound functions.
+        evalCheckStr(ctx, """
+            function bf6(a, b) {}
+            var b1 = bf6.bind(null), b2 = bf6.bind(null, 1);
+            [b1.name, b1.length, b2.name, b2.length].join()
+        """, expect: "bound bf6,2,bound bf6,1")
+        // Attributes and enumeration order.
+        evalCheckBool(ctx, """
+            function at6(a) {}
+            var dn = Object.getOwnPropertyDescriptor(at6, 'name');
+            var dl = Object.getOwnPropertyDescriptor(at6, 'length');
+            dn.value === 'at6' && dn.writable === false && dn.enumerable === false &&
+            dn.configurable === true &&
+            dl.value === 1 && dl.writable === false && dl.enumerable === false &&
+            dl.configurable === true &&
+            Object.getOwnPropertyNames(at6).join() === 'length,name,prototype' &&
+            Object.keys(at6).length === 0 && ('name' in at6) && ('length' in at6)
+        """, expect: true)
+        // The lazy properties can still be redefined, deleted and shadowed.
+        evalCheckBool(ctx, """
+            function rd6() {}
+            Object.defineProperty(rd6, 'name', { value: 'renamed' });
+            if (rd6.name !== 'renamed') return false;
+            function del6() {}
+            delete del6.name;
+            return rd6.name === 'renamed' && del6.name === undefined &&
+                   Object.getOwnPropertyNames(del6).indexOf('name') < 0;
+        """, expect: true)
+        // Assigning F.prototype keeps it non-enumerable and constructible.
+        evalCheckBool(ctx, """
+            var Base6 = function (x) { this.x = x; };
+            var Der6 = function (x, y) { Base6.call(this, x); this.y = y; };
+            Der6.prototype = Object.create(Base6.prototype);
+            var d = new Der6(1, 2);
+            d.x === 1 && d.y === 2 && d instanceof Base6 && Object.keys(Der6).length === 0
+        """, expect: true)
+
+        // --- 8. Error stacks and error messages ----------------------------
+        // `stack` was just the header: rt.currentStackFrame, which
+        // buildBacktrace walked, is never assigned. It now walks the live
+        // interpreter chain (ctx.currentFrame).
+        // (Written without `.*` — the regexp engine mis-backtracks a greedy
+        // dot-star followed by a literal, which is a separate pre-existing bug.)
+        evalCheckBool(ctx, """
+            function inner8() { return new Error('boom').stack; }
+            function outer8() { return inner8(); }
+            var lines = outer8().split('\\n');
+            function frameOK(line, name) {
+                return line.indexOf('    at ' + name + ' (') === 0 &&
+                       /:[0-9]+:[0-9]+\\)$/.test(line);
+            }
+            lines[0] === 'Error: boom' && lines.length >= 3 &&
+            frameOK(lines[1], 'inner8') && frameOK(lines[2], 'outer8')
+        """, expect: true)
+        // A thrown builtin error carries frames too.
+        evalCheckBool(ctx, """
+            function thrower8() { null.x; }
+            var ok = false;
+            try { thrower8(); } catch (e) {
+                var l = e.stack.split('\\n')[1];
+                ok = l.indexOf('    at thrower8 (') === 0 && /:[0-9]+:[0-9]+\\)$/.test(l);
+            }
+            ok
+        """, expect: true)
+        // Messages name the property actually being read — the old heuristic
+        // appended the last unrelated get_field atom
+        // ("'navigator.x' is undefined") and a " at file:line" suffix.
+        evalCheckStr(ctx, "var u8; try { u8.x; } catch (e) { e.message }",
+                     expect: "Cannot read properties of undefined (reading 'x')")
+        evalCheckStr(ctx, "try { null.y; } catch (e) { e.message }",
+                     expect: "Cannot read properties of null (reading 'y')")
+        evalCheckStr(ctx, "var o8 = {}; try { o8.a.b; } catch (e) { e.message }",
+                     expect: "Cannot read properties of undefined (reading 'b')")
+        // Writing through a null/undefined base throws in sloppy mode too.
+        evalCheckStr(ctx, "var o8b = {}; try { o8b.m.n = 1; } catch (e) { e.message }",
+                     expect: "Cannot set properties of undefined (setting 'n')")
+        evalCheckStr(ctx, "var o8c = {}; try { o8c.nope(); } catch (e) { e.message }",
+                     expect: "undefined is not a function")
     }
 
     mutating func runAPITests() -> String {

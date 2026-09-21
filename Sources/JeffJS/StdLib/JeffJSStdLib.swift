@@ -1133,9 +1133,12 @@ struct JeffJSStdLib {
         ctx.setPropertyFunc(obj: proto, name: "entries", fn: urlSearchParamsEntries, length: 0)
         ctx.setPropertyFunc(obj: proto, name: "forEach", fn: urlSearchParamsForEach, length: 1)
         ctx.setPropertyFunc(obj: proto, name: "toString", fn: urlSearchParamsToString, length: 0)
-        // The engine maps a symbol key to the atom named after its
-        // description, so this is the real `[Symbol.iterator]` slot.
-        ctx.setPropertyFunc(obj: proto, name: "Symbol.iterator", fn: urlSearchParamsEntries, length: 0)
+        // Symbols have their own atom kind and are kept out of the string
+        // hash chain, so the well-known atom is the only way to reach the
+        // real `[Symbol.iterator]` slot.
+        let uspIterFn = ctx.newCFunction(urlSearchParamsEntries, name: "[Symbol.iterator]", length: 0)
+        _ = ctx.setProperty(obj: proto, atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue,
+                            value: uspIterFn)
         ctx.setPropertyGetSet(obj: proto, atom: ctx.newAtom("size"),
                               getter: { c, t, _ in .newInt32(Int32(uspReadEntries(c, t).count)) },
                               setter: { _, _, _ in .undefined })
@@ -1187,7 +1190,8 @@ struct JeffJSStdLib {
             }
 
             // An iterable of pairs (array of arrays, a Map, ...).
-            let iterFn = ctx.getPropertyStr(obj: initVal, name: "Symbol.iterator")
+            let iterFn = ctx.getProperty(obj: initVal,
+                                         atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue)
             defer { iterFn.freeValue() }
             if iterFn.isFunction {
                 var entries: [(String, String)] = []

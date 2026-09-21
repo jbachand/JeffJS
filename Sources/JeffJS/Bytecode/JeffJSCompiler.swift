@@ -152,6 +152,8 @@ class JeffJSFunctionDefCompiler {
     var args: [JeffJSVarDef] = []      // parameters
     var closureVar: [JeffJSClosureVar] = []
     var argCount: Int = 0
+    /// Value of the function's `length`: parameters before the first default.
+    var functionLength: Int = 0
     var varCount: Int { return vars.count }
 
     // -- Scopes --
@@ -195,6 +197,18 @@ class JeffJSFunctionDefCompiler {
     var lastLineNum: Int = 1
     var lastColNum: Int = 1
     var lastPC: Int = 0
+    // Separate running state for the pc2line/pc2col delta encoders. They used
+    // to share lastLineNum/lastColNum/lastPC with the parser's emitLineNum,
+    // which had already advanced them to the *end* of the function — so every
+    // delta was computed against the wrong base and every frame in an Error
+    // stack reported line 1.
+    /// First source line/column of this function's body (see compile()).
+    var firstLine: Int = 0
+    var firstCol: Int = 0
+    var pc2EncLine: Int = 1
+    var pc2EncCol: Int = 1
+    var pc2EncLinePC: Int = 0
+    var pc2EncColPC: Int = 0
     var lastColPC: Int = 0
     /// line_num events recorded during label resolution (pre-compaction
     /// positions); encoded into pc2line/pc2col after NOP compaction.
@@ -236,6 +250,14 @@ class JeffJSFunctionBytecodeCompiled: JeffJSFunctionBytecode {
     var debugPc2lineBuf: [UInt8] = []
     var debugPc2colLen: Int = 0
     var debugPc2colBuf: [UInt8] = []
+    /// Decoded pc->line / pc->column tables, built on first lookup.
+    private var pc2lineTable: [(pc: Int32, value: Int32)]? = nil
+    private var pc2colTable: [(pc: Int32, value: Int32)]? = nil
+    /// Filename / function name as Swift strings, resolved once. `atomToString`
+    /// allocates a fresh String per call, and an Error stack asks for both on
+    /// every frame.
+    var cachedDebugFilename: String? = nil
+    var cachedFuncName: String? = nil
     var debugSourceStr: String?
     var definedArgCountValue: UInt16 = 0
     var varRefCountValue: UInt16 = 0
@@ -243,7 +265,60 @@ class JeffJSFunctionBytecodeCompiled: JeffJSFunctionBytecode {
 
     /// Decode the pc2line buffer to find the source line number for a given PC offset.
     /// Returns the 1-based line number, or 0 if debug info is unavailable.
+    /// Decoded (pc, value) table, built once per buffer. `lineForPC` used to
+    /// re-decode the whole delta stream on every call, which made building an
+    /// Error's stack O(size of the enclosing script): 25 000 `new Error()` in
+    /// a loop spent most of their time re-walking the top-level function's
+    /// pc2line buffer.
+    private static func decodeTable(_ buf: [UInt8], start: Int) -> [(pc: Int32, value: Int32)] {
+        var out: [(pc: Int32, value: Int32)] = []
+        let bufLen = buf.count
+        var pc = 0
+        var value = start
+        var offset = 0
+        while offset < bufLen {
+            let byte = Int(buf[offset])
+            offset += 1
+            if byte == 0 {
+                guard offset < bufLen else { break }
+                let (pcDelta, off1) = getSLEB128(buf, offset)
+                guard off1 < bufLen else { pc += Int(pcDelta); break }
+                let (valDelta, off2) = getSLEB128(buf, off1)
+                guard off2 <= bufLen else { break }
+                offset = off2
+                pc += Int(pcDelta)
+                value += Int(valDelta)
+            } else {
+                let val = byte - PC2LINE_OP_FIRST
+                pc += val / PC2LINE_RANGE
+                value += (val % PC2LINE_RANGE) + PC2LINE_BASE
+            }
+            out.append((Int32(truncatingIfNeeded: pc), Int32(truncatingIfNeeded: value)))
+        }
+        return out
+    }
+
+    /// Last entry whose pc is <= targetPC (binary search).
+    private static func lookup(_ table: [(pc: Int32, value: Int32)], _ targetPC: Int) -> Int {
+        if table.isEmpty { return 0 }
+        let t = Int32(truncatingIfNeeded: targetPC)
+        var lo = 0, hi = table.count - 1, best = -1
+        while lo <= hi {
+            let mid = (lo + hi) / 2
+            if table[mid].pc <= t { best = mid; lo = mid + 1 } else { hi = mid - 1 }
+        }
+        return Int(table[best < 0 ? 0 : best].value)
+    }
+
     func lineForPC(_ targetPC: Int) -> Int {
+        guard debugPc2lineLen > 0, !debugPc2lineBuf.isEmpty else { return 0 }
+        if pc2lineTable == nil {
+            pc2lineTable = JeffJSFunctionBytecodeCompiled.decodeTable(debugPc2lineBuf, start: 1)
+        }
+        return max(1, JeffJSFunctionBytecodeCompiled.lookup(pc2lineTable!, targetPC))
+    }
+
+    private func lineForPCSlow(_ targetPC: Int) -> Int {
         guard debugPc2lineLen > 0, !debugPc2lineBuf.isEmpty else { return 0 }
         let bufLen = debugPc2lineBuf.count
         var pc = 0
@@ -283,6 +358,14 @@ class JeffJSFunctionBytecodeCompiled: JeffJSFunctionBytecode {
     /// Decode the pc2col buffer to find the source column number for a given PC offset.
     /// Returns the 1-based column number, or 0 if debug info is unavailable.
     func colForPC(_ targetPC: Int) -> Int {
+        guard debugPc2colLen > 0, !debugPc2colBuf.isEmpty else { return 0 }
+        if pc2colTable == nil {
+            pc2colTable = JeffJSFunctionBytecodeCompiled.decodeTable(debugPc2colBuf, start: 1)
+        }
+        return max(1, JeffJSFunctionBytecodeCompiled.lookup(pc2colTable!, targetPC))
+    }
+
+    private func colForPCSlow(_ targetPC: Int) -> Int {
         guard debugPc2colLen > 0, !debugPc2colBuf.isEmpty else { return 0 }
         let bufLen = debugPc2colBuf.count
         var pc = 0
@@ -2238,6 +2321,12 @@ struct JeffJSCompiler {
         // addresses and the line/column tables.
         // ------------------------------------------------------------------
         let pcMap = compactNops(fd: fd, bc: &bc)
+        // The pc2line delta encoder drops an entry whose delta is zero (the
+        // common case for a one-line body), so remember the first position.
+        if let first = fd.pc2Events.first {
+            fd.firstLine = first.line
+            fd.firstCol = first.col
+        }
         for e in fd.pc2Events {
             let np = e.pc < pcMap.count ? pcMap[e.pc] : bc.len
             addPC2Line(fd: fd, pc: np, lineNum: e.line)
@@ -3155,8 +3244,8 @@ struct JeffJSCompiler {
     /// Uses the QuickJS pc2line delta encoding.
     private static func addPC2Line(fd: JeffJSFunctionDefCompiler,
                                     pc: Int, lineNum: Int) {
-        let pcDelta = pc - fd.lastPC
-        let lineDelta = lineNum - fd.lastLineNum
+        let pcDelta = pc - fd.pc2EncLinePC
+        let lineDelta = lineNum - fd.pc2EncLine
 
         // Encode using QuickJS's compact delta format
         if pcDelta == 0 && lineDelta == 0 { return }
@@ -3174,16 +3263,16 @@ struct JeffJSCompiler {
             putSLEB128(&fd.pc2lineBuf, Int32(lineDelta))
         }
 
-        fd.lastPC = pc
-        fd.lastLineNum = lineNum
+        fd.pc2EncLinePC = pc
+        fd.pc2EncLine = lineNum
     }
 
     /// Add a PC-to-column mapping for debug info.
     /// Uses the same delta encoding as pc2line.
     private static func addPC2Col(fd: JeffJSFunctionDefCompiler,
                                    pc: Int, colNum: Int) {
-        let pcDelta = pc - fd.lastColPC
-        let colDelta = colNum - fd.lastColNum
+        let pcDelta = pc - fd.pc2EncColPC
+        let colDelta = colNum - fd.pc2EncCol
 
         if pcDelta == 0 && colDelta == 0 { return }
 
@@ -3198,8 +3287,8 @@ struct JeffJSCompiler {
             putSLEB128(&fd.pc2colBuf, Int32(colDelta))
         }
 
-        fd.lastColPC = pc
-        fd.lastColNum = colNum
+        fd.pc2EncColPC = pc
+        fd.pc2EncCol = colNum
     }
 
     // =========================================================================
@@ -3556,9 +3645,13 @@ struct JeffJSCompiler {
 
         // Function metadata
         fb.funcNameAtom = fd.funcName
+        fb.nameAtom = fd.funcName
         fb.argCount = UInt16(fd.argCount)
         fb.varCount = UInt16(fd.vars.count)
         fb.definedArgCountValue = UInt16(fd.argCount)
+        // `length` stops at the first defaulted parameter (the rest parameter
+        // is already excluded from fd.argCount).
+        fb.definedArgCount = UInt16(fd.functionLength)
         fb.stackSize = UInt16(fd.stackSize)
 
         // Mode and flags
@@ -3608,8 +3701,15 @@ struct JeffJSCompiler {
         fb.cpool = fd.cpool
         fb.cpoolCountValue = fd.cpool.count
 
+        // The function's own first source position, used as the fallback
+        // location in Error stacks.
+        if fb.lineNum == 0 { fb.lineNum = fd.firstLine }
+        if fb.colNum == 0 { fb.colNum = fd.firstCol }
+
         // Debug info
-        if fd.source != nil || fd.pc2lineBuf.len > 0 {
+        // A nested function inherits its parent's filename but not its source
+        // text, so key the debug info on having *either*.
+        if fd.source != nil || fd.pc2lineBuf.len > 0 || fd.filename != 0 {
             fb.hasDebugInfo = true
             fb.hasDebug = true
             fb.debugFilenameAtom = fd.filename

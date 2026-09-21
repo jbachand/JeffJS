@@ -242,9 +242,12 @@ struct JeffJSBuiltinFunction {
         let thisArg: JeffJSValue = (args.isEmpty ? .undefined : args[0]).dupValue()
         let boundArgs: [JeffJSValue] = args.count > 1 ? args[1...].map { $0.dupValue() } : []
 
-        // length = max(0, target.length - bound argument count). Bytecode
-        // functions carry their parameter count on the bytecode (they have no
-        // own `length` property yet).
+        // A bytecode function's `name`/`length` are created on first access,
+        // so force them out before reading the target's own properties —
+        // otherwise every bound function was named "bound " with length 0.
+        if targetObj.needsLazyNameLength { ctx.materializeFunctionNameLength(targetObj) }
+
+        // length = max(0, target.length - bound argument count).
         var targetLength: Int32 = 0
         let targetLengthVal = targetObj.getOwnPropertyValue(
             atom: JeffJSAtomID.JS_ATOM_length.rawValue)

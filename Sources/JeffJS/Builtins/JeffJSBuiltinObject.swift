@@ -176,12 +176,40 @@ extension JeffJSContext {
     /// Returns a property descriptor object for an own property, or undefined if not found.
     func getOwnPropertyDescriptor(_ obj: JeffJSValue, key: JeffJSValue) -> JeffJSValue {
         guard let jsObj = obj.toObject() else { return .undefined }
-        if key.isString, let s = key.stringValue {
-            let atom = rt.findAtom(s.toSwiftString())
-            defer { rt.freeAtom(atom) }
-            if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
-                materializeFunctionPrototype(jsObj)
-            }
+        // Resolve the property key to an atom. Previously only string keys were
+        // handled, so `getOwnPropertyDescriptor(o, Symbol.iterator)` and
+        // `getOwnPropertyDescriptor(arr, '0')` both answered undefined.
+        var ownedAtom = false
+        let atom: UInt32
+        if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
+            atom = rt.symbolAtom(for: symStr)
+        } else if key.isInt {
+            atom = rt.newAtomUInt32(UInt32(bitPattern: key.toInt32()))
+        } else if key.isString, let s = key.stringValue {
+            atom = rt.findAtom(s.toSwiftString()); ownedAtom = true
+        } else if let str = toSwiftString(key) {
+            atom = rt.findAtom(str); ownedAtom = true
+        } else {
+            return .undefined
+        }
+        defer { if ownedAtom { rt.freeAtom(atom) } }
+        // A function's deferred own properties must exist before they can be
+        // described.
+        if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
+
+        // Fast-array elements are not shape properties: they are always
+        // { writable: true, enumerable: true, configurable: true }.
+        if rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom),
+           jsObj.hasArrayElement(idx) {
+            let desc = newPlainObject()
+            _ = setPropertyStr(obj: desc, name: "value", value: jsObj.getArrayElement(idx).dupValue())
+            _ = setPropertyStr(obj: desc, name: "writable", value: .JS_TRUE)
+            _ = setPropertyStr(obj: desc, name: "enumerable", value: .JS_TRUE)
+            _ = setPropertyStr(obj: desc, name: "configurable", value: .JS_TRUE)
+            return desc
+        }
+
+        do {
             let (shapeProp, prop) = jeffJS_findOwnProperty(obj: jsObj, atom: atom)
             guard let shapeProp = shapeProp, let prop = prop else { return .undefined }
 
@@ -225,7 +253,6 @@ extension JeffJSContext {
                                value: JeffJSValue.newBool(shapeProp.flags.contains(.configurable)))
             return desc
         }
-        return .undefined
     }
 
     /// True when the descriptor object carries `name` (own or inherited),
@@ -252,11 +279,10 @@ extension JeffJSContext {
         if key.isString, let s = key.stringValue {
             atom = rt.findAtom(s.toSwiftString())
         } else if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
-            // Symbol keys map to atoms via their description, matching the
-            // engine-wide convention (getPropertyValue/setPropertyValue).
-            // Well-known symbols (e.g. Symbol.toStringTag) resolve to their
-            // predefined atoms this way.
-            atom = rt.findAtom(symStr.toSwiftString())
+            // Symbol keys get their own symbol-typed atom (well-known symbols
+            // resolve to their predefined JS_ATOM_Symbol_* id) — never the
+            // string atom for their description.
+            atom = rt.symbolAtom(for: symStr)
         } else if let str = toSwiftString(key) {
             atom = rt.findAtom(str)
         } else {
@@ -341,6 +367,10 @@ extension JeffJSContext {
         guard let jsObj = obj.toObject() else {
             return newArrayWithLength(0)
         }
+        // A function's deferred own properties have to exist before they can
+        // be listed.
+        if jsObj.needsLazyNameLength { materializeFunctionNameLength(jsObj) }
+        if jsObj.needsLazyPrototype { materializeFunctionPrototype(jsObj) }
 
         let wantStrings = (flags & JS_GPN_STRING_MASK) != 0
         let wantSymbols = (flags & JS_GPN_SYMBOL_MASK) != 0
@@ -375,9 +405,9 @@ extension JeffJSContext {
                 for i in 0 ..< s.len {
                     intKeys.append((UInt32(i), intKeyString(i)))
                 }
-                if !enumOnly {
-                    stringKeys.append(newStringValue("length"))
-                }
+                // "length" is also a real shape property on the wrapper, so
+                // the shape walk below appends it — don't emit it twice.
+                _ = enumOnly
             }
         }
 
@@ -387,7 +417,9 @@ extension JeffJSContext {
             if let snap = jsObj.arraySnapshot() {
                 let values = snap.values, count = snap.count
                 for i in 0..<count {
-                    if i < values.count && !values[i].isUndefined {
+                    // Only a hole is absent; an explicit `undefined` element is
+                    // still an own property.
+                    if i < values.count && !values[i].isUninitialized {
                         intKeys.append((UInt32(i), intKeyString(i)))
                     }
                 }
@@ -423,7 +455,14 @@ extension JeffJSContext {
                                    entry.atomType == .JS_ATOM_TYPE_GLOBAL_SYMBOL
                     if isSymbol {
                         if wantSymbols {
-                            symbolKeys.append(newStringValue(entry.str))
+                            // Rebuild the symbol value, not its description:
+                            // Object.getOwnPropertySymbols must yield keys that
+                            // can be fed straight back into obj[key].
+                            if let symStr = rt.symbolStringForAtom(atom) {
+                                symbolKeys.append(JeffJSValue.mkPtr(tag: .symbol, ptr: symStr.retain()))
+                            } else {
+                                symbolKeys.append(newStringValue(entry.str))
+                            }
                         }
                     } else {
                         if wantStrings {

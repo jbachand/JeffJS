@@ -116,8 +116,13 @@ struct JeffJSBuiltinIterator {
         }
 
         // Iterator.prototype[Symbol.toStringTag] = "Iterator"
-        ctx.setPropertyStr(obj: iterProto, name: "toStringTag",
-                           value: ctx.newStringValue("Iterator"))
+        // (this used to define the *string* key "toStringTag", which
+        // Object.prototype.toString never reads).
+        _ = ctx.definePropertyValue(
+            obj: iterProto,
+            atom: JeffJSAtomID.JS_ATOM_Symbol_toStringTag.rawValue,
+            value: ctx.newStringValue("Iterator"),
+            flags: JS_PROP_CONFIGURABLE)
 
         // Iterator.prototype helper methods (ES2025)
         addProtoFunc(ctx, iterProto, "map",     iteratorMap,     1)

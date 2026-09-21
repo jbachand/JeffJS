@@ -333,24 +333,29 @@ extension JeffJSContext {
             else if funcVal.isInt { desc = String(funcVal.toInt32()) }
             else if funcVal.isBool { desc = funcVal.toBool() ? "true" : "false" }
             else { desc = toSwiftString(funcVal) ?? "\(funcVal.tag)" }
-            // Build context hint from current stack frame
-            var hint = ""
-            var f: JeffJSStackFrame? = self.currentFrame
-            var depth = 0
-            while let frame = f, depth < 4 {
-                if let curFn = frame.curFunc.toObject(), let fb = curFn.fbFast {
-                    let fname = fb.fileName?.toSwiftString() ?? "?"
-                    let line = (fb as? JeffJSFunctionBytecodeCompiled).map {
-                        $0.debugPc2lineBuf.isEmpty ? fb.lineNum : $0.lineForPC(frame.curPC)
-                    } ?? fb.lineNum
-                    hint += depth == 0 ? " at \(fname):\(line) pc=\(frame.curPC)"
-                                       : " <- \(fname):\(line)"
-                    depth += 1
+            // The call site belongs in the error's `stack`, not in its
+            // message — except under JEFFJS_TRACE_LAST, where the inline
+            // frame hint (and the opcode dump) is the point.
+            if jeffJSTraceLast {
+                var hint = ""
+                var f: JeffJSStackFrame? = self.currentFrame
+                var depth = 0
+                while let frame = f, depth < 4 {
+                    if let curFn = frame.curFunc.toObject(), let fb = curFn.fbFast {
+                        let fname = fb.fileName?.toSwiftString() ?? "?"
+                        let line = (fb as? JeffJSFunctionBytecodeCompiled).map {
+                            $0.debugPc2lineBuf.isEmpty ? fb.lineNum : $0.lineForPC(frame.curPC)
+                        } ?? fb.lineNum
+                        hint += depth == 0 ? " at \(fname):\(line) pc=\(frame.curPC)"
+                                           : " <- \(fname):\(line)"
+                        depth += 1
+                    }
+                    f = frame.prevFrame
                 }
-                f = frame.prevFrame
+                jeffJS_dumpLastOps(self)
+                return throwTypeError(message: "\(desc) is not a function\(hint)")
             }
-            jeffJS_dumpLastOps(self)
-            return throwTypeError(message: "\(desc) is not a function\(hint)")
+            return throwTypeError(message: "\(desc) is not a function")
         }
         // Hot path: plain bytecode function — skip the payload-enum matches
         // below (each one copies the payload, retaining FB + varRefs array).
@@ -517,15 +522,7 @@ extension JeffJSContext {
         guard case .bytecodeFunc = obj.payload else {
             // Not a callable type (plain object, array, etc.)
             let desc = toSwiftString(funcVal) ?? "[object]"
-            var hint = ""
-            if let frame = self.currentFrame,
-               let curFn = frame.curFunc.toObject(),
-               case .bytecodeFunc(let fbOpt, _, _) = curFn.payload,
-               let fb = fbOpt {
-                let fname = fb.fileName?.toSwiftString() ?? "?"
-                hint = " at \(fname):\(fb.lineNum) pc=\(frame.curPC)"
-            }
-            return throwTypeError(message: "\(desc) is not a function\(hint)")
+            return throwTypeError(message: "\(desc) is not a function")
         }
         return JeffJSInterpreter.callInternal(ctx: self, funcObj: funcVal,
                                                thisVal: thisVal, args: args, flags: 0)
@@ -893,8 +890,38 @@ extension JeffJSContext {
             obj.needsLazyPrototype = true
             obj.isConstructor = true
         }
+        // `name` and `length` are likewise deferred: two flag stores instead of
+        // two property defines + two shape transitions per closure.
+        obj.needsLazyNameLength = true
 
         return funcVal
+    }
+
+    /// Materialize the `name` and `length` own properties of a bytecode
+    /// function on first own-property access. Both are
+    /// { writable: false, enumerable: false, configurable: true }.
+    /// Self-guarding: a property already defined in the meantime (an explicit
+    /// `set_name`, `Object.defineProperty`) is left untouched.
+    func materializeFunctionNameLength(_ funcObj: JeffJSObject) {
+        funcObj.needsLazyNameLength = false
+        guard let fb = funcObj.fbFast else { return }
+        // Borrowed receiver: nothing here stores a reference to the function
+        // itself (only two fresh primitives), so it must NOT be released.
+        let funcVal = JeffJSValue.mkPtr(tag: .object, ptr: funcObj)
+        if jeffJS_findOwnPropertyIndex(obj: funcObj,
+                                       atom: JeffJSAtomID.JS_ATOM_length.rawValue) < 0 {
+            _ = definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
+                                    value: .newInt32(Int32(fb.definedArgCount)),
+                                    flags: JS_PROP_CONFIGURABLE)
+        }
+        if jeffJS_findOwnPropertyIndex(obj: funcObj,
+                                       atom: JeffJSAtomID.JS_ATOM_name.rawValue) < 0 {
+            // An anonymous function's name is "" (not undefined).
+            let nameVal = fb.nameAtom != 0 ? atomToString(fb.nameAtom) : newString("")
+            _ = definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
+                                    value: nameVal, flags: JS_PROP_CONFIGURABLE)
+            nameVal.freeValue()
+        }
     }
 
     /// Materialize the default `F.prototype = { constructor: F }` pair for a
@@ -910,12 +937,16 @@ extension JeffJSContext {
         let funcVal = JeffJSValue.mkPtr(tag: .object, ptr: funcObj)
         defer { funcVal.freeValue() }
         let protoObj = newObject()
-        _ = setPropertyStr(obj: protoObj, name: "constructor", value: funcVal.dupValue())
-        // An ordinary function's `prototype` is writable but neither
-        // enumerable nor configurable (ES2023 10.2.5).
-        _ = definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
+        // F.prototype.constructor: writable + configurable, NOT enumerable.
+        _ = definePropertyValue(obj: protoObj,
+                                atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
+                                value: funcVal,
+                                flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+        // F.prototype: writable, non-enumerable, non-configurable.
+        _ = definePropertyValue(obj: funcVal,
+                                atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
                                 value: protoObj, flags: JS_PROP_WRITABLE)
-        protoObj.freeValue()   // defineProperty dup'd it; drop our creation ref
+        protoObj.freeValue()
     }
 
     // MARK: - Atom Helpers
@@ -1480,14 +1511,13 @@ extension JeffJSContext {
             return getPropertyStr(obj: obj, name: key)
         }
         if prop.isSymbol {
-            // For symbol keys, look up via the symbol's string description as atom.
-            // Symbols are stored as mkPtr(tag: .symbol, ptr: JeffJSString).
+            // Symbols are stored as mkPtr(tag: .symbol, ptr: JeffJSString); the
+            // string pointer is the symbol's identity. `symbolAtom(for:)` gives
+            // it its own symbol-typed atom, so `o[Symbol("s")]` and `o.s` are
+            // different properties (see JeffJSRuntime "Symbol Atoms").
             if let symStr = prop.toPtr() as? JeffJSString {
-                let atomStr = symStr.toSwiftString()
-                let atom = rt.findAtom(atomStr)
-                let val = getProperty(obj: obj, atom: atom)
-                rt.freeAtom(atom)
-                return val
+                let atom = rt.symbolAtom(for: symStr)
+                return getProperty(obj: obj, atom: atom)
             }
         }
         // Fallback: convert to string
@@ -1529,12 +1559,8 @@ extension JeffJSContext {
         }
         if prop.isSymbol {
             if let symStr = prop.toPtr() as? JeffJSString {
-                let atomStr = symStr.toSwiftString()
-                let atom = rt.findAtom(atomStr)
-                let result = setProperty(obj: obj, atom: atom, value: val) >= 0
-                rt.freeAtom(atom)
-                // Don't free atom — setProperty stores it in the shape.
-                return result
+                let atom = rt.symbolAtom(for: symStr)
+                return setProperty(obj: obj, atom: atom, value: val) >= 0
             }
         }
         // Fallback: convert to string
@@ -1572,10 +1598,7 @@ extension JeffJSContext {
             return result
         }
         if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
-            let atom = rt.findAtom(symStr.toSwiftString())
-            let result = deleteProperty(obj: obj, atom: atom)
-            rt.freeAtom(atom)
-            return result
+            return deleteProperty(obj: obj, atom: rt.symbolAtom(for: symStr))
         }
         return false
     }
@@ -1625,10 +1648,7 @@ extension JeffJSContext {
             return result
         }
         if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
-            let atom = rt.findAtom(symStr.toSwiftString())
-            let result = hasProperty(obj: obj, atom: atom)
-            rt.freeAtom(atom)
-            return result
+            return hasProperty(obj: obj, atom: rt.symbolAtom(for: symStr))
         }
         return false
     }
@@ -1667,21 +1687,20 @@ extension JeffJSContext {
         guard atom != 0 else { return }
         let nameValue = atomToString(atom)
         if nameValue.isUndefined { return }
-        // `name` is non-enumerable (ES §10.2.9 SetFunctionName); a plain
-        // setProperty made every named class / function own an enumerable
-        // `name`, which showed up in Object.keys(SomeClass).
+        // Function "name": non-writable, non-enumerable, configurable.
+        // Defining it here wins over the lazy name (materialize self-guards).
         _ = definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
-                                value: nameValue,
-                                flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+                                value: nameValue, flags: JS_PROP_CONFIGURABLE)
+        nameValue.freeValue()
     }
 
     /// Sets the .name property on a function from a computed key.
     func setFunctionNameComputed(_ funcVal: JeffJSValue, key: JeffJSValue) {
         if key.isString, let str = key.stringValue {
-            let nameAtom = rt.findAtom("name")
-            _ = setProperty(obj: funcVal, atom: nameAtom, value: newString(str.toSwiftString()))
-            rt.freeAtom(nameAtom)
-            // Don't free nameAtom — setProperty stores it in the shape.
+            let nv = newString(str.toSwiftString())
+            _ = definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
+                                    value: nv, flags: JS_PROP_CONFIGURABLE)
+            nv.freeValue()
         }
     }
 
@@ -1814,26 +1833,34 @@ extension JeffJSContext {
         return true
     }
 
+    /// Property flags for a define_method operand: always
+    /// writable+configurable, enumerable only when bit 3 is set.
+    @inline(__always)
+    private func jeffJS_methodPropFlags(_ flags: Int) -> Int {
+        if (flags & Int(DefineMethodFlags.classPrototype.rawValue)) != 0 { return 0 }
+        let base = JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE
+        return (flags & Int(DefineMethodFlags.enumerable.rawValue)) != 0
+            ? (base | JS_PROP_ENUMERABLE) : base
+    }
+
     /// Defines a method on an object.
-    /// Flags: 0 = normal method, 2 = getter, 4 = setter.
+    /// Flags: 0 = normal method, 2 = getter, 4 = setter, 8 = enumerable.
+    /// Class-body methods, getters and setters are NOT enumerable
+    /// (ES §15.7.11) — `Object.keys(class { m() {} }.prototype)` must be
+    /// empty. Only object-literal members set bit 3.
     func defineMethod(obj: JeffJSValue, atom: UInt32, funcVal: JeffJSValue,
                       flags: Int) -> Bool {
         let isGetter = (flags & 2) != 0
         let isSetter = (flags & 4) != 0
-        // Bit 3: define the property non-enumerable. Class members are not
-        // enumerable (ES2022 ClassDefinitionEvaluation); object-literal
-        // methods are. Bit 4: the class's own `prototype`, which on top of
-        // that is non-writable and non-configurable (ES2023 15.7.14).
-        let baseFlags = (flags & 16) != 0 ? 0
-            : ((flags & 8) != 0 ? (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE) : JS_PROP_C_W_E)
+        let propFlags = jeffJS_methodPropFlags(flags)
         if isGetter || isSetter {
             return defineProperty(obj: obj, atom: atom, value: .JS_UNDEFINED,
                                   getter: isGetter ? funcVal : .JS_UNDEFINED,
                                   setter: isSetter ? funcVal : .JS_UNDEFINED,
-                                  flags: baseFlags | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
+                                  flags: propFlags | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
         }
         return definePropertyValue(obj: obj, atom: atom, value: funcVal,
-                                   flags: baseFlags) >= 0
+                                   flags: propFlags) >= 0
     }
 
     /// Defines a method with a computed key.
@@ -1842,9 +1869,7 @@ extension JeffJSContext {
                               flags: Int) -> Bool {
         let isGetter = (flags & 2) != 0
         let isSetter = (flags & 4) != 0
-        // Bits 3/4: non-enumerable / class `prototype` (see defineMethod).
-        let baseFlags = (flags & 16) != 0 ? 0
-            : ((flags & 8) != 0 ? (JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE) : JS_PROP_C_W_E)
+        let propFlags = jeffJS_methodPropFlags(flags)
         if key.isString, let str = key.stringValue {
             let atom = rt.findAtom(str.toSwiftString())
             let result: Bool
@@ -1852,26 +1877,25 @@ extension JeffJSContext {
                 result = defineProperty(obj: obj, atom: atom, value: .JS_UNDEFINED,
                                         getter: isGetter ? funcVal : .JS_UNDEFINED,
                                         setter: isSetter ? funcVal : .JS_UNDEFINED,
-                                        flags: baseFlags | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
+                                        flags: propFlags | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
             } else {
                 result = definePropertyValue(obj: obj, atom: atom, value: funcVal,
-                                              flags: baseFlags) >= 0
+                                              flags: propFlags) >= 0
             }
             // Don't free atom — defineProperty/definePropertyValue stores it in the shape.
             return result
         }
         if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
-            let atomStr = symStr.toSwiftString()
-            let atom = rt.findAtom(atomStr)
+            let atom = rt.symbolAtom(for: symStr)
             let result: Bool
             if isGetter || isSetter {
                 result = defineProperty(obj: obj, atom: atom, value: .JS_UNDEFINED,
                                         getter: isGetter ? funcVal : .JS_UNDEFINED,
                                         setter: isSetter ? funcVal : .JS_UNDEFINED,
-                                        flags: baseFlags | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
+                                        flags: propFlags | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
             } else {
                 result = definePropertyValue(obj: obj, atom: atom, value: funcVal,
-                                              flags: baseFlags) >= 0
+                                              flags: propFlags) >= 0
             }
             // Don't free atom — defineProperty/definePropertyValue stores it in the shape.
             return result
@@ -1902,15 +1926,14 @@ extension JeffJSContext {
             }
         }
 
-        // Set constructor.prototype = proto. A class's `prototype` is
-        // { writable: false, enumerable: false, configurable: false }
-        // (ES2023 15.7.14 step 12); a plain `setProperty` left it writable
-        // and configurable.
+        // C.prototype: non-writable, non-enumerable, non-configurable (ES §15.7.14).
+        // definePropertyValue dups the value, so no explicit dup here.
         _ = definePropertyValue(obj: ctor, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
                                 value: proto, flags: 0)
-        // Set proto.constructor = ctor
-        _ = setProperty(obj: proto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
-                        value: ctor.dupValue())
+        // C.prototype.constructor: writable + configurable, NOT enumerable.
+        _ = definePropertyValue(obj: proto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
+                                value: ctor,
+                                flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
         // Set the constructor's name
         if atom != 0 {
             setFunctionName(ctor, atom: atom)
@@ -2067,8 +2090,20 @@ extension JeffJSContext {
     /// the object's own cached list is returned as is. Otherwise the list is
     /// built level by level with the usual shadowing rules.
     func forInKeyList(obj: JeffJSValue) -> JeffJSForInKeyList {
+        // `for (k in "abc")` enumerates the index keys of the primitive string
+        // (ES §10.4.3). toObject() on a primitive used to return nil here, so
+        // the loop body never ran.
+        if obj.isString, let s = obj.stringValue {
+            var keys: [JeffJSValue] = []
+            keys.reserveCapacity(s.len)
+            for i in 0 ..< s.len { keys.append(intKeyString(i)) }
+            return JeffJSForInKeyList(keys: keys)
+        }
         guard let root = obj.toObject() else { return JeffJSForInKeyList(keys: []) }   // null / undefined
-        if let rootShape = root.shape, root.arraySnapshot() == nil {
+        // A String wrapper's index keys are not shape properties: it must take
+        // the general path below.
+        if let rootShape = root.shape, root.arraySnapshot() == nil,
+           root.classID != JSClassID.JS_CLASS_STRING.rawValue {
             var protosEmpty = true
             var p = root.proto
             while let cur = p {
@@ -2094,6 +2129,13 @@ extension JeffJSContext {
         while let cur = current {
             intKeys.removeAll(keepingCapacity: true)
             strKeys.removeAll(keepingCapacity: true)
+            // String exotic objects expose their characters as index keys.
+            if cur.classID == JSClassID.JS_CLASS_STRING.rawValue {
+                let pv = cur.primitiveValue
+                if pv.isString, let s = pv.stringValue {
+                    for i in 0 ..< s.len { intKeys.append(UInt32(i)) }
+                }
+            }
             // Fast-array elements are not shape properties: enumerate their
             // indices (present, i.e. not a hole) first.
             if let snap = cur.arraySnapshot() {
@@ -2810,6 +2852,7 @@ private func executeFastTrace(
             pc += 1
 
         case .call, .call0, .call1, .call2, .call3:
+            frame.curPC = pc   // so Error stacks can name this frame's line
             let argc: Int
             let instrSize: Int
             switch op {
@@ -2921,6 +2964,7 @@ private func executeFastTrace(
             }
 
         case .call_method:
+            frame.curPC = pc   // so Error stacks can name this frame's line
             let argc = Int(readU16(bc, pc + 1))
             // Array.prototype.push fast path (mirrors the main loop) so
             // `arr.push(x)` loops stay in the trace.
@@ -3432,11 +3476,13 @@ private func executeFastTrace(
             var element: JeffJSValue? = nil
             if let storage = jsObj._fastArrayValues {
                 if uidx < storage.count, Int(uidx) < storage.values.count {
-                    element = storage.values[Int(uidx)]
+                    let e = storage.values[Int(uidx)]
+                    if !e.isUninitialized { element = e }   // hole: deopt
                 }
             } else if case .array(_, let vals, let count) = jsObj.payload {
                 if uidx < count, Int(uidx) < vals.count {
-                    element = vals[Int(uidx)]
+                    let e = vals[Int(uidx)]
+                    if !e.isUninitialized { element = e }
                 }
             }
             guard let el = element else { resume = pc; break traceLoop } // deopt: OOB/holes — slow path decides
@@ -4705,11 +4751,13 @@ private func executeFastTraceLean(
             var element: JeffJSValue? = nil
             if let storage = jsObj._fastArrayValues {
                 if uidx < storage.count, Int(uidx) < storage.values.count {
-                    element = storage.values[Int(uidx)]
+                    let e = storage.values[Int(uidx)]
+                    if !e.isUninitialized { element = e }   // hole: deopt
                 }
             } else if case .array(_, let vals, let count) = jsObj.payload {
                 if uidx < count, Int(uidx) < vals.count {
-                    element = vals[Int(uidx)]
+                    let e = vals[Int(uidx)]
+                    if !e.isUninitialized { element = e }
                 }
             }
             guard let el = element else { ctx.interruptCounter = interrupt; return pc } // deopt: OOB/holes — slow path decides
@@ -7127,6 +7175,7 @@ struct JeffJSInterpreter {
             // -----------------------------------------------------------------
 
             case .call, .call0, .call1, .call2, .call3:
+                frame.curPC = pc   // so Error stacks can name this frame's line
                 // --- Optimizations applied here ---
                 // (a) For call0/call1/call2/call3: avoid allocating an args array;
                 //     use fixed-size stack reads or empty literal.
@@ -7356,6 +7405,7 @@ struct JeffJSInterpreter {
                 }
 
             case .call_method:
+                frame.curPC = pc   // so Error stacks can name this frame's line
                 var argc = Int(readU16(bc, pc + 1))
                 // ── Function.prototype.call intrinsic ───────────────────
                 // f.call(thisArg, a, b) becomes a direct call of f with
@@ -7713,6 +7763,7 @@ struct JeffJSInterpreter {
                 continue dispatchLoop
 
             case .call_constructor:
+                frame.curPC = pc   // so Error stacks can name this frame's line
                 ctx.lastGetFieldAtom = 0
                 let argc = Int(readU16(bc, pc + 1))
                 var callArgs = [JeffJSValue](repeating: .undefined, count: argc)
@@ -8209,29 +8260,13 @@ struct JeffJSInterpreter {
                 // actually-following call removes that churn from hot read loops and
                 // balances the reference.
                 let nextIsCall = (pc + 5) < bcLen && isCallOpcodeByte(bc[pc + 5])
-                // Early check: property access on null/undefined with location info
+                // Property access on null/undefined. The location goes in the
+                // error's `stack` (built from the live frame chain), not in the
+                // message — the message must read like every other engine's.
                 if obj.isNullOrUndefined {
+                    frame.curPC = pc
                     let propName = ctx.rt.atomToString(atom) ?? "?"
-                    let compiled = fb as? JeffJSFunctionBytecodeCompiled
-                    let fnameAtom = compiled?.debugFilenameAtom ?? 0
-                    let fname = fnameAtom > 0 ? (ctx.rt.atomToString(fnameAtom) ?? "?") : (fb.fileName?.toSwiftString() ?? "?")
-                    let line = compiled?.lineForPC(pc) ?? fb.lineNum
-                    // Walk the call stack for a full trace
-                    var trace: [String] = ["\(fname):\(line) pc=\(pc)"]
-                    var walkFrame = frame.prevFrame
-                    while let f = walkFrame, trace.count < 8 {
-                        if let fObj = f.curFunc.toObject(),
-                           case .bytecodeFunc(let wfb, _, _) = fObj.payload,
-                           let wf = wfb {
-                            let wCompiled = wf as? JeffJSFunctionBytecodeCompiled
-                            let wFnameAtom = wCompiled?.debugFilenameAtom ?? 0
-                            let wFname = wFnameAtom > 0 ? (ctx.rt.atomToString(wFnameAtom) ?? "?") : (wf.fileName?.toSwiftString() ?? "?")
-                            let wLine = wCompiled?.lineForPC(f.curPC) ?? wf.lineNum
-                            trace.append("\(wFname):\(wLine) pc=\(f.curPC)")
-                        }
-                        walkFrame = f.prevFrame
-                    }
-                    _ = ctx.throwTypeError(message: "Cannot read properties of \(obj.isNull ? "null" : "undefined") (reading '\(propName)') at \(fname):\(line)")
+                    _ = ctx.throwTypeError(message: "Cannot read properties of \(obj.isNull ? "null" : "undefined") (reading '\(propName)')")
                     retVal = .exception; break dispatchLoop
                 }
                 // Inline cache fast path: shape-matched direct property read
@@ -8554,14 +8589,14 @@ struct JeffJSInterpreter {
                         let uidx = UInt32(idx)
                         if let storage = jsObj._fastArrayValues {
                             if uidx < storage.count, Int(uidx) < storage.values.count {
-                                buf[sp] = storage.values[Int(uidx)].dupValue(); sp += 1
+                                buf[sp] = storage.values[Int(uidx)].arrayHoleAsUndefined.dupValue(); sp += 1
                                 obj.freeValue()   // popped receiver
                                 pc += 1
                                 continue dispatchLoop
                             }
                         } else if case .array(_, let vals, let count) = jsObj.payload {
                             if uidx < count, Int(uidx) < vals.count {
-                                buf[sp] = vals[Int(uidx)].dupValue(); sp += 1
+                                buf[sp] = vals[Int(uidx)].arrayHoleAsUndefined.dupValue(); sp += 1
                                 obj.freeValue()
                                 pc += 1
                                 continue dispatchLoop
@@ -8588,13 +8623,13 @@ struct JeffJSInterpreter {
                         let uidx = UInt32(idx)
                         if let storage = jsObj._fastArrayValues {
                             if uidx < storage.count, Int(uidx) < storage.values.count {
-                                buf[sp] = storage.values[Int(uidx)].dupValue(); sp += 1
+                                buf[sp] = storage.values[Int(uidx)].arrayHoleAsUndefined.dupValue(); sp += 1
                                 pc += 1
                                 continue dispatchLoop
                             }
                         } else if case .array(_, let vals, let count) = jsObj.payload {
                             if uidx < count, Int(uidx) < vals.count {
-                                buf[sp] = vals[Int(uidx)].dupValue(); sp += 1
+                                buf[sp] = vals[Int(uidx)].arrayHoleAsUndefined.dupValue(); sp += 1
                                 pc += 1
                                 continue dispatchLoop
                             }

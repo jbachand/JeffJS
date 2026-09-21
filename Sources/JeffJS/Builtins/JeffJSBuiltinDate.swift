@@ -223,20 +223,34 @@ private func timeClip(_ t: Double) -> Double {
     return Darwin.trunc(t) + 0  // +0 converts -0 to +0
 }
 
-/// LocalTZA — local timezone offset in milliseconds.
-/// This is a simplified implementation using Foundation.
+/// The local zone's offset from UTC, in ms, *at the given UTC instant*.
+/// Using `TimeZone.current.secondsFromGMT()` (the offset right now) made every
+/// date on the other side of a DST boundary an hour off: in a US zone
+/// `new Date("Dec 25, 1995 13:30:00")` came out an hour before QuickJS.
+private func localOffsetMs(atUTC t: Double) -> Double {
+    if t.isNaN || t.isInfinite { return 0 }
+    let secs = TimeZone.current.secondsFromGMT(for: Date(timeIntervalSince1970: t / 1000.0))
+    return Double(secs) * msPerSecond
+}
+
+/// LocalTZA — the current local timezone offset in milliseconds
+/// (kept for callers that have no particular instant in hand).
 private func localTZA() -> Double {
     return Double(-TimeZone.current.secondsFromGMT()) * msPerSecond
 }
 
 /// LocalTime(t) — convert UTC to local time.
 private func localTime(_ t: Double) -> Double {
-    return t - localTZA()
+    if t.isNaN { return t }
+    return t + localOffsetMs(atUTC: t)
 }
 
-/// UTC(t) — convert local time to UTC.
+/// UTC(t) — convert local time to UTC. The offset depends on the instant, so
+/// take one refinement step (this is what V8/JSC do).
 private func utcTime(_ t: Double) -> Double {
-    return t + localTZA()
+    if t.isNaN { return t }
+    let firstGuess = t - localOffsetMs(atUTC: t)
+    return t - localOffsetMs(atUTC: firstGuess)
 }
 
 // MARK: - Date Object Data
@@ -385,32 +399,248 @@ private func parseISODate(_ str: String) -> Double {
 
 /// Parse a date string. Tries ISO 8601 first, then falls back to
 /// a simplified "natural" parser for common formats.
-private func jsDateParse(_ str: String) -> Double {
-    // Try ISO 8601 first.
-    let isoResult = parseISODate(str)
-    if !isoResult.isNaN { return isoResult }
+// MARK: - Legacy ("natural") date parser
+//
+// Port of the fallback branch of QuickJS `js_Date_parse` (string_get_digits /
+// string_get_month / string_get_tzoffset).  Foundation's DateFormatter could
+// not be coaxed into the shapes browsers accept — `new Date("09/20/2026")`,
+// `new Date("Sep 20 2026")` and `new Date("September 20, 2026 10:00:00")` all
+// came back Invalid Date, and `new Date("2026-09-20 10:00")` landed on the
+// wrong hour — so the formats are parsed directly here.
+//
+// Accepted shapes (all case-insensitive, extra spaces/commas ignored):
+//   [Day,] Mon DD YYYY [HH:MM[:SS[.mmm]]] [AM|PM] [GMT|UTC|UT|Z][±HH[:]MM]
+//   [Day,] DD Mon YYYY ...                       (RFC 2822)
+//   MM/DD/YYYY [time...]                         (US slash form)
+//   YYYY/MM/DD [time...]
+//   YYYY-MM-DD HH:MM[...]                        (ISO with a space)
+// A trailing parenthesised zone name is ignored, as are unknown words.
 
-    // Fallback: try Foundation's date parsing for common formats.
-    let formatter = DateFormatter()
-    formatter.locale = Locale(identifier: "en_US_POSIX")
+private let jeffJS_monthNames = ["jan", "feb", "mar", "apr", "may", "jun",
+                                 "jul", "aug", "sep", "oct", "nov", "dec"]
+private let jeffJS_dayNames = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]
+/// Obsolete but still-seen US zone abbreviations -> offset in minutes.
+private let jeffJS_tzAbbrevs: [String: Int] = [
+    "gmt": 0, "utc": 0, "ut": 0, "z": 0,
+    "est": -300, "edt": -240, "cst": -360, "cdt": -300,
+    "mst": -420, "mdt": -360, "pst": -480, "pdt": -420,
+]
 
-    let formats = [
-        "EEE, dd MMM yyyy HH:mm:ss zzz",     // RFC 2822
-        "EEE MMM dd yyyy HH:mm:ss 'GMT'Z",    // toString() output
-        "MMM dd, yyyy HH:mm:ss",               // US style
-        "MMM dd yyyy",                          // Short US
-        "yyyy/MM/dd HH:mm:ss",                 // Slash-separated
-        "yyyy/MM/dd",
-    ]
+/// The "natural" (non-ISO) date parser. Returns NaN when nothing matched.
+private func jsDateParseLegacy(_ chars: [UInt8]) -> Double {
+    let len = chars.count
+    var pos = 0
 
-    for fmt in formats {
-        formatter.dateFormat = fmt
-        if let date = formatter.date(from: str) {
-            return date.timeIntervalSince1970 * 1000.0
+    @inline(__always) func isDigit(_ c: UInt8) -> Bool { c >= 0x30 && c <= 0x39 }
+    @inline(__always) func isAlpha(_ c: UInt8) -> Bool {
+        (c | 0x20) >= 0x61 && (c | 0x20) <= 0x7A
+    }
+    /// Skip spaces, commas and any parenthesised comment (a trailing
+    /// "(Eastern Daylight Time)" must not abort the parse).
+    func skipSeparators() {
+        while pos < len {
+            let c = chars[pos]
+            if c == 0x20 || c == 0x09 || c == 0x2C { pos += 1; continue }
+            if c == 0x28 {   // '('
+                var depth = 0
+                while pos < len {
+                    if chars[pos] == 0x28 { depth += 1 }
+                    else if chars[pos] == 0x29 { depth -= 1; pos += 1; if depth == 0 { break }; continue }
+                    pos += 1
+                }
+                continue
+            }
+            break
         }
     }
+    /// Read a run of digits (at most `maxDigits`), returning its value and length.
+    func readDigits(max maxDigits: Int = 9) -> (value: Int, digits: Int)? {
+        var v = 0, n = 0
+        while pos < len, isDigit(chars[pos]), n < maxDigits {
+            v = v * 10 + Int(chars[pos] - 0x30); pos += 1; n += 1
+        }
+        return n == 0 ? nil : (v, n)
+    }
+    func readWord() -> String? {
+        var out = ""
+        while pos < len, isAlpha(chars[pos]) {
+            out.append(Character(UnicodeScalar(chars[pos] | 0x20))); pos += 1
+        }
+        return out.isEmpty ? nil : out
+    }
 
-    return Double.nan
+    var year: Int? = nil
+    var month: Int? = nil          // 0-based
+    var day: Int? = nil
+    var hour = 0, minute = 0, second = 0, ms = 0
+    var tzOffsetMinutes: Int? = nil   // nil == local time
+    var pm: Bool? = nil
+    var sawTime = false
+    var negYear = false
+
+    while true {
+        skipSeparators()
+        if pos >= len { break }
+        let c = chars[pos]
+
+        if c == 0x2B || c == 0x2D {   // '+' / '-'
+            // Either a timezone offset (after a time) or a negative year.
+            let sign = (c == 0x2D) ? -1 : 1
+            pos += 1
+            guard let d = readDigits(max: 4) else { return Double.nan }
+            if sawTime || tzOffsetMinutes != nil || d.digits <= 4 && year != nil && sawTime {
+                // fall through to offset handling below
+            }
+            if sawTime {
+                var offMin: Int
+                if d.digits <= 2 {
+                    offMin = d.value * 60
+                    if pos < len, chars[pos] == 0x3A {   // ':'
+                        pos += 1
+                        if let m = readDigits(max: 2) { offMin += m.value }
+                    } else if let m = readDigits(max: 2) {
+                        offMin += m.value
+                    }
+                } else {
+                    offMin = (d.value / 100) * 60 + (d.value % 100)
+                }
+                tzOffsetMinutes = sign * offMin
+            } else {
+                year = d.value
+                negYear = sign < 0
+            }
+            continue
+        }
+
+        if isDigit(c) {
+            guard let first = readDigits() else { return Double.nan }
+            if pos < len, chars[pos] == 0x3A {   // "HH:MM..."
+                sawTime = true
+                hour = first.value
+                pos += 1
+                if let m = readDigits(max: 2) { minute = m.value }
+                if pos < len, chars[pos] == 0x3A {
+                    pos += 1
+                    if let sec = readDigits(max: 2) { second = sec.value }
+                    if pos < len, chars[pos] == 0x2E {   // '.' fractional seconds
+                        pos += 1
+                        if let f = readDigits(max: 3) {
+                            var v = f.value
+                            for _ in f.digits..<3 { v *= 10 }
+                            ms = v
+                        }
+                        while pos < len, isDigit(chars[pos]) { pos += 1 }
+                    }
+                }
+                continue
+            }
+            if pos < len, chars[pos] == 0x2F {   // '/' -> MM/DD/YYYY or YYYY/MM/DD
+                pos += 1
+                guard let second2 = readDigits() else { return Double.nan }
+                var third: Int? = nil
+                if pos < len, chars[pos] == 0x2F {
+                    pos += 1
+                    third = readDigits()?.value
+                }
+                if first.digits >= 3 {           // YYYY/MM/DD
+                    year = first.value; month = second2.value - 1; day = third ?? 1
+                } else {                          // MM/DD/YYYY
+                    month = first.value - 1; day = second2.value; year = third
+                }
+                continue
+            }
+            if pos < len, chars[pos] == 0x2D, first.digits >= 3 {   // "YYYY-MM-DD"
+                pos += 1
+                let m = readDigits(max: 2)
+                var d3: Int? = nil
+                if pos < len, chars[pos] == 0x2D {
+                    pos += 1
+                    d3 = readDigits(max: 2)?.value
+                }
+                year = first.value; month = (m?.value ?? 1) - 1; day = d3 ?? 1
+                continue
+            }
+            // A bare number: 3+ digits (or a value that cannot be a day) is the
+            // year; otherwise the first one is the day.
+            if first.digits >= 3 || (day != nil && year == nil) || first.value > 31 {
+                year = first.value
+            } else if day == nil {
+                day = first.value
+            } else if year == nil {
+                year = first.value
+            }
+            continue
+        }
+
+        if isAlpha(c) {
+            guard let word = readWord() else { break }
+            let head = String(word.prefix(3))
+            if let mi = jeffJS_monthNames.firstIndex(of: head), word.count >= 3,
+               // "march"/"may" etc. are months; "mon" is a day name.
+               !(jeffJS_dayNames.contains(word) && word.count == 3 && month != nil) {
+                month = mi
+                continue
+            }
+            if jeffJS_dayNames.contains(head) { continue }   // day-of-week: ignored
+            if word == "am" { pm = false; continue }
+            if word == "pm" { pm = true; continue }
+            if let off = jeffJS_tzAbbrevs[word] {
+                tzOffsetMinutes = off
+                sawTime = true   // so a following ±HHMM is read as an offset
+                continue
+            }
+            continue   // unknown word: ignore (e.g. "Pacific", "Daylight")
+        }
+
+        // Anything else is a separator we do not care about.
+        pos += 1
+    }
+
+    guard var y = year, let mo = month, let d = day else { return Double.nan }
+    if negYear { y = -y }
+    // Two-digit years: 0-49 -> 2000s, 50-99 -> 1900s (browser behaviour).
+    if year! >= 0 && year! < 100 && !negYear {
+        y = year! < 50 ? 2000 + year! : 1900 + year!
+    }
+    if let isPM = pm {
+        if isPM { if hour < 12 { hour += 12 } } else if hour == 12 { hour = 0 }
+    }
+    if mo < 0 || mo > 11 || d < 1 || d > 31 || hour > 24 || minute > 59 || second > 59 {
+        return Double.nan
+    }
+
+    let dayVal = makeDay(Double(y), Double(mo), Double(d))
+    let timeVal = makeTime(Double(hour), Double(minute), Double(second), Double(ms))
+    var t = makeDate(dayVal, timeVal)
+    if let off = tzOffsetMinutes {
+        t -= Double(off) * msPerMinute
+    } else {
+        t = utcTime(t)     // no zone given: the string names a local time
+    }
+    return timeClip(t)
+}
+
+private func jsDateParse(_ str: String) -> Double {
+    var chars = Array(str.utf8)
+    // "2026-09-20 10:00" — an ISO date with a space instead of 'T'. Browsers
+    // and QuickJS accept it and read it as a local time. This has to be
+    // rewritten *before* the plain ISO attempt: parseISODate stops at the
+    // space and would silently return UTC midnight, dropping the time.
+    if chars.count > 10, chars[10] == 0x20,
+       chars[0...3].allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }),
+       chars[4] == 0x2D, chars[7] == 0x2D {
+        chars[10] = 0x54   // 'T'
+    }
+
+    // parseISODate is lenient about what follows the year, so "2020/03/05"
+    // would come back as the ISO year 2020. A '/' or a space never appears in
+    // an ISO 8601 date: send those straight to the legacy parser.
+    if !chars.contains(0x2F) && !chars.contains(0x20) {
+        let isoResult = parseISODate(String(decoding: chars, as: UTF8.self))
+        if !isoResult.isNaN { return isoResult }
+    }
+
+    return jsDateParseLegacy(chars)
 }
 
 // MARK: - Date Constructor
