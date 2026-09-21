@@ -4578,25 +4578,31 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                           frames: [(fb: JeffJSFunctionBytecode, pc: Int)]) -> String {
         var lines: [String] = [message.isEmpty ? errorName : "\(errorName): \(message)"]
         for (fbBase, rawPC) in frames {
-            guard let fb = fbBase as? JeffJSFunctionBytecodeCompiled else { continue }
-            let pc = fb.bytecodeLen > 0 ? max(0, min(rawPC, fb.bytecodeLen - 1)) : 0
-            var lineNum = fb.debugPc2lineBuf.isEmpty ? 0 : fb.lineForPC(pc)
-            var colNum = fb.debugPc2colBuf.isEmpty ? 0 : fb.colForPC(pc)
-            if lineNum <= 0 { lineNum = fb.lineNum }
-            if colNum <= 0 { colNum = fb.colNum }
+            // A bytecode-cache hit hands back a plain JeffJSFunctionBytecode:
+            // no pc2line/pc2col tables, but the function's own line, column,
+            // file and name atom survive the round trip, so the frame is
+            // still worth printing (skipping it left `stack` as a bare
+            // header whenever the cache was warm).
+            let fbc = fbBase as? JeffJSFunctionBytecodeCompiled
+            let pc = fbBase.bytecodeLen > 0 ? max(0, min(rawPC, fbBase.bytecodeLen - 1)) : 0
+            var lineNum = (fbc?.debugPc2lineBuf.isEmpty ?? true) ? 0 : fbc!.lineForPC(pc)
+            var colNum = (fbc?.debugPc2colBuf.isEmpty ?? true) ? 0 : fbc!.colForPC(pc)
+            if lineNum <= 0 { lineNum = fbBase.lineNum }
+            if colNum <= 0 { colNum = fbBase.colNum }
             let filename: String
-            if let c = fb.cachedDebugFilename { filename = c }
+            if let c = fbc?.cachedDebugFilename { filename = c }
             else {
-                filename = fb.debugFilenameAtom != 0
-                    ? (rt.atomToString(fb.debugFilenameAtom) ?? "<unknown>")
-                    : (fb.fileName?.toSwiftString() ?? "<anonymous>")
-                fb.cachedDebugFilename = filename
+                filename = (fbc?.debugFilenameAtom ?? 0) != 0
+                    ? (rt.atomToString(fbc!.debugFilenameAtom) ?? "<unknown>")
+                    : (fbBase.fileName?.toSwiftString() ?? "<anonymous>")
+                fbc?.cachedDebugFilename = filename
             }
             let funcName: String
-            if let c = fb.cachedFuncName { funcName = c }
+            if let c = fbc?.cachedFuncName { funcName = c }
             else {
-                funcName = fb.funcNameAtom != 0 ? (rt.atomToString(fb.funcNameAtom) ?? "") : ""
-                fb.cachedFuncName = funcName
+                let nameAtom = (fbc?.funcNameAtom ?? 0) != 0 ? fbc!.funcNameAtom : fbBase.nameAtom
+                funcName = nameAtom != 0 ? (rt.atomToString(nameAtom) ?? "") : ""
+                fbc?.cachedFuncName = funcName
             }
             let location: String
             if lineNum > 0 && colNum > 0 { location = "\(filename):\(lineNum):\(colNum)" }
