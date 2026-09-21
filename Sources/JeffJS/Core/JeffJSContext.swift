@@ -1089,6 +1089,43 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// - Returns: True on success, false on error or non-configurable.
     func deleteProperty(obj: JeffJSValue, atom: UInt32, flags: Int = 0) -> Bool {
         guard let jsObj = obj.toObject() else { return false }
+
+        // Proxy intercept: dispatch to handler.deleteProperty, matching the
+        // `has`/`get`/`set` traps. Without this `delete proxy.x` silently hit
+        // the (empty) proxy object itself — `delete element.dataset.foo` never
+        // removed the backing data-* attribute.
+        if jsObj.classID == JeffJSClassID.proxy.rawValue || jsObj.classID == JSClassID.JS_CLASS_PROXY.rawValue {
+            if case .proxyData(let pd) = jsObj.payload {
+                if pd.isRevoked {
+                    _ = throwTypeError(message: "Cannot perform 'deleteProperty' on a proxy that has been revoked")
+                    return false
+                }
+                let trapAtom = rt.findAtom("deleteProperty")
+                let trap = getPropertyInternal(obj: pd.handler, atom: trapAtom, receiver: pd.handler)
+                rt.freeAtom(trapAtom)
+                if trap.isObject, let trapObj = trap.toObject(), trapObj.isCallable {
+                    let propName: JeffJSValue
+                    if let name = rt.atomToString(atom) {
+                        propName = newStringValue(name)
+                    } else {
+                        propName = .JS_UNDEFINED
+                    }
+                    let result = callFunction(trap, thisVal: pd.handler, args: [pd.target, propName])
+                    let ok = result.toBool()
+                    result.freeValue()
+                    propName.freeValue()
+                    trap.freeValue()
+                    if !ok && (flags & JS_PROP_THROW) != 0 {
+                        _ = throwTypeError(message: "'deleteProperty' on proxy: trap returned falsish")
+                    }
+                    return ok
+                }
+                trap.freeValue()
+                // No trap: forward to the target.
+                return deleteProperty(obj: pd.target, atom: atom, flags: flags)
+            }
+        }
+
         guard let shape = jsObj.shape else { return true }
 
         // Use hash-based lookup first, fall back to linear scan
