@@ -316,8 +316,30 @@ private func gcDecref(_ rt: JeffJSRuntime) {
 /// Decrements the child's refcount (trial deletion).
 /// Guard against objects already at zero (freed via freeValue but still in GC list).
 func gcDecrefChild(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
+    guard isGCTracked(header) else { return }
     guard header.refCount > 0 else { return }
     header.refCount -= 1
+}
+
+/// True when `header` takes part in trial deletion, i.e. it is on one of the
+/// runtime's GC lists (see `gcListIndex`).
+///
+/// Only shapes are ever added to `rt.gcObjects` (`addGCObject` has exactly two
+/// call sites, both in JeffJSShape.swift); JSObjects, function bytecodes and
+/// var-refs are plain refcounted values. Trial deletion must therefore stay
+/// inside the tracked sub-graph: an edge to an *untracked* node is not a
+/// counted reference in this port — `freeShape` explicitly does NOT release
+/// `shape.proto` ("ARC strong ref, not a NaN-boxed value"), and neither does
+/// `obj.proto` — so decrementing it here removes a reference nobody added.
+/// The scan phase could not put it back either, because an untracked node is
+/// never a scan root, so a prototype whose only remaining shapes were
+/// zero-owner cached shapes lost one refcount per GC and was then freed by the
+/// next dup/free pair (RegExp.prototype losing all 15 of its properties after
+/// a single chained `RegExp.prototype.x` read). The Metal collector already
+/// works this way: it only records children it can map to a tracked index.
+@inline(__always)
+func isGCTracked(_ header: JeffJSGCObjectHeader) -> Bool {
+    return header.gcListIndex != -1
 }
 
 // MARK: - Phase 2: Scan / rescue (gcScan)
@@ -340,6 +362,9 @@ private func gcScan(_ rt: JeffJSRuntime) {
 /// Recursively rescue a child: restore its refcount and, if this is the
 /// first rescue (mark transitions white -> black), recurse into its children.
 func gcScanIncrefChild(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
+    // Symmetric with gcDecrefChild: untracked nodes were never decremented,
+    // so restoring them here would inflate their refcount (a leak) instead.
+    guard isGCTracked(header) else { return }
     header.refCount += 1
     if header.mark == JeffJSGCMark.white {
         header.mark = JeffJSGCMark.black

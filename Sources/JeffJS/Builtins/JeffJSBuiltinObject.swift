@@ -57,7 +57,13 @@ extension JeffJSContext {
     func getPrototypeOf(_ val: JeffJSValue) -> JeffJSValue {
         guard let obj = val.toObject() else { return .null }
         if let proto = obj.proto {
-            return JeffJSValue.makeObject(proto)
+            // Owned result (Round 9: anything returned is dup'd). `obj.proto`
+            // is a borrow, so returning it unduped let the caller's freeValue
+            // release a reference nobody took — `Object.getPrototypeOf(/x/)`
+            // as a discarded expression used to strip RegExp.prototype.
+            // Recycled + dup, not makeObject: makeObject adds a second Swift
+            // retain that the single release in freeGCObject never balances.
+            return JeffJSValue.makeObjectRecycled(proto).dupValue()
         }
         return .null
     }
@@ -1249,7 +1255,8 @@ struct JeffJSBuiltinObject {
             if proto === thisObj {
                 return .JS_TRUE
             }
-            current = JeffJSValue.makeObject(proto)
+            // Borrowed walk pointer, never freed: no Swift retain either.
+            current = JeffJSValue.makeObjectRecycled(proto)
         }
     }
 
