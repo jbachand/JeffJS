@@ -467,6 +467,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             // namespace object (needs all intrinsics to exist first).
             addIntrinsicToStringTags()
 
+            // Phase 7: builtin methods and statics are never enumerable.
+            addIntrinsicNonEnumerableBuiltins()
+
             intrinsicsAdded = true
             rt.initComplete = true
         }

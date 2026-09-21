@@ -10592,6 +10592,43 @@ extension JeffJSTestRunner {
         evalCheckStr(ctx, "var r = ''; for (var k in new String('ab')) r += k; r", expect: "01")
         evalCheckStr(ctx, "var r = ''; for (var k in '') r += k; r", expect: "")
         evalCheckStr(ctx, "Object.getOwnPropertyNames(new String('ab')).join()", expect: "0,1,length")
+
+        // --- 7. Builtin and class members are non-enumerable ---------------
+        evalCheckBool(ctx, "Object.keys(class { m() {} }.prototype).length === 0", expect: true)
+        evalCheckBool(ctx, """
+            class K { m() {} get g() { return 1; } set g(v) {} static s() {} }
+            Object.keys(K.prototype).length === 0 && Object.keys(K).length === 0 &&
+            typeof K.prototype.m === 'function' && typeof K.s === 'function'
+        """, expect: true)
+        // Object-literal members stay enumerable.
+        evalCheckStr(ctx, "Object.keys({ m() {}, get g() { return 1; }, p: 1 }).join()", expect: "m,g,p")
+        // Class prototype/constructor attributes (ES §15.7.14).
+        evalCheckBool(ctx, """
+            class K2 {}
+            var dp = Object.getOwnPropertyDescriptor(K2, 'prototype');
+            var dc = Object.getOwnPropertyDescriptor(K2.prototype, 'constructor');
+            dp.writable === false && dp.enumerable === false && dp.configurable === false &&
+            dc.writable === true && dc.enumerable === false && dc.configurable === true
+        """, expect: true)
+        // Builtin methods and statics.
+        evalCheckBool(ctx, """
+            Object.keys(Function.prototype).length === 0 &&
+            Object.keys(Object.prototype).length === 0 &&
+            Object.keys(Array.prototype).length === 0 &&
+            Object.keys(RegExp.prototype).length === 0 &&
+            Object.keys(Error.prototype).length === 0 &&
+            Object.keys(Map.prototype).length === 0 &&
+            Object.keys(Promise.prototype).length === 0 &&
+            Object.keys(Math).length === 0 && Object.keys(JSON).length === 0 &&
+            typeof Function.prototype.call === 'function' && typeof Math.max === 'function'
+        """, expect: true)
+        // A plain function's lazy prototype pair keeps the right attributes.
+        evalCheckBool(ctx, """
+            function Fx() {}
+            var d = Object.getOwnPropertyDescriptor(Fx.prototype, 'constructor');
+            d.enumerable === false && d.writable === true && d.configurable === true &&
+            Object.keys(Fx.prototype).length === 0
+        """, expect: true)
     }
 
     mutating func runAPITests() -> String {

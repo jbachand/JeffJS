@@ -1406,9 +1406,14 @@ enum SpecialObjectType: UInt8 {
 /// Matches QuickJS JS_PROP_* method definition flags.
 enum DefineMethodFlags: UInt8 {
     case method         = 0    // regular method
-    case getter         = 1    // getter
-    case setter         = 2    // setter
-    case enumerable     = 4    // enumerable property
+    case getter         = 2    // getter
+    case setter         = 4    // setter
+    /// Object-literal methods are enumerable; class bodies' are not
+    /// (ES §15.7.11). The emitters set this bit only for object literals.
+    case enumerable     = 8
+    /// `C.prototype`: non-writable, non-enumerable, non-configurable
+    /// (ES §15.7.14). Only the class wiring uses this.
+    case classPrototype = 16
 }
 
 // MARK: - Define Class Flags

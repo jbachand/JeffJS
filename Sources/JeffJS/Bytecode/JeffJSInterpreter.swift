@@ -803,8 +803,16 @@ extension JeffJSContext {
         let funcVal = JeffJSValue.mkPtr(tag: .object, ptr: funcObj)
         defer { funcVal.freeValue() }
         let protoObj = newObject()
-        _ = setPropertyStr(obj: protoObj, name: "constructor", value: funcVal.dupValue())
-        _ = setPropertyStr(obj: funcVal, name: "prototype", value: protoObj)
+        // F.prototype.constructor: writable + configurable, NOT enumerable.
+        _ = definePropertyValue(obj: protoObj,
+                                atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
+                                value: funcVal,
+                                flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+        // F.prototype: writable, non-enumerable, non-configurable.
+        _ = definePropertyValue(obj: funcVal,
+                                atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
+                                value: protoObj, flags: JS_PROP_WRITABLE)
+        protoObj.freeValue()
     }
 
     // MARK: - Atom Helpers
@@ -1483,17 +1491,17 @@ extension JeffJSContext {
         guard atom != 0 else { return }
         let nameValue = atomToString(atom)
         if nameValue.isUndefined { return }
-        _ = setProperty(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
-                        value: nameValue)
+        // Function "name": non-writable, non-enumerable, configurable.
+        _ = definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
+                                value: nameValue, flags: JS_PROP_CONFIGURABLE)
     }
 
     /// Sets the .name property on a function from a computed key.
     func setFunctionNameComputed(_ funcVal: JeffJSValue, key: JeffJSValue) {
         if key.isString, let str = key.stringValue {
-            let nameAtom = rt.findAtom("name")
-            _ = setProperty(obj: funcVal, atom: nameAtom, value: newString(str.toSwiftString()))
-            rt.freeAtom(nameAtom)
-            // Don't free nameAtom — setProperty stores it in the shape.
+            _ = definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
+                                    value: newString(str.toSwiftString()),
+                                    flags: JS_PROP_CONFIGURABLE)
         }
     }
 
@@ -1609,20 +1617,34 @@ extension JeffJSContext {
         return true
     }
 
+    /// Property flags for a define_method operand: always
+    /// writable+configurable, enumerable only when bit 3 is set.
+    @inline(__always)
+    private func jeffJS_methodPropFlags(_ flags: Int) -> Int {
+        if (flags & Int(DefineMethodFlags.classPrototype.rawValue)) != 0 { return 0 }
+        let base = JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE
+        return (flags & Int(DefineMethodFlags.enumerable.rawValue)) != 0
+            ? (base | JS_PROP_ENUMERABLE) : base
+    }
+
     /// Defines a method on an object.
-    /// Flags: 0 = normal method, 2 = getter, 4 = setter.
+    /// Flags: 0 = normal method, 2 = getter, 4 = setter, 8 = enumerable.
+    /// Class-body methods, getters and setters are NOT enumerable
+    /// (ES §15.7.11) — `Object.keys(class { m() {} }.prototype)` must be
+    /// empty. Only object-literal members set bit 3.
     func defineMethod(obj: JeffJSValue, atom: UInt32, funcVal: JeffJSValue,
                       flags: Int) -> Bool {
         let isGetter = (flags & 2) != 0
         let isSetter = (flags & 4) != 0
+        let propFlags = jeffJS_methodPropFlags(flags)
         if isGetter || isSetter {
             return defineProperty(obj: obj, atom: atom, value: .JS_UNDEFINED,
                                   getter: isGetter ? funcVal : .JS_UNDEFINED,
                                   setter: isSetter ? funcVal : .JS_UNDEFINED,
-                                  flags: JS_PROP_C_W_E | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
+                                  flags: propFlags | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
         }
         return definePropertyValue(obj: obj, atom: atom, value: funcVal,
-                                   flags: JS_PROP_C_W_E) >= 0
+                                   flags: propFlags) >= 0
     }
 
     /// Defines a method with a computed key.
@@ -1631,6 +1653,7 @@ extension JeffJSContext {
                               flags: Int) -> Bool {
         let isGetter = (flags & 2) != 0
         let isSetter = (flags & 4) != 0
+        let propFlags = jeffJS_methodPropFlags(flags)
         if key.isString, let str = key.stringValue {
             let atom = rt.findAtom(str.toSwiftString())
             let result: Bool
@@ -1638,10 +1661,10 @@ extension JeffJSContext {
                 result = defineProperty(obj: obj, atom: atom, value: .JS_UNDEFINED,
                                         getter: isGetter ? funcVal : .JS_UNDEFINED,
                                         setter: isSetter ? funcVal : .JS_UNDEFINED,
-                                        flags: JS_PROP_C_W_E | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
+                                        flags: propFlags | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
             } else {
                 result = definePropertyValue(obj: obj, atom: atom, value: funcVal,
-                                              flags: JS_PROP_C_W_E) >= 0
+                                              flags: propFlags) >= 0
             }
             // Don't free atom — defineProperty/definePropertyValue stores it in the shape.
             return result
@@ -1653,10 +1676,10 @@ extension JeffJSContext {
                 result = defineProperty(obj: obj, atom: atom, value: .JS_UNDEFINED,
                                         getter: isGetter ? funcVal : .JS_UNDEFINED,
                                         setter: isSetter ? funcVal : .JS_UNDEFINED,
-                                        flags: JS_PROP_C_W_E | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
+                                        flags: propFlags | JS_PROP_GETSET | (isGetter ? JS_PROP_HAS_GET : 0) | (isSetter ? JS_PROP_HAS_SET : 0)) >= 0
             } else {
                 result = definePropertyValue(obj: obj, atom: atom, value: funcVal,
-                                              flags: JS_PROP_C_W_E) >= 0
+                                              flags: propFlags) >= 0
             }
             // Don't free atom — defineProperty/definePropertyValue stores it in the shape.
             return result
@@ -1687,12 +1710,13 @@ extension JeffJSContext {
             }
         }
 
-        // Set constructor.prototype = proto
-        _ = setProperty(obj: ctor, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
-                        value: proto.dupValue())
-        // Set proto.constructor = ctor
-        _ = setProperty(obj: proto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
-                        value: ctor.dupValue())
+        // C.prototype: non-writable, non-enumerable, non-configurable (ES §15.7.14).
+        _ = definePropertyValue(obj: ctor, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
+                                value: proto.dupValue(), flags: 0)
+        // C.prototype.constructor: writable + configurable, NOT enumerable.
+        _ = definePropertyValue(obj: proto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
+                                value: ctor.dupValue(),
+                                flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
         // Set the constructor's name
         if atom != 0 {
             setFunctionName(ctor, atom: atom)

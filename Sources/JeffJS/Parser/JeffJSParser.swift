@@ -3328,14 +3328,25 @@ final class JeffJSParser {
         // Stack (extends): ..., superclass, ctorFunc, proto
         // Stack (base):    ..., ctorFunc, proto
 
-        // Wire up ctorFunc.prototype = proto
+        // Wire up ctorFunc.prototype = proto.  `put_field` would make it a
+        // plain writable/enumerable/configurable property; the spec wants
+        // { writable: false, enumerable: false, configurable: false }
+        // (ES §15.7.14), so define_method carries the attributes instead.
+        // define_method is `obj func -> obj`, so the receiver must sit below.
         emitOp(.dup2)                                // ..., [sc,] ctorFunc, proto, ctorFunc, proto
-        emitPutField(getAtom("prototype"))           // ..., [sc,] ctorFunc, proto   (ctorFunc.prototype = proto)
+        emitOp(.define_method)                       // obj=ctorFunc, func=proto -> ctorFunc
+        emitAtom(getAtom("prototype"))
+        emitU8(DefineMethodFlags.classPrototype.rawValue)
+        emitOp(.drop)                                // ..., [sc,] ctorFunc, proto
 
         // Wire up proto.constructor = ctorFunc
+        // { writable: true, enumerable: false, configurable: true }.
         emitOp(.dup2)                                // ..., [sc,] ctorFunc, proto, ctorFunc, proto
         emitOp(.swap)                                // ..., [sc,] ctorFunc, proto, proto, ctorFunc
-        emitPutField(getAtom("constructor"))         // ..., [sc,] ctorFunc, proto   (proto.constructor = ctorFunc)
+        emitOp(.define_method)                       // obj=proto, func=ctorFunc -> proto
+        emitAtom(getAtom("constructor"))
+        emitU8(DefineMethodFlags.method.rawValue)
+        emitOp(.drop)                                // ..., [sc,] ctorFunc, proto
 
         // Set the constructor's name
         if className != 0 {
@@ -6000,8 +6011,11 @@ final class JeffJSParser {
                 emitOp(.define_method)
                 emitAtom(propAtom)
             }
+            // Object-literal methods/accessors are enumerable (bit 3);
+            // class-body ones are not.
             let flags: UInt8 = (propKind == .getter ? 2 : 0) |
-                               (propKind == .setter ? 4 : 0)
+                               (propKind == .setter ? 4 : 0) |
+                               DefineMethodFlags.enumerable.rawValue
             emitU8(flags)
         } else if propKind == .getter || propKind == .setter {
             // Getter/setter
@@ -6026,8 +6040,11 @@ final class JeffJSParser {
                 emitOp(.define_method)
                 emitAtom(propAtom)
             }
+            // Object-literal methods/accessors are enumerable (bit 3);
+            // class-body ones are not.
             let flags: UInt8 = (propKind == .getter ? 2 : 0) |
-                               (propKind == .setter ? 4 : 0)
+                               (propKind == .setter ? 4 : 0) |
+                               DefineMethodFlags.enumerable.rawValue
             emitU8(flags)
         } else if !isComputed && propAtom != 0 {
             // Shorthand: { x } or { x = default }

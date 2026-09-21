@@ -128,3 +128,59 @@ extension JeffJSContext {
         }
     }
 }
+
+// MARK: - Builtin property attributes
+
+extension JeffJSContext {
+
+    /// Clear the `enumerable` bit on every own property of `obj`.
+    /// Builtin methods and constructor statics are never enumerable
+    /// (ES §17): `Object.keys(Function.prototype)` must be empty.
+    private func makeOwnPropsNonEnumerable(_ obj: JeffJSValue) {
+        guard obj.isObject, let jsObj = obj.toObject(), let shape = jsObj.shape else { return }
+        for i in 0 ..< shape.prop.count where shape.prop[i].atom != 0 {
+            if shape.prop[i].flags.contains(.enumerable) {
+                shape.prop[i].flags.remove(.enumerable)
+            }
+        }
+        shape.enumKeyCache = nil
+    }
+
+    /// Strip `enumerable` from every builtin prototype, its constructor, and
+    /// the namespace objects. JeffJS registers builtin methods through
+    /// `setPropertyStr`, which creates writable/enumerable/configurable
+    /// properties, so `Object.keys(Function.prototype)` listed
+    /// call/apply/bind/toString and a `for (k in re)` walked every RegExp
+    /// method (this is what made the Prism-style deep clone copy them).
+    func addIntrinsicNonEnumerableBuiltins() {
+        var seen = Set<ObjectIdentifier>()
+        func sweep(_ v: JeffJSValue) {
+            guard v.isObject, let o = v.toObject(), seen.insert(ObjectIdentifier(o)).inserted
+            else { return }
+            makeOwnPropsNonEnumerable(v)
+        }
+
+        for proto in classProto where proto.isObject {
+            sweep(proto)
+            // ...and the constructor it points back to.
+            let ctor = getProperty(obj: proto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue)
+            if ctor.isObject { sweep(ctor) }
+            ctor.freeValue()
+        }
+
+        for name in ["Math", "JSON", "Reflect", "Atomics", "Intl",
+                     "Object", "Function", "Array", "String", "Number", "Boolean",
+                     "Symbol", "BigInt", "Date", "RegExp", "Error", "Map", "Set",
+                     "WeakMap", "WeakSet", "Promise", "Proxy", "ArrayBuffer",
+                     "SharedArrayBuffer", "DataView", "WeakRef", "FinalizationRegistry"] {
+            let v = getPropertyStr(obj: globalObj, name: name)
+            if v.isObject {
+                sweep(v)
+                let proto = getProperty(obj: v, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue)
+                if proto.isObject { sweep(proto) }
+                proto.freeValue()
+            }
+            v.freeValue()
+        }
+    }
+}
