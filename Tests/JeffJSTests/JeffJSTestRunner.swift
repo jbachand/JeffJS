@@ -10531,6 +10531,41 @@ extension JeffJSTestRunner {
         // $<name> mixes with the numeric and $& forms.
         evalCheckStr(ctx, "'2026-09'.replace(/(?<y>\\d+)-(?<m>\\d+)/, '$1|$2|$&|$<y>')",
                      expect: "2026|09|2026-09|2026")
+
+        // --- 3. Legacy ("natural") Date parsing ----------------------------
+        // Foundation's DateFormatter list rejected all of these.
+        evalCheckStr(ctx, """
+            var d = new Date('09/20/2026');
+            [d.getFullYear(), d.getMonth(), d.getDate(), d.getHours()].join()
+        """, expect: "2026,8,20,0")
+        evalCheckStr(ctx, """
+            var d = new Date('Sep 20 2026');
+            [d.getFullYear(), d.getMonth(), d.getDate()].join()
+        """, expect: "2026,8,20")
+        evalCheckStr(ctx, """
+            var d = new Date('September 20, 2026 10:00:00');
+            [d.getFullYear(), d.getMonth(), d.getDate(), d.getHours(), d.getMinutes()].join()
+        """, expect: "2026,8,20,10,0")
+        evalCheckStr(ctx, """
+            var d = new Date('2026-09-20 10:00');
+            [d.getFullYear(), d.getMonth(), d.getDate(), d.getHours()].join()
+        """, expect: "2026,8,20,10")
+        // An explicit zone wins over local time.
+        evalCheckBool(ctx, "new Date('Sat Sep 20 2026 10:00:00 GMT-0400').getTime() === 1789912800000",
+                      expect: true)
+        evalCheckBool(ctx, "new Date('Sat, 20 Sep 2026 00:00:00 GMT').getTime() === Date.UTC(2026, 8, 20)",
+                      expect: true)
+        // A slash date must not be mistaken for the ISO year "2020".
+        evalCheckStr(ctx, "var d = new Date('2020/03/05'); [d.getFullYear(), d.getMonth(), d.getDate()].join()",
+                     expect: "2020,2,5")
+        evalCheckBool(ctx, "new Date('12/25/1995 1:30 PM').getHours() === 13", expect: true)
+        evalCheckBool(ctx, "isNaN(new Date('not a date').getTime())", expect: true)
+        // Local-time conversion uses the offset at that instant, not today's,
+        // so dates on the other side of a DST boundary keep their wall clock.
+        evalCheckBool(ctx, """
+            var a = new Date('Dec 25, 1995 13:30:00'), b = new Date('Jul 4, 1996 13:30:00');
+            a.getHours() === 13 && b.getHours() === 13
+        """, expect: true)
     }
 
     mutating func runAPITests() -> String {
