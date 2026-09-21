@@ -934,6 +934,9 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     // (taken in typedArrayAdoptBuffer, or inherited from the buffer's own
     // creation reference) — release it here, or every buffer ever viewed
     // outlives the runtime.
+    // A Map/Set/WeakMap/WeakSet owns a counted reference to every key and
+    // value it stores (see `jeffJS_mapStateFree`).
+    if case .mapState(let ms) = savedPayload { jeffJS_mapStateFree(ms) }
     if case .typedArray(let ta) = savedPayload, let buf = ta.buffer {
         ta.buffer = nil
         if buf.refCount > 0 {
