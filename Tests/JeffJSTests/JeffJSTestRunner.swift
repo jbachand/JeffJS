@@ -219,6 +219,7 @@ struct JeffJSTestRunner {
             ("Symbol", { $0.testSymbol() }),
             ("TypedArrays", { $0.testTypedArrays() }),
             ("TypedArrayOwnership", { $0.testTypedArrayOwnership() }),
+            ("WebAPIGaps", { $0.testWebAPIGaps() }),
             ("Modules", { $0.testModules() }),
             ("LexicalScoping", { $0.testLexicalScopingBugs() }),
             ("ES262CriticalSubset", { $0.testES262CriticalSubset() }),
@@ -2574,6 +2575,31 @@ extension JeffJSTestRunner {
             function mk(){ var a = new Uint8Array([5,6,7,8]); return a.buffer; }
             new Uint8Array(mk())[3]
             """, expectInt: 8)
+
+        _ = rt
+    }
+
+    // MARK: - WebAPIGaps
+
+    /// Small spec gaps that browser-targeted code trips over.
+    mutating func testWebAPIGaps() {
+        let (rt, ctx) = makeCtx()
+
+        // An own property whose value is `undefined` is still an own property.
+        evalCheckBool(ctx, "({z: undefined}).hasOwnProperty('z')", expect: true)
+        evalCheckBool(ctx, "Object.hasOwn({z: undefined}, 'z')", expect: true)
+        evalCheckBool(ctx, "'z' in {z: undefined}", expect: true)
+        evalCheckBool(ctx, "({z: undefined}).hasOwnProperty('nope')", expect: false)
+        evalCheckBool(ctx, """
+            var d = Object.getOwnPropertyDescriptor({z: undefined}, 'z');
+            d !== undefined && ('value' in d) && d.value === undefined && d.writable === true
+            """, expect: true)
+        evalCheckBool(ctx, """
+            var d = Reflect.getOwnPropertyDescriptor({z: undefined}, 'z');
+            d !== undefined && ('value' in d) && d.value === undefined
+            """, expect: true)
+        evalCheckBool(ctx, "Object.getOwnPropertyDescriptor({z: undefined}, 'nope') === undefined",
+                      expect: true)
 
         _ = rt
     }

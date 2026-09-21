@@ -85,8 +85,16 @@ extension JeffJSContext {
         if key.isString, let s = key.stringValue {
             let atom = rt.findAtom(s.toSwiftString())
             defer { rt.freeAtom(atom) }
+            if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
+                materializeFunctionPrototype(jsObj)
+            }
             let val = jsObj.getOwnPropertyValue(atom: atom)
-            return val.isUndefined ? 0 : 1
+            if !val.isUndefined { return 1 }
+            // A property whose value *is* `undefined` reads exactly like an
+            // absent one, so `({z: undefined}).hasOwnProperty('z')` answered
+            // false. Ask the shape instead.
+            let (shapeProp, _) = jeffJS_findOwnProperty(obj: jsObj, atom: atom)
+            return shapeProp != nil ? 1 : 0
         }
         return 0
     }
@@ -142,6 +150,9 @@ extension JeffJSContext {
         if key.isString, let s = key.stringValue {
             let atom = rt.findAtom(s.toSwiftString())
             defer { rt.freeAtom(atom) }
+            if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
+                materializeFunctionPrototype(jsObj)
+            }
             let (shapeProp, prop) = jeffJS_findOwnProperty(obj: jsObj, atom: atom)
             guard let shapeProp = shapeProp, let prop = prop else { return .undefined }
 
