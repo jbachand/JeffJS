@@ -1202,7 +1202,10 @@ extension JeffJSContext {
                     if let idx = rt.atomToUInt32(atom) {
                         intKeys.append((idx, String(idx)))
                     }
-                } else if let name = rt.atomToString(atom) {
+                } else if !rt.atomIsSymbol(atom), let name = rt.atomToString(atom) {
+                    // Symbol-keyed properties are never serialised (and their
+                    // atom string is the description, which would otherwise
+                    // collide with a real string key of the same spelling).
                     stringKeys.append(name)
                 }
             }

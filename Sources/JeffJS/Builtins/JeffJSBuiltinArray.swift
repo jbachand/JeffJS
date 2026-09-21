@@ -107,7 +107,8 @@ struct JeffJSBuiltinArray {
 
         // @@species getter
         let speciesGetterVal = ctx.newCFunction(speciesGetter, name: "get [Symbol.species]", length: 0)
-        ctx.setPropertyGetSet(obj: arrayCtor, name: "Symbol.species",
+        ctx.setPropertyGetSet(obj: arrayCtor,
+                              atom: ctx.rt.dupAtom(JeffJSAtomID.JS_ATOM_Symbol_species.rawValue),
                               getter: speciesGetterVal, setter: nil)
 
         ctx.setGlobalConstructor(name: "Array", ctor: arrayCtor)
@@ -177,7 +178,8 @@ struct JeffJSBuiltinArray {
         }
 
         // Try getting the iterator first
-        let usingIterator = ctx.getMethod(items, name: "Symbol.iterator")
+        // Symbol atoms are not reachable by spelling — use the predefined id.
+        let usingIterator = ctx.getMethod(items, atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue)
         let usingIteratorIsNil = (usingIterator == nil)
 
         if !usingIteratorIsNil, let usingIter = usingIterator {
@@ -1984,7 +1986,8 @@ struct JeffJSBuiltinArray {
             return false
         }
 
-        let spreadableAtom = ctx.rt.findAtom("Symbol.isConcatSpreadable")
+        // Symbol atoms are not reachable by spelling: use the predefined id.
+        let spreadableAtom = JeffJSAtomID.JS_ATOM_Symbol_isConcatSpreadable.rawValue
         let spreadable = ctx.getProperty(obj: obj, atom: spreadableAtom)
         if spreadable.isException { return false }
 
@@ -2010,9 +2013,8 @@ struct JeffJSBuiltinArray {
 
         if ctor.isObject {
             // Check @@species
-            let speciesAtom = ctx.rt.findAtom("Symbol.species")
+            let speciesAtom = JeffJSAtomID.JS_ATOM_Symbol_species.rawValue
             let species = ctx.getProperty(obj: ctor, atom: speciesAtom)
-            ctx.rt.freeAtom(speciesAtom)
             if species.isException { return species }
             defer { species.freeValue() }
 

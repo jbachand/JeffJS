@@ -1684,13 +1684,46 @@ extension JeffJSObject {
     func getArrayElement(_ index: UInt32) -> JeffJSValue {
         if let storage = _fastArrayValues {
             guard index < storage.count, Int(index) < storage.values.count else { return .undefined }
-            return storage.values[Int(index)]
+            return storage.values[Int(index)].arrayHoleAsUndefined
         }
         if case .array(_, let vals, let count) = payload {
             guard index < count, Int(index) < vals.count else { return .undefined }
-            return vals[Int(index)]
+            return vals[Int(index)].arrayHoleAsUndefined
         }
         return .undefined
+    }
+
+    /// True when index `i` is a present (non-hole) fast-array element.
+    func hasArrayElement(_ index: UInt32) -> Bool {
+        if let storage = _fastArrayValues {
+            guard index < storage.count, Int(index) < storage.values.count else { return false }
+            return !storage.values[Int(index)].isUninitialized
+        }
+        if case .array(_, let vals, let count) = payload {
+            guard index < count, Int(index) < vals.count else { return false }
+            return !vals[Int(index)].isUninitialized
+        }
+        return false
+    }
+
+    /// `delete a[i]` on a fast array: punch a hole, keeping `length`.
+    /// Returns false when `i` is not a fast-array slot (caller falls back to
+    /// the shape path).
+    func deleteArrayElement(_ index: UInt32) -> Bool {
+        if let storage = _fastArrayValues {
+            guard index < storage.count, Int(index) < storage.values.count else { return false }
+            storage.values[Int(index)].freeValue()
+            storage.values[Int(index)] = .uninitialized
+            return true
+        }
+        if case .array(let size, var vals, let count) = payload {
+            guard index < count, Int(index) < vals.count else { return false }
+            vals[Int(index)].freeValue()
+            vals[Int(index)] = .uninitialized
+            payload = .array(size: size, values: vals, count: count)
+            return true
+        }
+        return false
     }
 
     /// The ref-type element storage of a fast array, converting from the

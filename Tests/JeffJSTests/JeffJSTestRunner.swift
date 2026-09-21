@@ -299,6 +299,7 @@ struct JeffJSTestRunner {
             ("PerIterationLet", { $0.testPerIterationLetScope() }),
             ("BuiltinSubclassing", { $0.testBuiltinSubclassing() }),
             ("ReflectConstructNewTarget", { $0.testReflectConstructNewTarget() }),
+            ("BuiltinGaps", { $0.testBuiltinGaps() }),
         ]
     }
 
@@ -10416,6 +10417,106 @@ extension JeffJSTestRunner {
             function Bd() { this.b = 1; } var BB = Bd.bind(null);
             var o = new BB(); o.b === 1 && o instanceof Bd && Reflect.construct(BB, []) instanceof Bd
         """, expect: true)
+    }
+
+    // MARK: - BuiltinGaps
+
+    /// Builtin-semantics gaps that type-sniffing / polyfill-heavy libraries
+    /// depend on. One section per gap.
+    mutating func testBuiltinGaps() {
+        let (_, ctx) = makeCtx()
+
+        // --- 1. Symbol.toStringTag on builtin prototypes -------------------
+        // Object.prototype.toString.call(x) is how every type-sniffing library
+        // (Prism, lodash getTag, core-js) identifies builtins. Without the tags
+        // every one of these answered "[object Object]".
+        evalCheckStr(ctx, "Object.prototype.toString.call(new Map())", expect: "[object Map]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(new Set())", expect: "[object Set]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(new WeakMap())", expect: "[object WeakMap]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(new WeakSet())", expect: "[object WeakSet]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(Promise.resolve())", expect: "[object Promise]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(new ArrayBuffer(1))", expect: "[object ArrayBuffer]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(new DataView(new ArrayBuffer(1)))", expect: "[object DataView]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(new Uint8Array(1))", expect: "[object Uint8Array]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(new Float64Array(1))", expect: "[object Float64Array]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(Symbol('s'))", expect: "[object Symbol]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(Math)", expect: "[object Math]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(JSON)", expect: "[object JSON]")
+        evalCheckStr(ctx, "(function*(){})()[Symbol.toStringTag]", expect: "Generator")
+        evalCheckStr(ctx, "Object.prototype.toString.call(function*(){})", expect: "[object GeneratorFunction]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(async function(){})", expect: "[object AsyncFunction]")
+        evalCheckStr(ctx, "Object.prototype.toString.call([][Symbol.iterator]())", expect: "[object Array Iterator]")
+        evalCheckStr(ctx, "Object.prototype.toString.call(new Map()[Symbol.iterator]())", expect: "[object Map Iterator]")
+        // The tags are non-enumerable and configurable, never writable.
+        evalCheckBool(ctx, """
+            var d = Object.getOwnPropertyDescriptor(Map.prototype, Symbol.toStringTag);
+            d.value === 'Map' && d.writable === false && d.enumerable === false && d.configurable === true
+        """, expect: true)
+        // A user @@toStringTag still wins over the builtin one.
+        evalCheckStr(ctx, """
+            class A { get [Symbol.toStringTag]() { return 'A'; } }
+            Object.prototype.toString.call(new A())
+        """, expect: "[object A]")
+
+        // --- 5. Symbols get their own atom kind ---------------------------
+        // `Symbol("s")` used to intern the *string* atom "s", so a symbol key
+        // and the string key of the same spelling were one property.
+        evalCheckBool(ctx, """
+            var o = {}; o[Symbol('s')] = 1;
+            o.s === undefined && o['s'] === undefined && Object.keys(o).length === 0
+        """, expect: true)
+        evalCheckBool(ctx, """
+            var o = {}; var s = Symbol('q'); o[s] = 1; o.q = 2;
+            o[s] === 1 && o.q === 2 &&
+            Object.keys(o).join() === 'q' &&
+            Object.getOwnPropertyNames(o).join() === 'q' &&
+            Object.getOwnPropertySymbols(o).length === 1 &&
+            Object.getOwnPropertySymbols(o)[0] === s &&
+            Reflect.ownKeys(o).length === 2 &&
+            JSON.stringify(o) === '{"q":2}'
+        """, expect: true)
+        evalCheckStr(ctx, """
+            var o = {}; o[Symbol('x')] = 1; o.a = 1; o.b = 2;
+            var r = ''; for (var k in o) r += k; r
+        """, expect: "ab")
+        // Well-known symbols keep their predefined atoms, so the engine's own
+        // lookups still match, and a symbol key survives `delete`/`in`.
+        evalCheckBool(ctx, """
+            var s = Symbol('k'); var o = {}; o[s] = 1;
+            var ok = (s in o) && o[s] === 1;
+            delete o[s];
+            ok && !(s in o) && Object.getOwnPropertySymbols(o).length === 0
+        """, expect: true)
+        evalCheckBool(ctx, """
+            Symbol.for('reg') === Symbol.for('reg') &&
+            Symbol.keyFor(Symbol.for('reg')) === 'reg' &&
+            Symbol('d') !== Symbol('d')
+        """, expect: true)
+        // The string spelling of a well-known symbol is a different key.
+        evalCheckBool(ctx, """
+            var o = {}; o['Symbol.iterator'] = 7;
+            o[Symbol.iterator] === undefined && o['Symbol.iterator'] === 7
+        """, expect: true)
+
+        // --- 4a. Own-property descriptors and array holes ------------------
+        evalCheckBool(ctx, """
+            var d = Object.getOwnPropertyDescriptor([1, 2], '0');
+            d.value === 1 && d.writable && d.enumerable && d.configurable
+        """, expect: true)
+        evalCheckBool(ctx, """
+            var s = Symbol('t'); var o = {}; o[s] = 5;
+            var d = Object.getOwnPropertyDescriptor(o, s);
+            d.value === 5 && d.writable && d.enumerable && d.configurable
+        """, expect: true)
+        // `delete a[1]` punches a hole: length unchanged, the index is gone.
+        evalCheckBool(ctx, """
+            var a = [1, 2, 3]; delete a[1];
+            !(1 in a) && a.length === 3 && a[1] === undefined &&
+            Object.keys(a).join() === '0,2' &&
+            (function () { var r = ''; for (var k in a) r += k; return r; })() === '02'
+        """, expect: true)
+        // An explicit undefined element is still present.
+        evalCheckBool(ctx, "var a = [1, undefined, 3]; (1 in a) && Object.keys(a).length === 3", expect: true)
     }
 
     mutating func runAPITests() -> String {

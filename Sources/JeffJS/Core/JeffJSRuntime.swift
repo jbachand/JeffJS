@@ -1283,7 +1283,12 @@ final class JeffJSRuntime {
 
     /// Adds a new atom to the table.
     /// Mirrors `__JS_NewAtom()` from QuickJS.
-    private func addAtom(str: String, hash: UInt32, atomType: JSAtomTypeEnum) -> UInt32 {
+    ///
+    /// `linkHash: false` allocates a slot that is deliberately left out of the
+    /// string hash chain — used for symbol atoms, whose identity is the symbol
+    /// object, not its spelling (see `symbolAtom(for:)`).
+    private func addAtom(str: String, hash: UInt32, atomType: JSAtomTypeEnum,
+                         linkHash: Bool = true) -> UInt32 {
         guard atomHashSize > 0, !atomHash.isEmpty else { return 0 }
         let newIndex: Int
 
@@ -1311,9 +1316,11 @@ final class JeffJSRuntime {
         atomArray[newIndex] = entry
 
         // Insert into hash chain
-        let bucketIndex = Int(hash) & (atomHashSize - 1)
-        entry.hashNext = atomHash[bucketIndex]
-        atomHash[bucketIndex] = UInt32(newIndex)
+        if linkHash {
+            let bucketIndex = Int(hash) & (atomHashSize - 1)
+            entry.hashNext = atomHash[bucketIndex]
+            atomHash[bucketIndex] = UInt32(newIndex)
+        }
 
         // Check if we need to resize the hash table
         if atomCount >= atomCountResize {
@@ -1321,6 +1328,85 @@ final class JeffJSRuntime {
         }
 
         return UInt32(newIndex)
+    }
+
+    // MARK: - Symbol Atoms
+    //
+    // A `Symbol("s")` used as a property key must not collide with the plain
+    // string key `"s"`: `o[Symbol("s")] = 1` must leave `o.s === undefined`
+    // and `Object.keys(o).length === 0`.  JeffJS used to intern the symbol's
+    // *description* with `findAtom(desc)`, which made the two the same atom.
+    //
+    // Every symbol now owns an atom-table slot whose atomType is
+    // JS_ATOM_TYPE_SYMBOL and which is NOT linked into the string hash chain,
+    // so `findAtom(desc)` can never return it.  Existing code already keys the
+    // string/symbol distinction off `atomArray[a].atomType` (for-in,
+    // Object.keys, getOwnPropertyNames), so those paths need no change.
+    //
+    // A symbol value in JeffJS is `mkPtr(.symbol, JeffJSString)`; that string
+    // pointer IS the symbol's identity, so the map is keyed by its
+    // ObjectIdentifier.  Well-known symbols are pre-bound to their predefined
+    // atoms by `bindSymbolAtom` during Symbol intrinsic init.
+
+    /// symbol description string identity -> its atom.
+    var symbolAtoms: [ObjectIdentifier: UInt32] = [:]
+    /// Reverse map, so `Object.getOwnPropertySymbols` / `Reflect.ownKeys` can
+    /// rebuild the symbol value from an atom found in a shape.
+    var symbolAtomStrings: [UInt32: JeffJSString] = [:]
+
+    /// The atom for a symbol, allocating one on first use as a property key.
+    /// Symbol atoms are immortal (they are only ever a handful per program and
+    /// recycling a slot would silently alias two different symbols).
+    func symbolAtom(for s: JeffJSString,
+                    type: JSAtomTypeEnum = .JS_ATOM_TYPE_SYMBOL) -> UInt32 {
+        let key = ObjectIdentifier(s)
+        if let a = symbolAtoms[key] { return a }
+        let desc = s.toSwiftString()
+        let atom = addAtom(str: desc, hash: atomHashString(desc),
+                           atomType: type, linkHash: false)
+        if atom == 0 { return 0 }
+        atomArray[Int(atom)]?.refCount = Int32.max / 2   // immortal
+        // A symbol's spelling is never an array index.
+        atomArray[Int(atom)]?.arrayIndexValue = nil
+        atomArray[Int(atom)]?.isIntegerIndex = false
+        symbolAtoms[key] = atom
+        symbolAtomStrings[atom] = s
+        s.refCount += 1
+        return atom
+    }
+
+    /// Bind a symbol to an already-allocated (predefined) atom and mark that
+    /// atom symbol-typed. Used for the well-known symbols, which must keep
+    /// their JS_ATOM_Symbol_* ids so the compiler's computed-key fast path and
+    /// every `getProperty(obj:atom: JS_ATOM_Symbol_iterator)` call still match.
+    func bindSymbolAtom(_ s: JeffJSString, atom: UInt32,
+                        type: JSAtomTypeEnum = .JS_ATOM_TYPE_SYMBOL) {
+        guard atom != JS_ATOM_NULL, Int(atom) < atomCount else { return }
+        // Predefined well-known symbol atoms were interned as ordinary strings
+        // ("Symbol.iterator"); unlink them so `findAtom("Symbol.iterator")`
+        // cannot hand back a symbol key.
+        if atomArray[Int(atom)]?.atomType == .JS_ATOM_TYPE_STRING {
+            removeAtomFromHash(atom)
+            atomArray[Int(atom)]?.hashNext = 0
+        }
+        atomArray[Int(atom)]?.atomType = type
+        symbolAtoms[ObjectIdentifier(s)] = atom
+        symbolAtomStrings[atom] = s
+        s.refCount += 1
+    }
+
+    /// The description string of a symbol atom, or nil if the atom is a
+    /// plain string atom.
+    func symbolStringForAtom(_ atom: UInt32) -> JeffJSString? {
+        return symbolAtomStrings[atom]
+    }
+
+    /// True when `atom` is a symbol (unique or global) rather than a string.
+    @inline(__always)
+    func atomIsSymbol(_ atom: UInt32) -> Bool {
+        guard (atom & JS_ATOM_TAG_INT) == 0, atom != JS_ATOM_NULL,
+              Int(atom) < atomCount, let e = atomArray[Int(atom)] else { return false }
+        return e.atomType == .JS_ATOM_TYPE_SYMBOL || e.atomType == .JS_ATOM_TYPE_GLOBAL_SYMBOL
     }
 
     /// Removes an atom from the hash chain.
@@ -1351,9 +1437,13 @@ final class JeffJSRuntime {
         let newSize = atomHashSize * 2
         var newHash = [UInt32](repeating: 0, count: newSize)
 
-        // Rehash all existing atoms
+        // Rehash all existing atoms. Symbol atoms are deliberately absent
+        // from the string hash chain (see "Symbol Atoms") — re-linking them
+        // here would resurrect the `Symbol("s")` / `"s"` key collision.
         for i in 1..<atomCount {
             guard let entry = atomArray[i] else { continue }
+            if entry.atomType == .JS_ATOM_TYPE_SYMBOL ||
+               entry.atomType == .JS_ATOM_TYPE_GLOBAL_SYMBOL { continue }
             let bucketIndex = Int(entry.hash) & (newSize - 1)
             entry.hashNext = newHash[bucketIndex]
             newHash[bucketIndex] = UInt32(i)
@@ -1386,7 +1476,12 @@ final class JeffJSRuntime {
                 atomType = .JS_ATOM_TYPE_STRING
             }
 
-            let actualID = addAtom(str: str, hash: hash, atomType: atomType)
+            // Well-known symbol atoms are deliberately left out of the string
+            // hash chain: `findAtom("Symbol.iterator")` must not hand back a
+            // symbol key (see "Symbol Atoms"). They are reached through their
+            // JS_ATOM_Symbol_* id instead.
+            let actualID = addAtom(str: str, hash: hash, atomType: atomType,
+                                   linkHash: atomType == .JS_ATOM_TYPE_STRING)
 
             // The atom IDs must match the predefined enum values.
             assert(actualID == expectedID,

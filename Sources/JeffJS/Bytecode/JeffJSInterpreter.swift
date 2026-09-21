@@ -1307,14 +1307,13 @@ extension JeffJSContext {
             return getPropertyStr(obj: obj, name: key)
         }
         if prop.isSymbol {
-            // For symbol keys, look up via the symbol's string description as atom.
-            // Symbols are stored as mkPtr(tag: .symbol, ptr: JeffJSString).
+            // Symbols are stored as mkPtr(tag: .symbol, ptr: JeffJSString); the
+            // string pointer is the symbol's identity. `symbolAtom(for:)` gives
+            // it its own symbol-typed atom, so `o[Symbol("s")]` and `o.s` are
+            // different properties (see JeffJSRuntime "Symbol Atoms").
             if let symStr = prop.toPtr() as? JeffJSString {
-                let atomStr = symStr.toSwiftString()
-                let atom = rt.findAtom(atomStr)
-                let val = getProperty(obj: obj, atom: atom)
-                rt.freeAtom(atom)
-                return val
+                let atom = rt.symbolAtom(for: symStr)
+                return getProperty(obj: obj, atom: atom)
             }
         }
         // Fallback: convert to string
@@ -1356,12 +1355,8 @@ extension JeffJSContext {
         }
         if prop.isSymbol {
             if let symStr = prop.toPtr() as? JeffJSString {
-                let atomStr = symStr.toSwiftString()
-                let atom = rt.findAtom(atomStr)
-                let result = setProperty(obj: obj, atom: atom, value: val) >= 0
-                rt.freeAtom(atom)
-                // Don't free atom — setProperty stores it in the shape.
-                return result
+                let atom = rt.symbolAtom(for: symStr)
+                return setProperty(obj: obj, atom: atom, value: val) >= 0
             }
         }
         // Fallback: convert to string
@@ -1399,10 +1394,7 @@ extension JeffJSContext {
             return result
         }
         if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
-            let atom = rt.findAtom(symStr.toSwiftString())
-            let result = deleteProperty(obj: obj, atom: atom)
-            rt.freeAtom(atom)
-            return result
+            return deleteProperty(obj: obj, atom: rt.symbolAtom(for: symStr))
         }
         return false
     }
@@ -1452,10 +1444,7 @@ extension JeffJSContext {
             return result
         }
         if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
-            let atom = rt.findAtom(symStr.toSwiftString())
-            let result = hasProperty(obj: obj, atom: atom)
-            rt.freeAtom(atom)
-            return result
+            return hasProperty(obj: obj, atom: rt.symbolAtom(for: symStr))
         }
         return false
     }
@@ -1658,8 +1647,7 @@ extension JeffJSContext {
             return result
         }
         if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
-            let atomStr = symStr.toSwiftString()
-            let atom = rt.findAtom(atomStr)
+            let atom = rt.symbolAtom(for: symStr)
             let result: Bool
             if isGetter || isSetter {
                 result = defineProperty(obj: obj, atom: atom, value: .JS_UNDEFINED,
@@ -3224,11 +3212,13 @@ private func executeFastTrace(
             var element: JeffJSValue? = nil
             if let storage = jsObj._fastArrayValues {
                 if uidx < storage.count, Int(uidx) < storage.values.count {
-                    element = storage.values[Int(uidx)]
+                    let e = storage.values[Int(uidx)]
+                    if !e.isUninitialized { element = e }   // hole: deopt
                 }
             } else if case .array(_, let vals, let count) = jsObj.payload {
                 if uidx < count, Int(uidx) < vals.count {
-                    element = vals[Int(uidx)]
+                    let e = vals[Int(uidx)]
+                    if !e.isUninitialized { element = e }
                 }
             }
             guard let el = element else { resume = pc; break traceLoop } // deopt: OOB/holes — slow path decides
@@ -4493,11 +4483,13 @@ private func executeFastTraceLean(
             var element: JeffJSValue? = nil
             if let storage = jsObj._fastArrayValues {
                 if uidx < storage.count, Int(uidx) < storage.values.count {
-                    element = storage.values[Int(uidx)]
+                    let e = storage.values[Int(uidx)]
+                    if !e.isUninitialized { element = e }   // hole: deopt
                 }
             } else if case .array(_, let vals, let count) = jsObj.payload {
                 if uidx < count, Int(uidx) < vals.count {
-                    element = vals[Int(uidx)]
+                    let e = vals[Int(uidx)]
+                    if !e.isUninitialized { element = e }
                 }
             }
             guard let el = element else { ctx.interruptCounter = interrupt; return pc } // deopt: OOB/holes — slow path decides
@@ -8242,14 +8234,14 @@ struct JeffJSInterpreter {
                         let uidx = UInt32(idx)
                         if let storage = jsObj._fastArrayValues {
                             if uidx < storage.count, Int(uidx) < storage.values.count {
-                                buf[sp] = storage.values[Int(uidx)].dupValue(); sp += 1
+                                buf[sp] = storage.values[Int(uidx)].arrayHoleAsUndefined.dupValue(); sp += 1
                                 obj.freeValue()   // popped receiver
                                 pc += 1
                                 continue dispatchLoop
                             }
                         } else if case .array(_, let vals, let count) = jsObj.payload {
                             if uidx < count, Int(uidx) < vals.count {
-                                buf[sp] = vals[Int(uidx)].dupValue(); sp += 1
+                                buf[sp] = vals[Int(uidx)].arrayHoleAsUndefined.dupValue(); sp += 1
                                 obj.freeValue()
                                 pc += 1
                                 continue dispatchLoop
@@ -8276,13 +8268,13 @@ struct JeffJSInterpreter {
                         let uidx = UInt32(idx)
                         if let storage = jsObj._fastArrayValues {
                             if uidx < storage.count, Int(uidx) < storage.values.count {
-                                buf[sp] = storage.values[Int(uidx)].dupValue(); sp += 1
+                                buf[sp] = storage.values[Int(uidx)].arrayHoleAsUndefined.dupValue(); sp += 1
                                 pc += 1
                                 continue dispatchLoop
                             }
                         } else if case .array(_, let vals, let count) = jsObj.payload {
                             if uidx < count, Int(uidx) < vals.count {
-                                buf[sp] = vals[Int(uidx)].dupValue(); sp += 1
+                                buf[sp] = vals[Int(uidx)].arrayHoleAsUndefined.dupValue(); sp += 1
                                 pc += 1
                                 continue dispatchLoop
                             }

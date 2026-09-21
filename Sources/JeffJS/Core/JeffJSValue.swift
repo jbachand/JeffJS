@@ -244,6 +244,12 @@ struct JeffJSValue {
     @inline(__always) var isNullOrUndefined: Bool { isNull || isUndefined }
     @inline(__always) var isException: Bool { bits == Self._exceptTag }
     @inline(__always) var isUninitialized: Bool { bits == Self._uninitTag }
+    /// Fast-array element slots use `uninitialized` as the hole marker
+    /// (`delete a[1]` leaves a hole: `!(1 in a)` but `a.length` unchanged).
+    /// Every path that hands an element to JS maps it back to `undefined`.
+    @inline(__always) var arrayHoleAsUndefined: JeffJSValue {
+        bits == Self._uninitTag ? .undefined : self
+    }
 
     var isFunction: Bool {
         guard let obj = toObject() else { return false }

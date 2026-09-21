@@ -166,6 +166,9 @@ func js_symbol_for(_ ctx: JeffJSContext,
     // Create a new global symbol with atomType = globalSymbol.
     let atomStr = JeffJSString(swiftString: keyStr)
     atomStr.atomType = JSAtomType.globalSymbol.rawValue
+    // Give it its own (global-symbol-typed) atom up front so that, like a
+    // unique symbol, it never collides with the string key of the same name.
+    _ = rt.symbolAtom(for: atomStr, type: .JS_ATOM_TYPE_GLOBAL_SYMBOL)
     let symVal = JeffJSValue.mkPtr(tag: .symbol, ptr: atomStr)
 
     // Store in the registry and return.
@@ -453,6 +456,12 @@ func js_init_symbol_builtin(_ ctx: JeffJSContext,
         // We create a symbol value from the atom.
         let symStr = JeffJSString(swiftString: wks.description)
         symStr.atomType = JSAtomType.symbol.rawValue
+        // Bind the symbol to its predefined JS_ATOM_Symbol_* id and mark that
+        // atom symbol-typed, so a well-known symbol used as a property key
+        // reaches the same atom the engine's internal
+        // `getProperty(obj:atom: JS_ATOM_Symbol_iterator)` calls use, while
+        // for-in / Object.keys / JSON.stringify still skip it.
+        ctx.rt.bindSymbolAtom(symStr, atom: wks.atomID)
         let symVal = JeffJSValue.mkPtr(tag: .symbol, ptr: symStr)
 
         // Install as a non-writable, non-enumerable, non-configurable property.

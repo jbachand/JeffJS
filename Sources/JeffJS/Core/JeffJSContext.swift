@@ -463,6 +463,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             // it runs once during init instead of on every function call.
             ensureMathFixup()
 
+            // Phase 6: Symbol.toStringTag on every builtin prototype /
+            // namespace object (needs all intrinsics to exist first).
+            addIntrinsicToStringTags()
+
             intrinsicsAdded = true
             rt.initComplete = true
         }
@@ -1033,6 +1037,15 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// - Returns: True on success, false on error or non-configurable.
     func deleteProperty(obj: JeffJSValue, atom: UInt32, flags: Int = 0) -> Bool {
         guard let jsObj = obj.toObject() else { return false }
+        // `delete a[i]` on a fast array punches a hole in the element storage
+        // (length is unchanged, `i in a` becomes false) — the element is not a
+        // shape property, so the code below would silently do nothing.
+        if jsObj.fastArray || jsObj.classID == JeffJSClassID.array.rawValue,
+           rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom),
+           jsObj.deleteArrayElement(idx) {
+            jsObj.shape?.enumKeyCache = nil
+            return true
+        }
         guard let shape = jsObj.shape else { return true }
 
         // Use hash-based lookup first, fall back to linear scan
@@ -1126,13 +1139,14 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // Fast path: check fast-array payload for integer-indexed access
         if jsObj.fastArray || jsObj.classID == JeffJSClassID.array.rawValue {
             if rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom) {
+                // A hole (from `delete a[i]`) is *absent*: `1 in a` is false.
                 if let storage = jsObj._fastArrayValues {
                     if idx < storage.count && Int(idx) < storage.values.count {
-                        return true
+                        return !storage.values[Int(idx)].isUninitialized
                     }
                 } else if let snap = jsObj.arraySnapshot() {
                     if Int(idx) < snap.count && Int(idx) < snap.values.count {
-                        return true
+                        return !snap.values[Int(idx)].isUninitialized
                     }
                 }
             }
@@ -3266,27 +3280,18 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         }, name: "keyFor", length: 1)
         _ = setPropertyStr(obj: symbolCtor, name: "keyFor", value: symbolKeyFor)
 
-        // Install well-known symbols as static properties on Symbol
-        let wellKnownSymbols: [(String, String)] = [
-            ("asyncIterator",      "Symbol.asyncIterator"),
-            ("hasInstance",        "Symbol.hasInstance"),
-            ("isConcatSpreadable", "Symbol.isConcatSpreadable"),
-            ("iterator",          "Symbol.iterator"),
-            ("match",             "Symbol.match"),
-            ("matchAll",          "Symbol.matchAll"),
-            ("replace",           "Symbol.replace"),
-            ("search",            "Symbol.search"),
-            ("split",             "Symbol.split"),
-            ("species",           "Symbol.species"),
-            ("toPrimitive",       "Symbol.toPrimitive"),
-            ("toStringTag",       "Symbol.toStringTag"),
-            ("unscopables",       "Symbol.unscopables"),
-        ]
-        for (name, desc) in wellKnownSymbols {
-            let symStr = JeffJSString(swiftString: desc)
+        // Install well-known symbols as static properties on Symbol.
+        // Each one is bound to its predefined JS_ATOM_Symbol_* id so that a
+        // well-known symbol used as a property key from JS reaches exactly the
+        // atom the engine's internal
+        // `getProperty(obj:atom: JS_ATOM_Symbol_toPrimitive)` lookups use, and
+        // so the atom is marked symbol-typed (kept out of for-in/Object.keys).
+        for wks in js_well_known_symbols {
+            let symStr = JeffJSString(swiftString: wks.description)
             symStr.atomType = JSAtomType.symbol.rawValue
+            rt.bindSymbolAtom(symStr, atom: wks.atomID)
             let symVal = JeffJSValue.mkPtr(tag: .symbol, ptr: symStr)
-            _ = setPropertyStr(obj: symbolCtor, name: name, value: symVal)
+            _ = setPropertyStr(obj: symbolCtor, name: wks.name, value: symVal)
         }
 
         _ = setPropertyStr(obj: globalObj, name: "Symbol", value: symbolCtor)
@@ -3746,7 +3751,12 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                         let isSymbol = entry.atomType == .JS_ATOM_TYPE_SYMBOL ||
                                        entry.atomType == .JS_ATOM_TYPE_GLOBAL_SYMBOL
                         if isSymbol {
-                            symbolKeys.append(self.newStringValue(entry.str))
+                            // Real symbol values, not their descriptions.
+                            if let symStr = self.rt.symbolStringForAtom(atom) {
+                                symbolKeys.append(JeffJSValue.mkPtr(tag: .symbol, ptr: symStr.retain()))
+                            } else {
+                                symbolKeys.append(self.newStringValue(entry.str))
+                            }
                         } else {
                             stringKeys.append(self.newStringValue(entry.str))
                         }
@@ -4006,13 +4016,13 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 // Check ref-type fast storage first (populated by push fast path)
                 if let storage = jsObj._fastArrayValues {
                     if idx < storage.count, Int(idx) < storage.values.count {
-                        return storage.values[Int(idx)].dupValue()
+                        return storage.values[Int(idx)].arrayHoleAsUndefined.dupValue()
                     }
                     return .JS_UNDEFINED
                 }
                 if case .array(_, let vals, let count) = jsObj.payload {
                     if idx < count, Int(idx) < vals.count {
-                        return vals[Int(idx)].dupValue()
+                        return vals[Int(idx)].arrayHoleAsUndefined.dupValue()
                     }
                     return .JS_UNDEFINED
                 }
@@ -4958,7 +4968,13 @@ extension JeffJSContext {
     }
 
     func setPropertyGetSet(obj: JeffJSValue, name: String, getter: JeffJSValue?, setter: JeffJSValue?) {
-        let atom = rt.findAtom(name)
+        setPropertyGetSet(obj: obj, atom: rt.findAtom(name), getter: getter, setter: setter)
+    }
+
+    /// Atom-keyed overload: well-known symbol accessors (`get [Symbol.species]`)
+    /// must pass the predefined JS_ATOM_Symbol_* id — symbol atoms are not
+    /// reachable by spelling.
+    func setPropertyGetSet(obj: JeffJSValue, atom: UInt32, getter: JeffJSValue?, setter: JeffJSValue?) {
         defer { rt.freeAtom(atom) }
         if let p = obj.toObject(), p.shape != nil {
             let idx = jeffJS_objectAddShapeProperty(self, p, atom: atom, flags: UInt32(JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_GETSET))
@@ -4973,6 +4989,11 @@ extension JeffJSContext {
 
     func createArrayIterator(obj: JeffJSValue, kind: Int) -> JeffJSValue {
         let iter = newObject()
+        // %ArrayIteratorPrototype% carries @@toStringTag ("Array Iterator") and
+        // the %IteratorPrototype% helpers; without it the ad-hoc iterator object
+        // inherits from Object.prototype and reports "[object Object]".
+        let aiProto = classProto[JSClassID.JS_CLASS_ARRAY_ITERATOR.rawValue]
+        if aiProto.isObject { _ = setPrototypeOf(obj: iter, proto: aiProto) }
         _ = setPropertyStr(obj: iter, name: "_target", value: obj)
         _ = setPropertyStr(obj: iter, name: "_index", value: .newInt32(0))
         _ = setPropertyStr(obj: iter, name: "_kind", value: .newInt32(Int32(kind)))
@@ -5045,6 +5066,14 @@ extension JeffJSContext {
 
     func getMethod(_ obj: JeffJSValue, name: String) -> JeffJSValue? {
         let val = getPropertyStr(obj: obj, name: name)
+        if val.isUndefined || val.isNull { return nil }
+        if !isCallable(val) { return nil }
+        return val
+    }
+
+    /// Atom-keyed GetMethod, for well-known symbol keys.
+    func getMethod(_ obj: JeffJSValue, atom: UInt32) -> JeffJSValue? {
+        let val = getProperty(obj: obj, atom: atom)
         if val.isUndefined || val.isNull { return nil }
         if !isCallable(val) { return nil }
         return val
