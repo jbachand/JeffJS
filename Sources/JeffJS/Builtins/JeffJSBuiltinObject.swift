@@ -284,9 +284,14 @@ extension JeffJSContext {
             return throwTypeError(message: "invalid property key")
         }
 
-        // Check if this is an accessor descriptor (has get or set)
+        // Check if this is an accessor descriptor (has get or set).
+        // Every `getPropertyStr` below hands back a reference this function
+        // owns; `defineProperty` dups whatever it stores, so all of them are
+        // released here. They used not to be, and `Object.defineProperty` in
+        // a loop pinned one object per call.
         let getterVal = getPropertyStr(obj: desc, name: "get")
         let setterVal = getPropertyStr(obj: desc, name: "set")
+        defer { getterVal.freeValue(); setterVal.freeValue() }
         let hasGetter = !getterVal.isUndefined
         let hasSetter = !setterVal.isUndefined
 
@@ -306,23 +311,28 @@ extension JeffJSContext {
 
             // Check configurable/enumerable from descriptor
             let configVal = getPropertyStr(obj: desc, name: "configurable")
+            defer { configVal.freeValue() }
             if !configVal.isUndefined && JeffJSTypeConvert.toBool(configVal) {
                 flags |= UInt32(JS_PROP_CONFIGURABLE)
             }
             let enumVal = getPropertyStr(obj: desc, name: "enumerable")
+            defer { enumVal.freeValue() }
             if !enumVal.isUndefined && JeffJSTypeConvert.toBool(enumVal) {
                 flags |= UInt32(JS_PROP_ENUMERABLE)
             }
 
-            // Define the accessor property
-            let getVal: JeffJSValue = getter != nil ? JeffJSValue.makeObject(getter!) : .undefined
-            let setVal: JeffJSValue = setter != nil ? JeffJSValue.makeObject(setter!) : .undefined
+            // Define the accessor property. Borrowed, not `makeObject`:
+            // `defineProperty` takes the count it needs, and the ARC retain
+            // `makeObject` adds is one nothing ever balances.
+            let getVal: JeffJSValue = getter != nil ? JeffJSValue.borrowedObject(getter!) : .undefined
+            let setVal: JeffJSValue = setter != nil ? JeffJSValue.borrowedObject(setter!) : .undefined
             _ = defineProperty(obj: obj, atom: atom, value: .undefined,
                                getter: getVal, setter: setVal,
                                flags: Int(flags))
         } else {
             // Data descriptor: { value, writable, configurable, enumerable }
             let val = getPropertyStr(obj: desc, name: "value")
+            defer { val.freeValue() }
 
             var flags = JS_PROP_DEFINE_PROPERTY
             if descriptorHas(desc, "configurable") { flags |= JS_PROP_HAS_CONFIGURABLE }
@@ -331,14 +341,17 @@ extension JeffJSContext {
             if descriptorHas(desc, "value")        { flags |= JS_PROP_HAS_VALUE }
 
             let configVal = getPropertyStr(obj: desc, name: "configurable")
+            defer { configVal.freeValue() }
             if !configVal.isUndefined && JeffJSTypeConvert.toBool(configVal) {
                 flags |= JS_PROP_CONFIGURABLE
             }
             let enumVal = getPropertyStr(obj: desc, name: "enumerable")
+            defer { enumVal.freeValue() }
             if !enumVal.isUndefined && JeffJSTypeConvert.toBool(enumVal) {
                 flags |= JS_PROP_ENUMERABLE
             }
             let writableVal = getPropertyStr(obj: desc, name: "writable")
+            defer { writableVal.freeValue() }
             if !writableVal.isUndefined && JeffJSTypeConvert.toBool(writableVal) {
                 flags |= JS_PROP_WRITABLE
             }
@@ -761,6 +774,9 @@ struct JeffJSBuiltinObject {
         // Convert prop to property key
         let key = ctx.toPropertyKey(prop)
         if key.isException { return key }
+        // `toPropertyKey` dups; the descriptor path only reads the key to
+        // intern an atom, so the reference is ours to release.
+        defer { key.freeValue() }
 
         let result = ctx.definePropertyFromDescriptor(obj, key: key, desc: desc)
         if result.isException { return result }
@@ -1450,10 +1466,12 @@ struct JeffJSBuiltinObject {
 
         let key = ctx.toPropertyKey(prop)
         if key.isException { return key }
+        defer { key.freeValue() }
 
         // Build a descriptor: { get: getter, enumerable: true, configurable: true }
         let desc = ctx.newPlainObject()
         if desc.isException { return desc }
+        defer { desc.freeValue() }   // a throwaway; the property keeps its own refs
         var ret = ctx.setProperty(obj: desc, atom: JSAtomID.get, value: getter.dupValue())
         if ret < 0 { return .exception }
         ret = ctx.setProperty(obj: desc, atom: JSAtomID.enumerable, value: .JS_TRUE)
@@ -1483,10 +1501,12 @@ struct JeffJSBuiltinObject {
 
         let key = ctx.toPropertyKey(prop)
         if key.isException { return key }
+        defer { key.freeValue() }
 
         // Build a descriptor: { set: setter, enumerable: true, configurable: true }
         let desc = ctx.newPlainObject()
         if desc.isException { return desc }
+        defer { desc.freeValue() }   // a throwaway; the property keeps its own refs
         var ret = ctx.setProperty(obj: desc, atom: JSAtomID.set, value: setter.dupValue())
         if ret < 0 { return .exception }
         ret = ctx.setProperty(obj: desc, atom: JSAtomID.enumerable, value: .JS_TRUE)
@@ -1614,7 +1634,9 @@ struct JeffJSBuiltinObject {
             descriptors.append((key: key, desc: descValue))
         }
 
-        // Second pass: apply all descriptors
+        // Second pass: apply all descriptors. Both halves of every pair came
+        // back owned from the collecting pass above.
+        defer { for (key, desc) in descriptors { key.freeValue(); desc.freeValue() } }
         for (key, desc) in descriptors {
             let result = ctx.definePropertyFromDescriptor(obj, key: key, desc: desc)
             if result.isException { return result }
