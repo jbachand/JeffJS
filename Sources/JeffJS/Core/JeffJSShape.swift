@@ -248,54 +248,6 @@ func jeffJS_rootShape(_ ctx: JeffJSContext, proto: JeffJSObject?) -> JeffJSShape
     return s
 }
 
-/// Sweep zero-owner hashed shapes out of the transition table.
-///
-/// Nothing ever emptied it: `removeHashedShape` was reachable only from
-/// `freeShape`, and `freeObject` refused to free a hashed shape at zero
-/// owners, so `shapeHashCount` only ever went up. A loop that builds a fresh
-/// prototype parks one hashed root shape per prototype — and because a shape
-/// owns one counted reference to its prototype (Round 12), that shape kept the
-/// prototype alive for the life of the runtime. That is what the ~0.74
-/// objects/iteration in a fresh-prototype loop actually were. Past
-/// `shapes.maxHashed` (16 384) it got worse rather than better: insertion is
-/// simply skipped, so every new object builds a private shape and every
-/// property access becomes a permanent IC miss.
-///
-/// Safety, since the inline caches compare shapes by raw address:
-///  * `refCount == 0` means no object is on the shape and no context cache
-///    holds it (all four caches take a count), so no live receiver can match
-///    an IC entry naming it.
-///  * Every IC entry retains the shapes it names, so the allocation survives
-///    the sweep and its address cannot be handed to a new shape while a stale
-///    entry still points at it.
-///  * `removeHashedShape` clears `isHashed`, and `jeffJS_icDefine` refuses a
-///    transition target that is not hashed — so a `define_field` IC whose
-///    `nextShapePtr` was swept misses instead of moving an object onto a
-///    gutted shape.
-///
-/// Returns the number of shapes swept.
-@discardableResult
-func jeffJS_evictHashedShapes(_ rt: JeffJSRuntime) -> Int {
-    guard rt.shapeHashSize > 0,
-          rt.shapeHashCount >= JeffJSConfig.shapesEvictThreshold else { return 0 }
-    var swept = 0
-    for i in 0 ..< rt.shapeHashSize {
-        var cur = rt.shapeHash[i]
-        while let shape = cur {           // strong local: unlinking may be the last reference
-            cur = shape.shapeHashNext
-            guard shape.refCount == 0, shape.gcListIndex != -1 else { continue }
-            removeHashedShape(rt, shape)  // clears isHashed, drops the table's reference
-            freeGCObjectChildren(rt, shape)   // releases the prototype it owned
-            swept += 1
-        }
-    }
-    rt.shapesEvicted += swept
-    if jeffJS_gcDebug, swept > 0 {
-        print("[GC-shapes] swept \(swept) zero-owner hashed shape(s), \(rt.shapeHashCount) left")
-    }
-    return swept
-}
-
 /// Drop one owner reference from `shape`. Private shapes are freed at zero;
 /// hashed shapes remain cached in the transition table.
 func jeffJS_leaveShape(_ rt: JeffJSRuntime, _ shape: JeffJSShape) {

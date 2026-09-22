@@ -307,8 +307,6 @@ func runGC(_ rt: JeffJSRuntime) {
     if JeffJSMetalGC.shared.shouldUseMetalGC(objectCount: rt.gcObjects.count) {
         if JeffJSMetalGC.shared.runMetalGC(rt: rt) {
             freeZeroRefcount(rt)
-            jeffJS_evictHashedShapes(rt)
-            freeZeroRefcount(rt)
             pruneWeakRefs(rt)
             rt.gcRuns += 1
             rt.mallocGCThreshold = jeffJS_nextGCThreshold(rt, reclaimed: rt.gcCyclesFreed - freedBefore)
@@ -342,13 +340,6 @@ func runGC(_ rt: JeffJSRuntime) {
     rt.gcPhase = .JS_GC_PHASE_NONE
 
     // Drain objects that hit zero during the collection.
-    freeZeroRefcount(rt)
-
-    // Sweep zero-owner hashed shapes. After the collection, not before: the
-    // collector is what takes the last owner off most of them, and a shape
-    // swept here releases the prototype it owned, which can drop more objects
-    // to zero (drained again below).
-    jeffJS_evictHashedShapes(rt)
     freeZeroRefcount(rt)
 
     // Prune dead weak references
@@ -522,15 +513,19 @@ private func gcFreeCycles(_ rt: JeffJSRuntime) {
     var remaining: ContiguousArray<Unmanaged<JeffJSGCObjectHeader>> = []
     remaining.reserveCapacity(rt.gcObjects.count)
     for u in rt.gcObjects {
-        // Only JS values are swept. Shapes reach zero only because nothing
-        // counted them in the first place (their incoming edges are ARC
-        // strong references), and hashed shapes deliberately live on at
-        // refCount 0 as the shape cache — quickjs likewise frees only
-        // JS_GC_OBJ_TYPE_JS_OBJECT / _FUNCTION_BYTECODE / _VAR_REF here.
+        // Unreachable JS values, plus the hashed shapes nothing is on any more
+        // (`jeffJS_shapeIsSweepable`). The shapes have to go *with* this group
+        // rather than after it: a white shape's prototype is white too, so a
+        // collection that freed the prototype and left the shape behind left
+        // the shape's `proto` pointing at freed memory — and the next thing to
+        // release it read a dead object. `gcFreeDeadObjects` is exactly the
+        // protocol for a mutually-dead group: it breaks every edge before it
+        // hands any allocation back.
         let isDead = u._withUnsafeGuaranteedRef { hdr -> Bool in
-            hdr.mark == JeffJSGCMark.white &&
-                (hdr.gcObjType == .jsObject || hdr.gcObjType == .functionBytecode
-                 || hdr.gcObjType == .varRef)
+            guard hdr.mark == JeffJSGCMark.white else { return false }
+            if hdr.gcObjType == .jsObject || hdr.gcObjType == .functionBytecode
+                || hdr.gcObjType == .varRef { return true }
+            return jeffJS_shapeIsSweepable(rt, hdr)
         }
         if isDead {
             u._withUnsafeGuaranteedRef { $0.gcListIndex = -2 - rt.gcTmpObjects.count }
@@ -542,6 +537,9 @@ private func gcFreeCycles(_ rt: JeffJSRuntime) {
     }
     rt.gcObjects = remaining
     rt.gcCyclesFreed += rt.gcTmpObjects.count
+    for u in rt.gcTmpObjects where u._withUnsafeGuaranteedRef({ $0.gcObjType == .shape }) {
+        rt.shapesEvicted += 1
+    }
 
     // Strong from here on: gcFreeDeadObjects hands the allocations back.
     var dead: [JeffJSGCObjectHeader] = []
@@ -566,6 +564,39 @@ func gcDebugDumpDead(_ rt: JeffJSRuntime, _ dead: [JeffJSGCObjectHeader], collec
         for pr in sh.prop.prefix(8) { names.append(rt.atomToString(pr.atom) ?? "?") }
         print("[GC-FREE] class=\(obj.classID) rc=\(obj.refCount) props=\(names)")
     }
+}
+
+/// True when `header` is a hashed shape with no owners left, i.e. one the
+/// collection should sweep out of the transition table.
+///
+/// Nothing ever emptied that table: `removeHashedShape` was reachable only
+/// from `freeShape`, and `freeObject` refused to free a hashed shape at zero
+/// owners, so `shapeHashCount` only went up. Because a shape owns one counted
+/// reference to its prototype (Round 12), a loop that builds a fresh prototype
+/// parked one hashed root shape per prototype and kept that prototype alive
+/// for the life of the runtime — 0.72 objects per iteration. Past
+/// `shapes.maxHashed` (16 384) it got worse, not better: insertion is simply
+/// skipped, so every later object builds a private shape and every property
+/// access on it is a permanent inline-cache miss.
+///
+/// Sweeping is safe even though the inline caches compare shapes by raw
+/// address, for three reasons that all had to hold:
+///  * `refCount == 0` means no object is on the shape, so no live receiver can
+///    match an IC entry naming it. All four context-level shape caches take a
+///    count — `plainObjectRootShape` did not, and now does.
+///  * Every IC entry retains the shapes it names (`JeffJSInlineCache` already
+///    did this, against exactly this hazard), so the allocation outlives the
+///    sweep and its address cannot be handed to a new shape while a stale
+///    entry still points at it.
+///  * `removeHashedShape` clears `isHashed`, and `jeffJS_icDefine` refuses a
+///    transition target that is not hashed — so a `define_field` cache whose
+///    `nextShapePtr` was swept misses instead of moving an object onto a
+///    gutted shape. That is the invalidation, and it was already there.
+@inline(__always)
+func jeffJS_shapeIsSweepable(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) -> Bool {
+    guard header.gcObjType == .shape, header.refCount == 0,
+          rt.shapeHashCount >= JeffJSConfig.shapesEvictThreshold else { return false }
+    return unsafeBitCast(header, to: JeffJSShape.self).isHashed
 }
 
 /// Take a doomed header off the GC lists by hand. The lists have already been

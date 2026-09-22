@@ -294,12 +294,13 @@ final class JeffJSMetalGC {
             let hdr = u.takeUnretainedValue()
             if deadIndexSet.contains(i),
                hdr.gcObjType == .jsObject || hdr.gcObjType == .functionBytecode
-                || hdr.gcObjType == .varRef {
+                || hdr.gcObjType == .varRef || jeffJS_shapeIsSweepable(rt, hdr) {
                 // Unlinked by hand, so the malloc accounting the GC threshold
                 // reads must be done here too (see gcUnlistDead).
                 hdr.gcListIndex = -1
                 rt.mallocState.mallocSize -= JeffJSConfig.gcObjectCost
                 rt.mallocState.mallocCount -= 1
+                if hdr.gcObjType == .shape { rt.shapesEvicted += 1 }
                 deadHeaders.append(hdr)
             } else {
                 hdr.gcListIndex = remaining.count
