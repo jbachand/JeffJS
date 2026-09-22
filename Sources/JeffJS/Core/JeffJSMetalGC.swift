@@ -15,6 +15,12 @@
 import Metal
 import Foundation
 
+/// `JEFFJS_GC_METAL=1`: load the collector's kernels from the package resource
+/// bundle when the process has no Metal default library of its own, so the CLI
+/// and the test suite run the same GPU collector the host app does.
+nonisolated(unsafe) let jeffJSForceMetalGC =
+    ProcessInfo.processInfo.environment["JEFFJS_GC_METAL"] == "1"
+
 // MARK: - GPU-side struct (must match JeffJSMetalGC.metal exactly)
 
 /// Mirror of the Metal shader's GCNode struct.
@@ -87,41 +93,9 @@ final class JeffJSMetalGC {
 
         // ---- Step 1: Snapshot the object graph ----
 
-        var nodes = [MetalGCNode]()
-        nodes.reserveCapacity(objectCount)
-        var children = [UInt32]()
-        children.reserveCapacity(objectCount * 4) // estimate ~4 children per object
-
-        // Map from JeffJSGCObjectHeader identity to index in the nodes array
-        var headerToIndex = [ObjectIdentifier: UInt32]()
-        headerToIndex.reserveCapacity(objectCount)
-
-        for (i, u) in rt.gcObjects.enumerated() {
-            headerToIndex[ObjectIdentifier(u.takeUnretainedValue())] = UInt32(i)
-        }
-
-        for u in rt.gcObjects {
-            let hdr = u.takeUnretainedValue()
-            let childOffset = UInt32(children.count)
-
-            // Enumerate children (replicates markChildren logic)
-            var childIndices = [UInt32]()
-            enumerateChildren(rt, hdr) { childHeader in
-                if let idx = headerToIndex[ObjectIdentifier(childHeader)] {
-                    childIndices.append(idx)
-                }
-            }
-
-            children.append(contentsOf: childIndices)
-
-            let node = MetalGCNode(
-                refCount: Int32(clamping: hdr.refCount),
-                childCount: UInt32(childIndices.count),
-                childOffset: childOffset,
-                mark: 0 // white
-            )
-            nodes.append(node)
-        }
+        let snapshot = buildGraphSnapshot(rt: rt)
+        var nodes = snapshot.nodes
+        var children = snapshot.children
 
         // ---- Step 2: Allocate Metal shared buffers ----
 
@@ -176,6 +150,7 @@ final class JeffJSMetalGC {
 
         // ---- Step 3b: Phase 2 — Scan/rescue (iterative until convergence) ----
 
+        var converged = false
         for _ in 0 ..< maxRescueIterations {
             // Reset rescue counter to 0
             let rescuePtr = rescueCountBuffer.contents().bindMemory(to: UInt32.self, capacity: 1)
@@ -197,9 +172,15 @@ final class JeffJSMetalGC {
             // Check if any nodes were rescued this iteration
             let rescuedCount = rescuePtr.pointee
             if rescuedCount == 0 {
+                converged = true
                 break // Converged
             }
         }
+        // Each iteration propagates the rescue one level, so a graph deeper
+        // than the cap is only half-scanned: everything the wavefront had not
+        // reached yet is still white and phase 3 would free it while it is
+        // live. Abandon the collection instead — the next run gets another go.
+        guard converged else { return }
 
         // ---- Step 3c: Phase 3 — Collect dead node indices ----
 
@@ -295,8 +276,23 @@ final class JeffJSMetalGC {
         }
         self.commandQueue = queue
 
-        // Load the shader library from the app bundle
-        guard let library = dev.makeDefaultLibrary() else {
+        // Load the shader library from the app bundle. A host app links the
+        // shaders into its own default library; a SwiftPM consumer (the CLI,
+        // the test suite) has no default library at all, which is why the GPU
+        // collector never ran outside the app and its divergences from the CPU
+        // collector went unseen. JEFFJS_GC_METAL=1 loads the same kernels out
+        // of the package's resource bundle so both can be exercised here.
+        var loaded: MTLLibrary? = dev.makeDefaultLibrary()
+        if loaded == nil, jeffJSForceMetalGC {
+            if let compiled = try? dev.makeDefaultLibrary(bundle: jeffJSResourceBundle) {
+                loaded = compiled
+            } else if let url = jeffJSResourceBundle.url(forResource: "JeffJSMetalGC",
+                                                         withExtension: "metal"),
+                      let source = try? String(contentsOf: url, encoding: .utf8) {
+                loaded = try? dev.makeLibrary(source: source, options: nil)
+            }
+        }
+        guard let library = loaded else {
             metalAvailable = false
             return
         }
@@ -320,6 +316,69 @@ final class JeffJSMetalGC {
     }
 
     // MARK: - Object graph child enumeration
+
+    /// Flatten the runtime's GC list into the node array and adjacency list the
+    /// kernels run on. Split out of `runMetalGC` so the seeding rules can be
+    /// checked without a GPU (MetalGCVarRefTests).
+    ///
+    /// Every node starts at its header's refcount — *except* detached var-refs.
+    /// Nothing maintains a var-ref's refcount: closures hold them through ARC,
+    /// and `JeffJSVarRef.init` leaves it at 1 forever no matter how many
+    /// closures capture the slot. The CPU collector handles that by seeding
+    /// them to zero (`gcSeedVarRefs`) and then skipping them in the trial
+    /// decrement (`gcDecrefChild`), so phases 2 and 2b recompute the in-degree.
+    /// `gc_trial_decref` has no such exemption — it decrements every edge it is
+    /// given — so the equivalent seed here is the in-degree itself: phase 1
+    /// takes it back to zero and the rescue pass puts back one count per
+    /// surviving holder, exactly as on the CPU.
+    ///
+    /// Seeding them with the header's 1 instead is what made `threes.day`
+    /// render blank: Prism's module object is captured by ~30 closures, so its
+    /// var-ref went to 1 - 30 in phase 1, could not be rescued, and was freed
+    /// with every one of those closures still live. `freeGCObjectChildren`
+    /// clears a dead var-ref's `value`, so `Prism.util.clone` then read its
+    /// captured `n` as `undefined` and threw on `n.util`. Only the host app
+    /// ever saw it: a SwiftPM consumer has no Metal default library, so the
+    /// CLI and the test suite always took the (correct) CPU path.
+    func buildGraphSnapshot(rt: JeffJSRuntime) -> (nodes: [MetalGCNode], children: [UInt32]) {
+        let objectCount = rt.gcObjects.count
+        var nodes = [MetalGCNode]()
+        nodes.reserveCapacity(objectCount)
+        var children = [UInt32]()
+        children.reserveCapacity(objectCount * 4) // estimate ~4 children per object
+
+        // Map from JeffJSGCObjectHeader identity to index in the nodes array
+        var headerToIndex = [ObjectIdentifier: UInt32]()
+        headerToIndex.reserveCapacity(objectCount)
+        for (i, u) in rt.gcObjects.enumerated() {
+            headerToIndex[ObjectIdentifier(u.takeUnretainedValue())] = UInt32(i)
+        }
+
+        var inDegree = [Int32](repeating: 0, count: objectCount)
+        var varRefNodes: [Int] = []
+        for (i, u) in rt.gcObjects.enumerated() {
+            let hdr = u.takeUnretainedValue()
+            let childOffset = UInt32(children.count)
+            var childCount: UInt32 = 0
+            // Children come from the CPU collector's markChildren, so the GPU
+            // graph can never drift from the reference traversal.
+            enumerateChildren(rt, hdr) { childHeader in
+                guard let idx = headerToIndex[ObjectIdentifier(childHeader)] else { return }
+                children.append(idx)
+                childCount += 1
+                inDegree[Int(idx)] += 1
+            }
+            nodes.append(MetalGCNode(
+                refCount: Int32(clamping: hdr.refCount),
+                childCount: childCount,
+                childOffset: childOffset,
+                mark: 0 // white
+            ))
+            if hdr.gcObjType == .varRef { varRefNodes.append(i) }
+        }
+        for i in varRefNodes { nodes[i].refCount = inDegree[i] }
+        return (nodes, children)
+    }
 
     /// Enumerate all GC-managed children of a header, calling the visitor for each.
     /// Delegates to the CPU collector's `markChildren` so the GPU graph can never

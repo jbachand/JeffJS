@@ -2901,6 +2901,20 @@ final class JeffJSParser {
             expect(0x28) // '('
             let (defaults, rest, dstructs) = parseFormalParameters(childFd: childFd)
             expect(0x29) // ')'
+            // ES §15.2.4 / §10.2.11: the self-reference binding lives in a
+            // funcEnv *outside* the parameter scope, so a formal parameter of
+            // the same name shadows it — `(function g(g) { return typeof g })(1)`
+            // is "number", not "function". Here the binding is an ordinary
+            // local, and resolveScopeVar searches locals before args, so it
+            // would win; drop it (the name atom is what the lookup matches on,
+            // and the slot is then simply unused). A body `var`/`let`/function
+            // declaration already shadows it: those are declared later and the
+            // scope chain is searched most-recent first.
+            if childFd.funcNameVarIdx >= 0,
+               childFd.args.contains(where: { $0.varName == funcName }) {
+                childFd.vars[childFd.funcNameVarIdx].varName = JeffJSAtomID.JS_ATOM_NULL.rawValue
+                childFd.funcNameVarIdx = -1
+            }
             expect(0x7B) // '{'
             parseFunctionBody(childFd: childFd, defaults: defaults, rest: rest, destructs: dstructs)
             expect(0x7D) // '}'
