@@ -262,10 +262,12 @@ final class SelectorTests: XCTestCase {
         XCTAssertTrue(node(root, id: "empty").matchesSelector(":empty"))
         XCTAssertTrue(node(root, id: "cmt").matchesSelector(":empty"))
         XCTAssertFalse(node(root, id: "txt").matchesSelector(":empty"))
-        // :root is the document element — exactly one per document, even when
-        // the markup has several top-level elements.
+        // :root is the document element — exactly one per document. A bare
+        // fragment like the markup above is still parsed as a *document*, so
+        // the parser supplies the implied <html>/<head>/<body> and that <html>
+        // is the root (what a browser does with the same source).
         XCTAssertEqual(root.querySelectorAll(":root").count, 1)
-        XCTAssertEqual(root.querySelectorAll(":root")[0].tagName, "ul")
+        XCTAssertEqual(root.querySelectorAll(":root")[0].tagName, "html")
         let page = tree("<html><body><div id='d'>x</div></body></html>")
         XCTAssertEqual(page.querySelectorAll(":root").map { $0.tagName }, ["html"])
         XCTAssertFalse(node(page, id: "d").matchesSelector(":root"))

@@ -33,6 +33,49 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
     public let tagName: String?
     public internal(set) var attributes: [String: String]
 
+    /// The element's namespace. `nil` means the HTML namespace — the common
+    /// case, kept nil so nothing pays for a string it never reads.
+    public internal(set) var namespaceURI: String?
+
+    /// ASCII-lowercased aliases of case-sensitive foreign-content attribute
+    /// names (`viewbox` -> the `viewBox` entry). They live in `attributes` so
+    /// every existing `attributes["viewbox"]` lookup keeps working, and are
+    /// listed here so enumeration (`element.attributes`, `outerHTML`) can skip
+    /// them.
+    public internal(set) var aliasAttributeKeys: Set<String> = []
+
+    /// `attributes` without the lowercase aliases — what the DOM exposes.
+    public var enumerableAttributes: [String: String] {
+        guard !aliasAttributeKeys.isEmpty else { return attributes }
+        return attributes.filter { !aliasAttributeKeys.contains($0.key) }
+    }
+
+    /// Document-level quirks mode, decided by the parser from the DOCTYPE.
+    /// Only meaningful on a `.document` node.
+    public enum QuirksMode: String, Sendable {
+        case noQuirks
+        case quirks
+        case limitedQuirks
+    }
+
+    public internal(set) var quirksMode: QuirksMode = .noQuirks
+
+    /// `document.compatMode`: "BackCompat" in quirks mode, "CSS1Compat"
+    /// otherwise (limited-quirks is a standards mode as far as this reports).
+    public var compatMode: String {
+        quirksMode == .quirks ? "BackCompat" : "CSS1Compat"
+    }
+
+    public static let htmlNamespace = "http://www.w3.org/1999/xhtml"
+    public static let svgNamespace = "http://www.w3.org/2000/svg"
+    public static let mathmlNamespace = "http://www.w3.org/1998/Math/MathML"
+
+    /// True for HTML-namespace elements (and for anything the parser did not
+    /// tag, which is the same thing).
+    public var isHTMLNamespace: Bool {
+        namespaceURI == nil || namespaceURI == Self.htmlNamespace
+    }
+
     // Text/comment content
     public internal(set) var textContent: String?
 
@@ -54,9 +97,16 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
         DOMNode(nodeType: .documentFragment, tagName: nil, attributes: [:], textContent: nil)
     }
 
-    public static func element(tag: String, attributes: [String: String] = [:], preserveCase: Bool = false) -> DOMNode {
+    public static func element(
+        tag: String,
+        attributes: [String: String] = [:],
+        preserveCase: Bool = false,
+        namespace: String? = nil
+    ) -> DOMNode {
         let resolvedTag = preserveCase ? tag : tag.lowercased()
-        return DOMNode(nodeType: .element, tagName: resolvedTag, attributes: attributes, textContent: nil)
+        let node = DOMNode(nodeType: .element, tagName: resolvedTag, attributes: attributes, textContent: nil)
+        node.namespaceURI = namespace
+        return node
     }
 
     public static func text(_ content: String) -> DOMNode {
@@ -241,6 +291,23 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
 
     // MARK: - Tree Mutation (used during parsing)
 
+    /// The last child without copying the whole children array — `children`
+    /// hands back a snapshot, which turns "append this character to the
+    /// trailing text node" into an O(n) copy per text token.
+    var lastChildNode: DOMNode? {
+        childrenLock.lock()
+        defer { childrenLock.unlock() }
+        return _children.last
+    }
+
+    /// The child immediately before `node`, again without a snapshot.
+    func childBefore(_ node: DOMNode) -> DOMNode? {
+        childrenLock.lock()
+        defer { childrenLock.unlock() }
+        guard let index = _children.firstIndex(where: { $0 === node }), index > 0 else { return nil }
+        return _children[index - 1]
+    }
+
     func appendChild(_ child: DOMNode) {
         child.parent = self
         childrenLock.lock()
@@ -333,7 +400,12 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
 
     public func setAttributePreservingCase(name: String, value: String) {
         attributes[name] = value
-        invalidateClassListIfNeeded(name.lowercased())
+        let lower = name.lowercased()
+        if lower != name {
+            attributes[lower] = value
+            aliasAttributeKeys.insert(lower)
+        }
+        invalidateClassListIfNeeded(lower)
     }
 
     public func removeAttributePreservingCase(name: String) {

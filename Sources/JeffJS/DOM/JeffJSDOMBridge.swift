@@ -336,6 +336,9 @@ final class JeffJSDOMBridge {
         ctx.setPropertyStr(obj: doc, name: "characterSet", value: ctx.newStringValue("UTF-8"))
         ctx.setPropertyStr(obj: doc, name: "charset", value: ctx.newStringValue("UTF-8"))
         ctx.setPropertyStr(obj: doc, name: "contentType", value: ctx.newStringValue("text/html"))
+        // The real value the parser decided from the DOCTYPE, not a guess made
+        // by re-scanning the source text.
+        ctx.setPropertyStr(obj: doc, name: "compatMode", value: ctx.newStringValue(root.compatMode))
         ctx.setPropertyStr(obj: doc, name: "visibilityState", value: ctx.newStringValue("visible"))
         ctx.setPropertyStr(obj: doc, name: "hidden", value: .newBool(false))
         ctx.setPropertyStr(obj: doc, name: "readyState", value: ctx.newStringValue("loading"))
@@ -1067,7 +1070,7 @@ final class JeffJSDOMBridge {
             guard let self else { return ctx.newArray() }
             guard let targetNode = self.extractNode(from: thisVal) else { return ctx.newArray() }
             let arr = ctx.newArray()
-            let keys = Array(targetNode.attributes.keys)
+            let keys = Array(targetNode.enumerableAttributes.keys)
             for (i, key) in keys.enumerated() {
                 ctx.setPropertyUint32(obj: arr, index: UInt32(i), value: ctx.newStringValue(key))
             }
@@ -1413,7 +1416,12 @@ final class JeffJSDOMBridge {
                   let position = self.extractString(ctx: ctx, args: args, index: 0),
                   let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             let html = self.extractString(ctx: ctx, args: args, index: 1) ?? ""
-            _ = self.insertAdjacent(position: position, target: targetNode, nodes: Self.parseHTMLFragment(html))
+            // beforebegin/afterend parse in the *parent's* context, beforeend/
+            // afterbegin in the element's own.
+            let context = (position.lowercased() == "beforebegin" || position.lowercased() == "afterend")
+                ? (targetNode.parent ?? targetNode) : targetNode
+            _ = self.insertAdjacent(position: position, target: targetNode,
+                                    nodes: Self.parseHTMLFragment(html, context: context))
             return JeffJSValue.undefined
         }, length: 2)
 
@@ -1540,7 +1548,7 @@ final class JeffJSDOMBridge {
             let html = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
             for child in targetNode.children { self.clearNodeAndDescendants(child) }
             targetNode.clearChildren()
-            let parsed = Self.parseHTMLFragment(html)
+            let parsed = Self.parseHTMLFragment(html, context: targetNode)
             for child in parsed {
                 targetNode.appendChild(child)
             }
@@ -1560,7 +1568,7 @@ final class JeffJSDOMBridge {
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             guard let parent = targetNode.parent else { return JeffJSValue.undefined }
             let html = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
-            for node in Self.parseHTMLFragment(html) {
+            for node in Self.parseHTMLFragment(html, context: parent) {
                 parent.insertChild(node, before: targetNode)
             }
             parent.removeChild(targetNode)
@@ -2821,7 +2829,12 @@ final class JeffJSDOMBridge {
     private func cloneDOMNode(_ node: DOMNode, deep: Bool) -> DOMNode {
         switch node.nodeType {
         case .element:
-            let cloned = DOMNode.element(tag: node.tagName ?? "div", attributes: node.attributes)
+            let cloned = DOMNode.element(
+                tag: node.tagName ?? "div",
+                attributes: node.attributes,
+                preserveCase: true,
+                namespace: node.namespaceURI
+            )
             if deep {
                 for child in node.children {
                     cloned.appendChild(cloneDOMNode(child, deep: true))
@@ -2886,7 +2899,7 @@ final class JeffJSDOMBridge {
         case .element:
             guard let tag = node.tagName else { return "" }
             var html = "<\(tag)"
-            for (key, val) in node.attributes.sorted(by: { $0.key < $1.key }) {
+            for (key, val) in node.enumerableAttributes.sorted(by: { $0.key < $1.key }) {
                 html += " \(key)=\"\(escapeAttribute(val))\""
             }
             let voidTags: Set<String> = [
@@ -2916,13 +2929,15 @@ final class JeffJSDOMBridge {
             .replacingOccurrences(of: ">", with: "&gt;")
     }
 
-    private static func parseHTMLFragment(_ html: String) -> [DOMNode] {
-        let wrapped = "<html><body>\(html)</body></html>"
-        let doc = HTMLParser.parse(wrapped)
-        guard let body = doc.querySelector("body") else {
-            return doc.children
-        }
-        return body.children
+    /// The HTML fragment parsing algorithm, run with `context` as the context
+    /// element — which is what makes `table.innerHTML = "<tr>…"` keep its rows
+    /// instead of foster-parenting them out of the table.
+    static func parseHTMLFragment(_ html: String, context: DOMNode? = nil) -> [DOMNode] {
+        HTMLParser.parseFragment(
+            html,
+            context: context?.tagName,
+            contextNamespace: context?.namespaceURI
+        )
     }
 
     // MARK: - Inline Style Helpers

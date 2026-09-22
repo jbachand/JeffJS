@@ -1,0 +1,414 @@
+import Foundation
+
+// Generated from the WHATWG HTML named character reference table
+// (HTML Standard §13.5, mirrored by CPython's `html.entities.html5`).
+// 2231 names, 106 of which are the legacy semicolon-less ones. Stored as one
+// packed string and decoded once, lazily: 2231 Swift dictionary literals cost
+// minutes of type-checking, a single literal costs nothing.
+enum HTMLEntities {
+
+    /// Longest legacy (semicolon-less) name, `frac34`. Bounds the backtracking
+    /// scan for `&amp` / `&notit;`-style references.
+    static let maxLegacyNameLength = 6
+
+    /// Longest name in the table, `CounterClockwiseContourIntegral;`.
+    static let maxNameLength = 32
+
+    /// name (including its trailing `;` when it has one) -> replacement text.
+    static let table: [String: String] = {
+        var result = [String: String](minimumCapacity: 2231)
+        var name = ""
+        var value = ""
+        var inValue = false
+        for ch in packed {
+            switch ch {
+            case "\t": inValue = true
+            case "\n":
+                result[name] = value
+                name = ""; value = ""; inValue = false
+            default:
+                if inValue { value.append(ch) } else { name.append(ch) }
+            }
+        }
+        return result
+    }()
+
+    /// Looks a candidate name up. `name` excludes the leading `&` and includes
+    /// the trailing `;` when the source had one.
+    @inline(__always)
+    static func lookup(_ name: String) -> String? { table[name] }
+
+    private static let packed: String =
+        "AElig\t\u{C6}\nAElig;\t\u{C6}\nAMP\t&\nAMP;\t&\nAacute\t\u{C1}\nAacute;\t\u{C1}\n" +
+        "Abreve;\t\u{102}\nAcirc\t\u{C2}\nAcirc;\t\u{C2}\nAcy;\t\u{410}\nAfr;\t\u{1D504}\nAgrave\t\u{C0}\n" +
+        "Agrave;\t\u{C0}\nAlpha;\t\u{391}\nAmacr;\t\u{100}\nAnd;\t\u{2A53}\nAogon;\t\u{104}\nAopf;\t\u{1D538}\n" +
+        "ApplyFunction;\t\u{2061}\nAring\t\u{C5}\nAring;\t\u{C5}\nAscr;\t\u{1D49C}\nAssign;\t\u{2254}\nAtilde\t\u{C3}\n" +
+        "Atilde;\t\u{C3}\nAuml\t\u{C4}\nAuml;\t\u{C4}\nBackslash;\t\u{2216}\nBarv;\t\u{2AE7}\nBarwed;\t\u{2306}\n" +
+        "Bcy;\t\u{411}\nBecause;\t\u{2235}\nBernoullis;\t\u{212C}\nBeta;\t\u{392}\nBfr;\t\u{1D505}\nBopf;\t\u{1D539}\n" +
+        "Breve;\t\u{2D8}\nBscr;\t\u{212C}\nBumpeq;\t\u{224E}\nCHcy;\t\u{427}\nCOPY\t\u{A9}\nCOPY;\t\u{A9}\n" +
+        "Cacute;\t\u{106}\nCap;\t\u{22D2}\nCapitalDifferentialD;\t\u{2145}\nCayleys;\t\u{212D}\nCcaron;\t\u{10C}\nCcedil\t\u{C7}\n" +
+        "Ccedil;\t\u{C7}\nCcirc;\t\u{108}\nCconint;\t\u{2230}\nCdot;\t\u{10A}\nCedilla;\t\u{B8}\nCenterDot;\t\u{B7}\n" +
+        "Cfr;\t\u{212D}\nChi;\t\u{3A7}\nCircleDot;\t\u{2299}\nCircleMinus;\t\u{2296}\nCirclePlus;\t\u{2295}\nCircleTimes;\t\u{2297}\n" +
+        "ClockwiseContourIntegral;\t\u{2232}\nCloseCurlyDoubleQuote;\t\u{201D}\nCloseCurlyQuote;\t\u{2019}\nColon;\t\u{2237}\nColone;\t\u{2A74}\nCongruent;\t\u{2261}\n" +
+        "Conint;\t\u{222F}\nContourIntegral;\t\u{222E}\nCopf;\t\u{2102}\nCoproduct;\t\u{2210}\nCounterClockwiseContourIntegral;\t\u{2233}\nCross;\t\u{2A2F}\n" +
+        "Cscr;\t\u{1D49E}\nCup;\t\u{22D3}\nCupCap;\t\u{224D}\nDD;\t\u{2145}\nDDotrahd;\t\u{2911}\nDJcy;\t\u{402}\n" +
+        "DScy;\t\u{405}\nDZcy;\t\u{40F}\nDagger;\t\u{2021}\nDarr;\t\u{21A1}\nDashv;\t\u{2AE4}\nDcaron;\t\u{10E}\n" +
+        "Dcy;\t\u{414}\nDel;\t\u{2207}\nDelta;\t\u{394}\nDfr;\t\u{1D507}\nDiacriticalAcute;\t\u{B4}\nDiacriticalDot;\t\u{2D9}\n" +
+        "DiacriticalDoubleAcute;\t\u{2DD}\nDiacriticalGrave;\t`\nDiacriticalTilde;\t\u{2DC}\nDiamond;\t\u{22C4}\nDifferentialD;\t\u{2146}\nDopf;\t\u{1D53B}\n" +
+        "Dot;\t\u{A8}\nDotDot;\t\u{20DC}\nDotEqual;\t\u{2250}\nDoubleContourIntegral;\t\u{222F}\nDoubleDot;\t\u{A8}\nDoubleDownArrow;\t\u{21D3}\n" +
+        "DoubleLeftArrow;\t\u{21D0}\nDoubleLeftRightArrow;\t\u{21D4}\nDoubleLeftTee;\t\u{2AE4}\nDoubleLongLeftArrow;\t\u{27F8}\nDoubleLongLeftRightArrow;\t\u{27FA}\nDoubleLongRightArrow;\t\u{27F9}\n" +
+        "DoubleRightArrow;\t\u{21D2}\nDoubleRightTee;\t\u{22A8}\nDoubleUpArrow;\t\u{21D1}\nDoubleUpDownArrow;\t\u{21D5}\nDoubleVerticalBar;\t\u{2225}\nDownArrow;\t\u{2193}\n" +
+        "DownArrowBar;\t\u{2913}\nDownArrowUpArrow;\t\u{21F5}\nDownBreve;\t\u{311}\nDownLeftRightVector;\t\u{2950}\nDownLeftTeeVector;\t\u{295E}\nDownLeftVector;\t\u{21BD}\n" +
+        "DownLeftVectorBar;\t\u{2956}\nDownRightTeeVector;\t\u{295F}\nDownRightVector;\t\u{21C1}\nDownRightVectorBar;\t\u{2957}\nDownTee;\t\u{22A4}\nDownTeeArrow;\t\u{21A7}\n" +
+        "Downarrow;\t\u{21D3}\nDscr;\t\u{1D49F}\nDstrok;\t\u{110}\nENG;\t\u{14A}\nETH\t\u{D0}\nETH;\t\u{D0}\n" +
+        "Eacute\t\u{C9}\nEacute;\t\u{C9}\nEcaron;\t\u{11A}\nEcirc\t\u{CA}\nEcirc;\t\u{CA}\nEcy;\t\u{42D}\n" +
+        "Edot;\t\u{116}\nEfr;\t\u{1D508}\nEgrave\t\u{C8}\nEgrave;\t\u{C8}\nElement;\t\u{2208}\nEmacr;\t\u{112}\n" +
+        "EmptySmallSquare;\t\u{25FB}\nEmptyVerySmallSquare;\t\u{25AB}\nEogon;\t\u{118}\nEopf;\t\u{1D53C}\nEpsilon;\t\u{395}\nEqual;\t\u{2A75}\n" +
+        "EqualTilde;\t\u{2242}\nEquilibrium;\t\u{21CC}\nEscr;\t\u{2130}\nEsim;\t\u{2A73}\nEta;\t\u{397}\nEuml\t\u{CB}\n" +
+        "Euml;\t\u{CB}\nExists;\t\u{2203}\nExponentialE;\t\u{2147}\nFcy;\t\u{424}\nFfr;\t\u{1D509}\nFilledSmallSquare;\t\u{25FC}\n" +
+        "FilledVerySmallSquare;\t\u{25AA}\nFopf;\t\u{1D53D}\nForAll;\t\u{2200}\nFouriertrf;\t\u{2131}\nFscr;\t\u{2131}\nGJcy;\t\u{403}\n" +
+        "GT\t>\nGT;\t>\nGamma;\t\u{393}\nGammad;\t\u{3DC}\nGbreve;\t\u{11E}\nGcedil;\t\u{122}\n" +
+        "Gcirc;\t\u{11C}\nGcy;\t\u{413}\nGdot;\t\u{120}\nGfr;\t\u{1D50A}\nGg;\t\u{22D9}\nGopf;\t\u{1D53E}\n" +
+        "GreaterEqual;\t\u{2265}\nGreaterEqualLess;\t\u{22DB}\nGreaterFullEqual;\t\u{2267}\nGreaterGreater;\t\u{2AA2}\nGreaterLess;\t\u{2277}\nGreaterSlantEqual;\t\u{2A7E}\n" +
+        "GreaterTilde;\t\u{2273}\nGscr;\t\u{1D4A2}\nGt;\t\u{226B}\nHARDcy;\t\u{42A}\nHacek;\t\u{2C7}\nHat;\t^\n" +
+        "Hcirc;\t\u{124}\nHfr;\t\u{210C}\nHilbertSpace;\t\u{210B}\nHopf;\t\u{210D}\nHorizontalLine;\t\u{2500}\nHscr;\t\u{210B}\n" +
+        "Hstrok;\t\u{126}\nHumpDownHump;\t\u{224E}\nHumpEqual;\t\u{224F}\nIEcy;\t\u{415}\nIJlig;\t\u{132}\nIOcy;\t\u{401}\n" +
+        "Iacute\t\u{CD}\nIacute;\t\u{CD}\nIcirc\t\u{CE}\nIcirc;\t\u{CE}\nIcy;\t\u{418}\nIdot;\t\u{130}\n" +
+        "Ifr;\t\u{2111}\nIgrave\t\u{CC}\nIgrave;\t\u{CC}\nIm;\t\u{2111}\nImacr;\t\u{12A}\nImaginaryI;\t\u{2148}\n" +
+        "Implies;\t\u{21D2}\nInt;\t\u{222C}\nIntegral;\t\u{222B}\nIntersection;\t\u{22C2}\nInvisibleComma;\t\u{2063}\nInvisibleTimes;\t\u{2062}\n" +
+        "Iogon;\t\u{12E}\nIopf;\t\u{1D540}\nIota;\t\u{399}\nIscr;\t\u{2110}\nItilde;\t\u{128}\nIukcy;\t\u{406}\n" +
+        "Iuml\t\u{CF}\nIuml;\t\u{CF}\nJcirc;\t\u{134}\nJcy;\t\u{419}\nJfr;\t\u{1D50D}\nJopf;\t\u{1D541}\n" +
+        "Jscr;\t\u{1D4A5}\nJsercy;\t\u{408}\nJukcy;\t\u{404}\nKHcy;\t\u{425}\nKJcy;\t\u{40C}\nKappa;\t\u{39A}\n" +
+        "Kcedil;\t\u{136}\nKcy;\t\u{41A}\nKfr;\t\u{1D50E}\nKopf;\t\u{1D542}\nKscr;\t\u{1D4A6}\nLJcy;\t\u{409}\n" +
+        "LT\t<\nLT;\t<\nLacute;\t\u{139}\nLambda;\t\u{39B}\nLang;\t\u{27EA}\nLaplacetrf;\t\u{2112}\n" +
+        "Larr;\t\u{219E}\nLcaron;\t\u{13D}\nLcedil;\t\u{13B}\nLcy;\t\u{41B}\nLeftAngleBracket;\t\u{27E8}\nLeftArrow;\t\u{2190}\n" +
+        "LeftArrowBar;\t\u{21E4}\nLeftArrowRightArrow;\t\u{21C6}\nLeftCeiling;\t\u{2308}\nLeftDoubleBracket;\t\u{27E6}\nLeftDownTeeVector;\t\u{2961}\nLeftDownVector;\t\u{21C3}\n" +
+        "LeftDownVectorBar;\t\u{2959}\nLeftFloor;\t\u{230A}\nLeftRightArrow;\t\u{2194}\nLeftRightVector;\t\u{294E}\nLeftTee;\t\u{22A3}\nLeftTeeArrow;\t\u{21A4}\n" +
+        "LeftTeeVector;\t\u{295A}\nLeftTriangle;\t\u{22B2}\nLeftTriangleBar;\t\u{29CF}\nLeftTriangleEqual;\t\u{22B4}\nLeftUpDownVector;\t\u{2951}\nLeftUpTeeVector;\t\u{2960}\n" +
+        "LeftUpVector;\t\u{21BF}\nLeftUpVectorBar;\t\u{2958}\nLeftVector;\t\u{21BC}\nLeftVectorBar;\t\u{2952}\nLeftarrow;\t\u{21D0}\nLeftrightarrow;\t\u{21D4}\n" +
+        "LessEqualGreater;\t\u{22DA}\nLessFullEqual;\t\u{2266}\nLessGreater;\t\u{2276}\nLessLess;\t\u{2AA1}\nLessSlantEqual;\t\u{2A7D}\nLessTilde;\t\u{2272}\n" +
+        "Lfr;\t\u{1D50F}\nLl;\t\u{22D8}\nLleftarrow;\t\u{21DA}\nLmidot;\t\u{13F}\nLongLeftArrow;\t\u{27F5}\nLongLeftRightArrow;\t\u{27F7}\n" +
+        "LongRightArrow;\t\u{27F6}\nLongleftarrow;\t\u{27F8}\nLongleftrightarrow;\t\u{27FA}\nLongrightarrow;\t\u{27F9}\nLopf;\t\u{1D543}\nLowerLeftArrow;\t\u{2199}\n" +
+        "LowerRightArrow;\t\u{2198}\nLscr;\t\u{2112}\nLsh;\t\u{21B0}\nLstrok;\t\u{141}\nLt;\t\u{226A}\nMap;\t\u{2905}\n" +
+        "Mcy;\t\u{41C}\nMediumSpace;\t\u{205F}\nMellintrf;\t\u{2133}\nMfr;\t\u{1D510}\nMinusPlus;\t\u{2213}\nMopf;\t\u{1D544}\n" +
+        "Mscr;\t\u{2133}\nMu;\t\u{39C}\nNJcy;\t\u{40A}\nNacute;\t\u{143}\nNcaron;\t\u{147}\nNcedil;\t\u{145}\n" +
+        "Ncy;\t\u{41D}\nNegativeMediumSpace;\t\u{200B}\nNegativeThickSpace;\t\u{200B}\nNegativeThinSpace;\t\u{200B}\nNegativeVeryThinSpace;\t\u{200B}\nNestedGreaterGreater;\t\u{226B}\n" +
+        "NestedLessLess;\t\u{226A}\nNewLine;\t\u{A}\nNfr;\t\u{1D511}\nNoBreak;\t\u{2060}\nNonBreakingSpace;\t\u{A0}\nNopf;\t\u{2115}\n" +
+        "Not;\t\u{2AEC}\nNotCongruent;\t\u{2262}\nNotCupCap;\t\u{226D}\nNotDoubleVerticalBar;\t\u{2226}\nNotElement;\t\u{2209}\nNotEqual;\t\u{2260}\n" +
+        "NotEqualTilde;\t\u{2242}\u{338}\nNotExists;\t\u{2204}\nNotGreater;\t\u{226F}\nNotGreaterEqual;\t\u{2271}\nNotGreaterFullEqual;\t\u{2267}\u{338}\nNotGreaterGreater;\t\u{226B}\u{338}\n" +
+        "NotGreaterLess;\t\u{2279}\nNotGreaterSlantEqual;\t\u{2A7E}\u{338}\nNotGreaterTilde;\t\u{2275}\nNotHumpDownHump;\t\u{224E}\u{338}\nNotHumpEqual;\t\u{224F}\u{338}\nNotLeftTriangle;\t\u{22EA}\n" +
+        "NotLeftTriangleBar;\t\u{29CF}\u{338}\nNotLeftTriangleEqual;\t\u{22EC}\nNotLess;\t\u{226E}\nNotLessEqual;\t\u{2270}\nNotLessGreater;\t\u{2278}\nNotLessLess;\t\u{226A}\u{338}\n" +
+        "NotLessSlantEqual;\t\u{2A7D}\u{338}\nNotLessTilde;\t\u{2274}\nNotNestedGreaterGreater;\t\u{2AA2}\u{338}\nNotNestedLessLess;\t\u{2AA1}\u{338}\nNotPrecedes;\t\u{2280}\nNotPrecedesEqual;\t\u{2AAF}\u{338}\n" +
+        "NotPrecedesSlantEqual;\t\u{22E0}\nNotReverseElement;\t\u{220C}\nNotRightTriangle;\t\u{22EB}\nNotRightTriangleBar;\t\u{29D0}\u{338}\nNotRightTriangleEqual;\t\u{22ED}\nNotSquareSubset;\t\u{228F}\u{338}\n" +
+        "NotSquareSubsetEqual;\t\u{22E2}\nNotSquareSuperset;\t\u{2290}\u{338}\nNotSquareSupersetEqual;\t\u{22E3}\nNotSubset;\t\u{2282}\u{20D2}\nNotSubsetEqual;\t\u{2288}\nNotSucceeds;\t\u{2281}\n" +
+        "NotSucceedsEqual;\t\u{2AB0}\u{338}\nNotSucceedsSlantEqual;\t\u{22E1}\nNotSucceedsTilde;\t\u{227F}\u{338}\nNotSuperset;\t\u{2283}\u{20D2}\nNotSupersetEqual;\t\u{2289}\nNotTilde;\t\u{2241}\n" +
+        "NotTildeEqual;\t\u{2244}\nNotTildeFullEqual;\t\u{2247}\nNotTildeTilde;\t\u{2249}\nNotVerticalBar;\t\u{2224}\nNscr;\t\u{1D4A9}\nNtilde\t\u{D1}\n" +
+        "Ntilde;\t\u{D1}\nNu;\t\u{39D}\nOElig;\t\u{152}\nOacute\t\u{D3}\nOacute;\t\u{D3}\nOcirc\t\u{D4}\n" +
+        "Ocirc;\t\u{D4}\nOcy;\t\u{41E}\nOdblac;\t\u{150}\nOfr;\t\u{1D512}\nOgrave\t\u{D2}\nOgrave;\t\u{D2}\n" +
+        "Omacr;\t\u{14C}\nOmega;\t\u{3A9}\nOmicron;\t\u{39F}\nOopf;\t\u{1D546}\nOpenCurlyDoubleQuote;\t\u{201C}\nOpenCurlyQuote;\t\u{2018}\n" +
+        "Or;\t\u{2A54}\nOscr;\t\u{1D4AA}\nOslash\t\u{D8}\nOslash;\t\u{D8}\nOtilde\t\u{D5}\nOtilde;\t\u{D5}\n" +
+        "Otimes;\t\u{2A37}\nOuml\t\u{D6}\nOuml;\t\u{D6}\nOverBar;\t\u{203E}\nOverBrace;\t\u{23DE}\nOverBracket;\t\u{23B4}\n" +
+        "OverParenthesis;\t\u{23DC}\nPartialD;\t\u{2202}\nPcy;\t\u{41F}\nPfr;\t\u{1D513}\nPhi;\t\u{3A6}\nPi;\t\u{3A0}\n" +
+        "PlusMinus;\t\u{B1}\nPoincareplane;\t\u{210C}\nPopf;\t\u{2119}\nPr;\t\u{2ABB}\nPrecedes;\t\u{227A}\nPrecedesEqual;\t\u{2AAF}\n" +
+        "PrecedesSlantEqual;\t\u{227C}\nPrecedesTilde;\t\u{227E}\nPrime;\t\u{2033}\nProduct;\t\u{220F}\nProportion;\t\u{2237}\nProportional;\t\u{221D}\n" +
+        "Pscr;\t\u{1D4AB}\nPsi;\t\u{3A8}\nQUOT\t\"\nQUOT;\t\"\nQfr;\t\u{1D514}\nQopf;\t\u{211A}\n" +
+        "Qscr;\t\u{1D4AC}\nRBarr;\t\u{2910}\nREG\t\u{AE}\nREG;\t\u{AE}\nRacute;\t\u{154}\nRang;\t\u{27EB}\n" +
+        "Rarr;\t\u{21A0}\nRarrtl;\t\u{2916}\nRcaron;\t\u{158}\nRcedil;\t\u{156}\nRcy;\t\u{420}\nRe;\t\u{211C}\n" +
+        "ReverseElement;\t\u{220B}\nReverseEquilibrium;\t\u{21CB}\nReverseUpEquilibrium;\t\u{296F}\nRfr;\t\u{211C}\nRho;\t\u{3A1}\nRightAngleBracket;\t\u{27E9}\n" +
+        "RightArrow;\t\u{2192}\nRightArrowBar;\t\u{21E5}\nRightArrowLeftArrow;\t\u{21C4}\nRightCeiling;\t\u{2309}\nRightDoubleBracket;\t\u{27E7}\nRightDownTeeVector;\t\u{295D}\n" +
+        "RightDownVector;\t\u{21C2}\nRightDownVectorBar;\t\u{2955}\nRightFloor;\t\u{230B}\nRightTee;\t\u{22A2}\nRightTeeArrow;\t\u{21A6}\nRightTeeVector;\t\u{295B}\n" +
+        "RightTriangle;\t\u{22B3}\nRightTriangleBar;\t\u{29D0}\nRightTriangleEqual;\t\u{22B5}\nRightUpDownVector;\t\u{294F}\nRightUpTeeVector;\t\u{295C}\nRightUpVector;\t\u{21BE}\n" +
+        "RightUpVectorBar;\t\u{2954}\nRightVector;\t\u{21C0}\nRightVectorBar;\t\u{2953}\nRightarrow;\t\u{21D2}\nRopf;\t\u{211D}\nRoundImplies;\t\u{2970}\n" +
+        "Rrightarrow;\t\u{21DB}\nRscr;\t\u{211B}\nRsh;\t\u{21B1}\nRuleDelayed;\t\u{29F4}\nSHCHcy;\t\u{429}\nSHcy;\t\u{428}\n" +
+        "SOFTcy;\t\u{42C}\nSacute;\t\u{15A}\nSc;\t\u{2ABC}\nScaron;\t\u{160}\nScedil;\t\u{15E}\nScirc;\t\u{15C}\n" +
+        "Scy;\t\u{421}\nSfr;\t\u{1D516}\nShortDownArrow;\t\u{2193}\nShortLeftArrow;\t\u{2190}\nShortRightArrow;\t\u{2192}\nShortUpArrow;\t\u{2191}\n" +
+        "Sigma;\t\u{3A3}\nSmallCircle;\t\u{2218}\nSopf;\t\u{1D54A}\nSqrt;\t\u{221A}\nSquare;\t\u{25A1}\nSquareIntersection;\t\u{2293}\n" +
+        "SquareSubset;\t\u{228F}\nSquareSubsetEqual;\t\u{2291}\nSquareSuperset;\t\u{2290}\nSquareSupersetEqual;\t\u{2292}\nSquareUnion;\t\u{2294}\nSscr;\t\u{1D4AE}\n" +
+        "Star;\t\u{22C6}\nSub;\t\u{22D0}\nSubset;\t\u{22D0}\nSubsetEqual;\t\u{2286}\nSucceeds;\t\u{227B}\nSucceedsEqual;\t\u{2AB0}\n" +
+        "SucceedsSlantEqual;\t\u{227D}\nSucceedsTilde;\t\u{227F}\nSuchThat;\t\u{220B}\nSum;\t\u{2211}\nSup;\t\u{22D1}\nSuperset;\t\u{2283}\n" +
+        "SupersetEqual;\t\u{2287}\nSupset;\t\u{22D1}\nTHORN\t\u{DE}\nTHORN;\t\u{DE}\nTRADE;\t\u{2122}\nTSHcy;\t\u{40B}\n" +
+        "TScy;\t\u{426}\nTab;\t\u{9}\nTau;\t\u{3A4}\nTcaron;\t\u{164}\nTcedil;\t\u{162}\nTcy;\t\u{422}\n" +
+        "Tfr;\t\u{1D517}\nTherefore;\t\u{2234}\nTheta;\t\u{398}\nThickSpace;\t\u{205F}\u{200A}\nThinSpace;\t\u{2009}\nTilde;\t\u{223C}\n" +
+        "TildeEqual;\t\u{2243}\nTildeFullEqual;\t\u{2245}\nTildeTilde;\t\u{2248}\nTopf;\t\u{1D54B}\nTripleDot;\t\u{20DB}\nTscr;\t\u{1D4AF}\n" +
+        "Tstrok;\t\u{166}\nUacute\t\u{DA}\nUacute;\t\u{DA}\nUarr;\t\u{219F}\nUarrocir;\t\u{2949}\nUbrcy;\t\u{40E}\n" +
+        "Ubreve;\t\u{16C}\nUcirc\t\u{DB}\nUcirc;\t\u{DB}\nUcy;\t\u{423}\nUdblac;\t\u{170}\nUfr;\t\u{1D518}\n" +
+        "Ugrave\t\u{D9}\nUgrave;\t\u{D9}\nUmacr;\t\u{16A}\nUnderBar;\t_\nUnderBrace;\t\u{23DF}\nUnderBracket;\t\u{23B5}\n" +
+        "UnderParenthesis;\t\u{23DD}\nUnion;\t\u{22C3}\nUnionPlus;\t\u{228E}\nUogon;\t\u{172}\nUopf;\t\u{1D54C}\nUpArrow;\t\u{2191}\n" +
+        "UpArrowBar;\t\u{2912}\nUpArrowDownArrow;\t\u{21C5}\nUpDownArrow;\t\u{2195}\nUpEquilibrium;\t\u{296E}\nUpTee;\t\u{22A5}\nUpTeeArrow;\t\u{21A5}\n" +
+        "Uparrow;\t\u{21D1}\nUpdownarrow;\t\u{21D5}\nUpperLeftArrow;\t\u{2196}\nUpperRightArrow;\t\u{2197}\nUpsi;\t\u{3D2}\nUpsilon;\t\u{3A5}\n" +
+        "Uring;\t\u{16E}\nUscr;\t\u{1D4B0}\nUtilde;\t\u{168}\nUuml\t\u{DC}\nUuml;\t\u{DC}\nVDash;\t\u{22AB}\n" +
+        "Vbar;\t\u{2AEB}\nVcy;\t\u{412}\nVdash;\t\u{22A9}\nVdashl;\t\u{2AE6}\nVee;\t\u{22C1}\nVerbar;\t\u{2016}\n" +
+        "Vert;\t\u{2016}\nVerticalBar;\t\u{2223}\nVerticalLine;\t|\nVerticalSeparator;\t\u{2758}\nVerticalTilde;\t\u{2240}\nVeryThinSpace;\t\u{200A}\n" +
+        "Vfr;\t\u{1D519}\nVopf;\t\u{1D54D}\nVscr;\t\u{1D4B1}\nVvdash;\t\u{22AA}\nWcirc;\t\u{174}\nWedge;\t\u{22C0}\n" +
+        "Wfr;\t\u{1D51A}\nWopf;\t\u{1D54E}\nWscr;\t\u{1D4B2}\nXfr;\t\u{1D51B}\nXi;\t\u{39E}\nXopf;\t\u{1D54F}\n" +
+        "Xscr;\t\u{1D4B3}\nYAcy;\t\u{42F}\nYIcy;\t\u{407}\nYUcy;\t\u{42E}\nYacute\t\u{DD}\nYacute;\t\u{DD}\n" +
+        "Ycirc;\t\u{176}\nYcy;\t\u{42B}\nYfr;\t\u{1D51C}\nYopf;\t\u{1D550}\nYscr;\t\u{1D4B4}\nYuml;\t\u{178}\n" +
+        "ZHcy;\t\u{416}\nZacute;\t\u{179}\nZcaron;\t\u{17D}\nZcy;\t\u{417}\nZdot;\t\u{17B}\nZeroWidthSpace;\t\u{200B}\n" +
+        "Zeta;\t\u{396}\nZfr;\t\u{2128}\nZopf;\t\u{2124}\nZscr;\t\u{1D4B5}\naacute\t\u{E1}\naacute;\t\u{E1}\n" +
+        "abreve;\t\u{103}\nac;\t\u{223E}\nacE;\t\u{223E}\u{333}\nacd;\t\u{223F}\nacirc\t\u{E2}\nacirc;\t\u{E2}\n" +
+        "acute\t\u{B4}\nacute;\t\u{B4}\nacy;\t\u{430}\naelig\t\u{E6}\naelig;\t\u{E6}\naf;\t\u{2061}\n" +
+        "afr;\t\u{1D51E}\nagrave\t\u{E0}\nagrave;\t\u{E0}\nalefsym;\t\u{2135}\naleph;\t\u{2135}\nalpha;\t\u{3B1}\n" +
+        "amacr;\t\u{101}\namalg;\t\u{2A3F}\namp\t&\namp;\t&\nand;\t\u{2227}\nandand;\t\u{2A55}\n" +
+        "andd;\t\u{2A5C}\nandslope;\t\u{2A58}\nandv;\t\u{2A5A}\nang;\t\u{2220}\nange;\t\u{29A4}\nangle;\t\u{2220}\n" +
+        "angmsd;\t\u{2221}\nangmsdaa;\t\u{29A8}\nangmsdab;\t\u{29A9}\nangmsdac;\t\u{29AA}\nangmsdad;\t\u{29AB}\nangmsdae;\t\u{29AC}\n" +
+        "angmsdaf;\t\u{29AD}\nangmsdag;\t\u{29AE}\nangmsdah;\t\u{29AF}\nangrt;\t\u{221F}\nangrtvb;\t\u{22BE}\nangrtvbd;\t\u{299D}\n" +
+        "angsph;\t\u{2222}\nangst;\t\u{C5}\nangzarr;\t\u{237C}\naogon;\t\u{105}\naopf;\t\u{1D552}\nap;\t\u{2248}\n" +
+        "apE;\t\u{2A70}\napacir;\t\u{2A6F}\nape;\t\u{224A}\napid;\t\u{224B}\napos;\t'\napprox;\t\u{2248}\n" +
+        "approxeq;\t\u{224A}\naring\t\u{E5}\naring;\t\u{E5}\nascr;\t\u{1D4B6}\nast;\t*\nasymp;\t\u{2248}\n" +
+        "asympeq;\t\u{224D}\natilde\t\u{E3}\natilde;\t\u{E3}\nauml\t\u{E4}\nauml;\t\u{E4}\nawconint;\t\u{2233}\n" +
+        "awint;\t\u{2A11}\nbNot;\t\u{2AED}\nbackcong;\t\u{224C}\nbackepsilon;\t\u{3F6}\nbackprime;\t\u{2035}\nbacksim;\t\u{223D}\n" +
+        "backsimeq;\t\u{22CD}\nbarvee;\t\u{22BD}\nbarwed;\t\u{2305}\nbarwedge;\t\u{2305}\nbbrk;\t\u{23B5}\nbbrktbrk;\t\u{23B6}\n" +
+        "bcong;\t\u{224C}\nbcy;\t\u{431}\nbdquo;\t\u{201E}\nbecaus;\t\u{2235}\nbecause;\t\u{2235}\nbemptyv;\t\u{29B0}\n" +
+        "bepsi;\t\u{3F6}\nbernou;\t\u{212C}\nbeta;\t\u{3B2}\nbeth;\t\u{2136}\nbetween;\t\u{226C}\nbfr;\t\u{1D51F}\n" +
+        "bigcap;\t\u{22C2}\nbigcirc;\t\u{25EF}\nbigcup;\t\u{22C3}\nbigodot;\t\u{2A00}\nbigoplus;\t\u{2A01}\nbigotimes;\t\u{2A02}\n" +
+        "bigsqcup;\t\u{2A06}\nbigstar;\t\u{2605}\nbigtriangledown;\t\u{25BD}\nbigtriangleup;\t\u{25B3}\nbiguplus;\t\u{2A04}\nbigvee;\t\u{22C1}\n" +
+        "bigwedge;\t\u{22C0}\nbkarow;\t\u{290D}\nblacklozenge;\t\u{29EB}\nblacksquare;\t\u{25AA}\nblacktriangle;\t\u{25B4}\nblacktriangledown;\t\u{25BE}\n" +
+        "blacktriangleleft;\t\u{25C2}\nblacktriangleright;\t\u{25B8}\nblank;\t\u{2423}\nblk12;\t\u{2592}\nblk14;\t\u{2591}\nblk34;\t\u{2593}\n" +
+        "block;\t\u{2588}\nbne;\t=\u{20E5}\nbnequiv;\t\u{2261}\u{20E5}\nbnot;\t\u{2310}\nbopf;\t\u{1D553}\nbot;\t\u{22A5}\n" +
+        "bottom;\t\u{22A5}\nbowtie;\t\u{22C8}\nboxDL;\t\u{2557}\nboxDR;\t\u{2554}\nboxDl;\t\u{2556}\nboxDr;\t\u{2553}\n" +
+        "boxH;\t\u{2550}\nboxHD;\t\u{2566}\nboxHU;\t\u{2569}\nboxHd;\t\u{2564}\nboxHu;\t\u{2567}\nboxUL;\t\u{255D}\n" +
+        "boxUR;\t\u{255A}\nboxUl;\t\u{255C}\nboxUr;\t\u{2559}\nboxV;\t\u{2551}\nboxVH;\t\u{256C}\nboxVL;\t\u{2563}\n" +
+        "boxVR;\t\u{2560}\nboxVh;\t\u{256B}\nboxVl;\t\u{2562}\nboxVr;\t\u{255F}\nboxbox;\t\u{29C9}\nboxdL;\t\u{2555}\n" +
+        "boxdR;\t\u{2552}\nboxdl;\t\u{2510}\nboxdr;\t\u{250C}\nboxh;\t\u{2500}\nboxhD;\t\u{2565}\nboxhU;\t\u{2568}\n" +
+        "boxhd;\t\u{252C}\nboxhu;\t\u{2534}\nboxminus;\t\u{229F}\nboxplus;\t\u{229E}\nboxtimes;\t\u{22A0}\nboxuL;\t\u{255B}\n" +
+        "boxuR;\t\u{2558}\nboxul;\t\u{2518}\nboxur;\t\u{2514}\nboxv;\t\u{2502}\nboxvH;\t\u{256A}\nboxvL;\t\u{2561}\n" +
+        "boxvR;\t\u{255E}\nboxvh;\t\u{253C}\nboxvl;\t\u{2524}\nboxvr;\t\u{251C}\nbprime;\t\u{2035}\nbreve;\t\u{2D8}\n" +
+        "brvbar\t\u{A6}\nbrvbar;\t\u{A6}\nbscr;\t\u{1D4B7}\nbsemi;\t\u{204F}\nbsim;\t\u{223D}\nbsime;\t\u{22CD}\n" +
+        "bsol;\t\\\nbsolb;\t\u{29C5}\nbsolhsub;\t\u{27C8}\nbull;\t\u{2022}\nbullet;\t\u{2022}\nbump;\t\u{224E}\n" +
+        "bumpE;\t\u{2AAE}\nbumpe;\t\u{224F}\nbumpeq;\t\u{224F}\ncacute;\t\u{107}\ncap;\t\u{2229}\ncapand;\t\u{2A44}\n" +
+        "capbrcup;\t\u{2A49}\ncapcap;\t\u{2A4B}\ncapcup;\t\u{2A47}\ncapdot;\t\u{2A40}\ncaps;\t\u{2229}\u{FE00}\ncaret;\t\u{2041}\n" +
+        "caron;\t\u{2C7}\nccaps;\t\u{2A4D}\nccaron;\t\u{10D}\nccedil\t\u{E7}\nccedil;\t\u{E7}\nccirc;\t\u{109}\n" +
+        "ccups;\t\u{2A4C}\nccupssm;\t\u{2A50}\ncdot;\t\u{10B}\ncedil\t\u{B8}\ncedil;\t\u{B8}\ncemptyv;\t\u{29B2}\n" +
+        "cent\t\u{A2}\ncent;\t\u{A2}\ncenterdot;\t\u{B7}\ncfr;\t\u{1D520}\nchcy;\t\u{447}\ncheck;\t\u{2713}\n" +
+        "checkmark;\t\u{2713}\nchi;\t\u{3C7}\ncir;\t\u{25CB}\ncirE;\t\u{29C3}\ncirc;\t\u{2C6}\ncirceq;\t\u{2257}\n" +
+        "circlearrowleft;\t\u{21BA}\ncirclearrowright;\t\u{21BB}\ncircledR;\t\u{AE}\ncircledS;\t\u{24C8}\ncircledast;\t\u{229B}\ncircledcirc;\t\u{229A}\n" +
+        "circleddash;\t\u{229D}\ncire;\t\u{2257}\ncirfnint;\t\u{2A10}\ncirmid;\t\u{2AEF}\ncirscir;\t\u{29C2}\nclubs;\t\u{2663}\n" +
+        "clubsuit;\t\u{2663}\ncolon;\t:\ncolone;\t\u{2254}\ncoloneq;\t\u{2254}\ncomma;\t,\ncommat;\t@\n" +
+        "comp;\t\u{2201}\ncompfn;\t\u{2218}\ncomplement;\t\u{2201}\ncomplexes;\t\u{2102}\ncong;\t\u{2245}\ncongdot;\t\u{2A6D}\n" +
+        "conint;\t\u{222E}\ncopf;\t\u{1D554}\ncoprod;\t\u{2210}\ncopy\t\u{A9}\ncopy;\t\u{A9}\ncopysr;\t\u{2117}\n" +
+        "crarr;\t\u{21B5}\ncross;\t\u{2717}\ncscr;\t\u{1D4B8}\ncsub;\t\u{2ACF}\ncsube;\t\u{2AD1}\ncsup;\t\u{2AD0}\n" +
+        "csupe;\t\u{2AD2}\nctdot;\t\u{22EF}\ncudarrl;\t\u{2938}\ncudarrr;\t\u{2935}\ncuepr;\t\u{22DE}\ncuesc;\t\u{22DF}\n" +
+        "cularr;\t\u{21B6}\ncularrp;\t\u{293D}\ncup;\t\u{222A}\ncupbrcap;\t\u{2A48}\ncupcap;\t\u{2A46}\ncupcup;\t\u{2A4A}\n" +
+        "cupdot;\t\u{228D}\ncupor;\t\u{2A45}\ncups;\t\u{222A}\u{FE00}\ncurarr;\t\u{21B7}\ncurarrm;\t\u{293C}\ncurlyeqprec;\t\u{22DE}\n" +
+        "curlyeqsucc;\t\u{22DF}\ncurlyvee;\t\u{22CE}\ncurlywedge;\t\u{22CF}\ncurren\t\u{A4}\ncurren;\t\u{A4}\ncurvearrowleft;\t\u{21B6}\n" +
+        "curvearrowright;\t\u{21B7}\ncuvee;\t\u{22CE}\ncuwed;\t\u{22CF}\ncwconint;\t\u{2232}\ncwint;\t\u{2231}\ncylcty;\t\u{232D}\n" +
+        "dArr;\t\u{21D3}\ndHar;\t\u{2965}\ndagger;\t\u{2020}\ndaleth;\t\u{2138}\ndarr;\t\u{2193}\ndash;\t\u{2010}\n" +
+        "dashv;\t\u{22A3}\ndbkarow;\t\u{290F}\ndblac;\t\u{2DD}\ndcaron;\t\u{10F}\ndcy;\t\u{434}\ndd;\t\u{2146}\n" +
+        "ddagger;\t\u{2021}\nddarr;\t\u{21CA}\nddotseq;\t\u{2A77}\ndeg\t\u{B0}\ndeg;\t\u{B0}\ndelta;\t\u{3B4}\n" +
+        "demptyv;\t\u{29B1}\ndfisht;\t\u{297F}\ndfr;\t\u{1D521}\ndharl;\t\u{21C3}\ndharr;\t\u{21C2}\ndiam;\t\u{22C4}\n" +
+        "diamond;\t\u{22C4}\ndiamondsuit;\t\u{2666}\ndiams;\t\u{2666}\ndie;\t\u{A8}\ndigamma;\t\u{3DD}\ndisin;\t\u{22F2}\n" +
+        "div;\t\u{F7}\ndivide\t\u{F7}\ndivide;\t\u{F7}\ndivideontimes;\t\u{22C7}\ndivonx;\t\u{22C7}\ndjcy;\t\u{452}\n" +
+        "dlcorn;\t\u{231E}\ndlcrop;\t\u{230D}\ndollar;\t$\ndopf;\t\u{1D555}\ndot;\t\u{2D9}\ndoteq;\t\u{2250}\n" +
+        "doteqdot;\t\u{2251}\ndotminus;\t\u{2238}\ndotplus;\t\u{2214}\ndotsquare;\t\u{22A1}\ndoublebarwedge;\t\u{2306}\ndownarrow;\t\u{2193}\n" +
+        "downdownarrows;\t\u{21CA}\ndownharpoonleft;\t\u{21C3}\ndownharpoonright;\t\u{21C2}\ndrbkarow;\t\u{2910}\ndrcorn;\t\u{231F}\ndrcrop;\t\u{230C}\n" +
+        "dscr;\t\u{1D4B9}\ndscy;\t\u{455}\ndsol;\t\u{29F6}\ndstrok;\t\u{111}\ndtdot;\t\u{22F1}\ndtri;\t\u{25BF}\n" +
+        "dtrif;\t\u{25BE}\nduarr;\t\u{21F5}\nduhar;\t\u{296F}\ndwangle;\t\u{29A6}\ndzcy;\t\u{45F}\ndzigrarr;\t\u{27FF}\n" +
+        "eDDot;\t\u{2A77}\neDot;\t\u{2251}\neacute\t\u{E9}\neacute;\t\u{E9}\neaster;\t\u{2A6E}\necaron;\t\u{11B}\n" +
+        "ecir;\t\u{2256}\necirc\t\u{EA}\necirc;\t\u{EA}\necolon;\t\u{2255}\necy;\t\u{44D}\nedot;\t\u{117}\n" +
+        "ee;\t\u{2147}\nefDot;\t\u{2252}\nefr;\t\u{1D522}\neg;\t\u{2A9A}\negrave\t\u{E8}\negrave;\t\u{E8}\n" +
+        "egs;\t\u{2A96}\negsdot;\t\u{2A98}\nel;\t\u{2A99}\nelinters;\t\u{23E7}\nell;\t\u{2113}\nels;\t\u{2A95}\n" +
+        "elsdot;\t\u{2A97}\nemacr;\t\u{113}\nempty;\t\u{2205}\nemptyset;\t\u{2205}\nemptyv;\t\u{2205}\nemsp13;\t\u{2004}\n" +
+        "emsp14;\t\u{2005}\nemsp;\t\u{2003}\neng;\t\u{14B}\nensp;\t\u{2002}\neogon;\t\u{119}\neopf;\t\u{1D556}\n" +
+        "epar;\t\u{22D5}\neparsl;\t\u{29E3}\neplus;\t\u{2A71}\nepsi;\t\u{3B5}\nepsilon;\t\u{3B5}\nepsiv;\t\u{3F5}\n" +
+        "eqcirc;\t\u{2256}\neqcolon;\t\u{2255}\neqsim;\t\u{2242}\neqslantgtr;\t\u{2A96}\neqslantless;\t\u{2A95}\nequals;\t=\n" +
+        "equest;\t\u{225F}\nequiv;\t\u{2261}\nequivDD;\t\u{2A78}\neqvparsl;\t\u{29E5}\nerDot;\t\u{2253}\nerarr;\t\u{2971}\n" +
+        "escr;\t\u{212F}\nesdot;\t\u{2250}\nesim;\t\u{2242}\neta;\t\u{3B7}\neth\t\u{F0}\neth;\t\u{F0}\n" +
+        "euml\t\u{EB}\neuml;\t\u{EB}\neuro;\t\u{20AC}\nexcl;\t!\nexist;\t\u{2203}\nexpectation;\t\u{2130}\n" +
+        "exponentiale;\t\u{2147}\nfallingdotseq;\t\u{2252}\nfcy;\t\u{444}\nfemale;\t\u{2640}\nffilig;\t\u{FB03}\nfflig;\t\u{FB00}\n" +
+        "ffllig;\t\u{FB04}\nffr;\t\u{1D523}\nfilig;\t\u{FB01}\nfjlig;\tfj\nflat;\t\u{266D}\nfllig;\t\u{FB02}\n" +
+        "fltns;\t\u{25B1}\nfnof;\t\u{192}\nfopf;\t\u{1D557}\nforall;\t\u{2200}\nfork;\t\u{22D4}\nforkv;\t\u{2AD9}\n" +
+        "fpartint;\t\u{2A0D}\nfrac12\t\u{BD}\nfrac12;\t\u{BD}\nfrac13;\t\u{2153}\nfrac14\t\u{BC}\nfrac14;\t\u{BC}\n" +
+        "frac15;\t\u{2155}\nfrac16;\t\u{2159}\nfrac18;\t\u{215B}\nfrac23;\t\u{2154}\nfrac25;\t\u{2156}\nfrac34\t\u{BE}\n" +
+        "frac34;\t\u{BE}\nfrac35;\t\u{2157}\nfrac38;\t\u{215C}\nfrac45;\t\u{2158}\nfrac56;\t\u{215A}\nfrac58;\t\u{215D}\n" +
+        "frac78;\t\u{215E}\nfrasl;\t\u{2044}\nfrown;\t\u{2322}\nfscr;\t\u{1D4BB}\ngE;\t\u{2267}\ngEl;\t\u{2A8C}\n" +
+        "gacute;\t\u{1F5}\ngamma;\t\u{3B3}\ngammad;\t\u{3DD}\ngap;\t\u{2A86}\ngbreve;\t\u{11F}\ngcirc;\t\u{11D}\n" +
+        "gcy;\t\u{433}\ngdot;\t\u{121}\nge;\t\u{2265}\ngel;\t\u{22DB}\ngeq;\t\u{2265}\ngeqq;\t\u{2267}\n" +
+        "geqslant;\t\u{2A7E}\nges;\t\u{2A7E}\ngescc;\t\u{2AA9}\ngesdot;\t\u{2A80}\ngesdoto;\t\u{2A82}\ngesdotol;\t\u{2A84}\n" +
+        "gesl;\t\u{22DB}\u{FE00}\ngesles;\t\u{2A94}\ngfr;\t\u{1D524}\ngg;\t\u{226B}\nggg;\t\u{22D9}\ngimel;\t\u{2137}\n" +
+        "gjcy;\t\u{453}\ngl;\t\u{2277}\nglE;\t\u{2A92}\ngla;\t\u{2AA5}\nglj;\t\u{2AA4}\ngnE;\t\u{2269}\n" +
+        "gnap;\t\u{2A8A}\ngnapprox;\t\u{2A8A}\ngne;\t\u{2A88}\ngneq;\t\u{2A88}\ngneqq;\t\u{2269}\ngnsim;\t\u{22E7}\n" +
+        "gopf;\t\u{1D558}\ngrave;\t`\ngscr;\t\u{210A}\ngsim;\t\u{2273}\ngsime;\t\u{2A8E}\ngsiml;\t\u{2A90}\n" +
+        "gt\t>\ngt;\t>\ngtcc;\t\u{2AA7}\ngtcir;\t\u{2A7A}\ngtdot;\t\u{22D7}\ngtlPar;\t\u{2995}\n" +
+        "gtquest;\t\u{2A7C}\ngtrapprox;\t\u{2A86}\ngtrarr;\t\u{2978}\ngtrdot;\t\u{22D7}\ngtreqless;\t\u{22DB}\ngtreqqless;\t\u{2A8C}\n" +
+        "gtrless;\t\u{2277}\ngtrsim;\t\u{2273}\ngvertneqq;\t\u{2269}\u{FE00}\ngvnE;\t\u{2269}\u{FE00}\nhArr;\t\u{21D4}\nhairsp;\t\u{200A}\n" +
+        "half;\t\u{BD}\nhamilt;\t\u{210B}\nhardcy;\t\u{44A}\nharr;\t\u{2194}\nharrcir;\t\u{2948}\nharrw;\t\u{21AD}\n" +
+        "hbar;\t\u{210F}\nhcirc;\t\u{125}\nhearts;\t\u{2665}\nheartsuit;\t\u{2665}\nhellip;\t\u{2026}\nhercon;\t\u{22B9}\n" +
+        "hfr;\t\u{1D525}\nhksearow;\t\u{2925}\nhkswarow;\t\u{2926}\nhoarr;\t\u{21FF}\nhomtht;\t\u{223B}\nhookleftarrow;\t\u{21A9}\n" +
+        "hookrightarrow;\t\u{21AA}\nhopf;\t\u{1D559}\nhorbar;\t\u{2015}\nhscr;\t\u{1D4BD}\nhslash;\t\u{210F}\nhstrok;\t\u{127}\n" +
+        "hybull;\t\u{2043}\nhyphen;\t\u{2010}\niacute\t\u{ED}\niacute;\t\u{ED}\nic;\t\u{2063}\nicirc\t\u{EE}\n" +
+        "icirc;\t\u{EE}\nicy;\t\u{438}\niecy;\t\u{435}\niexcl\t\u{A1}\niexcl;\t\u{A1}\niff;\t\u{21D4}\n" +
+        "ifr;\t\u{1D526}\nigrave\t\u{EC}\nigrave;\t\u{EC}\nii;\t\u{2148}\niiiint;\t\u{2A0C}\niiint;\t\u{222D}\n" +
+        "iinfin;\t\u{29DC}\niiota;\t\u{2129}\nijlig;\t\u{133}\nimacr;\t\u{12B}\nimage;\t\u{2111}\nimagline;\t\u{2110}\n" +
+        "imagpart;\t\u{2111}\nimath;\t\u{131}\nimof;\t\u{22B7}\nimped;\t\u{1B5}\nin;\t\u{2208}\nincare;\t\u{2105}\n" +
+        "infin;\t\u{221E}\ninfintie;\t\u{29DD}\ninodot;\t\u{131}\nint;\t\u{222B}\nintcal;\t\u{22BA}\nintegers;\t\u{2124}\n" +
+        "intercal;\t\u{22BA}\nintlarhk;\t\u{2A17}\nintprod;\t\u{2A3C}\niocy;\t\u{451}\niogon;\t\u{12F}\niopf;\t\u{1D55A}\n" +
+        "iota;\t\u{3B9}\niprod;\t\u{2A3C}\niquest\t\u{BF}\niquest;\t\u{BF}\niscr;\t\u{1D4BE}\nisin;\t\u{2208}\n" +
+        "isinE;\t\u{22F9}\nisindot;\t\u{22F5}\nisins;\t\u{22F4}\nisinsv;\t\u{22F3}\nisinv;\t\u{2208}\nit;\t\u{2062}\n" +
+        "itilde;\t\u{129}\niukcy;\t\u{456}\niuml\t\u{EF}\niuml;\t\u{EF}\njcirc;\t\u{135}\njcy;\t\u{439}\n" +
+        "jfr;\t\u{1D527}\njmath;\t\u{237}\njopf;\t\u{1D55B}\njscr;\t\u{1D4BF}\njsercy;\t\u{458}\njukcy;\t\u{454}\n" +
+        "kappa;\t\u{3BA}\nkappav;\t\u{3F0}\nkcedil;\t\u{137}\nkcy;\t\u{43A}\nkfr;\t\u{1D528}\nkgreen;\t\u{138}\n" +
+        "khcy;\t\u{445}\nkjcy;\t\u{45C}\nkopf;\t\u{1D55C}\nkscr;\t\u{1D4C0}\nlAarr;\t\u{21DA}\nlArr;\t\u{21D0}\n" +
+        "lAtail;\t\u{291B}\nlBarr;\t\u{290E}\nlE;\t\u{2266}\nlEg;\t\u{2A8B}\nlHar;\t\u{2962}\nlacute;\t\u{13A}\n" +
+        "laemptyv;\t\u{29B4}\nlagran;\t\u{2112}\nlambda;\t\u{3BB}\nlang;\t\u{27E8}\nlangd;\t\u{2991}\nlangle;\t\u{27E8}\n" +
+        "lap;\t\u{2A85}\nlaquo\t\u{AB}\nlaquo;\t\u{AB}\nlarr;\t\u{2190}\nlarrb;\t\u{21E4}\nlarrbfs;\t\u{291F}\n" +
+        "larrfs;\t\u{291D}\nlarrhk;\t\u{21A9}\nlarrlp;\t\u{21AB}\nlarrpl;\t\u{2939}\nlarrsim;\t\u{2973}\nlarrtl;\t\u{21A2}\n" +
+        "lat;\t\u{2AAB}\nlatail;\t\u{2919}\nlate;\t\u{2AAD}\nlates;\t\u{2AAD}\u{FE00}\nlbarr;\t\u{290C}\nlbbrk;\t\u{2772}\n" +
+        "lbrace;\t{\nlbrack;\t[\nlbrke;\t\u{298B}\nlbrksld;\t\u{298F}\nlbrkslu;\t\u{298D}\nlcaron;\t\u{13E}\n" +
+        "lcedil;\t\u{13C}\nlceil;\t\u{2308}\nlcub;\t{\nlcy;\t\u{43B}\nldca;\t\u{2936}\nldquo;\t\u{201C}\n" +
+        "ldquor;\t\u{201E}\nldrdhar;\t\u{2967}\nldrushar;\t\u{294B}\nldsh;\t\u{21B2}\nle;\t\u{2264}\nleftarrow;\t\u{2190}\n" +
+        "leftarrowtail;\t\u{21A2}\nleftharpoondown;\t\u{21BD}\nleftharpoonup;\t\u{21BC}\nleftleftarrows;\t\u{21C7}\nleftrightarrow;\t\u{2194}\nleftrightarrows;\t\u{21C6}\n" +
+        "leftrightharpoons;\t\u{21CB}\nleftrightsquigarrow;\t\u{21AD}\nleftthreetimes;\t\u{22CB}\nleg;\t\u{22DA}\nleq;\t\u{2264}\nleqq;\t\u{2266}\n" +
+        "leqslant;\t\u{2A7D}\nles;\t\u{2A7D}\nlescc;\t\u{2AA8}\nlesdot;\t\u{2A7F}\nlesdoto;\t\u{2A81}\nlesdotor;\t\u{2A83}\n" +
+        "lesg;\t\u{22DA}\u{FE00}\nlesges;\t\u{2A93}\nlessapprox;\t\u{2A85}\nlessdot;\t\u{22D6}\nlesseqgtr;\t\u{22DA}\nlesseqqgtr;\t\u{2A8B}\n" +
+        "lessgtr;\t\u{2276}\nlesssim;\t\u{2272}\nlfisht;\t\u{297C}\nlfloor;\t\u{230A}\nlfr;\t\u{1D529}\nlg;\t\u{2276}\n" +
+        "lgE;\t\u{2A91}\nlhard;\t\u{21BD}\nlharu;\t\u{21BC}\nlharul;\t\u{296A}\nlhblk;\t\u{2584}\nljcy;\t\u{459}\n" +
+        "ll;\t\u{226A}\nllarr;\t\u{21C7}\nllcorner;\t\u{231E}\nllhard;\t\u{296B}\nlltri;\t\u{25FA}\nlmidot;\t\u{140}\n" +
+        "lmoust;\t\u{23B0}\nlmoustache;\t\u{23B0}\nlnE;\t\u{2268}\nlnap;\t\u{2A89}\nlnapprox;\t\u{2A89}\nlne;\t\u{2A87}\n" +
+        "lneq;\t\u{2A87}\nlneqq;\t\u{2268}\nlnsim;\t\u{22E6}\nloang;\t\u{27EC}\nloarr;\t\u{21FD}\nlobrk;\t\u{27E6}\n" +
+        "longleftarrow;\t\u{27F5}\nlongleftrightarrow;\t\u{27F7}\nlongmapsto;\t\u{27FC}\nlongrightarrow;\t\u{27F6}\nlooparrowleft;\t\u{21AB}\nlooparrowright;\t\u{21AC}\n" +
+        "lopar;\t\u{2985}\nlopf;\t\u{1D55D}\nloplus;\t\u{2A2D}\nlotimes;\t\u{2A34}\nlowast;\t\u{2217}\nlowbar;\t_\n" +
+        "loz;\t\u{25CA}\nlozenge;\t\u{25CA}\nlozf;\t\u{29EB}\nlpar;\t(\nlparlt;\t\u{2993}\nlrarr;\t\u{21C6}\n" +
+        "lrcorner;\t\u{231F}\nlrhar;\t\u{21CB}\nlrhard;\t\u{296D}\nlrm;\t\u{200E}\nlrtri;\t\u{22BF}\nlsaquo;\t\u{2039}\n" +
+        "lscr;\t\u{1D4C1}\nlsh;\t\u{21B0}\nlsim;\t\u{2272}\nlsime;\t\u{2A8D}\nlsimg;\t\u{2A8F}\nlsqb;\t[\n" +
+        "lsquo;\t\u{2018}\nlsquor;\t\u{201A}\nlstrok;\t\u{142}\nlt\t<\nlt;\t<\nltcc;\t\u{2AA6}\n" +
+        "ltcir;\t\u{2A79}\nltdot;\t\u{22D6}\nlthree;\t\u{22CB}\nltimes;\t\u{22C9}\nltlarr;\t\u{2976}\nltquest;\t\u{2A7B}\n" +
+        "ltrPar;\t\u{2996}\nltri;\t\u{25C3}\nltrie;\t\u{22B4}\nltrif;\t\u{25C2}\nlurdshar;\t\u{294A}\nluruhar;\t\u{2966}\n" +
+        "lvertneqq;\t\u{2268}\u{FE00}\nlvnE;\t\u{2268}\u{FE00}\nmDDot;\t\u{223A}\nmacr\t\u{AF}\nmacr;\t\u{AF}\nmale;\t\u{2642}\n" +
+        "malt;\t\u{2720}\nmaltese;\t\u{2720}\nmap;\t\u{21A6}\nmapsto;\t\u{21A6}\nmapstodown;\t\u{21A7}\nmapstoleft;\t\u{21A4}\n" +
+        "mapstoup;\t\u{21A5}\nmarker;\t\u{25AE}\nmcomma;\t\u{2A29}\nmcy;\t\u{43C}\nmdash;\t\u{2014}\nmeasuredangle;\t\u{2221}\n" +
+        "mfr;\t\u{1D52A}\nmho;\t\u{2127}\nmicro\t\u{B5}\nmicro;\t\u{B5}\nmid;\t\u{2223}\nmidast;\t*\n" +
+        "midcir;\t\u{2AF0}\nmiddot\t\u{B7}\nmiddot;\t\u{B7}\nminus;\t\u{2212}\nminusb;\t\u{229F}\nminusd;\t\u{2238}\n" +
+        "minusdu;\t\u{2A2A}\nmlcp;\t\u{2ADB}\nmldr;\t\u{2026}\nmnplus;\t\u{2213}\nmodels;\t\u{22A7}\nmopf;\t\u{1D55E}\n" +
+        "mp;\t\u{2213}\nmscr;\t\u{1D4C2}\nmstpos;\t\u{223E}\nmu;\t\u{3BC}\nmultimap;\t\u{22B8}\nmumap;\t\u{22B8}\n" +
+        "nGg;\t\u{22D9}\u{338}\nnGt;\t\u{226B}\u{20D2}\nnGtv;\t\u{226B}\u{338}\nnLeftarrow;\t\u{21CD}\nnLeftrightarrow;\t\u{21CE}\nnLl;\t\u{22D8}\u{338}\n" +
+        "nLt;\t\u{226A}\u{20D2}\nnLtv;\t\u{226A}\u{338}\nnRightarrow;\t\u{21CF}\nnVDash;\t\u{22AF}\nnVdash;\t\u{22AE}\nnabla;\t\u{2207}\n" +
+        "nacute;\t\u{144}\nnang;\t\u{2220}\u{20D2}\nnap;\t\u{2249}\nnapE;\t\u{2A70}\u{338}\nnapid;\t\u{224B}\u{338}\nnapos;\t\u{149}\n" +
+        "napprox;\t\u{2249}\nnatur;\t\u{266E}\nnatural;\t\u{266E}\nnaturals;\t\u{2115}\nnbsp\t\u{A0}\nnbsp;\t\u{A0}\n" +
+        "nbump;\t\u{224E}\u{338}\nnbumpe;\t\u{224F}\u{338}\nncap;\t\u{2A43}\nncaron;\t\u{148}\nncedil;\t\u{146}\nncong;\t\u{2247}\n" +
+        "ncongdot;\t\u{2A6D}\u{338}\nncup;\t\u{2A42}\nncy;\t\u{43D}\nndash;\t\u{2013}\nne;\t\u{2260}\nneArr;\t\u{21D7}\n" +
+        "nearhk;\t\u{2924}\nnearr;\t\u{2197}\nnearrow;\t\u{2197}\nnedot;\t\u{2250}\u{338}\nnequiv;\t\u{2262}\nnesear;\t\u{2928}\n" +
+        "nesim;\t\u{2242}\u{338}\nnexist;\t\u{2204}\nnexists;\t\u{2204}\nnfr;\t\u{1D52B}\nngE;\t\u{2267}\u{338}\nnge;\t\u{2271}\n" +
+        "ngeq;\t\u{2271}\nngeqq;\t\u{2267}\u{338}\nngeqslant;\t\u{2A7E}\u{338}\nnges;\t\u{2A7E}\u{338}\nngsim;\t\u{2275}\nngt;\t\u{226F}\n" +
+        "ngtr;\t\u{226F}\nnhArr;\t\u{21CE}\nnharr;\t\u{21AE}\nnhpar;\t\u{2AF2}\nni;\t\u{220B}\nnis;\t\u{22FC}\n" +
+        "nisd;\t\u{22FA}\nniv;\t\u{220B}\nnjcy;\t\u{45A}\nnlArr;\t\u{21CD}\nnlE;\t\u{2266}\u{338}\nnlarr;\t\u{219A}\n" +
+        "nldr;\t\u{2025}\nnle;\t\u{2270}\nnleftarrow;\t\u{219A}\nnleftrightarrow;\t\u{21AE}\nnleq;\t\u{2270}\nnleqq;\t\u{2266}\u{338}\n" +
+        "nleqslant;\t\u{2A7D}\u{338}\nnles;\t\u{2A7D}\u{338}\nnless;\t\u{226E}\nnlsim;\t\u{2274}\nnlt;\t\u{226E}\nnltri;\t\u{22EA}\n" +
+        "nltrie;\t\u{22EC}\nnmid;\t\u{2224}\nnopf;\t\u{1D55F}\nnot\t\u{AC}\nnot;\t\u{AC}\nnotin;\t\u{2209}\n" +
+        "notinE;\t\u{22F9}\u{338}\nnotindot;\t\u{22F5}\u{338}\nnotinva;\t\u{2209}\nnotinvb;\t\u{22F7}\nnotinvc;\t\u{22F6}\nnotni;\t\u{220C}\n" +
+        "notniva;\t\u{220C}\nnotnivb;\t\u{22FE}\nnotnivc;\t\u{22FD}\nnpar;\t\u{2226}\nnparallel;\t\u{2226}\nnparsl;\t\u{2AFD}\u{20E5}\n" +
+        "npart;\t\u{2202}\u{338}\nnpolint;\t\u{2A14}\nnpr;\t\u{2280}\nnprcue;\t\u{22E0}\nnpre;\t\u{2AAF}\u{338}\nnprec;\t\u{2280}\n" +
+        "npreceq;\t\u{2AAF}\u{338}\nnrArr;\t\u{21CF}\nnrarr;\t\u{219B}\nnrarrc;\t\u{2933}\u{338}\nnrarrw;\t\u{219D}\u{338}\nnrightarrow;\t\u{219B}\n" +
+        "nrtri;\t\u{22EB}\nnrtrie;\t\u{22ED}\nnsc;\t\u{2281}\nnsccue;\t\u{22E1}\nnsce;\t\u{2AB0}\u{338}\nnscr;\t\u{1D4C3}\n" +
+        "nshortmid;\t\u{2224}\nnshortparallel;\t\u{2226}\nnsim;\t\u{2241}\nnsime;\t\u{2244}\nnsimeq;\t\u{2244}\nnsmid;\t\u{2224}\n" +
+        "nspar;\t\u{2226}\nnsqsube;\t\u{22E2}\nnsqsupe;\t\u{22E3}\nnsub;\t\u{2284}\nnsubE;\t\u{2AC5}\u{338}\nnsube;\t\u{2288}\n" +
+        "nsubset;\t\u{2282}\u{20D2}\nnsubseteq;\t\u{2288}\nnsubseteqq;\t\u{2AC5}\u{338}\nnsucc;\t\u{2281}\nnsucceq;\t\u{2AB0}\u{338}\nnsup;\t\u{2285}\n" +
+        "nsupE;\t\u{2AC6}\u{338}\nnsupe;\t\u{2289}\nnsupset;\t\u{2283}\u{20D2}\nnsupseteq;\t\u{2289}\nnsupseteqq;\t\u{2AC6}\u{338}\nntgl;\t\u{2279}\n" +
+        "ntilde\t\u{F1}\nntilde;\t\u{F1}\nntlg;\t\u{2278}\nntriangleleft;\t\u{22EA}\nntrianglelefteq;\t\u{22EC}\nntriangleright;\t\u{22EB}\n" +
+        "ntrianglerighteq;\t\u{22ED}\nnu;\t\u{3BD}\nnum;\t#\nnumero;\t\u{2116}\nnumsp;\t\u{2007}\nnvDash;\t\u{22AD}\n" +
+        "nvHarr;\t\u{2904}\nnvap;\t\u{224D}\u{20D2}\nnvdash;\t\u{22AC}\nnvge;\t\u{2265}\u{20D2}\nnvgt;\t>\u{20D2}\nnvinfin;\t\u{29DE}\n" +
+        "nvlArr;\t\u{2902}\nnvle;\t\u{2264}\u{20D2}\nnvlt;\t<\u{20D2}\nnvltrie;\t\u{22B4}\u{20D2}\nnvrArr;\t\u{2903}\nnvrtrie;\t\u{22B5}\u{20D2}\n" +
+        "nvsim;\t\u{223C}\u{20D2}\nnwArr;\t\u{21D6}\nnwarhk;\t\u{2923}\nnwarr;\t\u{2196}\nnwarrow;\t\u{2196}\nnwnear;\t\u{2927}\n" +
+        "oS;\t\u{24C8}\noacute\t\u{F3}\noacute;\t\u{F3}\noast;\t\u{229B}\nocir;\t\u{229A}\nocirc\t\u{F4}\n" +
+        "ocirc;\t\u{F4}\nocy;\t\u{43E}\nodash;\t\u{229D}\nodblac;\t\u{151}\nodiv;\t\u{2A38}\nodot;\t\u{2299}\n" +
+        "odsold;\t\u{29BC}\noelig;\t\u{153}\nofcir;\t\u{29BF}\nofr;\t\u{1D52C}\nogon;\t\u{2DB}\nograve\t\u{F2}\n" +
+        "ograve;\t\u{F2}\nogt;\t\u{29C1}\nohbar;\t\u{29B5}\nohm;\t\u{3A9}\noint;\t\u{222E}\nolarr;\t\u{21BA}\n" +
+        "olcir;\t\u{29BE}\nolcross;\t\u{29BB}\noline;\t\u{203E}\nolt;\t\u{29C0}\nomacr;\t\u{14D}\nomega;\t\u{3C9}\n" +
+        "omicron;\t\u{3BF}\nomid;\t\u{29B6}\nominus;\t\u{2296}\noopf;\t\u{1D560}\nopar;\t\u{29B7}\noperp;\t\u{29B9}\n" +
+        "oplus;\t\u{2295}\nor;\t\u{2228}\norarr;\t\u{21BB}\nord;\t\u{2A5D}\norder;\t\u{2134}\norderof;\t\u{2134}\n" +
+        "ordf\t\u{AA}\nordf;\t\u{AA}\nordm\t\u{BA}\nordm;\t\u{BA}\norigof;\t\u{22B6}\noror;\t\u{2A56}\n" +
+        "orslope;\t\u{2A57}\norv;\t\u{2A5B}\noscr;\t\u{2134}\noslash\t\u{F8}\noslash;\t\u{F8}\nosol;\t\u{2298}\n" +
+        "otilde\t\u{F5}\notilde;\t\u{F5}\notimes;\t\u{2297}\notimesas;\t\u{2A36}\nouml\t\u{F6}\nouml;\t\u{F6}\n" +
+        "ovbar;\t\u{233D}\npar;\t\u{2225}\npara\t\u{B6}\npara;\t\u{B6}\nparallel;\t\u{2225}\nparsim;\t\u{2AF3}\n" +
+        "parsl;\t\u{2AFD}\npart;\t\u{2202}\npcy;\t\u{43F}\npercnt;\t%\nperiod;\t.\npermil;\t\u{2030}\n" +
+        "perp;\t\u{22A5}\npertenk;\t\u{2031}\npfr;\t\u{1D52D}\nphi;\t\u{3C6}\nphiv;\t\u{3D5}\nphmmat;\t\u{2133}\n" +
+        "phone;\t\u{260E}\npi;\t\u{3C0}\npitchfork;\t\u{22D4}\npiv;\t\u{3D6}\nplanck;\t\u{210F}\nplanckh;\t\u{210E}\n" +
+        "plankv;\t\u{210F}\nplus;\t+\nplusacir;\t\u{2A23}\nplusb;\t\u{229E}\npluscir;\t\u{2A22}\nplusdo;\t\u{2214}\n" +
+        "plusdu;\t\u{2A25}\npluse;\t\u{2A72}\nplusmn\t\u{B1}\nplusmn;\t\u{B1}\nplussim;\t\u{2A26}\nplustwo;\t\u{2A27}\n" +
+        "pm;\t\u{B1}\npointint;\t\u{2A15}\npopf;\t\u{1D561}\npound\t\u{A3}\npound;\t\u{A3}\npr;\t\u{227A}\n" +
+        "prE;\t\u{2AB3}\nprap;\t\u{2AB7}\nprcue;\t\u{227C}\npre;\t\u{2AAF}\nprec;\t\u{227A}\nprecapprox;\t\u{2AB7}\n" +
+        "preccurlyeq;\t\u{227C}\npreceq;\t\u{2AAF}\nprecnapprox;\t\u{2AB9}\nprecneqq;\t\u{2AB5}\nprecnsim;\t\u{22E8}\nprecsim;\t\u{227E}\n" +
+        "prime;\t\u{2032}\nprimes;\t\u{2119}\nprnE;\t\u{2AB5}\nprnap;\t\u{2AB9}\nprnsim;\t\u{22E8}\nprod;\t\u{220F}\n" +
+        "profalar;\t\u{232E}\nprofline;\t\u{2312}\nprofsurf;\t\u{2313}\nprop;\t\u{221D}\npropto;\t\u{221D}\nprsim;\t\u{227E}\n" +
+        "prurel;\t\u{22B0}\npscr;\t\u{1D4C5}\npsi;\t\u{3C8}\npuncsp;\t\u{2008}\nqfr;\t\u{1D52E}\nqint;\t\u{2A0C}\n" +
+        "qopf;\t\u{1D562}\nqprime;\t\u{2057}\nqscr;\t\u{1D4C6}\nquaternions;\t\u{210D}\nquatint;\t\u{2A16}\nquest;\t?\n" +
+        "questeq;\t\u{225F}\nquot\t\"\nquot;\t\"\nrAarr;\t\u{21DB}\nrArr;\t\u{21D2}\nrAtail;\t\u{291C}\n" +
+        "rBarr;\t\u{290F}\nrHar;\t\u{2964}\nrace;\t\u{223D}\u{331}\nracute;\t\u{155}\nradic;\t\u{221A}\nraemptyv;\t\u{29B3}\n" +
+        "rang;\t\u{27E9}\nrangd;\t\u{2992}\nrange;\t\u{29A5}\nrangle;\t\u{27E9}\nraquo\t\u{BB}\nraquo;\t\u{BB}\n" +
+        "rarr;\t\u{2192}\nrarrap;\t\u{2975}\nrarrb;\t\u{21E5}\nrarrbfs;\t\u{2920}\nrarrc;\t\u{2933}\nrarrfs;\t\u{291E}\n" +
+        "rarrhk;\t\u{21AA}\nrarrlp;\t\u{21AC}\nrarrpl;\t\u{2945}\nrarrsim;\t\u{2974}\nrarrtl;\t\u{21A3}\nrarrw;\t\u{219D}\n" +
+        "ratail;\t\u{291A}\nratio;\t\u{2236}\nrationals;\t\u{211A}\nrbarr;\t\u{290D}\nrbbrk;\t\u{2773}\nrbrace;\t}\n" +
+        "rbrack;\t]\nrbrke;\t\u{298C}\nrbrksld;\t\u{298E}\nrbrkslu;\t\u{2990}\nrcaron;\t\u{159}\nrcedil;\t\u{157}\n" +
+        "rceil;\t\u{2309}\nrcub;\t}\nrcy;\t\u{440}\nrdca;\t\u{2937}\nrdldhar;\t\u{2969}\nrdquo;\t\u{201D}\n" +
+        "rdquor;\t\u{201D}\nrdsh;\t\u{21B3}\nreal;\t\u{211C}\nrealine;\t\u{211B}\nrealpart;\t\u{211C}\nreals;\t\u{211D}\n" +
+        "rect;\t\u{25AD}\nreg\t\u{AE}\nreg;\t\u{AE}\nrfisht;\t\u{297D}\nrfloor;\t\u{230B}\nrfr;\t\u{1D52F}\n" +
+        "rhard;\t\u{21C1}\nrharu;\t\u{21C0}\nrharul;\t\u{296C}\nrho;\t\u{3C1}\nrhov;\t\u{3F1}\nrightarrow;\t\u{2192}\n" +
+        "rightarrowtail;\t\u{21A3}\nrightharpoondown;\t\u{21C1}\nrightharpoonup;\t\u{21C0}\nrightleftarrows;\t\u{21C4}\nrightleftharpoons;\t\u{21CC}\nrightrightarrows;\t\u{21C9}\n" +
+        "rightsquigarrow;\t\u{219D}\nrightthreetimes;\t\u{22CC}\nring;\t\u{2DA}\nrisingdotseq;\t\u{2253}\nrlarr;\t\u{21C4}\nrlhar;\t\u{21CC}\n" +
+        "rlm;\t\u{200F}\nrmoust;\t\u{23B1}\nrmoustache;\t\u{23B1}\nrnmid;\t\u{2AEE}\nroang;\t\u{27ED}\nroarr;\t\u{21FE}\n" +
+        "robrk;\t\u{27E7}\nropar;\t\u{2986}\nropf;\t\u{1D563}\nroplus;\t\u{2A2E}\nrotimes;\t\u{2A35}\nrpar;\t)\n" +
+        "rpargt;\t\u{2994}\nrppolint;\t\u{2A12}\nrrarr;\t\u{21C9}\nrsaquo;\t\u{203A}\nrscr;\t\u{1D4C7}\nrsh;\t\u{21B1}\n" +
+        "rsqb;\t]\nrsquo;\t\u{2019}\nrsquor;\t\u{2019}\nrthree;\t\u{22CC}\nrtimes;\t\u{22CA}\nrtri;\t\u{25B9}\n" +
+        "rtrie;\t\u{22B5}\nrtrif;\t\u{25B8}\nrtriltri;\t\u{29CE}\nruluhar;\t\u{2968}\nrx;\t\u{211E}\nsacute;\t\u{15B}\n" +
+        "sbquo;\t\u{201A}\nsc;\t\u{227B}\nscE;\t\u{2AB4}\nscap;\t\u{2AB8}\nscaron;\t\u{161}\nsccue;\t\u{227D}\n" +
+        "sce;\t\u{2AB0}\nscedil;\t\u{15F}\nscirc;\t\u{15D}\nscnE;\t\u{2AB6}\nscnap;\t\u{2ABA}\nscnsim;\t\u{22E9}\n" +
+        "scpolint;\t\u{2A13}\nscsim;\t\u{227F}\nscy;\t\u{441}\nsdot;\t\u{22C5}\nsdotb;\t\u{22A1}\nsdote;\t\u{2A66}\n" +
+        "seArr;\t\u{21D8}\nsearhk;\t\u{2925}\nsearr;\t\u{2198}\nsearrow;\t\u{2198}\nsect\t\u{A7}\nsect;\t\u{A7}\n" +
+        "semi;\t;\nseswar;\t\u{2929}\nsetminus;\t\u{2216}\nsetmn;\t\u{2216}\nsext;\t\u{2736}\nsfr;\t\u{1D530}\n" +
+        "sfrown;\t\u{2322}\nsharp;\t\u{266F}\nshchcy;\t\u{449}\nshcy;\t\u{448}\nshortmid;\t\u{2223}\nshortparallel;\t\u{2225}\n" +
+        "shy\t\u{AD}\nshy;\t\u{AD}\nsigma;\t\u{3C3}\nsigmaf;\t\u{3C2}\nsigmav;\t\u{3C2}\nsim;\t\u{223C}\n" +
+        "simdot;\t\u{2A6A}\nsime;\t\u{2243}\nsimeq;\t\u{2243}\nsimg;\t\u{2A9E}\nsimgE;\t\u{2AA0}\nsiml;\t\u{2A9D}\n" +
+        "simlE;\t\u{2A9F}\nsimne;\t\u{2246}\nsimplus;\t\u{2A24}\nsimrarr;\t\u{2972}\nslarr;\t\u{2190}\nsmallsetminus;\t\u{2216}\n" +
+        "smashp;\t\u{2A33}\nsmeparsl;\t\u{29E4}\nsmid;\t\u{2223}\nsmile;\t\u{2323}\nsmt;\t\u{2AAA}\nsmte;\t\u{2AAC}\n" +
+        "smtes;\t\u{2AAC}\u{FE00}\nsoftcy;\t\u{44C}\nsol;\t/\nsolb;\t\u{29C4}\nsolbar;\t\u{233F}\nsopf;\t\u{1D564}\n" +
+        "spades;\t\u{2660}\nspadesuit;\t\u{2660}\nspar;\t\u{2225}\nsqcap;\t\u{2293}\nsqcaps;\t\u{2293}\u{FE00}\nsqcup;\t\u{2294}\n" +
+        "sqcups;\t\u{2294}\u{FE00}\nsqsub;\t\u{228F}\nsqsube;\t\u{2291}\nsqsubset;\t\u{228F}\nsqsubseteq;\t\u{2291}\nsqsup;\t\u{2290}\n" +
+        "sqsupe;\t\u{2292}\nsqsupset;\t\u{2290}\nsqsupseteq;\t\u{2292}\nsqu;\t\u{25A1}\nsquare;\t\u{25A1}\nsquarf;\t\u{25AA}\n" +
+        "squf;\t\u{25AA}\nsrarr;\t\u{2192}\nsscr;\t\u{1D4C8}\nssetmn;\t\u{2216}\nssmile;\t\u{2323}\nsstarf;\t\u{22C6}\n" +
+        "star;\t\u{2606}\nstarf;\t\u{2605}\nstraightepsilon;\t\u{3F5}\nstraightphi;\t\u{3D5}\nstrns;\t\u{AF}\nsub;\t\u{2282}\n" +
+        "subE;\t\u{2AC5}\nsubdot;\t\u{2ABD}\nsube;\t\u{2286}\nsubedot;\t\u{2AC3}\nsubmult;\t\u{2AC1}\nsubnE;\t\u{2ACB}\n" +
+        "subne;\t\u{228A}\nsubplus;\t\u{2ABF}\nsubrarr;\t\u{2979}\nsubset;\t\u{2282}\nsubseteq;\t\u{2286}\nsubseteqq;\t\u{2AC5}\n" +
+        "subsetneq;\t\u{228A}\nsubsetneqq;\t\u{2ACB}\nsubsim;\t\u{2AC7}\nsubsub;\t\u{2AD5}\nsubsup;\t\u{2AD3}\nsucc;\t\u{227B}\n" +
+        "succapprox;\t\u{2AB8}\nsucccurlyeq;\t\u{227D}\nsucceq;\t\u{2AB0}\nsuccnapprox;\t\u{2ABA}\nsuccneqq;\t\u{2AB6}\nsuccnsim;\t\u{22E9}\n" +
+        "succsim;\t\u{227F}\nsum;\t\u{2211}\nsung;\t\u{266A}\nsup1\t\u{B9}\nsup1;\t\u{B9}\nsup2\t\u{B2}\n" +
+        "sup2;\t\u{B2}\nsup3\t\u{B3}\nsup3;\t\u{B3}\nsup;\t\u{2283}\nsupE;\t\u{2AC6}\nsupdot;\t\u{2ABE}\n" +
+        "supdsub;\t\u{2AD8}\nsupe;\t\u{2287}\nsupedot;\t\u{2AC4}\nsuphsol;\t\u{27C9}\nsuphsub;\t\u{2AD7}\nsuplarr;\t\u{297B}\n" +
+        "supmult;\t\u{2AC2}\nsupnE;\t\u{2ACC}\nsupne;\t\u{228B}\nsupplus;\t\u{2AC0}\nsupset;\t\u{2283}\nsupseteq;\t\u{2287}\n" +
+        "supseteqq;\t\u{2AC6}\nsupsetneq;\t\u{228B}\nsupsetneqq;\t\u{2ACC}\nsupsim;\t\u{2AC8}\nsupsub;\t\u{2AD4}\nsupsup;\t\u{2AD6}\n" +
+        "swArr;\t\u{21D9}\nswarhk;\t\u{2926}\nswarr;\t\u{2199}\nswarrow;\t\u{2199}\nswnwar;\t\u{292A}\nszlig\t\u{DF}\n" +
+        "szlig;\t\u{DF}\ntarget;\t\u{2316}\ntau;\t\u{3C4}\ntbrk;\t\u{23B4}\ntcaron;\t\u{165}\ntcedil;\t\u{163}\n" +
+        "tcy;\t\u{442}\ntdot;\t\u{20DB}\ntelrec;\t\u{2315}\ntfr;\t\u{1D531}\nthere4;\t\u{2234}\ntherefore;\t\u{2234}\n" +
+        "theta;\t\u{3B8}\nthetasym;\t\u{3D1}\nthetav;\t\u{3D1}\nthickapprox;\t\u{2248}\nthicksim;\t\u{223C}\nthinsp;\t\u{2009}\n" +
+        "thkap;\t\u{2248}\nthksim;\t\u{223C}\nthorn\t\u{FE}\nthorn;\t\u{FE}\ntilde;\t\u{2DC}\ntimes\t\u{D7}\n" +
+        "times;\t\u{D7}\ntimesb;\t\u{22A0}\ntimesbar;\t\u{2A31}\ntimesd;\t\u{2A30}\ntint;\t\u{222D}\ntoea;\t\u{2928}\n" +
+        "top;\t\u{22A4}\ntopbot;\t\u{2336}\ntopcir;\t\u{2AF1}\ntopf;\t\u{1D565}\ntopfork;\t\u{2ADA}\ntosa;\t\u{2929}\n" +
+        "tprime;\t\u{2034}\ntrade;\t\u{2122}\ntriangle;\t\u{25B5}\ntriangledown;\t\u{25BF}\ntriangleleft;\t\u{25C3}\ntrianglelefteq;\t\u{22B4}\n" +
+        "triangleq;\t\u{225C}\ntriangleright;\t\u{25B9}\ntrianglerighteq;\t\u{22B5}\ntridot;\t\u{25EC}\ntrie;\t\u{225C}\ntriminus;\t\u{2A3A}\n" +
+        "triplus;\t\u{2A39}\ntrisb;\t\u{29CD}\ntritime;\t\u{2A3B}\ntrpezium;\t\u{23E2}\ntscr;\t\u{1D4C9}\ntscy;\t\u{446}\n" +
+        "tshcy;\t\u{45B}\ntstrok;\t\u{167}\ntwixt;\t\u{226C}\ntwoheadleftarrow;\t\u{219E}\ntwoheadrightarrow;\t\u{21A0}\nuArr;\t\u{21D1}\n" +
+        "uHar;\t\u{2963}\nuacute\t\u{FA}\nuacute;\t\u{FA}\nuarr;\t\u{2191}\nubrcy;\t\u{45E}\nubreve;\t\u{16D}\n" +
+        "ucirc\t\u{FB}\nucirc;\t\u{FB}\nucy;\t\u{443}\nudarr;\t\u{21C5}\nudblac;\t\u{171}\nudhar;\t\u{296E}\n" +
+        "ufisht;\t\u{297E}\nufr;\t\u{1D532}\nugrave\t\u{F9}\nugrave;\t\u{F9}\nuharl;\t\u{21BF}\nuharr;\t\u{21BE}\n" +
+        "uhblk;\t\u{2580}\nulcorn;\t\u{231C}\nulcorner;\t\u{231C}\nulcrop;\t\u{230F}\nultri;\t\u{25F8}\numacr;\t\u{16B}\n" +
+        "uml\t\u{A8}\numl;\t\u{A8}\nuogon;\t\u{173}\nuopf;\t\u{1D566}\nuparrow;\t\u{2191}\nupdownarrow;\t\u{2195}\n" +
+        "upharpoonleft;\t\u{21BF}\nupharpoonright;\t\u{21BE}\nuplus;\t\u{228E}\nupsi;\t\u{3C5}\nupsih;\t\u{3D2}\nupsilon;\t\u{3C5}\n" +
+        "upuparrows;\t\u{21C8}\nurcorn;\t\u{231D}\nurcorner;\t\u{231D}\nurcrop;\t\u{230E}\nuring;\t\u{16F}\nurtri;\t\u{25F9}\n" +
+        "uscr;\t\u{1D4CA}\nutdot;\t\u{22F0}\nutilde;\t\u{169}\nutri;\t\u{25B5}\nutrif;\t\u{25B4}\nuuarr;\t\u{21C8}\n" +
+        "uuml\t\u{FC}\nuuml;\t\u{FC}\nuwangle;\t\u{29A7}\nvArr;\t\u{21D5}\nvBar;\t\u{2AE8}\nvBarv;\t\u{2AE9}\n" +
+        "vDash;\t\u{22A8}\nvangrt;\t\u{299C}\nvarepsilon;\t\u{3F5}\nvarkappa;\t\u{3F0}\nvarnothing;\t\u{2205}\nvarphi;\t\u{3D5}\n" +
+        "varpi;\t\u{3D6}\nvarpropto;\t\u{221D}\nvarr;\t\u{2195}\nvarrho;\t\u{3F1}\nvarsigma;\t\u{3C2}\nvarsubsetneq;\t\u{228A}\u{FE00}\n" +
+        "varsubsetneqq;\t\u{2ACB}\u{FE00}\nvarsupsetneq;\t\u{228B}\u{FE00}\nvarsupsetneqq;\t\u{2ACC}\u{FE00}\nvartheta;\t\u{3D1}\nvartriangleleft;\t\u{22B2}\nvartriangleright;\t\u{22B3}\n" +
+        "vcy;\t\u{432}\nvdash;\t\u{22A2}\nvee;\t\u{2228}\nveebar;\t\u{22BB}\nveeeq;\t\u{225A}\nvellip;\t\u{22EE}\n" +
+        "verbar;\t|\nvert;\t|\nvfr;\t\u{1D533}\nvltri;\t\u{22B2}\nvnsub;\t\u{2282}\u{20D2}\nvnsup;\t\u{2283}\u{20D2}\n" +
+        "vopf;\t\u{1D567}\nvprop;\t\u{221D}\nvrtri;\t\u{22B3}\nvscr;\t\u{1D4CB}\nvsubnE;\t\u{2ACB}\u{FE00}\nvsubne;\t\u{228A}\u{FE00}\n" +
+        "vsupnE;\t\u{2ACC}\u{FE00}\nvsupne;\t\u{228B}\u{FE00}\nvzigzag;\t\u{299A}\nwcirc;\t\u{175}\nwedbar;\t\u{2A5F}\nwedge;\t\u{2227}\n" +
+        "wedgeq;\t\u{2259}\nweierp;\t\u{2118}\nwfr;\t\u{1D534}\nwopf;\t\u{1D568}\nwp;\t\u{2118}\nwr;\t\u{2240}\n" +
+        "wreath;\t\u{2240}\nwscr;\t\u{1D4CC}\nxcap;\t\u{22C2}\nxcirc;\t\u{25EF}\nxcup;\t\u{22C3}\nxdtri;\t\u{25BD}\n" +
+        "xfr;\t\u{1D535}\nxhArr;\t\u{27FA}\nxharr;\t\u{27F7}\nxi;\t\u{3BE}\nxlArr;\t\u{27F8}\nxlarr;\t\u{27F5}\n" +
+        "xmap;\t\u{27FC}\nxnis;\t\u{22FB}\nxodot;\t\u{2A00}\nxopf;\t\u{1D569}\nxoplus;\t\u{2A01}\nxotime;\t\u{2A02}\n" +
+        "xrArr;\t\u{27F9}\nxrarr;\t\u{27F6}\nxscr;\t\u{1D4CD}\nxsqcup;\t\u{2A06}\nxuplus;\t\u{2A04}\nxutri;\t\u{25B3}\n" +
+        "xvee;\t\u{22C1}\nxwedge;\t\u{22C0}\nyacute\t\u{FD}\nyacute;\t\u{FD}\nyacy;\t\u{44F}\nycirc;\t\u{177}\n" +
+        "ycy;\t\u{44B}\nyen\t\u{A5}\nyen;\t\u{A5}\nyfr;\t\u{1D536}\nyicy;\t\u{457}\nyopf;\t\u{1D56A}\n" +
+        "yscr;\t\u{1D4CE}\nyucy;\t\u{44E}\nyuml\t\u{FF}\nyuml;\t\u{FF}\nzacute;\t\u{17A}\nzcaron;\t\u{17E}\n" +
+        "zcy;\t\u{437}\nzdot;\t\u{17C}\nzeetrf;\t\u{2128}\nzeta;\t\u{3B6}\nzfr;\t\u{1D537}\nzhcy;\t\u{436}\n" +
+        "zigrarr;\t\u{21DD}\nzopf;\t\u{1D56B}\nzscr;\t\u{1D4CF}\nzwj;\t\u{200D}\nzwnj;\t\u{200C}\n"
+}
