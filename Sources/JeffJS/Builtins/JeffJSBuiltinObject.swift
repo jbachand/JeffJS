@@ -9,6 +9,15 @@ import Foundation
 
 // MARK: - JeffJSContext extensions for Object built-in
 
+/// The integer-indexed exotic object classes: every `%TypedArray%` view.
+/// `DataView` is deliberately not one of them — it has no indexed elements.
+@inline(__always)
+func jeffJS_isTypedArrayClass<T: BinaryInteger>(_ classID: T) -> Bool {
+    let id = Int(classID)
+    return id >= Int(JeffJSClassID.uint8cArray.rawValue) &&
+        id <= Int(JeffJSClassID.float64Array.rawValue)
+}
+
 extension JeffJSContext {
     /// Object.prototype convenience accessor.
     var objectPrototype: JeffJSValue {
@@ -124,12 +133,40 @@ extension JeffJSContext {
             return true
         }
         if let shape = jsObj.shape, findShapeProperty(shape, atom) != nil { return true }
+        // The same three exotic index stores the `in` operator reads
+        // (`hasPropertyEx`): array holes, typed-array elements and a String
+        // wrapper's [[StringData]] indices. This used to be a separate, shorter
+        // walk that reported a deleted array slot as present and never saw a
+        // typed array or a string wrapper at all.
         if jsObj.fastArray || jsObj.classID == JeffJSClassID.array.rawValue,
            let idx = rt.atomToUInt32(atom) {
+            // A hole is absent: `[1].hasOwnProperty(1)` and, after
+            // `delete a[0]`, `a.hasOwnProperty(0)` are both false.
             if let storage = jsObj._fastArrayValues {
-                if idx < storage.count, Int(idx) < storage.values.count { return true }
+                if idx < storage.count, Int(idx) < storage.values.count {
+                    return !storage.values[Int(idx)].isUninitialized
+                }
             } else if let snap = jsObj.arraySnapshot() {
-                if Int(idx) < snap.count, Int(idx) < snap.values.count { return true }
+                if Int(idx) < snap.count, Int(idx) < snap.values.count {
+                    return !snap.values[Int(idx)].isUninitialized
+                }
+            }
+        }
+        if jeffJS_isTypedArrayClass(jsObj.classID) {
+            if case .typedArray(let ta) = jsObj.payload,
+               rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom) {
+                guard let bufObj = ta.buffer,
+                      case .arrayBuffer(let ab) = bufObj.payload,
+                      !ab.detached else { return false }
+                return idx < ta.length
+            }
+        }
+        if jsObj.classID == JeffJSClassID.string.rawValue,
+           rt.atomIsArrayIndex(atom) {
+            let pv = jsObj.primitiveValue
+            if pv.isString, let idx = rt.atomToUInt32(atom),
+               let js = pv.stringValue, Int(idx) < js.len {
+                return true
             }
         }
         return false
@@ -406,8 +443,13 @@ extension JeffJSContext {
         // Object.keys / Object.entries / Object.assign on a plain object:
         // the shape's cached for-in key list already has exactly these keys
         // in this order.
+        // A typed array is excluded for the same reason a String wrapper and an
+        // array are: its index keys live in the backing buffer, not in the
+        // shape, so the cached key list is missing every one of them and
+        // `Object.keys(new Uint8Array(3))` came back empty.
         if enumOnly, wantStrings, !wantSymbols, let shape = jsObj.shape,
-           jsObj.classID != JSClassID.JS_CLASS_STRING.rawValue, jsObj.arraySnapshot() == nil {
+           jsObj.classID != JSClassID.JS_CLASS_STRING.rawValue,
+           !jeffJS_isTypedArrayClass(jsObj.classID), jsObj.arraySnapshot() == nil {
             let cached = shapeEnumKeys(shape).keys
             var names: [JeffJSValue] = []
             names.reserveCapacity(cached.count)
@@ -435,6 +477,23 @@ extension JeffJSContext {
                 // "length" is also a real shape property on the wrapper, so
                 // the shape walk below appends it — don't emit it twice.
                 _ = enumOnly
+            }
+        }
+
+        // 0b. Integer-indexed exotic objects (every %TypedArray% view) keep
+        //     their elements in the ArrayBuffer, so the shape walk below sees
+        //     none of them. They are enumerable, writable, non-configurable
+        //     own properties (ES §10.4.5), and there are never holes: a view
+        //     of length n has exactly the keys 0 … n-1. A detached buffer has
+        //     none at all.
+        if wantStrings, jeffJS_isTypedArrayClass(jsObj.classID),
+           case .typedArray(let ta) = jsObj.payload {
+            var detached = true
+            if let bufObj = ta.buffer, case .arrayBuffer(let ab) = bufObj.payload {
+                detached = ab.detached
+            }
+            if !detached {
+                for i in 0 ..< Int(ta.length) { intKeys.append((UInt32(i), intKeyString(i))) }
             }
         }
 
@@ -1511,12 +1570,16 @@ struct JeffJSBuiltinObject {
         let desc = ctx.newPlainObject()
         if desc.isException { return desc }
         defer { desc.freeValue() }   // a throwaway; the property keeps its own refs
-        var ret = ctx.setProperty(obj: desc, atom: JSAtomID.get, value: getter.dupValue())
-        if ret < 0 { return .exception }
-        ret = ctx.setProperty(obj: desc, atom: JSAtomID.enumerable, value: .JS_TRUE)
-        if ret < 0 { return .exception }
-        ret = ctx.setProperty(obj: desc, atom: JSAtomID.configurable, value: .JS_TRUE)
-        if ret < 0 { return .exception }
+        // By name, not by `JSAtomID.get`/`JSAtomID.set`: the predefined table
+        // has *two* atoms spelled "set" (`set` = 68 and `set_` = 355), and
+        // `definePropertyFromDescriptor` reads the descriptor through
+        // `rt.findAtom("set")`, which resolves to the other one. The setter
+        // written under atom 68 was therefore invisible and
+        // `__defineSetter__` quietly installed a `{ writable: false }` data
+        // property instead of an accessor.
+        _ = ctx.setPropertyStr(obj: desc, name: "get", value: getter.dupValue())
+        _ = ctx.setPropertyStr(obj: desc, name: "enumerable", value: .JS_TRUE)
+        _ = ctx.setPropertyStr(obj: desc, name: "configurable", value: .JS_TRUE)
 
         let result = ctx.definePropertyFromDescriptor(obj, key: key, desc: desc)
         if result.isException { return result }
@@ -1546,12 +1609,10 @@ struct JeffJSBuiltinObject {
         let desc = ctx.newPlainObject()
         if desc.isException { return desc }
         defer { desc.freeValue() }   // a throwaway; the property keeps its own refs
-        var ret = ctx.setProperty(obj: desc, atom: JSAtomID.set, value: setter.dupValue())
-        if ret < 0 { return .exception }
-        ret = ctx.setProperty(obj: desc, atom: JSAtomID.enumerable, value: .JS_TRUE)
-        if ret < 0 { return .exception }
-        ret = ctx.setProperty(obj: desc, atom: JSAtomID.configurable, value: .JS_TRUE)
-        if ret < 0 { return .exception }
+        // See __defineGetter__: the descriptor keys go in by name.
+        _ = ctx.setPropertyStr(obj: desc, name: "set", value: setter.dupValue())
+        _ = ctx.setPropertyStr(obj: desc, name: "enumerable", value: .JS_TRUE)
+        _ = ctx.setPropertyStr(obj: desc, name: "configurable", value: .JS_TRUE)
 
         let result = ctx.definePropertyFromDescriptor(obj, key: key, desc: desc)
         if result.isException { return result }
@@ -1583,7 +1644,8 @@ struct JeffJSBuiltinObject {
 
             if !desc.isUndefined {
                 defer { ctx.freeValue(desc) }
-                let getter = ctx.getProperty(obj: desc, atom: JSAtomID.get)
+                // By name — see __defineGetter__ on the duplicate "set" atom.
+                let getter = ctx.getPropertyStr(obj: desc, name: "get")
                 if getter.isException { return getter }
                 if !getter.isUndefined {
                     return getter
@@ -1627,7 +1689,8 @@ struct JeffJSBuiltinObject {
 
             if !desc.isUndefined {
                 defer { ctx.freeValue(desc) }
-                let setter = ctx.getProperty(obj: desc, atom: JSAtomID.set)
+                // By name — see __defineGetter__ on the duplicate "set" atom.
+                let setter = ctx.getPropertyStr(obj: desc, name: "set")
                 if setter.isException { return setter }
                 if !setter.isUndefined {
                     return setter

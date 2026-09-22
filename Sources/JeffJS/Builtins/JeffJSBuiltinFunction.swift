@@ -319,19 +319,19 @@ struct JeffJSBuiltinFunction {
             // No recorded source (stripped or synthesized bytecode) — QuickJS
             // falls back to the native-code form here too.
             let name = getFunctionName(obj: obj)
-            let result = "function \(name)() { [native code] }"
+            let result = "function \(name)() {\n    [native code]\n}"
             return JeffJSValue.makeString(JeffJSString(swiftString: result))
 
         case .cFunc(_, _, _, _, _):
-            // C function — return "function name() { [native code] }"
+            // C function — return "function name() {\n    [native code]\n}"
             let name = getFunctionName(obj: obj)
-            let result = "function \(name)() { [native code] }"
+            let result = "function \(name)() {\n    [native code]\n}"
             return JeffJSValue.makeString(JeffJSString(swiftString: result))
 
         case .boundFunction(_):
-            // Bound function — return "function () { [native code] }"
+            // Bound function — return "function () {\n    [native code]\n}"
             let name = getFunctionName(obj: obj)
-            let result = "function \(name)() { [native code] }"
+            let result = "function \(name)() {\n    [native code]\n}"
             return JeffJSValue.makeString(JeffJSString(swiftString: result))
 
         default:
@@ -339,7 +339,7 @@ struct JeffJSBuiltinFunction {
             // (proxy or class-based callable), still produce output.
             if classID == JeffJSClassID.proxy.rawValue {
                 // Proxy wrapping a function
-                let result = "function () { [native code] }"
+                let result = "function () {\n    [native code]\n}"
                 return JeffJSValue.makeString(JeffJSString(swiftString: result))
             }
             return ctx.throwTypeError("Function.prototype.toString requires that 'this' be a Function")

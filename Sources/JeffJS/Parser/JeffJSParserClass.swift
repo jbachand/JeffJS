@@ -585,7 +585,8 @@ extension JeffJSParser {
 
             let methodFd = JeffJSFunctionDefCompiler()
             methodFd.parent = fd
-            methodFd.funcName = propAtom
+            methodFd.funcName = accessorFuncName(propKind, propAtom,
+                                                 isComputed: isComputed, isPrivate: isPrivate)
             methodFd.definedScopeLevel = fd.curScope
             if isGenerator {
                 methodFd.funcKind = isAsync

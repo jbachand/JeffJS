@@ -153,6 +153,49 @@ private func js_atomics_validateTypedArray(
     return (taObj, ab, byteIndex, elemSize)
 }
 
+// MARK: - BigInt64Array / BigUint64Array
+
+// The 64-bit atomics work on raw bits. Everything above them ran through
+// `Int64`/`Double` and had no ToBigInt step at all, so an operand of `7n`
+// converted to zero, the result came back as a Number, and every
+// `Atomics.load/store/add/...` on a BigInt64Array answered 0.
+
+/// The element's raw little-endian bits.
+@inline(__always)
+private func js_atomics_loadBits(_ data: [UInt8], _ byteIndex: Int) -> UInt64 {
+    guard byteIndex >= 0, byteIndex + 7 < data.count else { return 0 }
+    var raw: UInt64 = 0
+    for i in 0 ..< 8 { raw |= UInt64(data[byteIndex + i]) << (i * 8) }
+    return raw
+}
+
+@inline(__always)
+private func js_atomics_storeBits(_ data: inout [UInt8], _ byteIndex: Int, _ bits: UInt64) {
+    guard byteIndex >= 0, byteIndex + 7 < data.count else { return }
+    for i in 0 ..< 8 { data[byteIndex + i] = UInt8((bits >> (i * 8)) & 0xFF) }
+}
+
+/// The JS value for a 64-bit element: a BigInt, signed or not.
+@inline(__always)
+private func js_atomics_bigIntValue(_ bits: UInt64, isSigned: Bool) -> JeffJSValue {
+    isSigned ? .newBigInt(Int64(bitPattern: bits)) : .newBigInt(JBigInt(bits))
+}
+
+/// ToBigInt, then the low 64 bits (ES §25.4.2.1 step 2: a BigInt array's
+/// operands go through ToBigInt, so a Number operand is a TypeError).
+/// Returns nil with the exception already thrown.
+private func js_atomics_bigIntBits(_ ctx: JeffJSContext, _ v: JeffJSValue) -> UInt64? {
+    if v.isBigInt { return v.bigIntValue.lowUInt64 }
+    let b = ctx.toBigIntValue(v)
+    if b.isException { return nil }
+    defer { b.freeValue() }
+    guard b.isBigInt else {
+        _ = ctx.throwTypeError("Atomics: cannot convert value to a BigInt")
+        return nil
+    }
+    return b.bigIntValue.lowUInt64
+}
+
 // MARK: - Atomic read/write helpers
 
 /// Read an atomic value from the buffer at the given byte offset.
@@ -393,6 +436,40 @@ func js_atomics_op(
 
     let (classify_isBigInt, classify_isSigned) = js_atomics_classify(info.obj.classID)
 
+    guard let opKindEarly = JSAtomicsOpKind(rawValue: magic) else {
+        return ctx.throwTypeError("Atomics: invalid operation")
+    }
+    if classify_isBigInt {
+        guard let operandBits = js_atomics_bigIntBits(ctx, argv[2]) else { return .exception }
+        var replacementBits: UInt64 = 0
+        if opKindEarly == .compareExchange {
+            guard argv.count >= 4,
+                  let r = js_atomics_bigIntBits(ctx, argv[3]) else { return .exception }
+            replacementBits = r
+        }
+        jsAtomicsGlobalLock.lock()
+        defer { jsAtomicsGlobalLock.unlock() }
+        let oldBits = js_atomics_loadBits(info.buffer.data, info.byteIndex)
+        let newBits: UInt64
+        switch opKindEarly {
+        case .add:      newBits = oldBits &+ operandBits
+        case .and:      newBits = oldBits & operandBits
+        case .or:       newBits = oldBits | operandBits
+        case .sub:      newBits = oldBits &- operandBits
+        case .xor:      newBits = oldBits ^ operandBits
+        case .exchange: newBits = operandBits
+        case .compareExchange:
+            // Compared on the bits, which is the same test either signedness
+            // gives on a two's-complement 64-bit element.
+            guard oldBits == operandBits else {
+                return js_atomics_bigIntValue(oldBits, isSigned: classify_isSigned)
+            }
+            newBits = replacementBits
+        }
+        js_atomics_storeBits(&info.buffer.data, info.byteIndex, newBits)
+        return js_atomics_bigIntValue(oldBits, isSigned: classify_isSigned)
+    }
+
     // Read the operand value.
     let operandVal: Int64
     if argv[2].isInt {
@@ -511,16 +588,18 @@ func js_atomics_load(
     let (isBigInt, isSigned) = js_atomics_classify(info.obj.classID)
 
     jsAtomicsGlobalLock.lock()
-    let result = js_atomics_load_raw(
+    defer { jsAtomicsGlobalLock.unlock() }
+    if isBigInt {
+        return js_atomics_bigIntValue(
+            js_atomics_loadBits(info.buffer.data, info.byteIndex), isSigned: isSigned)
+    }
+    return js_atomics_load_raw(
         buffer: info.buffer,
         byteIndex: info.byteIndex,
         elemSize: info.elemSize,
         isBigInt: isBigInt,
         isSigned: isSigned
     )
-    jsAtomicsGlobalLock.unlock()
-
-    return result
 }
 
 // MARK: - Atomics.store
@@ -548,6 +627,16 @@ func js_atomics_store(
     }
 
     let value = argv[2]
+    let (storeIsBigInt, storeIsSigned) = js_atomics_classify(info.obj.classID)
+
+    if storeIsBigInt {
+        guard let bits = js_atomics_bigIntBits(ctx, value) else { return .exception }
+        jsAtomicsGlobalLock.lock()
+        js_atomics_storeBits(&info.buffer.data, info.byteIndex, bits)
+        jsAtomicsGlobalLock.unlock()
+        // Atomics.store returns the *converted* value, not the argument.
+        return js_atomics_bigIntValue(bits, isSigned: storeIsSigned)
+    }
 
     jsAtomicsGlobalLock.lock()
     js_atomics_store_raw(

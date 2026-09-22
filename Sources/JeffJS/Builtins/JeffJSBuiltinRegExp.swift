@@ -1252,7 +1252,26 @@ func js_regexp_Symbol_split(
     var p = 0  // Previous match end position.
     var q = 0  // Current search position.
 
-    while q <= inputStr.len {
+    // ES §22.2.6.14 step 16: an empty subject is answered by one probe, not by
+    // the loop — `"".split(/(?:)/)` is `[]` and `"".split(/a/)` is `[""]`.
+    if inputStr.len == 0 {
+        let probe = js_regexp_execInternal(ctx: ctx, obj: obj, inputStr: inputStr,
+                                           startIndex: 0, flags: flags,
+                                           captureCount: captureCount)
+        let arrVal = ctx.newArray()
+        if probe == nil || probe!.isEmpty, limit > 0 {
+            _ = ctx.setPropertyStr(obj: arrVal, name: "0", value: .makeString(inputStr))
+            _ = ctx.setPropertyStr(obj: arrVal, name: "length", value: .newInt32(1))
+        }
+        return arrVal
+    }
+
+    // `q < size`, not `q <= size` (step 19). At `q == size` the forced-sticky
+    // probe finds the empty match every `*`-quantified pattern has there, and
+    // because that match's end differs from `p` it emitted one extra segment
+    // and then an empty tail: `"a,b,,c".split(/,*/)` came back as
+    // ["a","b","c",""].
+    while q < inputStr.len {
         // Execute regex starting from position q using execInternal directly.
         let matchResult = js_regexp_execInternal(
             ctx: ctx,

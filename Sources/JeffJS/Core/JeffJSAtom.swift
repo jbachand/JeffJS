@@ -1791,8 +1791,12 @@ enum JSAtomID {
     static let hasOwnProperty:          JSAtom = JSPredefinedAtom.hasOwnProperty.rawValue
     static let isPrototypeOf:           JSAtom = JSPredefinedAtom.isPrototypeOf.rawValue
     static let propertyIsEnumerable:    JSAtom = JSPredefinedAtom.propertyIsEnumerable.rawValue
-    static let defineGetter:            JSAtom = JSPredefinedAtom.lookupGetter.rawValue   // __defineGetter__
-    static let defineSetter:            JSAtom = JSPredefinedAtom.lookupSetter.rawValue   // __defineSetter__
+    // Their own atoms, not the lookup ones: aliasing them to lookupGetter /
+    // lookupSetter made `addIntrinsic` install four functions into two slots,
+    // and the later `__lookupGetter__`/`__lookupSetter__` writes won — so
+    // `({}).__defineGetter__` was undefined and every call to it threw.
+    static let defineGetter:            JSAtom = JSPredefinedAtom.defineGetter.rawValue
+    static let defineSetter:            JSAtom = JSPredefinedAtom.defineSetter.rawValue
     static let lookupGetter:            JSAtom = JSPredefinedAtom.lookupGetter.rawValue
     static let lookupSetter:            JSAtom = JSPredefinedAtom.lookupSetter.rawValue
     static let getPrototypeOf:          JSAtom = JSPredefinedAtom.getPrototypeOf.rawValue

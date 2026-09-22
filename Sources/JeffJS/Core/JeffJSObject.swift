@@ -820,9 +820,54 @@ struct GeneratorSavedState {
 }
 
 /// Generator data.
+/// One queued `next` / `return` / `throw` on an async generator, with the
+/// promise capability whose settlement is that call's answer.
+final class JeffJSAsyncGenRequest {
+    let completionType: Int
+    var value: JeffJSValue      // owned
+    var resolve: JeffJSValue    // owned
+    var reject: JeffJSValue     // owned
+    init(completionType: Int, value: JeffJSValue,
+         resolve: JeffJSValue, reject: JeffJSValue) {
+        self.completionType = completionType
+        self.value = value
+        self.resolve = resolve
+        self.reject = reject
+    }
+    func release() {
+        value.freeValue(); resolve.freeValue(); reject.freeValue()
+        value = .undefined; resolve = .undefined; reject = .undefined
+    }
+}
+
 final class JeffJSGeneratorData {
     var state: JeffJSGeneratorStateEnum = .suspended_start
     var asyncState: JeffJSAsyncFunctionState = JeffJSAsyncFunctionState()
+
+    // MARK: Async generators
+    //
+    // An async generator body suspends for two different reasons and the
+    // driver has to tell them apart: a `yield` hands a value to the caller,
+    // an `await` on a *pending* promise hands control to the microtask queue
+    // and comes back to the same spot. Both leave `state == .suspended_yield`
+    // and a `savedState`, so the awaited promise is the discriminator.
+
+    /// The promise a parked `await` is waiting on; `.undefined` when the body
+    /// is parked on a `yield` instead. Owned.
+    var awaitedPromise: JeffJSValue = .undefined
+    /// Set by the await continuation: the body is to be resumed with this
+    /// value (or this exception) rather than with the head request's.
+    var awaitResumePending = false
+    var awaitResumeValue: JeffJSValue = .undefined   // owned
+    var awaitResumeIsThrow = false
+    /// The parked await is on a `yield*` delegate's iterator-result promise,
+    /// so the value it resumes with *is* the iterator result and the
+    /// delegation must not call `next()` again for it.
+    var delegateAwaitPending = false
+    /// Outstanding next/return/throw calls, oldest first.
+    var asyncQueue: [JeffJSAsyncGenRequest] = []
+    /// Re-entrancy guard for the drain loop.
+    var asyncDraining = false
     /// Saved interpreter state from the last yield/initial_yield.
     /// Non-nil when the generator is in a suspended state.  The saved value
     /// stack is *owned* by this state (the suspending frame moves its slots
@@ -837,6 +882,12 @@ final class JeffJSGeneratorData {
         if let saved = savedState, JeffJSGCObjectHeader.activeRuntime != nil {
             JeffJSGeneratorData.releaseSuspendedState(saved)
         }
+        if JeffJSGCObjectHeader.activeRuntime != nil {
+            awaitedPromise.freeValue()
+            awaitResumeValue.freeValue()
+            for req in asyncQueue { req.release() }
+        }
+        asyncQueue.removeAll()
     }
 
     /// Releases everything a suspended (never resumed) state owns: its value

@@ -601,6 +601,40 @@ final class JeffJSParser {
         }
     }
 
+    /// One loop step of `for (... of ...)` / `for await (... of ...)`.
+    ///
+    /// `for await` must await the *iterator result object* before it reads
+    /// `value` and `done` off it (ES §7.4.x, ForIn/OfBodyEvaluation step 6.b
+    /// with iteratorKind async) — an async iterator's `next()` returns a
+    /// promise **of** `{value, done}`, not the record itself. The loop used
+    /// `for_of_next`, which reads the two fields straight off whatever `next()`
+    /// returned, and then awaited the extracted value. That only worked while
+    /// async generator objects were (wrongly) handed the synchronous generator
+    /// prototype and `next()` answered with a plain object; against a real
+    /// promise it read `done` as `undefined` and looped forever.
+    ///
+    /// The three opcodes this needs — `for_await_of_next`,
+    /// `iterator_check_object`, `iterator_get_value_done` — already existed and
+    /// were emitted by nothing.
+    ///
+    /// The trailing `await_` on the value is kept: `for await` over a *sync*
+    /// iterable goes through CreateAsyncFromSyncIterator, which awaits each
+    /// value, and that is the common case.
+    private func emitForOfNext(isAwait: Bool, doneLabel: Int) {
+        guard isAwait else {
+            emitOp(.for_of_next)
+            emitU8(0)
+            emitIfTrue(doneLabel)
+            return
+        }
+        emitOp(.for_await_of_next)        // [iter, obj, method, result]
+        emitOp(.await_)                   // [iter, obj, method, awaited]
+        emitOp(.iterator_check_object)
+        emitOp(.iterator_get_value_done)  // [iter, obj, method, value, done]
+        emitIfTrue(doneLabel)
+        emitOp(.await_)
+    }
+
     /// Emit a scope_get_var opcode (to be resolved by the compiler later).
     ///
     /// Inside a `with` body the access becomes a guarded property read on the
@@ -634,6 +668,59 @@ final class JeffJSParser {
         emitOp(.scope_get_var)
         emitAtom(atom)
         emitU16(UInt16(scopeLevel))
+    }
+
+    /// The callee form of `emitScopeGetVar`: leaves **two** stack slots,
+    /// `[this, func]`, so the call that follows is a method call.
+    ///
+    /// `with (o) { m() }` must call `o.m` with `this === o` (ES §13.3.6.2 —
+    /// an identifier that resolves through an object environment record has
+    /// that object as its base, and the call uses the base as the receiver).
+    /// This is what the unused `with_make_ref` / `with_get_ref` opcodes were
+    /// for. Emitting a plain `scope_get_var` handed the method `undefined`,
+    /// so every `with (form) { submit() }` in a page threw.
+    ///
+    /// The miss path pushes `undefined` for the receiver, which is exactly
+    /// what an ordinary call passes, so both branches join with the same
+    /// height and `call_method` is correct either way.
+    func emitScopeGetVarCallee(_ atom: JSAtom, scopeLevel: Int) {
+        noteArgumentsUse(atom)
+        guard !fd.withVarStack.isEmpty, atom != JSPredefinedAtom.this_.rawValue else {
+            emitOp(.undefined)
+            emitOp(.scope_get_var)
+            emitAtom(atom)
+            emitU16(UInt16(scopeLevel))
+            return
+        }
+        let done = newLabel()
+        for withAtom in fd.withVarStack.reversed() {
+            let miss = newLabel()
+            emitOp(.scope_get_var)                        // [obj]
+            emitAtom(withAtom)
+            emitU16(UInt16(scopeLevel))
+            emitOp(.dup)                                  // [obj, obj]
+            emitOp(.push_atom_value); emitAtom(atom)      // [obj, obj, key]
+            emitOp(.swap)                                 // [obj, key, obj]
+            emitOp(.in_)                                  // [obj, hasProp]
+            emitIfFalse(miss)                             // [obj]
+            emitOp(.get_field2)                           // [obj, value]
+            emitAtom(atom)
+            emitGoto(done)
+            emitLabel(miss)
+            emitOp(.drop)                                 // []
+        }
+        emitOp(.undefined)                                // [undefined]
+        emitOp(.scope_get_var)                            // [undefined, value]
+        emitAtom(atom)
+        emitU16(UInt16(scopeLevel))
+        emitLabel(done)
+    }
+
+    /// True when the token after an identifier starts a call, so the
+    /// identifier should be emitted in its two-slot callee form.
+    var withCallFollows: Bool {
+        !fd.withVarStack.isEmpty
+            && (tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue)
     }
 
     /// Emit a scope_put_var opcode. See emitScopeGetVar for the `with` form;
@@ -1116,9 +1203,70 @@ final class JeffJSParser {
         return -1
     }
 
+    /// Look ahead over the program's directive prologue — the leading run of
+    /// string-literal expression statements — and turn strict mode on if
+    /// `"use strict"` is among them. Restores the tokenizer exactly.
+    private func scanProgramDirectivePrologue() {
+        let savedBufPtr = s.bufPtr
+        let savedLineNum = s.lineNum
+        let savedToken = s.token
+        let savedGotLF = s.gotLF
+        let savedLastLineNum = s.lastLineNum
+        let savedLastPtr = s.lastPtr
+        let savedTemplateNest = s.templateNestLevel
+        let savedMode = fd.jsMode
+        var strict = false
+
+        next()
+        while tok == JSTokenType.TOK_STRING.rawValue {
+            let text = s.token.strValue
+            next()
+            // A directive is a *lone* string expression statement. Anything
+            // that continues the expression (`"a" + b`, `"a".length`, a comma)
+            // ends the prologue, and so does a token that is not a statement
+            // boundary.
+            if tok == 0x3B {            // ';'
+                next()
+            } else if tok == JSTokenType.TOK_EOF.rawValue || s.gotLF || tok == 0x7D {
+                // ASI or end of input: still a directive.
+            } else {
+                break
+            }
+            if text == "use strict" { strict = true; break }
+        }
+
+        s.bufPtr = savedBufPtr
+        s.lineNum = savedLineNum
+        s.token = savedToken
+        s.gotLF = savedGotLF
+        s.lastLineNum = savedLastLineNum
+        s.lastPtr = savedLastPtr
+        s.templateNestLevel = savedTemplateNest
+        fd.jsMode = savedMode
+        if strict { fd.jsMode |= JS_MODE_STRICT }
+    }
+
     /// Get the atom for a string, creating it if necessary.
     func getAtom(_ name: String) -> JSAtom {
         return s.ctx?.findAtom(name) ?? 0
+    }
+
+    /// The `.name` of an accessor carries its kind: `{ get g() {} }` names its
+    /// getter `"get g"` and its setter `"set g"` (ES §10.2.9, SetFunctionName
+    /// with a `prefix` argument — the only three callers of which are the two
+    /// accessor forms and `bind`). Naming them plain `"g"` made a getter and
+    /// its setter indistinguishable in a stack trace and in any tooling that
+    /// reads `Object.getOwnPropertyDescriptor(o, k).get.name`.
+    ///
+    /// Only for a literal key: a computed one is named at run time
+    /// (`define_method_computed`), and a private name keeps its own spelling.
+    func accessorFuncName(_ kind: PropertyKind, _ propAtom: JSAtom,
+                          isComputed: Bool, isPrivate: Bool = false) -> JSAtom {
+        guard !isComputed, !isPrivate, propAtom != 0,
+              kind == .getter || kind == .setter,
+              let name = s.ctx?.atomName(propAtom), !name.isEmpty
+        else { return propAtom }
+        return getAtom((kind == .getter ? "get " : "set ") + name)
     }
 
     // =========================================================================
@@ -1255,6 +1403,19 @@ final class JeffJSParser {
 
     /// Parse a complete program (script or module).
     func parseProgram() {
+        // A program has a directive prologue too (ES §11.2.1). Nothing looked
+        // for it: `"use strict";` at the top of a script parsed sloppy, so
+        // `this` in a top-level function call was the global object and every
+        // nested function inherited the wrong mode — top-level strictness came
+        // only from the external `isStrict`/module flags.
+        //
+        // The scan is a throwaway pass over the prologue that leaves the
+        // tokenizer where it started, so the directive is then parsed as the
+        // ordinary string-expression statement it also is (a script whose only
+        // statement is `"use strict"` still completes with that string). It
+        // matters that the mode is set *before* the real pass: strictness
+        // changes tokenization — reserved words, legacy octal literals, `with`.
+        scanProgramDirectivePrologue()
         next() // prime the first token
 
         // Parse source elements (statements and declarations)
@@ -1842,14 +2003,7 @@ final class JeffJSParser {
                     let doneLabel = newLabel()
                     emitLabel(loopLabel)
                     emitLabel(continueLabel)
-                    emitOp(.for_of_next)
-                    emitU8(0)
-                    emitIfTrue(doneLabel)
-                    // `for await`: each value the iterator yields is awaited
-                    // (this covers a sync iterable of promises; an async
-                    // iterator's values are already settled, so the extra
-                    // await is a no-op tick).
-                    if isAwait { emitOp(.await_) }
+                    emitForOfNext(isAwait: isAwait, doneLabel: doneLabel)
 
                     // Rewind and parse destructuring binding
                     s.bufPtr = dSavedBufPtr; s.token = dSavedToken; s.lineNum = dSavedLineNum
@@ -2098,11 +2252,7 @@ final class JeffJSParser {
 
         // Get next value: for_of_next extracts {value, done} from the
         // iterator result and pushes [iter, obj, method, value, done].
-        emitOp(.for_of_next)
-        emitU8(0) // flags
-        emitIfTrue(doneLabel) // done flag => exit via doneLabel
-        // `for await`: await each yielded value (see parseForIn/OfDestructuring).
-        if isAwait { emitOp(.await_) }
+        emitForOfNext(isAwait: isAwait, doneLabel: doneLabel)
 
         // Assign to the variable
         if varIdx >= 0 {
@@ -2862,6 +3012,13 @@ final class JeffJSParser {
         childFd.definedScopeLevel = fd.curScope
         childFd.filename = fd.filename  // inherit parent's filename for debug info
         childFd.funcName = funcName
+        // A function declared inside a `with` body still resolves its free
+        // identifiers against the with object — the object environment record
+        // is on the scope chain its closure captures (ES §13.3.6.1). Only the
+        // class-field synthetic defs propagated this, so `with (o) { var f =
+        // function () { return z; }; }` threw `z is not defined` while the
+        // same expression written outside the function worked.
+        childFd.withVarStack = fd.withVarStack
         childFd.funcKind = isGenerator
             ? (isAsync ? JSFunctionKindEnum.JS_FUNC_ASYNC_GENERATOR.rawValue
                        : JSFunctionKindEnum.JS_FUNC_GENERATOR.rawValue)
@@ -3784,6 +3941,7 @@ final class JeffJSParser {
                     // Use parseFormalParameters to handle destructuring patterns
                     let arrowFd = JeffJSFunctionDefCompiler()
                     arrowFd.parent = fd
+                    arrowFd.withVarStack = fd.withVarStack   // see parseFunctionDef
                     arrowFd.isArrow = true
                     arrowFd.argumentsAllowed = false
                     if fd.jsMode & JS_MODE_STRICT != 0 {
@@ -5013,6 +5171,7 @@ final class JeffJSParser {
         childFd.parent = fd
         childFd.definedScopeLevel = fd.curScope
         childFd.filename = fd.filename
+        childFd.withVarStack = fd.withVarStack   // see parseFunctionDef
         childFd.isArrow = true
         childFd.argumentsAllowed = false  // arrow functions don't have own arguments
         if isAsync {
@@ -5549,8 +5708,15 @@ final class JeffJSParser {
                 return
             }
 
-            // Regular identifier -- emit scope variable access
-            emitScopeGetVar(atom, scopeLevel: fd.curScope)
+            // Regular identifier -- emit scope variable access. Inside a
+            // `with` body a call needs the with object as its receiver, which
+            // takes the two-slot callee form.
+            if withCallFollows {
+                emitScopeGetVarCallee(atom, scopeLevel: fd.curScope)
+                pendingMethodCall = true
+            } else {
+                emitScopeGetVar(atom, scopeLevel: fd.curScope)
+            }
 
         case 0x28: // '(' -- grouping or arrow params
             // Try full arrow scan first (handles destructuring patterns like ([e,t])=>...)
@@ -5564,6 +5730,7 @@ final class JeffJSParser {
                 } else if hasDestructuring {
                     let arrowFd = JeffJSFunctionDefCompiler()
                     arrowFd.parent = fd
+                    arrowFd.withVarStack = fd.withVarStack   // see parseFunctionDef
                     arrowFd.isArrow = true
                     arrowFd.argumentsAllowed = false
                     if fd.jsMode & JS_MODE_STRICT != 0 {
@@ -5695,7 +5862,12 @@ final class JeffJSParser {
                     emitArrowFunction(paramAtoms: [atom], isAsync: false)
                     return
                 }
-                emitScopeGetVar(atom, scopeLevel: fd.curScope)
+                if withCallFollows {
+                    emitScopeGetVarCallee(atom, scopeLevel: fd.curScope)
+                    pendingMethodCall = true
+                } else {
+                    emitScopeGetVar(atom, scopeLevel: fd.curScope)
+                }
             } else {
                 syntaxError("unexpected token in expression: \(tokenName(tok))")
                 // Skip the token to avoid infinite loops
@@ -6002,10 +6174,19 @@ final class JeffJSParser {
                 emitDefineField(propAtom)
             }
         } else if tok == 0x28 { // '(' -- method shorthand
-            // Method
+            // Method — and also `{ get g() {} }`, which reaches here with
+            // propKind already set, so the accessor name prefix belongs here
+            // too (the dedicated getter/setter branch below only sees the
+            // forms this one does not swallow).
             let methodFd = JeffJSFunctionDefCompiler()
             methodFd.parent = fd
-            methodFd.funcName = propAtom
+            // Both are needed together: the with object is a synthetic lexical
+            // (`*with*N`) in the enclosing scope, so a method that is told to
+            // look for it must also know which scope level it was defined at.
+            // Class methods already set this; object-literal ones did not.
+            methodFd.definedScopeLevel = fd.curScope
+            methodFd.withVarStack = fd.withVarStack   // see parseFunctionDef
+            methodFd.funcName = accessorFuncName(propKind, propAtom, isComputed: isComputed)
             if isGenerator {
                 methodFd.funcKind = isAsync
                     ? JSFunctionKindEnum.JS_FUNC_ASYNC_GENERATOR.rawValue
@@ -6042,7 +6223,13 @@ final class JeffJSParser {
             // Getter/setter
             let methodFd = JeffJSFunctionDefCompiler()
             methodFd.parent = fd
-            methodFd.funcName = propAtom
+            // Both are needed together: the with object is a synthetic lexical
+            // (`*with*N`) in the enclosing scope, so a method that is told to
+            // look for it must also know which scope level it was defined at.
+            // Class methods already set this; object-literal ones did not.
+            methodFd.definedScopeLevel = fd.curScope
+            methodFd.withVarStack = fd.withVarStack   // see parseFunctionDef
+            methodFd.funcName = accessorFuncName(propKind, propAtom, isComputed: isComputed)
             fd.childFunctions.append(methodFd)
 
             expect(0x28) // '('
@@ -6726,7 +6913,11 @@ final class JeffJSParser {
     /// the value; otherwise fall through with the sent value as the yield
     /// expression's result.
     private func emitYieldReturnCheck() {
-        guard fd.funcKind == JSFunctionKindEnum.JS_FUNC_GENERATOR.rawValue else { return }
+        // Async generators use the same two-slot resume protocol: their
+        // `return(v)` must run the enclosing finally blocks too.
+        guard fd.funcKind == JSFunctionKindEnum.JS_FUNC_GENERATOR.rawValue
+                || fd.funcKind == JSFunctionKindEnum.JS_FUNC_ASYNC_GENERATOR.rawValue
+        else { return }
         let skip = newLabel()
         emitIfFalse(skip)
         // A forced return has to close every iterator the suspended generator

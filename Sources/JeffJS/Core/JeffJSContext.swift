@@ -37,6 +37,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
 
     /// Conforms to JeffJSTokenizerContext so the parser can intern atoms
     /// directly into the runtime's atom table (instead of a separate namespace).
+
+    /// `JeffJSTokenizerContext`: the string behind an atom (see `atomName`).
+    func atomName(_ atom: UInt32) -> String? { rt.atomToString(atom) }
+
     func findAtom(_ name: String) -> UInt32 {
         return rt.findAtom(name)
     }
@@ -3117,7 +3121,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // Function.prototype.toString
         let toStringFunc = newCFunction({ [weak self] ctx, thisVal, args in
             guard let self = self else { return .exception }
-            return self.newStringValue("function () { [native code] }")
+            return self.newStringValue("function () {\n    [native code]\n}")
         }, name: "toString", length: 0)
         _ = setPropertyStr(obj: proto, name: "toString", value: toStringFunc)
 
@@ -3303,6 +3307,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     private func addNumberIntrinsic() {
         let numberProto = newObjectClass(classID: JSClassID.JS_CLASS_NUMBER.rawValue)
         classProto[JSClassID.JS_CLASS_NUMBER.rawValue] = numberProto.dupValue()
+        inheritFromObjectPrototype(numberProto)
 
         let numberCtor = newCFunction({ [weak self] ctx, thisVal, args in
             guard let self = self else { return .exception }
@@ -3580,6 +3585,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     private func addStringIntrinsic() {
         let stringProto = newObjectClass(classID: JSClassID.JS_CLASS_STRING.rawValue)
         classProto[JSClassID.JS_CLASS_STRING.rawValue] = stringProto.dupValue()
+        inheritFromObjectPrototype(stringProto)
 
         let stringCtor = newCFunction({ [weak self] ctx, thisVal, args in
             guard let self = self else { return .exception }
@@ -3609,10 +3615,49 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         classProto[JSClassID.JS_CLASS_STRING_ITERATOR.rawValue] = stringIterProto
     }
 
+    /// `String.prototype`, `Number.prototype` and `Boolean.prototype` are each
+    /// built twice — once in the phase-1 intrinsic and again by the builtin
+    /// module — and the second one is chained onto the first, which is empty.
+    /// So even with `inheritFromObjectPrototype` on both, the *observable*
+    /// `Object.getPrototypeOf(String.prototype)` was that empty intermediate
+    /// rather than `Object.prototype`. Every wrapper prototype is an ordinary
+    /// object whose [[Prototype]] is `Object.prototype` (ES §20.3.3, §21.1.3,
+    /// §22.1.3), so the last word is had here, after every phase has run.
+    private func fixUpWrapperPrototypeChains() {
+        let objectProto = classProto[JSClassID.JS_CLASS_OBJECT.rawValue]
+        guard objectProto.isObject, let objectProtoObj = objectProto.toObject() else { return }
+        for name in ["String", "Number", "Boolean", "Symbol", "BigInt"] {
+            let ctor = getPropertyStr(obj: globalObj, name: name)
+            defer { ctor.freeValue() }
+            guard ctor.isObject else { continue }
+            let proto = getPropertyStr(obj: ctor, name: "prototype")
+            defer { proto.freeValue() }
+            guard let protoObj = proto.toObject(), protoObj !== objectProtoObj,
+                  protoObj.storedProto !== objectProtoObj else { continue }
+            _ = setPrototypeOf(proto, proto: objectProto)
+        }
+    }
+
+    /// A primitive wrapper's prototype is an ordinary object that inherits
+    /// from `Object.prototype` (ES §20.3.3, §21.1.3, §22.1.3, §20.4.3).
+    /// `newObjectClass(classID:)` reads its prototype out of
+    /// `classProto[classID]` — which is the very slot being filled — so
+    /// `String.prototype`, `Number.prototype`, `Boolean.prototype`,
+    /// `Symbol.prototype` and `BigInt.prototype` were all created with **no**
+    /// prototype at all. `new String("ab").hasOwnProperty` was therefore
+    /// undefined, and so was every other `Object.prototype` method on a
+    /// wrapper object.
+    private func inheritFromObjectPrototype(_ proto: JeffJSValue) {
+        let objectProto = classProto[JSClassID.JS_CLASS_OBJECT.rawValue]
+        guard objectProto.isObject, proto.isObject else { return }
+        _ = setPrototypeOf(proto, proto: objectProto)
+    }
+
     /// Adds Boolean constructor.
     private func addBooleanIntrinsic() {
         let boolProto = newObjectClass(classID: JSClassID.JS_CLASS_BOOLEAN.rawValue)
         classProto[JSClassID.JS_CLASS_BOOLEAN.rawValue] = boolProto.dupValue()
+        inheritFromObjectPrototype(boolProto)
 
         let boolCtor = newCFunction({ [weak self] ctx, thisVal, args in
             guard let self = self else { return .exception }
@@ -3626,6 +3671,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     private func addSymbolIntrinsic() {
         let symbolProto = newObjectClass(classID: JSClassID.JS_CLASS_OBJECT.rawValue)
         classProto[JSClassID.JS_CLASS_SYMBOL.rawValue] = symbolProto
+        inheritFromObjectPrototype(symbolProto)
 
         // Symbol.prototype.toString()
         let symToString = newCFunction({ [weak self] ctx, thisVal, args in
@@ -3633,9 +3679,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             let desc: String
             if thisVal.isSymbol {
                 desc = getSymbolDescription(thisVal)
-            } else if let obj = thisVal.toObject(),
-                      obj.classID == JeffJSClassID.symbol.rawValue,
-                      case .objectData(let inner) = obj.payload {
+            } else if let inner = jeffJS_unwrapSymbolObject(thisVal) {
                 desc = getSymbolDescription(inner)
             } else {
                 return self.throwTypeError(message: "Symbol.prototype.toString requires a Symbol value")
@@ -3650,9 +3694,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             if thisVal.isSymbol {
                 return thisVal.dupValue()
             }
-            if let obj = thisVal.toObject(),
-               obj.classID == JeffJSClassID.symbol.rawValue,
-               case .objectData(let inner) = obj.payload {
+            if let inner = jeffJS_unwrapSymbolObject(thisVal) {
                 return inner.dupValue()
             }
             return self.throwTypeError(message: "Symbol.prototype.valueOf requires a Symbol value")
@@ -3665,9 +3707,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             let desc: String
             if thisVal.isSymbol {
                 desc = getSymbolDescription(thisVal)
-            } else if let obj = thisVal.toObject(),
-                      obj.classID == JeffJSClassID.symbol.rawValue,
-                      case .objectData(let inner) = obj.payload {
+            } else if let inner = jeffJS_unwrapSymbolObject(thisVal) {
                 desc = getSymbolDescription(inner)
             } else {
                 return self.throwTypeError(message: "Symbol.prototype.description getter requires a Symbol value")
@@ -3740,6 +3780,24 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             _ = setPropertyStr(obj: symbolCtor, name: wks.name, value: symVal)
         }
 
+        // `Symbol.prototype` and `Symbol.prototype.constructor`. Without the
+        // first, `Symbol.prototype` was undefined and every `Symbol.prototype.x`
+        // read threw; without the second, `Object(Symbol()).constructor` walked
+        // the proto chain to `Object`. The prototype slot of a built-in
+        // constructor is { writable: false, enumerable: false, configurable:
+        // false } and `constructor` is { writable: true, enumerable: false,
+        // configurable: true } (ES §20.4.2.9, §20.4.3.2).
+        let symProtoAtom = JeffJSAtomID.JS_ATOM_prototype.rawValue
+        _ = defineProperty(obj: symbolCtor, atom: symProtoAtom,
+                           value: symbolProto.dupValue(), flags: JS_PROP_HAS_VALUE)
+        let symCtorAtom = rt.findAtom("constructor")
+        _ = defineProperty(obj: symbolProto, atom: symCtorAtom,
+                           value: symbolCtor.dupValue(),
+                           flags: JS_PROP_HAS_VALUE | JS_PROP_WRITABLE |
+                                  JS_PROP_CONFIGURABLE | JS_PROP_HAS_WRITABLE |
+                                  JS_PROP_HAS_CONFIGURABLE)
+        rt.freeAtom(symCtorAtom)
+
         _ = setPropertyStr(obj: globalObj, name: "Symbol", value: symbolCtor)
     }
 
@@ -3750,6 +3808,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// wired at the time of first registration. This runs after ALL phases
     /// and serves as the single authoritative fix-up.
     private func fixUpKeywordNamedMethods() {
+        fixUpWrapperPrototypeChains()
         // --- Symbol.for / Symbol.keyFor (static methods on Symbol constructor) ---
         let symbolCtor = getPropertyStr(obj: globalObj, name: "Symbol")
         if symbolCtor.isObject {
@@ -3790,6 +3849,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     private func addBigIntIntrinsic() {
         let bigIntProto = newObjectClass(classID: JSClassID.JS_CLASS_OBJECT.rawValue)
         classProto[JSClassID.JS_CLASS_BIG_INT.rawValue] = bigIntProto
+        inheritFromObjectPrototype(bigIntProto)
 
         // BigInt(value) — ES 21.2.1.1. Not a constructor: `new BigInt(1n)`
         // is a TypeError.
@@ -4634,8 +4694,12 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                             propName = .JS_UNDEFINED
                         }
                         let result = callFunction(trap, thisVal: pd.handler, args: [pd.target, propName, value, obj])
+                        propName.freeValue()
+                        value.freeValue()
+                        let ok = result.toBool()
+                        result.freeValue()
                         if result.isException { return -1 }
-                        return result.toBool() ? 1 : 0
+                        return ok ? 1 : 0
                     }
                     _ = handlerObj // suppress warning
                 }
@@ -4723,7 +4787,16 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 // Accessor property — call the setter
                 if let e = jsObj.extra(at: exIdx), e.kind == .getset, let setterObj = e.setter {
                     let setterVal = JeffJSValue.makeObject(setterObj)
+                    // `setPropertyInternal` consumes `value`, and a callee
+                    // borrows its arguments (Round 9) — so the setter branch
+                    // owes both a release of the argument and a release of the
+                    // setter's return value. It released neither, so every
+                    // `o.s = {…}` on an accessor property — including the
+                    // `__proto__` setter — left one permanent reference on the
+                    // object assigned.
                     let result = callFunction(setterVal, thisVal: obj, args: [value])
+                    value.freeValue()
+                    result.freeValue()
                     if result.isException { return -1 }
                     return 1
                 }
@@ -4760,7 +4833,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                     // Inherited accessor — call its setter
                     if let e = p.extra(at: pIdx), e.kind == .getset, let setterObj = e.setter {
                         let setterVal = JeffJSValue.makeObject(setterObj)
+                        // Same ownership as the own-accessor branch above.
                         let result = callFunction(setterVal, thisVal: obj, args: [value])
+                        value.freeValue()
+                        result.freeValue()
                         if result.isException { return -1 }
                         return 1
                     }
@@ -5661,4 +5737,19 @@ nonisolated(unsafe) let jeffJSTimePrecompiled = ProcessInfo.processInfo.environm
 final class JeffJSWeakObjectBox {
     weak var obj: JeffJSObject?
     init() {}
+}
+
+/// The primitive inside a Symbol wrapper object, or nil.
+///
+/// `Object(Symbol("x"))` stores the symbol in `primitiveValue` (see
+/// `newObjectPrimitive`), not in a `.objectData` payload — which is what
+/// `Symbol.prototype.toString` / `valueOf` / `description` were all looking
+/// for, so every one of them threw on a boxed symbol.
+@inline(__always)
+func jeffJS_unwrapSymbolObject(_ v: JeffJSValue) -> JeffJSValue? {
+    guard let obj = v.toObject(),
+          obj.classID == JeffJSClassID.symbol.rawValue else { return nil }
+    if obj.primitiveValue.isSymbol { return obj.primitiveValue }
+    if case .objectData(let inner) = obj.payload, inner.isSymbol { return inner }
+    return nil
 }

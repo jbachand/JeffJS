@@ -1464,87 +1464,161 @@ struct JeffJSBuiltinIterator {
     ///
     /// - Parameters:
     ///   - completionType: 0 = next, 1 = return, 2 = throw
+    /// `next` / `return` / `throw` on an async generator (ES §27.6.3.x
+    /// AsyncGeneratorEnqueue + AsyncGeneratorResumeNext).
+    ///
+    /// Every call answers with a promise and joins a FIFO queue, because the
+    /// body can only be in one place at a time. The drain below resumes the
+    /// body; if the body parks on an `await`, the head request stays queued
+    /// and the promise reaction restarts the drain with the settled value.
+    ///
+    /// This used to build a promise nobody ever settled and a resolve/reject
+    /// pair that returned `undefined`, with "in a full engine ..." at every
+    /// branch — async generator objects escaped it only because they were
+    /// handed the *synchronous* generator prototype, whose `next` runs the
+    /// body to the next yield and returns a plain `{value, done}`.
     private static func asyncGeneratorEnqueue(ctx: JeffJSContext, this: JeffJSValue,
                                                args: [JeffJSValue],
                                                completionType: Int) -> JeffJSValue {
-        guard let obj = this.toObject() else {
-            return ctx.throwTypeError(message: "async generator method called on non-object")
+        guard let obj = this.toObject(),
+              case .generatorData(let genData) = obj.payload else {
+            // A rejected promise, not a throw: these methods never throw
+            // synchronously (ES §27.6.3.2 step 8).
+            return rejectedPromise(ctx,
+                ctx.throwTypeError(message: "not an async generator object"))
         }
 
-        guard case .generatorData(let genData) = obj.payload else {
-            return ctx.throwTypeError(message: "not an async generator object")
+        guard let cap = JeffJSBuiltinPromise.newPromiseCapability(ctx: ctx, ctor: .undefined) else {
+            return .exception
         }
+        let req = JeffJSAsyncGenRequest(
+            completionType: completionType,
+            value: (args.first ?? .undefined).dupValue(),
+            resolve: cap.resolve,
+            reject: cap.reject)
+        genData.asyncQueue.append(req)
+        asyncGeneratorDrain(ctx: ctx, genObj: this, genData: genData)
+        return cap.promise
+    }
 
-        let value = args.isEmpty ? JeffJSValue.undefined : args[0]
+    /// A promise already rejected with the pending exception.
+    private static func rejectedPromise(_ ctx: JeffJSContext, _ marker: JeffJSValue) -> JeffJSValue {
+        _ = marker
+        let exc = ctx.getException()
+        guard let cap = JeffJSBuiltinPromise.newPromiseCapability(ctx: ctx, ctor: .undefined) else {
+            exc.freeValue()
+            return .exception
+        }
+        _ = ctx.callFunction(cap.reject, thisVal: .undefined, args: [exc])
+        exc.freeValue()
+        cap.resolve.freeValue(); cap.reject.freeValue()
+        return cap.promise
+    }
 
-        // Create the promise that will be returned to the caller
-        let promise = ctx.newObjectClass(classID: JSClassID.JS_CLASS_PROMISE.rawValue)
-        if promise.isException { return .exception }
+    /// Run queued requests until the queue empties or the body parks on an
+    /// `await`. Re-entrant calls (a resolve handler that calls `next` again)
+    /// return immediately; the running loop picks the new request up.
+    private static func asyncGeneratorDrain(ctx: JeffJSContext, genObj: JeffJSValue,
+                                            genData: JeffJSGeneratorData) {
+        if genData.asyncDraining { return }
+        // Parked on an await: the continuation restarts the drain.
+        if !genData.awaitedPromise.isUndefined { return }
+        genData.asyncDraining = true
+        defer { genData.asyncDraining = false }
 
-        // Create resolve and reject functions for the promise
-        let resolveFunc = ctx.newCFunction({ ctx, this, args in
-            return .undefined
-        }, name: "resolve", length: 1)
+        while !genData.asyncQueue.isEmpty {
+            let req = genData.asyncQueue[0]
 
-        let rejectFunc = ctx.newCFunction({ ctx, this, args in
-            return .undefined
-        }, name: "reject", length: 1)
-
-        // Process the request based on the generator's current state
-        switch genData.state {
-        case .completed:
-            // Generator is done
-            if completionType == 2 {
-                // throw: reject the promise
-                // In a full engine, we'd call reject(value)
-                return promise
+            if genData.state == .completed && !genData.awaitResumePending {
+                genData.asyncQueue.removeFirst()
+                settleCompleted(ctx, req)
+                req.release()
+                continue
             }
-            // next or return: resolve with { value, done: true }
-            // In a full engine, we'd call resolve({value: (type==1 ? value : undefined), done: true})
-            return promise
 
-        case .executing:
-            // Queue the request for later processing.
-            // In a full engine, this would be added to the async generator's
-            // request queue and processed when the current execution completes.
-            return promise
-
-        case .suspended_start:
-            if completionType == 1 {
-                // return: complete the generator
+            // A `return(v)` on a generator that has not started yet finishes it
+            // without running a line of the body (ES §27.6.3.8).
+            if genData.state == .suspended_start && req.completionType != 0 {
                 genData.state = .completed
-                return promise
+                genData.savedState = nil
+                genData.asyncQueue.removeFirst()
+                settleCompleted(ctx, req)
+                req.release()
+                continue
             }
-            if completionType == 2 {
-                // throw: complete the generator and reject
-                genData.state = .completed
-                return promise
+
+            let sendValue: JeffJSValue
+            let sendType: Int
+            var owned = false
+            if genData.awaitResumePending {
+                sendValue = genData.awaitResumeValue
+                sendType = genData.awaitResumeIsThrow ? 2 : 0
+                genData.awaitResumePending = false
+                genData.awaitResumeValue = .undefined
+                owned = true
+            } else {
+                sendValue = req.value
+                sendType = req.completionType
             }
-            // next: start execution
-            genData.state = .executing
 
-            // In a full engine, this would begin executing the generator's
-            // bytecode body. When it hits a yield or return, the generator
-            // would resolve the promise and transition to the appropriate state.
-            genData.state = .completed
-            return promise
+            let result = ctx.generatorResume(genObj: genObj, sendValue: sendValue,
+                                             completionType: sendType)
+            if owned { sendValue.freeValue() }
 
-        case .suspended_yield, .suspended_yield_star:
-            genData.state = .executing
+            // Parked on an await? The request stays at the head.
+            if !genData.awaitedPromise.isUndefined {
+                result.freeValue()
+                attachAwaitContinuation(ctx: ctx, genObj: genObj, genData: genData)
+                return
+            }
 
-            // In a full engine, this would resume the generator at the yield
-            // point with the appropriate completion type (normal, return, or
-            // throw). The async state machine handles the promise resolution.
-            //
-            // The bytecode interpreter would:
-            // 1. Resume execution at the saved PC
-            // 2. Pass `value` as the result of the await/yield expression
-            // 3. On the next yield/return/throw, resolve/reject the promise
-            // 4. Transition the state accordingly
-
-            genData.state = .completed
-            return promise
+            genData.asyncQueue.removeFirst()
+            if result.isException {
+                let exc = ctx.getException()
+                _ = ctx.callFunction(req.reject, thisVal: .undefined, args: [exc])
+                exc.freeValue()
+            } else {
+                _ = ctx.callFunction(req.resolve, thisVal: .undefined, args: [result])
+            }
+            result.freeValue()
+            req.release()
         }
+    }
+
+    /// Settle a request against a generator that has already finished:
+    /// `next()` and `return(v)` resolve, `throw(e)` rejects.
+    private static func settleCompleted(_ ctx: JeffJSContext, _ req: JeffJSAsyncGenRequest) {
+        if req.completionType == 2 {
+            _ = ctx.callFunction(req.reject, thisVal: .undefined, args: [req.value])
+            return
+        }
+        let value: JeffJSValue = req.completionType == 1 ? req.value : .undefined
+        let iterResult = createIterResult(ctx: ctx, val: value, done: true)
+        _ = ctx.callFunction(req.resolve, thisVal: .undefined, args: [iterResult])
+        iterResult.freeValue()
+    }
+
+    /// Resume the parked body when its awaited promise settles, then keep
+    /// draining. The generator object is retained across the microtask: the
+    /// only other reference may be a `for await` temporary that is already
+    /// gone by the time the reaction runs.
+    private static func attachAwaitContinuation(ctx: JeffJSContext, genObj: JeffJSValue,
+                                                genData: JeffJSGeneratorData) {
+        let awaited = genData.awaitedPromise
+        let held = genObj.dupValue()
+        _ = JeffJSBuiltinPromise.performPromiseThen(
+            ctx: ctx, promise: awaited,
+            onFulfilled: .undefined, onRejected: .undefined,
+            resultPromise: nil,
+            nativeContinuation: { ctx, value, isRejection in
+                genData.awaitedPromise.freeValue()
+                genData.awaitedPromise = .undefined
+                genData.awaitResumeValue = value.dupValue()
+                genData.awaitResumeIsThrow = isRejection
+                genData.awaitResumePending = true
+                asyncGeneratorDrain(ctx: ctx, genObj: held, genData: genData)
+                held.freeValue()
+            })
     }
 
     // MARK: - Private Helpers

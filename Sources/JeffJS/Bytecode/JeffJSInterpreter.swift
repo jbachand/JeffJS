@@ -232,6 +232,40 @@ func jeffJS_fastToBool(_ v: JeffJSValue) -> Bool {
 /// Bridge helpers that adapt the interpreter's call-site conventions to the
 /// actual JeffJSContext API (which uses named parameters like `message:`,
 /// `obj:`, etc.).  Keeps the main interpreter switch compact.
+
+/// What to do with an iterator result handed back by a `yield*` delegate
+/// inside an **async** generator: an async iterator's `next()` answers with a
+/// promise *of* `{value, done}`, not with the record.
+enum JeffJSDelegateResult {
+    case ready(JeffJSValue)      // owned iterator-result object
+    case park(JeffJSValue)       // owned pending promise to await
+    case rejected                // exception already thrown
+}
+
+/// Unwrap a delegate's iterator result for an async generator. The delegate is
+/// usually another async generator whose step did not park, so the promise is
+/// already settled by the time it comes back; a pending one parks the
+/// delegating generator on it, exactly as an `await` in its own body would.
+func jeffJS_asyncDelegateResult(_ ctx: JeffJSContext, _ result: JeffJSValue) -> JeffJSDelegateResult {
+    guard let obj = result.toObject(),
+          obj.classID == JSClassID.JS_CLASS_PROMISE.rawValue,
+          case .promiseData(let pd) = obj.payload else {
+        return .ready(result)
+    }
+    switch pd.promiseState {
+    case .fulfilled:
+        let v = pd.promiseResult.dupValue()
+        result.freeValue()
+        return .ready(v)
+    case .rejected:
+        ctx.throwValue(pd.promiseResult.dupValue())
+        result.freeValue()
+        return .rejected
+    case .pending:
+        return .park(result)
+    }
+}
+
 extension JeffJSContext {
     /// Creates a new JS string value from a Swift String.
     /// Bridges `ctx.newString(s)` to a proper JeffJSString allocation.
@@ -424,8 +458,14 @@ extension JeffJSContext {
         // resumption doesn't push a spurious value onto the stack.
         if case .bytecodeFunc(let fbOpt, _, _) = obj.payload,
            let fb = fbOpt, fb.isGenerator {
-            // Create the generator object with JS_CLASS_GENERATOR class
-            let genObj = newObjectClass(classID: JSClassID.JS_CLASS_GENERATOR.rawValue)
+            // An `async function*` produces an AsyncGenerator, whose
+            // prototype carries the promise-returning next/return/throw and
+            // `Symbol.asyncIterator`. It used to be handed the *synchronous*
+            // generator prototype, so `next()` returned a bare `{value, done}`
+            // and `Symbol.asyncIterator in it` was false.
+            let genObj = newObjectClass(classID: fb.isAsyncFunc
+                ? JSClassID.JS_CLASS_ASYNC_GENERATOR.rawValue
+                : JSClassID.JS_CLASS_GENERATOR.rawValue)
             if genObj.isException { return .exception }
 
             // Build initial varBuf / argBuf that callInternal would create.
@@ -1718,13 +1758,22 @@ extension JeffJSContext {
     }
 
     /// Sets the .name property on a function from a computed key.
-    func setFunctionNameComputed(_ funcVal: JeffJSValue, key: JeffJSValue) {
+    func setFunctionNameComputed(_ funcVal: JeffJSValue, key: JeffJSValue,
+                                 prefix: String = "") {
+        var base: String? = nil
         if key.isString, let str = key.stringValue {
-            let nv = newString(str.toSwiftString())
-            _ = definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
-                                    value: nv, flags: JS_PROP_CONFIGURABLE)
-            nv.freeValue()
+            base = str.toSwiftString()
+        } else if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
+            // A symbol-keyed method is named "[description]" (ES §10.2.9); a
+            // symbol with no description is anonymous.
+            let desc = symStr.toSwiftString()
+            base = desc.isEmpty ? (prefix.isEmpty ? nil : "") : "[\(desc)]"
         }
+        guard let name = base else { return }
+        let nv = newString(prefix + name)
+        _ = definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
+                                value: nv, flags: JS_PROP_CONFIGURABLE)
+        nv.freeValue()
     }
 
     /// Sets the [[Prototype]] of an object.
@@ -1893,6 +1942,12 @@ extension JeffJSContext {
         let isGetter = (flags & 2) != 0
         let isSetter = (flags & 4) != 0
         let propFlags = jeffJS_methodPropFlags(flags)
+        // `{ [k]() {} }` names its method after the computed key, and
+        // `{ get [k]() {} }` names its getter "get <k>" (ES §10.2.9 with a
+        // prefix). Nothing named these at all, so every computed-key method
+        // and accessor had an empty `.name`.
+        setFunctionNameComputed(funcVal, key: key,
+                                prefix: isGetter ? "get " : (isSetter ? "set " : ""))
         if key.isString, let str = key.stringValue {
             let atom = rt.findAtom(str.toSwiftString())
             let result: Bool
@@ -6594,13 +6649,29 @@ struct JeffJSInterpreter {
             // iterator (next/throw forwarded from the outer generator's
             // caller); handled uniformly after the switch.
             var delegatedResult: JeffJSValue? = nil
+            // A resume that is delivering a parked delegate's settled iterator
+            // result: use it as-is instead of advancing the delegate again.
+            var genData_delegateResumeUsed = false
+            if let genObj = generatorObject.toObject(),
+               case .generatorData(let gd) = genObj.payload,
+               gd.delegateAwaitPending {
+                gd.delegateAwaitPending = false
+                delegatedResult = resumeValue.dupValue()
+                genData_delegateResumeUsed = true
+            }
             // The delegated result came from the inner iterator's return():
             // if it reports done, the OUTER generator performs a return
             // completion too (is_return = true after yield_star).
             var delegatedFromReturn = false
-            switch resumeCompletionType {
+            switch genData_delegateResumeUsed ? -1 : resumeCompletionType {
             case 1:
-                if fb.isGenerator && !fb.isAsyncFunc && !saved.isInitialYield &&
+                if fb.isGenerator && !saved.isInitialYield &&
+                   // An async generator's `return(v)` runs its finally blocks too
+                   // (ES §27.6.3.8 resumes with a return completion). The
+                   // `bc[saved.pc - 1] == yield_` test is what tells a
+                   // yield-park from an await-park, so `isAsyncFunc` is not the
+                   // discriminator any more; before, every async generator took
+                   // the plain-return branch and skipped its `finally`.
                    saved.delegatedIter.isUndefined && saved.pc >= 1 &&
                    bc[saved.pc - 1] == JeffJSOpcode.yield_.rawValue {
                     // Suspended at a plain `yield` of a sync generator: resume
@@ -6608,7 +6679,7 @@ struct JeffJSInterpreter {
                     // yield runs the enclosing finally blocks and returns.
                     buf[sp] = resumeValue.dupValue(); sp += 1   // next(v)'s caller releases v
                     buf[sp] = .newBool(true); sp += 1
-                } else if fb.isGenerator && !fb.isAsyncFunc && !saved.delegatedIter.isUndefined {
+                } else if fb.isGenerator && !saved.delegatedIter.isUndefined {
                     // Suspended inside a `yield*` delegation: forward the
                     // return to the inner iterator first (its finally blocks
                     // run there), then resume the outer generator with
@@ -6707,10 +6778,44 @@ struct JeffJSInterpreter {
                 } else if !saved.isInitialYield {
                     buf[sp] = resumeValue.dupValue()   // next(v)'s caller releases v
                     sp += 1
-                    if fb.isGenerator && !fb.isAsyncFunc && saved.pc >= 1 &&
+                    if fb.isGenerator && saved.pc >= 1 &&
                        bc[saved.pc - 1] == JeffJSOpcode.yield_.rawValue {
                         buf[sp] = .newBool(false); sp += 1   // is_return flag for the check after yield_
                     }
+                }
+            }
+            // An async generator's delegate answers with a promise of the
+            // iterator result; unwrap it (or park on it) before reading
+            // `value`/`done` off what would otherwise be a Promise object.
+            if fb.isGenerator, fb.isAsyncFunc, let pending = delegatedResult,
+               !genData_delegateResumeUsed {
+                switch jeffJS_asyncDelegateResult(ctx, pending) {
+                case .ready(let r): delegatedResult = r
+                case .rejected:
+                    delegatedResult = nil
+                    saved.delegatedIter.freeValue()
+                    retVal = .exception
+                case .park(let promise):
+                    if let genObj = generatorObject.toObject(),
+                       case .generatorData(let gd) = genObj.payload {
+                        var st = GeneratorSavedState(
+                            pc: saved.pc, sp: saved.sp, stack: saved.stack,
+                            varBuf: saved.varBuf, argBuf: saved.argBuf,
+                            funcObj: saved.funcObj, thisVal: saved.thisVal,
+                            capturedVarRefs: saved.capturedVarRefs)
+                        st.delegatedIter = saved.delegatedIter
+                        gd.savedState = st
+                        gd.state = .suspended_yield_star
+                        gd.awaitedPromise = promise
+                        gd.delegateAwaitPending = true
+                        ctx.currentFrame = frame.prevFrame
+                        if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
+                        rt.releaseFrame(frame)
+                        rt.inlineStackTop = inlineBase
+                        return .undefined
+                    }
+                    delegatedResult = nil
+                    promise.freeValue()
                 }
             }
             if let result = delegatedResult {
@@ -6729,7 +6834,7 @@ struct JeffJSInterpreter {
                         // value of the yield* expression; skip the yield_star.
                         iter.freeValue()   // the delegation is over
                         buf[sp] = value; sp += 1
-                        if fb.isGenerator && !fb.isAsyncFunc {
+                        if fb.isGenerator {
                             // is_return flag for the check after yield_star
                             buf[sp] = .newBool(delegatedFromReturn); sp += 1
                         }
@@ -10351,18 +10456,55 @@ struct JeffJSInterpreter {
                    case .generatorData(let genData) = genObj.payload {
                     // Get the iterator from the value (the iterator holds its
                     // own reference; the popped iterable is released here).
-                    let iter = ctx.getIterator(obj: val, isAsync: false)
+                    // `yield*` inside an async generator delegates through
+                    // `Symbol.asyncIterator` (ES §27.6.3.x, GetIterator with
+                    // hint async), which is the only thing an async generator
+                    // object has — asking for `Symbol.iterator` got "object is
+                    // not iterable".
+                    let iter = ctx.getIterator(obj: val, isAsync: fb.isAsyncFunc)
                     val.freeValue()
                     if iter.isException {
                         retVal = .exception
                         break dispatchLoop
                     }
                     // Get the first value from the inner iterator
-                    let result = ctx.iteratorNext(iter: iter)
+                    var result = ctx.iteratorNext(iter: iter)
                     if result.isException {
                         iter.freeValue()
                         retVal = .exception
                         break dispatchLoop
+                    }
+                    if fb.isAsyncFunc {
+                        switch jeffJS_asyncDelegateResult(ctx, result) {
+                        case .ready(let r): result = r
+                        case .rejected:
+                            iter.freeValue()
+                            retVal = .exception
+                            break dispatchLoop
+                        case .park(let promise):
+                            // Park the delegating generator on the delegate's
+                            // pending result, keeping the delegation state; the
+                            // driver resumes with the settled iterator result.
+                            jeffJS_syncBufToFrame(frame, buf, varBase)
+                            let stackCount = sp - spBase
+                            var savedStack = [JeffJSValue](repeating: .undefined, count: stackCount)
+                            for i in 0..<stackCount {
+                                savedStack[i] = buf[spBase + i]; buf[spBase + i] = .undefined
+                            }
+                            sp = spBase
+                            var st = GeneratorSavedState(
+                                pc: pc, sp: stackCount, stack: savedStack,
+                                varBuf: frame.varBuf, argBuf: frame.argBuf,
+                                funcObj: mFuncObj, thisVal: thisVal,
+                                capturedVarRefs: frame.liveVarRefs)
+                            st.delegatedIter = iter
+                            genData.savedState = st
+                            genData.state = .suspended_yield_star
+                            genData.awaitedPromise = promise
+                            genData.delegateAwaitPending = true
+                            retVal = .undefined
+                            break dispatchLoop
+                        }
                     }
                     let done = ctx.iteratorCheckDone(result: result)
                     let value = ctx.iteratorGetValue(result: result)
@@ -10372,7 +10514,7 @@ struct JeffJSInterpreter {
                         // the delegation is over, release the iterator.
                         iter.freeValue()
                         buf[sp] = value; sp += 1
-                        if fb.isGenerator && !fb.isAsyncFunc {
+                        if fb.isGenerator {
                             buf[sp] = .newBool(false); sp += 1   // is_return flag for the check after yield_star
                         }
                         genData.state = .executing
@@ -10485,8 +10627,41 @@ struct JeffJSInterpreter {
                         retVal = .exception
                         break dispatchLoop
                     case .pending:
-                        // Promise still pending (async I/O). Suspend the async
-                        // function and register a continuation to resume later.
+                        // An async *generator* body parks on its own frame, the
+                        // way `yield_` does — its state belongs to the generator
+                        // object, not to whatever async activation happens to own
+                        // ctx._asyncResolve right now. The driver
+                        // (`asyncGeneratorDrain`) tells an await-park from a
+                        // yield-park by `awaitedPromise` and re-enters here with
+                        // the settled value. Before this, an `await` on a pending
+                        // promise inside an async generator pushed `undefined`
+                        // and ran on: `yield await fetch(...)` yielded undefined.
+                        if fb.isGenerator, fb.isAsyncFunc,
+                           let genObj = generatorObject.toObject(),
+                           case .generatorData(let genData) = genObj.payload {
+                            jeffJS_syncBufToFrame(frame, buf, varBase)
+                            let stackCount = sp - spBase
+                            var savedStack = [JeffJSValue](repeating: .undefined, count: stackCount)
+                            for i in 0..<stackCount {
+                                savedStack[i] = buf[spBase + i]; buf[spBase + i] = .undefined
+                            }
+                            sp = spBase
+                            genData.savedState = GeneratorSavedState(
+                                pc: pc + 1,
+                                sp: stackCount,
+                                stack: savedStack,
+                                varBuf: frame.varBuf,
+                                argBuf: frame.argBuf,
+                                funcObj: mFuncObj,
+                                thisVal: thisVal,
+                                capturedVarRefs: frame.liveVarRefs)
+                            genData.state = .suspended_yield
+                            genData.awaitedPromise = val   // moves the popped reference in
+                            retVal = .undefined
+                            break dispatchLoop
+                        }
+                        // Suspend the async function and register a continuation
+                        // to resume later.
                         guard !ctx._asyncResolve.isUndefined, !fb.isGenerator else {
                             // Not inside an async function — fallback.
                             // Async *generator* bodies are excluded on purpose:

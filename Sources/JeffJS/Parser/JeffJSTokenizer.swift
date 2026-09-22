@@ -142,6 +142,10 @@ class JeffJSParseState {
 protocol JeffJSTokenizerContext: AnyObject {
     /// Find or create an atom for the given string. Returns 0 on failure.
     func findAtom(_ name: String) -> UInt32
+    /// The string behind an atom, or nil if there is none. The parser needs it
+    /// to build an accessor's `"get x"` / `"set x"` function name from the
+    /// property key it just read.
+    func atomName(_ atom: UInt32) -> String?
 }
 
 // MARK: - Placeholder for JeffJSFunctionDef
@@ -2911,6 +2915,7 @@ func jeffJS_canStartExpr(_ tokType: Int) -> Bool {
 /// Used for standalone tokenization without a full JeffJSContext.
 final class JeffJSSimpleTokenizerContext: JeffJSTokenizerContext {
     private var atoms: [String: UInt32] = [:]
+    private var _names: [UInt32: String] = [:]
     private var nextAtomID: UInt32 = 1
 
     func findAtom(_ name: String) -> UInt32 {
@@ -2920,7 +2925,14 @@ final class JeffJSSimpleTokenizerContext: JeffJSTokenizerContext {
         let id = nextAtomID
         nextAtomID += 1
         atoms[name] = id
+        names[id] = name
         return id
+    }
+
+    func atomName(_ atom: UInt32) -> String? { names[atom] }
+    private var names: [UInt32: String] {
+        get { _names }
+        set { _names = newValue }
     }
 }
 
