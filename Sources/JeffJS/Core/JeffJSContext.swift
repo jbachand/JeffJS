@@ -779,7 +779,15 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 let s = jeffJS_rootShape(self, proto: protoObj)
                 obj.shape = s
                 if classID == JSClassID.JS_CLASS_OBJECT.rawValue, s.isHashed {
-                    plainObjectRootShape = s
+                    // The pin the other three shape caches (`arrayShape`,
+                    // `iterResultShape`, `argumentsShapes`) already took. It
+                    // did not matter while hashed shapes were never freed;
+                    // now that a collection evicts them at zero owners, an
+                    // unpinned cache is a pointer to a gutted shape.
+                    if plainObjectRootShape !== s {
+                        s.refCount += 1
+                        plainObjectRootShape = s
+                    }
                 }
             }
         }

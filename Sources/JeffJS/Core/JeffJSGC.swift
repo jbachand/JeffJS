@@ -307,6 +307,8 @@ func runGC(_ rt: JeffJSRuntime) {
     if JeffJSMetalGC.shared.shouldUseMetalGC(objectCount: rt.gcObjects.count) {
         if JeffJSMetalGC.shared.runMetalGC(rt: rt) {
             freeZeroRefcount(rt)
+            jeffJS_evictHashedShapes(rt)
+            freeZeroRefcount(rt)
             pruneWeakRefs(rt)
             rt.gcRuns += 1
             rt.mallocGCThreshold = jeffJS_nextGCThreshold(rt, reclaimed: rt.gcCyclesFreed - freedBefore)
@@ -340,6 +342,13 @@ func runGC(_ rt: JeffJSRuntime) {
     rt.gcPhase = .JS_GC_PHASE_NONE
 
     // Drain objects that hit zero during the collection.
+    freeZeroRefcount(rt)
+
+    // Sweep zero-owner hashed shapes. After the collection, not before: the
+    // collector is what takes the last owner off most of them, and a shape
+    // swept here releases the prototype it owned, which can drop more objects
+    // to zero (drained again below).
+    jeffJS_evictHashedShapes(rt)
     freeZeroRefcount(rt)
 
     // Prune dead weak references

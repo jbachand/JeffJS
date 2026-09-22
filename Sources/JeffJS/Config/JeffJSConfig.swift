@@ -119,6 +119,11 @@ enum JeffJSConfig {
     // MARK: - Shapes
 
     static let shapesHashBits      = int("shapes.hashBits",           default: 4)
+    /// Shape-table size above which a collection also sweeps zero-owner
+    /// hashed shapes out of the transition table (see
+    /// `jeffJS_evictHashedShapes`). Below it the sweep is not worth the walk:
+    /// a small program's shapes are all live.
+    static let shapesEvictThreshold = int("shapes.evictThreshold",     default: 512)
     /// Max shared (hashed) shapes kept alive in the transition table.
     static let shapesMaxHashed     = int("shapes.maxHashed",          default: 16384)
 

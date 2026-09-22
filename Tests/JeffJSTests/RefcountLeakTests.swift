@@ -204,6 +204,58 @@ final class RefcountLeakTests: XCTestCase {
     /// The headline case, stated directly: a prototype that 100 000 objects
     /// were created from must die with them. Before, `p` reached the end of
     /// the run with a refcount of 100 001.
+    /// The hashed shape table is swept by the collector. A loop that builds a
+    /// fresh prototype parks one hashed root shape per prototype, and a shape
+    /// owns one counted reference to its prototype (Round 12), so before the
+    /// sweep those prototypes were immortal — ~0.72 objects per iteration,
+    /// until `shapes.maxHashed` (16 384) was reached and every later object
+    /// got a private shape and permanent IC misses instead.
+    func testFreshPrototypeLoopsDoNotGrowTheShapeTable() {
+        assertFlat("fresh prototype per iteration", """
+            for (var i = 0; i < $N; i++) { var p = { k: i }; var o = Object.create(p); o.x = i; }
+            """, slack: 512)
+        assertFlat("fresh class per iteration", """
+            for (var i = 0; i < $N; i++) {
+                var A = class { constructor() { this.x = i; } m() { return this.x; } };
+                var a = new A(); a.m();
+            }
+            """, slack: 512)
+    }
+
+    /// The sweep must not break the inline caches, which compare shapes by raw
+    /// address: a hot polymorphic read over objects whose shapes are being
+    /// evicted underneath it has to keep answering correctly.
+    func testShapeEvictionKeepsInlineCachesHonest() {
+        let rt = JeffJSRuntime()
+        let ctx = rt.newContext()
+        defer { ctx.free(); rt.free() }
+        let src = """
+            function read(o) { return o.a + o.b; }
+            var bad = 0;
+            for (var pass = 0; pass < 40; pass++) {
+                var protos = [];
+                for (var i = 0; i < 300; i++) protos.push({ tag: i });
+                for (var i = 0; i < 300; i++) {
+                    var o = Object.create(protos[i]);
+                    o.a = i; o.b = i + 1;
+                    if (read(o) !== 2 * i + 1) bad++;
+                    if (o.tag !== i) bad++;
+                }
+                protos = null;
+            }
+            bad
+            """
+        let r = ctx.eval(input: src, filename: "<shape-evict>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+        XCTAssertFalse(r.isException, "shape-eviction stress threw")
+        XCTAssertEqual(ctx.toInt32(r), 0, "reads through evicted shapes gave wrong answers")
+        r.freeValue()
+        runGC(rt)
+        XCTAssertLessThan(rt.shapeHashCount, 4000,
+                          "the shape table kept \(rt.shapeHashCount) shapes after the sweep")
+        print("[rc-leak] shape table after eviction stress: \(rt.shapeHashCount) "
+              + "(\(rt.shapesEvicted) swept)")
+    }
+
     func testAPrototypeDiesWithItsInstances() {
         let rt = JeffJSRuntime()
         let ctx = rt.newContext()

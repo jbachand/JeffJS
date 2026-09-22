@@ -633,6 +633,8 @@ final class JeffJSRuntime {
     var shapeHashSize: Int
     /// Number of shapes currently in the hash table.
     var shapeHashCount: Int
+    /// Hashed shapes swept out of the transition table by collections so far.
+    var shapesEvicted: Int = 0
     /// Shape hash table buckets (chained via JeffJSShape.shapeHashNext).
     var shapeHash: [JeffJSShape?]
 
