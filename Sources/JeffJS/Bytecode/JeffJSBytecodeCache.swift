@@ -21,6 +21,14 @@ private let JFBC_MAGIC: UInt32 = 0x4A46_4243
 ///    so the null atom no longer collapses onto the empty-string atom.
 private let JFBC_VERSION: UInt8 = 6
 
+/// Magic bytes for a *disk cache entry*: "JBCK" (JeffJS ByteCode Key).
+/// A disk entry is this header followed by the JFBC blob. The blob format is
+/// untouched, so a precompiled `.jfbc` produced by the polyfill generator
+/// still loads through `evalPrecompiled`.
+private let JBCK_MAGIC: UInt32 = 0x4A42_434B
+/// Disk-entry header version. Bump when the header layout changes.
+private let JBCK_HEADER_VERSION: UInt8 = 1
+
 /// Atom-table entry kinds (v6+).
 private let ATOM_ENTRY_NULL: UInt8 = 0
 private let ATOM_ENTRY_STRING: UInt8 = 1
@@ -885,10 +893,45 @@ struct JeffJSBytecodeDeserializer {
     }
 }
 
+// MARK: - Cache Key
+
+/// Everything about a compile that can change the bytes of a cached blob, or
+/// the behaviour of the code those bytes run.
+///
+/// The key used to be `FNV-1a(source) ^ compilerVersion` and nothing else, so
+/// two evals of byte-identical source text shared one blob even when they were
+/// compiled differently:
+///
+///   * `evalFlags` — script vs module (`JS_EVAL_TYPE_MASK`), strict vs sloppy
+///     (`JS_EVAL_FLAG_STRICT`, which sets `fd.jsMode = JS_MODE_STRICT` and
+///     changes scoping, `this`, and what the parser even accepts), plus the
+///     backtrace-barrier / async / compile-only bits;
+///   * `filename` — it is written into the blob (`fb.fileName`, read back by
+///     `buildStackTrace`), so a hit under a different filename reports the
+///     *other* page's file in every stack frame;
+///   * the codegen toggles (`optimize.enabled`, `optimize.shortOpcodes`) and
+///     the limits the compiler emits against (`stack.maxLocalVars`,
+///     `stack.maxStackSize`);
+///   * the blob format version itself (`JFBC_VERSION`).
+///
+/// All of them are folded in here.
+struct JeffJSBytecodeCacheKey {
+    /// FNV-1a over `desc`, a separator, then the source bytes.
+    let hash: UInt64
+    /// Canonical rendering of every compile input except the source text.
+    /// Stored verbatim in the disk entry header and compared on load, so a
+    /// 64-bit collision (or a file left by a differently-configured build) is
+    /// rejected instead of executed.
+    let desc: String
+    /// Source length in UTF-8 bytes; also checked on load.
+    let sourceLength: Int
+}
+
 // MARK: - Bytecode Cache
 
 /// Per-runtime bytecode cache with disk persistence. Stores serialized
-/// bytecode keyed by FNV-1a hash of the source string.
+/// bytecode keyed by a `JeffJSBytecodeCacheKey` (source + flags + config +
+/// filename), not by the source text alone.
 ///
 /// Atom remapping (v2 format) makes bytecode portable across runtimes,
 /// so disk-cached bytecode survives app relaunches and even CLI precompilation.
@@ -897,8 +940,17 @@ struct JeffJSBytecodeDeserializer {
 /// that runtime.
 final class JeffJSBytecodeCache {
 
-    /// Serialized bytecode keyed by source hash.
-    private var cache: [UInt64: [UInt8]] = [:]
+    /// One cached compile. `desc`/`sourceLength` are the in-memory equivalent
+    /// of the disk entry header: the same mismatch check runs on both paths,
+    /// so the two caches can never disagree about what a key means.
+    struct Entry {
+        let desc: String
+        let sourceLength: Int
+        let blob: [UInt8]
+    }
+
+    /// Serialized bytecode keyed by the cache key's hash.
+    private var cache: [UInt64: Entry] = [:]
 
     /// Maximum cached entries.
     private let maxEntries = 512
@@ -909,6 +961,17 @@ final class JeffJSBytecodeCache {
     /// Number of cache hits from disk.
     private(set) var diskHitCount: Int = 0
 
+    /// Lookups that found nothing.
+    private(set) var missCount: Int = 0
+
+    /// Lookups that found an entry and refused it (header/key mismatch, or a
+    /// blob that would not deserialize).
+    private(set) var rejectCount: Int = 0
+
+    /// Why the last rejection happened — surfaced for tests and for
+    /// `cache.bytecodeDebug` logging.
+    private(set) var lastRejectReason: String?
+
     /// Runtime for atom remapping during deserialization.
     ///
     /// unowned(unsafe), not weak: a weak reference to the runtime forces a
@@ -918,13 +981,40 @@ final class JeffJSBytecodeCache {
     /// the runtime, so it can never outlive it.
     unowned(unsafe) var rt: JeffJSRuntime?
 
+    // MARK: - Debug Logging
+
+    /// `cache.bytecodeDebug` (env `JEFFJS_CACHE_BYTECODEDEBUG=1`). Read once.
+    static let debugLogging = JeffJSConfig.bytecodeDebug
+
+    /// One line per hit / miss / reject / store, on stderr so a host app's
+    /// console picks it up. Compiled to a flag test when the flag is off.
+    @inline(__always)
+    func debugLog(_ message: @autoclosure () -> String) {
+        guard Self.debugLogging else { return }
+        writeDebugLine(message())
+    }
+
+    @inline(never)
+    private func writeDebugLine(_ message: String) {
+        FileHandle.standardError.write(Data("[jeffjs:bccache] \(message)\n".utf8))
+    }
+
+    private func reject(_ reason: String, _ key: JeffJSBytecodeCacheKey) {
+        rejectCount += 1
+        lastRejectReason = reason
+        debugLog("reject (\(reason)) key=\(key.desc) srcLen=\(key.sourceLength)")
+    }
+
     // MARK: - Disk Cache
 
-    /// Bump when the bytecode format changes.
-    private static let diskVersion: UInt32 = 3
+    /// Bump when the *disk entry* layout changes (it names the cache
+    /// subdirectory, so old entries are simply never looked at again).
+    /// 4 = entries carry a JBCK header (compiler version, key hash, source
+    ///     length, canonical flags/config/filename string).
+    private static let diskVersion: UInt32 = 4
 
     /// Bump when parser or compiler logic changes (bug fixes, new opcodes, etc.).
-    /// This is mixed into the source hash so cached bytecode from an older compiler
+    /// This is mixed into the cache key so cached bytecode from an older compiler
     /// is never reused. Bump this number after ANY change to:
     ///   - JeffJSParser.swift (parsing, bytecode emission)
     ///   - JeffJSCompiler.swift (resolveLabels, resolveVariables, peephole)
@@ -944,6 +1034,8 @@ final class JeffJSBytecodeCache {
     //   - atom-table entries carry a kind byte, so JS_ATOM_NULL (an
     //     anonymous function's `name`) no longer reads back as the
     //     empty-string atom.
+    // Still 12: the cache-key fix below changes the *entry* layout (diskVersion
+    // 3 -> 4), not the JFBC blob, which precompiled bundles also use.
     static let compilerVersion: UInt64 = 12  // 2026-09-21: JFBC v6 (wide-opcode-aware atom walk, tagged atom table)
 
     /// Lazily-initialized disk cache directory.
@@ -981,13 +1073,66 @@ final class JeffJSBytecodeCache {
         Self.diskCacheDir?.appendingPathComponent("\(hash).jfbc")
     }
 
+    /// The file a key maps to. Exposed for tests (header-rejection,
+    /// concurrent-writer) and for host-side cache inspection.
+    func diskEntryURL(for key: JeffJSBytecodeCacheKey) -> URL? {
+        diskURL(for: key.hash)
+    }
+
     // MARK: - Hashing
 
-    /// FNV-1a 64-bit hash, seeded with compiler version.
-    /// Changing `compilerVersion` invalidates all cached bytecode automatically.
+    /// Canonical string for every compile input that is *not* the source text.
+    ///
+    /// Anything appended here must be something that changes the emitted
+    /// bytecode or the behaviour of running it; anything that changes the blob
+    /// bytes but not behaviour (nothing today) could instead be stored in the
+    /// blob and left out.
+    static func keyDescription(filename: String, evalFlags: Int) -> String {
+        var s = "cv=\(compilerVersion);jfbc=\(JFBC_VERSION);"
+        // Eval flags: every bit that reaches the parser or the compiler.
+        // `et` is script(0)/module(1)/direct(2)/indirect(3) — module flips
+        // `isModule`, which turns off HTML comments and forces strict mode.
+        s += "et=\(evalFlags & JS_EVAL_TYPE_MASK);"
+        s += "strict=\((evalFlags & JS_EVAL_FLAG_STRICT) != 0 ? 1 : 0);"
+        s += "bbarrier=\((evalFlags & JS_EVAL_FLAG_BACKTRACE_BARRIER) != 0 ? 1 : 0);"
+        s += "async=\((evalFlags & JS_EVAL_FLAG_ASYNC) != 0 ? 1 : 0);"
+        s += "compileOnly=\((evalFlags & JS_EVAL_FLAG_COMPILE_ONLY) != 0 ? 1 : 0);"
+        // Codegen toggles and the limits the compiler emits against.
+        s += "opt=\(JEFFJS_OPTIMIZE ? 1 : 0);short=\(JEFFJS_SHORT_OPCODES ? 1 : 0);"
+        s += "mlv=\(JS_MAX_LOCAL_VARS);mss=\(JS_STACK_SIZE_MAX);"
+        // The filename lands in the blob and comes back out in stack traces.
+        s += "fn=\(filename)"
+        return s
+    }
+
+    /// Build the full cache key for one compile.
+    static func key(source: String, filename: String, evalFlags: Int) -> JeffJSBytecodeCacheKey {
+        let desc = keyDescription(filename: filename, evalFlags: evalFlags)
+        var hash: UInt64 = 0xcbf29ce484222325
+        hash ^= compilerVersion
+        hash &*= 0x100000001b3
+        for byte in desc.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x100000001b3
+        }
+        // Separator: `desc` never contains a 0 byte, so no source text can
+        // impersonate a different desc.
+        hash ^= 0
+        hash &*= 0x100000001b3
+        var length = 0
+        for byte in source.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x100000001b3
+            length &+= 1
+        }
+        return JeffJSBytecodeCacheKey(hash: hash, desc: desc, sourceLength: length)
+    }
+
+    /// FNV-1a 64-bit hash of source text alone, seeded with the compiler
+    /// version. NOT the cache key — kept because the precompiled-polyfill
+    /// generator prints it as a build-time fingerprint.
     static func hashSource(_ source: String) -> UInt64 {
         var hash: UInt64 = 0xcbf29ce484222325
-        // Mix in compiler version so bug fixes invalidate the cache
         hash ^= compilerVersion
         hash &*= 0x100000001b3
         for byte in source.utf8 {
@@ -997,32 +1142,114 @@ final class JeffJSBytecodeCache {
         return hash
     }
 
+    // MARK: - Disk Entry Header
+
+    /// `JBCK` header + the JFBC blob:
+    ///   u32 magic | u8 headerVersion | u64 compilerVersion | u64 keyHash
+    ///   | u32 sourceLength | u32 descLength | desc bytes | blob bytes
+    static func makeEntry(key: JeffJSBytecodeCacheKey, blob: [UInt8]) -> [UInt8] {
+        let desc = Array(key.desc.utf8)
+        var out: [UInt8] = []
+        out.reserveCapacity(29 + desc.count + blob.count)
+        func put32(_ v: UInt32) { for i in 0..<4 { out.append(UInt8((v >> (8 * UInt32(i))) & 0xFF)) } }
+        func put64(_ v: UInt64) { for i in 0..<8 { out.append(UInt8((v >> (8 * UInt64(i))) & 0xFF)) } }
+        put32(JBCK_MAGIC)
+        out.append(JBCK_HEADER_VERSION)
+        put64(compilerVersion)
+        put64(key.hash)
+        put32(UInt32(truncatingIfNeeded: key.sourceLength))
+        put32(UInt32(desc.count))
+        out.append(contentsOf: desc)
+        out.append(contentsOf: blob)
+        return out
+    }
+
+    /// The JFBC blob inside a validated entry, or why the entry was refused.
+    enum EntryResult {
+        case ok([UInt8])
+        case refused(String)
+    }
+
+    /// Validate an entry against the key it was looked up with and return the
+    /// JFBC blob, or the reason it was refused.
+    static func openEntry(_ bytes: [UInt8], key: JeffJSBytecodeCacheKey) -> EntryResult {
+        var p = 0
+        func get32() -> UInt32? {
+            guard p + 4 <= bytes.count else { return nil }
+            defer { p += 4 }
+            return UInt32(bytes[p]) | UInt32(bytes[p + 1]) << 8 | UInt32(bytes[p + 2]) << 16 | UInt32(bytes[p + 3]) << 24
+        }
+        func get64() -> UInt64? {
+            guard let lo = get32(), let hi = get32() else { return nil }
+            return UInt64(lo) | UInt64(hi) << 32
+        }
+        guard let magic = get32() else { return .refused("truncated header") }
+        guard magic == JBCK_MAGIC else { return .refused("bad magic") }
+        guard p < bytes.count else { return .refused("truncated header") }
+        let headerVersion = bytes[p]; p += 1
+        guard headerVersion == JBCK_HEADER_VERSION else { return .refused("header version mismatch") }
+        guard let cv = get64() else { return .refused("truncated header") }
+        guard cv == compilerVersion else { return .refused("compilerVersion mismatch") }
+        guard let storedHash = get64() else { return .refused("truncated header") }
+        guard storedHash == key.hash else { return .refused("key hash mismatch") }
+        guard let srcLen = get32() else { return .refused("truncated header") }
+        guard Int(srcLen) == key.sourceLength else { return .refused("source length mismatch") }
+        guard let descLen = get32() else { return .refused("truncated header") }
+        guard p + Int(descLen) <= bytes.count else { return .refused("truncated desc") }
+        let desc = String(decoding: bytes[p..<(p + Int(descLen))], as: UTF8.self)
+        p += Int(descLen)
+        guard desc == key.desc else { return .refused("key mismatch") }
+        return .ok(Array(bytes[p...]))
+    }
+
     // MARK: - Lookup
 
     /// Look up cached bytecode. Checks in-memory first, then disk.
     /// Atom table indices are remapped to the current runtime's atom IDs.
-    func lookup(_ sourceHash: UInt64, ctx: JeffJSContext? = nil) -> JeffJSFunctionBytecode? {
+    func lookup(_ key: JeffJSBytecodeCacheKey, ctx: JeffJSContext? = nil) -> JeffJSFunctionBytecode? {
         // In-memory cache
-        if let serialized = cache[sourceHash] {
-            guard let fb = JeffJSBytecodeDeserializer.deserialize(serialized, rt: rt, ctx: ctx) else {
-                cache.removeValue(forKey: sourceHash)
+        if let entry = cache[key.hash] {
+            guard entry.desc == key.desc, entry.sourceLength == key.sourceLength else {
+                // Same 64-bit hash, different compile. Never serve it.
+                reject("memory key mismatch", key)
+                cache.removeValue(forKey: key.hash)
+                return nil
+            }
+            guard let fb = JeffJSBytecodeDeserializer.deserialize(entry.blob, rt: rt, ctx: ctx) else {
+                reject("memory deserialize failed", key)
+                cache.removeValue(forKey: key.hash)
                 return nil
             }
             hitCount += 1
+            debugLog("hit memory key=\(key.desc) srcLen=\(key.sourceLength)")
             return fb
         }
         // Disk fallback
-        guard let url = diskURL(for: sourceHash),
-              let data = try? Data(contentsOf: url) else { return nil }
-        let bytes = [UInt8](data)
-        guard let fb = JeffJSBytecodeDeserializer.deserialize(bytes, rt: rt, ctx: ctx) else {
+        guard let url = diskURL(for: key.hash),
+              let data = try? Data(contentsOf: url) else {
+            missCount += 1
+            debugLog("miss key=\(key.desc) srcLen=\(key.sourceLength)")
+            return nil
+        }
+        let blob: [UInt8]
+        switch Self.openEntry([UInt8](data), key: key) {
+        case .refused(let reason):
+            reject("disk \(reason)", key)
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        case .ok(let b):
+            blob = b
+        }
+        guard let fb = JeffJSBytecodeDeserializer.deserialize(blob, rt: rt, ctx: ctx) else {
+            reject("disk deserialize failed", key)
             try? FileManager.default.removeItem(at: url)
             return nil
         }
         // Promote to in-memory cache
-        cache[sourceHash] = bytes
+        cache[key.hash] = Entry(desc: key.desc, sourceLength: key.sourceLength, blob: blob)
         hitCount += 1
         diskHitCount += 1
+        debugLog("hit disk key=\(key.desc) srcLen=\(key.sourceLength) bytes=\(blob.count)")
         return fb
     }
 
@@ -1030,15 +1257,26 @@ final class JeffJSBytecodeCache {
 
     /// Store compiled bytecode in the cache (serializes with atom table).
     /// Also persists to disk for cross-launch caching.
-    func store(_ sourceHash: UInt64, bytecode fb: JeffJSFunctionBytecode) {
-        guard cache.count < maxEntries else { return }
+    func store(_ key: JeffJSBytecodeCacheKey, bytecode fb: JeffJSFunctionBytecode) {
+        guard cache.count < maxEntries else {
+            debugLog("store skipped (cache full) key=\(key.desc)")
+            return
+        }
         let serialized = JeffJSBytecodeSerializer.serialize(fb, rt: rt)
-        cache[sourceHash] = serialized
+        cache[key.hash] = Entry(desc: key.desc, sourceLength: key.sourceLength, blob: serialized)
         // Persist to disk synchronously: a few hundred KB takes ~1 ms, and a
         // queued write is lost when a short-lived host (the CLI) exits first.
-        if let url = diskURL(for: sourceHash) {
-            try? Data(serialized).write(to: url, options: .atomic)
+        // `.atomic` writes a sibling temp file and renames it, so a concurrent
+        // reader sees either the whole old entry or the whole new one — never
+        // a half-written blob.
+        if let url = diskURL(for: key.hash) {
+            do {
+                try Data(Self.makeEntry(key: key, blob: serialized)).write(to: url, options: .atomic)
+            } catch {
+                debugLog("store write failed key=\(key.desc): \(error)")
+            }
         }
+        debugLog("store key=\(key.desc) srcLen=\(key.sourceLength) bytes=\(serialized.count)")
     }
 
     /// Clear all cached entries (in-memory and disk).
@@ -1046,5 +1284,8 @@ final class JeffJSBytecodeCache {
         cache.removeAll()
         hitCount = 0
         diskHitCount = 0
+        missCount = 0
+        rejectCount = 0
+        lastRejectReason = nil
     }
 }

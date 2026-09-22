@@ -2767,21 +2767,38 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // ---- Bytecode cache lookup ----
         // Cache stores SERIALIZED bytecode (not live objects). On cache hit,
         // deserialization creates fresh cpool values in the current context.
-        let cacheEnabled: Bool = {
-            guard JeffJSConfig.bytecodeEnabled && !isModule else { return false }
+        let cacheSkipReason: String? = {
+            guard JeffJSConfig.bytecodeEnabled else { return "cache.bytecodeEnabled=false" }
+            guard !isModule else { return "module" }
             // Exclude small dynamic scripts (eval, onclick, diagnostics)
-            if JeffJSConfig.bytecodeExcludePrefixes.contains(where: { filename.hasPrefix($0) }) { return false }
-            // If legacy include-prefixes are set, require a match
-            if !JeffJSConfig.bytecodePrefixes.isEmpty {
-                return JeffJSConfig.bytecodePrefixes.contains(where: { filename.hasPrefix($0) })
+            if let p = JeffJSConfig.bytecodeExcludePrefixes.first(where: { filename.hasPrefix($0) }) {
+                return "excluded prefix \(p)"
             }
-            return true  // cache everything not excluded
+            // If legacy include-prefixes are set, require a match
+            if !JeffJSConfig.bytecodePrefixes.isEmpty,
+               !JeffJSConfig.bytecodePrefixes.contains(where: { filename.hasPrefix($0) }) {
+                return "no include-prefix match"
+            }
+            return nil  // cache everything not excluded
         }()
-        let cacheKey = cacheEnabled ? JeffJSBytecodeCache.hashSource(input) : 0
-        if cacheEnabled, let cached = rt.bytecodeCache.lookup(cacheKey, ctx: self) {
-            bytecodeCacheHits += 1
-            lastBytecodeSize = cached.bytecodeLen
-            return executeBytecode(cached)
+        let cacheEnabled = cacheSkipReason == nil
+        // The key covers the source AND everything else about this compile:
+        // eval flags (module/strict/backtrace-barrier/async/compile-only), the
+        // filename (it round-trips through the blob into stack traces), the
+        // codegen toggles, and the compiler version. Two pages that load
+        // byte-identical script text under different flags now get different
+        // blobs instead of silently sharing one.
+        let cacheKey: JeffJSBytecodeCacheKey? = cacheEnabled
+            ? JeffJSBytecodeCache.key(source: input, filename: filename, evalFlags: evalFlags)
+            : nil
+        if let cacheKey {
+            if let cached = rt.bytecodeCache.lookup(cacheKey, ctx: self) {
+                bytecodeCacheHits += 1
+                lastBytecodeSize = cached.bytecodeLen
+                return executeBytecode(cached)
+            }
+        } else if let reason = cacheSkipReason {
+            rt.bytecodeCache.debugLog("skip (\(reason)) file=\(filename)")
         }
 
         // ---- Cache MISS — full pipeline: Tokenize → Parse → Compile ----
@@ -2840,8 +2857,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         totalBytecodeSize += compiledSize
 
         // Store serialized bytecode in cache for future evals of the same source
-        if cacheEnabled && !tooLargeToCache {
+        if let cacheKey, !tooLargeToCache {
             rt.bytecodeCache.store(cacheKey, bytecode: fb)
+        } else if cacheKey != nil {
+            rt.bytecodeCache.debugLog("skip store (bytecode \(bcSize) > cache.bytecodeMaxSize) file=\(filename)")
         }
 
         return executeBytecode(fb)

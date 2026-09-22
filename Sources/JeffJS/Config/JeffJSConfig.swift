@@ -83,6 +83,10 @@ enum JeffJSConfig {
             .split(separator: ",").map(String.init)
     }()
     static let bytecodeMaxSize     = int("cache.bytecodeMaxSize",      default: 1_000_000)
+    /// One stderr line per bytecode-cache hit / miss / reject / store, with the
+    /// full cache key and the reason a rejected entry was refused.
+    /// `JEFFJS_CACHE_BYTECODEDEBUG=1` turns it on without touching the plist.
+    static let bytecodeDebug       = bool("cache.bytecodeDebug",       default: false)
 
     // MARK: - Trace Blocks
 
