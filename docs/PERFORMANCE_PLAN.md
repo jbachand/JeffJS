@@ -1023,3 +1023,114 @@ Found, not fixed:
   hashed root shape per prototype, up to `shapes.maxHashed` (16 384), and
   those shapes are never evicted. It is bounded and pre-existing, but it is
   what a per-iteration "leak" of ~0.74 objects in those loops actually is.
+
+## Round 13 — two collectors, one answer (hardening)
+
+### The GPU collector was never run outside the app
+
+`shouldUseMetalGC` needs a Metal library, a SwiftPM consumer has no default
+one, and nothing said so — the CLI and the whole test suite quietly took the
+CPU path however the flags were set. That is how the var-ref seeding bug
+(Round 12's postscript) survived a day of green runs: only the app ever
+executed the kernels.
+
+- `JEFFJS_GC_METAL=1` now means "use the GPU collector", not "use it on big
+  heaps": the crossover drops to zero unless `JEFFJS_GC_METALTHRESHOLD` names
+  one, and the kernels are compiled out of the package resource bundle
+  whenever a collector is pinned. `Scripts/run_tests.sh` runs the suite twice,
+  once per collector, and diffs `Tests/gcstress/cycles.js` through the CLI on
+  both.
+- `MetalGCParityTests` runs thirteen heap shapes in two runtimes, one pinned
+  to each collector, and compares the surviving object count *and* what JS
+  still reads back out of the heap: self-cycles, a React-style tree with
+  handlers, thirty closures over one var-ref, WeakRef/FinalizationRegistry,
+  Map/Set with object keys, promise reaction cycles, class hierarchies,
+  suspended generators and async frames, mapped arguments, bound functions,
+  proxy<->target cycles, typed arrays, and DOM wrappers through
+  `JeffJSEnvironment`. It fails rather than skips when the kernels will not
+  load. **No divergence was found** — the seeding fix holds on all thirteen.
+- The GPU path declines instead of guessing: `runMetalGC` returns false, and
+  `runGC` re-runs the CPU collector on the same heap, when Metal is missing, a
+  buffer will not allocate, a command buffer reports anything but `.completed`,
+  or the rescue wavefront does not converge inside the iteration cap. It also
+  honours `JEFFJS_GC_OFF` and logs under `JEFFJS_GC_DEBUG`.
+- **Cost.** bench/realworld.js under `JEFFJS_GC_METAL=1` is 0.94x of the same
+  binary on the CPU collector — inside the noise floor (see below). The test
+  suite is not: 26.0s -> 48.5s, which is what thousands of collections on
+  small heaps cost in GPU dispatch. The app's 5 000-object threshold is the
+  right shape.
+
+### One shared leak the parity work found
+
+`FinalizationRegistry.prototype.register` did `entry.target = target.dupValue()`
+— a counted edge that `js_finrec_mark` deliberately does not mark, so the
+count could never be given back. A registered object was immortal and its
+cleanup callback could never fire. `[[WeakRefTarget]]` is a weak slot; the
+entry borrows it now and the weakref cell stays the authority on liveness.
+
+### The collector sweeps the shape table
+
+Nothing ever emptied it: `removeHashedShape` was reachable only from
+`freeShape`, and `freeObject` refused to free a hashed shape at zero owners.
+Because a shape owns one counted reference to its prototype (Round 12), a loop
+that builds a fresh prototype parked one hashed root shape per prototype and
+kept that prototype alive for the life of the runtime — the ~0.74 objects per
+iteration Round 12 recorded and could not account for. Past `shapes.maxHashed`
+(16 384) it got *worse*: insertion is skipped, so every later object builds a
+private shape and every property access on it is a permanent IC miss.
+
+White hashed shapes with no owners now go into the collection's dead set,
+alongside the objects. They have to go *with* them, not after: a white shape's
+prototype is white too, so a first attempt that swept after `runGC` left the
+shape's `proto` pointing at freed memory and `JEFFJS_ZOMBIES=1` caught the
+release immediately. `gcFreeDeadObjects` is exactly the protocol for a
+mutually-dead group — it breaks every edge before it hands any allocation back.
+
+Sweeping is safe against the inline caches, which compare shapes by raw
+address, for three reasons that all had to hold: `refCount == 0` means no live
+receiver can match an entry naming the shape (all four context-level shape
+caches take a count — `plainObjectRootShape` did not, and now does); every IC
+entry retains the shapes it names, so the allocation outlives the sweep and its
+address cannot be recycled under a stale entry; and `removeHashedShape` clears
+`isHashed`, which `jeffJS_icDefine` already checks before moving an object onto
+a transition target. That last one is the invalidation, and it was already
+there.
+
+**Results** (60 000-iteration loops, `__gcStats().liveObjects` either side):
+`Object.create(fresh)` 0.718 -> 0.000 per iteration, a fresh `class` per
+iteration 0.000, `new F()` with a fresh constructor a flat +271 total. The
+engine's own post-GC root set drops 4063 -> 2170. A polymorphic-read stress
+over 12 000 prototypes swept 36 439 shapes, left the table at 55, and every
+read was correct.
+
+### Per-object free
+
+`sample` on a 200-pass build-and-drop of a 16 383-node tree, top of stack:
+`swift_release` 261, `swift_retain` 186, **`JeffJSObjectPayload`
+copy/destroy/outlined-destroy 288 combined**, `freeObject` 125, malloc/free
+255. Almost all of the payload traffic was `freeObject` reading the enum into a
+local and writing `.opaque(nil)` back — a retain and a release of whatever
+class the case carries, plus the `didSet` re-matching it, on *every object
+freed*. A plain object has no payload edges (`markObject` returns on the same
+class-ID compare), so it is skipped; `propExtra` gets the same treatment, and
+the all-data-slots case is one tight loop.
+
+`weakrefFree` was a dictionary probe on every free: `freeObject` and the
+recycle pool asked `!rt.gcWeakRefMap.isEmpty` and then hashed an
+`ObjectIdentifier`, so one live `WeakMap` entry anywhere put that probe on the
+whole heap's teardown path. `weakrefNew` now sets the `firstWeakRef` marker
+`isPoolable` was already testing for, and both call sites test the field.
+
+Teardown microbenchmark: free-tree 878 -> 544 ms, free-plain 602 -> 570,
+free-with-weakref 729 -> 625, free-accessors 738 -> 591.
+
+### A word on the measurements
+
+This machine had an unrelated `swift-frontend` at ~99% CPU throughout, and the
+honest noise floor is large: the *same binary* benchmarked against *itself*,
+best of five alternating runs, came out at 1.104x. Nothing below ~10% per
+kernel from this session should be believed. With that caveat:
+bench/realworld.js geomean 0.9839x of a same-worktree base at dcb4eab (best of
+nine, 38 kernels), and the three kernels Round 11 flagged, re-measured on their
+own with best of fifteen: `vdom-build-diff` 1.032x, `closure-creation` 0.964x,
+`tree-walk` 0.935x.
