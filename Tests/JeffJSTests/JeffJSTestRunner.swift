@@ -293,6 +293,7 @@ struct JeffJSTestRunner {
             ("MappedArguments", { $0.testMappedArguments() }),
             ("FunctionToString", { $0.testFunctionToString() }),
             ("InOperator", { $0.testInOperator() }),
+            ("DOMEvents", { $0.testDOMEvents() }),
         ]
     }
 
