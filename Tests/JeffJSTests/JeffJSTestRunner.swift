@@ -291,6 +291,7 @@ struct JeffJSTestRunner {
             ("InterpreterGaps", { $0.testInterpreterGaps() }),
             ("MappedArguments", { $0.testMappedArguments() }),
             ("FunctionToString", { $0.testFunctionToString() }),
+            ("InOperator", { $0.testInOperator() }),
         ]
     }
 
@@ -6002,6 +6003,205 @@ extension JeffJSTestRunner {
             for (r = ({v: 'a' in {a:1}}).v; false;) {}
             r ? 1 : 0
             """, expectInt: 1)
+    }
+
+    // MARK: - InOperator
+    //
+    // en.wikipedia's ResourceLoader threw
+    // "TypeError: Cannot use 'in' operator to search for property in non-object"
+    // out of mw.loader.resolve where JSC answered a plain "Unknown module".
+    // The statement was a module `skip` expression run through `new Function`:
+    //   'IntersectionObserver' in window && ... && 'toJSON' in URL.prototype
+    // `URL` was registered as a bare native function with no `prototype`, so
+    // the last `in` had `undefined` on its right. Chasing it turned up four
+    // more `in` divergences, all covered here.
+
+    mutating func testInOperator() {
+        let (rt, ctx) = makeCtx()
+        _ = rt
+        // The shared test context does not install the stdlib intrinsics.
+        JeffJSStdLib.addURL(ctx: ctx)
+
+        // --- the reported bug: web constructors need a real prototype ---
+        evalCheckBool(ctx, "typeof URL.prototype === 'object' && 'toJSON' in URL.prototype", expect: true)
+        evalCheckBool(ctx, "'get' in URLSearchParams.prototype", expect: true)
+        evalCheckBool(ctx, "new URL('https://a.b/c') instanceof URL", expect: true)
+        evalCheckBool(ctx, "new URL('https://a.b/c').constructor === URL", expect: true)
+        evalCheckStr(ctx, "new URL('https://a.b/c?x=1').toJSON()", expect: "https://a.b/c?x=1")
+        evalCheckBool(ctx, "new URLSearchParams('a=1') instanceof URLSearchParams", expect: true)
+        evalCheckBool(ctx, """
+            (function(){
+              var f = new Function("return typeof URL === 'function' && 'toJSON' in URL.prototype;");
+              return f() === true;
+            })()
+            """, expect: true)
+
+        // --- the ResourceLoader shape: Object.create(null) as a registry ---
+        evalCheckStr(ctx, """
+            (function(){
+              var registry = Object.create(null);
+              function reg(m, deps) { if (m in registry) throw new Error('dup'); registry[m] = {deps: deps || []}; }
+              function sort(m, out) {
+                if (!(m in registry)) throw new Error('Unknown module: ' + m);
+                var d = registry[m].deps;
+                for (var i = 0; i < d.length; i++) sort(d[i], out);
+                if (out.indexOf(m) < 0) out.push(m);
+              }
+              reg('base'); reg('app', ['base']);
+              var out = []; sort('app', out);
+              try { sort('nope', out); } catch (e) { return out.join() + '|' + e.message; }
+              return 'no-throw';
+            })()
+            """, expect: "base,app|Unknown module: nope")
+        evalCheckBool(ctx, "var o = Object.create(null); o.a = 1; 'a' in o", expect: true)
+        evalCheckBool(ctx, "var o = Object.create(null); o.a = 1; 'toString' in o", expect: false)
+        evalCheckBool(ctx, "var b = Object.create(null); b.x = 1; 'x' in Object.create(b)", expect: true)
+        evalCheck(ctx, """
+            var bad = 0;
+            for (var i = 0; i < 3000; i++) {
+              var o = {}; o.k = i;
+              var n = Object.create(null); n.k = i;
+              if (!('k' in o) || !('k' in n) || ('toString' in n) || !('toString' in o) || ('j' in o)) bad++;
+            }
+            bad
+            """, expectInt: 0)
+
+        // --- prototype chain after setPrototypeOf (shapes own the proto) ---
+        evalCheckBool(ctx, "var o = {a:1}; Object.setPrototypeOf(o, null); 'toString' in o", expect: false)
+        evalCheckBool(ctx, "var o = {a:1}; Object.setPrototypeOf(o, null); 'a' in o", expect: true)
+        evalCheckBool(ctx, "var o = Object.create(null); Object.setPrototypeOf(o, {z:9}); 'z' in o", expect: true)
+        evalCheckBool(ctx, "var o = {}; Object.setPrototypeOf(o, null); Object.setPrototypeOf(o, Object.prototype); 'toString' in o", expect: true)
+        evalCheckBool(ctx, "var o = {a:1}; Reflect.setPrototypeOf(o, null); 'toString' in o", expect: false)
+        evalCheckBool(ctx, "var o = Object.create(null); o.a=1; o.b=2; o.c=3; Object.setPrototypeOf(o, {d:4}); ('a' in o) && ('d' in o)", expect: true)
+
+        // --- array holes are absent, not undefined ---
+        evalCheckBool(ctx, "1 in [1,,3]", expect: false)
+        evalCheckBool(ctx, "0 in [1,,3]", expect: true)
+        evalCheckBool(ctx, "2 in [1,,3]", expect: true)
+        evalCheckBool(ctx, "3 in [1,,3]", expect: false)
+        evalCheckBool(ctx, "'length' in [1,,3]", expect: true)
+        evalCheck(ctx, "[1,,3].length", expectInt: 3)
+        evalCheck(ctx, "[1,,].length", expectInt: 2)
+        evalCheckBool(ctx, "1 in [1,,]", expect: false)
+        evalCheckBool(ctx, "0 in [,1]", expect: false)
+        evalCheckStr(ctx, "Object.keys([1,,3]).join()", expect: "0,2")
+        evalCheckStr(ctx, "var a=[0,1,,3,,5]; var o=[]; for (var i=0;i<6;i++) o.push(i in a ? 1 : 0); o.join()", expect: "1,1,0,1,0,1")
+        evalCheck(ctx, "var n=0; [1,,3].forEach(function(){ n++; }); n", expectInt: 2)
+        evalCheckStr(ctx, "var k=[]; for (var i in [1,,3]) k.push(i); k.join()", expect: "0,2")
+        evalCheckBool(ctx, "1 in [1,,3].map(function(x){ return x; })", expect: false)
+        evalCheckStr(ctx, "[1,,3].join('-')", expect: "1--3")
+        evalCheckBool(ctx, "var a=[1,,3]; a[1]=9; (1 in a) && a[1] === 9", expect: true)
+        // sparse growth skips over holes, it does not fill with undefined
+        evalCheckBool(ctx, "var b=[]; b[1000]=1; 5 in b", expect: false)
+        evalCheckBool(ctx, "var b=[]; b[1000]=1; 1000 in b", expect: true)
+        evalCheckStr(ctx, "var b=[]; b[1000]=1; Object.keys(b).join()", expect: "1000")
+        evalCheckBool(ctx, "var c=[1,2,3]; delete c[1]; 1 in c", expect: false)
+        evalCheckBool(ctx, "0 in new Array(3)", expect: false)
+        evalCheckBool(ctx, "var a=[]; for (var i=0;i<1000;i++) a.push(i); (999 in a) && !(1000 in a)", expect: true)
+
+        // --- integer-indexed exotic objects ---
+        evalCheckBool(ctx, "0 in new Uint8Array(3)", expect: true)
+        evalCheckBool(ctx, "2 in new Uint8Array(3)", expect: true)
+        evalCheckBool(ctx, "3 in new Uint8Array(3)", expect: false)
+        evalCheckBool(ctx, "'3' in new Uint8Array(3)", expect: false)
+        evalCheckBool(ctx, "'length' in new Uint8Array(3)", expect: true)
+        evalCheckBool(ctx, "'buffer' in new Uint8Array(3)", expect: true)
+        evalCheckBool(ctx, "0 in new Float64Array(2)", expect: true)
+        evalCheckBool(ctx, "2 in new Float64Array(2)", expect: false)
+        evalCheckBool(ctx, "0 in new Uint8Array(0)", expect: false)
+
+        // --- String wrapper objects ---
+        evalCheckBool(ctx, "0 in new String('ab')", expect: true)
+        evalCheckBool(ctx, "1 in new String('ab')", expect: true)
+        evalCheckBool(ctx, "2 in new String('ab')", expect: false)
+        evalCheckBool(ctx, "'length' in new String('ab')", expect: true)
+        evalCheckBool(ctx, "'charAt' in new String('ab')", expect: true)
+        evalCheckBool(ctx, "0 in new String('')", expect: false)
+
+        // --- proxies: a throwing `has` trap must not read as "absent" ---
+        evalCheckStr(ctx, """
+            (function(){
+              var p = new Proxy({}, { has: function(){ throw new Error('trap boom'); } });
+              try { 'a' in p; return 'no-throw'; } catch (e) { return e.message; }
+            })()
+            """, expect: "trap boom")
+        evalCheckStr(ctx, """
+            (function(){
+              var p = new Proxy({}, { has: function(){ throw new Error('trap boom'); } });
+              try { Reflect.has(p, 'a'); return 'no-throw'; } catch (e) { return e.message; }
+            })()
+            """, expect: "trap boom")
+        evalCheckBool(ctx, """
+            (function(){
+              var r = Proxy.revocable({a:1}, {});
+              r.revoke();
+              try { 'a' in r.proxy; return 'no-throw'; } catch (e) { return e instanceof TypeError; }
+            })()
+            """, expect: true)
+        evalCheckBool(ctx, """
+            (function(){
+              var r = Proxy.revocable({a:1}, {});
+              var revoke = r.revoke;
+              revoke();
+              try { r.proxy.a; return 'no-throw'; } catch (e) { return e instanceof TypeError; }
+            })()
+            """, expect: true)
+        evalCheckBool(ctx, "var p = new Proxy({}, { has: function(t,k){ return k === 'yes'; } }); ('yes' in p) && !('no' in p)", expect: true)
+        evalCheckBool(ctx, "var p = new Proxy({a:1}, {}); ('a' in p) && !('b' in p)", expect: true)
+        evalCheckBool(ctx, "'a' in new Proxy(Object.create(null), {})", expect: false)
+
+        // --- other right-hand sides ---
+        evalCheckBool(ctx, "function f(a,b){} ('length' in f) && ('call' in f) && !('nope' in f)", expect: true)
+        evalCheckBool(ctx, "function f(){} var b = f.bind(null); ('length' in b) && ('call' in b)", expect: true)
+        evalCheckBool(ctx, "class C { static s(){} } ('s' in C) && ('prototype' in C)", expect: true)
+        evalCheckBool(ctx, """
+            class A { constructor(){ this.x = 1; } }
+            class B extends A { constructor(){ super(); this.y = 2; } }
+            var b = new B(); ('x' in b) && ('y' in b) && !('z' in b)
+            """, expect: true)
+        evalCheckBool(ctx, "(function(a){ return (0 in arguments) && !(1 in arguments) && ('callee' in arguments) && ('length' in arguments); })(1)", expect: true)
+        evalCheckBool(ctx, "(function(a,b){ a = 9; return (0 in arguments) && arguments[0] === 9; })(1,2)", expect: true)
+        evalCheckBool(ctx, "('Object' in globalThis) && !('__nope__' in globalThis)", expect: true)
+        evalCheckBool(ctx, "var o = Object.freeze({a:1}); ('a' in o) && !('b' in o)", expect: true)
+        evalCheckBool(ctx, "'a' in Object.seal({a:1})", expect: true)
+        evalCheckBool(ctx, "('toFixed' in new Number(5)) && !('x' in new Number(5))", expect: true)
+        evalCheckBool(ctx, "('get' in new Map()) && ('size' in new Map())", expect: true)
+        evalCheckBool(ctx, "('exec' in /a/) && ('lastIndex' in /a/) && ('getTime' in new Date())", expect: true)
+
+        // --- keys: symbols, numbers, bigints, toPropertyKey ---
+        evalCheckBool(ctx, "var s = Symbol('k'); var o = {}; o[s] = 1; (s in o) && !(Symbol.iterator in o)", expect: true)
+        evalCheckBool(ctx, "Symbol.iterator in []", expect: true)
+        evalCheckBool(ctx, "var s = Symbol('k'); var o = Object.create(null); o[s] = 1; s in o", expect: true)
+        evalCheckBool(ctx, "var n = {1:'a'}; (1 in n) && ('1' in n) && (1.0 in n) && !(2 in n)", expect: true)
+        evalCheckBool(ctx, "var a = ['x']; (0 in a) && ('0' in a) && (-0 in a)", expect: true)
+        evalCheckBool(ctx, "1n in {1:1}", expect: true)
+        evalCheckBool(ctx, "({ toString: function(){ return 'ab'; } }) in {ab:1}", expect: true)
+        evalCheckStr(ctx, """
+            (function(){
+              try { ({ toString: function(){ throw new Error('key boom'); } }) in {}; return 'no-throw'; }
+              catch (e) { return e.message; }
+            })()
+            """, expect: "key boom")
+
+        // --- TypeError for a non-object right-hand side ---
+        evalCheckException(ctx, "'a' in null")
+        evalCheckException(ctx, "'a' in undefined")
+        evalCheckException(ctx, "0 in 'abc'")
+        evalCheckException(ctx, "'a' in 5")
+        evalCheckException(ctx, "'a' in Symbol()")
+        evalCheckException(ctx, "'a' in 1n")
+        evalCheckBool(ctx, "(function(){ try { 'a' in null; return false; } catch (e) { return e instanceof TypeError; } })()", expect: true)
+
+        // --- #priv in obj, and `in` under a with statement ---
+        evalCheckBool(ctx, "class C { #p = 1; static has(o){ return #p in o; } } C.has(new C()) && !C.has({})", expect: true)
+        evalCheck(ctx, "var o = Object.create(null); o.wv = 42; var r; with (o) { r = wv; } r", expectInt: 42)
+
+        // --- the operand stack stays balanced (no leak, no drift) ---
+        evalCheck(ctx, """
+            var o = {a:1}; var n = 0;
+            for (var i = 0; i < 50000; i++) { if ('a' in o) n++; if ('b' in o) n--; }
+            n
+            """, expectInt: 50000)
     }
 
     // MARK: - Opcode: instanceof

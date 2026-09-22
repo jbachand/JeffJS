@@ -1957,7 +1957,11 @@ extension JeffJSObject {
                 let newSize = min(growthTarget, maxSafe)
                 storage.values.reserveCapacity(newSize)
                 let fillCount = newSize - storage.values.count
-                for _ in 0..<fillCount { storage.values.append(.undefined) }
+                // The slots skipped over by `a[1000] = 1` are holes, not
+                // `undefined`: `5 in a` is false and `Object.keys` must not
+                // invent them. Filling with `.undefined` made every skipped
+                // index look like a present element.
+                for _ in 0..<fillCount { storage.values.append(.uninitialized) }
             }
             if index < storage.count { storage.values[idx].freeValue() }   // overwrite releases the old element
             storage.values[idx] = value
