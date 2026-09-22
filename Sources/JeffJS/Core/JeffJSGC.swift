@@ -888,17 +888,23 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     // Release each property value. Data values are manually refcounted;
     // an accessor's getter/setter are too (`defineProperty` dups them, and
     // `markObject` marks them as counted edges) even though the slot stores
-    // them as ARC references; a detached varRef's captured value is freed
-    // explicitly; autoInit refs are ARC-only.
+    // them as ARC references; a varRef slot and autoInit refs are ARC-only.
     for i in 0..<savedValues.count {
         // propExtra is lazily allocated: empty means every slot is plain data.
         if i < savedExtra.count, let e = savedExtra[i] {
             switch e.kind {
             case .varRef:
-                if let vr = e.varRef, vr.isDetached {
-                    freeValue(rt, vr.value)
-                    vr.value = .undefined
-                }
+                // A mapped `arguments` slot holds the *same* var-ref the
+                // closures over that parameter captured (jeffJS_argVarRef
+                // hands out one per frame slot), so the detached value is not
+                // this object's to free — ARC is, through
+                // `JeffJSVarRef.deinit`, when the last holder (arguments
+                // object or closure, whichever goes second) lets go. Freeing
+                // it here cleared the binding out from under every surviving
+                // closure: `function f(x){ var a = arguments;
+                // return function () { return x } }` handed back a closure
+                // that read `undefined` as soon as f's arguments object died.
+                break
             case .getset:
                 // Dropping only the ARC reference left the manual count one
                 // too high, so every object literal getter/setter (and every

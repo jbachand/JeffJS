@@ -205,6 +205,7 @@ struct JeffJSTestRunner {
             ("ControlFlow", { $0.testControlFlow() }),
             ("Scoping", { $0.testScoping() }),
             ("Closures", { $0.testClosures() }),
+            ("NamedFunctionExpressions", { $0.testNamedFunctionExpressions() }),
             ("Classes", { $0.testClasses() }),
             ("Iterators", { $0.testIterators() }),
             ("Generators", { $0.testGenerators() }),
@@ -1402,6 +1403,164 @@ extension JeffJSTestRunner {
     }
 
     // MARK: - Classes
+
+    /// Named function expressions: the self-name binding, its scope, and the
+    /// closure var-refs the body reads through it.
+    ///
+    /// The shape that brought this group into being is Prism's
+    /// `clone: function e(t,a) { ... n.util.type(t) ... e(t[A],a) ... }`:
+    /// an NFE that recurses by its own name, through a native callback, while
+    /// reading the enclosing module object `n` through a closure var-ref that
+    /// thirty other closures in the same module also hold.
+    mutating func testNamedFunctionExpressions() {
+        let (_, ctx) = makeCtx()
+
+        // Self-recursion over a captured variable, non-tail and tail, deep
+        // enough to pass the trace-entry threshold and to run as inline frames.
+        evalCheck(ctx, """
+            (function () {
+                var outer = 7;
+                var f = function g(n) { return n ? 1 + g(n - 1) : outer; };
+                var s = 0;
+                for (var d = 1; d <= 50; d++) s += f(d);
+                return s;
+            })()
+            """, expectInt: 1625)
+        evalCheck(ctx, """
+            (function () {
+                var outer = 3;
+                var f = function g(n) { if (!n) return outer; return g(n - 1); };
+                var s = 0;
+                for (var d = 1; d <= 50; d++) s += f(d);
+                return s;
+            })()
+            """, expectInt: 150)
+        // The captured variable is read *after* the recursive call returns, so
+        // every frame on the way out touches the var-ref again.
+        evalCheck(ctx, """
+            (function () {
+                var outer = 5;
+                var f = function g(n) { if (!n) return 0; var r = g(n - 1); return r + outer; };
+                return f(20);
+            })()
+            """, expectInt: 100)
+
+        // The name binding is const and still names the function.
+        evalCheckStr(ctx, """
+            (function () {
+                var f = function g(n) { try { g = null; } catch (e) {} return n ? g(n - 1) : "g"; };
+                return f(3);
+            })()
+            """, expect: "g")
+        // ... and is invisible outside the function expression.
+        evalCheckStr(ctx, "(function () { var f = function g() { return 1; }; return typeof g; })()",
+                        expect: "undefined")
+        // ES 15.2.4 / 10.2.11: the name binding lives in a scope *outside* the
+        // parameter scope, so a formal parameter of the same name shadows it.
+        evalCheckStr(ctx, "(function g(g) { return typeof g; })(1)", expect: "number")
+        evalCheckStr(ctx, "(function g(g) { return typeof g; })()", expect: "undefined")
+        // A body `var`/`let`/function declaration shadows it too.
+        evalCheckStr(ctx, "(function () { var f = function g() { var g; return typeof g; }; return f(); })()",
+                        expect: "undefined")
+        evalCheckStr(ctx, "(function () { var f = function g() { function g() {} return typeof g; }; return f(); })()",
+                        expect: "function")
+
+        // The Prism clone shape: recursion by name through a native callback,
+        // reading a module-scope object through a closure var-ref.
+        evalCheckStr(ctx, """
+            (function () {
+                var ns = { tag: "NS" };
+                var clone = function e(t, a) {
+                    a = a || {};
+                    if (Array.isArray(t)) {
+                        var r = [];
+                        t.forEach(function (v, j) { r[j] = e(v, a); });
+                        return r;
+                    }
+                    if (t && typeof t === "object") {
+                        var o = {};
+                        for (var k in t) if (t.hasOwnProperty(k)) o[k] = e(t[k], a);
+                        o.__ns = ns.tag;
+                        return o;
+                    }
+                    return t;
+                };
+                function mk(d) { if (!d) return [1, 2, { z: 3 }]; return { a: mk(d - 1), b: [mk(d - 1), d], c: d }; }
+                var res = clone(mk(8));
+                return res.__ns + "," + res.b[0].c + "," + res.a.a.a.a.a.a.a.c;
+            })()
+            """, expect: "NS,7,1")
+
+        // Recursion routed through an intermediate closure, a class method,
+        // and a webpack-style module wrapper.
+        evalCheck(ctx, """
+            (function () {
+                var outer = 17;
+                var f = function g(n) { var h = function () { return g(n - 1); }; return n ? h() : outer; };
+                return f(30);
+            })()
+            """, expectInt: 17)
+        evalCheck(ctx, """
+            (function () {
+                var outer = 11;
+                class C { m(n) { var f = function g(k) { return k ? g(k - 1) : outer; }; return f(n); } }
+                var c = new C();
+                return c.m(40);
+            })()
+            """, expectInt: 11)
+        evalCheck(ctx, """
+            (function (e, t, n) {
+                var mod = (function () {
+                    var c = 0;
+                    var api = { util: { bump: function () { return ++c; },
+                                        walk: function q(x) { return x ? q(x - 1) : api.util.bump(); } } };
+                    return api;
+                })();
+                for (var d = 0; d < 40; d++) mod.util.walk(d);
+                return mod.util.bump();
+            })(1, 2, 3)
+            """, expectInt: 41)
+        // `arguments` inside the NFE itself.
+        evalCheck(ctx, """
+            (function () {
+                var outer = 2;
+                var f = function g(n) { if (n === 0) return outer; return g(n - 1) + arguments[0]; };
+                return f(4);
+            })()
+            """, expectInt: 12)
+        // Frozen / redefined function objects still recurse by name.
+        evalCheck(ctx, """
+            (function () {
+                var outer = 13;
+                var f = function g(n) { return n ? g(n - 1) : outer; };
+                Object.freeze(f);
+                var h = function g2(n) { return n ? g2(n - 1) : outer; };
+                Object.defineProperty(h, "x", { value: 1 });
+                return f(30) + h(30);
+            })()
+            """, expectInt: 26)
+
+        // A mapped `arguments` object aliases its parameters through the very
+        // var-refs the closures captured. Freeing the arguments object must
+        // not wipe the value those closures read.
+        evalCheck(ctx, "(function () { function f(x) { var a = arguments; return function () { return x; }; } return f(42)(); })()",
+                  expectInt: 42)
+        evalCheck(ctx, "(function () { function f(x) { return [arguments, function () { return x; }]; } var p = f(9); p[0] = null; return p[1](); })()",
+                  expectInt: 9)
+        evalCheck(ctx, "(function () { function f(x, y) { var a = arguments; var g = function () { return x + y; }; a = null; return g(); } return f(3, 4); })()",
+                  expectInt: 7)
+        // Two closures share one detached var-ref; dropping one must not take
+        // the captured object away from the other.
+        evalCheckStr(ctx, """
+            (function () {
+                function mk() { var n = { t: "NS" }; return { a: function () { return n.t; }, b: function () { return n.t; } }; }
+                var o = mk();
+                var onlyA = o.a;
+                o.b = null;
+                return onlyA();
+            })()
+            """, expect: "NS")
+    }
 
     mutating func testClasses() {
         let (rt, ctx) = makeCtx()
