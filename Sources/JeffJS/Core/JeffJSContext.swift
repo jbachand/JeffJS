@@ -1398,21 +1398,36 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     ///   - obj: The target object.
     ///   - atom: The property atom.
     /// - Returns: True if the property exists, false otherwise.
+    ///
+    /// A `has` trap that throws is indistinguishable from "absent" through this
+    /// signature; callers that must tell them apart (the `in` operator,
+    /// `Reflect.has`) call `hasPropertyEx` instead.
+    @inline(__always)
     func hasProperty(obj: JeffJSValue, atom: UInt32) -> Bool {
-        guard let jsObj = obj.toObject() else { return false }
+        return hasPropertyEx(obj: obj, atom: atom) > 0
+    }
+
+    /// `JS_HasProperty()` proper: 1 = present, 0 = absent, **-1 = an exception
+    /// is pending**. quickjs's returns `int` for exactly this reason — a proxy
+    /// `has` trap can throw, and a revoked proxy always does. The Bool-returning
+    /// wrapper above collapsed -1 into "absent", so `'x' in revokedProxy`
+    /// answered `false` and a throwing trap was swallowed outright.
+    func hasPropertyEx(obj: JeffJSValue, atom: UInt32) -> Int {
+        guard let jsObj = obj.toObject() else { return 0 }
 
         // Proxy intercept: if this object is a proxy, dispatch to handler.has trap
         if jsObj.classID == JeffJSClassID.proxy.rawValue || jsObj.classID == JSClassID.JS_CLASS_PROXY.rawValue {
             if case .proxyData(let pd) = jsObj.payload {
                 if pd.isRevoked {
                     _ = throwTypeError(message: "Cannot perform 'has' on a proxy that has been revoked")
-                    return false
+                    return -1
                 }
                 // Look for handler.has trap
                 if let handlerObj = pd.handler.toObject() {
                     let hasTrapAtom = rt.findAtom("has")
                     let trap = getPropertyInternal(obj: pd.handler, atom: hasTrapAtom, receiver: pd.handler)
                     rt.freeAtom(hasTrapAtom)
+                    if trap.isException { return -1 }
                     if trap.isObject, let trapObj = trap.toObject(), trapObj.isCallable {
                         // Call trap(target, property)
                         let propName: JeffJSValue
@@ -1422,12 +1437,18 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                             propName = .JS_UNDEFINED
                         }
                         let result = callFunction(trap, thisVal: pd.handler, args: [pd.target, propName])
-                        return result.toBool()
+                        propName.freeValue()
+                        trap.freeValue()
+                        if result.isException { return -1 }
+                        let b = result.toBool()
+                        result.freeValue()
+                        return b ? 1 : 0
                     }
+                    trap.freeValue()
                     _ = handlerObj // suppress warning
                 }
                 // No trap: fall through to target
-                return hasProperty(obj: pd.target, atom: atom)
+                return hasPropertyEx(obj: pd.target, atom: atom)
             }
         }
 
@@ -1437,26 +1458,56 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 // A hole (from `delete a[i]`) is *absent*: `1 in a` is false.
                 if let storage = jsObj._fastArrayValues {
                     if idx < storage.count && Int(idx) < storage.values.count {
-                        return !storage.values[Int(idx)].isUninitialized
+                        return storage.values[Int(idx)].isUninitialized ? 0 : 1
                     }
                 } else if let snap = jsObj.arraySnapshot() {
                     if Int(idx) < snap.count && Int(idx) < snap.values.count {
-                        return !snap.values[Int(idx)].isUninitialized
+                        return snap.values[Int(idx)].isUninitialized ? 0 : 1
                     }
                 }
             }
         }
 
+        // TypedArray integer-indexed elements live in the backing ArrayBuffer,
+        // not in the shape, so the walk below missed every one of them
+        // (`0 in new Uint8Array(3)` answered false). An integer-indexed exotic
+        // object also *stops* the search at its own elements: a canonical index
+        // outside the range is absent and does not continue onto the prototype
+        // chain (ES 10.4.5.2, [[HasProperty]]).
+        if jsObj.classID >= JeffJSClassID.uint8cArray.rawValue &&
+           jsObj.classID <= JeffJSClassID.float64Array.rawValue {
+            if case .typedArray(let ta) = jsObj.payload,
+               rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom) {
+                guard let bufObj = ta.buffer,
+                      case .arrayBuffer(let ab) = bufObj.payload,
+                      !ab.detached else { return 0 }
+                return idx < ta.length ? 1 : 0
+            }
+        }
+
+        // String wrapper: the index properties are delegated to the underlying
+        // [[StringData]] primitive (ES 10.4.3) and are likewise not in the
+        // shape. `length` is a real own property and falls through below; an
+        // out-of-range index is an ordinary lookup, so it falls through too.
+        if jsObj.classID == JSClassID.JS_CLASS_STRING.rawValue,
+           rt.atomIsArrayIndex(atom) {
+            let pv = jsObj.primitiveValue
+            if pv.isString, let idx = rt.atomToUInt32(atom),
+               let js = pv.stringValue, Int(idx) < js.len {
+                return 1
+            }
+        }
+
         // Lazily created own properties count as present
         if jsObj.lazyFlags != 0 {
-            if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue { return true }
-            if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) { return true }
-            if jsObj.pendingStack != nil, atom == JeffJSAtomID.JS_ATOM_stack.rawValue { return true }
+            if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue { return 1 }
+            if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) { return 1 }
+            if jsObj.pendingStack != nil, atom == JeffJSAtomID.JS_ATOM_stack.rawValue { return 1 }
         }
 
         // Check own properties via the shape hash table
         if let shape = jsObj.shape, findShapeProperty(shape, atom) != nil {
-            return true
+            return 1
         }
 
         // Walk the prototype chain (check both shape.proto and obj.proto
@@ -1464,12 +1515,12 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         var proto = jsObj.proto
         while let p = proto {
             if let shape = p.shape, findShapeProperty(shape, atom) != nil {
-                return true
+                return 1
             }
             proto = p.proto
         }
 
-        return false
+        return 0
     }
 
     /// Gets the own property descriptor for a property.
@@ -2237,18 +2288,31 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             if proxyVal.isException { return proxyVal }
 
             // Create revoke function that captures the proxy
+            // The proxy reference is kept as an internal property of the revoke
+            // *function*, so the GC can see the edge — but the function body
+            // only gets `thisVal`, and `const {revoke} = ...; revoke()` (or
+            // `r.revoke()`) never passes the function itself. Reading
+            // `__proxyRef__` off `thisVal` therefore found nothing and every
+            // revoke silently did nothing: a revoked proxy kept working, and
+            // `'x' in revokedProxy` answered `false` instead of throwing.
+            // This weak box is how the body reaches its own function object.
+            let revokeSelf = JeffJSWeakObjectBox()
             let revokeFunc = self.newCFunction({ [weak self] ctx, thisVal, revokeArgs in
                 guard let self = self else { return .JS_UNDEFINED }
-                // The proxy reference is stored as an internal property on the revoke function
+                guard let fnObj = revokeSelf.obj else { return .JS_UNDEFINED }
+                let fnVal = JeffJSValue.borrowedObject(fnObj)
                 let proxyRefAtom = self.rt.findAtom("__proxyRef__")
-                let proxyRef = self.getPropertyInternal(obj: thisVal, atom: proxyRefAtom, receiver: thisVal)
+                let proxyRef = self.getPropertyInternal(obj: fnVal, atom: proxyRefAtom, receiver: fnVal)
                 self.rt.freeAtom(proxyRefAtom)
+                defer { proxyRef.freeValue() }
                 guard let proxyObj = proxyRef.toObject(),
                       proxyObj.classID == JeffJSClassID.proxy.rawValue || proxyObj.classID == JSClassID.JS_CLASS_PROXY.rawValue,
                       case .proxyData(var pd) = proxyObj.payload else {
                     return .JS_UNDEFINED
                 }
                 if !pd.isRevoked {
+                    pd.target.freeValue()
+                    pd.handler.freeValue()
                     pd.target = .undefined
                     pd.handler = .undefined
                     pd.isRevoked = true
@@ -2256,6 +2320,8 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 }
                 return .JS_UNDEFINED
             }, name: "revoke", length: 0)
+
+            revokeSelf.obj = revokeFunc.toObject()
 
             // Store the proxy reference on the revoke function
             let proxyRefAtom = self.rt.findAtom("__proxyRef__")
@@ -4017,7 +4083,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             }
             guard let (atom, owned) = self.propertyKeyAtom(args[1]) else { return .exception }
             defer { if owned { self.rt.freeAtom(atom) } }
-            return .newBool(self.hasProperty(obj: args[0], atom: atom))
+            // -1: the `has` trap threw. Reporting `false` here swallowed it.
+            let r = self.hasPropertyEx(obj: args[0], atom: atom)
+            return r < 0 ? .exception : .newBool(r > 0)
         }, name: "has", length: 2)
         _ = setPropertyStr(obj: reflectObj, name: "has", value: reflHas)
 
@@ -5567,3 +5635,11 @@ extension JeffJSContext {
 /// JEFFJS_TIME_PRECOMPILED=1 reports the deserialize/execute split of
 /// evalPrecompiled, for startup profiling in embedders.
 nonisolated(unsafe) let jeffJSTimePrecompiled = ProcessInfo.processInfo.environment["JEFFJS_TIME_PRECOMPILED"] == "1"
+
+/// A weak handle on a JS object, for native closures that need to reach the
+/// function object they are the body of (`Proxy.revocable`'s `revoke`). Weak
+/// on purpose: the strong, GC-visible edge is the object's own property.
+final class JeffJSWeakObjectBox {
+    weak var obj: JeffJSObject?
+    init() {}
+}

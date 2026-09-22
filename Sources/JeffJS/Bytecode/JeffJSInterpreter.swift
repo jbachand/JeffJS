@@ -1623,6 +1623,14 @@ extension JeffJSContext {
     /// (e.g. "0", "1"), checks both the integer atom and string atom paths since
     /// arrays store elements with integer atoms but object literals may use string atoms.
     func hasPropertyValue(obj: JeffJSValue, key: JeffJSValue) -> Bool {
+        return hasPropertyValueEx(obj: obj, key: key) > 0
+    }
+
+    /// `hasPropertyValue` on quickjs's `JS_HasProperty` protocol:
+    /// 1 = present, 0 = absent, -1 = an exception is pending (a proxy `has`
+    /// trap threw, or the proxy is revoked). The `in` operator needs the third
+    /// answer; everything else is happy with the Bool wrapper above.
+    func hasPropertyValueEx(obj: JeffJSValue, key: JeffJSValue) -> Int {
         if key.isString, let str = key.stringValue {
             let s = str.toSwiftString()
             // Check if the string represents an array index (e.g. "0", "1", ...)
@@ -1630,19 +1638,19 @@ extension JeffJSContext {
             // then fall back to string atom (for object literals like {0: "a"}).
             if let idx = UInt32(s), String(idx) == s {
                 let intAtom = rt.newAtomUInt32(idx)
-                let intResult = hasProperty(obj: obj, atom: intAtom)
+                let intResult = hasPropertyEx(obj: obj, atom: intAtom)
                 rt.freeAtom(intAtom)
-                if intResult { return true }
+                if intResult != 0 { return intResult }
                 // Fall through to check string atom too
             }
             let atom = rt.findAtom(s)
-            let result = hasProperty(obj: obj, atom: atom)
+            let result = hasPropertyEx(obj: obj, atom: atom)
             rt.freeAtom(atom)
             return result
         }
         if key.isInt {
             let atom = rt.newAtomUInt32(UInt32(bitPattern: key.toInt32()))
-            let result = hasProperty(obj: obj, atom: atom)
+            let result = hasPropertyEx(obj: obj, atom: atom)
             rt.freeAtom(atom)
             return result
         }
@@ -1651,21 +1659,21 @@ extension JeffJSContext {
             if d >= 0 && d <= Double(UInt32.max), Double(UInt32(d)) == d {
                 let u = UInt32(d)
                 let atom = rt.newAtomUInt32(u)
-                let result = hasProperty(obj: obj, atom: atom)
+                let result = hasPropertyEx(obj: obj, atom: atom)
                 rt.freeAtom(atom)
                 return result
             }
             // Non-integer float key: convert to string
             let k = JeffJSTypeConvert.formatNumber(d)
             let atom = rt.findAtom(k)
-            let result = hasProperty(obj: obj, atom: atom)
+            let result = hasPropertyEx(obj: obj, atom: atom)
             rt.freeAtom(atom)
             return result
         }
         if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
-            return hasProperty(obj: obj, atom: rt.symbolAtom(for: symStr))
+            return hasPropertyEx(obj: obj, atom: rt.symbolAtom(for: symStr))
         }
-        return false
+        return 0
     }
 
     // MARK: - Super Property Stubs
@@ -10970,6 +10978,7 @@ struct JeffJSInterpreter {
             case .in_:
                 let rhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let lhs = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if !rhs.isObject {
+                    lhs.freeValue(); rhs.freeValue()
                     _ = ctx.throwTypeError(message: "Cannot use 'in' operator to search for property in non-object")
                     retVal = .exception; break dispatchLoop
                 }
@@ -10977,14 +10986,24 @@ struct JeffJSInterpreter {
                 // uses integer atoms (matching how arrays store elements).
                 // For other types, convert to property key first.
                 let key: JeffJSValue
+                let keyOwned: Bool
                 if lhs.isInt || lhs.isFloat64 || lhs.isString || lhs.isSymbol {
-                    key = lhs
+                    key = lhs; keyOwned = false
                 } else {
-                    key = ctx.toPropertyKey(lhs)
-                    if key.isException { retVal = .exception; break dispatchLoop }
+                    key = ctx.toPropertyKey(lhs); keyOwned = true
+                    if key.isException {
+                        lhs.freeValue(); rhs.freeValue()
+                        retVal = .exception; break dispatchLoop
+                    }
                 }
-                let has = ctx.hasPropertyValue(obj: rhs, key: key)
-                buf[sp] = .newBool(has); sp += 1
+                // -1 is "the proxy `has` trap threw" — the Bool-returning
+                // wrapper folded that into `false`, so `x in revokedProxy`
+                // quietly answered false instead of raising the TypeError.
+                let has = ctx.hasPropertyValueEx(obj: rhs, key: key)
+                if keyOwned { key.freeValue() }
+                lhs.freeValue(); rhs.freeValue()
+                if has < 0 { retVal = .exception; break dispatchLoop }
+                buf[sp] = .newBool(has > 0); sp += 1
                 pc += 1
 
             // -----------------------------------------------------------------

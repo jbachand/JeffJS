@@ -861,13 +861,54 @@ struct JeffJSStdLib {
     /// This is a simplified version; the full WHATWG URL spec is very large.
     static func addURL(ctx: JeffJSContext) {
         let global = ctx.getGlobalObject()
+        defer { global.freeValue() }
 
-        // URL constructor
-        ctx.setPropertyFunc(obj: global, name: "URL", fn: urlConstructor, length: 1)
+        // Both interfaces get a real `prototype`. A bare C function has none,
+        // so `URL.prototype` read back `undefined` — and MediaWiki's
+        // ResourceLoader feature-detects with
+        //   typeof URL === 'function' && 'toJSON' in URL.prototype
+        // which turned into `'toJSON' in undefined`: a TypeError thrown out of
+        // a module's `skip` expression, where the browser just answers false.
+        // The methods belong on the prototype anyway; hanging them off every
+        // instance is what the URLSearchParams side already stopped doing.
+        // `newConstructorFunc` and `setPropertyStr` each consume the reference
+        // they are handed, so neither the prototypes nor the constructors are
+        // released here.
+        let urlCtor = ctx.newConstructorFunc(name: "URL", fn: urlConstructor,
+                                             length: 1, proto: urlPrototype(ctx: ctx))
+        _ = ctx.setPropertyStr(obj: global, name: "URL", value: urlCtor)
 
-        // URLSearchParams constructor
-        ctx.setPropertyFunc(obj: global, name: "URLSearchParams",
-                           fn: urlSearchParamsConstructor, length: 0)
+        let uspCtor = ctx.newConstructorFunc(name: "URLSearchParams",
+                                             fn: urlSearchParamsConstructor,
+                                             length: 0, proto: uspPrototype(ctx: ctx))
+        _ = ctx.setPropertyStr(obj: global, name: "URLSearchParams", value: uspCtor)
+    }
+
+    /// Slot on the global holding the shared URL method table.
+    static let urlProtoSlot = "__urlProto"
+
+    /// The prototype every URL instance in this context shares. Returns an
+    /// owned reference.
+    static func urlPrototype(ctx: JeffJSContext) -> JeffJSValue {
+        let global = ctx.getGlobalObject()
+        defer { global.freeValue() }
+        let cached = ctx.getPropertyStr(obj: global, name: urlProtoSlot)
+        if cached.isObject { return cached }
+        cached.freeValue()
+
+        let proto = ctx.newPlainObject()
+        ctx.setPropertyFunc(obj: proto, name: "toString", fn: { ctx, this, _ in
+            return ctx.getPropertyStr(obj: this, name: "href")
+        }, length: 0)
+        ctx.setPropertyFunc(obj: proto, name: "toJSON", fn: { ctx, this, _ in
+            return ctx.getPropertyStr(obj: this, name: "href")
+        }, length: 0)
+
+        let atom = ctx.newAtom(urlProtoSlot)
+        _ = ctx.definePropertyValue(obj: global, atom: atom, value: proto,
+                                    flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+        ctx.rt.freeAtom(atom)
+        return proto
     }
 
     /// new URL(url, base?)
@@ -920,16 +961,13 @@ struct JeffJSStdLib {
         // live `searchParams`, so a mutation there shows up immediately — and
         // no back-pointer is needed (a url <-> params cycle would never be
         // collected, object cycles are not traced).
-        let obj = ctx.newPlainObject()
+        // `toString` / `toJSON` (and `constructor`) come from the shared
+        // prototype: two function objects per URL was both a leak and the
+        // reason `URL.prototype` had nothing to be asked about.
+        let proto = urlPrototype(ctx: ctx)
+        defer { proto.freeValue() }
+        let obj = ctx.newObjectWithProto(proto)
         urlPopulate(ctx: ctx, obj: obj, url: url, components: components)
-
-        // toString() / toJSON() return the href
-        ctx.setPropertyFunc(obj: obj, name: "toString", fn: { ctx, this, _ in
-            return ctx.getPropertyStr(obj: this, name: "href")
-        }, length: 0)
-        ctx.setPropertyFunc(obj: obj, name: "toJSON", fn: { ctx, this, _ in
-            return ctx.getPropertyStr(obj: this, name: "href")
-        }, length: 0)
 
         ctx.setPropertyGetSet(obj: obj, atom: ctx.newAtom("search"),
                               getter: urlSearchGetter, setter: urlSearchSetter)

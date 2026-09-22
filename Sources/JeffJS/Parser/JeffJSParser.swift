@@ -5705,6 +5705,11 @@ final class JeffJSParser {
         // Parse elements, tracking whether any spread (...) is present.
         var count = 0
         var hasSpread = false
+        // Indices skipped by an elision. `[1,,3]` has a *hole* at 1, not
+        // `undefined`: `1 in a` is false, `forEach` skips it and `Object.keys`
+        // does not list it. array_from only takes a count, so the holes are
+        // punched back out once the array exists (see below).
+        var holes: [Int] = []
 
         // Element descriptors: false = normal value, true = spread iterable.
         // We record these so we can emit the right bytecode AFTER parsing
@@ -5729,6 +5734,7 @@ final class JeffJSParser {
                     emitOp(.append)
                 } else {
                     emitOp(.undefined)
+                    holes.append(count)
                     count += 1
                 }
                 next()
@@ -5777,6 +5783,14 @@ final class JeffJSParser {
             // No spread was found — use the fast array_from path.
             emitOp(.array_from)
             emitU16(UInt16(count))
+            // Turn the placeholder `undefined`s back into holes. Nothing is
+            // emitted for an array without elisions, which is all of them.
+            for h in holes {
+                emitOp(.dup)                 // [arr, arr]
+                emitPushI32(Int32(h))        // [arr, arr, i]
+                emitOp(.delete_)             // [arr, ok]
+                emitOp(.drop)                // [arr]
+            }
         }
         // If hasSpread, the array was already built incrementally and is on
         // the stack as a proper Array.  Nothing more to emit.
