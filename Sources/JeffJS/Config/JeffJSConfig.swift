@@ -105,6 +105,10 @@ enum JeffJSConfig {
     static let gcMallocThreshold   = int("gc.mallocThreshold",        default: 256 * 1024)
     static let gcObjectCost        = int("gc.objectCost",              default: 256)
     static let gcMetalThreshold    = int("gc.metalThreshold",          default: 5000)
+    /// True when the crossover was named in the environment. `JEFFJS_GC_METAL=1`
+    /// otherwise drops it to zero so "use the GPU collector" means every
+    /// collection, not only the ones on a 5 000-object heap.
+    static let gcMetalThresholdIsExplicit = envOverride("gc.metalThreshold").flatMap(Int.init) != nil
     static let gcMetalThreadGroupSize = int("gc.metalThreadGroupSize", default: 256)
     static let gcMetalMaxRescue    = int("gc.metalMaxRescueIterations", default: 100)
 

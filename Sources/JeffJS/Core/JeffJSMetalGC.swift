@@ -68,16 +68,61 @@ final class JeffJSMetalGC {
 
     /// Returns true when the object count is large enough for Metal to
     /// outperform the CPU linear walk.
+    /// `JEFFJS_GC_METAL=1` means "run the GPU collector", not "run it on big
+    /// heaps": the whole point of the flag is to put the test suite and the CLI
+    /// on the same code path the app uses above `gc.metalThreshold`, and a
+    /// conformance group's heap is nowhere near 5 000 objects. An explicit
+    /// `JEFFJS_GC_METALTHRESHOLD` still wins, so a benchmark can ask for the
+    /// app's real crossover.
+    var effectiveThreshold: Int {
+        if let override = JeffJSMetalGC.thresholdOverride { return override }
+        if jeffJSForceMetalGC, !JeffJSConfig.gcMetalThresholdIsExplicit { return 0 }
+        return metalThreshold
+    }
+
+    /// Test hook: force the collector choice for one runtime's worth of work
+    /// without a second process (see GCParityTests). `nil` = honour the
+    /// environment.
+    nonisolated(unsafe) static var thresholdOverride: Int? = nil
+
+    /// Collections the GPU ran to completion, and collections it declined and
+    /// handed back to the CPU. A parity test that only compared results would
+    /// pass just as happily if the kernels never ran at all — which is exactly
+    /// the state this suite was in until yesterday.
+    private(set) var completedRuns = 0
+    private(set) var declinedRuns = 0
+
+    /// True when the kernels actually loaded. Tests skip rather than silently
+    /// exercising the CPU collector twice — which is how the var-ref seeding
+    /// bug survived a green suite.
+    var isAvailable: Bool {
+        ensureMetalInitialized()
+        return metalAvailable
+    }
+
     func shouldUseMetalGC(objectCount: Int) -> Bool {
-        guard objectCount > metalThreshold else { return false }
+        guard objectCount > effectiveThreshold else { return false }
         ensureMetalInitialized()
         return metalAvailable
     }
 
     /// Run all 3 GC phases on the GPU, then free dead objects on CPU.
     ///
+    /// Returns `true` only when the collection ran to completion. Every other
+    /// exit — Metal missing, a buffer that would not allocate, a command buffer
+    /// that errored, a rescue wavefront that did not converge — returns `false`
+    /// having freed nothing, and `runGC` re-runs the CPU collector on the same
+    /// heap. A partial GPU scan must never reach phase 3: everything the
+    /// wavefront had not touched is still white and would be freed while live.
+    ///
     /// - Parameter rt: The JeffJS runtime whose gcObjects list to collect.
-    func runMetalGC(rt: JeffJSRuntime) {
+    @discardableResult
+    func runMetalGC(rt: JeffJSRuntime) -> Bool {
+        // The CPU collector's own switch. `runGC` checks it before dispatching
+        // here, but `runMetalGC` is also reachable from tests and from the
+        // environment's explicit runGC(), and "no cycle collection" has to mean
+        // the same thing on both paths.
+        guard !jeffJS_gcDisable else { declinedRuns += 1; return false }
         ensureMetalInitialized()
         guard metalAvailable,
               let device = device,
@@ -85,11 +130,12 @@ final class JeffJSMetalGC {
               let trialDecrefPipeline = trialDecrefPipeline,
               let scanRescuePipeline = scanRescuePipeline,
               let collectDeadPipeline = collectDeadPipeline else {
-            return
+            declinedRuns += 1
+            return false
         }
 
         let objectCount = rt.gcObjects.count
-        guard objectCount > 0 else { return }
+        guard objectCount > 0 else { completedRuns += 1; return true }
 
         // ---- Step 1: Snapshot the object graph ----
 
@@ -120,7 +166,12 @@ final class JeffJSMetalGC {
               let deadCountBuffer = device.makeBuffer(
                 length: counterBufferSize,
                 options: .storageModeShared) else {
-            return
+            if jeffJS_gcDebug { print("[GC-metal] buffer allocation failed; abandoning") }
+            declinedRuns += 1
+            return false
+        }
+        if jeffJS_gcDebug {
+            print("[GC-metal] \(objectCount) node(s), \(children.count) edge(s)")
         }
 
         var nodeCountValue = UInt32(objectCount)
@@ -137,7 +188,7 @@ final class JeffJSMetalGC {
         // ---- Step 3a: Phase 1 — Trial decrement ----
 
         guard let cmdBuffer1 = commandQueue.makeCommandBuffer(),
-              let encoder1 = cmdBuffer1.makeComputeCommandEncoder() else { return }
+              let encoder1 = cmdBuffer1.makeComputeCommandEncoder() else { declinedRuns += 1; return false }
 
         encoder1.setComputePipelineState(trialDecrefPipeline)
         encoder1.setBuffer(nodeBuffer, offset: 0, index: 0)
@@ -147,17 +198,19 @@ final class JeffJSMetalGC {
         encoder1.endEncoding()
         cmdBuffer1.commit()
         cmdBuffer1.waitUntilCompleted()
+        guard completed(cmdBuffer1, "trial_decref") else { declinedRuns += 1; return false }
 
         // ---- Step 3b: Phase 2 — Scan/rescue (iterative until convergence) ----
 
         var converged = false
+        var iterations = 0
         for _ in 0 ..< maxRescueIterations {
             // Reset rescue counter to 0
             let rescuePtr = rescueCountBuffer.contents().bindMemory(to: UInt32.self, capacity: 1)
             rescuePtr.pointee = 0
 
             guard let cmdBuffer2 = commandQueue.makeCommandBuffer(),
-                  let encoder2 = cmdBuffer2.makeComputeCommandEncoder() else { return }
+                  let encoder2 = cmdBuffer2.makeComputeCommandEncoder() else { declinedRuns += 1; return false }
 
             encoder2.setComputePipelineState(scanRescuePipeline)
             encoder2.setBuffer(nodeBuffer, offset: 0, index: 0)
@@ -168,6 +221,8 @@ final class JeffJSMetalGC {
             encoder2.endEncoding()
             cmdBuffer2.commit()
             cmdBuffer2.waitUntilCompleted()
+            guard completed(cmdBuffer2, "scan_rescue") else { declinedRuns += 1; return false }
+            iterations += 1
 
             // Check if any nodes were rescued this iteration
             let rescuedCount = rescuePtr.pointee
@@ -180,7 +235,14 @@ final class JeffJSMetalGC {
         // than the cap is only half-scanned: everything the wavefront had not
         // reached yet is still white and phase 3 would free it while it is
         // live. Abandon the collection instead — the next run gets another go.
-        guard converged else { return }
+        guard converged else {
+            if jeffJS_gcDebug {
+                print("[GC-metal] rescue did not converge in \(maxRescueIterations) iterations; abandoning")
+            }
+            declinedRuns += 1
+            return false
+        }
+        if jeffJS_gcDebug { print("[GC-metal] rescue converged in \(iterations) iteration(s)") }
 
         // ---- Step 3c: Phase 3 — Collect dead node indices ----
 
@@ -188,7 +250,7 @@ final class JeffJSMetalGC {
         deadCountPtr.pointee = 0
 
         guard let cmdBuffer3 = commandQueue.makeCommandBuffer(),
-              let encoder3 = cmdBuffer3.makeComputeCommandEncoder() else { return }
+              let encoder3 = cmdBuffer3.makeComputeCommandEncoder() else { declinedRuns += 1; return false }
 
         encoder3.setComputePipelineState(collectDeadPipeline)
         encoder3.setBuffer(nodeBuffer, offset: 0, index: 0)
@@ -199,11 +261,12 @@ final class JeffJSMetalGC {
         encoder3.endEncoding()
         cmdBuffer3.commit()
         cmdBuffer3.waitUntilCompleted()
+        guard completed(cmdBuffer3, "collect_dead") else { declinedRuns += 1; return false }
 
         // ---- Step 4: Read back dead indices and free on CPU ----
 
         let deadCount = Int(deadCountPtr.pointee)
-        guard deadCount > 0 else { return }
+        guard deadCount > 0 else { completedRuns += 1; return true }
 
         let deadIndicesPtr = deadIndicesBuffer.contents().bindMemory(
             to: UInt32.self, capacity: deadCount)
@@ -253,16 +316,48 @@ final class JeffJSMetalGC {
         let savedPhase = rt.gcPhase
         rt.gcPhase = .JS_GC_PHASE_REMOVE_CYCLES
         rt.gcCyclesFreed += deadHeaders.count
+        gcDebugDumpDead(rt, deadHeaders, collector: "metal")
         gcFreeDeadObjects(rt, deadHeaders)
         rt.gcPhase = savedPhase
+        completedRuns += 1
+        return true
+    }
+
+    /// A command buffer that errored has left its output buffers in whatever
+    /// state the partial dispatch reached; reading a dead set out of them would
+    /// free live objects. Treat anything but `.completed` as "abandon".
+    private func completed(_ buffer: MTLCommandBuffer, _ label: String) -> Bool {
+        if buffer.status == .completed, buffer.error == nil { return true }
+        if jeffJS_gcDebug {
+            print("[GC-metal] kernel \(label) failed (status \(buffer.status.rawValue), "
+                  + "\(buffer.error.map { String(describing: $0) } ?? "no error")); abandoning")
+        }
+        return false
     }
 
     // MARK: - Metal initialization
 
     /// Lazily create the Metal device, command queue, and pipeline states.
+    /// True when this process is allowed to compile the kernels out of the
+    /// package resource bundle. A host app links them into its own default
+    /// library and needs nothing here; a SwiftPM consumer has no default
+    /// library at all, which is why the GPU collector never ran outside the app.
+    private var mayLoadPackageLibrary: Bool {
+        jeffJSForceMetalGC || JeffJSMetalGC.thresholdOverride != nil
+    }
+
+    /// The value of `mayLoadPackageLibrary` at the last failed attempt. A
+    /// failure is only sticky while the answer to "may I load it?" has not
+    /// changed: a test that pins the GPU collector after an unpinned call has
+    /// to get a real second attempt, not the cached "no".
+    private var failedUnder: Bool?
+
     private func ensureMetalInitialized() {
-        guard !metalInitialized else { return }
+        if metalAvailable { return }
+        let allow = mayLoadPackageLibrary
+        if metalInitialized, failedUnder == allow { return }
         metalInitialized = true
+        failedUnder = allow
 
         guard let dev = MTLCreateSystemDefaultDevice() else {
             metalAvailable = false
@@ -283,7 +378,7 @@ final class JeffJSMetalGC {
         // collector went unseen. JEFFJS_GC_METAL=1 loads the same kernels out
         // of the package's resource bundle so both can be exercised here.
         var loaded: MTLLibrary? = dev.makeDefaultLibrary()
-        if loaded == nil, jeffJSForceMetalGC {
+        if loaded == nil, allow {
             if let compiled = try? dev.makeDefaultLibrary(bundle: jeffJSResourceBundle) {
                 loaded = compiled
             } else if let url = jeffJSResourceBundle.url(forResource: "JeffJSMetalGC",
@@ -294,6 +389,7 @@ final class JeffJSMetalGC {
         }
         guard let library = loaded else {
             metalAvailable = false
+            if jeffJS_gcDebug { print("[GC-metal] no shader library; CPU collector only") }
             return
         }
 
@@ -310,8 +406,10 @@ final class JeffJSMetalGC {
             scanRescuePipeline = try dev.makeComputePipelineState(function: scanRescueFn)
             collectDeadPipeline = try dev.makeComputePipelineState(function: collectDeadFn)
             metalAvailable = true
+            if jeffJS_gcDebug { print("[GC-metal] kernels ready on \(dev.name)") }
         } catch {
             metalAvailable = false
+            if jeffJS_gcDebug { print("[GC-metal] pipeline creation failed: \(error)") }
         }
     }
 

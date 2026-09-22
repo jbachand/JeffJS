@@ -57,7 +57,15 @@ final class JSFinRecEntry {
     /// Weak reference to the target object.
     var weakRef: JeffJSWeakRef?
 
-    /// The raw target value (for identity comparison during unregister).
+    /// The raw target value, **borrowed**: an entry must not keep its target
+    /// alive, or registering an object with a FinalizationRegistry makes it
+    /// immortal and the cleanup callback can never fire — which is exactly
+    /// what `entry.target = target.dupValue()` did here. `[[WeakRefTarget]]`
+    /// is a weak slot in the spec, and `js_finrec_mark` already (correctly)
+    /// refuses to mark it; the count taken at registration was therefore an
+    /// edge nothing could ever give back. `weakRef` is the authority on
+    /// liveness; this field is only ever inspected for its NaN-box tag, never
+    /// dereferenced, and is cleared the moment the entry is retired.
     var target: JeffJSValue = .undefined
 
     /// The value passed to the cleanup callback when the target is collected.
@@ -410,7 +418,7 @@ func js_finrec_register(
 
     // Create the entry.
     let entry = JSFinRecEntry()
-    entry.target = target.dupValue()
+    entry.target = target          // borrowed — see JSFinRecEntry.target
     entry.heldValue = heldValue.dupValue()
     entry.token = unregisterToken.dupValue()
     entry.hasToken = hasToken
@@ -477,7 +485,7 @@ func js_finrec_unregister(
     data.entries.removeAll { entry in
         if entry.hasToken && js_sameValue(entry.token, unregisterToken) {
             // Free the entry's retained values.
-            entry.target.freeValue()
+            entry.target = .undefined   // borrowed, never ours to free
             entry.heldValue.freeValue()
             entry.token.freeValue()
             entry.weakRef = nil
@@ -570,7 +578,7 @@ func js_finrec_runCleanup(
     // Remove dead entries (in reverse order to preserve indices).
     for index in deadIndices.reversed() {
         let entry = data.entries[index]
-        entry.target.freeValue()
+        entry.target = .undefined   // borrowed, never ours to free
         entry.heldValue.freeValue()
         entry.token.freeValue()
         entry.weakRef = nil
@@ -635,7 +643,7 @@ func js_finrec_finalizer(rt: JeffJSRuntime, val: JeffJSValue) {
 
     // Free all entries.
     for entry in data.entries {
-        entry.target.freeValue()
+        entry.target = .undefined   // borrowed, never ours to free
         entry.heldValue.freeValue()
         entry.token.freeValue()
         entry.weakRef = nil

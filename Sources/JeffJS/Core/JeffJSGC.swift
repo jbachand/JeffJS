@@ -64,8 +64,10 @@ final class JeffJSWeakRef {
 nonisolated(unsafe) let jeffJS_gcDebug =
     ProcessInfo.processInfo.environment["JEFFJS_GC_DEBUG"] == "1"
 /// `JEFFJS_GC_OFF=1`: reference counting only, no cycle collection — answers
-/// "is the collector responsible?" in one run.
-nonisolated(unsafe) let jeffJS_gcDisable =
+/// "is the collector responsible?" in one run. A `var` so the parity tests can
+/// check that *both* collectors refuse when it is set, without a second
+/// process per assertion.
+nonisolated(unsafe) var jeffJS_gcDisable =
     ProcessInfo.processInfo.environment["JEFFJS_GC_OFF"] == "1"
 
 // MARK: - GC object list management
@@ -296,13 +298,21 @@ func runGC(_ rt: JeffJSRuntime) {
     let freedBefore = rt.gcCyclesFreed
 
     #if canImport(Metal)
+    // The GPU collector declines (returns false) rather than guesses: a kernel
+    // that failed, a rescue wavefront that did not converge inside the
+    // iteration cap, or a heap shape it has no parity for all end with nothing
+    // freed and the CPU collector running instead on the same heap. Abandoning
+    // is always safe — the objects are still there for the next pass — while
+    // freeing on a half-finished scan is not.
     if JeffJSMetalGC.shared.shouldUseMetalGC(objectCount: rt.gcObjects.count) {
-        JeffJSMetalGC.shared.runMetalGC(rt: rt)
-        freeZeroRefcount(rt)
-        pruneWeakRefs(rt)
-        rt.gcRuns += 1
-        rt.mallocGCThreshold = jeffJS_nextGCThreshold(rt, reclaimed: rt.gcCyclesFreed - freedBefore)
-        return
+        if JeffJSMetalGC.shared.runMetalGC(rt: rt) {
+            freeZeroRefcount(rt)
+            pruneWeakRefs(rt)
+            rt.gcRuns += 1
+            rt.mallocGCThreshold = jeffJS_nextGCThreshold(rt, reclaimed: rt.gcCyclesFreed - freedBefore)
+            return
+        }
+        if jeffJS_gcDebug { print("[GC-metal] declined; falling back to the CPU collector") }
     }
     #endif
 
@@ -531,15 +541,22 @@ private func gcFreeCycles(_ rt: JeffJSRuntime) {
         dead.append(gcUnlistDead(rt, u))
     }
     rt.gcTmpObjects.removeAll(keepingCapacity: true)
-    if jeffJS_gcDebug {
-        for hdr in dead.prefix(40) {
-            guard let obj = hdr as? JeffJSObject, let sh = obj.shape else { continue }
-            var names: [String] = []
-            for pr in sh.prop.prefix(8) { names.append(rt.atomToString(pr.atom) ?? "?") }
-            print("[GC-FREE] class=\(obj.classID) rc=\(obj.refCount) props=\(names)")
-        }
-    }
+    gcDebugDumpDead(rt, dead, collector: "cpu")
     gcFreeDeadObjects(rt, dead)
+}
+
+/// `JEFFJS_GC_DEBUG=1`: print what a collection is about to free. Shared by the
+/// CPU and Metal collectors so a divergence between the two reads as a diff of
+/// two logs rather than one log and a silence.
+func gcDebugDumpDead(_ rt: JeffJSRuntime, _ dead: [JeffJSGCObjectHeader], collector: String) {
+    guard jeffJS_gcDebug else { return }
+    print("[GC-\(collector)] freeing \(dead.count) object(s)")
+    for hdr in dead.prefix(40) {
+        guard let obj = hdr as? JeffJSObject, let sh = obj.shape else { continue }
+        var names: [String] = []
+        for pr in sh.prop.prefix(8) { names.append(rt.atomToString(pr.atom) ?? "?") }
+        print("[GC-FREE] class=\(obj.classID) rc=\(obj.refCount) props=\(names)")
+    }
 }
 
 /// Take a doomed header off the GC lists by hand. The lists have already been
