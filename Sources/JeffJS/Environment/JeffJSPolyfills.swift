@@ -400,38 +400,26 @@ public enum JeffJSPolyfills {
   }
 
   if (typeof window.matchMedia === 'undefined') {
+    // MediaQueryList is an EventTarget ('change' events, `onchange`);
+    // addListener/removeListener are the legacy aliases.
+    var __MET = (typeof EventTarget === 'function') ? EventTarget : function() {};
+    function MediaQueryList(media) {
+      __MET.call(this);
+      this.media = media;
+      this.matches = evaluateMediaQuery(media);
+      this.onchange = null;
+    }
+    MediaQueryList.prototype = Object.create(__MET.prototype);
+    Object.defineProperty(MediaQueryList.prototype, 'constructor', { value: MediaQueryList, writable: true, configurable: true });
+    MediaQueryList.prototype.addListener = function(listener) {
+      if (typeof this.addEventListener === 'function') this.addEventListener('change', listener);
+    };
+    MediaQueryList.prototype.removeListener = function(listener) {
+      if (typeof this.removeEventListener === 'function') this.removeEventListener('change', listener);
+    };
+    if (typeof window.MediaQueryList === 'undefined') window.MediaQueryList = MediaQueryList;
     window.matchMedia = function(query) {
-      var listeners = [];
-      var media = String(query || '');
-      var mql = {
-        matches: evaluateMediaQuery(media),
-        media: media,
-        onchange: null,
-        addListener: function(listener) {
-          if (typeof listener === 'function') listeners.push(listener);
-        },
-        removeListener: function(listener) {
-          listeners = listeners.filter(function(item) { return item !== listener; });
-        },
-        addEventListener: function(type, listener) {
-          if (type === 'change' && typeof listener === 'function') listeners.push(listener);
-        },
-        removeEventListener: function(type, listener) {
-          if (type !== 'change') return;
-          listeners = listeners.filter(function(item) { return item !== listener; });
-        },
-        dispatchEvent: function(event) {
-          if (!event || event.type !== 'change') return true;
-          for (var i = 0; i < listeners.length; i++) {
-            try { listeners[i].call(this, event); } catch (e) {}
-          }
-          if (typeof this.onchange === 'function') {
-            try { this.onchange.call(this, event); } catch (e) {}
-          }
-          return true;
-        }
-      };
-      return mql;
+      return new MediaQueryList(String(query || ''));
     };
   }
 })();
@@ -449,37 +437,55 @@ public enum JeffJSPolyfills {
   }
 
   if (typeof AbortController === 'undefined') {
+    // AbortSignal is an EventTarget: listeners go through the engine's
+    // EventTarget (once/signal/handleEvent/dedupe), `onabort` is its event
+    // handler attribute, and `abort` fires a real Event.
+    var __ET = (typeof EventTarget === 'function') ? EventTarget : function() {};
+    var __AEv = (typeof Event === 'function') ? Event : null;
+    var __abortReason = function(reason) {
+      if (reason !== undefined) return reason;
+      if (typeof DOMException === 'function') return new DOMException('signal is aborted without reason', 'AbortError');
+      return window.__makeAbortError();
+    };
     function NativeAbortSignal() {
+      __ET.call(this);
       this.aborted = false;
       this.reason = undefined;
-      this._listeners = [];
+      this.onabort = null;
     }
-    NativeAbortSignal.prototype.addEventListener = function(type, listener) {
-      if (type !== 'abort' || typeof listener !== 'function') return;
-      this._listeners.push(listener);
-    };
-    NativeAbortSignal.prototype.removeEventListener = function(type, listener) {
-      if (type !== 'abort' || typeof listener !== 'function') return;
-      this._listeners = this._listeners.filter(function(item) { return item !== listener; });
+    NativeAbortSignal.prototype = Object.create(__ET.prototype);
+    Object.defineProperty(NativeAbortSignal.prototype, 'constructor', { value: NativeAbortSignal, writable: true, configurable: true });
+    NativeAbortSignal.prototype.throwIfAborted = function() {
+      if (this.aborted) throw this.reason;
     };
     NativeAbortSignal.prototype._dispatchAbort = function() {
-      var event = { type: 'abort', target: this };
-      for (var i = 0; i < this._listeners.length; i++) {
-        try { this._listeners[i].call(this, event); } catch (e) {}
-      }
-      if (typeof this.onabort === 'function') {
-        try { this.onabort.call(this, event); } catch (e) {}
-      }
+      if (typeof this.dispatchEvent === 'function') this.dispatchEvent(__AEv ? new __AEv('abort') : { type: 'abort' });
+    };
+    NativeAbortSignal.prototype._abort = function(reason) {
+      if (this.aborted) return;
+      this.aborted = true;
+      this.reason = __abortReason(reason);
+      this._dispatchAbort();
+    };
+    NativeAbortSignal.abort = function(reason) {
+      var s = new NativeAbortSignal();
+      s.aborted = true;
+      s.reason = __abortReason(reason);
+      return s;
+    };
+    NativeAbortSignal.timeout = function(ms) {
+      var s = new NativeAbortSignal();
+      setTimeout(function() {
+        s._abort(typeof DOMException === 'function' ? new DOMException('signal timed out', 'TimeoutError') : undefined);
+      }, Number(ms) || 0);
+      return s;
     };
 
     function NativeAbortController() {
       this.signal = new NativeAbortSignal();
     }
     NativeAbortController.prototype.abort = function(reason) {
-      if (this.signal.aborted) return;
-      this.signal.aborted = true;
-      this.signal.reason = reason;
-      this.signal._dispatchAbort();
+      this.signal._abort(reason);
     };
 
     window.AbortController = NativeAbortController;
@@ -746,7 +752,19 @@ public enum JeffJSPolyfills {
     //   'blob'        -> response = Blob over payload.bodyBytes
     //   'json'        -> response = JSON.parse(text) (null when invalid)
     //   'document'    -> response = decoded text (the host app parses it)
+    // XMLHttpRequest is an EventTarget: every progress/state event is a real
+    // Event dispatched through it, so addEventListener('load', ...) and the
+    // on* handler attributes both see it.
+    var __XET = (typeof EventTarget === 'function') ? EventTarget : function() {};
+    var __XEv = (typeof Event === 'function') ? Event : null;
+    var __xhrFire = function(xhr, type, init) {
+      if (typeof xhr.dispatchEvent !== 'function') return;
+      var ev = __XEv ? new __XEv(type) : { type: type };
+      if (init) { for (var k in init) { if (init.hasOwnProperty(k)) ev[k] = init[k]; } }
+      xhr.dispatchEvent(ev);
+    };
     function XHR() {
+      __XET.call(this);
       this.readyState = 0;
       this.status = 0;
       this.statusText = '';
@@ -761,6 +779,9 @@ public enum JeffJSPolyfills {
       this.onerror = null;
       this.onabort = null;
       this.onloadend = null;
+      this.onloadstart = null;
+      this.onprogress = null;
+      this.ontimeout = null;
       this._method = 'GET';
       this._url = '';
       this._headers = {};
@@ -769,11 +790,19 @@ public enum JeffJSPolyfills {
       this._aborted = false;
     }
 
+    XHR.prototype = Object.create(__XET.prototype);
+    Object.defineProperty(XHR.prototype, 'constructor', { value: XHR, writable: true, configurable: true });
+    XHR.UNSENT = XHR.prototype.UNSENT = 0;
+    XHR.OPENED = XHR.prototype.OPENED = 1;
+    XHR.HEADERS_RECEIVED = XHR.prototype.HEADERS_RECEIVED = 2;
+    XHR.LOADING = XHR.prototype.LOADING = 3;
+    XHR.DONE = XHR.prototype.DONE = 4;
+
     XHR.prototype.open = function(method, url) {
       this._method = String(method || 'GET');
       this._url = String(url || '');
       this.readyState = 1;
-      if (this.onreadystatechange) this.onreadystatechange();
+      __xhrFire(this, 'readystatechange');
     };
 
     XHR.prototype.setRequestHeader = function(name, value) {
@@ -799,9 +828,9 @@ public enum JeffJSPolyfills {
       this._aborted = true;
       if (this._rid) __nativeFetch.cancelFetch(this._rid);
       this.readyState = 4;
-      if (this.onreadystatechange) this.onreadystatechange();
-      if (this.onabort) this.onabort();
-      if (this.onloadend) this.onloadend();
+      __xhrFire(this, 'readystatechange');
+      __xhrFire(this, 'abort');
+      __xhrFire(this, 'loadend');
     };
 
     XHR.prototype.send = function(body) {
@@ -818,13 +847,9 @@ public enum JeffJSPolyfills {
         if (self._aborted) return;
         if (err) {
           self.readyState = 4;
-          if (self.onreadystatechange) self.onreadystatechange();
-          if (String(errName || '') === 'AbortError') {
-            if (self.onabort) self.onabort();
-          } else if (self.onerror) {
-            self.onerror(new Error(String(err)));
-          }
-          if (self.onloadend) self.onloadend();
+          __xhrFire(self, 'readystatechange');
+          __xhrFire(self, String(errName || '') === 'AbortError' ? 'abort' : 'error', { message: String(err) });
+          __xhrFire(self, 'loadend');
           return;
         }
         var p = payload;
@@ -854,9 +879,10 @@ public enum JeffJSPolyfills {
         }
 
         self.readyState = 4;
-        if (self.onreadystatechange) self.onreadystatechange();
-        if (self.onload) self.onload();
-        if (self.onloadend) self.onloadend();
+        var size = text.length;
+        __xhrFire(self, 'readystatechange');
+        __xhrFire(self, 'load', { lengthComputable: true, loaded: size, total: size });
+        __xhrFire(self, 'loadend', { lengthComputable: true, loaded: size, total: size });
       });
     };
 

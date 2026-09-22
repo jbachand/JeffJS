@@ -426,31 +426,32 @@ final class JeffJSWebAPIsBridge {
         let mc = ctx.eval(input: #"""
             (function(){
                 if (typeof MessageChannel !== 'undefined') return;
+                // MessagePort is an EventTarget: 'message' events go through
+                // the engine's EventTarget (addEventListener + onmessage).
+                // The engine's Event, captured now: a host polyfill may replace
+                // window.Event later, and delivery must not depend on it.
+                var ET = (typeof EventTarget === 'function') ? EventTarget : function(){};
+                var Ev = (typeof Event === 'function') ? Event : null;
                 var P = function(){
+                    ET.call(this);
                     this.onmessage = null;
-                    this._listeners = [];
+                    this.onmessageerror = null;
                     this._counterpart = null;
                     this._started = false;
                     this._closed = false;
                 };
+                P.prototype = Object.create(ET.prototype);
+                Object.defineProperty(P.prototype, 'constructor', { value: P, writable: true, configurable: true });
                 P.prototype.start = function(){ this._started = true; };
                 P.prototype.close = function(){ this._closed = true; };
-                P.prototype.addEventListener = function(type, listener){
-                    if (type === 'message' && typeof listener === 'function') this._listeners.push(listener);
-                };
-                P.prototype.removeEventListener = function(type, listener){
-                    if (type === 'message') this._listeners = this._listeners.filter(function(l){ return l !== listener; });
-                };
                 P.prototype.postMessage = function(message){
                     if (this._closed || !this._counterpart || this._counterpart._closed) return;
                     var target = this._counterpart, data = message;
                     setTimeout(function(){
-                        if (target._closed) return;
-                        var evt = {type:'message',data:data,target:target,currentTarget:target,
-                                   origin:'',source:null,ports:[],
-                                   preventDefault:function(){},stopPropagation:function(){}};
-                        if (typeof target.onmessage === 'function') try{target.onmessage(evt);}catch(e){}
-                        for(var i=0;i<target._listeners.length;i++) try{target._listeners[i](evt);}catch(e){}
+                        if (target._closed || typeof target.dispatchEvent !== 'function') return;
+                        var evt = Ev ? new Ev('message') : { type: 'message' };
+                        evt.data = data; evt.origin = ''; evt.lastEventId = ''; evt.source = null; evt.ports = [];
+                        target.dispatchEvent(evt);
                     }, 0);
                 };
                 var C = function(){
