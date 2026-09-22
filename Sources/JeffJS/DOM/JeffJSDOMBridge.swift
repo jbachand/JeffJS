@@ -66,9 +66,10 @@ final class JeffJSDOMBridge {
     /// browser behavior where methods are on HTMLElement.prototype, not per-element.
     private var elementPrototype: JeffJSValue?
 
-    /// Reference to the centralized event bridge. All addEventListener/removeEventListener/
-    /// dispatchEvent calls on elements and document are routed through this bridge,
-    /// which provides proper capture/at-target/bubble phase dispatch.
+    /// The engine's EventTarget implementation. `document` and the element
+    /// prototype chain to its `EventTarget.prototype`, so window, document and
+    /// every node share one addEventListener/removeEventListener/dispatchEvent
+    /// and one capture/at-target/bubble dispatch. Set before `register(on:)`.
     weak var eventBridge: JeffJSEventBridge?
 
     // MARK: - Layout Geometry State
@@ -320,7 +321,10 @@ final class JeffJSDOMBridge {
     // MARK: - Document Object
 
     private func buildDocumentObject(ctx: JeffJSContext) -> JeffJSValue {
-        let doc = ctx.newObject()
+        // Document is an EventTarget: chain to EventTarget.prototype so it
+        // shares addEventListener/removeEventListener/dispatchEvent with window
+        // and every element.
+        let doc = eventBridge?.eventTargetPrototype.map { ctx.newObjectProto(proto: $0) } ?? ctx.newObject()
 
         // -- nodeType = 9 (DOCUMENT_NODE) --
         ctx.setPropertyStr(obj: doc, name: "nodeType", value: .newInt32(9))
@@ -466,21 +470,8 @@ final class JeffJSDOMBridge {
             return self.wrapElement(node, ctx: ctx)
         }, length: 1)
 
-        // addEventListener(type, handler, options?) on document — routes through centralized event bridge
-        ctx.setPropertyFunc(obj: doc, name: "addEventListener", fn: { [weak self] ctx, thisVal, args in
-            guard let self, args.count >= 2 else { return JeffJSValue.undefined }
-            let options = args.count >= 3 ? args[2] : JeffJSValue.undefined
-            self.eventBridge?.addEventListener(ctx: ctx, target: thisVal, type: args[0], listener: args[1], options: options)
-            return JeffJSValue.undefined
-        }, length: 2)
-
-        // removeEventListener(type, handler) on document — routes through centralized event bridge
-        ctx.setPropertyFunc(obj: doc, name: "removeEventListener", fn: { [weak self] ctx, thisVal, args in
-            guard let self, args.count >= 2 else { return JeffJSValue.undefined }
-            let options = args.count >= 3 ? args[2] : JeffJSValue.undefined
-            self.eventBridge?.removeEventListener(ctx: ctx, target: thisVal, type: args[0], listener: args[1], options: options)
-            return JeffJSValue.undefined
-        }, length: 2)
+        // addEventListener / removeEventListener / dispatchEvent are inherited
+        // from EventTarget.prototype (see buildDocumentObject).
 
         // contains(node) -> bool (jQuery.contains and focus-trap libraries call it)
         ctx.setPropertyFunc(obj: doc, name: "contains", fn: { [weak self] ctx, _, args in
@@ -959,7 +950,9 @@ final class JeffJSDOMBridge {
     /// live here — they're inherited by element instances via the prototype chain.
     /// Methods are non-enumerable (via setPropertyFunc), matching browser behavior.
     private func buildElementPrototype(ctx: JeffJSContext) -> JeffJSValue {
-        let proto = ctx.newObject()
+        // Nodes are EventTargets: the element prototype chains to
+        // EventTarget.prototype for addEventListener/removeEventListener/dispatchEvent.
+        let proto = eventBridge?.eventTargetPrototype.map { ctx.newObjectProto(proto: $0) } ?? ctx.newObject()
 
         // Register all methods on the prototype
         registerElementMethods(on: proto, ctx: ctx)
@@ -1303,30 +1296,8 @@ final class JeffJSDOMBridge {
             return self.wrapElementArray(nodes, ctx: ctx)
         }, length: 1)
 
-        // addEventListener(type, handler, options?) — routes through centralized event bridge
-        // for proper capture/bubble phase support (required by React 18's event delegation)
-        ctx.setPropertyFunc(obj: el, name: "addEventListener", fn: { [weak self] ctx, thisVal, args in
-            guard let self, args.count >= 2 else { return JeffJSValue.undefined }
-            let options = args.count >= 3 ? args[2] : JeffJSValue.undefined
-            self.eventBridge?.addEventListener(ctx: ctx, target: thisVal, type: args[0], listener: args[1], options: options)
-            return JeffJSValue.undefined
-        }, length: 2)
-
-        // removeEventListener(type, handler) — routes through centralized event bridge
-        ctx.setPropertyFunc(obj: el, name: "removeEventListener", fn: { [weak self] ctx, thisVal, args in
-            guard let self, args.count >= 2 else { return JeffJSValue.undefined }
-            let options = args.count >= 3 ? args[2] : JeffJSValue.undefined
-            self.eventBridge?.removeEventListener(ctx: ctx, target: thisVal, type: args[0], listener: args[1], options: options)
-            return JeffJSValue.undefined
-        }, length: 2)
-
-        // dispatchEvent(event) — routes through centralized event bridge
-        // for proper capture/at-target/bubble phase dispatch with full bubble path traversal
-        ctx.setPropertyFunc(obj: el, name: "dispatchEvent", fn: { [weak self] ctx, thisVal, args in
-            guard let self, !args.isEmpty else { return .newBool(true) }
-            let result = self.eventBridge?.dispatchEvent(ctx: ctx, target: thisVal, event: args[0]) ?? true
-            return .newBool(result)
-        }, length: 1)
+        // addEventListener / removeEventListener / dispatchEvent are inherited
+        // from EventTarget.prototype (see buildElementPrototype).
 
         // matches(selector) -> bool
         ctx.setPropertyFunc(obj: el, name: "matches", fn: { [weak self] ctx, thisVal, args in

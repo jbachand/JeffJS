@@ -764,11 +764,6 @@ public final class JeffJSEnvironment {
         };
         window.requestAnimationFrame = function(cb) { return setTimeout(cb, 16); };
         window.cancelAnimationFrame = function(id) { clearTimeout(id); };
-        window.addEventListener = function() {};
-        window.removeEventListener = function() {};
-        window.dispatchEvent = function() { return true; };
-        window.Event = function(type) { this.type = type; };
-        window.CustomEvent = function(type, opts) { this.type = type; this.detail = (opts && opts.detail) || null; };
         window.MutationObserver = function() { this.observe = function(){}; this.disconnect = function(){}; };
         window.ResizeObserver = function() { this.observe = function(){}; this.disconnect = function(){}; };
         window.IntersectionObserver = function() { this.observe = function(){}; this.disconnect = function(){}; };
