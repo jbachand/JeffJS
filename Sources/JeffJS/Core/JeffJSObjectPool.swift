@@ -27,7 +27,10 @@ func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
         // Off the GC list while parked: a pooled object is dead, and leaving
         // it listed would make the collector walk (and try to rescue) it.
         removeGCObject(rt, o)
-        if !rt.gcWeakRefMap.isEmpty { weakrefFree(rt, o) }
+        // `isPoolable` already required `firstWeakRef == nil`, and that is now
+        // set for every object with a weakref cell, so a pooled object never
+        // has one. Kept as a field test rather than a dictionary probe.
+        if o.firstWeakRef != nil { weakrefFree(rt, o) }
         // Release the slots. Nested zero transitions are deferred while
         // inFreeChain is set and drained below, as freeGCObjectAtZeroRefcount
         // does, so deep object chains cannot recurse.

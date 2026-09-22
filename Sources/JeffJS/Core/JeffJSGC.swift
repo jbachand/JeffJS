@@ -932,21 +932,52 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     // Capture and clear payload/properties FIRST, then free values.
     // This prevents re-entrant access to obj during cascading frees.
     let savedValues = obj.propValues          // moved out: freed below
-    let savedExtra = obj.propExtra
-    let savedPayload = obj.payload
+    // A plain object has no payload edges — `markObject` returns on the same
+    // compare before it reads either `_fastArrayValues` or `payload`, and this
+    // is the other half of that rule. Reading the enum into a local and writing
+    // `.opaque(nil)` back costs a retain *and* a release of whatever class the
+    // case carries, plus the `didSet` re-matching it, on **every object freed**;
+    // the sampler put `JeffJSObjectPayload` copy/destroy second only to
+    // `swift_release` on a tree-teardown profile. Nothing cascades from a plain
+    // object's payload, so there is nothing to clear for re-entrancy either,
+    // and `JeffJSObject.deinit` releases it a moment later regardless.
+    let plain = obj.classID == jeffJS_plainObjectClassID && obj._fastArrayValues == nil
+    let savedPayload: JeffJSObjectPayload
+    if plain {
+        savedPayload = .opaque(nil)
+    } else {
+        savedPayload = obj.payload
+        obj.payload = .opaque(nil)
+        obj.fbFast = nil
+        if !obj.varRefsFast.isEmpty { obj.varRefsFast = [] }
+    }
+    // Same shape of saving: `propExtra` is lazily allocated and empty for the
+    // overwhelming majority of objects, and both the copy and the `= []` store
+    // (which fires the `propExtraCount` observer) are pure overhead then.
+    let extraCount = obj.propExtraCount
+    let savedExtra: ContiguousArray<JeffJSPropertyExtra?>
+    if extraCount == 0 {
+        savedExtra = []
+    } else {
+        savedExtra = obj.propExtra
+        obj.propExtra = []
+    }
     obj.propValues = JeffJSPropStorage()
-    obj.propExtra = []
-    obj.payload = .opaque(nil)
-    obj.fbFast = nil
-    obj.varRefsFast = []
     let savedArrowThis = obj.arrowThisVal    // owned by the closure; released below
-    obj.arrowThisVal = nil
+    if savedArrowThis != nil { obj.arrowThisVal = nil }
 
     // Release each property value. Data values are manually refcounted;
     // an accessor's getter/setter are too (`defineProperty` dups them, and
     // `markObject` marks them as counted edges) even though the slot stores
     // them as ARC references; a varRef slot and autoInit refs are ARC-only.
-    for i in 0..<savedValues.count {
+    if extraCount == 0 {
+        // Every slot is a plain data value: one tight loop, no per-slot
+        // `savedExtra.count` reload out of the ContiguousArray buffer.
+        var i = 0
+        let n = savedValues.count
+        while i < n { freeValue(rt, savedValues[i]); i += 1 }
+    } else {
+      for i in 0..<savedValues.count {
         // propExtra is lazily allocated: empty means every slot is plain data.
         if i < savedExtra.count, let e = savedExtra[i] {
             switch e.kind {
@@ -977,6 +1008,7 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
         } else {
             freeValue(rt, savedValues[i])
         }
+      }
     }
     savedArrowThis?.freeValue()
     savedValues.deallocateStorage()
@@ -1032,8 +1064,14 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
         }
     }
 
-    // Invalidate any weak references pointing at this object.
-    if !rt.gcWeakRefMap.isEmpty { weakrefFree(rt, obj) }
+    // Invalidate any weak reference pointing at this object. `firstWeakRef` is
+    // set by `weakrefNew` and is the only way an object gets into
+    // `gcWeakRefMap`, so the field test answers exactly what the dictionary
+    // probe did — without hashing an ObjectIdentifier on every object freed.
+    // One live `WeakMap` entry used to put that probe on the whole heap's
+    // teardown path (a 40 x 20 000 plain-object allocate-and-drop loop was 21%
+    // slower with one WeakRef in the runtime than without).
+    if obj.firstWeakRef != nil { weakrefFree(rt, obj) }
 }
 
 /// Free a Shape: remove from the runtime hash table if necessary, release the
@@ -1086,6 +1124,11 @@ func weakrefNew(_ rt: JeffJSRuntime, _ target: JeffJSObject) -> JeffJSWeakRef {
     }
     let ref = JeffJSWeakRef(target: target)
     rt.gcWeakRefMap[key] = ref
+    // The marker `freeObject` and the recycle pool test instead of probing the
+    // map. It is never cleared while the object lives, which also keeps a
+    // weak-referenced object out of the recycle pool (`isPoolable`) — where it
+    // has no business being anyway.
+    target.firstWeakRef = ref
     return ref
 }
 
