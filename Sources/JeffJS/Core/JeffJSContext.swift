@@ -4037,7 +4037,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 }
                 _ = arrObj // suppress warning
             }
-            return self.callFunction(target, thisVal: thisArg, args: callArgs)
+            // getPropertyByIndex returned owned values; the call borrows them.
+            let result = self.callFunction(target, thisVal: thisArg, args: callArgs)
+            for a in callArgs { a.freeValue() }
+            return result
         }, name: "apply", length: 3)
         _ = setPropertyStr(obj: reflectObj, name: "apply", value: reflApply)
 
