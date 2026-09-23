@@ -1134,3 +1134,37 @@ bench/realworld.js geomean 0.9839x of a same-worktree base at dcb4eab (best of
 nine, 38 kernels), and the three kernels Round 11 flagged, re-measured on their
 own with best of fifteen: `vdom-build-diff` 1.032x, `closure-creation` 0.964x,
 `tree-walk` 0.935x.
+
+### A dead prototype outlived by its cached shape
+
+`JEFFJS_ZOMBIES=1` on the threes fixture reported 13 touches on freed values,
+all while Google's tag script ran and all the same path: `gcFreeCycles ->
+freeShape -> jeffJS_shapeSetProto` released a prototype that an *earlier*
+collection had already freed. The prototypes were Closure-style classes
+(`B.prototype = Object.create(A.prototype)`), built inside a function and
+dropped.
+
+A shape owns one counted reference to its prototype (Round 12), and a hashed
+shape stays cached at zero owners. When a collection frees a prototype, every
+shape naming it is unreachable too, but only "sweepable" shapes (hashed, zero
+owners, table past `shapes.evictThreshold`) joined the dead set. A shape was
+left behind in two cases: an instance was still on it when the dead set was
+chosen (prototype and instance in one cycle), or the table was below the
+threshold. That shape kept pointing at the freed prototype, and the sweep in a
+later collection released it again. Outside zombie mode the second release
+does nothing, because the freed header's `refCount` is -1, but the shape's ARC
+reference still keeps the dead prototype allocated until the shape goes, and
+the zombie report hid the real touches in noise. quickjs never gets into this
+state, because `js_free_shape` frees a shape when its last owner dies.
+
+The fix: a dead shape whose prototype is in the dead set joins it
+(`jeffJS_shapeLosesProto`, in both the CPU and Metal collectors), and
+`gcFreeDeadObjects` frees shapes after every other member, so the dying
+instances bring the shape to zero owners first. A dead shape whose prototype
+survives is still left to the eviction threshold, so a live class whose
+instances die in cycles keeps its cached shapes. `FreedValueTouches` has three
+new cases, each with a collection after every step. Zombie touches: threes
+13 -> 0, hn and wiki 0 -> 0, apple 0 after the fix. (The base-build apple run
+failed twice to compile because another agent was editing app files.) bench/realworld.js geomean 0.995x
+(best of seven, worst kernel `tree-walk` 1.022x, which is inside the noise
+floor above).

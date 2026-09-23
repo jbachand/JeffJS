@@ -114,5 +114,114 @@ extension JeffJSTestRunner {
             """)
 
         _ = rt
+        testDeadPrototypeShapes()
+    }
+
+    /// Run `steps` in order (each must evaluate to true) with a full collection
+    /// after every one, zombie mode on and the pool off throughout: a value the
+    /// collector frees in one run and something releases in a later run is only
+    /// visible if the freed object stays allocated and flagged across both.
+    private mutating func evalStepsNoFreedTouches(_ rt: JeffJSRuntime, _ ctx: JeffJSContext,
+                                                  _ label: String, _ steps: [String]) {
+        let savedZombies = jeffJSZombiesEnabled
+        let savedDebug = jeffJS_refDebugMode
+        let savedNoPool = jeffJSObjectPoolDisabled
+        jeffJSZombiesEnabled = true
+        jeffJS_refDebugMode = true
+        jeffJSObjectPoolDisabled = true
+        let before = JeffJSZombieDebug.touches
+        for code in steps {
+            evalCheckBool(ctx, code, expect: true)
+            rt.runGC()
+        }
+        let touched = JeffJSZombieDebug.touches - before
+        jeffJSZombiesEnabled = savedZombies
+        jeffJS_refDebugMode = savedDebug
+        jeffJSObjectPoolDisabled = savedNoPool
+        assert(touched == 0, "\(label): \(touched) touch(es) on freed values")
+    }
+
+    /// A shape owns one counted reference to its prototype. When the collector
+    /// frees a prototype, every shape that names it is unreachable too — but a
+    /// hashed shape is kept cached at zero owners, so it outlived the group and
+    /// the shape sweep of a *later* collection released the freed prototype
+    /// again (`gcFreeCycles -> freeShape -> jeffJS_shapeSetProto`; Google's tag
+    /// script, 13 touches on /tmp/fixtures/threes). Each case gets a fresh
+    /// runtime so the hashed-shape count, which gates the sweep, is known.
+    private mutating func testDeadPrototypeShapes() {
+        // 600 distinct live transition shapes: past `shapes.evictThreshold`
+        // (512), so the collection that follows sweeps zero-owner shapes.
+        let fillTable = """
+            var keep = [];
+            for (var i = 0; i < 600; i++) { var q = {}; q["k" + i] = i; keep.push(q); }
+            keep.length === 600
+            """
+
+        // The prototype and an instance in one cycle: the instance's shape
+        // still had an owner when the dead set was chosen, so it was not
+        // sweepable; freeing the instance left it cached on a freed prototype.
+        do {
+            let rt = JeffJSRuntime()
+            let ctx = rt.newContext()
+            evalStepsNoFreedTouches(rt, ctx, "prototype and instance in one cycle", [
+                fillTable,
+                """
+                function mk(i) { var P = { m: i }; var o = Object.create(P); o.p = P; P.o = o; return o.m; }
+                var s = 0; for (var i = 0; i < 20; i++) s += mk(i);
+                s === 190
+                """,
+                "keep.length === 600",
+                "var o2 = Object.create({ m: 3 }); o2.p = 1; o2.m + o2.p === 4",
+            ])
+        }
+
+        // No owners left, but the first collection runs below the sweep
+        // threshold, so the shape stays cached; the table then grows past it
+        // and the next collection sweeps the shape and its freed prototype.
+        do {
+            let rt = JeffJSRuntime()
+            let ctx = rt.newContext()
+            // Installing the intrinsics leaves hundreds of zero-owner
+            // intermediate transition shapes; one collection sweeps them.
+            rt.runGC()
+            assert(rt.shapeHashCount + 100 < JeffJSConfig.shapesEvictThreshold,
+                   "dead prototype, sweep later: \(rt.shapeHashCount) hashed shapes after a collection")
+            evalStepsNoFreedTouches(rt, ctx, "dead prototype, shape swept by a later collection", [
+                """
+                function mk(i) { var P = { m: i }; P.self = P; var o = Object.create(P); return o.m; }
+                var s = 0; for (var i = 0; i < 20; i++) s += mk(i);
+                s === 190
+                """,
+                fillTable,
+                "keep[599].k599 === 599",
+            ])
+        }
+
+        // What the tag script does: Closure-style classes built inside a
+        // function that returns. B.prototype sits on a shape whose prototype
+        // is A.prototype, and both constructor <-> prototype pairs are cycles.
+        do {
+            let rt = JeffJSRuntime()
+            let ctx = rt.newContext()
+            evalStepsNoFreedTouches(rt, ctx, "Closure-style class hierarchy dropped", [
+                """
+                function build(n) {
+                    function A() { this.a = n; }
+                    A.prototype.f = function () { return this.a; };
+                    function B() { A.call(this); this.b = 2; }
+                    B.prototype = Object.create(A.prototype);
+                    B.prototype.constructor = B;
+                    B.prototype.isSupported = function () { return true; };
+                    var x = new B();
+                    return x.f() + x.b + (x.isSupported() ? 1 : 0);
+                }
+                var t = 0; for (var i = 0; i < 20; i++) t += build(i);
+                t === 250
+                """,
+                fillTable,
+                "var t2 = 0; for (var i = 0; i < 20; i++) t2 += build(i); t2 === 250",
+                "keep.length === 600 && build(7) === 10",
+            ])
+        }
     }
 }
