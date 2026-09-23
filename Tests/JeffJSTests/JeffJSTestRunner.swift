@@ -311,6 +311,7 @@ struct JeffJSTestRunner {
             ("ParameterScope", { $0.testParameterScope() }),
             ("GeneratorInstantiation", { $0.testGeneratorInstantiation() }),
             ("ArrayIntegrity", { $0.testArrayIntegrity() }),
+            ("DirectEval", { $0.testDirectEval() }),
         ]
     }
 

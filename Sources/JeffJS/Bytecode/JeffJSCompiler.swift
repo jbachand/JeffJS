@@ -39,6 +39,45 @@ struct JeffJSClosureVar {
     var varIdx: Int = 0              // index in parent (local/arg) or var_ref
 }
 
+/// One binding visible at a direct `eval` call site, innermost first
+/// (ES §19.2.1.1 PerformEval with direct = true: the eval code runs in the
+/// caller's LexicalEnvironment/VariableEnvironment). The calling function
+/// records one list per call site; the eval code, compiled at run time with
+/// no parent function definition, resolves its free names against it and
+/// binds the ones it uses as ordinary closure variables of the caller's frame.
+struct JeffJSEvalItem {
+    var name: JSAtom = 0
+    /// true: `idx` is a local (or, with `isArg`, an argument) slot of the
+    /// calling function; false: `idx` is one of the caller's closure vars.
+    var isLocal: Bool = false
+    var isArg: Bool = false
+    var idx: Int = 0
+    var isConst: Bool = false
+    var isLexical: Bool = false
+    var varKind: Int = JSVarKindEnum.JS_VAR_NORMAL.rawValue
+    /// The binding holds an object environment: a `with` object or the
+    /// variable object of a sloppy function that contains a direct eval.
+    /// A name that reaches it is looked up on the object first.
+    var isDynamic: Bool = false
+    /// Where the binding sits relative to the call site's var environment
+    /// (EvalDeclarationInstantiation step 3): 0 = a declarative binding
+    /// between the call site and the var environment (an eval `var` of the
+    /// same name is a SyntaxError), 1 = a binding of the var environment
+    /// itself (an eval `var` reuses it), 2 = outside the var environment.
+    var region: UInt8 = 2
+}
+
+/// Everything the eval code needs to know about one direct `eval` call site.
+final class JeffJSEvalSite {
+    var items: [JeffJSEvalItem] = []
+    /// Name of the hidden local (see JeffJSFunctionDefCompiler.varObjIdx)
+    /// holding the object that receives the sloppy eval code's `var` and
+    /// function declarations; 0 when the var environment is the global one.
+    var varEnvName: JSAtom = 0
+    /// The caller is strict, so the eval code is too.
+    var isStrict: Bool = false
+}
+
 /// Label slot used during bytecode compilation.
 /// Mirrors `LabelSlot` in QuickJS.
 struct JeffJSLabelSlot {
@@ -98,6 +137,26 @@ class JeffJSFunctionDefCompiler {
     /// identifiers resolve normally (`with` bindings are not visible to
     /// closures, a known divergence from QuickJS).
     var withVarStack: [JSAtom] = []
+
+    // -- Direct eval (ES §19.2.1.1) --
+    /// Local slot of this sloppy function's variable object: a direct eval
+    /// in its body declares its `var`s and functions there (they cannot be
+    /// locals: the eval code is compiled at run time). -1 when none.
+    var varObjIdx: Int = -1
+    /// Same for a direct eval in the formal parameters (ES §10.2.11 step 20:
+    /// its declarations go to an environment outside the parameters).
+    var argVarObjIdx: Int = -1
+    /// Set on the root definition of direct-eval code: the bindings of the
+    /// calling function at the call site.
+    var evalSite: JeffJSEvalSite? = nil
+    /// Call sites of the direct evals in this function, indexed by the
+    /// `eval` opcode's site operand (built by resolveVariables).
+    var evalSites: [JeffJSEvalSite] = []
+    /// evalSite item index -> this (root) function's closure var index.
+    var evalItemClosureIdx: [Int: Int] = [:]
+    /// Top-level function declarations of sloppy direct-eval code (checked
+    /// against the caller's lexical bindings, EvalDeclarationInstantiation).
+    var evalFuncDeclNames: [JSAtom] = []
 
     // -- Parent linkage --
     weak var parent: JeffJSFunctionDefCompiler?
@@ -463,6 +522,35 @@ struct JeffJSCompiler {
     @discardableResult
     static func resolveVariables(ctx: JeffJSContext,
                                  fd: JeffJSFunctionDefCompiler) -> Bool {
+        // Direct eval: create the variable object(s) at function entry
+        // (QuickJS OP_special_object VAR_OBJECT into `<var>`).
+        var varObjBytes: [UInt8] = []
+        for idx in [fd.varObjIdx, fd.argVarObjIdx] where idx >= 0 {
+            varObjBytes += opcodeBytes(.special_object) + [SpecialObjectType.varObject.rawValue]
+            varObjBytes += opcodeBytes(.put_loc) + [UInt8(idx & 0xFF), UInt8((idx >> 8) & 0xFF)]
+        }
+        if !varObjBytes.isEmpty {
+            let n = varObjBytes.count
+            fd.byteCode.buf.insert(contentsOf: varObjBytes, at: 0)
+            fd.byteCode.len += n
+            fd.bodyBytecodeStart += n
+            fd.hoistedFuncDeclRanges = fd.hoistedFuncDeclRanges.map { ($0.0 + n, $0.1 + n) }
+        }
+        // Does any name lookup here pass an object environment (a variable
+        // object of this or an enclosing function, or the scope chain of a
+        // direct-eval caller)? Only then are scope accesses resolved with
+        // the dynamic checks; everything else compiles exactly as before.
+        let dynChain: Bool = {
+            var f: JeffJSFunctionDefCompiler? = fd
+            var last = fd
+            while let x = f {
+                if x.varObjIdx >= 0 || x.argVarObjIdx >= 0 { return true }
+                last = x
+                f = x.parent
+            }
+            return last.evalSite != nil
+        }()
+
         // TDZ: scope 0 (function body scope) has no enter_scope opcode,
         // so we must insert set_loc_uninitialized opcodes for lexical
         // variables in scope 0 at the beginning of the bytecode.
@@ -564,11 +652,19 @@ struct JeffJSCompiler {
             case .scope_get_var:
                 let atom = readU32(fd.byteCode.buf, operandBase)
                 let scopeLevel = Int(readU16(fd.byteCode.buf, operandBase + 4))
+                var dyn: [(JeffJSOpcode, Int)]? = dynChain ? [] : nil
                 let (resolvedOp, varIdx) = resolveScopeVar(
                     ctx: ctx, fd: fd, name: atom,
                     scopeLevel: scopeLevel,
-                    opType: ScopeAccessType.get.rawValue
+                    opType: ScopeAccessType.get.rawValue,
+                    dyn: &dyn
                 )
+                if let d = dyn, !d.isEmpty {
+                    pos = emitDynamicScopeAccess(fd: fd, pos: pos, origSize: instrSize, atom: atom,
+                                                 dyn: d, finalOp: resolvedOp, finalIdx: varIdx,
+                                                 accessType: .get)
+                    continue
+                }
                 rewriteScopeAccess(fd: fd, pos: pos, origSize: instrSize,
                                    newOp: resolvedOp, varIdx: varIdx,
                                    atom: atom, accessType: .get)
@@ -585,11 +681,19 @@ struct JeffJSCompiler {
             case .scope_put_var:
                 let atom = readU32(fd.byteCode.buf, operandBase)
                 let scopeLevel = Int(readU16(fd.byteCode.buf, operandBase + 4))
+                var dyn: [(JeffJSOpcode, Int)]? = dynChain ? [] : nil
                 let (resolvedOp, varIdx) = resolveScopeVar(
                     ctx: ctx, fd: fd, name: atom,
                     scopeLevel: scopeLevel,
-                    opType: ScopeAccessType.put.rawValue
+                    opType: ScopeAccessType.put.rawValue,
+                    dyn: &dyn
                 )
+                if let d = dyn, !d.isEmpty {
+                    pos = emitDynamicScopeAccess(fd: fd, pos: pos, origSize: instrSize, atom: atom,
+                                                 dyn: d, finalOp: resolvedOp, finalIdx: varIdx,
+                                                 accessType: .put)
+                    continue
+                }
                 rewriteScopeAccess(fd: fd, pos: pos, origSize: instrSize,
                                    newOp: resolvedOp, varIdx: varIdx,
                                    atom: atom, accessType: .put)
@@ -615,11 +719,19 @@ struct JeffJSCompiler {
             case .scope_delete_var:
                 let atom = readU32(fd.byteCode.buf, operandBase)
                 let scopeLevel = Int(readU16(fd.byteCode.buf, operandBase + 4))
+                var dyn: [(JeffJSOpcode, Int)]? = dynChain ? [] : nil
                 let (resolvedOp, varIdx) = resolveScopeVar(
                     ctx: ctx, fd: fd, name: atom,
                     scopeLevel: scopeLevel,
-                    opType: ScopeAccessType.delete.rawValue
+                    opType: ScopeAccessType.delete.rawValue,
+                    dyn: &dyn
                 )
+                if let d = dyn, !d.isEmpty {
+                    pos = emitDynamicScopeAccess(fd: fd, pos: pos, origSize: instrSize, atom: atom,
+                                                 dyn: d, finalOp: resolvedOp, finalIdx: varIdx,
+                                                 accessType: .delete)
+                    continue
+                }
                 rewriteScopeAccess(fd: fd, pos: pos, origSize: instrSize,
                                    newOp: resolvedOp, varIdx: varIdx,
                                    atom: atom, accessType: .delete)
@@ -687,6 +799,20 @@ struct JeffJSCompiler {
                                           origSize: instrSize, name: atom,
                                           scopeLevel: scopeLevel,
                                           accessType: .inPrivate)
+
+            // -----------------------------------------------------------------
+            // eval(argc, scope) / apply_eval(scope): direct eval call site.
+            // Record the bindings visible at `scope` and replace the scope
+            // operand by the site index (the top bit, the `with` callee
+            // form of `eval`, is kept).
+            // -----------------------------------------------------------------
+            case .eval, .apply_eval:
+                let operandPos = operandBase + (op == .eval ? 2 : 0)
+                let raw = readU16(fd.byteCode.buf, operandPos)
+                let site = buildEvalSite(ctx: ctx, fd: fd, scope: Int(raw & 0x7FFF))
+                fd.evalSites.append(site)
+                writeU16(&fd.byteCode.buf, operandPos,
+                         UInt16(fd.evalSites.count - 1) | (raw & 0x8000))
 
             // -----------------------------------------------------------------
             // close_loc -- drop it when the variable cannot be captured.
@@ -834,10 +960,7 @@ struct JeffJSCompiler {
             pos += instrSize
         }
 
-        // Add eval-accessible variables if this function contains eval()
-        if fd.hasEval {
-            addEvalVariables(ctx: ctx, fd: fd)
-        }
+        // (A direct eval's bindings were captured per call site above.)
 
         return (!fd.resolveError)
     }
@@ -869,14 +992,40 @@ struct JeffJSCompiler {
                                 name: JSAtom,
                                 scopeLevel: Int,
                                 opType: Int) -> (opcode: JeffJSOpcode, varIdx: Int) {
+        var noDyn: [(JeffJSOpcode, Int)]? = nil
+        return resolveScopeVar(ctx: ctx, fd: fd, name: name, scopeLevel: scopeLevel,
+                               opType: opType, dyn: &noDyn)
+    }
+
+    /// As above. When `dyn` is non-nil it receives, in lookup order, the
+    /// object environments the name passes on its way to the resolved
+    /// binding: the variable objects of sloppy functions that contain a
+    /// direct eval (a `var` the eval code declared there shadows anything
+    /// further out) and, for direct-eval code, the caller's `with` objects.
+    /// Each entry is the load (get_loc / get_var_ref + index) of the object;
+    /// the caller emits a property check on each before the static access.
+    static func resolveScopeVar(ctx: JeffJSContext,
+                                fd: JeffJSFunctionDefCompiler,
+                                name: JSAtom,
+                                scopeLevel: Int,
+                                opType: Int,
+                                dyn: inout [(JeffJSOpcode, Int)]?) -> (opcode: JeffJSOpcode, varIdx: Int) {
         // Check for pseudo-variables first
         if let pseudoResult = resolvePseudoVar(ctx: ctx, fd: fd, name: name) {
             return pseudoResult
         }
+        let wantDyn = dyn != nil
 
         // Search local variables in the current function, respecting scope
         let localResult = findLocalVar(fd: fd, name: name, scopeLevel: scopeLevel)
         if let (localIdx, varDef) = localResult {
+            // A parameter seen from the body sits outside the body's var
+            // environment, so an eval-declared `var` of that name hides it.
+            if wantDyn {
+                for vo in varObjectsOutside(fd, localIdx: localIdx, varDef: varDef, from: scopeLevel) {
+                    dyn!.append((.get_loc, vo))
+                }
+            }
             let accessType = ScopeAccessType(rawValue: opType) ?? .get
             return resolvedLocalAccess(fd: fd, localIdx: localIdx,
                                        varDef: varDef, accessType: accessType)
@@ -885,9 +1034,18 @@ struct JeffJSCompiler {
         // Search arguments
         for i in 0 ..< fd.args.count {
             if fd.args[i].varName == name {
+                if wantDyn, fd.varObjIdx >= 0, fd.paramScope >= 0, scopeReachesBody(fd, scopeLevel) {
+                    dyn!.append((.get_loc, fd.varObjIdx))
+                }
                 let accessType = ScopeAccessType(rawValue: opType) ?? .get
                 return resolvedArgAccess(fd: fd, argIdx: i, accessType: accessType)
             }
+        }
+        if wantDyn {
+            if fd.varObjIdx >= 0 && scopeReachesBody(fd, scopeLevel) {
+                dyn!.append((.get_loc, fd.varObjIdx))
+            }
+            if fd.argVarObjIdx >= 0 { dyn!.append((.get_loc, fd.argVarObjIdx)) }
         }
 
         // Search parent functions (closure capture)
@@ -899,6 +1057,11 @@ struct JeffJSCompiler {
             // when multiple variables share the same name in different scopes.
             let parentScopeLevel = curFd.definedScopeLevel
             if let (i, varDef) = findLocalVar(fd: p, name: name, scopeLevel: parentScopeLevel) {
+                    if wantDyn {
+                        for vo in varObjectsOutside(p, localIdx: i, varDef: varDef, from: parentScopeLevel) {
+                            dyn!.append((.get_var_ref, varObjectClosureVar(ctx: ctx, s: fd, owner: p, idx: vo)))
+                        }
+                    }
                     p.vars[i].isCaptured = true
                     let closureIdx = getClosureVar(
                         ctx: ctx, s: fd, fd: p,
@@ -917,6 +1080,9 @@ struct JeffJSCompiler {
             // Search parent args
             for i in 0 ..< p.args.count {
                 if p.args[i].varName == name {
+                    if wantDyn, p.varObjIdx >= 0, p.paramScope >= 0, scopeReachesBody(p, parentScopeLevel) {
+                        dyn!.append((.get_var_ref, varObjectClosureVar(ctx: ctx, s: fd, owner: p, idx: p.varObjIdx)))
+                    }
                     p.args[i].isCaptured = true
                     let closureIdx = getClosureVar(
                         ctx: ctx, s: fd, fd: p,
@@ -932,13 +1098,336 @@ struct JeffJSCompiler {
                                                 accessType: accessType)
                 }
             }
+            if wantDyn {
+                if p.varObjIdx >= 0 && scopeReachesBody(p, parentScopeLevel) {
+                    dyn!.append((.get_var_ref, varObjectClosureVar(ctx: ctx, s: fd, owner: p, idx: p.varObjIdx)))
+                }
+                if p.argVarObjIdx >= 0 {
+                    dyn!.append((.get_var_ref, varObjectClosureVar(ctx: ctx, s: fd, owner: p, idx: p.argVarObjIdx)))
+                }
+            }
             curFd = p
             parentFd = p.parent
+        }
+
+        // Direct-eval code: continue into the calling function's scope chain
+        // as recorded at the call site.
+        if let site = curFd.evalSite {
+            for (i, item) in site.items.enumerated() {
+                if item.name == name {
+                    let closureIdx = evalItemClosureVar(ctx: ctx, s: fd, root: curFd, itemIndex: i)
+                    let accessType = ScopeAccessType(rawValue: opType) ?? .get
+                    return resolvedVarRefAccess(closureIdx: closureIdx,
+                                                isConst: item.isConst,
+                                                isLexical: item.isLexical,
+                                                accessType: accessType)
+                }
+                if wantDyn && item.isDynamic {
+                    dyn!.append((.get_var_ref, evalItemClosureVar(ctx: ctx, s: fd, root: curFd, itemIndex: i)))
+                }
+            }
         }
 
         // Not found in any local scope -- treat as global
         let accessType = ScopeAccessType(rawValue: opType) ?? .get
         return resolvedGlobalAccess(accessType: accessType)
+    }
+
+    // MARK: Direct eval support
+
+    /// True when scope `scope` of `fd` is inside the function body (its
+    /// chain reaches scope 0) rather than the separate parameter scope.
+    static func scopeReachesBody(_ fd: JeffJSFunctionDefCompiler, _ scope: Int) -> Bool {
+        if fd.paramScope < 0 { return true }
+        var sc = scope
+        while sc >= 0 && sc < fd.scopes.count {
+            if sc == 0 { return true }
+            sc = fd.scopes[sc].parent
+        }
+        return false
+    }
+
+    /// The variable objects of `p` that sit between a lookup from scope
+    /// `from` and p's local binding `localIdx`: a parameter (seen from the
+    /// body) is outside the body's var environment, and a named function
+    /// expression's own name is outside both (its funcEnv encloses them).
+    private static func varObjectsOutside(_ p: JeffJSFunctionDefCompiler, localIdx: Int,
+                                          varDef: JeffJSVarDef, from: Int) -> [Int] {
+        guard p.varObjIdx >= 0 || p.argVarObjIdx >= 0 else { return [] }
+        let fromBody = scopeReachesBody(p, from)
+        var out: [Int] = []
+        if localIdx == p.funcNameVarIdx {
+            if fromBody && p.varObjIdx >= 0 { out.append(p.varObjIdx) }
+            if p.argVarObjIdx >= 0 { out.append(p.argVarObjIdx) }
+        } else if p.paramScope >= 0 && varDef.scopeLevel == p.paramScope
+                    && fromBody && p.varObjIdx >= 0 {
+            out.append(p.varObjIdx)
+        }
+        return out
+    }
+
+    /// Closure var of `s` for local `idx` (a variable object) of ancestor `owner`.
+    private static func varObjectClosureVar(ctx: JeffJSContext, s: JeffJSFunctionDefCompiler,
+                                            owner: JeffJSFunctionDefCompiler, idx: Int) -> Int {
+        owner.vars[idx].isCaptured = true
+        return getClosureVar(ctx: ctx, s: s, fd: owner, isLocal: true, isArg: false,
+                             varIdx: idx, varName: owner.vars[idx].varName,
+                             isConst: false, isLexical: false,
+                             varKind: JSVarKindEnum.JS_VAR_NORMAL.rawValue)
+    }
+
+    /// Closure var of `s` (the direct-eval root `root` or a function nested
+    /// in it) for item `itemIndex` of the root's call site. The root binds
+    /// each item it uses once, straight to the caller's slot or var_ref.
+    static func evalItemClosureVar(ctx: JeffJSContext, s: JeffJSFunctionDefCompiler,
+                                   root: JeffJSFunctionDefCompiler, itemIndex: Int) -> Int {
+        guard let site = root.evalSite, itemIndex < site.items.count else { return 0 }
+        let item = site.items[itemIndex]
+        let rootIdx: Int
+        if let known = root.evalItemClosureIdx[itemIndex] {
+            rootIdx = known
+        } else {
+            var cv = JeffJSClosureVar()
+            cv.varName = item.name
+            cv.isLocal = item.isLocal
+            cv.isArg = item.isArg
+            cv.isConst = item.isConst
+            cv.isLexical = item.isLexical
+            cv.varKind = item.varKind
+            cv.varIdx = item.idx
+            root.closureVar.append(cv)
+            rootIdx = root.closureVar.count - 1
+            root.evalItemClosureIdx[itemIndex] = rootIdx
+        }
+        if s === root { return rootIdx }
+        return getClosureVar(ctx: ctx, s: s, fd: root, isLocal: false, isArg: false,
+                             varIdx: rootIdx, varName: item.name,
+                             isConst: item.isConst, isLexical: item.isLexical,
+                             varKind: item.varKind)
+    }
+
+    /// The bindings of `p` visible from its scope `from`, in lookup order
+    /// (the order resolveScopeVar searches them), with each binding's
+    /// position relative to p's var environment (see JeffJSEvalItem.region)
+    /// and whether it is an object environment. The variable objects are
+    /// placed where their environment sits: the body's after the body's
+    /// bindings, the parameters' after the parameters.
+    private static func visibleBindings(ctx: JeffJSContext, _ p: JeffJSFunctionDefCompiler, from: Int)
+        -> [(isArg: Bool, idx: Int, region: UInt8, dynamic: Bool)] {
+        var out: [(isArg: Bool, idx: Int, region: UInt8, dynamic: Bool)] = []
+        let fromBody = scopeReachesBody(p, from)
+        var added = Set<Int>()
+        func addVar(_ i: Int, _ region: UInt8) {
+            // The self name of a named function expression comes last: its
+            // environment encloses the parameters and both var objects.
+            guard i >= 0, i < p.vars.count, i != p.varObjIdx, i != p.argVarObjIdx,
+                  i != p.funcNameVarIdx,
+                  p.vars[i].varName != 0, added.insert(i).inserted else { return }
+            let isWith = p.vars[i].isLexical && ctx.atomToSwiftString(p.vars[i].varName).hasPrefix("*with*")
+            out.append((false, i, region, isWith))
+        }
+        var bodyDone = false
+        func finishBody() {
+            bodyDone = true
+            // Function-scoped vars not on the chain (the catch-all of findLocalVar).
+            for i in 0 ..< p.vars.count where !p.vars[i].isLexical
+                && !(p.paramScope >= 0 && p.vars[i].scopeLevel == p.paramScope) {
+                addVar(i, i == p.funcNameVarIdx ? 2 : 1)
+            }
+            if p.paramScope < 0 {
+                for i in 0 ..< p.args.count where p.args[i].varName != 0 {
+                    out.append((true, i, 1, false))
+                }
+            }
+            if p.varObjIdx >= 0 { out.append((false, p.varObjIdx, 1, true)) }
+        }
+        var sc = from
+        while sc >= 0 && sc < p.scopes.count {
+            if sc == p.paramScope && fromBody && !bodyDone { finishBody() }
+            var v = p.scopes[sc].first
+            while v >= 0 && v < p.vars.count {
+                let vd = p.vars[v]
+                let region: UInt8
+                if v == p.funcNameVarIdx { region = 2 }
+                else if sc == p.paramScope { region = fromBody ? 2 : 0 }
+                else if sc == 0 && !vd.isLexical { region = 1 }
+                else { region = 0 }
+                addVar(v, region)
+                v = vd.scopeNext
+            }
+            sc = p.scopes[sc].parent
+        }
+        if fromBody && !bodyDone { finishBody() }
+        if p.paramScope >= 0 {
+            for i in 0 ..< p.args.count where p.args[i].varName != 0 {
+                out.append((true, i, fromBody ? 2 : 0, false))
+            }
+        }
+        if p.argVarObjIdx >= 0 { out.append((false, p.argVarObjIdx, 1, true)) }
+        let selfIdx = p.funcNameVarIdx
+        if selfIdx >= 0, selfIdx < p.vars.count, p.vars[selfIdx].varName != 0 {
+            out.append((false, selfIdx, 2, false))
+        }
+        return out
+    }
+
+    /// Record the scope chain of a direct `eval` call in `c` at scope level
+    /// `scope`: every binding the eval code could name, innermost first,
+    /// shadowed names dropped. Bindings of `c` are captured as its own
+    /// slots; those of enclosing functions become closure vars of `c` (QuickJS
+    /// add_eval_variables / add_closure_variables do the same), so the eval
+    /// code, compiled later with no parent definition, reaches all of them
+    /// through the caller's frame and var_refs.
+    static func buildEvalSite(ctx: JeffJSContext, fd c: JeffJSFunctionDefCompiler,
+                              scope: Int) -> JeffJSEvalSite {
+        let site = JeffJSEvalSite()
+        site.isStrict = (c.jsMode & JS_MODE_STRICT) != 0
+        let fromBody = scopeReachesBody(c, scope)
+        if !site.isStrict {
+            if c.parent == nil {
+                // Global code keeps the global var environment; eval code
+                // shares its caller's.
+                site.varEnvName = c.evalSite?.varEnvName ?? 0
+            } else {
+                let vi = fromBody ? c.varObjIdx : c.argVarObjIdx
+                site.varEnvName = vi >= 0 ? c.vars[vi].varName : 0
+            }
+        }
+        var seen = Set<JSAtom>()
+        func accept(_ name: JSAtom, _ dynamic: Bool) -> Bool {
+            if name == 0 { return false }
+            return seen.insert(name).inserted || dynamic
+        }
+        for e in visibleBindings(ctx: ctx, c, from: scope) {
+            let name = e.isArg ? c.args[e.idx].varName : c.vars[e.idx].varName
+            guard accept(name, e.dynamic) else { continue }
+            var it = JeffJSEvalItem()
+            it.name = name
+            it.isLocal = true
+            it.isArg = e.isArg
+            it.idx = e.idx
+            if e.isArg {
+                c.args[e.idx].isCaptured = true
+            } else {
+                let vd = c.vars[e.idx]
+                c.vars[e.idx].isCaptured = true
+                it.isConst = vd.isConst
+                it.isLexical = vd.isLexical
+                it.varKind = vd.varKind
+            }
+            it.isDynamic = e.dynamic
+            it.region = e.region
+            site.items.append(it)
+        }
+        var cur = c
+        while let p = cur.parent {
+            for e in visibleBindings(ctx: ctx, p, from: cur.definedScopeLevel) {
+                let name = e.isArg ? p.args[e.idx].varName : p.vars[e.idx].varName
+                guard accept(name, e.dynamic) else { continue }
+                var it = JeffJSEvalItem()
+                it.name = name
+                it.isLocal = false
+                it.isDynamic = e.dynamic
+                it.region = 2
+                if e.isArg {
+                    p.args[e.idx].isCaptured = true
+                    it.idx = getClosureVar(ctx: ctx, s: c, fd: p, isLocal: true, isArg: true,
+                                           varIdx: e.idx, varName: name, isConst: false,
+                                           isLexical: false,
+                                           varKind: JSVarKindEnum.JS_VAR_NORMAL.rawValue)
+                } else {
+                    let vd = p.vars[e.idx]
+                    p.vars[e.idx].isCaptured = true
+                    it.isConst = vd.isConst
+                    it.isLexical = vd.isLexical
+                    it.varKind = vd.varKind
+                    it.idx = getClosureVar(ctx: ctx, s: c, fd: p, isLocal: true, isArg: false,
+                                           varIdx: e.idx, varName: name, isConst: vd.isConst,
+                                           isLexical: vd.isLexical, varKind: vd.varKind)
+                }
+                site.items.append(it)
+            }
+            cur = p
+        }
+        if let rootSite = cur.evalSite {
+            for (i, ri) in rootSite.items.enumerated() {
+                guard accept(ri.name, ri.isDynamic) else { continue }
+                var it = ri
+                it.isLocal = false
+                it.isArg = false
+                it.idx = evalItemClosureVar(ctx: ctx, s: c, root: cur, itemIndex: i)
+                // Nested eval directly in sloppy eval code shares its var
+                // environment; from anywhere deeper it is all outside.
+                if cur !== c { it.region = 2 }
+                site.items.append(it)
+            }
+        }
+        return site
+    }
+
+    /// Replace the scope access at `pos` by a property check on each object
+    /// environment in `dyn` (innermost first) followed by the static access,
+    /// e.g. for a read:
+    ///     <obj> dup push_atom_value(x) swap in if_false L1
+    ///           push_atom_value(x) get_array_el goto Ldone
+    ///     L1: drop  ...  <static get>  Ldone:
+    /// Returns the position just past the rewritten sequence.
+    private static func emitDynamicScopeAccess(fd: JeffJSFunctionDefCompiler, pos: Int, origSize: Int,
+                                               atom: JSAtom, dyn: [(JeffJSOpcode, Int)],
+                                               finalOp: JeffJSOpcode, finalIdx: Int,
+                                               accessType: ScopeAccessType) -> Int {
+        func u16(_ v: Int) -> [UInt8] { [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF)] }
+        func u32(_ v: UInt32) -> [UInt8] {
+            [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8((v >> 24) & 0xFF)]
+        }
+        func newLabel() -> Int { fd.labels.append(JeffJSLabelSlot()); return fd.labels.count - 1 }
+        let done = newLabel()
+        var prefix: [UInt8] = []
+        for (loadOp, loadIdx) in dyn {
+            let miss = newLabel()
+            prefix += opcodeBytes(loadOp) + u16(loadIdx)                       // [obj]
+            prefix += opcodeBytes(.dup)                                        // [obj, obj]
+            prefix += opcodeBytes(.push_atom_value) + u32(atom)                // [obj, obj, key]
+            prefix += opcodeBytes(.swap)                                       // [obj, key, obj]
+            prefix += opcodeBytes(.in_)                                        // [obj, has]
+            prefix += opcodeBytes(.if_false) + u32(UInt32(miss))               // [obj]
+            switch accessType {
+            case .put:
+                // [v, obj] -> []
+                prefix += opcodeBytes(.swap) + opcodeBytes(.put_field) + u32(atom)
+            case .delete:
+                prefix += opcodeBytes(.push_atom_value) + u32(atom) + opcodeBytes(.delete_)
+            default:
+                prefix += opcodeBytes(.push_atom_value) + u32(atom) + opcodeBytes(.get_array_el)
+            }
+            prefix += opcodeBytes(.goto_) + u32(UInt32(done))
+            prefix += opcodeBytes(.label_) + u32(UInt32(miss))
+            prefix += opcodeBytes(.drop)
+        }
+        // The prefix belongs to the instruction at `pos`: a hoisted range or
+        // the body start that begins there keeps its start.
+        fd.byteCode.buf.insert(contentsOf: prefix, at: pos)
+        fd.byteCode.len += prefix.count
+        let n = prefix.count
+        if fd.bodyBytecodeStart > pos { fd.bodyBytecodeStart += n }
+        fd.hoistedFuncDeclRanges = fd.hoistedFuncDeclRanges.map {
+            ($0.0 > pos ? $0.0 + n : $0.0, $0.1 > pos ? $0.1 + n : $0.1)
+        }
+        for (k, v) in fd.tdzInitPos where v >= pos { fd.tdzInitPos[k] = v + n }
+        let instrPos = pos + n
+        rewriteScopeAccess(fd: fd, pos: instrPos, origSize: origSize, newOp: finalOp,
+                           varIdx: finalIdx, atom: atom, accessType: accessType)
+        // ... and so does the join label after it.
+        let q = instrPos + origSize
+        let suffix = opcodeBytes(.label_) + u32(UInt32(done))
+        fd.byteCode.buf.insert(contentsOf: suffix, at: q)
+        fd.byteCode.len += suffix.count
+        if fd.bodyBytecodeStart >= q { fd.bodyBytecodeStart += suffix.count }
+        fd.hoistedFuncDeclRanges = fd.hoistedFuncDeclRanges.map {
+            ($0.0 >= q ? $0.0 + suffix.count : $0.0, $0.1 >= q ? $0.1 + suffix.count : $0.1)
+        }
+        for (k, v) in fd.tdzInitPos where v >= q { fd.tdzInitPos[k] = v + suffix.count }
+        return q + suffix.count
     }
 
     // MARK: resolveScopePrivateField
@@ -978,6 +1467,13 @@ struct JeffJSCompiler {
             }
             curFd = p
             parentFd = p.parent
+        }
+        // Direct eval inside a class body: the caller's private names.
+        if let site = curFd.evalSite,
+           let i = site.items.firstIndex(where: {
+               $0.name == name && $0.varKind >= JSVarKindEnum.JS_VAR_PRIVATE_FIELD.rawValue }) {
+            return (.get_var_ref, evalItemClosureVar(ctx: ctx, s: fd, root: curFd, itemIndex: i),
+                    site.items[i].varKind)
         }
 
         // Not found: the parser rejects `this.#x` outside a class that
@@ -1216,38 +1712,6 @@ struct JeffJSCompiler {
             }
         }
         return nil
-    }
-
-    // MARK: addEvalVariables
-
-    /// Add eval-accessible variables.
-    /// When a function contains `eval()`, all local variables must be accessible
-    /// dynamically.  This ensures proper closure var chain setup.
-    static func addEvalVariables(ctx: JeffJSContext,
-                                  fd: JeffJSFunctionDefCompiler) {
-        // When a function uses eval, all its variables and parent variables
-        // must be captured so eval can access them
-        for i in 0 ..< fd.vars.count {
-            fd.vars[i].isCaptured = true
-        }
-        for i in 0 ..< fd.args.count {
-            fd.args[i].isCaptured = true
-        }
-
-        // Walk parent chain and mark their vars as captured too
-        var p = fd.parent
-        while let parent = p {
-            if parent.hasEval {
-                break  // already processed
-            }
-            for i in 0 ..< parent.vars.count {
-                parent.vars[i].isCaptured = true
-            }
-            for i in 0 ..< parent.args.count {
-                parent.args[i].isCaptured = true
-            }
-            p = parent.parent
-        }
     }
 
     // =========================================================================
@@ -2558,9 +3022,12 @@ struct JeffJSCompiler {
             return 3  // func + this + args_array
         case .apply_constructor:
             return 3  // func + new.target + args_array
-        case .eval, .apply_eval:
+        case .eval:
+            // func + args, plus the receiver in the `with` form (site top bit)
             let argc = Int(readU16(buf, pos + opWidth))
-            return argc + 1
+            return argc + 1 + (readU16(buf, pos + opWidth + 2) & 0x8000 != 0 ? 1 : 0)
+        case .apply_eval:
+            return 3  // this + func + args_array
         default:
             return 0
         }
@@ -2850,11 +3317,13 @@ struct JeffJSCompiler {
                         let argc = Int(readU16(buf, pos + 2))
                         curStack -= argc  // only pops args, func is from local
                     }
-                case .eval, .apply_eval:
-                    if pos + 2 < buf.count {
+                case .eval:
+                    if pos + 4 < buf.count {
                         let argc = Int(readU16(buf, pos + 1))
-                        curStack -= argc + 1
+                        curStack -= argc + 1 + (readU16(buf, pos + 3) & 0x8000 != 0 ? 1 : 0)
                     }
+                case .apply_eval:
+                    curStack -= 3
                 default:
                     break
                 }
@@ -3730,6 +4199,8 @@ struct JeffJSCompiler {
             bvd.varKind = v.varKind
             return bvd
         }
+
+        if !fd.evalSites.isEmpty { fb.evalSites = fd.evalSites }
 
         // Closure variables
         fb.closureVars = fd.closureVar
