@@ -1189,6 +1189,46 @@ final class JeffJSParser {
         return idx
     }
 
+    /// Declare `name` as a `var` binding (VarDeclaredNames, ES §14.3.2,
+    /// §10.2.11 FunctionDeclarationInstantiation steps 27-28). `var` is
+    /// function-scoped with one binding per name: a `var` that names a
+    /// parameter, an earlier `var` or a function declaration of the same
+    /// function IS that binding (`function f(o) { var o; return o }` returns
+    /// the argument), and at the top level of a script it is a property of
+    /// the global object. Returns the local slot, or -1 when the binding is
+    /// not a local of its own (a parameter, a global). Callers store by name
+    /// (`emitScopePutVar`), which also reaches a same-named catch parameter
+    /// of an enclosing block (B.3.4) and `with` objects.
+    @discardableResult
+    func declareVarBinding(_ name: JSAtom) -> Int {
+        if fd.parent == nil {
+            // Same rule as parseVarDeclaration's global `var`: parseProgram
+            // hoists a define_var for it to the start of the script.
+            if !fd.hoistedGlobalVarAtoms.contains(name) {
+                fd.hoistedGlobalVarAtoms.append(name)
+            }
+            return -1
+        }
+        // Not the named function expression's self-reference: that binding
+        // is outside the function's scopes, a body `var` shadows it.
+        if let i = fd.vars.indices.first(where: {
+            fd.vars[$0].varName == name && !fd.vars[$0].isLexical && $0 != fd.funcNameVarIdx
+        }) {
+            return i
+        }
+        if fd.args.contains(where: { $0.varName == name }) {
+            return -1
+        }
+        // In the function's var scope (scope 0), not the block being parsed:
+        // a block-level lexical of the same name (a catch parameter) must
+        // still shadow it there, and the block's exit must not close it.
+        let saved = fd.curScope
+        fd.curScope = 0
+        let idx = defineVar(name)
+        fd.curScope = saved
+        return idx
+    }
+
     /// Find a variable by name in the current scope chain.
     /// Returns the variable index, or -1 if not found.
     func findVar(_ name: JSAtom) -> Int {
@@ -1892,8 +1932,9 @@ final class JeffJSParser {
                 next()
 
                 if tok == JSTokenType.TOK_IN.rawValue {
-                    // for (var x in ...)
-                    let varIdx = defineVar(varName, isConst: isConst, isLexical: isLexical)
+                    // for (var x in ...): a var head stores by name (-1)
+                    let varIdx = isLexical ? defineVar(varName, isConst: isConst, isLexical: true)
+                                           : { declareVarBinding(varName); return -1 }()
                     next() // consume 'in'
                     parseForIn(varIdx: varIdx, varAtom: varName, scopeLevel: fd.curScope,
                                loopLabel: loopLabel, breakLabel: breakLabel,
@@ -1902,8 +1943,9 @@ final class JeffJSParser {
                     return
                 } else if tok == JSTokenType.TOK_OF.rawValue ||
                           isIdent("of") {
-                    // for (var x of ...)
-                    let varIdx = defineVar(varName, isConst: isConst, isLexical: isLexical)
+                    // for (var x of ...): a var head stores by name (-1)
+                    let varIdx = isLexical ? defineVar(varName, isConst: isConst, isLexical: true)
+                                           : { declareVarBinding(varName); return -1 }()
                     next() // consume 'of'
                     parseForOf(varIdx: varIdx, varAtom: varName, scopeLevel: fd.curScope,
                                loopLabel: loopLabel, breakLabel: breakLabel,
@@ -3007,7 +3049,8 @@ final class JeffJSParser {
             }
             // No initializer: variable is already undefined on global object
         } else {
-            let varIdx = defineVar(varName, isConst: isConst, isLexical: isLexical)
+            let varIdx = isLexical ? defineVar(varName, isConst: isConst, isLexical: true)
+                                   : declareVarBinding(varName)
 
             if tok == 0x3D { // '='
                 next() // consume '='
@@ -3018,7 +3061,9 @@ final class JeffJSParser {
                     emitOp(.put_loc_check_init)
                     emitU16(UInt16(varIdx))
                 } else {
-                    emitScopePutVarInit(varName, scopeLevel: fd.curScope)
+                    // A reference, not an initialisation: the name may be a
+                    // parameter or a catch parameter (B.3.4) as well as the var.
+                    emitScopePutVar(varName, scopeLevel: fd.curScope)
                 }
             } else {
                 // No initializer
@@ -6851,11 +6896,14 @@ final class JeffJSParser {
                     restIsNestedPattern = true
                 }
 
-                // Define the rest variable (or a temp for nested patterns)
+                // Define the rest variable (or a temp for nested patterns and
+                // for a `var` name, which is stored by name once filled)
                 let restVarIdx: Int
-                if restIsNestedPattern {
+                let restBindsVarByName = !restIsNestedPattern && !isLexical
+                if restIsNestedPattern || restBindsVarByName {
                     // Use anonymous temp var for nested destructuring
                     restVarIdx = defineVar(0, isConst: false, isLexical: false)
+                    if restBindsVarByName { declareVarBinding(restVarName) }
                 } else {
                     restVarIdx = defineVar(restVarName, isConst: isConst, isLexical: isLexical)
                 }
@@ -6896,6 +6944,12 @@ final class JeffJSParser {
                 emitLabel(doneLabel)
                 // Stack: ... iter obj method value(undefined)
                 emitOp(.drop) // drop the undefined from the last for_of_next
+
+                if restBindsVarByName {
+                    emitOp(.get_loc)
+                    emitU16(UInt16(restVarIdx))
+                    emitScopePutVar(restVarName, scopeLevel: fd.curScope)
+                }
 
                 // For nested destructuring patterns, apply them to the rest array
                 if restIsNestedPattern {
@@ -6949,13 +7003,14 @@ final class JeffJSParser {
                     // Assignment mode: write to existing variable
                     emitScopePutVar(varName, scopeLevel: fd.curScope)
                 } else {
-                    let varIdx = defineVar(varName, isConst: isConst, isLexical: isLexical)
                     if isLexical {
+                        let varIdx = defineVar(varName, isConst: isConst, isLexical: true)
                         emitOp(.put_loc_check_init)
+                        emitU16(UInt16(varIdx))
                     } else {
-                        emitOp(.put_loc)
+                        declareVarBinding(varName)   // function-scoped; stored by name
+                        emitScopePutVar(varName, scopeLevel: fd.curScope)
                     }
-                    emitU16(UInt16(varIdx))
                 }
             } else if tok == 0x5B || tok == 0x7B {
                 parseNestedDestructuringElement(kind: kind, isLexical: isLexical, isConst: isConst)
@@ -7038,13 +7093,14 @@ final class JeffJSParser {
                 } else if kind == .assignment {
                     emitScopePutVar(varName, scopeLevel: fd.curScope)
                 } else {
-                    let varIdx = defineVar(varName, isConst: isConst, isLexical: isLexical)
                     if isLexical {
+                        let varIdx = defineVar(varName, isConst: isConst, isLexical: true)
                         emitOp(.put_loc_check_init)
+                        emitU16(UInt16(varIdx))
                     } else {
-                        emitOp(.put_loc)
+                        declareVarBinding(varName)   // function-scoped; stored by name
+                        emitScopePutVar(varName, scopeLevel: fd.curScope)
                     }
-                    emitU16(UInt16(varIdx))
                 }
                 // Stack: [src]
                 break
@@ -7149,13 +7205,14 @@ final class JeffJSParser {
                     if kind == .assignment {
                         emitScopePutVar(varName, scopeLevel: fd.curScope)
                     } else {
-                        let varIdx = defineVar(varName, isConst: isConst, isLexical: isLexical)
                         if isLexical {
+                            let varIdx = defineVar(varName, isConst: isConst, isLexical: true)
                             emitOp(.put_loc_check_init)
+                            emitU16(UInt16(varIdx))
                         } else {
-                            emitOp(.put_loc)
+                            declareVarBinding(varName)   // function-scoped; stored by name
+                            emitScopePutVar(varName, scopeLevel: fd.curScope)
                         }
-                        emitU16(UInt16(varIdx))
                     }
                 } else {
                     syntaxError("expected identifier or pattern")
@@ -7183,13 +7240,14 @@ final class JeffJSParser {
                 if kind == .assignment {
                     emitScopePutVar(propAtom, scopeLevel: fd.curScope)
                 } else {
-                    let varIdx = defineVar(propAtom, isConst: isConst, isLexical: isLexical)
                     if isLexical {
+                        let varIdx = defineVar(propAtom, isConst: isConst, isLexical: true)
                         emitOp(.put_loc_check_init)
+                        emitU16(UInt16(varIdx))
                     } else {
-                        emitOp(.put_loc)
+                        declareVarBinding(propAtom)   // function-scoped; stored by name
+                        emitScopePutVar(propAtom, scopeLevel: fd.curScope)
                     }
-                    emitU16(UInt16(varIdx))
                 }
             }
 

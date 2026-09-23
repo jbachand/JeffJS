@@ -2189,7 +2189,9 @@ final class JeffJSDOMBridge {
         // src/href/rel above. Without them `meta.name`, `img.alt`,
         // `input.placeholder` … all read as undefined, and real page code does
         // `el.name.replace(...)` on them without a guard.
-        for reflected in ["name", "alt", "title", "placeholder"] {
+        // `lang` is HTMLElement's (HTML §3.2.6.2); MediaWiki's
+        // ExternalGuidance does `documentElement.lang.indexOf(...)`.
+        for reflected in ["name", "alt", "title", "placeholder", "lang"] {
             ctx.setPropertyFunc(obj: el, name: "__get_\(reflected)", fn: { [weak self] ctx, thisVal, _ in
                 guard let self, let targetNode = self.extractNode(from: thisVal) else {
                     return ctx.newStringValue("")
@@ -2206,6 +2208,23 @@ final class JeffJSDOMBridge {
                 return JeffJSValue.undefined
             }, length: 1)
         }
+
+        // -- dir (HTML §3.2.6.4): reflected, limited to only known values —
+        // ltr / rtl / auto, ASCII case-insensitively, read back lowercase;
+        // anything else (or no attribute) reads "". --
+        ctx.setPropertyFunc(obj: el, name: "__get_dir", fn: { [weak self] ctx, thisVal, _ in
+            guard let self, let targetNode = self.extractNode(from: thisVal) else {
+                return ctx.newStringValue("")
+            }
+            let v = (targetNode.attributes["dir"] ?? "").lowercased()
+            return ctx.newStringValue(["ltr", "rtl", "auto"].contains(v) ? v : "")
+        }, length: 0)
+        ctx.setPropertyFunc(obj: el, name: "__set_dir", fn: { [weak self] ctx, thisVal, args in
+            guard let self, let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+            self.setAttributeValue(targetNode, name: "dir", value: self.extractString(ctx: ctx, args: args, index: 0) ?? "")
+            self.notifyMutation(for: targetNode)
+            return JeffJSValue.undefined
+        }, length: 1)
 
         // -- type (reflected, with the HTML defaults the attribute omits) --
         ctx.setPropertyFunc(obj: el, name: "__get_type", fn: { [weak self] ctx, thisVal, _ in
@@ -2250,6 +2269,7 @@ final class JeffJSDOMBridge {
             ("username", true), ("password", true), ("host", true), ("hostname", true),
             ("port", true), ("pathname", true), ("search", true), ("hash", true),
             ("name", true), ("alt", true), ("title", true), ("placeholder", true), ("type", true),
+            ("lang", true), ("dir", true),
             ("id", true), ("className", true), ("value", true), ("defaultValue", true),
             ("namespaceURI", false),
             ("checked", true), ("hidden", true), ("src", true), ("href", true),

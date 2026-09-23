@@ -163,6 +163,45 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// Borrowed value form of `arrayProtoPushObj` (owned by Array.prototype)
     /// for pushing `arr.push` onto the stack without an inline cache.
     var arrayProtoPushVal: JeffJSValue = .undefined
+    /// Where Array.prototype keeps `push`: the slot index, valid while
+    /// Array.prototype is on the shape `arrayProtoPushShapeID` (-1: no own
+    /// data property `push` on that shape).
+    private var arrayProtoPushShapeID: UnsafeRawPointer? = nil
+    private var arrayProtoPushSlot: Int = -1
+
+    /// True when `receiver.push` is the intrinsic Array.prototype.push, so the
+    /// interpreter may skip the lookup: the receiver is on the shared array
+    /// shape (own properties: a writable `length` only; [[Prototype]]:
+    /// Array.prototype — an own `push`, a subclass or `setPrototypeOf` moves
+    /// it off that shape) and Array.prototype's `push` is still the intrinsic
+    /// as a data property (pages replace it: polyfills, instrumentation,
+    /// webpack's JSONP chunk arrays override `push` on the instance).
+    @inline(__always)
+    func arrayPushIsIntrinsic(_ receiver: JeffJSObj) -> Bool {
+        guard let cached = arrayShape, let pushObj = arrayProtoPushObj,
+              receiver.shapeIdentity == UnsafeRawPointer(Unmanaged.passUnretained(cached).toOpaque()),
+              let proto = cached.proto else { return false }
+        if proto.shapeIdentity != arrayProtoPushShapeID {
+            arrayProtoPushShapeID = proto.shapeIdentity
+            arrayProtoPushSlot = proto.shape.flatMap { findShapeProperty($0, JSPredefinedAtom.push.rawValue) } ?? -1
+        }
+        let slot = arrayProtoPushSlot
+        guard slot >= 0, slot < proto.propValues.count, proto.extra(at: slot) == nil,
+              let v = proto.dataValue(at: slot).obj else { return false }
+        return v === pushObj
+    }
+
+    /// True when the push fast paths may append to `arr` in place: it is
+    /// extensible and its `length` (slot 0) is a writable data property.
+    /// Frozen, sealed and non-extensible arrays and a read-only `length` take
+    /// the builtin, which throws the TypeError.
+    @inline(__always)
+    static func arrayAcceptsFastPush(_ arr: JeffJSObj) -> Bool {
+        guard arr.extensible, arr.propCount > 0, let shape = arr.shape, shape.prop.count > 0 else { return false }
+        let p0 = shape.prop[0]
+        return p0.atom == JeffJSAtomID.JS_ATOM_length.rawValue && p0.flags.contains(.writable)
+            && arr.extra(at: 0) == nil
+    }
     /// %ThrowTypeError% — a frozen function that always throws TypeError.
     /// Used for arguments.callee in strict mode, etc.
     var throwTypeError: JeffJSValue

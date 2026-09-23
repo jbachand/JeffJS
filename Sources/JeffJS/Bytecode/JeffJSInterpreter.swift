@@ -2640,20 +2640,23 @@ private func isStoreOpcode(_ bc: UnsafePointer<UInt8>, _ pos: Int, _ bcLen: Int)
     }
 }
 
-/// True if `b` is one of the plain-call opcodes (call, call0…call3) that read
-/// `frame.lastGetFieldReceiver` as the method `this`. Used by get_field to
-/// decide whether to stash the receiver: the call consumer requires the call to
-/// sit exactly 5 bytes after the get_field (pc == lastGetFieldPC + 5), so only a
-/// directly-following call needs the stash. `call_method`/`call_constructor`
-/// take their receiver from the stack instead and are intentionally excluded.
-/// All five opcodes are < 256, so a single-byte compare is exact.
+/// True if the instruction at `pos` is a plain call with NO arguments (call0,
+/// or call with argc 0). Only then is the value a directly-preceding get_field
+/// pushed the callee, i.e. `o.m()` left unfused, and its receiver the call's
+/// `this` (read from `frame.lastGetFieldReceiver`; the consumer checks
+/// pc == lastGetFieldPC + 5). With arguments, a get_field right before the call
+/// read the LAST ARGUMENT — `s(o.x)` must call `s` with `this` undefined, not
+/// `o` (MediaWiki's loader runs every module as `script($, $, require,
+/// registry[m].module)`, which gave each module `this` = its registry entry).
+/// `call_method`/`call_constructor` take their receiver from the stack and are
+/// excluded. The opcodes are < 256, so a single-byte compare is exact.
 @inline(__always)
-private func isCallOpcodeByte(_ b: UInt8) -> Bool {
-    b == UInt8(truncatingIfNeeded: JeffJSOpcode.call.rawValue)
-        || b == UInt8(truncatingIfNeeded: JeffJSOpcode.call0.rawValue)
-        || b == UInt8(truncatingIfNeeded: JeffJSOpcode.call1.rawValue)
-        || b == UInt8(truncatingIfNeeded: JeffJSOpcode.call2.rawValue)
-        || b == UInt8(truncatingIfNeeded: JeffJSOpcode.call3.rawValue)
+private func isZeroArgCallAt(_ bc: UnsafePointer<UInt8>, _ pos: Int, _ bcLen: Int) -> Bool {
+    guard pos < bcLen else { return false }
+    let b = bc[pos]
+    if b == UInt8(truncatingIfNeeded: JeffJSOpcode.call0.rawValue) { return true }
+    return b == UInt8(truncatingIfNeeded: JeffJSOpcode.call.rawValue)
+        && pos + 2 < bcLen && bc[pos + 1] == 0 && bc[pos + 2] == 0
 }
 
 // =============================================================================
@@ -3103,9 +3106,7 @@ private func executeFastTrace(
                let funcObj = buf[sp - 2].obj, funcObj === pushObj,
                let arrObj = buf[sp - 3].obj,
                arrObj.classID == JeffJSClassID.array.rawValue,
-               arrObj.propCount > 0,
-               let shape = arrObj.shape, shape.prop.count > 0,
-               shape.prop[0].atom == JeffJSAtomID.JS_ATOM_length.rawValue {
+               JeffJSContext.arrayAcceptsFastPush(arrObj) {
                 let newCount = arrObj.asClass.fastArrayPush(buf[sp - 1])
                 if newCount > 0 {
                     arrObj.asClass.setPropEntry(at: 0, .value(.newInt32(Int32(newCount))))
@@ -3458,7 +3459,7 @@ private func executeFastTrace(
         case .get_field:
             // A directly-following plain call takes its `this` from a stash
             // that only the main loop maintains: let it handle that pair.
-            if pc + 5 < bcLen, isCallOpcodeByte(bc[pc + 5]) { resume = pc; break traceLoop }
+            if isZeroArgCallAt(bc, pc + 5, bcLen) { resume = pc; break traceLoop }
             guard let ents = fb.icEntries else { resume = pc; break traceLoop }
             let obj = buf[sp - 1]
             guard let jsObj = obj.obj else { resume = pc; break traceLoop }
@@ -3481,7 +3482,7 @@ private func executeFastTrace(
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
             if icHit == nil, jsObj.classID == JeffJSClassID.array.rawValue,
-               readU32(bc, pc + 1) == JSPredefinedAtom.push.rawValue, ctx.arrayProtoPushObj != nil {
+               readU32(bc, pc + 1) == JSPredefinedAtom.push.rawValue, ctx.arrayPushIsIntrinsic(jsObj) {
                 // `arr.push`: exotic receivers never fill the IC; the
                 // call_method fast path below consumes this borrowed value.
                 icHit = ctx.arrayProtoPushVal
@@ -7539,7 +7540,7 @@ struct JeffJSInterpreter {
                     // directly-following call (arrow callees ignore it, so
                     // leave the stash alone for them).
                     var callThis: JeffJSValue = .undefined
-                    if !fastFb.isArrow,
+                    if !fastFb.isArrow, argc == 0,
                        !frame.lastGetFieldReceiver.isUndefined,
                        frame.lastGetFieldPC >= 0, pc == frame.lastGetFieldPC + 5 {
                         callThis = frame.lastGetFieldReceiver   // move the stash's ref
@@ -7689,7 +7690,7 @@ struct JeffJSInterpreter {
                     let funcVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                     // Use lastGetFieldReceiver as `this` if available (method call
                     // that transformMethodCalls couldn't convert to call_method).
-                    let stashValid = !frame.lastGetFieldReceiver.isUndefined
+                    let stashValid = argc == 0 && !frame.lastGetFieldReceiver.isUndefined
                         && frame.lastGetFieldPC >= 0 && pc == frame.lastGetFieldPC + 5
                     let slowThis = stashValid ? frame.lastGetFieldReceiver : JeffJSValue.undefined
                     let result: JeffJSValue
@@ -7772,10 +7773,7 @@ struct JeffJSInterpreter {
                    funcObj === pushObj,
                    let arrObj = buf[sp - 3].obj,
                    arrObj.classID == JeffJSClassID.array.rawValue,
-                   arrObj.propCount > 0,
-                   let shape = arrObj.shape,
-                   shape.prop.count > 0,
-                   shape.prop[0].atom == JeffJSAtomID.JS_ATOM_length.rawValue
+                   JeffJSContext.arrayAcceptsFastPush(arrObj)
                 {
                     let newCount = arrObj.asClass.fastArrayPush(buf[sp - 1])
                     if newCount > 0 {
@@ -8585,7 +8583,7 @@ struct JeffJSInterpreter {
                 // dup + free on EVERY read) and leaked the popped ref. Gating on an
                 // actually-following call removes that churn from hot read loops and
                 // balances the reference.
-                let nextIsCall = (pc + 5) < bcLen && isCallOpcodeByte(bc[pc + 5])
+                let nextIsCall = isZeroArgCallAt(bc, pc + 5, bcLen)
                 // Property access on null/undefined. The location goes in the
                 // error's `stack` (built from the live frame chain), not in the
                 // message — the message must read like every other engine's.
@@ -8666,9 +8664,9 @@ struct JeffJSInterpreter {
                 // a single dispatch. Avoids prototype lookup, function
                 // identity check, and two extra opcode dispatches.
                 if atom == JSPredefinedAtom.push.rawValue,
-                   ctx.arrayProtoPushObj != nil,
                    let jsObj = obj.obj,
-                   jsObj.classID == JeffJSClassID.array.rawValue {
+                   jsObj.classID == JeffJSClassID.array.rawValue,
+                   ctx.arrayPushIsIntrinsic(jsObj) {
                     // Peek ahead: get_field2 is 5 bytes. Check what follows.
                     let nextPc = pc + 5
                     if nextPc < bcLen {
@@ -8744,10 +8742,7 @@ struct JeffJSInterpreter {
                                readU16(bc, cmPc + 1) == 1 {
                                 // All conditions met — do the push inline.
                                 // prop[0] check for length property
-                                if jsObj.propCount > 0,
-                                   let shape = jsObj.shape,
-                                   shape.prop.count > 0,
-                                   shape.prop[0].atom == JeffJSAtomID.JS_ATOM_length.rawValue {
+                                if JeffJSContext.arrayAcceptsFastPush(jsObj) {
                                     let newCount = jsObj.asClass.fastArrayPush(argOwned ? arg : arg.dupValue())
                                     if newCount > 0 {
                                         jsObj.asClass.setPropEntry(at: 0, .value(.newInt32(Int32(newCount))))

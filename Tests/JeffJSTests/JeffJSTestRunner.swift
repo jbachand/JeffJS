@@ -304,6 +304,10 @@ struct JeffJSTestRunner {
             ("HTMLParsing", { $0.testHTMLParsing() }),
             ("DOMBridgeRung15", { $0.testDOMBridgeRung15() }),
             ("DOMScriptPrepare", { $0.testDOMScriptPrepare() }),
+            ("VarBindings", { $0.testVarBindings() }),
+            ("ArrayPushOverride", { $0.testArrayPushOverride() }),
+            ("PlainCallThis", { $0.testPlainCallThis() }),
+            ("ElementLangDir", { $0.testElementLangDir() }),
         ]
     }
 
