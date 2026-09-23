@@ -2028,10 +2028,16 @@ final class JeffJSParser {
 
                     emitGoto(loopLabel)
 
+                    // Normal completion (next() reported done) must not
+                    // call return() (ES §14.7.5.7): drop the record.
+                    let endLabel = newLabel()
                     emitLabel(doneLabel)
                     emitOp(.drop) // drop value
+                    emitOp(.drop); emitOp(.drop); emitOp(.drop) // [iter, obj, method]
+                    emitGoto(endLabel)
                     emitLabel(breakLabel)
                     emitOp(.iterator_close) // pops [iter, obj, method]
+                    emitLabel(endLabel)
 
                     popScope(scopeIdx)
                     return
@@ -2351,15 +2357,23 @@ final class JeffJSParser {
 
         // Done exit: for_of_next pushed [iter, obj, method, value, done].
         // if_true popped done, leaving [iter, obj, method, value].
-        // Drop the value so the stack matches what iterator_close expects.
+        // A loop that runs to completion must NOT call the iterator's
+        // return() (ES §14.7.5.7: IteratorClose only on an abrupt body
+        // completion), so drop the value and the record and skip the close.
+        // (for_of_next also marks the record done at run time; for await's
+        // for_await_of_next path does not, so the skip matters there.)
+        let endLabel = newLabel()
         emitLabel(doneLabel)
-        emitOp(.drop)
+        emitOp(.drop)                                // value
+        emitOp(.drop); emitOp(.drop); emitOp(.drop)  // [iter, obj, method]
+        emitGoto(endLabel)
 
         // break from inside the body jumps here with [iter, obj, method].
         emitLabel(breakLabel)
 
         // Close iterator: pops [iter, obj, method].
         emitOp(.iterator_close)
+        emitLabel(endLabel)
     }
 
     // MARK: Switch Statement

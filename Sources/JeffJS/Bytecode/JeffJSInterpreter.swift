@@ -2386,12 +2386,40 @@ extension JeffJSContext {
 
     /// Closes an iterator.
     func iteratorClose(iter: JeffJSValue, isThrow: Bool) {
+        guard iter.isObject else { return }
         let returnFn = getProperty(obj: iter, atom: iterReturnAtom)
         if returnFn.isFunction {
             let r = callFunction(returnFn, thisVal: iter, args: [])
             r.freeValue()
         }
         returnFn.freeValue()
+    }
+
+    /// IteratorClose for a normal / break / return completion (ES §7.4.11
+    /// with a non-throw completion): GetMethod(iter, "return"), call it, and
+    /// propagate its throw or a TypeError when it answers a non-object.
+    /// Returns false with the exception pending on failure. A non-object
+    /// `iter` is a record whose [[Done]] is already true: nothing to close.
+    func iteratorCloseNormal(iter: JeffJSValue) -> Bool {
+        guard iter.isObject else { return true }
+        let returnFn = getProperty(obj: iter, atom: iterReturnAtom)
+        if returnFn.isException { return false }
+        if returnFn.isUndefined || returnFn.isNull { return true }
+        if !returnFn.isFunction {
+            returnFn.freeValue()
+            _ = throwTypeError(message: "iterator return is not a function")
+            return false
+        }
+        let r = callFunction(returnFn, thisVal: iter, args: [])
+        returnFn.freeValue()
+        if r.isException { return false }
+        if !r.isObject {
+            r.freeValue()
+            _ = throwTypeError(message: "iterator result is not an object")
+            return false
+        }
+        r.freeValue()
+        return true
     }
 
     /// Calls a specific method on an iterator.
@@ -10234,10 +10262,26 @@ struct JeffJSInterpreter {
                 // the stack; we peek at it via an offset and push value+done
                 // on top.  This matches QuickJS behaviour exactly (peek, not
                 // pop/push) and correctly handles non-zero offsets.
+                //
+                // Once the iterator reports done, or next()/the result's
+                // getters throw, the iter slot is replaced by `undefined`
+                // (QuickJS js_for_of_next). That is the record's [[Done]]
+                // flag: iterator_close and the exception unwinder skip a
+                // record whose iter is not an object, so a loop that runs to
+                // completion (or whose next() threw) never calls return()
+                // (ES §14.7.5.7, §7.4.6), and a destructuring pattern that
+                // outlives the iterator does not call next() again (§8.6.3).
                 let offset = Int(readU8(bc, pc + 1))
-                // Peek at the iterator state without popping
+                let iterSlot = sp - 1 - (2 + offset)
+                let iter   = buf[iterSlot]              // bottom of iter state
+                if !iter.isObject {
+                    // Already done: [[Done]] is true, next() is not called.
+                    buf[sp] = .undefined; sp += 1
+                    buf[sp] = .newBool(true); sp += 1
+                    pc += 2
+                    break
+                }
                 let method = buf[sp - 1 - (0 + offset)]  // top of iter state
-                let iter   = buf[sp - 1 - (2 + offset)]  // bottom of iter state
                 // Call method (next) with iter as this.
                 if traceOps {
                     print("[FOR-OF-NEXT] method.isFunction=\(method.isFunction) method.isUndefined=\(method.isUndefined) iter.isObject=\(iter.isObject)")
@@ -10248,6 +10292,7 @@ struct JeffJSInterpreter {
                 }
                 let forOfResult = ctx.callFunction(method, thisVal: iter, args: [])
                 if forOfResult.isException {
+                    buf[iterSlot] = .undefined; iter.freeValue()
                     retVal = .exception
                     break dispatchLoop
                 }
@@ -10263,6 +10308,12 @@ struct JeffJSInterpreter {
                 }
                 // Extract .done and .value from the iterator result
                 let forOfDoneVal = ctx.getPropertyStr(obj: forOfResult, name: "done")
+                if forOfDoneVal.isException {
+                    forOfResult.freeValue()
+                    buf[iterSlot] = .undefined; iter.freeValue()
+                    retVal = .exception
+                    break dispatchLoop
+                }
                 let forOfDone = jeffJS_fastToBool(forOfDoneVal)
                 if traceOps {
                     let v = ctx.getPropertyStr(obj: forOfResult, name: "value")
@@ -10272,10 +10323,18 @@ struct JeffJSInterpreter {
                     }
                 }
                 if forOfDone {
+                    buf[iterSlot] = .undefined; iter.freeValue()
                     buf[sp] = .undefined; sp += 1
                     buf[sp] = .newBool(true); sp += 1
                 } else {
                     let forOfValue = ctx.getPropertyStr(obj: forOfResult, name: "value")
+                    if forOfValue.isException {
+                        forOfDoneVal.freeValue()
+                        forOfResult.freeValue()
+                        buf[iterSlot] = .undefined; iter.freeValue()
+                        retVal = .exception
+                        break dispatchLoop
+                    }
                     buf[sp] = forOfValue; sp += 1
                     buf[sp] = .newBool(false); sp += 1
                 }
@@ -10336,8 +10395,15 @@ struct JeffJSInterpreter {
                 let icMethod = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)   // method
                 let icObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)      // obj
                 let iter = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) // iter
-                ctx.iteratorClose(iter: iter, isThrow: false)
+                // The record is off the stack before return() runs, so an
+                // exception it raises is not caught by the unwinder's
+                // iterator-record scan and closed a second time.
+                let icOK = ctx.iteratorCloseNormal(iter: iter)
                 icMethod.freeValue(); icObj.freeValue(); iter.freeValue()
+                if !icOK {
+                    retVal = .exception
+                    break dispatchLoop
+                }
                 pc += 1
 
             case .iterator_close_return:
