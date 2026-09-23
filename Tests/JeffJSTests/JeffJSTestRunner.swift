@@ -310,6 +310,7 @@ struct JeffJSTestRunner {
             ("ElementLangDir", { $0.testElementLangDir() }),
             ("ParameterScope", { $0.testParameterScope() }),
             ("GeneratorInstantiation", { $0.testGeneratorInstantiation() }),
+            ("ArrayIntegrity", { $0.testArrayIntegrity() }),
         ]
     }
 

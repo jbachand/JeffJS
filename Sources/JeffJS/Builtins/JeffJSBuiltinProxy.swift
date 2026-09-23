@@ -295,8 +295,8 @@ func js_proxy_preventExtensions(_ ctx: JeffJSContext,
 
     let trap = getTrap(ctx, pd.handler, JSPredefinedAtom.preventExtensions.rawValue)
     if trap.isUndefined {
-        if let targetObj = pd.target.toObject() {
-            targetObj.extensible = false
+        if pd.target.toObject() != nil {
+            _ = ctx.preventExtensions(pd.target)
         }
         return .JS_TRUE
     }
@@ -932,8 +932,8 @@ func js_reflect_preventExtensions(_ ctx: JeffJSContext,
     guard argv[0].isObject else {
         return ctx.throwTypeError("Reflect.preventExtensions target must be an object")
     }
-    guard let targetObj = argv[0].toObject() else { return .JS_FALSE }
-    targetObj.extensible = false
+    guard argv[0].toObject() != nil else { return .JS_FALSE }
+    _ = ctx.preventExtensions(argv[0])
     return .JS_TRUE
 }
 

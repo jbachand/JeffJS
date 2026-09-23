@@ -1137,6 +1137,14 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // otherwise the materialiser would later overwrite the new descriptor.
         if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
 
+        // Array exotic [[DefineOwnProperty]]: elements live in the fast
+        // storage (with their attribute bits), and `length` shrinks the
+        // array. JS_PROP_NO_EXOTIC is the ordinary definition it delegates to.
+        if jsObj.classID == JeffJSClassID.array.rawValue, (flags & JS_PROP_NO_EXOTIC) == 0,
+           let r = defineArrayOwnProperty(obj, jsObj, atom: atom, value: value, flags: flags) {
+            return r
+        }
+
         // Extensibility is checked only when a *new* property would be added
         // (ES2023 10.1.6.3 step 2): redefining a property that already exists
         // is legal on a non-extensible object, so
@@ -1388,10 +1396,18 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // (length is unchanged, `i in a` becomes false) — the element is not a
         // shape property, so the code below would silently do nothing.
         if jsObj.fastArray || jsObj.classID == JeffJSClassID.array.rawValue,
-           rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom),
-           jsObj.deleteArrayElement(idx) {
-            jsObj.shape?.enumKeyCache = nil
-            return true
+           rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom) {
+            // A non-configurable element (sealed / frozen array) stays.
+            if !arrayElementIsDeletable(jsObj, index: idx) {
+                if (flags & JS_PROP_THROW) != 0 {
+                    _ = throwTypeError(message: "Cannot delete property '\(idx)' of [object Array]")
+                }
+                return false
+            }
+            if jsObj.deleteArrayElement(idx) {
+                jsObj.shape?.enumKeyCache = nil
+                return true
+            }
         }
         guard let shape = jsObj.shape else { return true }
 
@@ -4378,8 +4394,8 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             guard !args.isEmpty, args[0].isObject else {
                 return self.throwTypeError(message: "Reflect.preventExtensions: target must be an object")
             }
-            guard let targetObj = args[0].toObject() else { return .JS_FALSE }
-            targetObj.extensible = false
+            guard args[0].toObject() != nil else { return .JS_FALSE }
+            _ = self.preventExtensions(args[0])
             return .JS_TRUE
         }, name: "preventExtensions", length: 1)
         _ = setPropertyStr(obj: reflectObj, name: "preventExtensions", value: reflPreventExtensions)
@@ -4862,12 +4878,25 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // `arr.length = n`: shrink the element storage (releasing the dropped
         // elements) before the length slot is updated below.
         if jsObj.classID == JeffJSClassID.array.rawValue, atom == JeffJSAtomID.JS_ATOM_length.rawValue {
-            if value.isInt { jsObj.truncateFastArray(to: Int(value.toInt32())) }
+            // A frozen / sealed array or a read-only length: ArraySetLength
+            // with its writable and non-configurable-element checks.
+            if let st = jsObj._fastArrayValues, st.checked {
+                // Not a valid length number: the generic slot write below,
+                // but never an unchecked truncation.
+                if let r = setArrayLengthChecked(jsObj, value: value, flags: flags) { return r }
+            } else if value.isInt { jsObj.truncateFastArray(to: Int(value.toInt32())) }
             else if value.isFloat64, value.toFloat64() >= 0, value.toFloat64() < 4294967296.0 { jsObj.truncateFastArray(to: Int(value.toFloat64())) }
         }
         // Fast path for array integer-indexed writes
         if jsObj.fastArray || jsObj.classID == JeffJSClassID.array.rawValue {
             if rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom) {
+                // Non-extensible, read-only length or non-default element
+                // attributes: the write is checked first (an allowed add
+                // continues below).
+                if let st = jsObj._fastArrayValues, st.checked,
+                   let r = setArrayElementChecked(jsObj, st, index: idx, value: value, flags: flags) {
+                    return r
+                }
                 if jsObj.setArrayElement(idx, value: value) {
                     // Update length if needed (single hash lookup)
                     let arrCount = jsObj.arrayCount
@@ -5614,6 +5643,11 @@ extension JeffJSContext {
 
     func setArrayLength(_ obj: JeffJSValue, _ len: Int64) {
         guard let p = obj.toObject() else { return }
+        // A frozen / sealed array's length goes through ArraySetLength only.
+        if let st = p._fastArrayValues, st.checked {
+            _ = setProperty(obj: obj, atom: JeffJSAtomID.JS_ATOM_length.rawValue, value: newInt64(len))
+            return
+        }
         p.truncateFastArray(to: Int(min(len, Int64(Int32.max))))
         if p._fastArrayValues == nil, case .array(_, let values, let count) = p.payload {
             p.payload = .array(size: UInt32(len), values: values, count: count)
