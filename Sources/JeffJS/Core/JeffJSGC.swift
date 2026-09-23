@@ -1042,6 +1042,9 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     if case .mapState(let ms) = savedPayload { jeffJS_mapStateFree(ms) }
     // A promise owns its settled value and every reaction still queued on it.
     if case .promiseData(let pd) = savedPayload { jeffJS_promiseDataFree(pd) }
+    // A RegExp owns a counted reference on its pattern string (see
+    // "Pattern ownership" in JeffJSBuiltinRegExp.swift).
+    if case .regexp(let pattern, _) = savedPayload { js_regexp_releasePattern(pattern) }
     if case .typedArray(let ta) = savedPayload, let buf = ta.buffer {
         ta.buffer = nil
         if buf.refCount > 0 {

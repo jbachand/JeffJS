@@ -667,6 +667,17 @@ struct JeffJSValue {
         return JeffJSValue(bits: _objectTag | UInt64(UInt(bitPattern: raw)))
     }
 
+    /// A **borrowed** string value for a flat string a Swift holder keeps a
+    /// counted reference on (a RegExp's pattern): no ARC retain and no
+    /// refcount change. `.dupValue()` it to hand the string to JS — never
+    /// `makeString(s.retain())`, whose extra ARC retain is only balanced when
+    /// that value happens to be the one that takes the count to zero.
+    @inline(__always)
+    static func borrowedString(_ s: JeffJSString) -> JeffJSValue {
+        let raw = Unmanaged.passUnretained(s).toOpaque()
+        return JeffJSValue(bits: _stringTag | UInt64(UInt(bitPattern: raw)))
+    }
+
     /// Value for an object taken from the recycle pool: it still carries the
     /// Swift retain of its original makeObject, so no new retain here.
     @inline(__always)

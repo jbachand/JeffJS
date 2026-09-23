@@ -29,6 +29,58 @@ private func js_regexp_getPattern(_ obj: JeffJSObject) -> JeffJSString? {
     return nil
 }
 
+// MARK: - Pattern ownership
+//
+// A RegExp payload owns one counted JS reference on its pattern string, like
+// QuickJS's regexp object holds `re->pattern` until `js_regexp_finalizer`.
+// The count is taken when the pattern is stored (constructor, compile(),
+// the matchAll copy) and dropped by `js_regexp_releasePattern` when the
+// object dies (`freeObject`) or compile() replaces the pattern. The payload's
+// Swift reference alone only kept the memory: the string's JS refcount
+// reached zero as soon as the value that supplied the pattern died, the
+// `source` getter then handed the freed string back to JS with a fresh count,
+// and every later dup/free touched a freed string (JEFFJS_ZOMBIES=1 on
+// apple.com: marked.js's `edit(re).replace(..).getRegex()`, which rebuilds
+// patterns from `re.source`).
+//
+// Every pattern string satisfies the string invariant "refCount > 0 means one
+// outstanding JS ARC retain", so the payload's count can be dropped with a
+// plain `freeValue` and `source` can return `borrowedString(p).dupValue()`.
+
+/// Take the payload's reference for a pattern supplied as a JS value. A flat
+/// string is shared (one more count on it); a rope or buffer is copied into a
+/// fresh flat string (the rope's cached `flat` is owned by the rope and has
+/// no JS reference of its own to count against). nil for non-strings.
+private func js_regexp_adoptPattern(_ val: JeffJSValue) -> JeffJSString? {
+    guard let sb = val.stringBase else { return nil }
+    if sb.kind == JeffJSStringBase.kindFlat {
+        _ = val.dupValue()
+        return unsafeDowncast(sb, to: JeffJSString.self)
+    }
+    guard let flat = val.stringValue else { return nil }
+    return js_regexp_adoptFreshPattern(
+        JeffJSString(len: flat.len, isWideChar: flat.isWideChar, storage: flat.storage))
+}
+
+/// A newly created pattern string (refCount 1, never wrapped): wrapping it
+/// once gives it the JS ARC retain its single count stands for.
+private func js_regexp_adoptFreshPattern(_ s: JeffJSString) -> JeffJSString {
+    _ = JeffJSValue.makeString(s)
+    return s
+}
+
+/// Share another RegExp's pattern: one more count on it.
+private func js_regexp_sharePattern(_ s: JeffJSString) -> JeffJSString {
+    _ = JeffJSValue.borrowedString(s).dupValue()
+    return s
+}
+
+/// Drop the payload's reference on its pattern (the object is dying, or
+/// compile() is replacing the pattern).
+func js_regexp_releasePattern(_ s: JeffJSString?) {
+    if let s { JeffJSValue.borrowedString(s).freeValue() }
+}
+
 /// Extract the compiled bytecode from a RegExp object.
 private func js_regexp_getBytecode(_ obj: JeffJSObject) -> JeffJSString? {
     if case .regexp(_, let bytecode) = obj.payload {
@@ -162,8 +214,8 @@ func js_regexp_constructor(
     if let patternObj = patternArg.toObject(),
        patternObj.classID == JSClassID.JS_CLASS_REGEXP.rawValue {
 
-        // Extract the source pattern.
-        patternStr = js_regexp_getPattern(patternObj)
+        // Extract the source pattern (shared: the new payload takes a count).
+        patternStr = js_regexp_getPattern(patternObj).map(js_regexp_sharePattern)
 
         if flagsArg.isUndefined {
             // Use the original flags.
@@ -174,15 +226,20 @@ func js_regexp_constructor(
             flagsStr = flagsArg.stringValue
         }
     } else {
-        // Coerce pattern to string (undefined -> "").
+        // Coerce pattern to string (undefined -> ""); the payload owns a
+        // counted reference on it (see "Pattern ownership").
         if patternArg.isUndefined {
-            patternStr = JeffJSString(swiftString: "")
+            patternStr = js_regexp_adoptFreshPattern(JeffJSString(swiftString: ""))
+        } else if patternArg.isString {
+            patternStr = js_regexp_adoptPattern(patternArg)
         } else {
-            patternStr = patternArg.stringValue
-            if patternStr == nil {
-                // In a full build, JS_ToString would be called here.
-                patternStr = JeffJSString(swiftString: "")
-            }
+            let sv = ctx.toString(patternArg)
+            if sv.isException { return .exception }
+            patternStr = js_regexp_adoptPattern(sv)
+            sv.freeValue()
+        }
+        if patternStr == nil {
+            patternStr = js_regexp_adoptFreshPattern(JeffJSString(swiftString: ""))
         }
         flagsStr = flagsArg.isUndefined ? nil : flagsArg.stringValue
     }
@@ -190,6 +247,7 @@ func js_regexp_constructor(
     // Parse flags.
     let flagBits = js_regexp_parseFlags(flagsStr)
     if flagBits < 0 {
+        js_regexp_releasePattern(patternStr)
         return ctx.throwTypeError("RegExp: invalid flags")
     }
 
@@ -197,6 +255,7 @@ func js_regexp_constructor(
     let compiledBytecode = js_regexp_compile(ctx: ctx, pattern: patternStr, flags: flagBits)
     if compiledBytecode == nil {
         // Compilation error was already thrown.
+        js_regexp_releasePattern(patternStr)
         return .exception
     }
 
@@ -441,7 +500,8 @@ func js_regexp_toString(
     if obj.classID == JSClassID.JS_CLASS_REGEXP.rawValue {
         // Fast path: native RegExp.
         if let pattern = js_regexp_getPattern(obj) {
-            sourceVal = JeffJSValue.makeString(pattern.retain())
+            // Owned value (freed below with the slow path's reads).
+            sourceVal = JeffJSValue.borrowedString(pattern).dupValue()
         } else {
             sourceVal = JeffJSValue.makeString(JeffJSString(swiftString: "(?:)"))
         }
@@ -451,9 +511,10 @@ func js_regexp_toString(
         flagsVal = JeffJSValue.makeString(flagStr)
     } else {
         // Slow path: read "source" and "flags" properties.
-        sourceVal = obj.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_source.rawValue)
-        flagsVal = obj.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_flags.rawValue)
+        sourceVal = obj.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_source.rawValue).dupValue()
+        flagsVal = obj.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_flags.rawValue).dupValue()
     }
+    defer { sourceVal.freeValue(); flagsVal.freeValue() }
 
     // Build "/source/flags".
     let buf = JeffJSStringBuffer()
@@ -517,27 +578,42 @@ func js_regexp_compile(
                 "RegExp.prototype.compile: cannot supply flags when pattern is a RegExp"
             )
         }
-        patternStr = js_regexp_getPattern(patternObj)
+        patternStr = js_regexp_getPattern(patternObj).map(js_regexp_sharePattern)
         let bits = js_regexp_getFlags(patternObj)
         flagsStr = js_regexp_buildFlagsString(bits)
     } else {
-        patternStr = patternArg.isUndefined
-            ? JeffJSString(swiftString: "")
-            : patternArg.stringValue ?? JeffJSString(swiftString: "")
+        if patternArg.isUndefined {
+            patternStr = js_regexp_adoptFreshPattern(JeffJSString(swiftString: ""))
+        } else if patternArg.isString {
+            patternStr = js_regexp_adoptPattern(patternArg)
+        } else {
+            let sv = ctx.toString(patternArg)
+            if sv.isException { return .exception }
+            patternStr = js_regexp_adoptPattern(sv)
+            sv.freeValue()
+        }
+        if patternStr == nil {
+            patternStr = js_regexp_adoptFreshPattern(JeffJSString(swiftString: ""))
+        }
         flagsStr = flagsArg.isUndefined ? nil : flagsArg.stringValue
     }
 
     let flagBits = js_regexp_parseFlags(flagsStr)
     if flagBits < 0 {
+        js_regexp_releasePattern(patternStr)
         return ctx.throwTypeError("RegExp.compile: invalid flags")
     }
 
     let compiled = js_regexp_compile(ctx: ctx, pattern: patternStr, flags: flagBits)
     if compiled == nil {
+        js_regexp_releasePattern(patternStr)
         return .exception
     }
 
+    // The old pattern's count goes with the old payload.
+    let oldPattern = js_regexp_getPattern(obj)
     obj.payload = JeffJSObjectPayload.regexp(pattern: patternStr, bytecode: compiled)
+    js_regexp_releasePattern(oldPattern)
     js_regexp_setLastIndex(obj, value: 0)
 
     return this.dupValue()
@@ -634,7 +710,7 @@ func js_regexp_get_source(
         if pattern.len == 0 {
             return JeffJSValue.makeString(JeffJSString(swiftString: "(?:)"))
         }
-        return JeffJSValue.makeString(pattern.retain())
+        return JeffJSValue.borrowedString(pattern).dupValue()
     }
     return JeffJSValue.makeString(JeffJSString(swiftString: "(?:)"))
 }
@@ -959,7 +1035,7 @@ func js_regexp_Symbol_matchAll(
     let regexpCopy = jeffJS_createObject(ctx: ctx, proto: nil,
                                           classID: UInt16(JSClassID.JS_CLASS_REGEXP.rawValue))
     regexpCopy.payload = .regexp(
-        pattern: js_regexp_getPattern(obj)?.retain(),
+        pattern: js_regexp_getPattern(obj).map(js_regexp_sharePattern),
         bytecode: js_regexp_getBytecode(obj)?.retain()
     )
 

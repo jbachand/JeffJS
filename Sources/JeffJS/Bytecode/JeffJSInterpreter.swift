@@ -8315,6 +8315,10 @@ struct JeffJSInterpreter {
                 let flagsVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let patternVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let result = ctx.newRegExp(pattern: patternVal, flags: flagsVal)
+                // The constructor borrows both (the RegExp takes its own
+                // count on the pattern); the popped stack values are ours.
+                patternVal.freeValue()
+                flagsVal.freeValue()
                 if result.isException {
                     retVal = .exception
                     break dispatchLoop
