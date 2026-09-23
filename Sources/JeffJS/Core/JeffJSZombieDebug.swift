@@ -32,6 +32,9 @@ func jeffJS_bootstrapDebugFlags() {
     jeffJSZombiesEnabled = ProcessInfo.processInfo.environment["JEFFJS_ZOMBIES"] == "1"
     jeffJSTraceDebug = ProcessInfo.processInfo.environment["JEFFJS_TRACE_DEBUG"] == "1"
     jeffJSObjectPoolDisabled = ProcessInfo.processInfo.environment["JEFFJS_NO_POOL"] == "1"
+    if let cap = ProcessInfo.processInfo.environment["JEFFJS_ZOMBIE_REPORTS"].flatMap({ Int($0) }) {
+        JeffJSZombieDebug.reportsRemaining = cap
+    }
     JeffJSGCObjectHeader.trackRefcounts = JeffJSConfig.trackRefcounts
         || ProcessInfo.processInfo.environment["JEFFJS_TRACK_RC"] == "1"
     jeffJS_refDebugMode = JeffJSGCObjectHeader.trackRefcounts || jeffJSZombiesEnabled
@@ -43,8 +46,46 @@ func jeffJS_bootstrapDebugFlags() {
 }
 
 enum JeffJSZombieDebug {
-    /// Cap report spam — first few stacks are the signal.
+    /// Most recently created context (zombie mode only): its live frame chain
+    /// is printed with each report so the touch can be tied to JS source.
+    nonisolated(unsafe) static weak var context: JeffJSContext?
+
+    static func printJSStack() {
+        guard let ctx = context, ctx.currentFrame != nil else { return }
+        let trace = ctx.formatStackTrace(errorName: "JS stack", message: "",
+                                         frames: ctx.captureStackFrames(maxDepth: 8))
+        print(trace)
+    }
+    /// Contents of a freed string for the report (zombie strings keep their
+    /// storage, so this is still readable): ` "<first 80 chars>" len=N`.
+    static func describeString(_ sb: AnyObject?) -> String {
+        var text: String? = nil
+        var len = 0
+        if let s = sb as? JeffJSString { text = s.toSwiftString(); len = s.len }
+        else if let r = sb as? JeffJSStringRope { len = r.len; text = r.flat?.toSwiftString() ?? "<rope>" }
+        else if let b = sb as? JeffJSStringBuffer { text = b.toSwiftString(); len = text?.utf16.count ?? 0 }
+        guard let t = text else { return "" }
+        let clipped = t.count > 80 ? String(t.prefix(80)) + "..." : t
+        return " \"\(clipped)\" len=\(len)"
+    }
+
+    /// Cap report spam — first few stacks are the signal
+    /// (JEFFJS_ZOMBIE_REPORTS=N raises it; every touch past the cap is still
+    /// counted and the total is printed at exit).
     nonisolated(unsafe) static var reportsRemaining = 8
+    nonisolated(unsafe) static var touches = 0
+    nonisolated(unsafe) static var totalRegistered = false
+
+    static func countTouch() -> Bool {
+        touches += 1
+        if !totalRegistered {
+            totalRegistered = true
+            atexit { print("[ZOMBIE] \(JeffJSZombieDebug.touches) touch(es) on freed values") }
+        }
+        guard reportsRemaining > 0 else { return false }
+        reportsRemaining -= 1
+        return true
+    }
 
     /// Keeps freed strings/ropes/buffers allocated in zombie mode so stale
     /// NaN-boxed pointers stay detectable instead of scribbling reused memory.
@@ -52,21 +93,21 @@ enum JeffJSZombieDebug {
     nonisolated(unsafe) static var stringKeepAlive: [AnyObject] = []
 
     static func reportTouch(_ kind: String, _ hdr: JeffJSGCObjectHeader) {
-        guard reportsRemaining > 0 else { return }
-        reportsRemaining -= 1
+        guard countTouch() else { return }
         let classID = (hdr as? JeffJSObject)?.classID ?? -1
         print("[ZOMBIE-\(kind)] touch on freed object classID=\(classID) rc=\(hdr.refCount) type=\(hdr.gcObjType) ptr=\(Unmanaged.passUnretained(hdr).toOpaque())")
         for sym in Thread.callStackSymbols.prefix(14) {
             print("    \(sym)")
         }
+        printJSStack()
     }
 
-    static func reportString(_ kind: String, _ what: String) {
-        guard reportsRemaining > 0 else { return }
-        reportsRemaining -= 1
-        print("[ZOMBIE-STR-\(kind)] touch on freed \(what)")
+    static func reportString(_ kind: String, _ what: String, _ sb: AnyObject? = nil) {
+        guard countTouch() else { return }
+        print("[ZOMBIE-STR-\(kind)] touch on freed \(what)\(describeString(sb))")
         for sym in Thread.callStackSymbols.prefix(14) {
             print("    \(sym)")
         }
+        printJSStack()
     }
 }

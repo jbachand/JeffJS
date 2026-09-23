@@ -1131,15 +1131,14 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        let isBytecode = !jeffJS_calleeTakesArgs(callbackFn)   // true: this caller releases the pinned element
         var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
         var cursor = ElementCursor(obj: obj, len: len)
         while let e = cursor.next(ctx) {
             if e.value.isException { return e.value }
-            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn, isBytecode: isBytecode,
+            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn,
                                                  thisArg: thisArg, element: e, cbArgs: &cbArgs)
-            if isBytecode { pinned.freeValue() }
+            pinned.freeValue()
             if r.isException { return r }
             r.freeValue()
         }
@@ -1161,7 +1160,6 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        let isBytecode = !jeffJS_calleeTakesArgs(callbackFn)   // true: this caller releases the pinned element
         var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
         let result = arraySpeciesCreate(ctx: ctx, obj: obj, length: len)
@@ -1181,9 +1179,9 @@ struct JeffJSBuiltinArray {
                 if e.value.isException { for v in out { v.freeValue() }; return e.value }
                 // A hole, or the array shrinking under the callback, leaves a gap.
                 while Int64(out.count) < e.index { out.append(.uninitialized); dense = false }
-                let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn, isBytecode: isBytecode,
+                let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn,
                                                      thisArg: thisArg, element: e, cbArgs: &cbArgs)
-                if isBytecode { pinned.freeValue() }
+                pinned.freeValue()
                 if r.isException { for v in out { v.freeValue() }; return r }
                 out.append(r)
             }
@@ -1202,9 +1200,9 @@ struct JeffJSBuiltinArray {
         var cursor = ElementCursor(obj: obj, len: len)
         while let e = cursor.next(ctx) {
             if e.value.isException { return e.value }
-            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn, isBytecode: isBytecode,
+            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn,
                                                  thisArg: thisArg, element: e, cbArgs: &cbArgs)
-            if isBytecode { pinned.freeValue() }
+            pinned.freeValue()
             if r.isException { return r }
             ctx.setPropertyByIndex(obj: result, index: UInt32(e.index), value: r)
         }
@@ -1226,7 +1224,6 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        let isBytecode = !jeffJS_calleeTakesArgs(callbackFn)   // true: this caller releases the pinned element
         var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
         let result = arraySpeciesCreate(ctx: ctx, obj: obj, length: 0)
@@ -1242,10 +1239,10 @@ struct JeffJSBuiltinArray {
         var cursor = ElementCursor(obj: obj, len: len)
         while let e = cursor.next(ctx) {
             if e.value.isException { for v in kept { v.freeValue() }; return e.value }
-            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn, isBytecode: isBytecode,
+            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn,
                                                  thisArg: thisArg, element: e, cbArgs: &cbArgs)
             if r.isException {
-                if isBytecode { pinned.freeValue() }
+                pinned.freeValue()
                 for v in kept { v.freeValue() }
                 return r
             }
@@ -1254,11 +1251,11 @@ struct JeffJSBuiltinArray {
             if selected {
                 // The result takes its own reference; after a C callee the
                 // pinned one was handed over, so take a fresh one.
-                let keep = isBytecode ? pinned : pinned.dupValue()
+                let keep = pinned
                 if plainResult { kept.append(keep) }
                 else { ctx.setPropertyByIndex(obj: result, index: UInt32(to), value: keep) }
                 to += 1
-            } else if isBytecode {
+            } else {
                 pinned.freeValue()
             }
         }
@@ -1282,15 +1279,14 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        let isBytecode = !jeffJS_calleeTakesArgs(callbackFn)   // true: this caller releases the pinned element
         var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
         var cursor = ElementCursor(obj: obj, len: len)
         while let e = cursor.next(ctx) {
             if e.value.isException { return e.value }
-            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn, isBytecode: isBytecode,
+            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn,
                                                  thisArg: thisArg, element: e, cbArgs: &cbArgs)
-            if isBytecode { pinned.freeValue() }
+            pinned.freeValue()
             if r.isException { return r }
             let t = ctx.toBool(r)
             r.freeValue()
@@ -1314,15 +1310,14 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        let isBytecode = !jeffJS_calleeTakesArgs(callbackFn)   // true: this caller releases the pinned element
         var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
         var cursor = ElementCursor(obj: obj, len: len)
         while let e = cursor.next(ctx) {
             if e.value.isException { return e.value }
-            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn, isBytecode: isBytecode,
+            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn,
                                                  thisArg: thisArg, element: e, cbArgs: &cbArgs)
-            if isBytecode { pinned.freeValue() }
+            pinned.freeValue()
             if r.isException { return r }
             let t = ctx.toBool(r)
             r.freeValue()
@@ -1346,21 +1341,20 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        let isBytecode = !jeffJS_calleeTakesArgs(callbackFn)   // true: this caller releases the pinned element
         var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
         // find visits holes as undefined rather than skipping them.
         var cursor = ElementCursor(obj: obj, len: len, visitHoles: true)
         while let e = cursor.next(ctx) {
             if e.value.isException { return e.value }
-            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn, isBytecode: isBytecode,
+            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn,
                                                  thisArg: thisArg, element: e, cbArgs: &cbArgs)
-            if r.isException { if isBytecode { pinned.freeValue() }; return r }
+            if r.isException { pinned.freeValue(); return r }
             let t = ctx.toBool(r)
             r.freeValue()
             // The value read before the callback ran is the one returned.
-            if t { return isBytecode ? pinned : pinned.dupValue() }
-            if isBytecode { pinned.freeValue() }
+            if t { return pinned }
+            pinned.freeValue()
         }
         return .undefined
     }
@@ -1380,15 +1374,14 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        let isBytecode = !jeffJS_calleeTakesArgs(callbackFn)   // true: this caller releases the pinned element
         var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
 
         var cursor = ElementCursor(obj: obj, len: len, visitHoles: true)
         while let e = cursor.next(ctx) {
             if e.value.isException { return e.value }
-            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn, isBytecode: isBytecode,
+            let (r, pinned) = callElementCallback(ctx: ctx, fn: callbackFn,
                                                  thisArg: thisArg, element: e, cbArgs: &cbArgs)
-            if isBytecode { pinned.freeValue() }
+            pinned.freeValue()
             if r.isException { return r }
             let t = ctx.toBool(r)
             r.freeValue()
@@ -1480,7 +1473,6 @@ struct JeffJSBuiltinArray {
         if !ctx.isCallable(callbackFn) {
             return ctx.throwTypeError(message: "Array.prototype.reduce: callback is not a function")
         }
-        let isBytecode = !jeffJS_calleeTakesArgs(callbackFn)   // true: this caller releases the pinned element
 
         var cursor = ElementCursor(obj: obj, len: len)
         // The accumulator is borrowed while it is still the caller's initial
@@ -1507,10 +1499,8 @@ struct JeffJSBuiltinArray {
             cbArgs[1] = pinned
             cbArgs[2] = ctx.newInt64(e.index)
             let r = ctx.callFunction(callbackFn, thisVal: .undefined, args: cbArgs)
-            if isBytecode {
-                pinned.freeValue()
-                if accOwned { acc.freeValue() }   // the callback returned its own reference
-            }
+            pinned.freeValue()
+            if accOwned { acc.freeValue() }   // the callback returned its own reference
             if r.isException { return r }
             acc = r
             accOwned = true
@@ -1961,7 +1951,7 @@ struct JeffJSBuiltinArray {
     /// it to an ownership-taking setter — the interpreter's own call sites
     /// follow the same rule.
     @inline(__always)
-    private static func callElementCallback(ctx: JeffJSContext, fn: JeffJSValue, isBytecode: Bool,
+    private static func callElementCallback(ctx: JeffJSContext, fn: JeffJSValue,
                                             thisArg: JeffJSValue, element: ElementCursor.Element,
                                             cbArgs: inout [JeffJSValue]) -> (result: JeffJSValue, pinned: JeffJSValue) {
         let pinned = element.owned ? element.value : element.value.dupValue()

@@ -405,6 +405,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         JeffJSGCObjectHeader.activeRuntime = rt
         self.rt = rt
         self.header = JeffJSGCObjectHeader()
+        defer { if jeffJSZombiesEnabled { JeffJSZombieDebug.context = self } }
         self.header.gcObjType = .jsObject
         self.link = ListNode()
 
@@ -4120,7 +4121,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 }
                 _ = arrObj // suppress warning
             }
-            return self.callFunction(target, thisVal: thisArg, args: callArgs)
+            // getPropertyByIndex returned owned values; the call borrows them.
+            let result = self.callFunction(target, thisVal: thisArg, args: callArgs)
+            for a in callArgs { a.freeValue() }
+            return result
         }, name: "apply", length: 3)
         _ = setPropertyStr(obj: reflectObj, name: "apply", value: reflApply)
 
