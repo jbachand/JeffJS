@@ -314,6 +314,8 @@ struct JeffJSTestRunner {
             ("BuiltinSubclassing", { $0.testBuiltinSubclassing() }),
             ("RegExpAlternation", { $0.testRegExpAlternation() }),
             ("RegExpBacktrack", { $0.testRegExpBacktrack() }),
+            ("RegExpCaseFolding", { $0.testRegExpCaseFolding() }),
+            ("RegExpAnnexBLookbehind", { $0.testRegExpAnnexBLookbehind() }),
             ("ReflectConstructNewTarget", { $0.testReflectConstructNewTarget() }),
             ("ClassFields", { $0.testClassFields() }),
             ("BuiltinGaps", { $0.testBuiltinGaps() }),
@@ -11674,6 +11676,142 @@ extension JeffJSTestRunner {
             }
             soFar.length + ":" + out.join("|")
             """#, expect: "0:.dropdown|SPACE|form")
+    }
+
+    /// Case-insensitive matching per ECMA-262 Canonicalize / CharacterSetMatcher.
+    /// A class is canonicalised (ranges included) and THEN negated, and the
+    /// input character is canonicalised before the membership test.  The VM
+    /// used to negate first and then add case variants, so `/[^a]/i` matched
+    /// "a" and `/[^a-z0-9-]/gi` matched letters.  Unicode mode uses simple
+    /// case folding; legacy mode uses toUpperCase and never maps non-ASCII to
+    /// ASCII (U+017F / U+212A).
+    mutating func testRegExpCaseFolding() {
+        let (_, ctx) = makeCtx()
+
+        // --- the reported repros ---------------------------------------------
+        evalCheckBool(ctx, #"/[^a]/i.test("a")"#, expect: false)
+        evalCheckBool(ctx, #"/[^a]/i.test("A")"#, expect: false)
+        evalCheckBool(ctx, #"/[^A]/i.test("a")"#, expect: false)
+        evalCheckBool(ctx, #"/[^a]/i.test("b")"#, expect: true)
+        evalCheckBool(ctx, #"/[^a-z0-9-]/gi.test("Q")"#, expect: false)
+        evalCheckStr(ctx, #""Hello-World_42!".replace(/[^a-z0-9-]/gi, "")"#, expect: "Hello-World42")
+
+        // --- ranges crossing the case boundary ---------------------------------
+        evalCheckBool(ctx, #"/[^a-z]/i.test("A")"#, expect: false)
+        evalCheckBool(ctx, #"/[^A-Z]/i.test("z")"#, expect: false)
+        evalCheckBool(ctx, #"/[^a-z]/i.test("5")"#, expect: true)
+        evalCheckBool(ctx, #"/[a-c]/i.test("B")"#, expect: true)
+        evalCheckBool(ctx, #"/[A-C]/i.test("b")"#, expect: true)
+        evalCheckBool(ctx, #"/[a-c]/i.test("d")"#, expect: false)
+        evalCheckBool(ctx, #"/^[a-z]+$/i.test("MiXeD")"#, expect: true)
+        evalCheckBool(ctx, #"/[Z-a]/i.test("z")"#, expect: true)      // Z [ \ ] ^ _ ` a
+        evalCheckBool(ctx, #"/[^Z-a]/i.test("A")"#, expect: false)
+        evalCheckBool(ctx, #"/[à-ÿ]/i.test("É")"#, expect: true)
+        evalCheckBool(ctx, #"/[^à-þ]/i.test("É")"#, expect: false)
+
+        // --- \w \W \s \S \d inside and outside classes -------------------------
+        evalCheckBool(ctx, #"/[\w]/i.test("K")"#, expect: true)
+        evalCheckBool(ctx, #"/[^\w]/i.test("k")"#, expect: false)
+        evalCheckBool(ctx, #"/[^\W]/i.test("s")"#, expect: true)
+        evalCheckBool(ctx, #"/\W/i.test("a")"#, expect: false)
+        evalCheckBool(ctx, #"/[\s]/i.test("\t")"#, expect: true)
+        evalCheckBool(ctx, #"/[^\s]/i.test("S")"#, expect: true)
+        evalCheckBool(ctx, #"/[^\d]/i.test("7")"#, expect: false)
+        evalCheckBool(ctx, #"/[^\D]/i.test("7")"#, expect: true)
+
+        // --- u mode: simple case folding; U+017F and U+212A are word chars ----
+        evalCheckBool(ctx, #"/\w/ui.test("ſ")"#, expect: true)
+        evalCheckBool(ctx, #"/\W/ui.test("ſ")"#, expect: false)
+        evalCheckBool(ctx, #"/[^\W]/ui.test("K")"#, expect: true)
+        evalCheckBool(ctx, #"/\b/ui.test("ſ")"#, expect: true)
+        evalCheckBool(ctx, #"/[^s]/ui.test("ſ")"#, expect: false)
+        evalCheckBool(ctx, #"/K/ui.test("k")"#, expect: true)
+        evalCheckBool(ctx, #"/ς/ui.test("Σ")"#, expect: true)
+        evalCheckBool(ctx, #"/[^σ]/ui.test("ς")"#, expect: false)
+        evalCheckBool(ctx, #"/ß/ui.test("ẞ")"#, expect: true)
+        evalCheckBool(ctx, #"/ι/ui.test("Ι")"#, expect: true)
+        evalCheckBool(ctx, #"/ı/ui.test("i")"#, expect: false)
+        evalCheckBool(ctx, #"/i/ui.test("İ")"#, expect: false)
+        evalCheckBool(ctx, #"/\u{10400}/ui.test("\u{10428}")"#, expect: true)
+        evalCheckBool(ctx, #"/[^\u{10400}]/ui.test("\u{10428}")"#, expect: false)
+        evalCheckBool(ctx, #"/[\u{10400}-\u{10410}]/ui.test("\u{10428}")"#, expect: true)
+        evalCheckBool(ctx, #"/\p{Lu}/ui.test("a")"#, expect: true)
+        evalCheckBool(ctx, #"/[^\p{Lu}]/ui.test("a")"#, expect: false)
+
+        // --- legacy mode: toUpperCase, no non-ASCII -> ASCII ------------------
+        evalCheckBool(ctx, #"/\w/i.test("ſ")"#, expect: false)
+        evalCheckBool(ctx, #"/\W/i.test("ſ")"#, expect: true)
+        evalCheckBool(ctx, #"/s/i.test("ſ")"#, expect: false)
+        evalCheckBool(ctx, #"/k/i.test("K")"#, expect: false)
+        evalCheckBool(ctx, #"/[^k]/i.test("K")"#, expect: true)
+        evalCheckBool(ctx, #"/İ/i.test("i")"#, expect: false)
+        evalCheckBool(ctx, #"/ß/i.test("ẞ")"#, expect: false)
+        evalCheckBool(ctx, #"/é/i.test("É")"#, expect: true)
+        evalCheckBool(ctx, #"/σ/i.test("Σ")"#, expect: true)
+        evalCheckBool(ctx, #"/[^σ]/i.test("Σ")"#, expect: false)
+
+        // --- flags and the string methods ------------------------------------
+        evalCheckStr(ctx, #"JSON.stringify("aAbBaAcC".match(/[^a]+/gi))"#, expect: #"["bB","cC"]"#)
+        evalCheckStr(ctx, #"var r = /[^a]/iy; r.lastIndex = 1; String(r.test("aAb"))"#, expect: "false")
+        evalCheckStr(ctx, #"var r = /[^a]/iy; r.lastIndex = 2; r.test("aAb") + "," + r.lastIndex"#, expect: "true,3")
+        evalCheckStr(ctx, #"JSON.stringify("xAaYaAz".split(/[^a]/i))"#, expect: #"["","Aa","aA",""]"#)
+        evalCheckStr(ctx, #""a1B2c3".replace(/[^A-Z]/gi, "")"#, expect: "aBc")
+        evalCheckStr(ctx, #""aXbx".replace(/x/gi, "-")"#, expect: "a-b-")
+        evalCheckBool(ctx, #"/^[^]$/i.test("A")"#, expect: true)
+        evalCheckBool(ctx, #"/[]/i.test("a")"#, expect: false)
+        evalCheckStr(ctx, #"String(/(a)\1/i.exec("aA"))"#, expect: "aA,a")
+        evalCheckStr(ctx, #"String(/(é)\1/i.exec("éÉ"))"#, expect: "\u{e9}\u{c9},\u{e9}")
+    }
+
+    /// Annex B back references (`\1` before its group, `\N` beyond the group
+    /// count is a legacy octal escape), right-to-left lookbehind bodies,
+    /// finite lazy loops nesting their optional iterations, and the empty
+    /// check on `?`.
+    mutating func testRegExpAnnexBLookbehind() {
+        let (_, ctx) = makeCtx()
+
+        // --- back references --------------------------------------------------
+        evalCheckStr(ctx, #"JSON.stringify(/\1(a)/.exec("aa"))"#, expect: #"["a","a"]"#)
+        evalCheckBool(ctx, #"/\1/.test("\x01")"#, expect: true)
+        evalCheckBool(ctx, #"/(a)\2/.test("a\x02")"#, expect: true)
+        evalCheckBool(ctx, #"/(a)\11/.test("a\t")"#, expect: true)
+        evalCheckBool(ctx, #"/\8/.test("8")"#, expect: true)
+        evalCheckBool(ctx, #"/[\1]/.test("\x01")"#, expect: true)
+        evalCheckBool(ctx, #"/\p{L}/.test("p{L}")"#, expect: true)
+        evalCheckStr(ctx, #"JSON.stringify(/\k<x>(?<x>b)/.exec("b"))"#, expect: #"["b","b"]"#)
+        evalCheckBool(ctx, #"/\k<a>/.test("k<a>")"#, expect: true)
+        evalCheckException(ctx, #"new RegExp("\\2(a)", "u")"#)
+        evalCheckException(ctx, #"new RegExp("[z-a]")"#)
+        evalCheckException(ctx, #"new RegExp("a{2}{3}")"#)
+        evalCheckBool(ctx, #"/\x4g/.test("x4g")"#, expect: true)
+        evalCheckBool(ctx, #"/\u12x/.test("u12x")"#, expect: true)
+        evalCheckBool(ctx, #"/^\u{2}$/.test("uu")"#, expect: true)
+
+        // --- lookbehind runs right to left ------------------------------------
+        evalCheckStr(ctx, #"String(/(?<=ab)c/.exec("abc"))"#, expect: "c")
+        evalCheckBool(ctx, #"/(?<!ab)c/.test("abc")"#, expect: false)
+        evalCheckStr(ctx, #"JSON.stringify(/(?<=(\d+))x/.exec("123x"))"#, expect: #"["x","123"]"#)
+        evalCheckStr(ctx, #"JSON.stringify(/(?<=(\d+?))x/.exec("123x"))"#, expect: #"["x","3"]"#)
+        evalCheckBool(ctx, #"/(?<=[a-z]{2})\d/.test("ab1")"#, expect: true)
+        evalCheckStr(ctx, #"String(/(?<=\$)\d+/.exec("$42"))"#, expect: "42")
+        evalCheckStr(ctx, #"JSON.stringify(/(?<=\1(a))b/.exec("aab"))"#, expect: #"["b","a"]"#)
+        evalCheckStr(ctx, #"JSON.stringify(/(?<=(a)\1)b/i.exec("aAb"))"#, expect: #"["b","A"]"#)
+        evalCheckStr(ctx, ##""a1 b2 c3".replace(/(?<=[ab])\d/g, "#")"##, expect: "a# b# c3")
+        evalCheckStr(ctx, #"JSON.stringify(/(?:(?<=(a))(x)){0,2}/.exec("a"))"#, expect: #"["",null,null]"#)
+
+        // --- nested lazy captures and the empty check on ? --------------------
+        evalCheckStr(ctx, #"JSON.stringify(/^(a+?){1,3}?$/.exec("aaa"))"#, expect: #"["aaa","a"]"#)
+        evalCheckStr(ctx, #"JSON.stringify(/^([a-c]{1,3}?){1,3}?$/.exec("abc"))"#, expect: #"["abc","c"]"#)
+        evalCheckStr(ctx, #"JSON.stringify(/^(a{1,3}?){2}$/.exec("aaa"))"#, expect: #"["aaa","aa"]"#)
+        evalCheckStr(ctx, #"String(/(?:a*?)?/.exec("a"))"#, expect: "a")
+        evalCheckStr(ctx, #"JSON.stringify(/(\d{1,3}?|(?:[a-c]*?|x+a?)?){2,}/.exec("a"))"#, expect: #"["a",""]"#)
+        evalCheckStr(ctx, #"JSON.stringify(/(?:b*?(?:(a|b)??)?b*)+?ab+?/.exec("abab"))"#, expect: #"["abab","a"]"#)
+
+        // --- u mode never starts a match inside a surrogate pair; non-u
+        //     patterns are UTF-16 ----------------------------------------------
+        evalCheckBool(ctx, #"/[^\u{10428}]/u.test("\u{10428}")"#, expect: false)
+        evalCheckBool(ctx, #"/😀/.test("😀")"#, expect: true)
+        evalCheckBool(ctx, #"/^.{2}$/.test("😀")"#, expect: true)
     }
 
     mutating func testBuiltinSubclassing() {
