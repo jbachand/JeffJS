@@ -46,11 +46,11 @@ final class JeffJSDOMBridge {
 
     /// Cache of wrapped JS element objects keyed by DOMNode UUID.
     /// Ensures identity: the same DOMNode always maps to the same JS object.
-    private var elementCache: [UUID: JeffJSValue] = [:]
+    var elementCache: [UUID: JeffJSValue] = [:]
 
     /// Registry of all DOMNodes that have been wrapped, keyed by UUID.
     /// Used by extractNode fallback when opaque payload is unavailable.
-    private var nodeRegistry: [UUID: DOMNode] = [:]
+    var nodeRegistry: [UUID: DOMNode] = [:]
 
     /// The JS `document` object, stored so wrapped elements can reference it
     /// as `ownerDocument` (required by React DOM's event delegation).
@@ -88,7 +88,7 @@ final class JeffJSDOMBridge {
     public var scrollOffset: CGPoint = .zero
 
     /// Per-element `scrollTop`/`scrollLeft` values assigned from JS.
-    private var elementScrollPositions: [UUID: CGPoint] = [:]
+    var elementScrollPositions: [UUID: CGPoint] = [:]
 
     /// Cache of `scrollWidth`/`scrollHeight` per node (descendant union is O(n));
     /// cleared whenever any rect changes.
@@ -109,25 +109,25 @@ final class JeffJSDOMBridge {
     /// prototype's `classList` accessor so every element gets its *own* list
     /// (the previous eager materialisation bound a single empty object to the
     /// shared prototype, leaving `el.classList.add` undefined).
-    private var classListCache: [UUID: JeffJSValue] = [:]
+    var classListCache: [UUID: JeffJSValue] = [:]
 
     /// Per-node `relList` wrappers, keyed by `DOMNode.id`. Same lifetime rules
     /// as `classListCache`.
-    private var relListCache: [UUID: JeffJSValue] = [:]
+    var relListCache: [UUID: JeffJSValue] = [:]
 
     /// Detached documents handed out by `document.implementation.createHTMLDocument`
     /// and `DOMParser.parseFromString`, keyed by their root `DOMNode.id`.
     /// Non-empty only on pages that ask for one, so the `ownerDocument` walk in
     /// `wrapElement` stays free for everything else.
-    private var detachedDocuments: [UUID: JeffJSValue] = [:]
-    private var detachedDocumentRoots: [DOMNode] = []
+    var detachedDocuments: [UUID: JeffJSValue] = [:]
+    var detachedDocumentRoots: [DOMNode] = []
 
     /// `<template>` content fragments, keyed by the template element's id.
-    private var templateContent: [UUID: DOMNode] = [:]
+    var templateContent: [UUID: DOMNode] = [:]
 
     /// `<textarea>` elements whose `value` script has set (the dirty value
     /// flag): from then on `value` no longer follows the child text.
-    private var dirtyTextareas: Set<UUID> = []
+    var dirtyTextareas: Set<UUID> = []
 
     /// The `<script>` element currently being evaluated (`document.currentScript`).
     private var currentScriptNode: DOMNode?
@@ -136,6 +136,61 @@ final class JeffJSDOMBridge {
     /// returned by `wrapElementArray` (HTMLCollection/NodeList shape).
     private var nodeListItemFn: JeffJSValue?
     private var nodeListNamedItemFn: JeffJSValue?
+
+    /// The context this bridge registered on (for mutation records, queued
+    /// tasks and events built outside a native call's own `ctx`).
+    private(set) weak var jsContext: JeffJSContext?
+
+    // MARK: Node lifetimes (JeffJSDOMBridge+Interaction.swift)
+
+    /// Nodes that left a tree, or were wrapped while detached. A node's
+    /// wrapper and listeners belong to the node (DOM §2.7): removal keeps
+    /// them, and they are dropped only when the whole detached subtree is
+    /// unreachable from script (`collectDetachedNodes`).
+    var detachedCandidates: [DOMNode] = []
+    var detachedCandidateIDs: Set<UUID> = []
+    var detachedSweepThreshold = 64
+
+    // MARK: dataset / MutationObserver / focus / click / tasks
+
+    /// Per-node `dataset` proxies (owned), keyed like the element cache.
+    var datasetCache: [UUID: JeffJSValue] = [:]
+    /// `function (target) -> Proxy` built by the dataset shim (owned).
+    var datasetFactory: JeffJSValue?
+
+    var moObservers: [Int: JeffJSMutationObserverEntry] = [:]
+    var moRegistrations: [UUID: [JeffJSMutationRegistration]] = [:]
+    var moDeliveryScheduled = false
+
+    /// The focused element (HTML "focused area"); nil = the viewport/body.
+    weak var focusedElement: DOMNode?
+    /// Script moved focus (`el.focus()`, `el.blur()`, autofocus, a focused
+    /// node's removal is silent): `(newFocus, oldFocus)`. The host moves its
+    /// first responder to match. Not called for host-initiated changes
+    /// (`hostFocusChanged(to:ctx:)` / `__nativeEventBridge.focus`).
+    var onFocusChange: ((_ newFocus: DOMNode?, _ oldFocus: DOMNode?) -> Void)?
+    /// Activation behaviour the DOM cannot perform itself, run after an
+    /// uncanceled `click()`: kind "hyperlink" (`a`/`area` with `href`),
+    /// "submit" / "reset" (when the form has no `requestSubmit` / `reset`).
+    /// Return true when handled. Falls back to the JS function
+    /// `window.__nativeActivationBehavior(element, kind)` when nil.
+    var onActivationBehavior: ((_ element: DOMNode, _ kind: String) -> Bool)?
+    /// Computed style for layout-dependent DOM getters (`innerText`,
+    /// focusability): the resolved value of a CSS property, or nil when
+    /// unknown. Without it the bridge asks the host's
+    /// `__nativeGetComputedStyleValue(nodeID, property)`, then the inline
+    /// style and the UA defaults.
+    var computedStyleProvider: ((_ node: DOMNode, _ property: String) -> String?)?
+
+    var clickInProgress: Set<UUID> = []
+    /// Details elements with a queued `toggle` task -> the old `open` state.
+    var pendingDetailsToggles: [UUID: Bool] = [:]
+    /// Queued tasks (HTML "queue a task"), run from one `setTimeout(…, 0)`.
+    var pendingTasks: [() -> Void] = []
+    var taskScheduled = false
+    var taskRunnerFn: JeffJSValue?
+    /// The inert documents holding `<template>` contents, per owner document.
+    var inertDocuments: [UUID: DOMNode] = [:]
 
     // MARK: - Init
 
@@ -186,6 +241,23 @@ final class JeffJSDOMBridge {
         nodeListItemFn?.freeValue(); nodeListItemFn = nil
         nodeListNamedItemFn?.freeValue(); nodeListNamedItemFn = nil
 
+        for (_, v) in datasetCache { v.freeValue() }
+        datasetCache.removeAll()
+        datasetFactory?.freeValue(); datasetFactory = nil
+        for (_, entry) in moObservers { entry.release() }
+        moObservers.removeAll()
+        moRegistrations.removeAll()
+        moDeliveryScheduled = false
+        focusedElement = nil
+        clickInProgress.removeAll()
+        pendingDetailsToggles.removeAll()
+        pendingTasks.removeAll()
+        taskScheduled = false
+        taskRunnerFn?.freeValue(); taskRunnerFn = nil
+        inertDocuments.removeAll()
+        detachedCandidates.removeAll()
+        detachedCandidateIDs.removeAll()
+
         nodeRegistry.removeAll()
         layoutRects.removeAll()
         elementScrollPositions.removeAll()
@@ -223,16 +295,9 @@ final class JeffJSDOMBridge {
         return pending
     }
 
-    /// Clears event listeners, element cache, and node registry for a node
-    /// and all its descendants when it is removed from the DOM.
-    func clearNodeAndDescendants(_ node: DOMNode) {
-        clearEventListeners(for: node.id)
-        for child in node.children {
-            clearNodeAndDescendants(child)
-        }
-    }
-
-    /// Clears event listeners and cache for a specific node when it is removed from the DOM.
+    /// Drops the event listeners, wrapper and caches of one node that script
+    /// can no longer reach (see `collectDetachedNodes`). Removal from the
+    /// tree does NOT call this: listeners belong to the node (DOM §2.7).
     func clearEventListeners(for nodeID: UUID) {
         // Tell centralized event bridge to free listeners for this node
         eventBridge?.removeAllListeners(forNodeID: nodeID)
@@ -251,6 +316,10 @@ final class JeffJSDOMBridge {
             cachedList.freeValue()
         }
         templateContent.removeValue(forKey: nodeID)
+        if let ds = datasetCache.removeValue(forKey: nodeID) { ds.freeValue() }
+        dirtyTextareas.remove(nodeID)
+        pendingDetailsToggles.removeValue(forKey: nodeID)
+        if moRegistrations.removeValue(forKey: nodeID) != nil { pruneIdleMutationObservers() }
     }
 
     // MARK: - document.currentScript
@@ -266,6 +335,7 @@ final class JeffJSDOMBridge {
 
     /// Registers `document` and `window` objects on the JeffJS context's global scope.
     func register(on ctx: JeffJSContext) {
+        jsContext = ctx
         let global = ctx.getGlobalObject()
 
         // -- window alias --
@@ -319,6 +389,10 @@ final class JeffJSDOMBridge {
             let html = ctx.toSwiftString(args.first ?? .undefined) ?? ""
             return self.parseDetachedDocument(html: html, ctx: ctx)
         }, length: 1)
+
+        // MutationObserver (DOM §4.3), native: replaces any stub installed
+        // earlier; host polyfills test `typeof MutationObserver` and skip.
+        installMutationObserver(on: global, ctx: ctx)
 
         global.freeValue()
     }
@@ -436,6 +510,7 @@ final class JeffJSDOMBridge {
             guard let self, let tag = self.extractString(ctx: ctx, args: args, index: 0) else {
                 return JeffJSValue.null
             }
+            self.maybeCollectDetachedNodes()
             let node = DOMNode.element(tag: tag)
             return self.wrapElement(node, ctx: ctx)
         }, length: 1)
@@ -446,6 +521,7 @@ final class JeffJSDOMBridge {
         // SVG context element fragment-parses as foreign content.
         ctx.setPropertyFunc(obj: doc, name: "createElementNS", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.null }
+            self.maybeCollectDetachedNodes()
             guard let node = Self.makeElementNS(ctx: ctx, args: args) else { return JeffJSValue.null }
             return self.wrapElement(node, ctx: ctx)
         }, length: 2)
@@ -455,6 +531,7 @@ final class JeffJSDOMBridge {
             guard let self, let text = self.extractString(ctx: ctx, args: args, index: 0) else {
                 return JeffJSValue.null
             }
+            self.maybeCollectDetachedNodes()
             let node = DOMNode.text(text)
             return self.wrapElement(node, ctx: ctx)
         }, length: 1)
@@ -462,6 +539,7 @@ final class JeffJSDOMBridge {
         // createDocumentFragment
         ctx.setPropertyFunc(obj: doc, name: "createDocumentFragment", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.null }
+            self.maybeCollectDetachedNodes()
             let node = DOMNode.documentFragment()
             return self.wrapElement(node, ctx: ctx)
         }, length: 0)
@@ -485,22 +563,41 @@ final class JeffJSDOMBridge {
             return .newBool(self.nodeContains(self.root, child: other) || other === self.root)
         }, length: 1)
 
-        // importNode(node, deep) / adoptNode(node)
+        // importNode(node, deep) / adoptNode(node) — DOM §4.5: the clone /
+        // the adopted node (removed from its old parent) belongs to this document.
         ctx.setPropertyFunc(obj: doc, name: "importNode", fn: { [weak self] ctx, _, args in
             guard let self, !args.isEmpty, let node = self.extractNode(from: args[0]) else {
                 return JeffJSValue.null
             }
+            if node.nodeType == .document {
+                return self.throwDOMException(ctx: ctx, name: "NotSupportedError",
+                                              message: "Failed to execute 'importNode' on 'Document': The node provided is a document, which may not be imported.")
+            }
             let deep = args.count > 1 && args[1].toBool()
-            return self.wrapElement(self.cloneDOMNode(node, deep: deep), ctx: ctx)
+            let clone = self.cloneDOMNode(node, deep: deep)
+            clone.nodeDocument = nil
+            return self.wrapElement(clone, ctx: ctx)
         }, length: 2)
 
         ctx.setPropertyFunc(obj: doc, name: "adoptNode", fn: { [weak self] ctx, _, args in
             guard let self, !args.isEmpty, let node = self.extractNode(from: args[0]) else {
                 return JeffJSValue.null
             }
-            node.parent?.removeChild(node)
-            return self.wrapElement(node, ctx: ctx)
+            if node.nodeType == .document {
+                return self.throwDOMException(ctx: ctx, name: "NotSupportedError",
+                                              message: "Failed to execute 'adoptNode' on 'Document': The node provided is a document, which may not be adopted.")
+            }
+            self.adopt(node, into: self.root)
+            return args[0].dupValue()
         }, length: 1)
+
+        // document.activeElement (HTML §6.6.4): the focused element, else the
+        // body, else the document element.
+        let activeGetter = ctx.newCFunction({ [weak self] ctx, _, _ in
+            guard let self, let node = self.activeElement() else { return JeffJSValue.null }
+            return self.wrapElement(node, ctx: ctx)
+        }, name: "get activeElement", length: 0)
+        ctx.setPropertyGetSet(obj: doc, name: "activeElement", getter: activeGetter, setter: nil)
 
         // document.implementation — createHTMLDocument backs jQuery.parseHTML.
         ctx.setPropertyStr(obj: doc, name: "implementation", value: buildDOMImplementation(ctx: ctx))
@@ -648,16 +745,16 @@ final class JeffJSDOMBridge {
     /// Wraps a detached document root as a Document-shaped JS object: the element
     /// wrapper already supplies querySelector/getElementsByTagName/appendChild
     /// scoped to this subtree, so only the Document-only surface is added here.
-    private func wrapDetachedDocument(_ docNode: DOMNode, ctx: JeffJSContext) -> JeffJSValue {
+    func wrapDetachedDocument(_ docNode: DOMNode, ctx: JeffJSContext) -> JeffJSValue {
         if let cached = detachedDocuments[docNode.id] { return cached.dupValue() }
 
         detachedDocumentRoots.append(docNode)
         let wrapper = wrapElement(docNode, ctx: ctx)
         detachedDocuments[docNode.id] = wrapper.dupValue()
 
-        // Document.ownerDocument is null; defaultView is null for a document that
+        // Document.ownerDocument is null (the prototype's accessor answers
+        // that for a document node); defaultView is null for a document that
         // has no browsing context.
-        ctx.setPropertyStr(obj: wrapper, name: "ownerDocument", value: .null)
         ctx.setPropertyStr(obj: wrapper, name: "defaultView", value: .null)
         // The mode the parser decided from this document's own DOCTYPE
         // (quirks without one), not the page's.
@@ -703,16 +800,14 @@ final class JeffJSDOMBridge {
         }, name: "set title", length: 1)
         ctx.setPropertyGetSet(obj: wrapper, name: "title", getter: titleGetter, setter: titleSetter)
 
-        // Factory methods create nodes owned by *this* document. `adopt` captures
-        // self weakly so the closures parked on the wrapper never retain the bridge.
-        let docID = docNode.id
-        let adopt: (DOMNode, JeffJSContext) -> JeffJSValue = { [weak self] node, ctx in
+        // Factory methods create nodes owned by *this* document (their node
+        // document, read back by the `ownerDocument` accessor). `adopt`
+        // captures self weakly so the closures parked on the wrapper never
+        // retain the bridge; `docNode` is kept alive by `detachedDocumentRoots`.
+        let adopt: (DOMNode, JeffJSContext) -> JeffJSValue = { [weak self, weak docNode] node, ctx in
             guard let self else { return JeffJSValue.null }
-            let value = self.wrapElement(node, ctx: ctx)
-            if let owner = self.detachedDocuments[docID] {
-                ctx.setPropertyStr(obj: value, name: "ownerDocument", value: owner.dupValue())
-            }
-            return value
+            if node.parent == nil { node.nodeDocument = docNode }
+            return self.wrapElement(node, ctx: ctx)
         }
 
         ctx.setPropertyFunc(obj: wrapper, name: "createElement", fn: { ctx, _, args in
@@ -750,10 +845,11 @@ final class JeffJSDOMBridge {
             return adopt(self.cloneDOMNode(node, deep: deep), ctx)
         }, length: 2)
 
-        ctx.setPropertyFunc(obj: wrapper, name: "adoptNode", fn: { [weak self] ctx, _, args in
-            guard let self, !args.isEmpty, let node = self.extractNode(from: args[0]) else { return JeffJSValue.null }
-            node.parent?.removeChild(node)
-            return adopt(node, ctx)
+        ctx.setPropertyFunc(obj: wrapper, name: "adoptNode", fn: { [weak self, weak docNode] ctx, _, args in
+            guard let self, let docNode, !args.isEmpty, let node = self.extractNode(from: args[0]),
+                  node.nodeType != .document else { return JeffJSValue.null }
+            self.adopt(node, into: docNode)
+            return args[0].dupValue()
         }, length: 1)
 
         ctx.setPropertyFunc(obj: wrapper, name: "contains", fn: { [weak self] _, _, args in
@@ -888,9 +984,8 @@ final class JeffJSDOMBridge {
             ctx.setPropertyStr(obj: el, name: "systemId", value: ctx.newStringValue(node.doctypeSystemId))
         }
         ctx.setPropertyStr(obj: el, name: "nativeNodeID", value: ctx.newStringValue(node.id.uuidString))
-        if let owner = ownerDocumentValue(for: node) {
-            ctx.setPropertyStr(obj: el, name: "ownerDocument", value: owner)
-        }
+        // `ownerDocument` is an accessor on the shared prototype (it follows
+        // adoption and removal from another document's tree).
 
         // -- Per-instance style sub-object --
         if node.nodeType == .element {
@@ -910,26 +1005,13 @@ final class JeffJSDOMBridge {
 
         nodeRegistry[node.id] = node
         elementCache[node.id] = el.dupValue()
+        // A wrapper for a node outside any tree is a collection candidate.
+        if node.parent == nil, node !== root, node.nodeType != .document { noteDetached(node) }
         return el
     }
 
-    /// The `ownerDocument` value for a node: the page document unless the node
-    /// belongs to a detached document handed out by `createHTMLDocument` /
-    /// `DOMParser`. The subtree walk only runs once such a document exists, so
-    /// ordinary pages pay nothing.
-    private func ownerDocumentValue(for node: DOMNode) -> JeffJSValue? {
-        if !detachedDocumentRoots.isEmpty {
-            var cursor: DOMNode? = node
-            while let current = cursor {
-                if let owner = detachedDocuments[current.id] { return owner.dupValue() }
-                cursor = current.parent
-            }
-        }
-        return documentJSValue?.dupValue()
-    }
-
     /// Wraps an array of DOMNodes as a JeffJS array.
-    private func wrapElementArray(_ nodes: [DOMNode], ctx: JeffJSContext) -> JeffJSValue {
+    func wrapElementArray(_ nodes: [DOMNode], ctx: JeffJSContext) -> JeffJSValue {
         let arr = ctx.newArray()
         for (i, node) in nodes.enumerated() {
             let wrapped = wrapElement(node, ctx: ctx)
@@ -1079,13 +1161,8 @@ final class JeffJSDOMBridge {
                   let value = self.extractString(ctx: ctx, args: args, index: 1) else {
                 return JeffJSValue.undefined
             }
-            if targetNode.isHTMLNamespace || targetNode.nodeType != .element {
-                targetNode.setAttribute(name: name, value: value)
-            } else {
-                // Foreign element: the name keeps its case (`viewBox`) and
-                // appears once when enumerated/serialised.
-                targetNode.setAttributePreservingCase(name: name, value: value)
-            }
+            // Foreign elements keep the name's case (`viewBox`); see setAttributeValue.
+            self.setAttributeValue(targetNode, name: name, value: value)
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 2)
@@ -1097,11 +1174,7 @@ final class JeffJSDOMBridge {
             guard let name = self.extractString(ctx: ctx, args: args, index: 0) else {
                 return JeffJSValue.undefined
             }
-            if targetNode.isHTMLNamespace || targetNode.nodeType != .element {
-                targetNode.removeAttribute(name: name)
-            } else {
-                targetNode.removeAttributePreservingCase(name: name)
-            }
+            self.removeAttributeValue(targetNode, name: name)
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 1)
@@ -1122,7 +1195,8 @@ final class JeffJSDOMBridge {
             guard let self else { return ctx.newArray() }
             guard let targetNode = self.extractNode(from: thisVal) else { return ctx.newArray() }
             let arr = ctx.newArray()
-            let keys = Array(targetNode.enumerableAttributes.keys)
+            // Attribute-list order (source order, then append order).
+            let keys = targetNode.orderedAttributeNames
             for (i, key) in keys.enumerated() {
                 ctx.setPropertyUint32(obj: arr, index: UInt32(i), value: ctx.newStringValue(key))
             }
@@ -1130,27 +1204,31 @@ final class JeffJSDOMBridge {
             return arr
         }, length: 0)
 
-        // appendChild(child) -> child
+        // appendChild(child) -> child. DOM §4.2.3: a DocumentFragment
+        // inserts its children (and is left empty); the fragment is returned.
         ctx.setPropertyFunc(obj: el, name: "appendChild", fn: { [weak self] ctx, thisVal, args in
             guard let self, !args.isEmpty else { return JeffJSValue.null }
-            guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.null }
+            guard let targetNode = self.nodeFromValue(thisVal) else { return JeffJSValue.null }
             guard let childNode = self.extractNode(from: args[0], ctx: ctx) else { return JeffJSValue.null }
-            // Remove from old parent first
-            if let oldParent = childNode.parent {
-                oldParent.removeChild(childNode)
+            guard self.insertNode(childNode, into: targetNode, before: nil) else {
+                return self.throwHierarchyRequestError(ctx: ctx, method: "appendChild")
             }
-            targetNode.appendChild(childNode)
             self.notifyMutation(for: targetNode)
             return args[0].dupValue()
         }, length: 1)
 
-        // removeChild(child) -> child
+        // removeChild(child) -> child. The node keeps its wrapper and its
+        // event listeners (they belong to the node, DOM §2.7).
         ctx.setPropertyFunc(obj: el, name: "removeChild", fn: { [weak self] ctx, thisVal, args in
             guard let self, !args.isEmpty else { return JeffJSValue.null }
-            guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.null }
+            guard let targetNode = self.nodeFromValue(thisVal) else { return JeffJSValue.null }
             guard let childNode = self.extractNode(from: args[0], ctx: ctx) else { return JeffJSValue.null }
-            targetNode.removeChild(childNode)
-            self.clearNodeAndDescendants(childNode)
+            self.maybeCollectDetachedNodes()
+            guard childNode.parent === targetNode else {
+                return self.throwDOMException(ctx: ctx, name: "NotFoundError",
+                    message: "Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node.")
+            }
+            self.removeNodeFromParent(childNode)
             self.notifyMutation(for: targetNode)
             return args[0].dupValue()
         }, length: 1)
@@ -1158,19 +1236,14 @@ final class JeffJSDOMBridge {
         // insertBefore(newChild, referenceChild) -> newChild
         ctx.setPropertyFunc(obj: el, name: "insertBefore", fn: { [weak self] ctx, thisVal, args in
             guard let self, !args.isEmpty else { return JeffJSValue.null }
-            guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.null }
+            guard let targetNode = self.nodeFromValue(thisVal) else { return JeffJSValue.null }
             guard let newChild = self.extractNode(from: args[0], ctx: ctx) else { return JeffJSValue.null }
-
-            // Remove from old parent first
-            if let oldParent = newChild.parent {
-                oldParent.removeChild(newChild)
+            var reference: DOMNode?
+            if args.count > 1, !args[1].isNull, !args[1].isUndefined {
+                reference = self.extractNode(from: args[1], ctx: ctx)
             }
-
-            if args.count > 1, !args[1].isNull, !args[1].isUndefined,
-               let refChild = self.extractNode(from: args[1], ctx: ctx) {
-                targetNode.insertChild(newChild, before: refChild)
-            } else {
-                targetNode.appendChild(newChild)
+            guard self.insertNode(newChild, into: targetNode, before: reference) else {
+                return self.throwHierarchyRequestError(ctx: ctx, method: "insertBefore")
             }
             self.notifyMutation(for: targetNode)
             return args[0].dupValue()
@@ -1179,15 +1252,17 @@ final class JeffJSDOMBridge {
         // replaceChild(newChild, oldChild) -> oldChild
         ctx.setPropertyFunc(obj: el, name: "replaceChild", fn: { [weak self] ctx, thisVal, args in
             guard let self, args.count >= 2 else { return JeffJSValue.null }
-            guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.null }
-            guard let newChild = self.extractNode(from: args[0]),
-                  let oldChild = self.extractNode(from: args[1]) else { return JeffJSValue.null }
-            if let oldParent = newChild.parent {
-                oldParent.removeChild(newChild)
+            guard let targetNode = self.nodeFromValue(thisVal) else { return JeffJSValue.null }
+            guard let newChild = self.extractNode(from: args[0], ctx: ctx),
+                  let oldChild = self.extractNode(from: args[1], ctx: ctx) else { return JeffJSValue.null }
+            self.maybeCollectDetachedNodes()
+            guard oldChild.parent === targetNode else {
+                return self.throwDOMException(ctx: ctx, name: "NotFoundError",
+                    message: "Failed to execute 'replaceChild' on 'Node': The node to be replaced is not a child of this node.")
             }
-            targetNode.insertChild(newChild, before: oldChild)
-            targetNode.removeChild(oldChild)
-            self.clearNodeAndDescendants(oldChild)
+            guard self.replaceChildNode(oldChild, with: newChild, in: targetNode) else {
+                return self.throwHierarchyRequestError(ctx: ctx, method: "replaceChild")
+            }
             self.notifyMutation(for: targetNode)
             return args[1].dupValue()
         }, length: 2)
@@ -1197,112 +1272,75 @@ final class JeffJSDOMBridge {
             guard let self else { return JeffJSValue.undefined }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             guard let parent = targetNode.parent else { return JeffJSValue.undefined }
-            parent.removeChild(targetNode)
-            self.clearNodeAndDescendants(targetNode)
+            self.maybeCollectDetachedNodes()
+            self.removeNodeFromParent(targetNode)
             self.notifyMutation(for: parent)
             return JeffJSValue.undefined
         }, length: 0)
 
-        // append(...nodes) — append multiple children (strings become text nodes)
+        // append(...nodes) / prepend(...nodes) — ParentNode (DOM §4.2.6):
+        // strings become Text nodes, fragments contribute their children.
         ctx.setPropertyFunc(obj: el, name: "append", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.undefined }
-            guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
-            for arg in args {
-                if let childNode = self.extractNode(from: arg, ctx: ctx) {
-                    if let oldParent = childNode.parent { oldParent.removeChild(childNode) }
-                    targetNode.appendChild(childNode)
-                } else if let text = ctx.toSwiftString(arg) {
-                    targetNode.appendChild(DOMNode.text(text))
-                }
-            }
+            guard let targetNode = self.nodeFromValue(thisVal) else { return JeffJSValue.undefined }
+            let nodes = self.convertNodesForInsertion(args, into: targetNode, ctx: ctx)
+            self.insertNodes(nodes, into: targetNode, before: nil)
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 0)
 
-        // prepend(...nodes)
         ctx.setPropertyFunc(obj: el, name: "prepend", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.undefined }
-            guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
-            let firstChild = targetNode.children.first
-            for arg in args {
-                if let childNode = self.extractNode(from: arg, ctx: ctx) {
-                    if let oldParent = childNode.parent { oldParent.removeChild(childNode) }
-                    if let ref = firstChild {
-                        targetNode.insertChild(childNode, before: ref)
-                    } else {
-                        targetNode.appendChild(childNode)
-                    }
-                } else if let text = ctx.toSwiftString(arg) {
-                    let textNode = DOMNode.text(text)
-                    if let ref = firstChild {
-                        targetNode.insertChild(textNode, before: ref)
-                    } else {
-                        targetNode.appendChild(textNode)
-                    }
-                }
-            }
+            guard let targetNode = self.nodeFromValue(thisVal) else { return JeffJSValue.undefined }
+            let nodes = self.convertNodesForInsertion(args, into: targetNode, ctx: ctx)
+            self.insertNodes(nodes, into: targetNode, before: targetNode.children.first)
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 0)
 
-        // before(...nodes) — insert before this element
+        // before(...nodes) / after(...nodes) / replaceWith(...nodes) —
+        // ChildNode (DOM §4.2.8), relative to the viable siblings (the
+        // nearest ones not among the arguments).
         ctx.setPropertyFunc(obj: el, name: "before", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.undefined }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             guard let parent = targetNode.parent else { return JeffJSValue.undefined }
-            for arg in args {
-                if let childNode = self.extractNode(from: arg, ctx: ctx) {
-                    if let oldParent = childNode.parent { oldParent.removeChild(childNode) }
-                    parent.insertChild(childNode, before: targetNode)
-                } else if let text = ctx.toSwiftString(arg) {
-                    parent.insertChild(DOMNode.text(text), before: targetNode)
-                }
-            }
+            let moving = self.argumentNodeSet(args, ctx: ctx)
+            var viablePrevious = self.previousSibling(of: targetNode)
+            while let v = viablePrevious, moving.contains(ObjectIdentifier(v)) { viablePrevious = self.previousSibling(of: v) }
+            let nodes = self.convertNodesForInsertion(args, into: parent, ctx: ctx)
+            let reference = viablePrevious.map { self.nextSibling(of: $0) } ?? parent.children.first
+            self.insertNodes(nodes, into: parent, before: reference)
             self.notifyMutation(for: parent)
             return JeffJSValue.undefined
         }, length: 0)
 
-        // after(...nodes) — insert after this element
         ctx.setPropertyFunc(obj: el, name: "after", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.undefined }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             guard let parent = targetNode.parent else { return JeffJSValue.undefined }
-            let nextSibling = self.nextSibling(of: targetNode)
-            for arg in args {
-                if let childNode = self.extractNode(from: arg, ctx: ctx) {
-                    if let oldParent = childNode.parent { oldParent.removeChild(childNode) }
-                    if let ref = nextSibling {
-                        parent.insertChild(childNode, before: ref)
-                    } else {
-                        parent.appendChild(childNode)
-                    }
-                } else if let text = ctx.toSwiftString(arg) {
-                    let textNode = DOMNode.text(text)
-                    if let ref = nextSibling {
-                        parent.insertChild(textNode, before: ref)
-                    } else {
-                        parent.appendChild(textNode)
-                    }
-                }
-            }
+            let moving = self.argumentNodeSet(args, ctx: ctx)
+            var viableNext = self.nextSibling(of: targetNode)
+            while let v = viableNext, moving.contains(ObjectIdentifier(v)) { viableNext = self.nextSibling(of: v) }
+            let nodes = self.convertNodesForInsertion(args, into: parent, ctx: ctx)
+            self.insertNodes(nodes, into: parent, before: viableNext)
             self.notifyMutation(for: parent)
             return JeffJSValue.undefined
         }, length: 0)
 
-        // replaceWith(...nodes) — replace this element with other nodes
         ctx.setPropertyFunc(obj: el, name: "replaceWith", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.undefined }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             guard let parent = targetNode.parent else { return JeffJSValue.undefined }
-            for arg in args {
-                if let childNode = self.extractNode(from: arg, ctx: ctx) {
-                    if let oldParent = childNode.parent { oldParent.removeChild(childNode) }
-                    parent.insertChild(childNode, before: targetNode)
-                } else if let text = ctx.toSwiftString(arg) {
-                    parent.insertChild(DOMNode.text(text), before: targetNode)
-                }
+            let moving = self.argumentNodeSet(args, ctx: ctx)
+            var viableNext = self.nextSibling(of: targetNode)
+            while let v = viableNext, moving.contains(ObjectIdentifier(v)) { viableNext = self.nextSibling(of: v) }
+            let nodes = self.convertNodesForInsertion(args, into: parent, ctx: ctx)
+            if targetNode.parent === parent {
+                self.replaceChildNode(targetNode, withNodes: nodes, in: parent)
+            } else {
+                self.insertNodes(nodes, into: parent, before: viableNext)
             }
-            parent.removeChild(targetNode)
             self.notifyMutation(for: parent)
             return JeffJSValue.undefined
         }, length: 0)
@@ -1402,9 +1440,9 @@ final class JeffJSDOMBridge {
             let hasForce = args.count >= 2 && !args[1].isUndefined
             let shouldSet = hasForce ? args[1].toBool() : !present
             if shouldSet {
-                if !present { targetNode.setAttribute(name: name, value: "") }
+                if !present { self.setAttributeValue(targetNode, name: name, value: "") }
             } else if present {
-                targetNode.removeAttribute(name: name)
+                self.removeAttributeValue(targetNode, name: name)
             }
             if shouldSet != present { self.notifyMutation(for: targetNode) }
             return .newBool(shouldSet)
@@ -1425,7 +1463,7 @@ final class JeffJSDOMBridge {
                   let position = self.extractString(ctx: ctx, args: args, index: 0),
                   let targetNode = self.extractNode(from: thisVal),
                   let newNode = self.extractNode(from: args[1], ctx: ctx) else { return JeffJSValue.null }
-            guard self.insertAdjacent(position: position, target: targetNode, nodes: [newNode]) else {
+            guard self.insertAdjacent(position: position, target: targetNode, node: newNode) else {
                 return JeffJSValue.null
             }
             return args[1].dupValue()
@@ -1437,7 +1475,7 @@ final class JeffJSDOMBridge {
                   let position = self.extractString(ctx: ctx, args: args, index: 0),
                   let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             let text = self.extractString(ctx: ctx, args: args, index: 1) ?? ""
-            _ = self.insertAdjacent(position: position, target: targetNode, nodes: [DOMNode.text(text)])
+            _ = self.insertAdjacent(position: position, target: targetNode, node: DOMNode.text(text))
             return JeffJSValue.undefined
         }, length: 2)
 
@@ -1451,24 +1489,18 @@ final class JeffJSDOMBridge {
             // afterbegin in the element's own.
             let context = (position.lowercased() == "beforebegin" || position.lowercased() == "afterend")
                 ? (targetNode.parent ?? targetNode) : targetNode
-            _ = self.insertAdjacent(position: position, target: targetNode,
-                                    nodes: Self.parseHTMLFragment(html, context: context))
+            let fragment = DOMNode.documentFragment()
+            for node in Self.parseHTMLFragment(html, context: context) { fragment.appendChild(node) }
+            _ = self.insertAdjacent(position: position, target: targetNode, node: fragment)
             return JeffJSValue.undefined
         }, length: 2)
 
         // replaceChildren(...nodes) — drop every child, then append the arguments
         ctx.setPropertyFunc(obj: el, name: "replaceChildren", fn: { [weak self] ctx, thisVal, args in
-            guard let self, let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
-            for child in targetNode.children { self.clearNodeAndDescendants(child) }
-            targetNode.clearChildren()
-            for arg in args {
-                if let childNode = self.extractNode(from: arg, ctx: ctx) {
-                    if let oldParent = childNode.parent { oldParent.removeChild(childNode) }
-                    targetNode.appendChild(childNode)
-                } else if let text = ctx.toSwiftString(arg) {
-                    targetNode.appendChild(DOMNode.text(text))
-                }
-            }
+            guard let self, let targetNode = self.nodeFromValue(thisVal) else { return JeffJSValue.undefined }
+            self.maybeCollectDetachedNodes()
+            let nodes = self.convertNodesForInsertion(args, into: targetNode, ctx: ctx)
+            self.replaceAllChildren(of: targetNode, with: nodes)
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 0)
@@ -1477,8 +1509,12 @@ final class JeffJSDOMBridge {
         ctx.setPropertyFunc(obj: el, name: "cloneNode", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.null }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.null }
+            self.maybeCollectDetachedNodes()
             let deep = !args.isEmpty && args[0].toBool()
             let cloned = self.cloneDOMNode(targetNode, deep: deep)
+            // The clone's node document is the original's (DOM §4.5 "clone").
+            let document = self.nodeDocument(of: targetNode)
+            cloned.nodeDocument = document === self.root ? nil : document
             return self.wrapElement(cloned, ctx: ctx)
         }, length: 1)
 
@@ -1490,9 +1526,26 @@ final class JeffJSDOMBridge {
             return .newBool(self.nodeContains(targetNode, child: otherNode))
         }, length: 1)
 
-        // focus() / blur() — no-ops in this environment
-        ctx.setPropertyFunc(obj: el, name: "focus", fn: { _, _, _ in JeffJSValue.undefined }, length: 0)
-        ctx.setPropertyFunc(obj: el, name: "blur", fn: { _, _, _ in JeffJSValue.undefined }, length: 0)
+        // focus(options?) / blur() — HTML §6.6.6 focusing / unfocusing steps.
+        ctx.setPropertyFunc(obj: el, name: "focus", fn: { [weak self] ctx, thisVal, _ in
+            guard let self, let node = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+            self.focusElement(node, ctx: ctx)
+            return JeffJSValue.undefined
+        }, length: 0)
+        ctx.setPropertyFunc(obj: el, name: "blur", fn: { [weak self] ctx, thisVal, _ in
+            guard let self, let node = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+            self.blurElement(node, ctx: ctx)
+            return JeffJSValue.undefined
+        }, length: 0)
+
+        // click() — HTML §6.2: a synthetic (untrusted) click, then the
+        // activation behaviour (checkbox/radio, label, summary, links and
+        // form submission through `onActivationBehavior`).
+        ctx.setPropertyFunc(obj: el, name: "click", fn: { [weak self] ctx, thisVal, _ in
+            guard let self, let node = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+            self.click(node, ctx: ctx)
+            return JeffJSValue.undefined
+        }, length: 0)
 
         // -- Geometry: getBoundingClientRect / getClientRects / scrolling --
         registerElementGeometryMethods(on: el, ctx: ctx)
@@ -1539,25 +1592,33 @@ final class JeffJSDOMBridge {
             guard let self else { return JeffJSValue.undefined }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             let text = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
-            for child in targetNode.children { self.clearNodeAndDescendants(child) }
-            targetNode.setTextContent(text)
+            self.maybeCollectDetachedNodes()
+            switch targetNode.nodeType {
+            case .text, .comment:
+                if !targetNode.isDocumentType { self.setCharacterData(targetNode, text) }
+            case .element, .documentFragment:
+                // DOM "string replace all": one Text node (none for "").
+                self.replaceAllChildren(of: targetNode, with: text.isEmpty ? [] : [DOMNode.text(text)])
+            case .document:
+                break
+            }
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 1)
 
-        // -- innerText (read-write) --
+        // -- innerText (read-write) — HTML §3.2.7 (rendered text) --
         ctx.setPropertyFunc(obj: el, name: "__get_innerText", fn: { [weak self] ctx, thisVal, _ in
             guard let self else { return ctx.newStringValue("") }
             guard let targetNode = self.extractNode(from: thisVal) else { return ctx.newStringValue("") }
-            return ctx.newStringValue(targetNode.textDescendants)
+            return ctx.newStringValue(self.innerText(of: targetNode, ctx: ctx))
         }, length: 0)
 
         ctx.setPropertyFunc(obj: el, name: "__set_innerText", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.undefined }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             let text = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
-            for child in targetNode.children { self.clearNodeAndDescendants(child) }
-            targetNode.setTextContent(text)
+            self.maybeCollectDetachedNodes()
+            self.setInnerText(targetNode, text)
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 1)
@@ -1581,12 +1642,9 @@ final class JeffJSDOMBridge {
             // element ("in template" mode), so `<tr><td>` keeps its table parts.
             let targetNode = Self.isHTMLTemplate(element) ? self.templateFragment(for: element) : element
             let html = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
-            for child in targetNode.children { self.clearNodeAndDescendants(child) }
-            targetNode.clearChildren()
-            let parsed = Self.parseHTMLFragment(html, context: element)
-            for child in parsed {
-                targetNode.appendChild(child)
-            }
+            self.maybeCollectDetachedNodes()
+            // One childList record: every old child removed, the parse added.
+            self.replaceAllChildren(of: targetNode, with: Self.parseHTMLFragment(html, context: element))
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 1)
@@ -1606,11 +1664,8 @@ final class JeffJSDOMBridge {
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             guard let parent = targetNode.parent else { return JeffJSValue.undefined }
             let html = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
-            for node in Self.parseHTMLFragment(html, context: parent) {
-                parent.insertChild(node, before: targetNode)
-            }
-            parent.removeChild(targetNode)
-            self.clearNodeAndDescendants(targetNode)
+            self.maybeCollectDetachedNodes()
+            self.replaceChildNode(targetNode, withNodes: Self.parseHTMLFragment(html, context: parent), in: parent)
             self.notifyMutation(for: parent)
             return JeffJSValue.undefined
         }, length: 1)
@@ -1633,7 +1688,7 @@ final class JeffJSDOMBridge {
         ctx.setPropertyFunc(obj: el, name: "__set_content", fn: { [weak self] ctx, thisVal, args in
             guard let self, let targetNode = self.extractNode(from: thisVal),
                   targetNode.tagName != "template" else { return JeffJSValue.undefined }
-            targetNode.setAttribute(name: "content", value: self.extractString(ctx: ctx, args: args, index: 0) ?? "")
+            self.setAttributeValue(targetNode, name: "content", value: self.extractString(ctx: ctx, args: args, index: 0) ?? "")
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 1)
@@ -1660,7 +1715,7 @@ final class JeffJSDOMBridge {
             guard let self else { return JeffJSValue.undefined }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             let value = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
-            targetNode.setAttribute(name: "id", value: value)
+            self.setAttributeValue(targetNode, name: "id", value: value)
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 1)
@@ -1676,7 +1731,7 @@ final class JeffJSDOMBridge {
             guard let self else { return JeffJSValue.undefined }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             let value = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
-            targetNode.setAttribute(name: "class", value: value)
+            self.setAttributeValue(targetNode, name: "class", value: value)
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 1)
@@ -1701,6 +1756,9 @@ final class JeffJSDOMBridge {
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             let value = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
             if Self.isTextarea(targetNode) { self.dirtyTextareas.insert(targetNode.id) }
+            // The IDL value / checked setters stand in for the dirty value /
+            // checkedness (no form-control state yet): not attribute
+            // mutations as far as MutationObserver is concerned.
             targetNode.setAttribute(name: "value", value: value)
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
@@ -1719,10 +1777,9 @@ final class JeffJSDOMBridge {
             guard let self, let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             let value = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
             if Self.isTextarea(targetNode) {
-                for child in targetNode.children { self.clearNodeAndDescendants(child) }
-                targetNode.setTextContent(value)
+                self.replaceAllChildren(of: targetNode, with: value.isEmpty ? [] : [DOMNode.text(value)])
             } else {
-                targetNode.setAttribute(name: "value", value: value)
+                self.setAttributeValue(targetNode, name: "value", value: value)
             }
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
@@ -1760,9 +1817,9 @@ final class JeffJSDOMBridge {
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             let hidden = !args.isEmpty && args[0].toBool()
             if hidden {
-                targetNode.setAttribute(name: "hidden", value: "")
+                self.setAttributeValue(targetNode, name: "hidden", value: "")
             } else {
-                targetNode.removeAttribute(name: "hidden")
+                self.removeAttributeValue(targetNode, name: "hidden")
             }
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
@@ -1779,7 +1836,7 @@ final class JeffJSDOMBridge {
             guard let self else { return JeffJSValue.undefined }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             let value = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
-            targetNode.setAttribute(name: "src", value: value)
+            self.setAttributeValue(targetNode, name: "src", value: value)
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 1)
@@ -1804,7 +1861,7 @@ final class JeffJSDOMBridge {
             guard let self else { return JeffJSValue.undefined }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             let value = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
-            targetNode.setAttribute(name: "href", value: value)
+            self.setAttributeValue(targetNode, name: "href", value: value)
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 1)
@@ -1828,7 +1885,8 @@ final class JeffJSDOMBridge {
             let value = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
             switch targetNode.nodeType {
             case .text, .comment:
-                targetNode.textContent = value
+                guard !targetNode.isDocumentType else { break }
+                self.setCharacterData(targetNode, value)
                 self.notifyMutation(for: targetNode)
             default:
                 break
@@ -1875,7 +1933,9 @@ final class JeffJSDOMBridge {
             guard let self else { return JeffJSValue.undefined }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             let value = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
-            targetNode.textContent = value
+            guard targetNode.nodeType == .text || targetNode.nodeType == .comment,
+                  !targetNode.isDocumentType else { return JeffJSValue.undefined }
+            self.setCharacterData(targetNode, value)
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 1)
@@ -1996,7 +2056,7 @@ final class JeffJSDOMBridge {
         }, length: 0)
         ctx.setPropertyFunc(obj: el, name: "__set_rel", fn: { [weak self] ctx, thisVal, args in
             guard let self, let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
-            targetNode.setAttribute(name: "rel", value: self.extractString(ctx: ctx, args: args, index: 0) ?? "")
+            self.setAttributeValue(targetNode, name: "rel", value: self.extractString(ctx: ctx, args: args, index: 0) ?? "")
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 1)
@@ -2026,7 +2086,7 @@ final class JeffJSDOMBridge {
                 if tags.contains(node.tagName?.lowercased() ?? "") {
                     set(self, node, value)
                 } else {
-                    node.setAttribute(name: contentAttr, value: value)
+                    self.setAttributeValue(node, name: contentAttr, value: value)
                 }
                 self.notifyMutation(for: node)
                 return JeffJSValue.undefined
@@ -2036,7 +2096,7 @@ final class JeffJSDOMBridge {
             return { _, node in node.attributes[attr] ?? "" }
         }
         func setPlain(_ attr: String) -> (JeffJSDOMBridge, DOMNode, String) -> Void {
-            return { _, node, v in node.setAttribute(name: attr, value: v) }
+            return { bridge, node, v in bridge.setAttributeValue(node, name: attr, value: v) }
         }
         let hyperlink: Set<String> = ["a", "area"]
         installReflection("hreflang", tags: ["a", "link"], get: plain("hreflang"), set: setPlain("hreflang"))
@@ -2065,7 +2125,7 @@ final class JeffJSDOMBridge {
                                   guard part != .origin, let raw = node.attributes["href"],
                                         var url = JeffJSHyperlinkURL(raw, base: bridge.documentBaseURL()) else { return }
                                   if url.set(part, value) {
-                                      node.setAttribute(name: "href", value: url.href)
+                                      bridge.setAttributeValue(node, name: "href", value: url.href)
                                   }
                               })
         }
@@ -2086,7 +2146,7 @@ final class JeffJSDOMBridge {
                 guard let self, let targetNode = self.extractNode(from: thisVal) else {
                     return JeffJSValue.undefined
                 }
-                targetNode.setAttribute(name: reflected,
+                self.setAttributeValue(targetNode, name: reflected,
                                         value: self.extractString(ctx: ctx, args: args, index: 0) ?? "")
                 self.notifyMutation(for: targetNode)
                 return JeffJSValue.undefined
@@ -2107,13 +2167,16 @@ final class JeffJSDOMBridge {
         }, length: 0)
         ctx.setPropertyFunc(obj: el, name: "__set_type", fn: { [weak self] ctx, thisVal, args in
             guard let self, let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
-            targetNode.setAttribute(name: "type", value: self.extractString(ctx: ctx, args: args, index: 0) ?? "")
+            self.setAttributeValue(targetNode, name: "type", value: self.extractString(ctx: ctx, args: args, index: 0) ?? "")
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 1)
 
         // -- Geometry accessors (offset*/client*/scroll*) --
         registerElementGeometryAccessors(on: el, ctx: ctx)
+
+        // -- ownerDocument / dataset / open / control / labels --
+        registerInteractionAccessors(on: el, ctx: ctx)
     }
 
     /// Installs getter/setter accessor properties on the element object using
@@ -2144,6 +2207,8 @@ final class JeffJSDOMBridge {
             ("nextElementSibling", false), ("previousElementSibling", false),
             ("firstElementChild", false), ("lastElementChild", false),
             ("childElementCount", false),
+            ("ownerDocument", false), ("dataset", false), ("open", true),
+            ("control", true), ("labels", true),
             // Geometry (see registerElementGeometryAccessors)
             ("offsetWidth", false), ("offsetHeight", false),
             ("offsetTop", false), ("offsetLeft", false), ("offsetParent", false),
@@ -2494,7 +2559,7 @@ final class JeffJSDOMBridge {
         ctx.setPropertyFunc(obj: proto, name: "__set_cssText", fn: { [weak self] ctx, thisVal, args in
             guard let self, let node = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             let value = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
-            node.setAttribute(name: "style", value: value)
+            self.setAttributeValue(node, name: "style", value: value)
             self.notifyMutation(for: node)
             return JeffJSValue.undefined
         }, length: 1)
@@ -2512,7 +2577,7 @@ final class JeffJSDOMBridge {
             } else {
                 styles[propName] = priority == "important" ? "\(propValue) !important" : propValue
             }
-            node.setAttribute(name: "style", value: Self.serializeInlineStyles(styles))
+            self.setAttributeValue(node, name: "style", value: Self.serializeInlineStyles(styles))
             self.notifyMutation(for: node)
             return JeffJSValue.undefined
         }, length: 3)
@@ -2533,7 +2598,7 @@ final class JeffJSDOMBridge {
             }
             var styles = Self.parseInlineStyles(node.attributes["style"] ?? "")
             let old = styles.removeValue(forKey: propName) ?? ""
-            node.setAttribute(name: "style", value: Self.serializeInlineStyles(styles))
+            self.setAttributeValue(node, name: "style", value: Self.serializeInlineStyles(styles))
             self.notifyMutation(for: node)
             return ctx.newStringValue(old)
         }, length: 1)
@@ -2622,8 +2687,8 @@ final class JeffJSDOMBridge {
         func tokens() -> [String] {
             DOMNode.orderedTokenSet(node.attributes[attribute] ?? "")
         }
-        func store(_ list: [String]) {
-            node.setAttribute(name: attribute, value: list.joined(separator: " "))
+        let store: ([String]) -> Void = { [weak self] list in
+            self?.setAttributeValue(node, name: attribute, value: list.joined(separator: " "))
         }
 
         // add(cls, ...)
@@ -2763,7 +2828,7 @@ final class JeffJSDOMBridge {
         }, name: "get value", length: 0)
         let valueSetter = ctx.newCFunction({ [weak self] ctx, _, args in
             guard let self, let v = ctx.toSwiftString(args.first ?? .undefined) else { return .undefined }
-            node.setAttribute(name: attribute, value: v)
+            self.setAttributeValue(node, name: attribute, value: v)
             self.notifyMutation(for: node)
             return .undefined
         }, name: "set value", length: 1)
@@ -2779,7 +2844,7 @@ final class JeffJSDOMBridge {
     /// The content fragment backing a `<template>` element. Created on first use;
     /// any children the HTML parser left directly on the template are migrated in,
     /// matching the spec where template markup never becomes element children.
-    private func templateFragment(for node: DOMNode) -> DOMNode {
+    func templateFragment(for node: DOMNode) -> DOMNode {
         // Move, don't clear: `appendChild` has already re-parented each child
         // to the fragment, and `clearChildren()` would reset those parent
         // pointers to nil (so `content.firstChild.parentNode` was null).
@@ -2788,6 +2853,9 @@ final class JeffJSDOMBridge {
             fragment = existing
         } else {
             fragment = DOMNode.documentFragment()
+            // HTML §4.12.3: the contents belong to the template's inert
+            // document ("appropriate template contents owner document").
+            fragment.nodeDocument = inertDocument(for: nodeDocument(of: node))
             templateContent[node.id] = fragment
         }
         let moved = node.detachChildrenArray()
@@ -2800,6 +2868,11 @@ final class JeffJSDOMBridge {
     /// Updates the document.readyState property on the context.
     func setReadyState(_ value: String, on doc: JeffJSValue, ctx: JeffJSContext) {
         ctx.setPropertyStr(obj: doc, name: "readyState", value: ctx.newStringValue(value))
+        // HTML §6.6.5: autofocus candidates are flushed at the next rendering
+        // update after parsing — a queued task here.
+        if value == "interactive" {
+            queueTask { [weak self] in self?.runAutofocus() }
+        }
     }
 
     // MARK: - Helpers
@@ -2844,7 +2917,7 @@ final class JeffJSDOMBridge {
     }
 
     /// Extracts a Swift string from args at the given index.
-    private func extractString(ctx: JeffJSContext, args: [JeffJSValue], index: Int) -> String? {
+    func extractString(ctx: JeffJSContext, args: [JeffJSValue], index: Int) -> String? {
         guard index < args.count else { return nil }
         let val = args[index]
         if val.isUndefined || val.isNull { return nil }
@@ -2852,7 +2925,7 @@ final class JeffJSDOMBridge {
     }
 
     /// Notifies the mutation observer of a change to the given node.
-    private func notifyMutation(for node: DOMNode) {
+    func notifyMutation(for node: DOMNode) {
         onMutated?([node.id])
         if node.tagName == "script", node.parent != nil {
             onScriptExecution?(node)
@@ -2860,7 +2933,7 @@ final class JeffJSDOMBridge {
     }
 
     /// Finds the first element node matching a predicate (DFS).
-    private func findElement(in node: DOMNode, where predicate: (DOMNode) -> Bool) -> DOMNode? {
+    func findElement(in node: DOMNode, where predicate: (DOMNode) -> Bool) -> DOMNode? {
         if node.nodeType == .element && predicate(node) { return node }
         for child in node.children {
             if let found = findElement(in: child, where: predicate) {
@@ -2871,7 +2944,7 @@ final class JeffJSDOMBridge {
     }
 
     /// Returns all element descendants of a node (DFS, pre-order).
-    private func allElementDescendants(of node: DOMNode) -> [DOMNode] {
+    func allElementDescendants(of node: DOMNode) -> [DOMNode] {
         var result: [DOMNode] = []
         func traverse(_ n: DOMNode) {
             for child in n.children {
@@ -2884,7 +2957,7 @@ final class JeffJSDOMBridge {
     }
 
     /// Checks if a node is connected to the root document.
-    private func isConnected(_ node: DOMNode) -> Bool {
+    func isConnected(_ node: DOMNode) -> Bool {
         var current: DOMNode? = node
         while let c = current {
             if c === root { return true }
@@ -2894,7 +2967,7 @@ final class JeffJSDOMBridge {
     }
 
     /// Returns the next sibling of a node in its parent's children.
-    private func nextSibling(of node: DOMNode) -> DOMNode? {
+    func nextSibling(of node: DOMNode) -> DOMNode? {
         guard let parent = node.parent else { return nil }
         let siblings = parent.children
         guard let idx = siblings.firstIndex(where: { $0 === node }) else { return nil }
@@ -2903,7 +2976,7 @@ final class JeffJSDOMBridge {
     }
 
     /// Returns the previous sibling of a node in its parent's children.
-    private func previousSibling(of node: DOMNode) -> DOMNode? {
+    func previousSibling(of node: DOMNode) -> DOMNode? {
         guard let parent = node.parent else { return nil }
         let siblings = parent.children
         guard let idx = siblings.firstIndex(where: { $0 === node }), idx > siblings.startIndex else { return nil }
@@ -2942,33 +3015,20 @@ final class JeffJSDOMBridge {
     /// Returns false for an unknown position or when the node has no parent and
     /// the position requires one.
     @discardableResult
-    private func insertAdjacent(position: String, target: DOMNode, nodes: [DOMNode]) -> Bool {
-        guard !nodes.isEmpty else { return true }
-        for node in nodes where node.parent != nil {
-            node.parent?.removeChild(node)
-        }
+    private func insertAdjacent(position: String, target: DOMNode, node: DOMNode) -> Bool {
         switch position.lowercased() {
         case "beforebegin":
-            guard let parent = target.parent else { return false }
-            for node in nodes { parent.insertChild(node, before: target) }
+            guard let parent = target.parent, insertNode(node, into: parent, before: target) else { return false }
             notifyMutation(for: parent)
         case "afterbegin":
-            if let first = target.children.first {
-                for node in nodes { target.insertChild(node, before: first) }
-            } else {
-                for node in nodes { target.appendChild(node) }
-            }
+            guard insertNode(node, into: target, before: target.children.first) else { return false }
             notifyMutation(for: target)
         case "beforeend":
-            for node in nodes { target.appendChild(node) }
+            guard insertNode(node, into: target, before: nil) else { return false }
             notifyMutation(for: target)
         case "afterend":
-            guard let parent = target.parent else { return false }
-            if let next = nextSibling(of: target) {
-                for node in nodes { parent.insertChild(node, before: next) }
-            } else {
-                for node in nodes { parent.appendChild(node) }
-            }
+            guard let parent = target.parent,
+                  insertNode(node, into: parent, before: nextSibling(of: target)) else { return false }
             notifyMutation(for: parent)
         default:
             return false
@@ -3001,7 +3061,7 @@ final class JeffJSDOMBridge {
         return found == 0 ? 0x21 : found
     }
 
-    private func nodeContains(_ parent: DOMNode, child: DOMNode) -> Bool {
+    func nodeContains(_ parent: DOMNode, child: DOMNode) -> Bool {
         if parent === child { return true }
         for c in parent.children {
             if nodeContains(c, child: child) { return true }
@@ -3010,15 +3070,15 @@ final class JeffJSDOMBridge {
     }
 
     /// Deep or shallow clone of a DOMNode.
-    private func cloneDOMNode(_ node: DOMNode, deep: Bool) -> DOMNode {
+    func cloneDOMNode(_ node: DOMNode, deep: Bool) -> DOMNode {
         switch node.nodeType {
         case .element:
             let cloned = DOMNode.element(
                 tag: node.tagName ?? "div",
-                attributes: node.attributes,
                 preserveCase: true,
                 namespace: node.namespaceURI
             )
+            cloned.copyAttributes(from: node)
             if deep {
                 // A template's contents are cloned with it (HTML §4.12.3
                 // cloning steps); they sit in its content fragment.
@@ -3120,7 +3180,7 @@ final class JeffJSDOMBridge {
         "style", "script", "xmp", "iframe", "noembed", "noframes", "plaintext",
     ]
 
-    private static func isHTMLTemplate(_ node: DOMNode) -> Bool {
+    static func isHTMLTemplate(_ node: DOMNode) -> Bool {
         node.nodeType == .element && node.tagName == "template" && node.isHTMLNamespace
     }
 
@@ -3143,7 +3203,7 @@ final class JeffJSDOMBridge {
     /// The children the serializer walks: a template's contents (its content
     /// fragment, then anything the parser left on the element and
     /// `templateFragment` has not migrated yet), otherwise the children.
-    private func serializationChildren(of node: DOMNode) -> [DOMNode] {
+    func serializationChildren(of node: DOMNode) -> [DOMNode] {
         guard Self.isHTMLTemplate(node) else { return node.children }
         if let fragment = templateContent[node.id] { return fragment.children + node.children }
         return node.children
@@ -3180,9 +3240,8 @@ final class JeffJSDOMBridge {
             guard let tag = node.tagName else { return }
             out += "<"
             out += tag
-            // Attribute order: this DOM keeps attributes in a dictionary, so
-            // they are written sorted by name (deterministic, not source order).
-            for (key, val) in node.enumerableAttributes.sorted(by: { $0.key < $1.key }) {
+            // Attribute-list order (source order, then append order).
+            for (key, val) in node.orderedAttributes {
                 out += " "
                 out += key
                 out += "=\""
@@ -3233,7 +3292,7 @@ final class JeffJSDOMBridge {
 
     // MARK: - Inline Style Helpers
 
-    private static func parseInlineStyles(_ style: String) -> [String: String] {
+    static func parseInlineStyles(_ style: String) -> [String: String] {
         var result: [String: String] = [:]
         for part in style.split(separator: ";") {
             let kv = part.split(separator: ":", maxSplits: 1)

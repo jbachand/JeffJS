@@ -179,7 +179,7 @@ extension JeffJSTestRunner {
             (function(){ var s = el('div', '<svg viewbox="0 0 1 1" preserveaspectratio=none></svg>').firstChild;
               var n = s.getAttributeNames().sort().join(',');
               return n === 'preserveAspectRatio,viewBox' && s.getAttribute('viewBox') === '0 0 1 1' &&
-                s.outerHTML === '<svg preserveAspectRatio="none" viewBox="0 0 1 1"></svg>'; })()
+                s.outerHTML === '<svg viewBox="0 0 1 1" preserveAspectRatio="none"></svg>'; })()
             """),
         ("setAttribute on an SVG element keeps the name's case", """
             (function(){ var s = document.createElementNS(SVGNS, 'svg'); s.setAttribute('viewBox', '0 0 2 2');

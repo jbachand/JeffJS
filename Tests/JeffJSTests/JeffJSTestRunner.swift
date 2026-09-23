@@ -299,6 +299,7 @@ struct JeffJSTestRunner {
             ("HyperlinkReflection", { $0.testHyperlinkReflection() }),
             ("FreedValueTouches", { $0.testFreedValueTouches() }),
             ("HTMLParsing", { $0.testHTMLParsing() }),
+            ("DOMBridgeRung15", { $0.testDOMBridgeRung15() }),
         ]
     }
 

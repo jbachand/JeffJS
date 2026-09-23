@@ -105,6 +105,9 @@ private final class JeffJSEventListenerStore {
         for (_, records) in typeMap { for rec in records { rec.release() } }
     }
 
+    /// Number of targets with at least one listener (diagnostics / tests).
+    var targetCount: Int { store.count }
+
     /// Removes and releases every listener.
     func removeAll() {
         let all = store
@@ -194,8 +197,12 @@ final class JeffJSEventBridge {
         dispatchEventFn?.freeValue(); dispatchEventFn = nil
     }
 
+    /// Number of event targets holding listeners (diagnostics / tests).
+    var listenerTargetCount: Int { listenerStore.targetCount }
+
     /// Removes all listeners for a specific DOMNode UUID, freeing dup'd values.
-    /// Called when a node is removed from the DOM tree.
+    /// Called when the node is collected (see JeffJSDOMBridge.collectDetachedNodes);
+    /// removal from the tree keeps them.
     func removeAllListeners(forNodeID nodeID: UUID) {
         listenerStore.removeAll(for: "node:\(nodeID.uuidString)")
     }
@@ -217,8 +224,9 @@ final class JeffJSEventBridge {
       };
       var phases = [['NONE', 0], ['CAPTURING_PHASE', 1], ['AT_TARGET', 2], ['BUBBLING_PHASE', 3]];
 
-      var E = g.Event;
+      var E = g.Event, ownEvent = false;
       if (!(typeof E === 'function' && E.prototype && typeof E.prototype.preventDefault === 'function')) {
+        ownEvent = true;
         E = function Event(type, eventInitDict) {
           if (!(this instanceof E)) throw new TypeError("Failed to construct 'Event': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
           if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present.");
@@ -230,7 +238,6 @@ final class JeffJSEventBridge {
           this.composed = !!init.composed;
           this.defaultPrevented = false;
           this.cancelBubble = false;
-          this.returnValue = true;
           this.isTrusted = false;
           this.target = null;
           this.currentTarget = null;
@@ -250,9 +257,20 @@ final class JeffJSEventBridge {
         def(E.prototype, 'initEvent', function initEvent(type, bubbles, cancelable) {
           if (this.eventPhase !== 0) return;
           this.type = String(type); this.bubbles = !!bubbles; this.cancelable = !!cancelable;
-          this.defaultPrevented = false; this.returnValue = true; this.cancelBubble = false;
+          this.defaultPrevented = false; this.cancelBubble = false;
           this.__immediateStopped = false; this.target = null; this.srcElement = null;
         });
+        // DOM §2.2 legacy `returnValue`: the negation of the canceled flag;
+        // setting it to false cancels (same rules as preventDefault).
+        Object.defineProperty(E.prototype, 'returnValue', {
+          configurable: true, enumerable: true,
+          get: function () { return !this.defaultPrevented; },
+          set: function (v) { if (!v && !this.defaultPrevented) this.preventDefault(); }
+        });
+        // Marks the engine's Event as the real one, so host glue that tests
+        // `Event.__jeffjsReal` keeps it (and the passive/composedPath logic
+        // that lives in its native methods) instead of installing its own.
+        Object.defineProperty(E, '__jeffjsReal', { value: true });
         g.Event = E;
         out.event = E.prototype;
       }
@@ -273,6 +291,67 @@ final class JeffJSEventBridge {
           this.detail = detail === undefined ? null : detail;
         });
         g.CustomEvent = C;
+      }
+
+      // UI Events / HTML event interfaces over the engine's Event. Each
+      // takes its init dictionary's members (unknown ones are ignored, as in
+      // a browser). Only installed alongside the engine's own Event, and
+      // never over an existing constructor.
+      if (ownEvent) {
+        var mk = function (name, Parent, defaults) {
+          if (typeof g[name] === 'function') return g[name];
+          var C = function (type, eventInitDict) {
+            if (!(this instanceof C)) throw new TypeError("Failed to construct '" + name + "': Please use the 'new' operator, this DOM object constructor cannot be called as a function.");
+            if (arguments.length < 1) throw new TypeError("Failed to construct '" + name + "': 1 argument required, but only 0 present.");
+            Parent.call(this, type, eventInitDict);
+            var init = (eventInitDict != null && typeof eventInitDict === 'object') ? eventInitDict : null;
+            for (var k in defaults) {
+              var d = defaults[k];
+              this[k] = (init && init[k] !== undefined) ? init[k] : (Array.isArray(d) ? [] : d);
+            }
+          };
+          Object.defineProperty(C, 'name', { value: name, configurable: true });
+          C.prototype = Object.create(Parent.prototype);
+          def(C.prototype, 'constructor', C);
+          g[name] = C;
+          return C;
+        };
+        var UI = mk('UIEvent', E, { view: null, detail: 0, which: 0 });
+        var ME = mk('MouseEvent', UI, { screenX: 0, screenY: 0, clientX: 0, clientY: 0, pageX: 0, pageY: 0, offsetX: 0, offsetY: 0, x: 0, y: 0, movementX: 0, movementY: 0, ctrlKey: false, shiftKey: false, altKey: false, metaKey: false, button: 0, buttons: 0, relatedTarget: null });
+        mk('PointerEvent', ME, { pointerId: 0, width: 1, height: 1, pressure: 0, tangentialPressure: 0, tiltX: 0, tiltY: 0, twist: 0, pointerType: '', isPrimary: false });
+        mk('WheelEvent', ME, { deltaX: 0, deltaY: 0, deltaZ: 0, deltaMode: 0 });
+        mk('DragEvent', ME, { dataTransfer: null });
+        mk('KeyboardEvent', UI, { key: '', code: '', location: 0, ctrlKey: false, shiftKey: false, altKey: false, metaKey: false, repeat: false, isComposing: false, charCode: 0, keyCode: 0 });
+        mk('InputEvent', UI, { data: null, isComposing: false, inputType: '', dataTransfer: null });
+        mk('FocusEvent', UI, { relatedTarget: null });
+        mk('TouchEvent', UI, { touches: [], targetTouches: [], changedTouches: [], ctrlKey: false, shiftKey: false, altKey: false, metaKey: false });
+        mk('CompositionEvent', UI, { data: '' });
+        mk('ErrorEvent', E, { message: '', filename: '', lineno: 0, colno: 0, error: null });
+        mk('ProgressEvent', E, { lengthComputable: false, loaded: 0, total: 0 });
+        mk('SubmitEvent', E, { submitter: null });
+        mk('HashChangeEvent', E, { oldURL: '', newURL: '' });
+        mk('PopStateEvent', E, { state: null });
+        mk('PageTransitionEvent', E, { persisted: false });
+        mk('TransitionEvent', E, { propertyName: '', elapsedTime: 0, pseudoElement: '' });
+        mk('AnimationEvent', E, { animationName: '', elapsedTime: 0, pseudoElement: '' });
+        mk('ClipboardEvent', E, { clipboardData: null });
+        mk('MessageEvent', E, { data: null, origin: '', lastEventId: '', source: null, ports: [] });
+        mk('StorageEvent', E, { key: null, oldValue: null, newValue: null, url: '', storageArea: null });
+        mk('CloseEvent', E, { wasClean: false, code: 0, reason: '' });
+        mk('PromiseRejectionEvent', E, { promise: null, reason: undefined });
+        mk('MediaQueryListEvent', E, { media: '', matches: false });
+        mk('BeforeUnloadEvent', E, {});
+        mk('SecurityPolicyViolationEvent', E, { blockedURI: '', violatedDirective: '', effectiveDirective: '', originalPolicy: '', disposition: 'enforce', statusCode: 0 });
+        mk('FormDataEvent', E, { formData: null });
+        mk('ToggleEvent', E, { oldState: '', newState: '' });
+        mk('AnimationPlaybackEvent', E, { currentTime: null, timelineTime: null });
+        if (typeof g.Touch !== 'function') {
+          g.Touch = function Touch(init) {
+            init = init || {};
+            var keys = ['identifier', 'target', 'clientX', 'clientY', 'screenX', 'screenY', 'pageX', 'pageY', 'radiusX', 'radiusY', 'rotationAngle', 'force'];
+            for (var i = 0; i < keys.length; i++) this[keys[i]] = init[keys[i]] !== undefined ? init[keys[i]] : (keys[i] === 'target' ? null : 0);
+          };
+        }
       }
 
       var T = g.EventTarget;
@@ -473,6 +552,31 @@ final class JeffJSEventBridge {
             return .undefined
         }, length: 2)
 
+        // focus(target) / blur(target): the host's own focus changes (a native
+        // text field became / stopped being first responder). Runs the HTML
+        // focus update steps — blur/focusout, focus/focusin, activeElement —
+        // without calling back into the host's `onFocusChange` hook.
+        ctx.setPropertyFunc(obj: bridge, name: "focus", fn: { [weak self] ctx, _, args in
+            guard let dom = self?.domBridge, let target = args.first,
+                  let node = dom.extractNode(from: target) else { return .undefined }
+            dom.hostFocusChanged(to: node, ctx: ctx)
+            return .undefined
+        }, length: 1)
+        ctx.setPropertyFunc(obj: bridge, name: "blur", fn: { [weak self] ctx, _, args in
+            guard let dom = self?.domBridge, let target = args.first,
+                  let node = dom.extractNode(from: target) else { return .undefined }
+            dom.hostBlurred(node, ctx: ctx)
+            return .undefined
+        }, length: 1)
+
+        // click(target) -> bool: `HTMLElement.click()` (synthetic, untrusted
+        // click + activation behaviour). False when a listener canceled it.
+        ctx.setPropertyFunc(obj: bridge, name: "click", fn: { [weak self] ctx, _, args in
+            guard let dom = self?.domBridge, let target = args.first,
+                  let node = dom.extractNode(from: target) else { return .newBool(true) }
+            return .newBool(dom.click(node, ctx: ctx))
+        }, length: 1)
+
         ctx.setPropertyStr(obj: global, name: "__nativeEventBridge", value: bridge)
     }
 
@@ -482,12 +586,17 @@ final class JeffJSEventBridge {
         guard listener.isObject else { return }
         let typeStr = ctx.toSwiftString(type) ?? ""
 
-        let (capture, once, passive, signal) = parseListenerOptions(ctx: ctx, options: options)
+        let (capture, once, passiveOption, signal) = parseListenerOptions(ctx: ctx, options: options)
         defer { signal?.freeValue() }
 
         if let signal, isAborted(ctx: ctx, signal) { return }
 
         let targetKey = eventTargetKey(ctx: ctx, value: target)
+        // DOM §2.7 "default passive value" (the WebKit/Blink intervention):
+        // touchstart/touchmove/wheel/mousewheel listeners on window, document,
+        // the document element or the body are passive unless `passive` is given.
+        let passive = passiveOption
+            ?? (Self.defaultPassiveTypes.contains(typeStr) && isDefaultPassiveTarget(targetKey: targetKey, target: target))
         if let existing = listenerStore.find(targetKey: targetKey, type: typeStr, listener: listener, capture: capture) {
             // Same (type, callback, capture) is registered once — unless the
             // earlier registration's signal has aborted since (it is gone).
@@ -856,18 +965,38 @@ final class JeffJSEventBridge {
 
     /// Flattens `options` (boolean capture, or {capture, once, passive,
     /// signal}). The returned signal is owned by the caller.
-    private func parseListenerOptions(ctx: JeffJSContext, options: JeffJSValue) -> (capture: Bool, once: Bool, passive: Bool, signal: JeffJSValue?) {
+    private func parseListenerOptions(ctx: JeffJSContext, options: JeffJSValue) -> (capture: Bool, once: Bool, passive: Bool?, signal: JeffJSValue?) {
         guard options.isObject else {
-            return (ctx.toBool(options), false, false, nil)
+            return (ctx.toBool(options), false, nil, nil)
         }
         let capture = readBool(ctx, options, "capture")
         let once = readBool(ctx, options, "once")
-        let passive = readBool(ctx, options, "passive")
+        // nil when the dictionary does not say (the default passive value applies).
+        let passiveVal = ctx.getPropertyStr(obj: options, name: "passive")
+        if passiveVal.isException { ctx.getException().freeValue() }
+        let passive: Bool? = (passiveVal.isUndefined || passiveVal.isException) ? nil : ctx.toBool(passiveVal)
+        passiveVal.freeValue()
         let signal = ctx.getPropertyStr(obj: options, name: "signal")
         if signal.isObject { return (capture, once, passive, signal) }
         if signal.isException { ctx.getException().freeValue() }
         signal.freeValue()
         return (capture, once, passive, nil)
+    }
+
+    /// Event types whose listeners default to passive on the document-level
+    /// targets (DOM §2.7 "default passive value").
+    private static let defaultPassiveTypes: Set<String> = ["touchstart", "touchmove", "wheel", "mousewheel"]
+
+    /// window, document, or the page document's `<html>` / `<body>`.
+    private func isDefaultPassiveTarget(targetKey: String, target: JeffJSValue) -> Bool {
+        if targetKey == "window" || targetKey == "document" { return true }
+        guard let dom = domBridge, let node = dom.extractNode(from: target),
+              node.nodeType == .element, node.isHTMLNamespace, let parent = node.parent else { return false }
+        switch node.tagName {
+        case "html": return parent === dom.root
+        case "body": return parent.tagName == "html" && parent.parent === dom.root
+        default: return false
+        }
     }
 
     // MARK: - Target Key

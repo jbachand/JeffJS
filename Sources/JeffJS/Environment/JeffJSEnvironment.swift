@@ -187,6 +187,9 @@ public final class JeffJSEnvironment {
             root: doc,
             baseURL: configuration.baseURL,
             onMutated: { [weak self] mutatedNodeIDs in
+                // No Task per mutation when nobody listens (CLI, tests): an
+                // undrained main-actor queue grew ~1.5 KB per DOM change.
+                guard self?.onDOMMutation != nil else { return }
                 Task { @MainActor in
                     self?.onDOMMutation?(mutatedNodeIDs)
                 }
@@ -764,7 +767,6 @@ public final class JeffJSEnvironment {
         };
         window.requestAnimationFrame = function(cb) { return setTimeout(cb, 16); };
         window.cancelAnimationFrame = function(id) { clearTimeout(id); };
-        window.MutationObserver = function() { this.observe = function(){}; this.disconnect = function(){}; };
         window.ResizeObserver = function() { this.observe = function(){}; this.disconnect = function(){}; };
         window.IntersectionObserver = function() { this.observe = function(){}; this.disconnect = function(){}; };
         var __cssProps = 'animation,animationDelay,animationDirection,animationDuration,animationFillMode,animationIterationCount,animationName,animationPlayState,animationTimingFunction,background,backgroundAttachment,backgroundClip,backgroundColor,backgroundImage,backgroundOrigin,backgroundPosition,backgroundRepeat,backgroundSize,border,borderBottom,borderBottomColor,borderBottomLeftRadius,borderBottomRightRadius,borderBottomStyle,borderBottomWidth,borderCollapse,borderColor,borderImage,borderLeft,borderLeftColor,borderLeftStyle,borderLeftWidth,borderRadius,borderRight,borderRightColor,borderRightStyle,borderRightWidth,borderSpacing,borderStyle,borderTop,borderTopColor,borderTopLeftRadius,borderTopRightRadius,borderTopStyle,borderTopWidth,borderWidth,bottom,boxShadow,boxSizing,clear,clip,color,content,cursor,direction,display,flex,flexBasis,flexDirection,flexFlow,flexGrow,flexShrink,flexWrap,float,font,fontFamily,fontSize,fontStyle,fontVariant,fontWeight,height,justifyContent,left,letterSpacing,lineHeight,listStyle,margin,marginBottom,marginLeft,marginRight,marginTop,maxHeight,maxWidth,minHeight,minWidth,opacity,order,outline,overflow,overflowX,overflowY,padding,paddingBottom,paddingLeft,paddingRight,paddingTop,position,right,tableLayout,textAlign,textDecoration,textIndent,textOverflow,textShadow,textTransform,top,transform,transformOrigin,transition,userSelect,verticalAlign,visibility,whiteSpace,width,wordBreak,wordSpacing,wordWrap,zIndex'.split(',');
