@@ -908,16 +908,23 @@ func jsTypedArray_join(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Je
     }
 
     var sep = ","
-    if argv.count >= 1, !argv[0].isUndefined, let s = argv[0].stringValue {
-        sep = s.toSwiftString()
+    if argv.count >= 1, !argv[0].isUndefined {
+        guard let s = ctx.toSwiftString(argv[0]) else { return .exception }
+        sep = s
     }
 
+    // Number::toString / BigInt::toString per element: Swift's own
+    // formatting wrote "3.0", "nan", "-inf", and nothing for BigInts.
     var parts = [String]()
+    parts.reserveCapacity(ta.length)
     for i in 0..<ta.length {
         let val = info.readElement(ab.data, offset: ta.byteOffset + i * info.bytesPerElement)
-        if val.isInt { parts.append(String(val.toInt32())) }
-        else if val.isFloat64 { parts.append(String(val.toFloat64())) }
-        else { parts.append("") }
+        if val.isInt {
+            parts.append(String(val.toInt32()))
+        } else {
+            parts.append(ctx.toSwiftString(val) ?? "")
+        }
+        val.freeValue()
     }
     return .makeString(JeffJSString(swiftString: parts.joined(separator: sep)))
 }
@@ -1374,6 +1381,238 @@ func jsTypedArray_of(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
     return .makeObject(obj)
 }
 
+// MARK: - %TypedArray%.prototype iteration and callback methods
+
+/// The typed array behind `thisVal`, or a TypeError (ValidateTypedArray:
+/// not a typed array, or its buffer is detached).
+private func typedArrayReceiver(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+                                _ method: String)
+    -> (ta: JeffJSTypedArray, ab: JeffJSArrayBuffer, info: TypedArrayElementInfo)? {
+    guard let (ta, ab) = validateTypedArray(thisVal),
+          let info = typedArrayInfo(forClassID: ta.classID) else {
+        _ = ctx.throwTypeError(message: "%TypedArray%.prototype.\(method): not a TypedArray")
+        return nil
+    }
+    return (ta, ab, info)
+}
+
+/// Element `i` of the view, re-read through the buffer each time (a callback
+/// may have written to it). Out of range (or a detached buffer) reads as
+/// undefined.
+private func typedArrayElement(_ thisVal: JeffJSValue, _ i: Int) -> JeffJSValue {
+    guard let (ta, ab) = validateTypedArray(thisVal), i < ta.length,
+          let info = typedArrayInfo(forClassID: ta.classID) else { return .undefined }
+    return info.readElement(ab.data, offset: ta.byteOffset + i * info.bytesPerElement)
+}
+
+/// `%TypedArray%.prototype.values()` / `keys()` / `entries()` and
+/// `[Symbol.iterator]` (the same function object as `values`): an Array
+/// Iterator over the view (QuickJS js_create_array_iterator accepts typed
+/// arrays after validating them).
+func jsTypedArray_iterator(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+                           kind: JeffJSArrayIteratorKind, method: String) -> JeffJSValue {
+    guard typedArrayReceiver(ctx, thisVal, method) != nil else { return .exception }
+    // createArrayIterator keeps the target: hand it its own reference.
+    return ctx.createArrayIterator(obj: thisVal.dupValue(), kind: kind.rawValue)
+}
+
+/// `get %TypedArray%.prototype[@@toStringTag]`: the concrete constructor's
+/// name for a typed array, undefined for anything else (no TypeError).
+func jsTypedArray_toStringTag(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
+    guard let obj = thisVal.toObject(), case .typedArray(let ta) = obj.payload,
+          let info = typedArrayInfo(forClassID: ta.classID) else { return .undefined }
+    return ctx.newStringValue(info.name)
+}
+
+/// The callback methods whose spec algorithm is the Array one over the
+/// view's elements (forEach, every, some, find*, reduce*): validate the
+/// receiver as a typed array, then run the generic Array.prototype
+/// implementation, which reads `length` and the indexed elements.
+func jsTypedArray_arrayGeneric(
+    _ method: String,
+    _ impl: @escaping (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue
+) -> (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue {
+    return { ctx, thisVal, argv in
+        guard typedArrayReceiver(ctx, thisVal, method) != nil else { return .exception }
+        return impl(ctx, thisVal, argv)
+    }
+}
+
+/// A new typed array of `classID` holding `values` (borrowed).
+private func typedArrayFromValues(_ ctx: JeffJSContext, classID: Int,
+                                  _ values: [JeffJSValue]) -> JeffJSValue {
+    return jsTypedArray_of(ctx, .undefined, values, classID: classID)
+}
+
+private func freeAll(_ values: [JeffJSValue]) {
+    for v in values { v.freeValue() }
+}
+
+/// `%TypedArray%.prototype.map(callbackfn [, thisArg])` — same element type.
+func jsTypedArray_map(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+    guard let (ta, _, _) = typedArrayReceiver(ctx, thisVal, "map") else { return .exception }
+    let fn = argv.count > 0 ? argv[0] : .undefined
+    guard ctx.isCallable(fn) else { return ctx.throwTypeError(message: "map: callback is not a function") }
+    let thisArg = argv.count > 1 ? argv[1] : .undefined
+    let len = ta.length
+    var out: [JeffJSValue] = []
+    out.reserveCapacity(len)
+    for i in 0..<len {
+        let v = typedArrayElement(thisVal, i)
+        let r = ctx.call(fn, this: thisArg, args: [v, .newInt32(Int32(i)), thisVal])
+        v.freeValue()
+        if r.isException { freeAll(out); return r }
+        out.append(r)
+    }
+    let result = typedArrayFromValues(ctx, classID: ta.classID, out)
+    freeAll(out)
+    return result
+}
+
+/// `%TypedArray%.prototype.filter(callbackfn [, thisArg])` — same element type.
+func jsTypedArray_filter(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+    guard let (ta, _, _) = typedArrayReceiver(ctx, thisVal, "filter") else { return .exception }
+    let fn = argv.count > 0 ? argv[0] : .undefined
+    guard ctx.isCallable(fn) else { return ctx.throwTypeError(message: "filter: callback is not a function") }
+    let thisArg = argv.count > 1 ? argv[1] : .undefined
+    var kept: [JeffJSValue] = []
+    for i in 0..<ta.length {
+        let v = typedArrayElement(thisVal, i)
+        let r = ctx.call(fn, this: thisArg, args: [v, .newInt32(Int32(i)), thisVal])
+        if r.isException { v.freeValue(); freeAll(kept); return r }
+        if ctx.toBoolFree(r) { kept.append(v) } else { v.freeValue() }
+    }
+    let result = typedArrayFromValues(ctx, classID: ta.classID, kept)
+    freeAll(kept)
+    return result
+}
+
+/// The view's elements in `%TypedArray%.prototype.sort` order, or nil after
+/// a throwing comparator. Without a comparator the order is numeric (NaN
+/// last, -0 before +0); BigInt views compare their 64-bit integers exactly.
+private func typedArraySortedElements(_ ctx: JeffJSContext, _ ta: JeffJSTypedArray,
+                                      _ ab: JeffJSArrayBuffer, _ info: TypedArrayElementInfo,
+                                      comparefn: JeffJSValue) -> [JeffJSValue]? {
+    let n = ta.length
+    let stride = info.bytesPerElement
+    if comparefn.isUndefined {
+        if info.isBigInt {
+            let data = ab.data
+            func raw(_ i: Int) -> UInt64 {
+                var r: UInt64 = 0
+                let base = ta.byteOffset + i * 8
+                for b in 0..<8 { r |= UInt64(data[base + b]) << (8 * UInt64(b)) }
+                return r
+            }
+            var idx = Array(0..<n)
+            if info.isSigned {
+                idx.sort { Int64(bitPattern: raw($0)) < Int64(bitPattern: raw($1)) }
+            } else {
+                idx.sort { raw($0) < raw($1) }
+            }
+            return idx.map { info.readElement(data, offset: ta.byteOffset + $0 * stride) }
+        }
+        var vals: [(Double, JeffJSValue)] = (0..<n).map { i in
+            let v = info.readElement(ab.data, offset: ta.byteOffset + i * stride)
+            return (v.isInt ? Double(v.toInt32()) : v.toNumber(), v)
+        }
+        vals.sort { a, b in
+            let x = a.0, y = b.0
+            if x.isNaN { return false }
+            if y.isNaN { return true }
+            if x < y { return true }
+            if x > y { return false }
+            return x == 0 && x.sign == .minus && y.sign == .plus
+        }
+        return vals.map { $0.1 }
+    }
+    var vals: [JeffJSValue] = (0..<n).map {
+        info.readElement(ab.data, offset: ta.byteOffset + $0 * stride)
+    }
+    struct Thrown: Error {}
+    do {
+        try vals.sort { a, b in
+            let r = ctx.call(comparefn, this: .undefined, args: [a, b])
+            if r.isException { throw Thrown() }
+            let d = r.isInt ? Double(r.toInt32()) : (ctx.toFloat64(r) ?? .nan)
+            r.freeValue()
+            return d < 0
+        }
+    } catch {
+        freeAll(vals)
+        return nil
+    }
+    return vals
+}
+
+/// `%TypedArray%.prototype.sort([comparefn])` — in place, returns the view.
+func jsTypedArray_sort(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+    let comparefn = argv.count > 0 ? argv[0] : .undefined
+    if !comparefn.isUndefined && !ctx.isCallable(comparefn) {
+        return ctx.throwTypeError(message: "sort: comparator must be a function")
+    }
+    guard let (ta, ab, info) = typedArrayReceiver(ctx, thisVal, "sort") else { return .exception }
+    guard let sorted = typedArraySortedElements(ctx, ta, ab, info, comparefn: comparefn) else {
+        return .exception
+    }
+    // A comparator may have detached or shrunk the buffer: write what fits.
+    if let (ta2, ab2) = validateTypedArray(thisVal) {
+        var data = ab2.data
+        for (i, v) in sorted.enumerated() where i < ta2.length {
+            info.writeElement(&data, offset: ta2.byteOffset + i * info.bytesPerElement, value: v)
+        }
+        ab2.data = data
+    }
+    freeAll(sorted)
+    return thisVal.dupValue()
+}
+
+/// `%TypedArray%.prototype.toSorted([comparefn])` — a sorted copy.
+func jsTypedArray_toSorted(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+    let comparefn = argv.count > 0 ? argv[0] : .undefined
+    if !comparefn.isUndefined && !ctx.isCallable(comparefn) {
+        return ctx.throwTypeError(message: "toSorted: comparator must be a function")
+    }
+    guard let (ta, ab, info) = typedArrayReceiver(ctx, thisVal, "toSorted") else { return .exception }
+    guard let sorted = typedArraySortedElements(ctx, ta, ab, info, comparefn: comparefn) else {
+        return .exception
+    }
+    let result = typedArrayFromValues(ctx, classID: ta.classID, sorted)
+    freeAll(sorted)
+    return result
+}
+
+/// `%TypedArray%.prototype.toReversed()` — a reversed copy.
+func jsTypedArray_toReversed(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+    guard let (ta, ab, info) = typedArrayReceiver(ctx, thisVal, "toReversed") else { return .exception }
+    let vals: [JeffJSValue] = (0..<ta.length).reversed().map {
+        info.readElement(ab.data, offset: ta.byteOffset + $0 * info.bytesPerElement)
+    }
+    let result = typedArrayFromValues(ctx, classID: ta.classID, vals)
+    freeAll(vals)
+    return result
+}
+
+/// `%TypedArray%.prototype.with(index, value)` — a copy with one element
+/// replaced; RangeError when the index is outside the view.
+func jsTypedArray_with(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+    guard let (ta, ab, info) = typedArrayReceiver(ctx, thisVal, "with") else { return .exception }
+    let len = ta.length
+    var rel = ctx.toIntegerOrInfinity(argv.count > 0 ? argv[0] : .undefined)
+    if rel < 0 { rel += Double(len) }
+    guard rel >= 0, rel < Double(len) else { return ctx.throwRangeError(message: "invalid array index") }
+    let at = Int(rel)
+    var vals: [JeffJSValue] = (0..<len).map {
+        info.readElement(ab.data, offset: ta.byteOffset + $0 * info.bytesPerElement)
+    }
+    let replacement = argv.count > 1 ? argv[1] : .undefined
+    vals[at].freeValue()
+    vals[at] = replacement   // borrowed: not freed below
+    let result = typedArrayFromValues(ctx, classID: ta.classID, vals)
+    for (i, v) in vals.enumerated() where i != at { v.freeValue() }
+    return result
+}
+
 // MARK: - Strict Equality Helper
 
 /// Simple strict equality for typed array element comparison.
@@ -1401,8 +1640,12 @@ func jeffJS_addGetterProperty(
         cproto: UInt8(JS_CFUNC_GETTER),
         magic: 0
     )
-    // Give the getter a shape so property lookup works
-    getterObj.shape = jeffJS_rootShape(ctx, proto: nil)
+    // Give the getter a shape so property lookup works, over
+    // Function.prototype: `Object.getOwnPropertyDescriptor(P, 'length').get`
+    // is an ordinary function (`.call`, `.name`) in every engine.
+    let fnProto = ctx.functionProto.isObject ? ctx.functionProto.toObject() : nil
+    getterObj.shape = jeffJS_rootShape(ctx, proto: fnProto)
+    getterObj.proto = fnProto
     getterObj.clearProps()
 
     let atom = ctx.rt.findAtom(name)

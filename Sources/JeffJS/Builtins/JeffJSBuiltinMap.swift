@@ -340,27 +340,98 @@ func js_map_constructor(_ ctx: JeffJSContext,
 
         // For Map/WeakMap, each element must be [key, value].
         // For Set/WeakSet, each element is a value to add.
-        if baseMagic == MAGIC_SET || baseMagic == MAGIC_WEAKSET {
-            // forEach on iterable, calling add for each element.
-            js_map_forEach_iterable(ctx, s, iterable, isSet: true, isWeak: isWeak)
-        } else {
-            // forEach on iterable, calling set for each [k, v] pair.
-            js_map_forEach_iterable(ctx, s, iterable, isSet: false, isWeak: isWeak)
+        let isSet = baseMagic == MAGIC_SET || baseMagic == MAGIC_WEAKSET
+        if !js_map_forEach_iterable(ctx, s, iterable, isSet: isSet, isWeak: isWeak) {
+            result.freeValue()
+            return .exception
         }
     }
 
     return result
 }
 
+/// Add one element (Set) or one `[key, value]` entry (Map) taken from the
+/// constructor's iterable. `elem` is borrowed. False after a TypeError
+/// (a Map entry that is not an object).
+private func js_map_addIterableElement(_ ctx: JeffJSContext, _ s: JeffJSMapState,
+                                       _ elem: JeffJSValue, isSet: Bool, isWeak: Bool) -> Bool {
+    if isSet {
+        let key = isWeak ? elem : normalizeKey(elem)
+        if mapStateFind(s, key: key) < 0 {
+            _ = mapStateInsert(s, key: key.dupValue(), value: .undefined)
+        }
+        return true
+    }
+    guard elem.isObject else {
+        _ = ctx.throwTypeError(message: "iterator value is not an entry object")
+        return false
+    }
+    let pairKey = ctx.getPropertyUint32(obj: elem, index: 0)
+    if pairKey.isException { return false }
+    let pairVal = ctx.getPropertyUint32(obj: elem, index: 1)
+    if pairVal.isException { pairKey.freeValue(); return false }
+    let key = isWeak ? pairKey : normalizeKey(pairKey)
+    let existing = mapStateFind(s, key: key)
+    if existing >= 0 {
+        s.records[existing].value.freeValue()
+        s.records[existing].value = pairVal.dupValue()
+    } else {
+        _ = mapStateInsert(s, key: key.dupValue(), value: pairVal.dupValue())
+    }
+    pairKey.freeValue()
+    pairVal.freeValue()
+    return true
+}
+
 /// Helper: iterate over an iterable and populate the map/set state.
+/// Returns false with an exception pending.
 private func js_map_forEach_iterable(_ ctx: JeffJSContext,
                                      _ s: JeffJSMapState,
                                      _ iterable: JeffJSValue,
                                      isSet: Bool,
-                                     isWeak: Bool) {
-    // In a full implementation this would use the iterator protocol.
-    // For arrays, iterate directly via fast path or property-based fallback.
-    guard let obj = iterable.toObject() else { return }
+                                     isWeak: Bool) -> Bool {
+    // Anything with a Symbol.iterator other than a plain fast array (typed
+    // arrays, strings, Maps/Sets and their iterators, generators, custom
+    // iterables) goes through the iterator protocol; `new Set(u8)` used to
+    // read an own `length` (typed arrays have none) and build an empty set.
+    let isFastArray = iterable.toObject()?.arraySnapshot() != nil
+    if !isFastArray && (iterable.isString || iterable.isObject) {
+        var useProtocol = iterable.isString   // strings: the interpreter's code-point fallback
+        if !useProtocol {
+            let iterFn = ctx.getProperty(obj: iterable, atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue)
+            if iterFn.isException { return false }
+            useProtocol = iterFn.isFunction
+            iterFn.freeValue()
+        }
+        if useProtocol {
+            // The for-of path's GetIterator (it also covers primitive strings).
+            let iter = ctx.getIterator(obj: iterable, isAsync: false)
+            if iter.isException { return false }
+            defer { iter.freeValue() }
+            while true {
+                let res = ctx.iteratorNext(iter)
+                if res.isException { return false }
+                guard res.isObject else {
+                    res.freeValue()
+                    _ = ctx.throwTypeError(message: "iterator result is not an object")
+                    return false
+                }
+                if ctx.iteratorCheckDone(result: res) { res.freeValue(); return true }
+                let v = ctx.iteratorGetValue(result: res)
+                res.freeValue()
+                if v.isException { return false }
+                let ok = js_map_addIterableElement(ctx, s, v, isSet: isSet, isWeak: isWeak)
+                v.freeValue()
+                if !ok {
+                    ctx.iteratorClose(iter: iter, isThrow: true)
+                    return false
+                }
+            }
+        }
+    }
+
+    // Plain arrays (fast path) and, leniently, non-iterable array-likes.
+    guard let obj = iterable.toObject() else { return true }
 
     // Determine element count: fast-array payload or length property.
     let elemCount: Int
@@ -418,6 +489,7 @@ private func js_map_forEach_iterable(_ ctx: JeffJSContext,
             }
         }
     }
+    return true
 }
 
 // MARK: - Map.prototype.get

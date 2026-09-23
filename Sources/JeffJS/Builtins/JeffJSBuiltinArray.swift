@@ -183,6 +183,10 @@ struct JeffJSBuiltinArray {
         let usingIteratorIsNil = (usingIterator == nil)
 
         if !usingIteratorIsNil, let usingIter = usingIterator {
+            // Every value this path receives is owned (getMethod, call,
+            // callMethod, getProperty) and released here; the array keeps
+            // the elements (setPropertyByIndex consumes them).
+            defer { usingIter.freeValue() }
             // Create array via species constructor or plain array
             let arr: JeffJSValue
             if this.isObject && ctx.isConstructor(this) {
@@ -194,35 +198,45 @@ struct JeffJSBuiltinArray {
             }
 
             let iter = ctx.call(usingIter, this: items, args: [])
-            if iter.isException { return iter }
+            if iter.isException { arr.freeValue(); return iter }
+            defer { iter.freeValue() }
 
             var k: Int64 = 0
             while true {
                 if k >= MAX_SAFE_INTEGER {
+                    ctx.iteratorClose(iter: iter, isThrow: true)
+                    arr.freeValue()
                     return ctx.throwTypeError(message: "Array.from: too many elements")
                 }
 
                 let next = ctx.callMethod(iter, name: "next", args: [])
-                if next.isException { return next }
+                if next.isException { arr.freeValue(); return next }
 
-                let done = ctx.getProperty(obj: next, atom: ctx.rt.findAtom("done"))
-                if done.isException { return done }
+                let done = ctx.getProperty(obj: next, atom: JeffJSAtomID.JS_ATOM_done.rawValue)
+                if done.isException { next.freeValue(); arr.freeValue(); return done }
                 if ctx.toBoolFree(done) {
+                    next.freeValue()
                     ctx.setArrayLength(arr, k)
                     return arr
                 }
 
-                var val = ctx.getProperty(obj: next, atom: ctx.rt.findAtom("value"))
+                var val = ctx.getProperty(obj: next, atom: JeffJSAtomID.JS_ATOM_value.rawValue)
+                next.freeValue()
                 if val.isException {
+                    arr.freeValue()
                     return val
                 }
 
                 if mapping {
                     let kValue = ctx.newInt64(k)
-                    val = ctx.call(mapFn, this: thisArg, args: [val, kValue])
-                    if val.isException {
-                        return val
+                    let mapped = ctx.call(mapFn, this: thisArg, args: [val, kValue])
+                    val.freeValue()
+                    if mapped.isException {
+                        ctx.iteratorClose(iter: iter, isThrow: true)
+                        arr.freeValue()
+                        return mapped
                     }
+                    val = mapped
                 }
 
                 ctx.setPropertyByIndex(obj: arr, index: UInt32(k), value: val)
@@ -255,12 +269,14 @@ struct JeffJSBuiltinArray {
         var k: Int64 = 0
         while k < len {
             var val = ctx.getPropertyByIndex(obj: arrayLike, index: UInt32(k))
-            if val.isException { return val }
+            if val.isException { arr.freeValue(); return val }
 
             if mapping {
                 let kValue = ctx.newInt64(k)
-                val = ctx.call(mapFn, this: thisArg, args: [val, kValue])
-                if val.isException { return val }
+                let mapped = ctx.call(mapFn, this: thisArg, args: [val, kValue])
+                val.freeValue()   // the callee borrowed it
+                if mapped.isException { arr.freeValue(); return mapped }
+                val = mapped
             }
 
             ctx.setPropertyByIndex(obj: arr, index: UInt32(k), value: val)

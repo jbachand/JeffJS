@@ -2622,8 +2622,131 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             (.JS_CLASS_FLOAT64_ARRAY,    "Float64Array",      JeffJSClassID.float64Array.rawValue),
         ]
 
+        // %TypedArray% and %TypedArray%.prototype (ES §23.2, QuickJS
+        // JS_AddIntrinsicTypedArrays): one abstract constructor whose
+        // prototype carries every accessor and method; each concrete
+        // constructor inherits from it and its prototype holds only
+        // `constructor` and BYTES_PER_ELEMENT.
+        let taProto = newObjectClass(classID: JSClassID.JS_CLASS_OBJECT.rawValue)
+        let taCtor = newCFunction({ ctx, _, _ in
+            return ctx.throwTypeError(message: "cannot be called")
+        }, name: "TypedArray", length: 0)
+        if let ctorObj = taCtor.toObject() { ctorObj.isConstructor = true }
+        _ = definePropertyValue(obj: taCtor, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
+                                value: taProto, flags: 0)
+        _ = definePropertyValue(obj: taProto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
+                                value: taCtor, flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+
+        // TypedArray.from / TypedArray.of dispatch on `this`: the concrete
+        // constructor (or a subclass of one) they are called on.
+        var ctorClassIDs: [ObjectIdentifier: Int] = [:]
+        let classIDForCtor: (JeffJSValue) -> Int? = { ctorVal in
+            var cur = ctorVal.toObject()
+            while let o = cur {
+                if let id = ctorClassIDs[ObjectIdentifier(o)] { return id }
+                cur = o.proto
+            }
+            return nil
+        }
+
+        if let taProtoObj = taProto.toObject() {
+            // Accessors
+            jeffJS_addGetterProperty(ctx: self, proto: taProtoObj, name: "buffer") { ctx, this in
+                return jsTypedArray_buffer(ctx, this)
+            }
+            jeffJS_addGetterProperty(ctx: self, proto: taProtoObj, name: "byteLength") { ctx, this in
+                return jsTypedArray_byteLength(ctx, this)
+            }
+            jeffJS_addGetterProperty(ctx: self, proto: taProtoObj, name: "byteOffset") { ctx, this in
+                return jsTypedArray_byteOffset(ctx, this)
+            }
+            jeffJS_addGetterProperty(ctx: self, proto: taProtoObj, name: "length") { ctx, this in
+                return jsTypedArray_length(ctx, this)
+            }
+
+            // Methods
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "at", length: 1, func: jsTypedArray_at)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "set", length: 1, func: jsTypedArray_set)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "slice", length: 2, func: jsTypedArray_slice)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "subarray", length: 2, func: jsTypedArray_subarray)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "fill", length: 1, func: jsTypedArray_fill)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "copyWithin", length: 2, func: jsTypedArray_copyWithin)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "reverse", length: 0, func: jsTypedArray_reverse)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "indexOf", length: 1, func: jsTypedArray_indexOf)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "lastIndexOf", length: 1, func: jsTypedArray_lastIndexOf)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "includes", length: 1, func: jsTypedArray_includes)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "join", length: 1, func: jsTypedArray_join)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "toString", length: 0, func: jsTypedArray_toString)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "toLocaleString", length: 0, func: jsTypedArray_toLocaleString)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "map", length: 1, func: jsTypedArray_map)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "filter", length: 1, func: jsTypedArray_filter)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "sort", length: 1, func: jsTypedArray_sort)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "toSorted", length: 1, func: jsTypedArray_toSorted)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "toReversed", length: 0, func: jsTypedArray_toReversed)
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "with", length: 2, func: jsTypedArray_with)
+            let generic: [(String, Int, (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue)] = [
+                ("forEach", 1, { JeffJSBuiltinArray.forEach(ctx: $0, this: $1, args: $2) }),
+                ("every", 1, { JeffJSBuiltinArray.every(ctx: $0, this: $1, args: $2) }),
+                ("some", 1, { JeffJSBuiltinArray.some(ctx: $0, this: $1, args: $2) }),
+                ("find", 1, { JeffJSBuiltinArray.find(ctx: $0, this: $1, args: $2) }),
+                ("findIndex", 1, { JeffJSBuiltinArray.findIndex(ctx: $0, this: $1, args: $2) }),
+                ("findLast", 1, { JeffJSBuiltinArray.findLast(ctx: $0, this: $1, args: $2) }),
+                ("findLastIndex", 1, { JeffJSBuiltinArray.findLastIndex(ctx: $0, this: $1, args: $2) }),
+                ("reduce", 1, { JeffJSBuiltinArray.reduce(ctx: $0, this: $1, args: $2) }),
+                ("reduceRight", 1, { JeffJSBuiltinArray.reduceRight(ctx: $0, this: $1, args: $2) }),
+            ]
+            for (name, len, impl) in generic {
+                jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: name, length: len,
+                                         func: jsTypedArray_arrayGeneric(name, impl))
+            }
+
+            // Iterators: [Symbol.iterator] is the same function object as values.
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "keys", length: 0) { ctx, this, _ in
+                jsTypedArray_iterator(ctx, this, kind: .key, method: "keys")
+            }
+            jeffJS_defineBuiltinFunc(ctx: self, obj: taProtoObj, name: "entries", length: 0) { ctx, this, _ in
+                jsTypedArray_iterator(ctx, this, kind: .keyAndValue, method: "entries")
+            }
+            let valuesFn = newCFunction({ ctx, this, _ in
+                jsTypedArray_iterator(ctx, this, kind: .value, method: "values")
+            }, name: "values", length: 0)
+            _ = definePropertyValue(obj: taProto, atom: JSPredefinedAtom.values.rawValue,
+                                    value: valuesFn, flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+            _ = definePropertyValue(obj: taProto, atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue,
+                                    value: valuesFn, flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+            valuesFn.freeValue()
+
+            // get [Symbol.toStringTag]: the concrete name, undefined for non-views.
+            let tagGetter = newCFunction({ ctx, this, _ in
+                jsTypedArray_toStringTag(ctx, this)
+            }, name: "get [Symbol.toStringTag]", length: 0)
+            _ = defineProperty(obj: taProto, atom: JeffJSAtomID.JS_ATOM_Symbol_toStringTag.rawValue,
+                               value: .undefined, getter: tagGetter,
+                               flags: JS_PROP_GETSET | JS_PROP_CONFIGURABLE)
+            tagGetter.freeValue()
+        }
+
+        let fromFn = newCFunction({ ctx, thisVal, args in
+            guard let id = classIDForCtor(thisVal) else {
+                return ctx.throwTypeError(message: "TypedArray.from: this is not a typed array constructor")
+            }
+            return jsTypedArray_from(ctx, thisVal, args, classID: id)
+        }, name: "from", length: 1)
+        _ = definePropertyValue(obj: taCtor, atom: findAtom("from"), value: fromFn,
+                                flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+        fromFn.freeValue()
+        let ofFn = newCFunction({ ctx, thisVal, args in
+            guard let id = classIDForCtor(thisVal) else {
+                return ctx.throwTypeError(message: "TypedArray.of: this is not a typed array constructor")
+            }
+            return jsTypedArray_of(ctx, thisVal, args, classID: id)
+        }, name: "of", length: 0)
+        _ = definePropertyValue(obj: taCtor, atom: findAtom("of"), value: ofFn,
+                                flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+        ofFn.freeValue()
+
         for (jsClassID, name, jeffClassID) in typedArrayNames {
-            let proto = newObjectClass(classID: JSClassID.JS_CLASS_OBJECT.rawValue)
+            let proto = newObjectProto(proto: taProto)
             classProto[jsClassID.rawValue] = proto
 
             let capturedJeffClassID = jeffClassID
@@ -2631,70 +2754,31 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 guard let self = self else { return .exception }
                 return jsTypedArray_constructor(self, thisVal, args, classID: capturedJeffClassID)
             }, name: name, length: 3)
+            // Float32Array.__proto__ === %TypedArray%
+            setPrototypeOf(ctor, proto: taCtor)
+            if let ctorObj = ctor.toObject() { ctorClassIDs[ObjectIdentifier(ctorObj)] = jeffClassID }
             _ = setPropertyStr(obj: ctor, name: "prototype", value: proto.dupValue())
             _ = definePropertyValue(obj: proto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
                                     value: ctor.dupValue(), flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
 
-            // TypedArray.from(source, mapFn?, thisArg?) — static method
-            let fromFn = newCFunction({ [weak self] ctx, thisVal, args in
-                guard let self = self else { return .exception }
-                return jsTypedArray_from(self, thisVal, args, classID: capturedJeffClassID)
-            }, name: "from", length: 1)
-            _ = setPropertyStr(obj: ctor, name: "from", value: fromFn)
-
-            // TypedArray.of(...items) — static method
-            let ofFn = newCFunction({ [weak self] ctx, thisVal, args in
-                guard let self = self else { return .exception }
-                return jsTypedArray_of(self, thisVal, args, classID: capturedJeffClassID)
-            }, name: "of", length: 0)
-            _ = setPropertyStr(obj: ctor, name: "of", value: ofFn)
-
-            // BYTES_PER_ELEMENT static property
+            // BYTES_PER_ELEMENT on the constructor and its prototype
             if let info = typedArrayInfo(forClassID: capturedJeffClassID) {
                 _ = setPropertyStr(obj: ctor, name: "BYTES_PER_ELEMENT",
                                    value: .newInt32(Int32(info.bytesPerElement)))
-            }
-
-            // Prototype methods
-            if let protoObj = proto.toObject() {
-                // Getters
-                jeffJS_addGetterProperty(ctx: self, proto: protoObj, name: "buffer") { ctx, this in
-                    return jsTypedArray_buffer(ctx, this)
-                }
-                jeffJS_addGetterProperty(ctx: self, proto: protoObj, name: "byteLength") { ctx, this in
-                    return jsTypedArray_byteLength(ctx, this)
-                }
-                jeffJS_addGetterProperty(ctx: self, proto: protoObj, name: "byteOffset") { ctx, this in
-                    return jsTypedArray_byteOffset(ctx, this)
-                }
-                jeffJS_addGetterProperty(ctx: self, proto: protoObj, name: "length") { ctx, this in
-                    return jsTypedArray_length(ctx, this)
-                }
-
-                // BYTES_PER_ELEMENT on prototype
-                if let info = typedArrayInfo(forClassID: capturedJeffClassID) {
+                if let protoObj = proto.toObject() {
                     jeffJS_setPropertyStr(ctx: self, obj: protoObj, name: "BYTES_PER_ELEMENT",
                                           value: .newInt32(Int32(info.bytesPerElement)))
                 }
-
-                // Instance methods
-                jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "at", length: 1, func: jsTypedArray_at)
-                jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "set", length: 1, func: jsTypedArray_set)
-                jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "slice", length: 2, func: jsTypedArray_slice)
-                jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "subarray", length: 2, func: jsTypedArray_subarray)
-                jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "fill", length: 1, func: jsTypedArray_fill)
-                jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "copyWithin", length: 2, func: jsTypedArray_copyWithin)
-                jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "reverse", length: 0, func: jsTypedArray_reverse)
-                jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "indexOf", length: 1, func: jsTypedArray_indexOf)
-                jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "lastIndexOf", length: 1, func: jsTypedArray_lastIndexOf)
-                jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "includes", length: 1, func: jsTypedArray_includes)
-                jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "join", length: 1, func: jsTypedArray_join)
-                jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "toString", length: 0, func: jsTypedArray_toString)
-                jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "toLocaleString", length: 0, func: jsTypedArray_toLocaleString)
             }
 
             _ = setPropertyStr(obj: globalObj, name: name, value: ctor)
         }
+        // Release the setup references: %TypedArray%.prototype stays owned by
+        // %TypedArray%.prototype's slot and the concrete prototypes' shapes,
+        // %TypedArray% by its prototype's `constructor` and the concrete
+        // constructors' shapes.
+        taProto.freeValue()
+        taCtor.freeValue()
     }
 
     /// Adds Promise, async function support, generators, and async generators.
@@ -5492,6 +5576,10 @@ extension JeffJSContext {
 
     func callMethod(_ obj: JeffJSValue, name: String, args: [JeffJSValue]) -> JeffJSValue {
         let method = getPropertyStr(obj: obj, name: name)
+        // The lookup is owned: release it after the call (it leaked one
+        // reference per call — for Array.from over an array iterator, the
+        // iterator's own `next` function every step).
+        defer { method.freeValue() }
         if method.isUndefined || !method.isFunction { return JeffJSValue.undefined }
         return call(method, this: obj, args: args)
     }

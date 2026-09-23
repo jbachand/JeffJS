@@ -44,20 +44,9 @@ private let jeffJS_toStringTagByClass: [(JSClassID, String)] = [
     (.JS_CLASS_ASYNC_GENERATOR,        "AsyncGenerator"),
     (.JS_CLASS_ASYNC_GENERATOR_FUNCTION, "AsyncGeneratorFunction"),
     (.JS_CLASS_ASYNC_FROM_SYNC_ITERATOR, "Async-from-Sync Iterator"),
-    // Typed arrays: the spec puts an accessor on %TypedArray%.prototype that
-    // reports the concrete constructor name.  A per-prototype data property is
-    // observationally identical for instances and far cheaper here.
-    (.JS_CLASS_UINT8C_ARRAY,           "Uint8ClampedArray"),
-    (.JS_CLASS_INT8_ARRAY,             "Int8Array"),
-    (.JS_CLASS_UINT8_ARRAY,            "Uint8Array"),
-    (.JS_CLASS_INT16_ARRAY,            "Int16Array"),
-    (.JS_CLASS_UINT16_ARRAY,           "Uint16Array"),
-    (.JS_CLASS_INT32_ARRAY,            "Int32Array"),
-    (.JS_CLASS_UINT32_ARRAY,           "Uint32Array"),
-    (.JS_CLASS_BIG_INT64_ARRAY,        "BigInt64Array"),
-    (.JS_CLASS_BIG_UINT64_ARRAY,       "BigUint64Array"),
-    (.JS_CLASS_FLOAT32_ARRAY,          "Float32Array"),
-    (.JS_CLASS_FLOAT64_ARRAY,          "Float64Array"),
+    // Typed arrays: no entry. %TypedArray%.prototype carries the spec's
+    // `get [Symbol.toStringTag]` accessor (installed with the typed array
+    // intrinsics); a per-prototype data property would shadow it.
 ]
 
 /// Namespace/global singletons that carry the tag on the object itself.

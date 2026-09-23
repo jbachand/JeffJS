@@ -2269,8 +2269,11 @@ extension JeffJSContext {
         // Try to get the iterator method via the well-known symbol atom
         let iterMethod = getProperty(obj: obj, atom: symAtom)
         if !iterMethod.isUndefined && !iterMethod.isNull {
-            // Call the iterator method
+            // Call the iterator method. The lookup is owned: release it (it
+            // leaked one reference per for-of / spread / destructuring, which
+            // kept every per-iterator `[Symbol.iterator]` function alive).
             let iter = callFunction(iterMethod, thisVal: obj, args: [])
+            iterMethod.freeValue()
             if iter.isException { return .exception }
             if !iter.isObject {
                 _ = throwTypeError(message: "iterator must return an object")
@@ -2285,6 +2288,7 @@ extension JeffJSContext {
                                           atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue)
             if !syncMethod.isUndefined && !syncMethod.isNull {
                 let syncIter = callFunction(syncMethod, thisVal: obj, args: [])
+                syncMethod.freeValue()
                 if syncIter.isException { return .exception }
                 return syncIter
             }
