@@ -141,6 +141,9 @@ struct JeffJSSavedDestructParam {
     var endLastLineNum: Int = 0
     var endLastPtr: Int = 0
     var endTemplateNestLevel: Int = 0
+    /// `...[a, b]` / `...{length}`: the pattern binds the rest array, and
+    /// takes no initializer.
+    var isRest: Bool = false
 }
 
 // =============================================================================
@@ -2505,7 +2508,11 @@ final class JeffJSParser {
                     emitOp(.put_loc)
                     emitU16(UInt16(varIdx))
                 } else if tok == 0x7B || tok == 0x5B { // destructuring
-                    parseDestructuringBinding(kind: .binding)
+                    // Lexical to the catch block, like the plain identifier
+                    // form. QuickJS also accepts an initializer on the pattern
+                    // (`catch ({a} = {})`, applied when the thrown value is
+                    // undefined); parseNestedDestructuringElement handles both.
+                    parseNestedDestructuringElement(kind: .binding, isLexical: true, isConst: false)
                 } else {
                     syntaxError("expected catch parameter")
                 }
@@ -3125,19 +3132,44 @@ final class JeffJSParser {
         var savedDefaults: [JeffJSSavedDefaultParam] = []
         var restParam: JeffJSRestParamInfo? = nil
         var savedDestructs: [JeffJSSavedDestructParam] = []
+        // `length` stops at the first parameter carrying an initializer,
+        // whether it is a plain name (`b = 1`) or a pattern (`{b} = {}`).
+        var firstDefaultIndex: Int? = nil
 
         while tok != 0x29 && tok != JSTokenType.TOK_EOF.rawValue && !shouldAbort { // ')'
             if tok == JSTokenType.TOK_ELLIPSIS.rawValue {
                 // Rest parameter
                 next()
+                childFd.hasSimpleParameterList = false
                 if tok == JSTokenType.TOK_IDENT.rawValue {
                     let paramName = s.token.identAtom
                     next()
                     var arg = JeffJSVarDef()
                     arg.varName = paramName
                     childFd.args.append(arg)
-                    childFd.hasSimpleParameterList = false
                     restParam = JeffJSRestParamInfo(argIndex: paramCount, paramName: paramName)
+                } else if tok == 0x7B || tok == 0x5B {
+                    // Rest pattern: `...[a, b]` / `...{length}` binds the rest
+                    // array through the pattern (replayed in the body prologue).
+                    var saved = JeffJSSavedDestructParam(
+                        argIndex: paramCount,
+                        bufPtr: s.bufPtr,
+                        lineNum: s.lineNum,
+                        token: s.token,
+                        gotLF: s.gotLF,
+                        lastLineNum: s.lastLineNum,
+                        lastPtr: s.lastPtr,
+                        templateNestLevel: s.templateNestLevel
+                    )
+                    saved.isRest = true
+                    var arg = JeffJSVarDef()
+                    arg.varName = 0
+                    childFd.args.append(arg)
+                    skipDestructuringPattern()
+                    savedDestructs.append(saved)
+                } else {
+                    syntaxError("expected rest parameter name or pattern")
+                    return (savedDefaults, restParam, savedDestructs)
                 }
                 break // rest must be last
             }
@@ -3167,8 +3199,10 @@ final class JeffJSParser {
                 // Skip the destructuring pattern
                 skipDestructuringPattern()
 
-                // Also skip a default value if present: ({x, y} = {x: 1, y: 2})
+                // Also skip a default value if present: ({x, y} = {x: 1, y: 2}).
+                // parseNestedDestructuringElement re-reads it on replay.
                 if tok == 0x3D { // '='
+                    if firstDefaultIndex == nil { firstDefaultIndex = paramCount }
                     next()
                     skipExpression()
                 }
@@ -3195,6 +3229,7 @@ final class JeffJSParser {
                 if tok == 0x3D { // '='
                     next()
                     childFd.hasSimpleParameterList = false
+                    if firstDefaultIndex == nil { firstDefaultIndex = paramCount }
 
                     // Save state AFTER consuming '=', before the default expression
                     var saved = JeffJSSavedDefaultParam(
@@ -3237,7 +3272,7 @@ final class JeffJSParser {
         childFd.argCount = paramCount
         // `length` counts parameters up to (not including) the first one with
         // a default; the rest parameter already broke out of the loop above.
-        childFd.functionLength = savedDefaults.first?.argIndex ?? paramCount
+        childFd.functionLength = firstDefaultIndex ?? paramCount
         return (savedDefaults, restParam, savedDestructs)
     }
 
@@ -3262,109 +3297,10 @@ final class JeffJSParser {
             expectSemicolon()
         }
 
-        // -- Emit default parameter initialization --
-        // For each parameter with a default value, check if the argument is
-        // undefined and if so evaluate the default expression and store it
-        // back into the argument slot.
-        for dflt in defaults {
-            let endLabel = newLabel()
-            // get_arg pushes the argument value
-            emitOp(.get_arg)
-            emitU16(UInt16(dflt.argIndex))
-            // Check if it's undefined
-            emitOp(.undefined)
-            emitOp(.strict_eq)
-            emitIfFalse(endLabel) // if not undefined, skip default
-
-            // Save current tokenizer state
-            let curBufPtr = s.bufPtr
-            let curLineNum = s.lineNum
-            let curToken = s.token
-            let curGotLF = s.gotLF
-            let curLastLineNum = s.lastLineNum
-            let curLastPtr = s.lastPtr
-            let curTemplateNest = s.templateNestLevel
-
-            // Rewind to the saved default expression position
-            s.bufPtr = dflt.bufPtr
-            s.lineNum = dflt.lineNum
-            s.token = dflt.token
-            s.gotLF = dflt.gotLF
-            s.lastLineNum = dflt.lastLineNum
-            s.lastPtr = dflt.lastPtr
-            s.templateNestLevel = dflt.templateNestLevel
-
-            // Parse the default expression (emits bytecode into childFd)
-            parseAssignExpr()
-
-            // Store into the argument slot
-            emitOp(.put_arg)
-            emitU16(UInt16(dflt.argIndex))
-
-            // Restore tokenizer to body position
-            s.bufPtr = curBufPtr
-            s.lineNum = curLineNum
-            s.token = curToken
-            s.gotLF = curGotLF
-            s.lastLineNum = curLastLineNum
-            s.lastPtr = curLastPtr
-            s.templateNestLevel = curTemplateNest
-
-            emitLabel(endLabel)
-        }
-
-        // -- Emit rest parameter collection --
-        // rest(argIndex) creates an array from arguments starting at argIndex
-        // and pushes it onto the stack. We then define a local variable for it.
-        if let restInfo = rest {
-            emitOp(.rest)
-            emitU16(UInt16(restInfo.argIndex))
-            let varIdx = defineVar(restInfo.paramName)
-            emitScopePutVarInit(restInfo.paramName, scopeLevel: fd.curScope)
-            _ = varIdx
-        }
-
-        // -- Emit destructuring parameter bindings --
-        // For each parameter that was a destructuring pattern ({x, y} or [a, b]),
-        // push the argument value and replay the pattern to create local bindings.
-        for dp in destructs {
-            // Push the argument value onto the stack (the RHS for destructuring)
-            emitOp(.get_arg)
-            emitU16(UInt16(dp.argIndex))
-
-            // Save current tokenizer state
-            let curBufPtr = s.bufPtr
-            let curLineNum = s.lineNum
-            let curToken = s.token
-            let curGotLF = s.gotLF
-            let curLastLineNum = s.lastLineNum
-            let curLastPtr = s.lastPtr
-            let curTemplateNest = s.templateNestLevel
-
-            // Rewind to the saved destructuring pattern position
-            s.bufPtr = dp.bufPtr
-            s.lineNum = dp.lineNum
-            s.token = dp.token
-            s.gotLF = dp.gotLF
-            s.lastLineNum = dp.lastLineNum
-            s.lastPtr = dp.lastPtr
-            s.templateNestLevel = dp.templateNestLevel
-
-            // Parse the destructuring pattern — this emits binding code that
-            // pulls properties/elements from the value on the stack
-            parseDestructuringBinding(kind: .binding)
-
-            // Restore tokenizer to body position
-            s.bufPtr = curBufPtr
-            s.lineNum = curLineNum
-            s.token = curToken
-            s.gotLF = curGotLF
-            s.lastLineNum = curLastLineNum
-            s.lastPtr = curLastPtr
-            s.templateNestLevel = curTemplateNest
-        }
-
         // -- Define `arguments` binding for non-arrow functions --
+        // Defined BEFORE the parameter initializers: a default may read
+        // `arguments` (`function f(a, b = arguments.length)`), and the object
+        // must snapshot the arguments as passed, before any default is stored.
         // The variable must exist before the body parses (so identifier
         // resolution binds to it), but the mapped-arguments OBJECT is built
         // only if the body actually references `arguments` (or calls eval).
@@ -3378,6 +3314,9 @@ final class JeffJSParser {
             fd.argumentsProloguePos = fd.byteCode.len
             fd.argumentsPrologueScope = fd.curScope
         }
+
+        // -- Parameter initializers, left to right --
+        emitParameterInitializers(defaults: defaults, rest: rest, destructs: destructs)
 
         // A base-class constructor runs the instance field initializers
         // before its own body (QuickJS emit_class_field_init).
@@ -3413,6 +3352,115 @@ final class JeffJSParser {
         curBlockEnvIdx = savedBlockEnvIdx
     }
 
+    /// Rewind the tokenizer to a saved parameter position, run `body` (which
+    /// parses from there and emits into the current function), and restore
+    /// the tokenizer to where the function body is being parsed.
+    private func replayParameterTokens(bufPtr: Int, lineNum: Int, token: JeffJSToken,
+                                       gotLF: Bool, lastLineNum: Int, lastPtr: Int,
+                                       templateNestLevel: Int, _ body: () -> Void) {
+        let curBufPtr = s.bufPtr
+        let curLineNum = s.lineNum
+        let curToken = s.token
+        let curGotLF = s.gotLF
+        let curLastLineNum = s.lastLineNum
+        let curLastPtr = s.lastPtr
+        let curTemplateNest = s.templateNestLevel
+
+        s.bufPtr = bufPtr
+        s.lineNum = lineNum
+        s.token = token
+        s.gotLF = gotLF
+        s.lastLineNum = lastLineNum
+        s.lastPtr = lastPtr
+        s.templateNestLevel = templateNestLevel
+
+        body()
+
+        s.bufPtr = curBufPtr
+        s.lineNum = curLineNum
+        s.token = curToken
+        s.gotLF = curGotLF
+        s.lastLineNum = curLastLineNum
+        s.lastPtr = curLastPtr
+        s.templateNestLevel = curTemplateNest
+    }
+
+    /// Emit the parameter prologue: every default, destructuring pattern and
+    /// rest parameter, in source order (ES FunctionDeclarationInstantiation
+    /// runs IteratorBindingInitialization over the formals left to right, so
+    /// `function f({a}, b = a)` and `function f(a, {b} = {b: a})` both see
+    /// the earlier parameter).
+    ///
+    ///   name = expr      get_arg i; undefined; strict_eq; if_false L;
+    ///                    <expr>; put_arg i; L:
+    ///   pattern [= expr] get_arg i; <pattern, with the initializer applied
+    ///                    when the argument is undefined>
+    ///   ...name          rest i; <store name>
+    ///   ...pattern       rest i; <pattern>
+    func emitParameterInitializers(defaults: [JeffJSSavedDefaultParam],
+                                   rest: JeffJSRestParamInfo?,
+                                   destructs: [JeffJSSavedDestructParam]) {
+        enum Step {
+            case initializer(JeffJSSavedDefaultParam)
+            case pattern(JeffJSSavedDestructParam)
+            case restName(JeffJSRestParamInfo)
+        }
+        var steps: [(index: Int, step: Step)] = []
+        steps.reserveCapacity(defaults.count + destructs.count + 1)
+        for d in defaults { steps.append((d.argIndex, .initializer(d))) }
+        for d in destructs { steps.append((d.argIndex, .pattern(d))) }
+        if let r = rest { steps.append((r.argIndex, .restName(r))) }
+        // Each formal owns one index, so the order is total.
+        steps.sort { $0.index < $1.index }
+
+        for (_, step) in steps {
+            switch step {
+            case .initializer(let dflt):
+                let endLabel = newLabel()
+                emitOp(.get_arg)
+                emitU16(UInt16(dflt.argIndex))
+                emitOp(.undefined)
+                emitOp(.strict_eq)
+                emitIfFalse(endLabel) // not undefined: keep the argument
+                replayParameterTokens(bufPtr: dflt.bufPtr, lineNum: dflt.lineNum, token: dflt.token,
+                                      gotLF: dflt.gotLF, lastLineNum: dflt.lastLineNum,
+                                      lastPtr: dflt.lastPtr, templateNestLevel: dflt.templateNestLevel) {
+                    parseAssignExpr()
+                }
+                emitOp(.put_arg)
+                emitU16(UInt16(dflt.argIndex))
+                emitLabel(endLabel)
+
+            case .pattern(let dp):
+                if dp.isRest {
+                    emitOp(.rest)
+                } else {
+                    emitOp(.get_arg)
+                }
+                emitU16(UInt16(dp.argIndex))
+                replayParameterTokens(bufPtr: dp.bufPtr, lineNum: dp.lineNum, token: dp.token,
+                                      gotLF: dp.gotLF, lastLineNum: dp.lastLineNum,
+                                      lastPtr: dp.lastPtr, templateNestLevel: dp.templateNestLevel) {
+                    if dp.isRest {
+                        parseDestructuringBinding(kind: .binding)
+                    } else {
+                        // Pattern plus its optional `= initializer`, which
+                        // replaces the argument when that is undefined.
+                        parseNestedDestructuringElement(kind: .binding, isLexical: false, isConst: false)
+                    }
+                }
+
+            case .restName(let restInfo):
+                // rest(argIndex) creates an array from the arguments starting
+                // at argIndex; bind it to the rest parameter's name.
+                emitOp(.rest)
+                emitU16(UInt16(restInfo.argIndex))
+                _ = defineVar(restInfo.paramName)
+                emitScopePutVarInit(restInfo.paramName, scopeLevel: fd.curScope)
+            }
+        }
+    }
+
     /// Parse an arrow function body (concise or block).
     func parseArrowFunctionBody(childFd: JeffJSFunctionDefCompiler, isAsync: Bool,
                                 defaults: [JeffJSSavedDefaultParam] = [],
@@ -3431,90 +3479,8 @@ final class JeffJSParser {
         inFlag = true // Default params always use [+In]
         fd = childFd
 
-        // -- Emit default parameter initialization --
-        for dflt in defaults {
-            let endLabel = newLabel()
-            emitOp(.get_arg)
-            emitU16(UInt16(dflt.argIndex))
-            emitOp(.undefined)
-            emitOp(.strict_eq)
-            emitIfFalse(endLabel)
-
-            // Save current tokenizer state
-            let curBufPtr = s.bufPtr
-            let curLineNum = s.lineNum
-            let curToken = s.token
-            let curGotLF = s.gotLF
-            let curLastLineNum = s.lastLineNum
-            let curLastPtr = s.lastPtr
-            let curTemplateNest = s.templateNestLevel
-
-            // Rewind to the saved default expression position
-            s.bufPtr = dflt.bufPtr
-            s.lineNum = dflt.lineNum
-            s.token = dflt.token
-            s.gotLF = dflt.gotLF
-            s.lastLineNum = dflt.lastLineNum
-            s.lastPtr = dflt.lastPtr
-            s.templateNestLevel = dflt.templateNestLevel
-
-            parseAssignExpr()
-
-            emitOp(.put_arg)
-            emitU16(UInt16(dflt.argIndex))
-
-            // Restore tokenizer to body position
-            s.bufPtr = curBufPtr
-            s.lineNum = curLineNum
-            s.token = curToken
-            s.gotLF = curGotLF
-            s.lastLineNum = curLastLineNum
-            s.lastPtr = curLastPtr
-            s.templateNestLevel = curTemplateNest
-
-            emitLabel(endLabel)
-        }
-
-        // -- Emit rest parameter collection --
-        if let restInfo = rest {
-            emitOp(.rest)
-            emitU16(UInt16(restInfo.argIndex))
-            let varIdx = defineVar(restInfo.paramName)
-            emitScopePutVarInit(restInfo.paramName, scopeLevel: fd.curScope)
-            _ = varIdx
-        }
-
-        // -- Emit destructuring parameter bindings --
-        for dp in destructs {
-            emitOp(.get_arg)
-            emitU16(UInt16(dp.argIndex))
-
-            let curBufPtr = s.bufPtr
-            let curLineNum = s.lineNum
-            let curToken = s.token
-            let curGotLF = s.gotLF
-            let curLastLineNum = s.lastLineNum
-            let curLastPtr = s.lastPtr
-            let curTemplateNest = s.templateNestLevel
-
-            s.bufPtr = dp.bufPtr
-            s.lineNum = dp.lineNum
-            s.token = dp.token
-            s.gotLF = dp.gotLF
-            s.lastLineNum = dp.lastLineNum
-            s.lastPtr = dp.lastPtr
-            s.templateNestLevel = dp.templateNestLevel
-
-            parseDestructuringBinding(kind: .binding)
-
-            s.bufPtr = curBufPtr
-            s.lineNum = curLineNum
-            s.token = curToken
-            s.gotLF = curGotLF
-            s.lastLineNum = curLastLineNum
-            s.lastPtr = curLastPtr
-            s.templateNestLevel = curTemplateNest
-        }
+        // -- Parameter initializers, left to right --
+        emitParameterInitializers(defaults: defaults, rest: rest, destructs: destructs)
 
         if tok == 0x7B { // '{' -- block body
             next()
@@ -3862,6 +3828,13 @@ final class JeffJSParser {
                 next() // consume 'async'
                 // [no LineTerminator here] between async and (
                 if !s.gotLF {
+                    // async (pattern, ...) => — the ident-only scanner below
+                    // does not accept patterns.
+                    if let full = scanFullArrowFromParen(), full.contains(where: { $0.atom == 0 }) {
+                        next() // consume '('
+                        emitPatternArrowFunction(isAsync: true)
+                        return
+                    }
                     next() // consume '('
                     if tok == 0x29 { // ')' — async () =>
                         next()
@@ -3938,23 +3911,7 @@ final class JeffJSParser {
                     expect(JSTokenType.TOK_ARROW.rawValue)
                     emitArrowFunction(paramAtoms: [], isAsync: false)
                 } else if hasDestructuring {
-                    // Use parseFormalParameters to handle destructuring patterns
-                    let arrowFd = JeffJSFunctionDefCompiler()
-                    arrowFd.parent = fd
-                    arrowFd.withVarStack = fd.withVarStack   // see parseFunctionDef
-                    arrowFd.isArrow = true
-                    arrowFd.argumentsAllowed = false
-                    if fd.jsMode & JS_MODE_STRICT != 0 {
-                        arrowFd.jsMode = JS_MODE_STRICT
-                    }
-                    let (adflts, arst, adstructs) = parseFormalParameters(childFd: arrowFd)
-                    expect(0x29) // ')'
-                    expect(JSTokenType.TOK_ARROW.rawValue)
-                    fd.childFunctions.append(arrowFd)
-                    parseArrowFunctionBody(childFd: arrowFd, isAsync: false,
-                                           defaults: adflts, rest: arst, destructs: adstructs)
-                    let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
-                    emitFClosure(cpoolIdx, anonymous: true)
+                    emitPatternArrowFunction(isAsync: false)
                 } else {
                     let (dflts, rst) = consumeParenArrowParams(params)
                     emitArrowFunction(paramAtoms: params.map { $0.atom }, isAsync: false,
@@ -5200,6 +5157,33 @@ final class JeffJSParser {
         emitFClosure(cpoolIdx, anonymous: true)   // arrows are always anonymous
     }
 
+    /// An arrow whose parameter list holds a pattern (`({a} = {}) => a`,
+    /// `async ([x], ...[y]) => x`). The '(' is consumed; parses the formals,
+    /// ')' '=>' and the body, and emits the closure.
+    func emitPatternArrowFunction(isAsync: Bool) {
+        let arrowFd = JeffJSFunctionDefCompiler()
+        arrowFd.parent = fd
+        arrowFd.definedScopeLevel = fd.curScope
+        arrowFd.filename = fd.filename
+        arrowFd.withVarStack = fd.withVarStack   // see parseFunctionDef
+        arrowFd.isArrow = true
+        arrowFd.argumentsAllowed = false
+        if isAsync {
+            arrowFd.funcKind = JSFunctionKindEnum.JS_FUNC_ASYNC.rawValue
+        }
+        if fd.jsMode & JS_MODE_STRICT != 0 {
+            arrowFd.jsMode = JS_MODE_STRICT
+        }
+        let (adflts, arst, adstructs) = parseFormalParameters(childFd: arrowFd)
+        expect(0x29) // ')'
+        expect(JSTokenType.TOK_ARROW.rawValue)
+        fd.childFunctions.append(arrowFd)
+        parseArrowFunctionBody(childFd: arrowFd, isAsync: isAsync,
+                               defaults: adflts, rest: arst, destructs: adstructs)
+        let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
+        emitFClosure(cpoolIdx, anonymous: true)
+    }
+
     /// Scan ahead from '(' to determine if this is a parenthesized arrow:
     ///   '(' [params] ')' '=>'
     /// This is called BEFORE the '(' is consumed. It saves and restores
@@ -5242,12 +5226,25 @@ final class JeffJSParser {
             let curTok = s.token.type
             if curTok == JSTokenType.TOK_EOF.rawValue { return nil }
 
-            // Rest parameter: '...' IDENT
+            // Rest parameter: '...' IDENT, or '...' pattern (atom 0 routes the
+            // arrow through parseFormalParameters, like any destructuring one)
             if curTok == JSTokenType.TOK_ELLIPSIS.rawValue {
                 _ = s.nextToken()
-                if s.token.type != JSTokenType.TOK_IDENT.rawValue { return nil }
-                params.append((atom: s.token.identAtom, isRest: true))
-                _ = s.nextToken()
+                if s.token.type == 0x7B || s.token.type == 0x5B {
+                    var depth = 1
+                    _ = s.nextToken()
+                    while depth > 0 && s.token.type != JSTokenType.TOK_EOF.rawValue {
+                        let t = s.token.type
+                        if t == 0x7B || t == 0x5B { depth += 1 }
+                        if t == 0x7D || t == 0x5D { depth -= 1 }
+                        _ = s.nextToken()
+                    }
+                    params.append((atom: 0, isRest: true))
+                } else {
+                    if s.token.type != JSTokenType.TOK_IDENT.rawValue { return nil }
+                    params.append((atom: s.token.identAtom, isRest: true))
+                    _ = s.nextToken()
+                }
                 if s.token.type != 0x29 { return nil }
                 _ = s.nextToken()
                 return s.token.type == JSTokenType.TOK_ARROW.rawValue ? params : nil
@@ -5636,6 +5633,13 @@ final class JeffJSParser {
                     next() // consume 'async'
                     // [no LineTerminator here] between async and (
                     if !s.gotLF {
+                        // async (pattern, ...) => — the ident-only scanner
+                        // below does not accept patterns.
+                        if let full = scanFullArrowFromParen(), full.contains(where: { $0.atom == 0 }) {
+                            next() // consume '('
+                            emitPatternArrowFunction(isAsync: true)
+                            return
+                        }
                         next() // consume '('
                         // Check for () => or (params) =>
                         if tok == 0x29 { // ')'
@@ -5728,22 +5732,7 @@ final class JeffJSParser {
                     expect(JSTokenType.TOK_ARROW.rawValue)
                     emitArrowFunction(paramAtoms: [], isAsync: false)
                 } else if hasDestructuring {
-                    let arrowFd = JeffJSFunctionDefCompiler()
-                    arrowFd.parent = fd
-                    arrowFd.withVarStack = fd.withVarStack   // see parseFunctionDef
-                    arrowFd.isArrow = true
-                    arrowFd.argumentsAllowed = false
-                    if fd.jsMode & JS_MODE_STRICT != 0 {
-                        arrowFd.jsMode = JS_MODE_STRICT
-                    }
-                    let (adflts, arst, adstructs) = parseFormalParameters(childFd: arrowFd)
-                    expect(0x29) // ')'
-                    expect(JSTokenType.TOK_ARROW.rawValue)
-                    fd.childFunctions.append(arrowFd)
-                    parseArrowFunctionBody(childFd: arrowFd, isAsync: false,
-                                           defaults: adflts, rest: arst, destructs: adstructs)
-                    let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
-                    emitFClosure(cpoolIdx, anonymous: true)
+                    emitPatternArrowFunction(isAsync: false)
                 } else {
                     let (dflts, rst) = consumeParenArrowParams(params)
                     emitArrowFunction(paramAtoms: params.map { $0.atom }, isAsync: false,
