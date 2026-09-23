@@ -1679,7 +1679,16 @@ final class JeffJSDOMBridge {
         ctx.setPropertyFunc(obj: el, name: "__get_href", fn: { [weak self] ctx, thisVal, _ in
             guard let self else { return ctx.newStringValue("") }
             guard let targetNode = self.extractNode(from: thisVal) else { return ctx.newStringValue("") }
-            return ctx.newStringValue(targetNode.attributes["href"] ?? "")
+            // <a>/<area>/<link>/<base>: the href URL resolved against the
+            // document base (HTML §4.6.1 / §4.2.4 "reflect as a URL"); the raw
+            // attribute when it does not parse. Other elements: the attribute.
+            let raw = targetNode.attributes["href"]
+            if JeffJSHyperlinkURL.resolvesHref(targetNode), let raw {
+                if let url = JeffJSHyperlinkURL(raw, base: self.documentBaseURL()) {
+                    return ctx.newStringValue(url.href)
+                }
+            }
+            return ctx.newStringValue(raw ?? "")
         }, length: 0)
 
         ctx.setPropertyFunc(obj: el, name: "__set_href", fn: { [weak self] ctx, thisVal, args in
@@ -1882,6 +1891,75 @@ final class JeffJSDOMBridge {
             return JeffJSValue.undefined
         }, length: 1)
 
+        // -- Hyperlink / link reflections (HTML §4.6.1 HTMLHyperlinkElementUtils,
+        //    §4.6.2 HTMLAnchorElement, §4.6.3 HTMLAreaElement, §4.2.4 HTMLLinkElement) --
+        // One shared element prototype serves every tag, so each accessor
+        // checks the element's tag: where the IDL attribute does not exist
+        // it reads the content attribute if present (undefined otherwise)
+        // and writes it, as the attribute path frameworks fall back to.
+        func installReflection(_ idl: String, tags: Set<String>,
+                               get: @escaping (JeffJSDOMBridge, DOMNode) -> String,
+                               set: @escaping (JeffJSDOMBridge, DOMNode, String) -> Void) {
+            let contentAttr = idl.lowercased()
+            ctx.setPropertyFunc(obj: el, name: "__get_\(idl)", fn: { [weak self] ctx, thisVal, _ in
+                guard let self, let node = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+                guard tags.contains(node.tagName?.lowercased() ?? "") else {
+                    if let v = node.attributes[contentAttr] { return ctx.newStringValue(v) }
+                    return JeffJSValue.undefined
+                }
+                return ctx.newStringValue(get(self, node))
+            }, length: 0)
+            ctx.setPropertyFunc(obj: el, name: "__set_\(idl)", fn: { [weak self] ctx, thisVal, args in
+                guard let self, let node = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+                // DOMString conversion: null -> "null", undefined -> "undefined".
+                let value = args.isEmpty ? "undefined" : (ctx.toSwiftString(args[0]) ?? "")
+                if tags.contains(node.tagName?.lowercased() ?? "") {
+                    set(self, node, value)
+                } else {
+                    node.setAttribute(name: contentAttr, value: value)
+                }
+                self.notifyMutation(for: node)
+                return JeffJSValue.undefined
+            }, length: 1)
+        }
+        func plain(_ attr: String) -> (JeffJSDOMBridge, DOMNode) -> String {
+            return { _, node in node.attributes[attr] ?? "" }
+        }
+        func setPlain(_ attr: String) -> (JeffJSDOMBridge, DOMNode, String) -> Void {
+            return { _, node, v in node.setAttribute(name: attr, value: v) }
+        }
+        let hyperlink: Set<String> = ["a", "area"]
+        installReflection("hreflang", tags: ["a", "link"], get: plain("hreflang"), set: setPlain("hreflang"))
+        installReflection("target", tags: ["a", "area", "base", "form"], get: plain("target"), set: setPlain("target"))
+        installReflection("download", tags: hyperlink, get: plain("download"), set: setPlain("download"))
+        installReflection("ping", tags: hyperlink, get: plain("ping"), set: setPlain("ping"))
+        // referrerPolicy: an enumerated attribute limited to known values.
+        installReflection("referrerPolicy", tags: ["a", "area", "img", "iframe", "link", "script"],
+                          get: { _, node in
+                              JeffJSHyperlinkURL.referrerPolicy(node.attributes["referrerpolicy"])
+                          },
+                          set: setPlain("referrerpolicy"))
+        // URL decomposition (HTMLHyperlinkElementUtils) on <a> and <area>.
+        // A missing or unparsable href reads as "" (":" for protocol) and
+        // makes the setters no-ops, per the spec's "url is null" steps.
+        for part in JeffJSHyperlinkURL.Part.allCases {
+            installReflection(part.rawValue, tags: hyperlink,
+                              get: { bridge, node in
+                                  guard let raw = node.attributes["href"],
+                                        let url = JeffJSHyperlinkURL(raw, base: bridge.documentBaseURL()) else {
+                                      return part == .`protocol` ? ":" : ""
+                                  }
+                                  return url.get(part)
+                              },
+                              set: { bridge, node, value in
+                                  guard part != .origin, let raw = node.attributes["href"],
+                                        var url = JeffJSHyperlinkURL(raw, base: bridge.documentBaseURL()) else { return }
+                                  if url.set(part, value) {
+                                      node.setAttribute(name: "href", value: url.href)
+                                  }
+                              })
+        }
+
         // -- Plain string reflections (HTML "reflect" IDL attributes) --
         // Each is `el.<x>` <-> the `<x>` content attribute, the same shape as
         // src/href/rel above. Without them `meta.name`, `img.alt`,
@@ -1940,6 +2018,10 @@ final class JeffJSDOMBridge {
         let props: [(String, Bool)] = [
             ("textContent", true), ("innerText", true), ("innerHTML", true), ("outerHTML", true),
             ("content", true), ("classList", false), ("relList", false), ("rel", true),
+            ("hreflang", true), ("target", true), ("download", true), ("ping", true),
+            ("referrerPolicy", true), ("origin", false), ("protocol", true),
+            ("username", true), ("password", true), ("host", true), ("hostname", true),
+            ("port", true), ("pathname", true), ("search", true), ("hash", true),
             ("name", true), ("alt", true), ("title", true), ("placeholder", true), ("type", true),
             ("id", true), ("className", true), ("value", true),
             ("checked", true), ("hidden", true), ("src", true), ("href", true),
@@ -2630,6 +2712,23 @@ final class JeffJSDOMBridge {
         return nil
     }
 
+    /// The document base URL (HTML §2.4.1): the first `<base href>` in the
+    /// document's head resolved against the document URL, else the document
+    /// URL itself.
+    func documentBaseURL() -> URL {
+        let html = root.children.first { $0.nodeType == .element && $0.tagName?.lowercased() == "html" }
+        let head = html?.children.first { $0.nodeType == .element && $0.tagName?.lowercased() == "head" }
+        if let base = head?.children.first(where: {
+               $0.nodeType == .element && $0.tagName?.lowercased() == "base" && $0.attributes["href"] != nil
+           }),
+           let href = base.attributes["href"],
+           let resolved = JeffJSHyperlinkURL(href, base: baseURL),
+           let url = URL(string: resolved.href) {
+            return url
+        }
+        return baseURL
+    }
+
     /// Extracts a Swift string from args at the given index.
     private func extractString(ctx: JeffJSContext, args: [JeffJSValue], index: Int) -> String? {
         guard index < args.count else { return nil }
@@ -2929,5 +3028,187 @@ final class JeffJSDOMBridge {
         styles.sorted(by: { $0.key < $1.key })
             .map { "\($0.key): \($0.value)" }
             .joined(separator: "; ")
+    }
+}
+
+// MARK: - Hyperlink URL (HTMLHyperlinkElementUtils)
+
+/// A WHATWG-flavoured view of a hyperlink's URL over Foundation's parser:
+/// scheme and host lower-cased, default ports dropped, special schemes
+/// always carry a path ("https://a.b" -> "https://a.b/"). Used by the
+/// `href` / `origin` / `protocol` / `host` / `hostname` / `port` /
+/// `pathname` / `search` / `hash` reflections on `<a>` and `<area>`.
+struct JeffJSHyperlinkURL {
+    enum Part: String, CaseIterable {
+        case origin, `protocol`, username, password, host, hostname, port, pathname, search, hash
+    }
+
+    private static let defaultPorts: [String: Int] = ["http": 80, "https": 443, "ws": 80, "wss": 443, "ftp": 21]
+    private static let specialSchemes: Set<String> = ["http", "https", "ws", "wss", "ftp", "file"]
+
+    private var comps: URLComponents
+
+    /// Parse `string` against `base`; nil when it is not a valid URL.
+    init?(_ string: String, base: URL) {
+        let trimmed = string.trimmingCharacters(in: CharacterSet(charactersIn: " \t\n\r\u{0C}"))
+        var url: URL?
+        if trimmed.isEmpty {
+            url = base
+        } else {
+            url = URL(string: trimmed, relativeTo: base)
+            if url == nil {
+                url = URL(string: Self.encode(trimmed, allowed: .urlFragmentAllowed.union(["#"])), relativeTo: base)
+            }
+        }
+        guard let abs = url?.absoluteURL,
+              var c = URLComponents(url: abs, resolvingAgainstBaseURL: false),
+              let scheme = c.scheme, !scheme.isEmpty else { return nil }
+        c.scheme = scheme.lowercased()
+        if let h = c.percentEncodedHost { c.percentEncodedHost = h.lowercased() }
+        comps = c
+        normalize()
+    }
+
+    private var scheme: String { comps.scheme ?? "" }
+    private var isSpecial: Bool { Self.specialSchemes.contains(scheme) }
+
+    private mutating func normalize() {
+        if let p = comps.port, Self.defaultPorts[scheme] == p { comps.port = nil }
+        if isSpecial && comps.percentEncodedPath.isEmpty { comps.percentEncodedPath = "/" }
+    }
+
+    var href: String { comps.string ?? "" }
+
+    func get(_ part: Part) -> String {
+        switch part {
+        case .origin:
+            guard Self.defaultPorts[scheme] != nil, let h = comps.percentEncodedHost, !h.isEmpty else { return "null" }
+            return "\(scheme)://\(h)\(comps.port.map { ":\($0)" } ?? "")"
+        case .`protocol`: return scheme + ":"
+        case .username: return comps.percentEncodedUser ?? ""
+        case .password: return comps.percentEncodedPassword ?? ""
+        case .host:
+            guard let h = comps.percentEncodedHost else { return "" }
+            return h + (comps.port.map { ":\($0)" } ?? "")
+        case .hostname: return comps.percentEncodedHost ?? ""
+        case .port: return comps.port.map(String.init) ?? ""
+        case .pathname: return comps.percentEncodedPath
+        case .search:
+            guard let q = comps.percentEncodedQuery, !q.isEmpty else { return "" }
+            return "?" + q
+        case .hash:
+            guard let f = comps.percentEncodedFragment, !f.isEmpty else { return "" }
+            return "#" + f
+        }
+    }
+
+    /// Apply a component setter; false when the spec's basic-URL-parser
+    /// state override leaves the URL unchanged.
+    mutating func set(_ part: Part, _ value: String) -> Bool {
+        let hasHost = comps.percentEncodedHost != nil
+        switch part {
+        case .origin:
+            return false
+        case .`protocol`:
+            let s = value.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init)?.lowercased() ?? ""
+            guard let first = s.unicodeScalars.first, CharacterSet.letters.contains(first), first.isASCII,
+                  s.unicodeScalars.allSatisfy({ $0.isASCII && (CharacterSet.alphanumerics.contains($0) || "+-.".unicodeScalars.contains($0)) })
+            else { return false }
+            // Special and non-special schemes do not convert into each other.
+            if Self.specialSchemes.contains(s) != isSpecial { return false }
+            if s == "file" && (comps.port != nil || comps.percentEncodedUser != nil) { return false }
+            comps.scheme = s
+        case .username, .password:
+            guard hasHost, scheme != "file", !(comps.percentEncodedHost ?? "").isEmpty else { return false }
+            let enc = Self.encode(value, allowed: .urlUserAllowed)
+            if part == .username { comps.percentEncodedUser = enc.isEmpty ? nil : enc }
+            else { comps.percentEncodedPassword = enc.isEmpty ? nil : enc }
+        case .host, .hostname:
+            guard hasHost else { return false }
+            let cut = value.prefix { !"/?#\\".contains($0) }
+            var hostPart = String(cut)
+            var portPart: String? = nil
+            if part == .host, !hostPart.hasPrefix("["), let colon = hostPart.firstIndex(of: ":") {
+                portPart = String(hostPart[hostPart.index(after: colon)...])
+                hostPart = String(hostPart[..<colon])
+            }
+            if hostPart.isEmpty && isSpecial { return false }
+            let forbidden = CharacterSet(charactersIn: " #%/:<>?@[\\]^|\t\n\r")
+            if hostPart.unicodeScalars.contains(where: { forbidden.contains($0) }) { return false }
+            comps.host = hostPart.lowercased()
+            if let portPart {
+                let digits = portPart.prefix { $0.isASCII && $0.isNumber }
+                if !digits.isEmpty, let p = Int(digits), p <= 65535 { comps.port = p }
+            }
+        case .port:
+            guard hasHost, scheme != "file", !(comps.percentEncodedHost ?? "").isEmpty else { return false }
+            if value.isEmpty {
+                comps.port = nil
+            } else {
+                let digits = value.prefix { $0.isASCII && $0.isNumber }
+                guard !digits.isEmpty, let p = Int(digits), p <= 65535 else { return false }
+                comps.port = p
+            }
+        case .pathname:
+            // An opaque path (mailto:, javascript:) cannot be replaced.
+            guard hasHost || comps.percentEncodedPath.hasPrefix("/") else { return false }
+            var p = Self.encode(value, allowed: .urlPathAllowed)
+            if isSpecial && !p.hasPrefix("/") { p = "/" + p }
+            comps.percentEncodedPath = p
+        case .search:
+            let v = value.hasPrefix("?") ? String(value.dropFirst()) : value
+            comps.percentEncodedQuery = v.isEmpty ? nil : Self.encode(v, allowed: .urlQueryAllowed)
+        case .hash:
+            let v = value.hasPrefix("#") ? String(value.dropFirst()) : value
+            comps.percentEncodedFragment = v.isEmpty ? nil : Self.encode(v, allowed: .urlFragmentAllowed)
+        }
+        normalize()
+        return true
+    }
+
+    /// Percent-encode everything outside `allowed`, keeping existing valid
+    /// `%XX` escapes (the WHATWG encode sets never re-encode `%`), so the
+    /// result is always acceptable to URLComponents' percentEncoded* setters.
+    static func encode(_ s: String, allowed: CharacterSet) -> String {
+        let scalars = Array(s.unicodeScalars)
+        var out = ""
+        var i = 0
+        func isHex(_ u: Unicode.Scalar) -> Bool { u.isASCII && u.properties.isASCIIHexDigit }
+        while i < scalars.count {
+            let u = scalars[i]
+            if u == "%" {
+                if i + 2 < scalars.count, isHex(scalars[i + 1]), isHex(scalars[i + 2]) {
+                    out.unicodeScalars.append(contentsOf: scalars[i...(i + 2)])
+                    i += 3
+                    continue
+                }
+                out += "%25"
+            } else if u.isASCII && allowed.contains(u) {
+                out.unicodeScalars.append(u)
+            } else {
+                for b in String(u).utf8 { out += String(format: "%%%02X", b) }
+            }
+            i += 1
+        }
+        return out
+    }
+
+    /// Elements whose `href` IDL attribute reflects as a URL.
+    static func resolvesHref(_ node: DOMNode) -> Bool {
+        switch node.tagName?.lowercased() {
+        case "a", "area", "link", "base": return true
+        default: return false
+        }
+    }
+
+    /// `referrerPolicy`: limited to the referrer-policy tokens, ASCII
+    /// case-insensitive; anything else (or no attribute) reads as "".
+    static func referrerPolicy(_ raw: String?) -> String {
+        guard let v = raw?.lowercased() else { return "" }
+        let known: Set<String> = [
+            "no-referrer", "no-referrer-when-downgrade", "same-origin", "origin",
+            "strict-origin", "origin-when-cross-origin", "strict-origin-when-cross-origin", "unsafe-url",
+        ]
+        return known.contains(v) ? v : ""
     }
 }
