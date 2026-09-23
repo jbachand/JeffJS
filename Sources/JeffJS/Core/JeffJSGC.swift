@@ -526,6 +526,9 @@ private func gcFreeCycles(_ rt: JeffJSRuntime) {
             if hdr.gcObjType == .jsObject || hdr.gcObjType == .functionBytecode
                 || hdr.gcObjType == .varRef { return true }
             return jeffJS_shapeIsSweepable(rt, hdr)
+                || jeffJS_shapeLosesProto(hdr) { p in
+                    p.mark == JeffJSGCMark.white && isGCTracked(p)
+                }
         }
         if isDead {
             u._withUnsafeGuaranteedRef { $0.gcListIndex = -2 - rt.gcTmpObjects.count }
@@ -599,6 +602,37 @@ func jeffJS_shapeIsSweepable(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader
     return unsafeBitCast(header, to: JeffJSShape.self).isHashed
 }
 
+/// True when `header` is a shape whose prototype this collection frees, so the
+/// shape has to be freed in the same group (`isDying` answers "is this object
+/// in the dead set" for the collector asking).
+///
+/// Only ever asked about an unreachable shape. An unreachable shape's owners
+/// are all unreachable too (an owner outside the dead set would have rescued
+/// it), so once the group is freed nothing is on it and it is exactly what
+/// quickjs frees in `js_free_shape` when the last owner goes. Leaving it behind
+/// is only harmless when its prototype survives: a hashed shape is kept cached
+/// at zero owners for the inline caches, and it keeps its one counted
+/// reference on the prototype (`jeffJS_shapeSetProto`). If the prototype is in
+/// the dead set, that reference now names a freed object, and whatever frees
+/// the shape later — the sweep in a later collection, which is what
+/// `JEFFJS_ZOMBIES=1` caught on Google's tag script, or runtime teardown —
+/// releases it a second time. Two ways in:
+///  * the shape still had owners when the group was chosen (a prototype and
+///    an instance in one cycle: `o = Object.create(P); P.o = o`), so
+///    `jeffJS_shapeIsSweepable`'s `refCount == 0` test failed; freeing the
+///    owners then dropped it to zero, and hashed shapes are not freed at zero;
+///  * it had no owners but the table was below `shapes.evictThreshold`.
+/// A dead shape whose prototype survives is still left to the eviction
+/// policy, so a class whose instances die in cycles keeps its cached shapes.
+@inline(__always)
+func jeffJS_shapeLosesProto(_ header: JeffJSGCObjectHeader,
+                            _ isDying: (JeffJSObject) -> Bool) -> Bool {
+    guard header.gcObjType == .shape,
+          let p = unsafeBitCast(header, to: JeffJSShape.self).proto else { return false }
+    guard p.gcObjType == .jsObject || p.gcObjType == .functionBytecode else { return false }
+    return isDying(p)
+}
+
 /// Take a doomed header off the GC lists by hand. The lists have already been
 /// rebuilt around it, so `removeGCObject` would find nothing to unlink and,
 /// crucially, would skip the malloc accounting — which is what the threshold
@@ -628,10 +662,32 @@ private func gcUnlistDead(_ rt: JeffJSRuntime,
 func gcFreeDeadObjects(_ rt: JeffJSRuntime, _ dead: [JeffJSGCObjectHeader]) {
     var toRelease: [JeffJSGCObjectHeader] = []
     toRelease.reserveCapacity(dead.count)
+    // Shapes last. A dead shape can still have owners in this group
+    // (`jeffJS_shapeLosesProto`); freeing the owners first brings it to zero
+    // the ordinary way, and nothing ever sees an object on an emptied shape.
+    var hasShapes = false
     for hdr in dead {
+        if hdr.gcObjType == .shape { hasShapes = true; continue }
         guard hdr.refCount >= 0 else { continue }   // already processed
         freeGCObjectChildren(rt, hdr)
         toRelease.append(hdr)
+    }
+    if hasShapes {
+        for hdr in dead where hdr.gcObjType == .shape {
+            // A non-hashed shape its last owner just freed is already done
+            // (refCount -1); a hashed one is at zero and still holds its proto.
+            if hdr.refCount < 0 { continue }
+            if hdr.refCount > 0 {
+                // Cannot happen while the mark set is exactly the counted edges
+                // (an unreachable shape's owners are all in this group). If it
+                // ever does, a live object is still on the shape: leave it
+                // listed rather than empty it under that object.
+                if jeffJS_gcDebug { print("[GC] dead shape kept: \(hdr.refCount) owner(s) outside the group") }
+                addGCObject(rt, hdr)
+                continue
+            }
+            freeGCObjectChildren(rt, hdr)
+        }
     }
     // A dying object can drop a *non*-cycle object to zero (it held the last
     // reference to an acyclic subgraph); those were deferred by

@@ -290,11 +290,28 @@ final class JeffJSMetalGC {
         var remaining = ContiguousArray<Unmanaged<JeffJSGCObjectHeader>>()
         remaining.reserveCapacity(objectCount - deadCount)
 
+        // Dead shapes whose prototype dies with this group go with it
+        // (`jeffJS_shapeLosesProto`). Decided before the loop below rewrites
+        // `gcListIndex`, which is how a prototype's slot in the dead set is found.
+        var shapesLosingProto = Set<Int>()
+        let listed = rt.gcObjects
+        for i in deadIndexSet where listed[i]._withUnsafeGuaranteedRef({ $0.gcObjType == .shape }) {
+            let hdr = listed[i].takeUnretainedValue()
+            if jeffJS_shapeLosesProto(hdr, { p in
+                let pi = p.gcListIndex
+                return pi >= 0 && pi < objectCount && deadIndexSet.contains(pi)
+                    && listed[pi].toOpaque() == Unmanaged.passUnretained(p).toOpaque()
+            }) {
+                shapesLosingProto.insert(i)
+            }
+        }
+
         for (i, u) in rt.gcObjects.enumerated() {
             let hdr = u.takeUnretainedValue()
             if deadIndexSet.contains(i),
                hdr.gcObjType == .jsObject || hdr.gcObjType == .functionBytecode
-                || hdr.gcObjType == .varRef || jeffJS_shapeIsSweepable(rt, hdr) {
+                || hdr.gcObjType == .varRef || jeffJS_shapeIsSweepable(rt, hdr)
+                || shapesLosingProto.contains(i) {
                 // Unlinked by hand, so the malloc accounting the GC threshold
                 // reads must be done here too (see gcUnlistDead).
                 hdr.gcListIndex = -1
