@@ -174,12 +174,21 @@ func lreIsSpace(_ c: UInt32) -> Bool {
 }
 
 /// ECMAScript \w character (word character).
+@inline(__always)
 func lreIsWordChar(_ c: UInt32) -> Bool {
-    if c >= UInt32(Character("a").asciiValue!) && c <= UInt32(Character("z").asciiValue!) { return true }
-    if c >= UInt32(Character("A").asciiValue!) && c <= UInt32(Character("Z").asciiValue!) { return true }
-    if c >= UInt32(Character("0").asciiValue!) && c <= UInt32(Character("9").asciiValue!) { return true }
-    if c == UInt32(Character("_").asciiValue!) { return true }
-    return false
+    if c >= 0x61 && c <= 0x7A { return true }   // a-z
+    if c >= 0x41 && c <= 0x5A { return true }   // A-Z
+    if c >= 0x30 && c <= 0x39 { return true }   // 0-9
+    return c == 0x5F                            // _
+}
+
+/// WordCharacters(rer) (ECMA-262 22.2.2.9.4): with both `u` (or `v`) and `i`
+/// it also contains every character whose canonical value is a basic word
+/// character, i.e. U+017F (folds to "s") and U+212A KELVIN SIGN (folds to "k").
+@inline(__always)
+func lreIsWordChar(_ c: UInt32, _ flags: JeffJSRegExpFlags) -> Bool {
+    if lreIsWordChar(c) { return true }
+    return (c == 0x017F || c == 0x212A) && flags.isUnicode && flags.contains(.ignoreCase)
 }
 
 /// ECMAScript \d character.
@@ -196,29 +205,141 @@ private func lreIsLineTerminator(_ c: UInt32) -> Bool {
 // MARK: - Case folding helpers
 // ============================================================================
 
-/// Simple case fold for Canonicalize (non-unicode mode):
-/// Only folds ASCII letters. This mirrors QuickJS's behaviour for the 'i'
-/// flag without 'u'/'v'.
-func lreCanonicalizeChar(_ c: UInt32, _ flags: JeffJSRegExpFlags) -> UInt32 {
-    if flags.isUnicode {
-        return lreCanonicalizeUnicode(c)
+// ECMA-262 22.2.2.7.3 Canonicalize(rer, ch), used by every case-insensitive
+// comparison: literal characters, back references and character classes.
+//
+// - Unicode mode (u / v): simple case folding (CaseFolding.txt, status C + S).
+// - Legacy mode: toUppercase(ch) when it is a single UTF-16 code unit, except
+//   that a non-ASCII character never canonicalises to an ASCII one (so U+017F
+//   LATIN SMALL LETTER LONG S and U+212A KELVIN SIGN do not match "s" / "k").
+//
+// A character class is matched the way ECMA-262 CharacterSetMatcher and
+// QuickJS's cr_regexp_canonicalize do it: the class's set is canonicalised
+// once at compile time (every member replaced by its canonical value, ranges
+// included), *then* negated, and the VM canonicalises each input character
+// before the membership test.  Negating before canonicalising, or folding only
+// one side, is what made `/[^a]/i.test("a")` true.
+
+/// Canonicalisation tables for one mode.  Built lazily on first use of a
+/// case-insensitive regexp and kept for the life of the process.
+final class LRECaseTables {
+    /// Canonical value of every BMP code point (legacy mode: of every code unit).
+    let bmp: UnsafeMutablePointer<UInt16>
+    /// Supplementary-plane entries whose canonical value differs (unicode mode only).
+    let supplementary: [UInt32: UInt32]
+    /// Every code point whose canonical value differs from itself, sorted,
+    /// paired with that canonical value.
+    let changed: [(UInt32, UInt32)]
+    /// `changed` as a normalised range list.
+    let changedRanges: [CharRange]
+
+    static let unicode = LRECaseTables(unicode: true)
+    static let legacy = LRECaseTables(unicode: false)
+
+    @inline(__always)
+    static func forFlags(_ flags: JeffJSRegExpFlags) -> LRECaseTables {
+        return flags.isUnicode ? unicode : legacy
     }
-    // Non-unicode: only fold ASCII A-Z <-> a-z.
-    if c >= 0x41 && c <= 0x5A { return c + 0x20 }
-    if c >= 0x61 && c <= 0x7A { return c - 0x20 }
+
+    private init(unicode: Bool) {
+        bmp = UnsafeMutablePointer<UInt16>.allocate(capacity: 0x10000)
+        var changed = [(UInt32, UInt32)]()
+        var supp = [UInt32: UInt32]()
+        for c in UInt32(0) ..< 0x10000 {
+            let k = unicode ? lreSimpleCaseFold(c) : lreLegacyCanonicalize(c)
+            bmp[Int(c)] = UInt16(truncatingIfNeeded: k)
+            if k != c { changed.append((c, k)) }
+        }
+        if unicode {
+            // Every cased supplementary character is in plane 1 (Deseret,
+            // Osage, Vithkuqi, Old Hungarian, Garay, Warang Citi, Medefaidrin,
+            // Adlam).
+            for c in UInt32(0x10000) ..< 0x20000 {
+                let k = lreSimpleCaseFold(c)
+                if k != c { changed.append((c, k)); supp[c] = k }
+            }
+        }
+        var ranges = [CharRange]()
+        for (c, _) in changed {
+            if let last = ranges.last, last.hi &+ 1 == c {
+                ranges[ranges.count - 1].hi = c
+            } else {
+                ranges.append(CharRange(c))
+            }
+        }
+        self.changed = changed
+        self.changedRanges = ranges
+        self.supplementary = supp
+    }
+
+    @inline(__always)
+    func canonicalize(_ c: UInt32) -> UInt32 {
+        if c < 0x10000 { return UInt32(bmp[Int(c)]) }
+        return supplementary[c] ?? c
+    }
+
+    /// The set { Canonicalize(c) : c in ranges } for a normalised range list.
+    func canonicalizeSet(_ ranges: [CharRange]) -> [CharRange] {
+        guard !ranges.isEmpty else { return ranges }
+        var mapped = [CharRange]()
+        var ri = 0
+        for (c, k) in changed {
+            while ri < ranges.count && ranges[ri].hi < c { ri += 1 }
+            if ri == ranges.count { break }
+            if ranges[ri].lo <= c { mapped.append(CharRange(k)) }
+        }
+        if mapped.isEmpty { return ranges }
+        return crUnion(crSubtraction(ranges, changedRanges), crNormalize(mapped))
+    }
+}
+
+/// Simple case folding (scf) of one code point, from the platform's Unicode
+/// case mappings.  scf(c) is lowercase(uppercase(c)) restricted to 1:1
+/// mappings, with the handful of characters where that identity does not hold
+/// special-cased (Cherokee folds to its uppercase letters; U+0131 and U+0130
+/// have no simple folding; three Unicode 15 foldings have no case mapping).
+func lreSimpleCaseFold(_ c: UInt32) -> UInt32 {
+    if c < 0x80 { return (c >= 0x41 && c <= 0x5A) ? c + 0x20 : c }
+    if c >= 0xAB70 && c <= 0xABBF { return c - 0xAB70 + 0x13A0 }   // Cherokee small -> capital
+    if c >= 0x13F8 && c <= 0x13FD { return c - 8 }
+    if c >= 0x13A0 && c <= 0x13F5 { return c }
+    // Unicode 15 added simple foldings with no 1:1 case mapping behind them.
+    if c == 0x1FD3 { return 0x0390 }
+    if c == 0x1FE3 { return 0x03B0 }
+    if c == 0xFB05 { return 0xFB06 }
+    if c == 0x0131 { return c }   // dotless i: uppercases to "I" but has no simple folding
+    guard let s = Unicode.Scalar(c) else { return c }
+    let p = s.properties
+    // Not changesWhenCaseFolded: that property is defined on the NFD form, so
+    // it is false for U+1FBE (NFD U+03B9) although scf(U+1FBE) = U+03B9.
+    guard p.changesWhenCaseMapped else { return c }
+    var t = s
+    let up = p.uppercaseMapping.unicodeScalars
+    if up.count == 1, let u = up.first { t = u }
+    let lo = t.properties.lowercaseMapping.unicodeScalars
+    if lo.count == 1, let l = lo.first { return l.value }
+    // Upper case form has no 1:1 lower case form (U+0130): fall back to the
+    // character's own lower case, else the character itself.
+    let own = p.lowercaseMapping.unicodeScalars
+    if own.count == 1, let l = own.first { return l.value }
     return c
 }
 
-/// Unicode-mode case fold (simple case folding from CaseFolding.txt, status C+S).
-/// For a full engine this table would be thousands of entries; we implement the
-/// most important folds here and fall back to Foundation for the rest.
-private func lreCanonicalizeUnicode(_ c: UInt32) -> UInt32 {
-    guard let scalar = Unicode.Scalar(c) else { return c }
-    let str = String(scalar).lowercased()
-    if let first = str.unicodeScalars.first {
-        return first.value
-    }
-    return c
+/// Legacy (non-unicode) Canonicalize: toUppercase when it yields exactly one
+/// UTF-16 code unit and does not map a non-ASCII character to ASCII.
+func lreLegacyCanonicalize(_ c: UInt32) -> UInt32 {
+    if c < 0x80 { return (c >= 0x61 && c <= 0x7A) ? c - 0x20 : c }
+    guard c <= 0xFFFF, let s = Unicode.Scalar(c) else { return c }   // lone surrogates map to themselves
+    let p = s.properties
+    guard p.changesWhenUppercased else { return c }
+    let u = p.uppercaseMapping.utf16
+    guard u.count == 1, let cu = u.first, cu >= 0x80 else { return c }
+    return UInt32(cu)
+}
+
+/// Canonicalize(rer, ch) for the given flags.
+func lreCanonicalizeChar(_ c: UInt32, _ flags: JeffJSRegExpFlags) -> UInt32 {
+    return LRECaseTables.forFlags(flags).canonicalize(c)
 }
 
 /// Case conversion that may expand (e.g. German sharp-s -> "SS").
@@ -717,10 +838,74 @@ private final class RECompiler {
     var error: String? = nil
     var hasNamedGroups = false
 
+    /// Number of capturing groups in the whole pattern (group 0 included),
+    /// and their names in order.  Back references are resolved against these,
+    /// not against the groups parsed so far.
+    var totalCaptureCount: Int = 1
+    var allGroupNames: [String?] = [nil]
+    /// True while compiling a lookbehind body, which QuickJS compiles to match
+    /// right to left: terms in reverse order, every character atom wrapped in
+    /// `prev` ... `prev`, captures closed before they are opened, and back
+    /// references compared backwards.
+    var isBackward = false
+
     init(pattern: String, flags: JeffJSRegExpFlags) {
-        // Convert to code points.
-        self.pattern = Array(pattern.unicodeScalars.map { $0.value })
+        // With u / v the pattern is a sequence of code points; without, it is
+        // a sequence of UTF-16 code units (so /😀/ is two surrogate atoms and
+        // matches the two code units of the input).
+        if flags.isUnicode {
+            self.pattern = Array(pattern.unicodeScalars.map { $0.value })
+        } else {
+            self.pattern = Array(pattern.utf16.map { UInt32($0) })
+        }
         self.flags = flags
+        prescanGroups()
+    }
+
+    /// Decode pattern characters (code points, or UTF-16 units without u) to a String.
+    func patternString(_ chars: [UInt32]) -> String {
+        if flags.isUnicode {
+            var s = ""
+            for c in chars { if let sc = Unicode.Scalar(c) { s.unicodeScalars.append(sc) } }
+            return s
+        }
+        return String(decoding: chars.map { UInt16(truncatingIfNeeded: $0) }, as: UTF16.self)
+    }
+
+    /// Count the capturing groups of the whole pattern (QuickJS re_count_captures).
+    private func prescanGroups() {
+        let p = pattern
+        let n = p.count
+        var i = 0
+        var inClass = false
+        while i < n {
+            let c = p[i]
+            if c == 0x5C { i += 2; continue }                  // \x
+            if inClass {
+                if c == 0x5D { inClass = false }               // ]
+                i += 1
+                continue
+            }
+            if c == 0x5B { inClass = true; i += 1; continue }  // [
+            if c == 0x28 {                                     // (
+                if i + 1 < n && p[i + 1] == 0x3F {             // (?
+                    if i + 3 < n && p[i + 2] == 0x3C && p[i + 3] != 0x3D && p[i + 3] != 0x21 {
+                        var j = i + 3
+                        var nameChars = [UInt32]()
+                        while j < n && p[j] != 0x3E {
+                            nameChars.append(p[j])
+                            j += 1
+                        }
+                        totalCaptureCount += 1
+                        allGroupNames.append(patternString(nameChars))
+                    }
+                } else {
+                    totalCaptureCount += 1
+                    allGroupNames.append(nil)
+                }
+            }
+            i += 1
+        }
     }
 
     // MARK: Compile entry point
@@ -875,9 +1060,19 @@ private final class RECompiler {
     // MARK: Alternative (term term term ...)
 
     func parseAlternative() {
+        let altStart = bc.count
         while let c = peek(), c != 0x7C /* | */, c != 0x29 /* ) */ {
+            let termStart = bc.count
             parseTerm()
             if error != nil { return }
+            if isBackward && termStart > altStart {
+                // Right-to-left: this term runs before the ones already emitted.
+                // Every jump is relative and stays inside its term, so moving
+                // whole terms is safe (QuickJS re_parse_alternative).
+                let term = Array(bc.code[termStart...])
+                bc.code.removeSubrange(termStart...)
+                bc.code.insert(contentsOf: term, at: altStart)
+            }
         }
     }
 
@@ -889,6 +1084,7 @@ private final class RECompiler {
 
         guard parseAtom() else { return }
         if error != nil { return }
+        if isBackward { wrapBackwardCharAtom(atomStart) }
 
         // Quantifier?
         if let c = peek() {
@@ -925,6 +1121,28 @@ private final class RECompiler {
                 break
             }
         }
+    }
+
+    /// In a lookbehind body a character atom matches the character BEFORE
+    /// the current position: `prev; <atom>; prev` (QuickJS emits the same).
+    private func wrapBackwardCharAtom(_ atomStart: Int) {
+        let size = bc.count - atomStart
+        guard size > 0, let op = JeffJSRegExpOpcode(rawValue: bc.code[atomStart]) else { return }
+        let opSize: Int
+        switch op {
+        case .char_: opSize = 3
+        case .char32: opSize = 5
+        case .dot, .any: opSize = 1
+        case .range, .range32:
+            guard size >= 3 else { return }
+            let pairCount = Int(UInt16(bc.code[atomStart + 1]) | (UInt16(bc.code[atomStart + 2]) << 8))
+            opSize = 3 + pairCount * (op == .range ? 4 : 8)
+        default:
+            return
+        }
+        guard opSize == size else { return }
+        bc.code.insert(JeffJSRegExpOpcode.prev.rawValue, at: atomStart)
+        bc.emitOp(.prev)
     }
 
     /// Try to parse {n}, {n,}, {n,m}. Returns (min, max, charsConsumed) or nil.
@@ -1158,15 +1376,20 @@ private final class RECompiler {
                 bc.patchJump(splitPos)
             }
         } else if min == 0 && max == 1 {
-            // ? (or ??)
+            // ? (or ??).  RepeatMatcher's min is 0, so an iteration that
+            // matches empty fails (ECMA-262 22.2.2.3.1 step 2.b) and the body
+            // backtracks into a non-empty match: /(?:a*?)?/ matches "a".
+            let needsEmptyCheck = reCheckAdvance(atomBody) != 1
             let splitPos: Int
             if lazy {
                 splitPos = bc.emitSplitGotoFirst()
             } else {
                 splitPos = bc.emitSplitNextFirst()
             }
+            if needsEmptyCheck { bc.emitOp(.pushCharPos) }
             emitAtomCaptureReset(atomCaptures, hasCaptures)
             bc.code.append(contentsOf: atomBody)
+            if needsEmptyCheck { bc.emitOp(.checkAdvance) }
             bc.patchJump(splitPos)
         } else {
             // General {n,m}.  The mandatory copies never get the zero-advance
@@ -1196,21 +1419,23 @@ private final class RECompiler {
                 bc.patchI32(loopPos, Int32(splitPos - loopPos - 4 - 1))
                 bc.patchJump(splitPos)
             } else {
-                // {n,m} where m is finite — emit (m-n) optional copies
+                // {n,m} where m is finite — emit (m-n) optional copies,
+                // nested like (?:x(?:x(?:x)?)?)?: declining one iteration
+                // leaves the loop.  Each split used to skip only its own copy
+                // and fall into the next one, so a lazy loop, on backtracking,
+                // ran a LATER copy before retrying the inner quantifiers of
+                // the earlier ones (/^(a+?){1,3}?$/ captured "aa", not "a").
                 let extra = max - min
+                var splitPositions = [Int]()
+                splitPositions.reserveCapacity(Int(extra))
                 for _ in 0 ..< extra {
-                    let splitPos: Int
-                    if lazy {
-                        splitPos = bc.emitSplitGotoFirst()
-                    } else {
-                        splitPos = bc.emitSplitNextFirst()
-                    }
+                    splitPositions.append(lazy ? bc.emitSplitGotoFirst() : bc.emitSplitNextFirst())
                     if needsEmptyCheck { bc.emitOp(.pushCharPos) }
                     emitAtomCaptureReset(atomCaptures, hasCaptures)
                     bc.code.append(contentsOf: atomBody)
                     if needsEmptyCheck { bc.emitOp(.checkAdvance) }
-                    bc.patchJump(splitPos)
                 }
+                for sp in splitPositions { bc.patchJump(sp) }
             }
         }
     }
@@ -1264,6 +1489,15 @@ private final class RECompiler {
                 setError("nothing to repeat")
                 return false
             }
+            // Annex B: a lone `{` is literal, but a well-formed braced
+            // quantifier with nothing before it (`/a{2}{3}/`, `/{1}/`) is
+            // still a SyntaxError (InvalidBracedQuantifier).
+            pos -= 1
+            if tryParseQuantifierBraces() != nil {
+                setError("nothing to repeat")
+                return false
+            }
+            pos += 1
             bc.emitChar(c)
             return true
 
@@ -1289,34 +1523,40 @@ private final class RECompiler {
         }
     }
 
-    /// Emit a character match, respecting case-insensitive flag.
+    /// Emit a character match.  Under `i` the VM compares Canonicalize() of
+    /// both sides (see REVirtualMachine.matchCharCaseInsensitive), so the
+    /// literal itself is emitted unchanged.
     func emitCharWithCase(_ c: UInt32) {
-        if flags.contains(.ignoreCase) {
-            let folded = flags.isUnicode ? lreCanonicalizeUnicode(c) : c
-            // Build a small char class for all case variants.
-            var variants = Set<UInt32>()
-            variants.insert(c)
-            if let s = Unicode.Scalar(c) {
-                for ch in String(s).lowercased().unicodeScalars { variants.insert(ch.value) }
-                for ch in String(s).uppercased().unicodeScalars { variants.insert(ch.value) }
-            }
-            if !flags.isUnicode {
-                variants.insert(folded)
-            }
+        bc.emitChar(c)
+    }
 
-            if variants.count == 1 {
-                bc.emitChar(c)
-            } else {
-                // Emit a range opcode with all variants.
-                var ranges = [CharRange]()
-                for v in variants {
-                    crAddChar(&ranges, v)
-                }
-                emitCharClassRanges(crNormalize(ranges))
-            }
-        } else {
-            bc.emitChar(c)
+    /// WordCharacters(rer) as a range list (adds U+017F / U+212A under `ui`).
+    func wordCharSet() -> [CharRange] {
+        var r = lreWordCharRanges()
+        if flags.isUnicode && flags.contains(.ignoreCase) {
+            r.append(CharRange(0x017F))
+            r.append(CharRange(0x212A))
+            r = crNormalize(r)
         }
+        return r
+    }
+
+    /// Emit a CharacterSetMatcher for `ranges` (ECMA-262 22.2.2.7.1).  Under
+    /// `i` the set is canonicalised first and only then negated; the VM
+    /// canonicalises the input character before the membership test.
+    func emitCharSet(_ ranges: [CharRange], invert: Bool = false) {
+        var set = crNormalize(ranges)
+        if flags.contains(.ignoreCase) {
+            set = LRECaseTables.forFlags(flags).canonicalizeSet(set)
+        }
+        if invert {
+            set = crComplement(set)
+            // Non-unicode input is UTF-16 code units: keep the class 16-bit.
+            if !flags.isUnicode {
+                set = crIntersection(set, [CharRange(0, 0xFFFF)])
+            }
+        }
+        emitCharClassRanges(set)
     }
 
     // MARK: Escaped atom (\...)
@@ -1329,22 +1569,22 @@ private final class RECompiler {
 
         switch c {
         case 0x64: // d
-            emitCharClassRanges([CharRange(0x30, 0x39)])
+            emitCharSet([CharRange(0x30, 0x39)])
             return true
         case 0x44: // D
-            emitCharClassRanges(crComplement([CharRange(0x30, 0x39)]))
+            emitCharSet([CharRange(0x30, 0x39)], invert: true)
             return true
         case 0x77: // w
-            emitCharClassRanges(lreWordCharRanges())
+            emitCharSet(wordCharSet())
             return true
         case 0x57: // W
-            emitCharClassRanges(crComplement(lreWordCharRanges()))
+            emitCharSet(crComplement(wordCharSet()))
             return true
         case 0x73: // s
-            emitCharClassRanges(lreSpaceCharRanges())
+            emitCharSet(lreSpaceCharRanges())
             return true
         case 0x53: // S
-            emitCharClassRanges(crComplement(lreSpaceCharRanges()))
+            emitCharSet(lreSpaceCharRanges(), invert: true)
             return true
         case 0x62: // b
             bc.emitOp(.wordBoundary)
@@ -1353,16 +1593,22 @@ private final class RECompiler {
             bc.emitOp(.notWordBoundary)
             return true
         case 0x70, 0x50: // p, P  — Unicode property escape
+            if !flags.isUnicode {
+                // Annex B identity escape: /\p{L}/ matches "p{L}".
+                emitCharWithCase(c)
+                return true
+            }
             let negate = (c == 0x50)
             guard expect(0x7B) else {
                 setError("invalid Unicode property escape")
                 return false
             }
-            var propName = ""
+            var propChars = [UInt32]()
             while let ch = peek(), ch != 0x7D {
-                propName.append(Character(Unicode.Scalar(ch)!))
+                propChars.append(ch)
                 pos += 1
             }
+            let propName = patternString(propChars)
             guard expect(0x7D) else {
                 setError("unterminated Unicode property escape")
                 return false
@@ -1379,7 +1625,7 @@ private final class RECompiler {
                 setError("invalid Unicode property name: \(propName)")
                 return false
             }
-            emitCharClassRanges(ranges)
+            emitCharSet(ranges)
             return true
 
         case 0x30: // \0  — NUL
@@ -1391,48 +1637,56 @@ private final class RECompiler {
             return true
 
         case 0x31...0x39: // 1-9 — backreference
+            // DecimalEscape takes every digit.  It is a back reference when
+            // the number is <= the number of capturing groups in the WHOLE
+            // pattern (forward references included: `\1(a)` refers to the
+            // group that follows and matches empty).
+            let afterFirstDigit = pos
             var num = Int(c - 0x30)
             while let nc = peek(), nc >= 0x30 && nc <= 0x39 {
-                let newNum = num * 10 + Int(nc - 0x30)
-                if newNum >= captureCount && newNum > 9 { break }
-                num = newNum
+                num = min(num * 10 + Int(nc - 0x30), 1_000_000)
                 pos += 1
             }
-            if num >= captureCount {
+            if num >= totalCaptureCount {
                 if flags.isUnicode {
                     setError("invalid backreference \\\(num)")
                     return false
                 }
-                // In non-unicode mode, treat as octal if possible.
-                pos -= 1
-                // But if it's just a single digit > captureCount, emit as backreference
-                // (it will always fail to match, which is spec-correct).
+                // Annex B.1.2: otherwise it is a legacy octal escape (\1 is
+                // U+0001, \12 is U+000A), or an identity escape for 8 and 9.
+                pos = afterFirstDigit
+                if c <= 0x37 { return parseOctalEscape(firstDigit: c - 0x30) }
+                emitCharWithCase(c)
+                return true
             }
-            bc.emitOp(.backReference)
+            bc.emitOp(isBackward ? .backwardBackReference : .backReference)
             bc.emit(UInt8(num & 0xFF))
             return true
 
         case 0x6B: // k — named backreference
-            guard expect(0x3C) else {
-                if flags.isUnicode {
-                    setError("expected '<' after \\k")
-                    return false
-                }
-                bc.emitChar(c)
+            // Annex B: without u and without any named group in the pattern,
+            // `\k` is an identity escape.
+            if !flags.isUnicode && !allGroupNames.contains(where: { $0 != nil }) {
+                emitCharWithCase(c)
                 return true
             }
-            var name = ""
+            guard expect(0x3C) else {
+                setError("expected '<' after \\k")
+                return false
+            }
+            var nameChars = [UInt32]()
             while let ch = peek(), ch != 0x3E {
-                name.append(Character(Unicode.Scalar(ch)!))
+                nameChars.append(ch)
                 pos += 1
             }
+            let name = patternString(nameChars)
             guard expect(0x3E) else {
                 setError("unterminated named backreference")
                 return false
             }
-            // Find group index.
-            if let idx = groupNames.firstIndex(where: { $0 == name }) {
-                bc.emitOp(.backReference)
+            // Find group index (the group may follow the reference).
+            if let idx = allGroupNames.firstIndex(where: { $0 == name }) {
+                bc.emitOp(isBackward ? .backwardBackReference : .backReference)
                 bc.emit(UInt8(idx & 0xFF))
             } else {
                 setError("undefined named backreference: \(name)")
@@ -1456,11 +1710,13 @@ private final class RECompiler {
             return true
 
         case 0x78: // \xHH
+            let hexStart = pos
             guard let h1 = parseHexDigit(), let h2 = parseHexDigit() else {
                 if flags.isUnicode {
                     setError("invalid hex escape")
                     return false
                 }
+                pos = hexStart           // Annex B: `\x1g` is "x1g"
                 emitCharWithCase(0x78) // literal 'x'
                 return true
             }
@@ -1468,8 +1724,9 @@ private final class RECompiler {
             return true
 
         case 0x75: // \uHHHH or \u{HHHH}
-            if expect(0x7B) {
-                // \u{HHHH+}
+            let hexStart = pos
+            if flags.isUnicode && expect(0x7B) {
+                // \u{HHHH+} (u / v only; otherwise `\u{2}` is "u" repeated twice)
                 var val: UInt32 = 0
                 var count = 0
                 while let d = parseHexDigit() {
@@ -1489,6 +1746,7 @@ private final class RECompiler {
                         setError("invalid Unicode escape")
                         return false
                     }
+                    pos = hexStart
                     emitCharWithCase(0x75) // literal 'u'
                     return true
                 }
@@ -1532,6 +1790,13 @@ private final class RECompiler {
     }
 
     func parseOctalEscape(firstDigit: UInt32) -> Bool {
+        emitCharWithCase(scanLegacyOctal(firstDigit: firstDigit))
+        return true
+    }
+
+    /// LegacyOctalEscapeSequence after its first digit: at most three digits
+    /// in all, value <= 0o377.
+    func scanLegacyOctal(firstDigit: UInt32) -> UInt32 {
         var val = firstDigit
         for _ in 0 ..< 2 {
             guard let c = peek(), c >= 0x30 && c <= 0x37 else { break }
@@ -1540,8 +1805,7 @@ private final class RECompiler {
             val = newVal
             pos += 1
         }
-        emitCharWithCase(val)
-        return true
+        return val
     }
 
     func parseHexDigit() -> UInt32? {
@@ -1610,12 +1874,12 @@ private final class RECompiler {
             captureCount += 1
             groupNames.append(nil)
 
-            bc.emitOp(.saveStart)
+            bc.emitOp(isBackward ? .saveEnd : .saveStart)
             bc.emit(UInt8(groupId & 0xFF))
 
             parseDisjunction()
 
-            bc.emitOp(.saveEnd)
+            bc.emitOp(isBackward ? .saveStart : .saveEnd)
             bc.emit(UInt8(groupId & 0xFF))
 
             guard expect(0x29) else {
@@ -1627,11 +1891,12 @@ private final class RECompiler {
     }
 
     func parseNamedGroup() -> Bool {
-        var name = ""
+        var nameChars = [UInt32]()
         while let ch = peek(), ch != 0x3E /* > */ {
-            name.append(Character(Unicode.Scalar(ch)!))
+            nameChars.append(ch)
             pos += 1
         }
+        let name = patternString(nameChars)
         guard expect(0x3E) else {
             setError("unterminated group name")
             return false
@@ -1651,12 +1916,12 @@ private final class RECompiler {
         groupNames.append(name)
         hasNamedGroups = true
 
-        bc.emitOp(.saveStart)
+        bc.emitOp(isBackward ? .saveEnd : .saveStart)
         bc.emit(UInt8(groupId & 0xFF))
 
         parseDisjunction()
 
-        bc.emitOp(.saveEnd)
+        bc.emitOp(isBackward ? .saveStart : .saveEnd)
         bc.emit(UInt8(groupId & 0xFF))
 
         guard expect(0x29) else {
@@ -1674,7 +1939,10 @@ private final class RECompiler {
         let captureStart = captureCount
         bc.emit(UInt8(captureStart & 0xFF))
 
+        let savedDir = isBackward
+        isBackward = false
         parseDisjunction()
+        isBackward = savedDir
 
         bc.emitOp(.match)
         bc.patchJump(patchPos)
@@ -1698,15 +1966,12 @@ private final class RECompiler {
         let captureStart = captureCount
         bc.emit(UInt8(captureStart & 0xFF))
 
-        // Mark this as a lookbehind by emitting prev before each atom.
-        // For simplicity we compile the body normally then the VM will
-        // handle backward scanning via the prev opcode when we wrap it.
-        // QuickJS actually reverses the body. We take a simpler approach:
-        // just compile normally, and handle lookbehind in the VM by
-        // scanning backward from the current position.
-        // Emit prev at start to back up.
-        bc.emitOp(.prev)
+        // The body is compiled right to left (see isBackward) and runs from
+        // the current position towards the start of the input.
+        let savedDir = isBackward
+        isBackward = true
         parseDisjunction()
+        isBackward = savedDir
 
         bc.emitOp(.match)
         bc.patchJump(patchPos)
@@ -1774,12 +2039,10 @@ private final class RECompiler {
                     continue
                 }
                 if lo > hi {
-                    if flags.isUnicode {
-                        setError("range out of order in character class")
-                        return false
-                    }
-                    crAddChar(&ranges, lo)
-                    crAddChar(&ranges, hi)
+                    // A SyntaxError with or without u (Annex B only relaxes
+                    // ranges that have a class escape such as \w at one end).
+                    setError("range out of order in character class")
+                    return false
                 } else {
                     crAddRange(&ranges, lo, hi)
                 }
@@ -1793,20 +2056,8 @@ private final class RECompiler {
             return false
         }
 
-        var normalized = crNormalize(ranges)
-        if negate {
-            normalized = crComplement(normalized)
-            // In non-unicode mode, cap at 0xFFFF.
-            if !flags.isUnicode {
-                normalized = crIntersection(normalized, [CharRange(0, 0xFFFF)])
-            }
-        }
-
-        if flags.contains(.ignoreCase) {
-            normalized = expandCaseVariants(normalized)
-        }
-
-        emitCharClassRanges(normalized)
+        // Canonicalise under `i`, THEN negate (CharacterSetMatcher).
+        emitCharSet(ranges, invert: negate)
         return true
     }
 
@@ -1816,8 +2067,8 @@ private final class RECompiler {
         switch val {
         case 0xFFFF_FFFF: return [CharRange(0x30, 0x39)]                              // \d
         case 0xFFFF_FFFE: return crComplement([CharRange(0x30, 0x39)])                 // \D
-        case 0xFFFF_FFFD: return lreWordCharRanges()                                    // \w
-        case 0xFFFF_FFFC: return crComplement(lreWordCharRanges())                      // \W
+        case 0xFFFF_FFFD: return wordCharSet()                                          // \w
+        case 0xFFFF_FFFC: return crComplement(wordCharSet())                            // \W
         case 0xFFFF_FFFB: return lreSpaceCharRanges()                                   // \s
         case 0xFFFF_FFFA: return crComplement(lreSpaceCharRanges())                     // \S
         case 0xFFFF_FFF0: return _classPropertyStash                                    // \p{}/\P{}
@@ -1858,26 +2109,31 @@ private final class RECompiler {
             case 0x62: return (0x08, true) // \b in char class = backspace
             case 0x30:
                 if pos < pattern.count && isDigit(pattern[pos]) && !flags.isUnicode {
-                    var val: UInt32 = 0
-                    for _ in 0 ..< 3 {
-                        guard let d = peek(), d >= 0x30 && d <= 0x37 else { break }
-                        val = val * 8 + (d - 0x30)
-                        pos += 1
-                    }
-                    return (val, true)
+                    return (scanLegacyOctal(firstDigit: 0), true)
                 }
                 return (0, true) // NUL
+            case 0x31...0x39:
+                // Annex B ClassEscape: legacy octal escape, or 8 / 9 literally.
+                if flags.isUnicode {
+                    setError("invalid class escape")
+                    return (0, false)
+                }
+                if esc <= 0x37 { return (scanLegacyOctal(firstDigit: esc - 0x30), true) }
+                return (esc, true)
             case 0x63: // \cX
                 guard let ctrl = advance() else { setError("bad \\c"); return (0, false) }
                 return (ctrl % 32, true)
             case 0x78: // \xHH
+                let hexStart = pos
                 guard let h1 = parseHexDigit(), let h2 = parseHexDigit() else {
                     if flags.isUnicode { setError("invalid hex escape in class"); return (0, false) }
+                    pos = hexStart
                     return (0x78, true)
                 }
                 return ((h1 << 4) | h2, true)
             case 0x75: // \uHHHH or \u{HHHH}
-                if expect(0x7B) {
+                let hexStart = pos
+                if flags.isUnicode && expect(0x7B) {
                     var val: UInt32 = 0; var cnt = 0
                     while let d = parseHexDigit() {
                         val = (val << 4) | d; cnt += 1
@@ -1889,14 +2145,16 @@ private final class RECompiler {
                 guard let h1 = parseHexDigit(), let h2 = parseHexDigit(),
                       let h3 = parseHexDigit(), let h4 = parseHexDigit() else {
                     if flags.isUnicode { setError("invalid \\u in class"); return (0, false) }
+                    pos = hexStart
                     return (0x75, true)
                 }
                 return ((h1 << 12) | (h2 << 8) | (h3 << 4) | h4, true)
-            case 0x70, 0x50: // \p{} / \P{} inside class
+            case 0x70, 0x50 where flags.isUnicode: // \p{} / \P{} inside class
                 let neg = (esc == 0x50)
                 guard expect(0x7B) else { setError("expected '{' after \\p/\\P"); return (0, false) }
-                var propName = ""
-                while let ch = peek(), ch != 0x7D { propName.append(Character(Unicode.Scalar(ch)!)); pos += 1 }
+                var propChars = [UInt32]()
+                while let ch = peek(), ch != 0x7D { propChars.append(ch); pos += 1 }
+                let propName = patternString(propChars)
                 guard expect(0x7D) else { setError("unterminated \\p{}"); return (0, false) }
                 let parts = propName.split(separator: "=", maxSplits: 1)
                 let lookup = parts.count == 2 ? String(parts[1]) : propName
@@ -1945,31 +2203,6 @@ private final class RECompiler {
                 bc.emitU16(UInt16(r.hi))
             }
         }
-    }
-
-    /// Expand character ranges to include all case variants (for 'i' flag).
-    func expandCaseVariants(_ ranges: [CharRange]) -> [CharRange] {
-        var expanded = ranges
-        for r in ranges {
-            // For small ranges, enumerate.  For large ranges, keep as-is
-            // (runtime will fold per-character).
-            let size = UInt64(r.hi) - UInt64(r.lo) + 1
-            if size <= 256 {
-                var c = r.lo
-                while c <= r.hi {
-                    if let scalar = Unicode.Scalar(c) {
-                        for ch in String(scalar).lowercased().unicodeScalars {
-                            crAddChar(&expanded, ch.value)
-                        }
-                        for ch in String(scalar).uppercased().unicodeScalars {
-                            crAddChar(&expanded, ch.value)
-                        }
-                    }
-                    c += 1
-                }
-            }
-        }
-        return crNormalize(expanded)
     }
 }
 
@@ -2057,6 +2290,15 @@ func lreExec(bytecode: [UInt8], input: String, startPos: Int,
     return lreExec(bytecode: bytecode, input: codePoints, startPos: startPos, flags: flags)
 }
 
+/// True when `pos` is the low half of a surrogate pair (u / v mode never
+/// starts a match there: AdvanceStringIndex steps over the whole pair).
+@inline(__always)
+func lreIsInsideSurrogatePair(_ input: UnsafeBufferPointer<UInt32>, _ pos: Int) -> Bool {
+    guard pos > 0 && pos < input.count else { return false }
+    let lo = input[pos], hi = input[pos - 1]
+    return lo >= 0xDC00 && lo <= 0xDFFF && hi >= 0xD800 && hi <= 0xDBFF
+}
+
 /// Fast global match: creates ONE REVirtualMachine and reuses it across all
 /// match attempts, returning (start, end) tuples for every match.
 ///
@@ -2104,6 +2346,11 @@ func lreExecGlobalMatch(bytecode: [UInt8], input: [UInt32],
             // Apply pre-filter: skip positions that can't match.
             pos = preFilter.nextCandidate(inputBuf: inputBuf, from: pos, inputLen: inputLen)
             if pos > inputLen { break }
+            // With u / v a match never starts inside a surrogate pair.
+            if isUnicode && lreIsInsideSurrogatePair(inputBuf, pos) {
+                pos += 1
+                continue
+            }
 
             vm.reset(startPos: pos)
             let execResult = vm.exec()
@@ -2335,6 +2582,8 @@ final class REVirtualMachine {
     var startPos: Int       // starting position in input (var for reuse in global match)
     let flags: JeffJSRegExpFlags
     let captureCount: Int
+    /// Canonicalisation table when the regexp has the `i` flag, else nil.
+    let caseTables: LRECaseTables?
 
     // Execution state
     var captures: ContiguousArray<Int>   // flat: [start0, end0, start1, end1, ...]
@@ -2404,6 +2653,7 @@ final class REVirtualMachine {
         self.inputLen = input.count
         self.startPos = startPos
         self.flags = flags
+        self.caseTables = flags.contains(.ignoreCase) ? LRECaseTables.forFlags(flags) : nil
 
         // Parse header.
         if bytecode.count >= kHeaderSize {
@@ -2770,7 +3020,7 @@ final class REVirtualMachine {
 
             case OP_BACKWARD_BACK_REFERENCE:
                 let groupId = Int(bcBuf[pc + 1])
-                if matchBackReference(groupId, pos: &pos) {
+                if matchBackReference(groupId, pos: &pos, backward: true) {
                     pc += 2
                 } else {
                     if !backtrack(&pc, &pos) { return false }
@@ -2803,10 +3053,17 @@ final class REVirtualMachine {
                 let bodyPC = pc + 6
                 let matched = runSub(pc: bodyPC, pos: pos)
                 if matched {
-                    // Lookahead succeeded, continue after it.
+                    // Lookahead succeeded, continue after it.  Its captures
+                    // stay set, but the sub-execution's backtrack entries are
+                    // gone, so record the old values here: backtracking past
+                    // this lookaround (e.g. a failed quantifier iteration
+                    // around it) must undo them.
+                    for i in 0 ..< captures.count where captures[i] != savedCaptures[i] {
+                        stack.append(BacktrackEntry(pc: -1, pos: savedPos, captureIdx: Int32(i),
+                                                    captureVal: savedCaptures[i]))
+                    }
                     pos = savedPos
                     pc = pc + 6 + Int(offset) - 1
-                    // Restore captures? No -- lookahead can set captures per spec.
                 } else {
                     captures = savedCaptures
                     if !backtrack(&pc, &pos) { return false }
@@ -3152,84 +3409,44 @@ final class REVirtualMachine {
 
     // MARK: Character matching helpers
 
+    /// Character comparison: Canonicalize(actual) == Canonicalize(expected)
+    /// under `i` (ECMA-262 22.2.2.7.3), plain equality otherwise.
+    @inline(__always)
     func matchCharCaseInsensitive(_ actual: UInt32, _ expected: UInt32) -> Bool {
         if actual == expected { return true }
-        if !flags.contains(.ignoreCase) { return false }
+        guard let t = caseTables else { return false }
+        return t.canonicalize(actual) == t.canonicalize(expected)
+    }
 
-        // Fold both sides and compare.
-        if flags.isUnicode {
-            return lreCanonicalizeUnicode(actual) == lreCanonicalizeUnicode(expected)
-        }
-        // Non-unicode: only ASCII fold.
-        func asciiLower(_ c: UInt32) -> UInt32 {
-            if c >= 0x41 && c <= 0x5A { return c + 0x20 }
-            return c
-        }
-        return asciiLower(actual) == asciiLower(expected)
+    /// The value a character class is tested with: the input character,
+    /// canonicalised under `i` (the class itself was canonicalised, then
+    /// negated, at compile time).
+    @inline(__always)
+    func classKey(_ ch: UInt32) -> UInt32 {
+        guard let t = caseTables else { return ch }
+        return t.canonicalize(ch)
     }
 
     func matchRange16(_ offset: Int, pairCount: Int, ch: UInt32) -> Bool {
-        let isIC = flags.contains(.ignoreCase)
-        let c: UInt32 = isIC ? (flags.isUnicode ? lreCanonicalizeUnicode(ch) : ch) : ch
-
+        let c = classKey(ch)
         var off = offset
-        if isIC {
-            let isUni = flags.isUnicode
-            for _ in 0 ..< pairCount {
-                let lo = UInt32(readU16(off))
-                let hi = UInt32(readU16(off + 2))
-                off += 4
-                if c >= lo && c <= hi { return true }
-                if !isUni {
-                    // ASCII case variants
-                    let lower: UInt32 = (ch >= 0x41 && ch <= 0x5A) ? ch + 0x20 : ch
-                    let upper: UInt32 = (ch >= 0x61 && ch <= 0x7A) ? ch - 0x20 : ch
-                    if lower >= lo && lower <= hi { return true }
-                    if upper >= lo && upper <= hi { return true }
-                }
-            }
-        } else {
-            // Fast non-ignoreCase path
-            if pairCount == 1 {
-                // Single pair fast path (common: \d, \w ranges)
-                let lo = UInt32(readU16(off))
-                let hi = UInt32(readU16(off + 2))
-                return c >= lo && c <= hi
-            }
-            for _ in 0 ..< pairCount {
-                let lo = UInt32(readU16(off))
-                let hi = UInt32(readU16(off + 2))
-                off += 4
-                if c >= lo && c <= hi { return true }
-            }
+        for _ in 0 ..< pairCount {
+            let lo = UInt32(readU16(off))
+            let hi = UInt32(readU16(off + 2))
+            off += 4
+            if c >= lo && c <= hi { return true }
         }
         return false
     }
 
     func matchRange32(_ offset: Int, pairCount: Int, ch: UInt32) -> Bool {
-        let isIC = flags.contains(.ignoreCase)
-        let c: UInt32 = isIC ? (flags.isUnicode ? lreCanonicalizeUnicode(ch) : ch) : ch
-
+        let c = classKey(ch)
         var off = offset
-        if isIC {
-            for _ in 0 ..< pairCount {
-                let lo = readU32(off)
-                let hi = readU32(off + 4)
-                off += 8
-                if c >= lo && c <= hi { return true }
-            }
-        } else {
-            if pairCount == 1 {
-                let lo = readU32(off)
-                let hi = readU32(off + 4)
-                return c >= lo && c <= hi
-            }
-            for _ in 0 ..< pairCount {
-                let lo = readU32(off)
-                let hi = readU32(off + 4)
-                off += 8
-                if c >= lo && c <= hi { return true }
-            }
+        for _ in 0 ..< pairCount {
+            let lo = readU32(off)
+            let hi = readU32(off + 4)
+            off += 8
+            if c >= lo && c <= hi { return true }
         }
         return false
     }
@@ -3239,36 +3456,18 @@ final class REVirtualMachine {
     /// Match a 16-bit character class using unsafe buffer pointer for bytecode access.
     @inline(__always)
     func matchRange16Fast(_ bcBuf: UnsafeBufferPointer<UInt8>, _ offset: Int, pairCount: Int, ch: UInt32) -> Bool {
-        let isIC = flags.contains(.ignoreCase)
-        let c: UInt32 = isIC ? (flags.isUnicode ? lreCanonicalizeUnicode(ch) : ch) : ch
-
+        let c = classKey(ch)
         var off = offset
-        if isIC {
-            let isUni = flags.isUnicode
-            for _ in 0 ..< pairCount {
-                let lo = UInt32(bcBuf[off]) | (UInt32(bcBuf[off + 1]) << 8)
-                let hi = UInt32(bcBuf[off + 2]) | (UInt32(bcBuf[off + 3]) << 8)
-                off += 4
-                if c >= lo && c <= hi { return true }
-                if !isUni {
-                    let lower: UInt32 = (ch >= 0x41 && ch <= 0x5A) ? ch + 0x20 : ch
-                    let upper: UInt32 = (ch >= 0x61 && ch <= 0x7A) ? ch - 0x20 : ch
-                    if lower >= lo && lower <= hi { return true }
-                    if upper >= lo && upper <= hi { return true }
-                }
-            }
-        } else {
-            if pairCount == 1 {
-                let lo = UInt32(bcBuf[off]) | (UInt32(bcBuf[off + 1]) << 8)
-                let hi = UInt32(bcBuf[off + 2]) | (UInt32(bcBuf[off + 3]) << 8)
-                return c >= lo && c <= hi
-            }
-            for _ in 0 ..< pairCount {
-                let lo = UInt32(bcBuf[off]) | (UInt32(bcBuf[off + 1]) << 8)
-                let hi = UInt32(bcBuf[off + 2]) | (UInt32(bcBuf[off + 3]) << 8)
-                off += 4
-                if c >= lo && c <= hi { return true }
-            }
+        if pairCount == 1 {
+            let lo = UInt32(bcBuf[off]) | (UInt32(bcBuf[off + 1]) << 8)
+            let hi = UInt32(bcBuf[off + 2]) | (UInt32(bcBuf[off + 3]) << 8)
+            return c >= lo && c <= hi
+        }
+        for _ in 0 ..< pairCount {
+            let lo = UInt32(bcBuf[off]) | (UInt32(bcBuf[off + 1]) << 8)
+            let hi = UInt32(bcBuf[off + 2]) | (UInt32(bcBuf[off + 3]) << 8)
+            off += 4
+            if c >= lo && c <= hi { return true }
         }
         return false
     }
@@ -3276,29 +3475,18 @@ final class REVirtualMachine {
     /// Match a 32-bit character class using unsafe buffer pointer for bytecode access.
     @inline(__always)
     func matchRange32Fast(_ bcBuf: UnsafeBufferPointer<UInt8>, _ offset: Int, pairCount: Int, ch: UInt32) -> Bool {
-        let isIC = flags.contains(.ignoreCase)
-        let c: UInt32 = isIC ? (flags.isUnicode ? lreCanonicalizeUnicode(ch) : ch) : ch
-
+        let c = classKey(ch)
         var off = offset
-        if isIC {
-            for _ in 0 ..< pairCount {
-                let lo = UInt32(bcBuf[off]) | (UInt32(bcBuf[off + 1]) << 8) | (UInt32(bcBuf[off + 2]) << 16) | (UInt32(bcBuf[off + 3]) << 24)
-                let hi = UInt32(bcBuf[off + 4]) | (UInt32(bcBuf[off + 5]) << 8) | (UInt32(bcBuf[off + 6]) << 16) | (UInt32(bcBuf[off + 7]) << 24)
-                off += 8
-                if c >= lo && c <= hi { return true }
-            }
-        } else {
-            if pairCount == 1 {
-                let lo = UInt32(bcBuf[off]) | (UInt32(bcBuf[off + 1]) << 8) | (UInt32(bcBuf[off + 2]) << 16) | (UInt32(bcBuf[off + 3]) << 24)
-                let hi = UInt32(bcBuf[off + 4]) | (UInt32(bcBuf[off + 5]) << 8) | (UInt32(bcBuf[off + 6]) << 16) | (UInt32(bcBuf[off + 7]) << 24)
-                return c >= lo && c <= hi
-            }
-            for _ in 0 ..< pairCount {
-                let lo = UInt32(bcBuf[off]) | (UInt32(bcBuf[off + 1]) << 8) | (UInt32(bcBuf[off + 2]) << 16) | (UInt32(bcBuf[off + 3]) << 24)
-                let hi = UInt32(bcBuf[off + 4]) | (UInt32(bcBuf[off + 5]) << 8) | (UInt32(bcBuf[off + 6]) << 16) | (UInt32(bcBuf[off + 7]) << 24)
-                off += 8
-                if c >= lo && c <= hi { return true }
-            }
+        if pairCount == 1 {
+            let lo = UInt32(bcBuf[off]) | (UInt32(bcBuf[off + 1]) << 8) | (UInt32(bcBuf[off + 2]) << 16) | (UInt32(bcBuf[off + 3]) << 24)
+            let hi = UInt32(bcBuf[off + 4]) | (UInt32(bcBuf[off + 5]) << 8) | (UInt32(bcBuf[off + 6]) << 16) | (UInt32(bcBuf[off + 7]) << 24)
+            return c >= lo && c <= hi
+        }
+        for _ in 0 ..< pairCount {
+            let lo = UInt32(bcBuf[off]) | (UInt32(bcBuf[off + 1]) << 8) | (UInt32(bcBuf[off + 2]) << 16) | (UInt32(bcBuf[off + 3]) << 24)
+            let hi = UInt32(bcBuf[off + 4]) | (UInt32(bcBuf[off + 5]) << 8) | (UInt32(bcBuf[off + 6]) << 16) | (UInt32(bcBuf[off + 7]) << 24)
+            off += 8
+            if c >= lo && c <= hi { return true }
         }
         return false
     }
@@ -3309,19 +3497,19 @@ final class REVirtualMachine {
             left = false
         } else {
             let (ch, _) = getCharBefore(pos)
-            left = lreIsWordChar(ch)
+            left = lreIsWordChar(ch, flags)
         }
         let right: Bool
         if pos >= inputLen {
             right = false
         } else {
             let (ch, _) = getCharUnicode(pos)
-            right = lreIsWordChar(ch)
+            right = lreIsWordChar(ch, flags)
         }
         return left != right
     }
 
-    func matchBackReference(_ groupId: Int, pos: inout Int) -> Bool {
+    func matchBackReference(_ groupId: Int, pos: inout Int, backward: Bool = false) -> Bool {
         guard groupId < captureCount else { return true }
         let si = groupId * 2
         let ei = groupId * 2 + 1
@@ -3333,6 +3521,17 @@ final class REVirtualMachine {
             return true
         }
         let len = end - start
+        if backward {
+            // Lookbehind: the captured text must END at the current position.
+            if pos - len < 0 { return false }
+            for i in 0 ..< len {
+                if !matchCharCaseInsensitive(input[pos - len + i], input[start + i]) {
+                    return false
+                }
+            }
+            pos -= len
+            return true
+        }
         if pos + len > inputLen { return false }
 
         for i in 0 ..< len {

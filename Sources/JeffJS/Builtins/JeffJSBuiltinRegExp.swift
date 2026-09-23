@@ -1788,6 +1788,13 @@ private func js_regexp_execInternal(
             return nil
         }
         pos += 1
+        // With u / v the next start is the next code point, never the low
+        // half of a surrogate pair (/[^\u{10428}]/u must not match "\u{10428}").
+        if regexpFlags.isUnicode && pos < inputCodeUnits.count,
+           inputCodeUnits[pos] >= 0xDC00 && inputCodeUnits[pos] <= 0xDFFF,
+           inputCodeUnits[pos - 1] >= 0xD800 && inputCodeUnits[pos - 1] <= 0xDBFF {
+            pos += 1
+        }
     }
 
     return nil
