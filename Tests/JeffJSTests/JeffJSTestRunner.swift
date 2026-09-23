@@ -294,6 +294,9 @@ struct JeffJSTestRunner {
             ("FunctionToString", { $0.testFunctionToString() }),
             ("InOperator", { $0.testInOperator() }),
             ("DOMEvents", { $0.testDOMEvents() }),
+            ("ParameterPatterns", { $0.testParameterPatterns() }),
+            ("TypedArrayIteration", { $0.testTypedArrayIteration() }),
+            ("HyperlinkReflection", { $0.testHyperlinkReflection() }),
         ]
     }
 
@@ -404,7 +407,7 @@ struct JeffJSTestRunner {
     private static var _sharedRt: JeffJSRuntime?
     private static var _sharedCtx: JeffJSContext?
 
-    private func makeCtx() -> (JeffJSRuntime, JeffJSContext) {
+    func makeCtx() -> (JeffJSRuntime, JeffJSContext) {
         if let rt = JeffJSTestRunner._sharedRt,
            let ctx = JeffJSTestRunner._sharedCtx {
             // Clear any pending exception from previous test
