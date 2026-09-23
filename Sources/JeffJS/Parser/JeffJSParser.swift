@@ -1930,8 +1930,6 @@ final class JeffJSParser {
                 let dSavedLastLineNum = s.lastLineNum
                 let dSavedLastPtr = s.lastPtr
                 let dSavedLastTokenType = s.lastTokenType
-                let isObjDestructure = tok == 0x7B
-
                 skipDestructuringPattern()
 
                 if tok == JSTokenType.TOK_IN.rawValue {
@@ -1962,8 +1960,9 @@ final class JeffJSParser {
                     s.lastLineNum = dSavedLastLineNum; s.lastPtr = dSavedLastPtr
                     s.lastTokenType = dSavedLastTokenType
 
+                    // The pattern consumes the value (an object pattern
+                    // drops its source itself).
                     parseDestructuringBinding(kind: .binding, isLexical: isLexical, isConst: isConst)
-                    if isObjDestructure { emitOp(.drop) }
 
                     s.bufPtr = rhsBufPtr; s.token = rhsToken; s.lineNum = rhsLineNum
                     s.templateNestLevel = rhsTemplateNest; s.gotLF = rhsGotLF
@@ -2014,8 +2013,9 @@ final class JeffJSParser {
                     s.lastLineNum = dSavedLastLineNum; s.lastPtr = dSavedLastPtr
                     s.lastTokenType = dSavedLastTokenType
 
+                    // The pattern consumes the value (an object pattern
+                    // drops its source itself).
                     parseDestructuringBinding(kind: .binding, isLexical: isLexical, isConst: isConst)
-                    if isObjDestructure { emitOp(.drop) }
 
                     s.bufPtr = rhsBufPtr; s.token = rhsToken; s.lineNum = rhsLineNum
                     s.templateNestLevel = rhsTemplateNest; s.gotLF = rhsGotLF
@@ -2056,6 +2056,15 @@ final class JeffJSParser {
             // Save the identifier atom in case this is `for (ident in/of ...)`
             // so we can emit the correct assignment inside the loop.
             let forLhsAtom: JSAtom = (tok == JSTokenType.TOK_IDENT.rawValue) ? s.token.identAtom : 0
+            // Any other left-hand side (`o.x`, `o[k]`, `[a, b]`, `{a, b}`)
+            // is assigned on every iteration (§14.7.5.7): the head is parsed
+            // once here as an expression to find `in` / `of`, then its code
+            // is discarded and the head is re-parsed as an assignment target
+            // inside the loop, after the next value is on the stack.
+            let headIsBareIdent = forLhsAtom != 0 && forHeadIdentIsWholeTarget()
+            let headMark = markTokenizer()
+            let headBcStart = fd.byteCode.len
+            let headChildCount = fd.childFunctions.count
 
             // Disable the `in` operator so `for(x in obj)` is parsed as
             // for-in, not as `for((x in obj); ...)`.
@@ -2064,23 +2073,35 @@ final class JeffJSParser {
             parseExpression()
             inFlag = savedInFlag
 
-            if tok == JSTokenType.TOK_IN.rawValue {
-                // for (expr in ...)
-                // Drop the expression VALUE (we need assignment target, not value)
-                emitOp(.drop)
+            let isForIn = tok == JSTokenType.TOK_IN.rawValue
+            if isForIn || tok == JSTokenType.TOK_OF.rawValue || isIdent("of") {
+                var assignHead: (() -> Void)? = nil
+                if headIsBareIdent {
+                    // Drop the expression VALUE (we need assignment target, not value)
+                    emitOp(.drop)
+                } else {
+                    fd.byteCode.len = headBcStart
+                    if fd.childFunctions.count > headChildCount {
+                        fd.childFunctions.removeSubrange(headChildCount...)
+                    }
+                    assignHead = { [unowned self] in
+                        let resume = self.markTokenizer()
+                        self.resetTokenizer(to: headMark)
+                        self.parseForHeadAssignment()
+                        self.resetTokenizer(to: resume)
+                    }
+                }
                 next()
-                parseForIn(varIdx: -1, varAtom: forLhsAtom, scopeLevel: fd.curScope,
-                           loopLabel: loopLabel, breakLabel: breakLabel,
-                           continueLabel: continueLabel)
-                popScope(scopeIdx)
-                return
-            } else if tok == JSTokenType.TOK_OF.rawValue || isIdent("of") {
-                // for (expr of ...)
-                emitOp(.drop)
-                next()
-                parseForOf(varIdx: -1, varAtom: forLhsAtom, scopeLevel: fd.curScope,
-                           loopLabel: loopLabel, breakLabel: breakLabel,
-                           continueLabel: continueLabel, isAwait: isAwait)
+                if isForIn {
+                    parseForIn(varIdx: -1, varAtom: forLhsAtom, scopeLevel: fd.curScope,
+                               loopLabel: loopLabel, breakLabel: breakLabel,
+                               continueLabel: continueLabel, assignHead: assignHead)
+                } else {
+                    parseForOf(varIdx: -1, varAtom: forLhsAtom, scopeLevel: fd.curScope,
+                               loopLabel: loopLabel, breakLabel: breakLabel,
+                               continueLabel: continueLabel, isAwait: isAwait,
+                               assignHead: assignHead)
+                }
                 popScope(scopeIdx)
                 return
             }
@@ -2092,6 +2113,49 @@ final class JeffJSParser {
         }
 
         popScope(scopeIdx)
+    }
+
+    /// True when the identifier at the current token is directly followed by
+    /// `in` / `of`, i.e. it is the whole left-hand side of a for-in/of head.
+    private func forHeadIdentIsWholeTarget() -> Bool {
+        let mark = markTokenizer()
+        let savedSuppress = JeffJSParseState.suppressErrorPrinting
+        let savedErrorMsg = s.lastErrorMessage
+        JeffJSParseState.suppressErrorPrinting = true
+        defer {
+            resetTokenizer(to: mark)
+            s.lastErrorMessage = savedErrorMsg
+            JeffJSParseState.suppressErrorPrinting = savedSuppress
+        }
+        guard s.nextToken() else { return false }
+        return tok == JSTokenType.TOK_IN.rawValue || tok == JSTokenType.TOK_OF.rawValue || isIdent("of")
+    }
+
+    /// Assign the value on top of the stack to a for-in/of head that is not
+    /// a declaration or a bare identifier: a pattern (`for ([a, b] of ..)`)
+    /// or a reference (`for (o.x in ..)`), evaluated after the value.
+    private func parseForHeadAssignment() {
+        if tok == 0x5B || tok == 0x7B {
+            let after = tokenAfterBalancedGroup()
+            if after == JSTokenType.TOK_IN.rawValue || after == JSTokenType.TOK_OF.rawValue
+                || after == JSTokenType.TOK_IDENT.rawValue {
+                parseDestructuringBinding(kind: .assignment) // consumes the value
+                return
+            }
+        }
+        guard let ref = parseAssignTargetRef() else { return }
+        guard tok == JSTokenType.TOK_IN.rawValue || tok == JSTokenType.TOK_OF.rawValue
+                || isIdent("of") else {
+            syntaxError("invalid left-hand side in for-in/of")
+            return
+        }
+        // Stack: [value, ref...] -> [ref..., value]
+        if ref.depth == 1 {
+            emitOp(.swap)
+        } else if ref.depth == 2 {
+            emitOp(.rot3l)
+        }
+        emitAssignTargetPut(ref)
     }
 
     /// Parse the remainder of a classic for(init; cond; update) body.
@@ -2176,7 +2240,8 @@ final class JeffJSParser {
 
     /// Parse for-in loop body.
     private func parseForIn(varIdx: Int, varAtom: JSAtom, scopeLevel: Int,
-                            loopLabel: Int, breakLabel: Int, continueLabel: Int) {
+                            loopLabel: Int, breakLabel: Int, continueLabel: Int,
+                            assignHead: (() -> Void)? = nil) {
         // Evaluate the right-hand side
         parseExpression()
         expect(0x29) // ')'
@@ -2198,13 +2263,14 @@ final class JeffJSParser {
         // Stack here (not done): [iter, value]
 
         // Assign to the variable
-        if varIdx >= 0 {
+        if let assign = assignHead {
+            assign() // pattern or member target
+        } else if varIdx >= 0 {
             emitScopePutVarInit(varAtom, scopeLevel: scopeLevel)
         } else if varAtom != 0 {
             // Pre-declared variable: assign the key to it
             emitScopePutVar(varAtom, scopeLevel: scopeLevel)
         } else {
-            // Complex LHS expression (a.b, a[0]) — not yet supported, drop
             emitOp(.drop)
         }
         // Stack here: [iter]
@@ -2234,7 +2300,7 @@ final class JeffJSParser {
     /// Parse for-of loop body.
     private func parseForOf(varIdx: Int, varAtom: JSAtom, scopeLevel: Int,
                             loopLabel: Int, breakLabel: Int, continueLabel: Int,
-                            isAwait: Bool) {
+                            isAwait: Bool, assignHead: (() -> Void)? = nil) {
         // Evaluate the right-hand side
         parseAssignExpr()
         expect(0x29) // ')'
@@ -2258,7 +2324,9 @@ final class JeffJSParser {
         emitForOfNext(isAwait: isAwait, doneLabel: doneLabel)
 
         // Assign to the variable
-        if varIdx >= 0 {
+        if let assign = assignHead {
+            assign() // pattern or member target
+        } else if varIdx >= 0 {
             emitScopePutVarInit(varAtom, scopeLevel: scopeLevel)
         } else if varAtom != 0 {
             emitScopePutVar(varAtom, scopeLevel: scopeLevel)
@@ -6521,7 +6589,15 @@ final class JeffJSParser {
     /// `= initializer`. Pure lookahead over balanced brackets; the tokenizer
     /// state is restored.
     func nestedPatternHasDefault() -> Bool {
-        guard tok == 0x5B || tok == 0x7B else { return false }
+        return tokenAfterBalancedGroup() == 0x3D
+    }
+
+    /// The type of the token that follows the balanced `[..]` / `{..}` / `(..)`
+    /// group starting at the current token, or -1 when the current token does
+    /// not open one (or the source ends first). Pure lookahead; the tokenizer
+    /// state is restored.
+    func tokenAfterBalancedGroup() -> Int {
+        guard tok == 0x5B || tok == 0x7B || tok == 0x28 else { return -1 }
         let savedBufPtr   = s.bufPtr
         let savedLineNum  = s.lineNum
         let savedToken    = s.token
@@ -6546,18 +6622,138 @@ final class JeffJSParser {
         var depth = 0
         while true {
             let t = s.token.type
-            if t == JSTokenType.TOK_EOF.rawValue { return false }
+            if t == JSTokenType.TOK_EOF.rawValue { return -1 }
             if t == 0x5B || t == 0x7B || t == 0x28 {
                 depth += 1
             } else if t == 0x5D || t == 0x7D || t == 0x29 {
                 depth -= 1
                 if depth <= 0 {
-                    guard s.nextToken() else { return false }
-                    return s.token.type == 0x3D
+                    guard s.nextToken() else { return -1 }
+                    return s.token.type
                 }
             }
-            guard s.nextToken() else { return false }
+            guard s.nextToken() else { return -1 }
         }
+    }
+
+    // MARK: Assignment-pattern targets (ES §13.15.5)
+
+    /// A tokenizer position, for re-parsing a stretch of source: an
+    /// assignment pattern or a for-in/of head is first parsed as an
+    /// expression, then again as a target.
+    struct TokenizerMark {
+        let bufPtr: Int, lineNum: Int, token: JeffJSToken, gotLF: Bool
+        let lastLineNum: Int, lastPtr: Int, templateNestLevel: Int, lastTokenType: Int
+    }
+
+    func markTokenizer() -> TokenizerMark {
+        return TokenizerMark(bufPtr: s.bufPtr, lineNum: s.lineNum, token: s.token, gotLF: s.gotLF,
+                             lastLineNum: s.lastLineNum, lastPtr: s.lastPtr,
+                             templateNestLevel: s.templateNestLevel, lastTokenType: s.lastTokenType)
+    }
+
+    func resetTokenizer(to m: TokenizerMark) {
+        s.bufPtr = m.bufPtr; s.lineNum = m.lineNum; s.token = m.token; s.gotLF = m.gotLF
+        s.lastLineNum = m.lastLineNum; s.lastPtr = m.lastPtr
+        s.templateNestLevel = m.templateNestLevel; s.lastTokenType = m.lastTokenType
+    }
+
+    /// A DestructuringAssignmentTarget that is not a nested pattern: `x`,
+    /// `o.x`, `o[k]`, `o.#x` (any LeftHandSideExpression that is a
+    /// reference). parseAssignTargetRef evaluates the reference onto the
+    /// stack — `depth` values: none for a variable, the object for a field,
+    /// the object and key for an element — and emitAssignTargetPut stores
+    /// the value sitting on top of them.
+    struct AssignTargetRef {
+        enum Kind { case variable, field, element, privateField }
+        let kind: Kind
+        let atom: JSAtom
+        let scopeLevel: Int
+        var depth: Int { kind == .variable ? 0 : (kind == .element ? 2 : 1) }
+    }
+
+    func parseAssignTargetRef() -> AssignTargetRef? {
+        let start = fd.byteCode.len
+        parseCallExpr()
+        if shouldAbort { return nil }
+        let end = fd.byteCode.len
+        // The expression has to END in the read of a reference: `f()`,
+        // `a + b` or `o?.x` are not assignment targets.
+        let (lastOp, lastPos) = findLastGetOpcode(from: start, to: end)
+        guard let op = lastOp, let pos = lastPos else {
+            syntaxError("invalid destructuring assignment target")
+            return nil
+        }
+        let wide = fd.byteCode.buf[pos] == 0
+        let opcodeSize = wide ? 2 : 1
+        let instrSize = Int(jeffJSGetOpcodeInfo(op).size) + (wide ? 1 : 0)
+        guard pos + instrSize == end else {
+            syntaxError("invalid destructuring assignment target")
+            return nil
+        }
+        let ref: AssignTargetRef
+        switch op {
+        case .scope_get_var:
+            ref = AssignTargetRef(kind: .variable,
+                                  atom: readU32FromBuf(fd.byteCode.buf, pos + opcodeSize),
+                                  scopeLevel: Int(readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4)))
+        case .scope_get_private_field:
+            ref = AssignTargetRef(kind: .privateField,
+                                  atom: readU32FromBuf(fd.byteCode.buf, pos + opcodeSize),
+                                  scopeLevel: Int(readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4)))
+        case .get_field:
+            ref = AssignTargetRef(kind: .field,
+                                  atom: readU32FromBuf(fd.byteCode.buf, pos + opcodeSize),
+                                  scopeLevel: 0)
+        default: // .get_array_el
+            ref = AssignTargetRef(kind: .element, atom: 0, scopeLevel: 0)
+        }
+        fd.byteCode.len = pos // drop the read, keep the reference
+        return ref
+    }
+
+    /// Store the value on top of the stack through `ref` (whose `depth`
+    /// reference values sit right under it); pops all of them.
+    func emitAssignTargetPut(_ ref: AssignTargetRef) {
+        switch ref.kind {
+        case .variable:     emitScopePutVar(ref.atom, scopeLevel: ref.scopeLevel)
+        case .field:        emitPutField(ref.atom)
+        case .element:      emitOp(.put_array_el)
+        case .privateField: emitScopePutPrivateField(ref.atom, scopeLevel: ref.scopeLevel)
+        }
+    }
+
+    /// A plain identifier target (`a`, `a = 1`): the existing binding /
+    /// variable-store paths handle these, member targets go through
+    /// parseAssignTargetRef.
+    func atSimpleIdentifierTarget() -> Bool {
+        guard tok == JSTokenType.TOK_IDENT.rawValue else { return false }
+        let t = s.peekToken().type
+        return t == 0x2C || t == 0x5D || t == 0x7D || t == 0x3D
+    }
+
+    /// In an assignment pattern, `[` / `{` starts a nested pattern only when
+    /// the group is the whole target (`[[a], {b} = {}]`); `[{a}.x] = ..`
+    /// assigns to a member of an object literal.
+    func atNestedAssignmentPattern() -> Bool {
+        guard tok == 0x5B || tok == 0x7B else { return false }
+        let t = tokenAfterBalancedGroup()
+        return t == 0x2C || t == 0x5D || t == 0x7D || t == 0x3D
+    }
+
+    /// `= initializer` after a target: replaces an undefined value on top of
+    /// the stack with the initializer's value.
+    func parseDestructuringDefault() {
+        guard tok == 0x3D else { return }
+        let endLabel = newLabel()
+        emitOp(.dup)
+        emitOp(.undefined)
+        emitOp(.strict_eq)
+        emitIfFalse(endLabel)
+        emitOp(.drop)
+        next()
+        parseAssignExpr()
+        emitLabel(endLabel)
     }
 
     /// Parse array destructuring: [a, b, ...rest] = expr
@@ -6591,6 +6787,45 @@ final class JeffJSParser {
                 // Instead, emit a loop that calls for_of_next until done,
                 // appending each value to a new array.
                 next()
+
+                if kind == .assignment {
+                    // `[...target] = it`: the target reference is evaluated
+                    // before the iterator is drained (§13.15.5.5), so it sits
+                    // under the rest array; for_of_next reaches past it.
+                    var restRef: AssignTargetRef? = nil
+                    if !atNestedAssignmentPattern() {
+                        guard let r = parseAssignTargetRef() else { return }
+                        restRef = r
+                    }
+                    let depth = UInt8(restRef?.depth ?? 0)
+                    let restTmp = defineVar(0, isConst: false, isLexical: false)
+                    emitOp(.array_from)
+                    emitU16(0)
+                    emitOp(.put_loc)
+                    emitU16(UInt16(restTmp))
+                    let loopLabel = newLabel()
+                    let doneLabel = newLabel()
+                    emitLabel(loopLabel)
+                    emitOp(.for_of_next)
+                    emitU8(depth)
+                    emitIfTrue(doneLabel)
+                    emitOp(.get_loc)
+                    emitU16(UInt16(restTmp))
+                    emitOp(.swap)
+                    emitOp(.append)
+                    emitOp(.drop)
+                    emitGoto(loopLabel)
+                    emitLabel(doneLabel)
+                    emitOp(.drop) // the undefined from the last for_of_next
+                    emitOp(.get_loc)
+                    emitU16(UInt16(restTmp))
+                    if let r = restRef {
+                        emitAssignTargetPut(r)
+                    } else {
+                        parseDestructuringBinding(kind: kind)
+                    }
+                    break
+                }
 
                 // Determine the binding target before emitting code
                 var restVarName: JSAtom = 0
@@ -6656,6 +6891,21 @@ final class JeffJSParser {
                 }
 
                 break
+            }
+
+            if kind == .assignment && !atSimpleIdentifierTarget() && !atNestedAssignmentPattern() {
+                // `[o.x, o[k] = d] = it`: the target reference is evaluated
+                // first, then the iterator steps (§13.15.5.5), so
+                // for_of_next reaches past the reference values.
+                guard let ref = parseAssignTargetRef() else { return }
+                emitOp(.for_of_next)
+                emitU8(UInt8(ref.depth))
+                emitOp(.drop) // done flag
+                parseDestructuringDefault()
+                emitAssignTargetPut(ref)
+                idx += 1
+                if tok == 0x2C { next() }
+                continue
             }
 
             // Get next value from iterator.
@@ -6726,15 +6976,31 @@ final class JeffJSParser {
                 // property of the source except the ones already bound.
                 next()
 
-                guard tok == JSTokenType.TOK_IDENT.rawValue else {
+                // `{...o.r} = src`: the target reference comes first
+                // (§13.15.5.4), then the copy.
+                var restRef: AssignTargetRef? = nil
+                var restSrcTmp = -1
+                if kind == .assignment && tok != 0x5B && tok != 0x7B && !atSimpleIdentifierTarget() {
+                    restSrcTmp = defineVar(0, isConst: false, isLexical: false)
+                    emitOp(.dup)
+                    emitOp(.put_loc)
+                    emitU16(UInt16(restSrcTmp))
+                    guard let r = parseAssignTargetRef() else { return }
+                    restRef = r
+                    emitOp(.get_loc)  // Stack: [src, ref..., src]
+                    emitU16(UInt16(restSrcTmp))
+                } else {
+                    emitOp(.dup)      // keep `src` for the trailing drop
+                }
+
+                guard restRef != nil || tok == JSTokenType.TOK_IDENT.rawValue else {
                     syntaxError("rest element in object pattern must be an identifier")
                     return
                 }
-                let varName = s.token.identAtom
-                next()
+                let varName: JSAtom = restRef == nil ? s.token.identAtom : 0
+                if restRef == nil { next() }
 
-                // Stack: [src] -> [src, target, src, excludeList]
-                emitOp(.dup)      // keep `src` for the trailing drop
+                // Stack: [src, src] -> [src, target, src, excludeList]
                 emitOp(.object)   // the rest object
                 emitOp(.swap)
                 emitOp(.object)   // the exclusion list
@@ -6753,7 +7019,9 @@ final class JeffJSParser {
                 emitU8(1) // an exclusion list is present
                 // Stack: [src, target]
 
-                if kind == .assignment {
+                if let r = restRef {
+                    emitAssignTargetPut(r)
+                } else if kind == .assignment {
                     emitScopePutVar(varName, scopeLevel: fd.curScope)
                 } else {
                     let varIdx = defineVar(varName, isConst: isConst, isLexical: isLexical)
@@ -6770,22 +7038,23 @@ final class JeffJSParser {
 
             var propAtom: JSAtom = 0
             var isComputed = false
+            var computedKeySlot = -1
 
             // Parse property name
             if tok == 0x5B { // '[' computed
                 isComputed = true
                 next()
-                // `src` has to be under the key for get_array_el, so it is
-                // duplicated before the key expression runs.
-                emitOp(.dup)
                 parseAssignExpr()
                 expect(0x5D) // ']'
-                // Stash the key: a later `...rest` has to exclude it.
+                // Stash the key: the value read below and a later `...rest`
+                // (which has to exclude it) both need it.
                 let keySlot = defineVar(0, isConst: false, isLexical: false)
                 emitOp(.dup)
                 emitOp(.put_loc)
                 emitU16(UInt16(keySlot))
+                emitOp(.drop)
                 excludedSlots.append(keySlot)
+                computedKeySlot = keySlot
             } else if tok == JSTokenType.TOK_IDENT.rawValue {
                 propAtom = s.token.identAtom
                 next()
@@ -6805,18 +7074,45 @@ final class JeffJSParser {
             }
             if !isComputed { excludedAtoms.append(propAtom) }
 
-            // Stack: [src] (static key) or [src, src, key] (computed key)
-            // -> [src, value]
+            let hasTarget = tok == 0x3A // ':' -- different binding name
+            if hasTarget { next() }
+
+            if hasTarget && kind == .assignment
+                && !atSimpleIdentifierTarget() && !atNestedAssignmentPattern() {
+                // `{p: o.x, [k]: o[i] = d} = src`: the target reference is
+                // evaluated before the property is read (§13.15.5.6), so the
+                // source is re-read from a temporary above it.
+                let srcTmp = defineVar(0, isConst: false, isLexical: false)
+                emitOp(.dup)
+                emitOp(.put_loc)
+                emitU16(UInt16(srcTmp))
+                guard let ref = parseAssignTargetRef() else { return }
+                emitOp(.get_loc)
+                emitU16(UInt16(srcTmp))
+                if isComputed {
+                    emitOp(.get_loc)
+                    emitU16(UInt16(computedKeySlot))
+                    emitOp(.get_array_el)
+                } else {
+                    emitGetField(propAtom)
+                }
+                parseDestructuringDefault()
+                emitAssignTargetPut(ref) // Stack: [src]
+                if tok == 0x2C { next() }
+                continue
+            }
+
+            // Stack: [src] -> [src, value]
+            emitOp(.dup)
             if isComputed {
+                emitOp(.get_loc)
+                emitU16(UInt16(computedKeySlot))
                 emitOp(.get_array_el)
             } else {
-                emitOp(.dup)
                 emitGetField(propAtom)
             }
 
-            if tok == 0x3A { // ':' -- different binding name
-                next()
-
+            if hasTarget {
                 if tok == 0x5B || tok == 0x7B {
                     parseNestedDestructuringElement(kind: kind, isLexical: isLexical, isConst: isConst)
                 } else if tok == JSTokenType.TOK_IDENT.rawValue {
