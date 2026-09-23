@@ -4286,6 +4286,11 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 return self.throwTypeError(message: "Reflect.ownKeys: target must be an object")
             }
             guard let targetObj = args[0].toObject() else { return .exception }
+            if targetObj.classID == JeffJSClassID.proxy.rawValue {
+                guard let keys = jeffJS_proxyOwnKeys(self, targetObj, strings: true, symbols: true,
+                                                     enumerableOnly: false) else { return .exception }
+                return self.newArrayFrom(keys)
+            }
             if targetObj.needsLazyNameLength { self.materializeFunctionNameLength(targetObj) }
             if targetObj.needsLazyPrototype { self.materializeFunctionPrototype(targetObj) }
             var intKeys: [(UInt32, JeffJSValue)] = []
@@ -4568,8 +4573,11 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                             propName = .JS_UNDEFINED
                         }
                         let result = callFunction(trap, thisVal: pd.handler, args: [pd.target, propName, receiver])
+                        propName.freeValue()
+                        trap.freeValue()
                         return result
                     }
+                    trap.freeValue()
                     _ = handlerObj // suppress warning
                 }
                 // No trap: fall through to target
@@ -4792,11 +4800,13 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                         let result = callFunction(trap, thisVal: pd.handler, args: [pd.target, propName, value, obj])
                         propName.freeValue()
                         value.freeValue()
+                        trap.freeValue()
                         let ok = result.toBool()
                         result.freeValue()
                         if result.isException { return -1 }
                         return ok ? 1 : 0
                     }
+                    trap.freeValue()
                     _ = handlerObj // suppress warning
                 }
                 // No trap: fall through to target
@@ -5533,6 +5543,10 @@ extension JeffJSContext {
         // Use non-enumerable so methods don't appear in for-in iteration.
         // DOM elements and prototype objects should not pollute property enumeration.
         setNonEnumerableProperty(obj: obj, name: name, value: funcObj)
+        // definePropertyValue took its own reference; drop the creation one.
+        // (Leaking it pinned every per-object native method forever: a
+        // classList object's twelve methods outlived the element.)
+        funcObj.freeValue()
     }
 
     // -- Value creation --

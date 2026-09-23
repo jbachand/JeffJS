@@ -900,6 +900,10 @@ func markObject(_ rt: JeffJSRuntime,
         // without this edge the collector treats them as unreferenced and
         // clears the locals the continuation is going to read.
         for vr in st.frame.liveVarRefs where vr.gcListIndex != -1 { markFunc(rt, vr) }
+    case .proxyData(let pd):
+        // A proxy owns its target and handler (released by freeObject).
+        if let c = pd.target.toGCObjectHeader() { markFunc(rt, c) }
+        if let c = pd.handler.toGCObjectHeader() { markFunc(rt, c) }
     default:
         break
     }
@@ -1101,6 +1105,12 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     // A RegExp owns a counted reference on its pattern string (see
     // "Pattern ownership" in JeffJSBuiltinRegExp.swift).
     if case .regexp(let pattern, _) = savedPayload { js_regexp_releasePattern(pattern) }
+    // A proxy owns its target and handler (dup'd by createProxyObject;
+    // revocation frees them and leaves undefined behind).
+    if case .proxyData(let pd) = savedPayload {
+        freeValue(rt, pd.target)
+        freeValue(rt, pd.handler)
+    }
     if case .typedArray(let ta) = savedPayload, let buf = ta.buffer {
         ta.buffer = nil
         if buf.refCount > 0 {

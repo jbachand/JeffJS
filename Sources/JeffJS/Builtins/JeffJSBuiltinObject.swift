@@ -440,6 +440,13 @@ extension JeffJSContext {
         let wantSymbols = (flags & JS_GPN_SYMBOL_MASK) != 0
         let enumOnly    = (flags & JS_GPN_ENUM_ONLY) != 0
 
+        // A proxy's keys come from its ownKeys trap (ES §10.5.11).
+        if jsObj.classID == JeffJSClassID.proxy.rawValue {
+            guard let keys = jeffJS_proxyOwnKeys(self, jsObj, strings: wantStrings, symbols: wantSymbols,
+                                                 enumerableOnly: enumOnly) else { return .exception }
+            return newArrayFrom(keys)
+        }
+
         // Object.keys / Object.entries / Object.assign on a plain object:
         // the shape's cached for-in key list already has exactly these keys
         // in this order.

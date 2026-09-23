@@ -2189,6 +2189,16 @@ extension JeffJSContext {
             return JeffJSForInKeyList(keys: keys)
         }
         guard let root = obj.toObject() else { return JeffJSForInKeyList(keys: []) }   // null / undefined
+        // A proxy enumerates its enumerable own string keys (ownKeys +
+        // getOwnPropertyDescriptor traps). A throwing trap ends the loop.
+        if root.classID == JeffJSClassID.proxy.rawValue {
+            guard let keys = jeffJS_proxyOwnKeys(self, root, strings: true, symbols: false,
+                                                 enumerableOnly: true) else {
+                getException().freeValue()
+                return JeffJSForInKeyList(keys: [])
+            }
+            return JeffJSForInKeyList(keys: keys)
+        }
         // A String wrapper's index keys are not shape properties: it must take
         // the general path below.
         if let rootShape = root.shape, root.arraySnapshot() == nil,

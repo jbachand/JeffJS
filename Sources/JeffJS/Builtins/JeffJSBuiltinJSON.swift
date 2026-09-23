@@ -1202,6 +1202,16 @@ extension JeffJSContext {
     }
 
     func getOwnPropertyNames(obj: JeffJSValue) -> [String] {
+        if let jsObj = obj.toObject(), jsObj.classID == JeffJSClassID.proxy.rawValue {
+            guard let keys = jeffJS_proxyOwnKeys(self, jsObj, strings: true, symbols: false,
+                                                 enumerableOnly: true) else {
+                getException().freeValue()
+                return []
+            }
+            var names: [String] = []
+            for k in keys { if let s = toSwiftString(k) { names.append(s) }; k.freeValue() }
+            return names
+        }
         guard let jsObj = obj.toObject(), let shape = jsObj.shape else { return [] }
         // Per ES spec §9.1.12: integer indices first (ascending), then string keys (insertion order).
         var intKeys: [(UInt32, String)] = []

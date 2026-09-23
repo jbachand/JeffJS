@@ -523,6 +523,61 @@ func js_proxy_ownKeys(_ ctx: JeffJSContext,
     return result
 }
 
+/// [[OwnPropertyKeys]] of a proxy as key values (strings and/or symbols),
+/// optionally only the enumerable ones (asked through
+/// [[GetOwnProperty]], i.e. the getOwnPropertyDescriptor trap). Every key is
+/// owned by the caller. Nil with a pending exception when a trap threw or
+/// returned something that is not an array-like of property keys.
+///
+/// Object.keys / Object.getOwnPropertyNames / Reflect.ownKeys / for-in /
+/// JSON.stringify read a proxy through this; they used to walk the proxy
+/// object's own (empty) shape and saw nothing.
+func jeffJS_proxyOwnKeys(_ ctx: JeffJSContext, _ proxyObj: JeffJSObject,
+                         strings: Bool, symbols: Bool, enumerableOnly: Bool) -> [JeffJSValue]? {
+    let list = js_proxy_ownKeys(ctx, proxyObj)
+    if list.isException { return nil }
+    defer { list.freeValue() }
+    guard list.isObject else {
+        _ = ctx.throwTypeError("ownKeys trap result must be an object")
+        return nil
+    }
+    let lenVal = ctx.getPropertyStr(obj: list, name: "length")
+    let length = Int(ctx.toInt32(lenVal) ?? 0)
+    lenVal.freeValue()
+    var keys: [JeffJSValue] = []
+    for i in 0 ..< max(0, length) {
+        let key = ctx.getPropertyUint32(obj: list, index: UInt32(i))
+        if key.isException { for k in keys { k.freeValue() }; return nil }
+        guard key.isString || key.isSymbol else {
+            key.freeValue()
+            for k in keys { k.freeValue() }
+            _ = ctx.throwTypeError("proxy [[OwnPropertyKeys]] must return an array with only string and symbol elements")
+            return nil
+        }
+        if (key.isString && !strings) || (key.isSymbol && !symbols) { key.freeValue(); continue }
+        if enumerableOnly {
+            guard let (atom, owned) = ctx.propertyKeyAtom(key) else {
+                key.freeValue()
+                for k in keys { k.freeValue() }
+                return nil
+            }
+            let desc = js_proxy_getOwnPropertyDescriptor(ctx, proxyObj, atom)
+            if owned { ctx.rt.freeAtom(atom) }
+            if desc.isException { key.freeValue(); for k in keys { k.freeValue() }; return nil }
+            var enumerable = false
+            if desc.isObject {
+                let e = ctx.getPropertyStr(obj: desc, name: "enumerable")
+                enumerable = e.toBool()
+                e.freeValue()
+            }
+            desc.freeValue()
+            if !enumerable { key.freeValue(); continue }
+        }
+        keys.append(key)
+    }
+    return keys
+}
+
 /// 12. apply trap (for callable proxies).
 func js_proxy_apply(_ ctx: JeffJSContext,
                     _ proxyObj: JeffJSObject,
@@ -593,11 +648,17 @@ let js_proxy_exotic_methods: JeffJSExoticMethods = {
         return result.isException ? -1 : (result.isUndefined ? 0 : 1)
     }
     m.getOwnPropertyNames = { ctx, obj, flags in
-        guard let proxyObj = obj.toObject() else { return nil }
-        let result = js_proxy_ownKeys(ctx, proxyObj)
-        if result.isException { return nil }
-        // Convert array result to atom list.
-        return []
+        guard let proxyObj = obj.toObject(),
+              let keys = jeffJS_proxyOwnKeys(ctx, proxyObj,
+                                              strings: (flags & JS_GPN_STRING_MASK) != 0,
+                                              symbols: (flags & JS_GPN_SYMBOL_MASK) != 0,
+                                              enumerableOnly: (flags & JS_GPN_ENUM_ONLY) != 0) else { return nil }
+        var atoms: [UInt32] = []
+        for key in keys {
+            if let (atom, _) = ctx.propertyKeyAtom(key) { atoms.append(atom) }   // the list owns its atoms
+            key.freeValue()
+        }
+        return atoms
     }
     m.deleteProperty = { ctx, obj, atom in
         guard let proxyObj = obj.toObject() else { return -1 }
