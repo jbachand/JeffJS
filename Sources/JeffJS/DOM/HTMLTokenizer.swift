@@ -44,6 +44,8 @@ public struct HTMLTokenizer: Sendable {
     private var commentBytes: [UInt8] = []
     private var tempBytes: [UInt8] = []
     private var currentAttributes: [HTMLAttribute] = []
+    /// Set by `doctypeIdentifier()` when a `>` ended the identifier early.
+    private var lastIdentifierAbrupt = false
 
     // ASCII constants
     private static let lt: UInt8 = 0x3C
@@ -88,6 +90,11 @@ public struct HTMLTokenizer: Sendable {
         if bytes.count >= 3, bytes[0] == 0xEF, bytes[1] == 0xBB, bytes[2] == 0xBF {
             bytes.removeFirst(3)
         }
+        // §13.2.3.5: every CR LF pair and every lone CR becomes a single LF
+        // before tokenisation, so no state (and no `<pre>` newline rule) ever
+        // sees a CR from the source. `&#13;` still produces one: character
+        // references are decoded after this step.
+        if bytes.contains(Self.cr) { bytes = Self.normalizingNewlines(bytes) }
         self.input = bytes
         textBytes.reserveCapacity(256)
         tagNameBytes.reserveCapacity(32)
@@ -95,6 +102,25 @@ public struct HTMLTokenizer: Sendable {
         attrValueBytes.reserveCapacity(128)
         commentBytes.reserveCapacity(64)
         queue.reserveCapacity(4)
+    }
+
+    /// CR LF -> LF, lone CR -> LF.
+    private static func normalizingNewlines(_ bytes: [UInt8]) -> [UInt8] {
+        var out: [UInt8] = []
+        out.reserveCapacity(bytes.count)
+        var i = 0
+        let n = bytes.count
+        while i < n {
+            let b = bytes[i]
+            if b == cr {
+                out.append(nl)
+                if i + 1 < n, bytes[i + 1] == nl { i += 1 }
+            } else {
+                out.append(b)
+            }
+            i += 1
+        }
+        return out
     }
 
     // MARK: - Public API
@@ -258,7 +284,8 @@ public struct HTMLTokenizer: Sendable {
         let name = string(lastStartTagName)
         currentAttributes = []
         var selfClosing = false
-        parseAttributes(selfClosing: &selfClosing)
+        // eof-in-tag: a tag cut off by the end of input is dropped.
+        guard parseAttributes(selfClosing: &selfClosing) else { return }
         emit(.endTag(name: name))
     }
 
@@ -509,6 +536,14 @@ public struct HTMLTokenizer: Sendable {
                     emit(.comment(string(commentBytes)))
                     return
                 }
+                if scan == input.count || (dashes >= 2 && scan + 1 == input.count && input[scan] == Self.bang) {
+                    // eof-in-comment from the comment end dash / end / end
+                    // bang states: the (up to two) closing dashes are not data.
+                    for _ in 0..<(dashes - min(dashes, 2)) { commentBytes.append(Self.dash) }
+                    pos = input.count
+                    emit(.comment(string(commentBytes)))
+                    return
+                }
                 for _ in 0..<dashes { commentBytes.append(Self.dash) }
                 pos = scan
                 continue
@@ -583,6 +618,7 @@ public struct HTMLTokenizer: Sendable {
             skipWhitespace()
             if let id = doctypeIdentifier() {
                 doctype.publicId = id
+                if finishAbruptIdentifier(&doctype) { return }
             } else {
                 doctype.forceQuirks = true
                 skipToGT()
@@ -597,6 +633,7 @@ public struct HTMLTokenizer: Sendable {
             }
             if let id = doctypeIdentifier() {
                 doctype.systemId = id
+                if finishAbruptIdentifier(&doctype) { return }
             } else {
                 doctype.forceQuirks = true
                 skipToGT()
@@ -608,6 +645,7 @@ public struct HTMLTokenizer: Sendable {
             skipWhitespace()
             if let id = doctypeIdentifier() {
                 doctype.systemId = id
+                if finishAbruptIdentifier(&doctype) { return }
             } else {
                 doctype.forceQuirks = true
                 skipToGT()
@@ -623,10 +661,29 @@ public struct HTMLTokenizer: Sendable {
         }
 
         // After the identifiers: anything but `>` is a bogus DOCTYPE, which
-        // notably does *not* force quirks.
+        // notably does *not* force quirks — but EOF there does (§13.2.5.67).
         skipWhitespace()
+        if pos >= input.count { doctype.forceQuirks = true }
         skipToGT()
         emit(.doctype(doctype))
+    }
+
+    /// After a quoted identifier: when it was cut short by `>` (abrupt-doctype-
+    /// …-identifier) or by EOF, the DOCTYPE is emitted now with force-quirks
+    /// on. Returns true when it was.
+    private mutating func finishAbruptIdentifier(_ doctype: inout HTMLDoctype) -> Bool {
+        if pos >= input.count {
+            doctype.forceQuirks = true
+            emit(.doctype(doctype))
+            return true
+        }
+        if lastIdentifierAbrupt {
+            pos += 1 // the `>`
+            doctype.forceQuirks = true
+            emit(.doctype(doctype))
+            return true
+        }
+        return false
     }
 
     /// A quoted public/system identifier, or nil when the quote is missing.
@@ -636,8 +693,9 @@ public struct HTMLTokenizer: Sendable {
         guard quote == Self.dquote || quote == Self.squote else { return nil }
         pos += 1
         var bytes: [UInt8] = []
+        lastIdentifierAbrupt = false
         while pos < input.count, input[pos] != quote {
-            if input[pos] == Self.gt { break } // abrupt-doctype-…-identifier
+            if input[pos] == Self.gt { lastIdentifierAbrupt = true; break } // abrupt-doctype-…-identifier
             if input[pos] == Self.nul {
                 bytes.append(contentsOf: Self.replacementBytes)
             } else {
@@ -669,7 +727,9 @@ public struct HTMLTokenizer: Sendable {
         }
         let name = string(tagNameBytes)
 
-        parseAttributes(selfClosing: &selfClosing)
+        // §13.2.5.8-43 eof-in-tag: EOF anywhere inside a tag (name, attribute
+        // name or value, before the `>`) emits nothing — `x<a b=c` is just "x".
+        guard parseAttributes(selfClosing: &selfClosing) else { return }
 
         if isEnd {
             emit(.endTag(name: name))
@@ -679,15 +739,18 @@ public struct HTMLTokenizer: Sendable {
         }
     }
 
-    private mutating func parseAttributes(selfClosing: inout Bool) {
+    /// Parses attributes up to and including the closing `>`. Returns false
+    /// when the input ends first (the caller drops the tag).
+    @discardableResult
+    private mutating func parseAttributes(selfClosing: inout Bool) -> Bool {
         while pos < input.count {
             skipWhitespace()
-            guard pos < input.count else { return }
+            guard pos < input.count else { return false }
             let b = input[pos]
 
             if b == Self.gt {
                 pos += 1
-                return
+                return true
             }
             if b == Self.slash {
                 pos += 1
@@ -695,7 +758,7 @@ public struct HTMLTokenizer: Sendable {
                 if pos < input.count, input[pos] == Self.gt {
                     selfClosing = true
                     pos += 1
-                    return
+                    return true
                 }
                 continue
             }
@@ -733,6 +796,7 @@ public struct HTMLTokenizer: Sendable {
                 currentAttributes.append(HTMLAttribute(name: name, value: value))
             }
         }
+        return false
     }
 
     private mutating func parseAttributeValue() -> String {

@@ -298,6 +298,7 @@ struct JeffJSTestRunner {
             ("TypedArrayIteration", { $0.testTypedArrayIteration() }),
             ("HyperlinkReflection", { $0.testHyperlinkReflection() }),
             ("FreedValueTouches", { $0.testFreedValueTouches() }),
+            ("HTMLParsing", { $0.testHTMLParsing() }),
         ]
     }
 

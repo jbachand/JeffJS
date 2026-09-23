@@ -125,6 +125,10 @@ final class JeffJSDOMBridge {
     /// `<template>` content fragments, keyed by the template element's id.
     private var templateContent: [UUID: DOMNode] = [:]
 
+    /// `<textarea>` elements whose `value` script has set (the dirty value
+    /// flag): from then on `value` no longer follows the child text.
+    private var dirtyTextareas: Set<UUID> = []
+
     /// The `<script>` element currently being evaluated (`document.currentScript`).
     private var currentScriptNode: DOMNode?
 
@@ -177,6 +181,7 @@ final class JeffJSDOMBridge {
         detachedDocuments.removeAll()
         detachedDocumentRoots.removeAll()
         templateContent.removeAll()
+        dirtyTextareas.removeAll()
         currentScriptNode = nil
         nodeListItemFn?.freeValue(); nodeListItemFn = nil
         nodeListNamedItemFn?.freeValue(); nodeListNamedItemFn = nil
@@ -419,8 +424,9 @@ final class JeffJSDOMBridge {
             }
             let normalized = tagName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             guard !normalized.isEmpty else { return self.wrapElementArray([], ctx: ctx) }
+            let raw = tagName.trimmingCharacters(in: .whitespacesAndNewlines)
             let nodes = self.allElementDescendants(of: self.root).filter {
-                normalized == "*" || $0.tagName == normalized
+                normalized == "*" || $0.tagName == ($0.isHTMLNamespace ? normalized : raw)
             }
             return self.wrapElementArray(nodes, ctx: ctx)
         }, length: 1)
@@ -434,15 +440,13 @@ final class JeffJSDOMBridge {
             return self.wrapElement(node, ctx: ctx)
         }, length: 1)
 
-        // createElementNS(namespace, tag, options?) — used by Preact and modern frameworks.
-        // Namespace is accepted but ignored (all elements treated as HTML).
+        // createElementNS(namespace, qualifiedName, options?) — DOM §4.5: the
+        // element carries the namespace and its local name keeps its case, so
+        // `createElementNS(svgNS, 'linearGradient')` is an SVG element and an
+        // SVG context element fragment-parses as foreign content.
         ctx.setPropertyFunc(obj: doc, name: "createElementNS", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.null }
-            // args[0] = namespace URI (ignored), args[1] = tag name
-            let tag = self.extractString(ctx: ctx, args: args, index: 1)
-                ?? self.extractString(ctx: ctx, args: args, index: 0)
-            guard let tag else { return JeffJSValue.null }
-            let node = DOMNode.element(tag: tag)
+            guard let node = Self.makeElementNS(ctx: ctx, args: args) else { return JeffJSValue.null }
             return self.wrapElement(node, ctx: ctx)
         }, length: 2)
 
@@ -524,6 +528,14 @@ final class JeffJSDOMBridge {
         }, name: "get currentScript", length: 0)
         ctx.setPropertyGetSet(obj: doc, name: "currentScript", getter: currentScriptGetter, setter: nil)
 
+        // document.doctype — the DocumentType node the parser created (null
+        // for a page without a DOCTYPE, i.e. a quirks-mode page).
+        let doctypeGetter = ctx.newCFunction({ [weak self] ctx, _, _ in
+            guard let self, let node = self.root.doctype else { return JeffJSValue.null }
+            return self.wrapElement(node, ctx: ctx)
+        }, name: "get doctype", length: 0)
+        ctx.setPropertyGetSet(obj: doc, name: "doctype", getter: doctypeGetter, setter: nil)
+
         // The host pushes the executing <script> by node id. Going through JS
         // (rather than a Swift entry point) keeps the host compiling against any
         // engine revision: it feature-tests the function before calling it.
@@ -552,7 +564,8 @@ final class JeffJSDOMBridge {
 
         ctx.setPropertyFunc(obj: impl, name: "createHTMLDocument", fn: { [weak self] ctx, _, args in
             guard let self else { return JeffJSValue.null }
-            let title = args.isEmpty ? "" : (ctx.toSwiftString(args[0]) ?? "")
+            // DOM §4.5.1: the title element exists only when a title is given.
+            let title: String? = (args.isEmpty || args[0].isUndefined) ? nil : (ctx.toSwiftString(args[0]) ?? "")
             return self.wrapDetachedDocument(self.makeDetachedDocument(title: title), ctx: ctx)
         }, length: 1)
 
@@ -580,14 +593,19 @@ final class JeffJSDOMBridge {
         return impl
     }
 
-    /// `html > head > title + body` skeleton for a detached document.
-    private func makeDetachedDocument(title: String) -> DOMNode {
+    /// DOM §4.5.1 `createHTMLDocument(title)`: `<!DOCTYPE html>`, then
+    /// `html > head (> title > text) + body`, in no-quirks mode. The title
+    /// element (holding a Text node, even an empty one) only when a title is given.
+    private func makeDetachedDocument(title: String?) -> DOMNode {
         let docNode = DOMNode.document()
+        docNode.appendChild(DOMNode.documentType(name: "html"))
         let html = DOMNode.element(tag: "html")
         let head = DOMNode.element(tag: "head")
-        let titleNode = DOMNode.element(tag: "title")
-        titleNode.appendChild(DOMNode.text(title))
-        head.appendChild(titleNode)
+        if let title {
+            let titleNode = DOMNode.element(tag: "title")
+            titleNode.appendChild(DOMNode.text(title))
+            head.appendChild(titleNode)
+        }
         html.appendChild(head)
         html.appendChild(DOMNode.element(tag: "body"))
         docNode.appendChild(html)
@@ -595,19 +613,36 @@ final class JeffJSDOMBridge {
     }
 
     /// Parses `html` into a detached `Document`, for `DOMParser.parseFromString`.
+    /// DOM Parsing §2: the document has no browsing context, so it is parsed
+    /// with scripting DISABLED (`<noscript>` content becomes elements), and its
+    /// mode (`compatMode`) is whatever its own DOCTYPE decided.
     func parseDetachedDocument(html: String, ctx: JeffJSContext) -> JeffJSValue {
-        let parsed = HTMLParser.parse(html)
-        // Guarantee html/head/body exist so `.body` is never null.
-        let docNode: DOMNode
-        if parsed.querySelector("body") != nil, parsed.querySelector("html") != nil {
-            docNode = parsed
-        } else {
-            docNode = makeDetachedDocument(title: "")
-            if let body = docNode.querySelector("body") {
-                for child in parsed.children { body.appendChild(child) }
-            }
+        wrapDetachedDocument(HTMLParser.parse(html, scriptingEnabled: false), ctx: ctx)
+    }
+
+    /// `createElementNS(namespace, qualifiedName)` arguments -> an element.
+    /// `nil` on a DOMNode means the HTML namespace; "" is the null namespace.
+    static func makeElementNS(ctx: JeffJSContext, args: [JeffJSValue]) -> DOMNode? {
+        guard args.count >= 2 else {
+            // Lenient: a lone argument is a tag name (old callers passed one).
+            guard let tag = args.first.flatMap({ ctx.toSwiftString($0) }) else { return nil }
+            return DOMNode.element(tag: tag)
         }
-        return wrapDetachedDocument(docNode, ctx: ctx)
+        let rawNS: String? = (args[0].isNull || args[0].isUndefined) ? nil : ctx.toSwiftString(args[0])
+        guard let qualified = ctx.toSwiftString(args[1]) else { return nil }
+        let local: String
+        if let colon = qualified.lastIndex(of: ":") {
+            local = String(qualified[qualified.index(after: colon)...])
+        } else {
+            local = qualified
+        }
+        let namespace: String?
+        switch rawNS {
+        case nil, "": namespace = ""
+        case DOMNode.htmlNamespace: namespace = nil
+        default: namespace = rawNS
+        }
+        return DOMNode.element(tag: local, preserveCase: true, namespace: namespace)
     }
 
     /// Wraps a detached document root as a Document-shaped JS object: the element
@@ -624,7 +659,9 @@ final class JeffJSDOMBridge {
         // has no browsing context.
         ctx.setPropertyStr(obj: wrapper, name: "ownerDocument", value: .null)
         ctx.setPropertyStr(obj: wrapper, name: "defaultView", value: .null)
-        ctx.setPropertyStr(obj: wrapper, name: "compatMode", value: ctx.newStringValue("CSS1Compat"))
+        // The mode the parser decided from this document's own DOCTYPE
+        // (quirks without one), not the page's.
+        ctx.setPropertyStr(obj: wrapper, name: "compatMode", value: ctx.newStringValue(docNode.compatMode))
         ctx.setPropertyStr(obj: wrapper, name: "characterSet", value: ctx.newStringValue("UTF-8"))
         ctx.setPropertyStr(obj: wrapper, name: "contentType", value: ctx.newStringValue("text/html"))
         ctx.setPropertyStr(obj: wrapper, name: "readyState", value: ctx.newStringValue("complete"))
@@ -637,7 +674,8 @@ final class JeffJSDOMBridge {
         let accessors: [(String, () -> DOMNode?)] = [
             ("documentElement", { tag("html") ?? docNode.children.first(where: { $0.nodeType == .element }) }),
             ("head", { tag("head") }),
-            ("body", { tag("body") }),
+            ("body", { tag("body") ?? tag("frameset") }),
+            ("doctype", { docNode.doctype }),
             ("scrollingElement", { tag("html") }),
             ("activeElement", { tag("body") }),
         ]
@@ -683,9 +721,7 @@ final class JeffJSDOMBridge {
         }, length: 1)
 
         ctx.setPropertyFunc(obj: wrapper, name: "createElementNS", fn: { ctx, _, args in
-            let tagName = (args.count > 1 ? ctx.toSwiftString(args[1]) : nil)
-                ?? ctx.toSwiftString(args.first ?? .undefined) ?? "div"
-            return adopt(DOMNode.element(tag: tagName), ctx)
+            adopt(Self.makeElementNS(ctx: ctx, args: args) ?? DOMNode.element(tag: "div"), ctx)
         }, length: 2)
 
         ctx.setPropertyFunc(obj: wrapper, name: "createTextNode", fn: { ctx, _, args in
@@ -843,8 +879,14 @@ final class JeffJSDOMBridge {
         // -- Per-instance read-only properties --
         ctx.setPropertyStr(obj: el, name: "nodeType", value: .newInt32(nodeTypeInt(node)))
         ctx.setPropertyStr(obj: el, name: "nodeName", value: ctx.newStringValue(nodeNameStr(node)))
-        ctx.setPropertyStr(obj: el, name: "tagName", value: ctx.newStringValue((node.tagName ?? "").uppercased()))
+        ctx.setPropertyStr(obj: el, name: "tagName", value: ctx.newStringValue(Self.qualifiedTagName(node)))
         ctx.setPropertyStr(obj: el, name: "localName", value: ctx.newStringValue(node.tagName ?? ""))
+        if node.isDocumentType {
+            // DocumentType: `name` comes from the shared prototype's reflected
+            // `name` accessor (the doctype keeps its name under that key).
+            ctx.setPropertyStr(obj: el, name: "publicId", value: ctx.newStringValue(node.doctypePublicId))
+            ctx.setPropertyStr(obj: el, name: "systemId", value: ctx.newStringValue(node.doctypeSystemId))
+        }
         ctx.setPropertyStr(obj: el, name: "nativeNodeID", value: ctx.newStringValue(node.id.uuidString))
         if let owner = ownerDocumentValue(for: node) {
             ctx.setPropertyStr(obj: el, name: "ownerDocument", value: owner)
@@ -998,6 +1040,8 @@ final class JeffJSDOMBridge {
         for (name, value) in nodeConstants {
             ctx.setPropertyStr(obj: proto, name: name, value: .newInt32(value))
         }
+        // No element this bridge creates has a namespace prefix.
+        ctx.setPropertyStr(obj: proto, name: "prefix", value: .null)
 
         return proto
     }
@@ -1017,9 +1061,13 @@ final class JeffJSDOMBridge {
             guard let name = self.extractString(ctx: ctx, args: args, index: 0) else {
                 return JeffJSValue.null
             }
-            guard let value = targetNode.attributes[name.lowercased()] else {
-                return JeffJSValue.null
-            }
+            // DOM §4.9: names are lowercased only on HTML elements; an SVG
+            // element's `viewBox` is looked up as written (the lowercase alias
+            // the parser registers keeps the lenient spelling working).
+            let value = targetNode.isHTMLNamespace
+                ? targetNode.attributes[name.lowercased()]
+                : (targetNode.attributes[name] ?? targetNode.attributes[name.lowercased()])
+            guard let value else { return JeffJSValue.null }
             return ctx.newStringValue(value)
         }, length: 1)
 
@@ -1031,7 +1079,13 @@ final class JeffJSDOMBridge {
                   let value = self.extractString(ctx: ctx, args: args, index: 1) else {
                 return JeffJSValue.undefined
             }
-            targetNode.setAttribute(name: name, value: value)
+            if targetNode.isHTMLNamespace || targetNode.nodeType != .element {
+                targetNode.setAttribute(name: name, value: value)
+            } else {
+                // Foreign element: the name keeps its case (`viewBox`) and
+                // appears once when enumerated/serialised.
+                targetNode.setAttributePreservingCase(name: name, value: value)
+            }
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 2)
@@ -1043,7 +1097,11 @@ final class JeffJSDOMBridge {
             guard let name = self.extractString(ctx: ctx, args: args, index: 0) else {
                 return JeffJSValue.undefined
             }
-            targetNode.removeAttribute(name: name)
+            if targetNode.isHTMLNamespace || targetNode.nodeType != .element {
+                targetNode.removeAttribute(name: name)
+            } else {
+                targetNode.removeAttributePreservingCase(name: name)
+            }
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 1)
@@ -1055,6 +1113,7 @@ final class JeffJSDOMBridge {
             guard let name = self.extractString(ctx: ctx, args: args, index: 0) else {
                 return JeffJSValue.JS_FALSE
             }
+            if !targetNode.isHTMLNamespace, targetNode.attributes[name] != nil { return .newBool(true) }
             return .newBool(targetNode.attributes[name.lowercased()] != nil)
         }, length: 1)
 
@@ -1290,8 +1349,9 @@ final class JeffJSDOMBridge {
             }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.null }
             let normalized = tagName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let raw = tagName.trimmingCharacters(in: .whitespacesAndNewlines)
             let nodes = self.allElementDescendants(of: targetNode).filter {
-                normalized == "*" || $0.tagName == normalized
+                normalized == "*" || $0.tagName == ($0.isHTMLNamespace ? normalized : raw)
             }
             return self.wrapElementArray(nodes, ctx: ctx)
         }, length: 1)
@@ -1505,21 +1565,25 @@ final class JeffJSDOMBridge {
         // -- innerHTML (read-write) --
         ctx.setPropertyFunc(obj: el, name: "__get_innerHTML", fn: { [weak self] ctx, thisVal, _ in
             guard let self else { return ctx.newStringValue("") }
-            guard var targetNode = self.extractNode(from: thisVal) else { return ctx.newStringValue("") }
-            // A <template>'s markup lives in its content fragment, not its children.
-            if targetNode.tagName == "template" { targetNode = self.templateFragment(for: targetNode) }
-            let html = targetNode.children.map { Self.serializeHTML($0) }.joined()
+            guard let targetNode = self.extractNode(from: thisVal) else { return ctx.newStringValue("") }
+            // A <template>'s markup lives in its content fragment, not its
+            // children (serializeChildren reads it from there).
+            var html = ""
+            self.serializeChildren(of: targetNode, into: &html, scripting: self.scriptingEnabled(for: targetNode))
             return ctx.newStringValue(html)
         }, length: 0)
 
         ctx.setPropertyFunc(obj: el, name: "__set_innerHTML", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.undefined }
-            guard var targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
-            if targetNode.tagName == "template" { targetNode = self.templateFragment(for: targetNode) }
+            guard let element = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+            // HTML §4.12.3 / §13.2.9: a template's markup goes into its content
+            // fragment, but it is parsed with the *template* as the context
+            // element ("in template" mode), so `<tr><td>` keeps its table parts.
+            let targetNode = Self.isHTMLTemplate(element) ? self.templateFragment(for: element) : element
             let html = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
             for child in targetNode.children { self.clearNodeAndDescendants(child) }
             targetNode.clearChildren()
-            let parsed = Self.parseHTMLFragment(html, context: targetNode)
+            let parsed = Self.parseHTMLFragment(html, context: element)
             for child in parsed {
                 targetNode.appendChild(child)
             }
@@ -1531,7 +1595,10 @@ final class JeffJSDOMBridge {
         ctx.setPropertyFunc(obj: el, name: "__get_outerHTML", fn: { [weak self] ctx, thisVal, _ in
             guard let self else { return ctx.newStringValue("") }
             guard let targetNode = self.extractNode(from: thisVal) else { return ctx.newStringValue("") }
-            return ctx.newStringValue(Self.serializeHTML(targetNode))
+            var html = ""
+            self.serializeNode(targetNode, rawTextParent: false, into: &html,
+                               scripting: self.scriptingEnabled(for: targetNode))
+            return ctx.newStringValue(html)
         }, length: 0)
 
         ctx.setPropertyFunc(obj: el, name: "__set_outerHTML", fn: { [weak self] ctx, thisVal, args in
@@ -1571,6 +1638,17 @@ final class JeffJSDOMBridge {
             return JeffJSValue.undefined
         }, length: 1)
 
+        // -- namespaceURI (read-only) --
+        // DOM §4.9: every element has a namespace; the parser leaves HTML
+        // elements' nil (= XHTML) and "" is createElementNS's null namespace.
+        ctx.setPropertyFunc(obj: el, name: "__get_namespaceURI", fn: { [weak self] ctx, thisVal, _ in
+            guard let self, let node = self.extractNode(from: thisVal), node.nodeType == .element else {
+                return JeffJSValue.null
+            }
+            let ns = node.namespaceURI ?? DOMNode.htmlNamespace
+            return ns.isEmpty ? JeffJSValue.null : ctx.newStringValue(ns)
+        }, length: 0)
+
         // -- id (read-write) --
         ctx.setPropertyFunc(obj: el, name: "__get_id", fn: { [weak self] ctx, thisVal, _ in
             guard let self else { return ctx.newStringValue("") }
@@ -1604,9 +1682,17 @@ final class JeffJSDOMBridge {
         }, length: 1)
 
         // -- value (read-write, for form elements) --
+        // <textarea> (HTML §4.10.11): the raw value is the element's child
+        // text content (its default value) until script sets `value` (the
+        // dirty flag); the `value` content attribute is never consulted. The
+        // setter still writes the attribute, which is where the host's
+        // renderer reads a textarea's displayed text from.
         ctx.setPropertyFunc(obj: el, name: "__get_value", fn: { [weak self] ctx, thisVal, _ in
             guard let self else { return ctx.newStringValue("") }
             guard let targetNode = self.extractNode(from: thisVal) else { return ctx.newStringValue("") }
+            if Self.isTextarea(targetNode), !self.dirtyTextareas.contains(targetNode.id) {
+                return ctx.newStringValue(Self.childTextContent(targetNode))
+            }
             return ctx.newStringValue(targetNode.attributes["value"] ?? "")
         }, length: 0)
 
@@ -1614,7 +1700,30 @@ final class JeffJSDOMBridge {
             guard let self else { return JeffJSValue.undefined }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
             let value = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
+            if Self.isTextarea(targetNode) { self.dirtyTextareas.insert(targetNode.id) }
             targetNode.setAttribute(name: "value", value: value)
+            self.notifyMutation(for: targetNode)
+            return JeffJSValue.undefined
+        }, length: 1)
+
+        // -- defaultValue --
+        // <textarea>: its child text content; setting it replaces the children
+        // with one Text node. Elsewhere (input/output…) the `value` attribute.
+        ctx.setPropertyFunc(obj: el, name: "__get_defaultValue", fn: { [weak self] ctx, thisVal, _ in
+            guard let self, let targetNode = self.extractNode(from: thisVal) else { return ctx.newStringValue("") }
+            if Self.isTextarea(targetNode) { return ctx.newStringValue(Self.childTextContent(targetNode)) }
+            return ctx.newStringValue(targetNode.attributes["value"] ?? "")
+        }, length: 0)
+
+        ctx.setPropertyFunc(obj: el, name: "__set_defaultValue", fn: { [weak self] ctx, thisVal, args in
+            guard let self, let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
+            let value = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
+            if Self.isTextarea(targetNode) {
+                for child in targetNode.children { self.clearNodeAndDescendants(child) }
+                targetNode.setTextContent(value)
+            } else {
+                targetNode.setAttribute(name: "value", value: value)
+            }
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 1)
@@ -1704,6 +1813,7 @@ final class JeffJSDOMBridge {
         ctx.setPropertyFunc(obj: el, name: "__get_nodeValue", fn: { [weak self] ctx, thisVal, _ in
             guard let self else { return JeffJSValue.null }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.null }
+            if targetNode.isDocumentType { return JeffJSValue.null }
             switch targetNode.nodeType {
             case .text, .comment:
                 return ctx.newStringValue(targetNode.textContent ?? "")
@@ -2023,7 +2133,8 @@ final class JeffJSDOMBridge {
             ("username", true), ("password", true), ("host", true), ("hostname", true),
             ("port", true), ("pathname", true), ("search", true), ("hash", true),
             ("name", true), ("alt", true), ("title", true), ("placeholder", true), ("type", true),
-            ("id", true), ("className", true), ("value", true),
+            ("id", true), ("className", true), ("value", true), ("defaultValue", true),
+            ("namespaceURI", false),
             ("checked", true), ("hidden", true), ("src", true), ("href", true),
             ("nodeValue", true), ("data", true), ("isConnected", false),
             ("parentNode", false), ("parentElement", false),
@@ -2669,15 +2780,18 @@ final class JeffJSDOMBridge {
     /// any children the HTML parser left directly on the template are migrated in,
     /// matching the spec where template markup never becomes element children.
     private func templateFragment(for node: DOMNode) -> DOMNode {
+        // Move, don't clear: `appendChild` has already re-parented each child
+        // to the fragment, and `clearChildren()` would reset those parent
+        // pointers to nil (so `content.firstChild.parentNode` was null).
+        let fragment: DOMNode
         if let existing = templateContent[node.id] {
-            for child in node.children { existing.appendChild(child) }
-            if !node.children.isEmpty { node.clearChildren() }
-            return existing
+            fragment = existing
+        } else {
+            fragment = DOMNode.documentFragment()
+            templateContent[node.id] = fragment
         }
-        let fragment = DOMNode.documentFragment()
-        for child in node.children { fragment.appendChild(child) }
-        node.clearChildren()
-        templateContent[node.id] = fragment
+        let moved = node.detachChildrenArray()
+        for child in moved { fragment.appendChild(child) }
         return fragment
     }
 
@@ -2906,7 +3020,9 @@ final class JeffJSDOMBridge {
                 namespace: node.namespaceURI
             )
             if deep {
-                for child in node.children {
+                // A template's contents are cloned with it (HTML §4.12.3
+                // cloning steps); they sit in its content fragment.
+                for child in serializationChildren(of: node) {
                     cloned.appendChild(cloneDOMNode(child, deep: true))
                 }
             }
@@ -2914,6 +3030,10 @@ final class JeffJSDOMBridge {
         case .text:
             return DOMNode.text(node.textContent ?? "")
         case .comment:
+            if node.isDocumentType {
+                return DOMNode.documentType(name: node.doctypeName, publicId: node.doctypePublicId,
+                                            systemId: node.doctypeSystemId)
+            }
             return DOMNode.comment(node.textContent ?? "")
         case .documentFragment:
             let frag = DOMNode.documentFragment()
@@ -2939,7 +3059,7 @@ final class JeffJSDOMBridge {
         switch node.nodeType {
         case .element: return 1
         case .text: return 3
-        case .comment: return 8
+        case .comment: return node.isDocumentType ? 10 : 8
         case .document: return 9
         case .documentFragment: return 11
         }
@@ -2948,55 +3068,156 @@ final class JeffJSDOMBridge {
     /// Returns the nodeName string for a DOMNode.
     private func nodeNameStr(_ node: DOMNode) -> String {
         switch node.nodeType {
-        case .element: return (node.tagName ?? "").uppercased()
+        case .element: return Self.qualifiedTagName(node)
         case .text: return "#text"
-        case .comment: return "#comment"
+        case .comment: return node.isDocumentType ? node.doctypeName : "#comment"
         case .document: return "#document"
         case .documentFragment: return "#document-fragment"
         }
     }
 
+    private static func isTextarea(_ node: DOMNode) -> Bool {
+        node.nodeType == .element && node.tagName == "textarea" && node.isHTMLNamespace
+    }
+
+    /// DOM "child text content": the concatenated data of the Text children.
+    static func childTextContent(_ node: DOMNode) -> String {
+        var out = ""
+        for child in node.children where child.nodeType == .text { out += child.textContent ?? "" }
+        return out
+    }
+
+    /// `Element.tagName` (DOM §4.9 "HTML-uppercased qualified name"): HTML
+    /// elements ASCII-uppercase, SVG/MathML/other namespaces keep their case
+    /// (`foreignObject`, `clipPath`). Non-elements: "".
+    static func qualifiedTagName(_ node: DOMNode) -> String {
+        guard node.nodeType == .element, let tag = node.tagName else { return "" }
+        guard node.isHTMLNamespace else { return tag }
+        return asciiUppercased(tag)
+    }
+
+    private static func asciiUppercased(_ s: String) -> String {
+        var needs = false
+        for b in s.utf8 where b >= 0x61 && b <= 0x7A { needs = true; break }
+        guard needs else { return s }
+        return String(decoding: s.utf8.map { ($0 >= 0x61 && $0 <= 0x7A) ? $0 - 0x20 : $0 }, as: UTF8.self)
+    }
+
     // MARK: - HTML Serialization / Parsing
 
-    private static func serializeHTML(_ node: DOMNode) -> String {
-        switch node.nodeType {
-        case .text:
-            return escapeText(node.textContent ?? "")
-        case .comment:
-            return "<!--\(node.textContent ?? "")-->"
-        case .document, .documentFragment:
-            return node.children.map(serializeHTML).joined()
-        case .element:
-            guard let tag = node.tagName else { return "" }
-            var html = "<\(tag)"
-            for (key, val) in node.enumerableAttributes.sorted(by: { $0.key < $1.key }) {
-                html += " \(key)=\"\(escapeAttribute(val))\""
-            }
-            let voidTags: Set<String> = [
-                "area", "base", "br", "col", "embed", "hr", "img",
-                "input", "link", "meta", "param", "source", "track", "wbr"
-            ]
-            if voidTags.contains(tag.lowercased()) {
-                return html + ">"
-            }
-            html += ">"
-            html += node.children.map(serializeHTML).joined()
-            html += "</\(tag)>"
-            return html
+    // §13.3 "serializing HTML fragments".
+
+    /// HTML void elements: no children serialised, no end tag.
+    private static let serializerVoidElements: Set<String> = [
+        "area", "base", "basefont", "bgsound", "br", "col", "embed", "frame", "hr",
+        "img", "input", "keygen", "link", "meta", "param", "source", "track", "wbr",
+    ]
+
+    /// Elements whose Text children are written verbatim (their content was
+    /// RAWTEXT / script data / PLAINTEXT to the parser). `noscript` joins them
+    /// only when scripting is enabled for the node.
+    private static let serializerRawTextParents: Set<String> = [
+        "style", "script", "xmp", "iframe", "noembed", "noframes", "plaintext",
+    ]
+
+    private static func isHTMLTemplate(_ node: DOMNode) -> Bool {
+        node.nodeType == .element && node.tagName == "template" && node.isHTMLNamespace
+    }
+
+    /// "Scripting is enabled for the node": its node document has a browsing
+    /// context. Nodes of a DOMParser / createHTMLDocument document and template
+    /// contents (an inert document) do not; everything else here belongs to
+    /// the page.
+    private func scriptingEnabled(for node: DOMNode) -> Bool {
+        var top = node
+        while let p = top.parent { top = p }
+        if top === root { return true }
+        if top.nodeType == .document { return false }
+        if top.nodeType == .documentFragment, !templateContent.isEmpty,
+           templateContent.values.contains(where: { $0 === top }) {
+            return false
+        }
+        return true
+    }
+
+    /// The children the serializer walks: a template's contents (its content
+    /// fragment, then anything the parser left on the element and
+    /// `templateFragment` has not migrated yet), otherwise the children.
+    private func serializationChildren(of node: DOMNode) -> [DOMNode] {
+        guard Self.isHTMLTemplate(node) else { return node.children }
+        if let fragment = templateContent[node.id] { return fragment.children + node.children }
+        return node.children
+    }
+
+    private func serializeChildren(of node: DOMNode, into out: inout String, scripting: Bool) {
+        var raw = false
+        if node.nodeType == .element, node.isHTMLNamespace, let tag = node.tagName {
+            raw = Self.serializerRawTextParents.contains(tag) || (scripting && tag == "noscript")
+        }
+        for child in serializationChildren(of: node) {
+            serializeNode(child, rawTextParent: raw, into: &out, scripting: scripting)
         }
     }
 
-    private static func escapeText(_ text: String) -> String {
-        text.replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: ">", with: "&gt;")
+    private func serializeNode(_ node: DOMNode, rawTextParent: Bool, into out: inout String, scripting: Bool) {
+        switch node.nodeType {
+        case .text:
+            let text = node.textContent ?? ""
+            if rawTextParent { out += text } else { Self.appendEscaped(text, attribute: false, into: &out) }
+        case .comment:
+            if node.isDocumentType {
+                out += "<!DOCTYPE "
+                out += node.doctypeName
+                out += ">"
+            } else {
+                out += "<!--"
+                out += node.textContent ?? ""
+                out += "-->"
+            }
+        case .document, .documentFragment:
+            serializeChildren(of: node, into: &out, scripting: scripting)
+        case .element:
+            guard let tag = node.tagName else { return }
+            out += "<"
+            out += tag
+            // Attribute order: this DOM keeps attributes in a dictionary, so
+            // they are written sorted by name (deterministic, not source order).
+            for (key, val) in node.enumerableAttributes.sorted(by: { $0.key < $1.key }) {
+                out += " "
+                out += key
+                out += "=\""
+                Self.appendEscaped(val, attribute: true, into: &out)
+                out += "\""
+            }
+            out += ">"
+            if node.isHTMLNamespace, Self.serializerVoidElements.contains(tag) { return }
+            serializeChildren(of: node, into: &out, scripting: scripting)
+            out += "</"
+            out += tag
+            out += ">"
+        }
     }
 
-    private static func escapeAttribute(_ text: String) -> String {
-        text.replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "\"", with: "&quot;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: ">", with: "&gt;")
+    /// §13.3 "escaping a string": `&` -> `&amp;`, U+00A0 -> `&nbsp;`; in text
+    /// `<`/`>` -> `&lt;`/`&gt;`; in attribute values `"` -> `&quot;` (and `<`/`>`
+    /// too, as current browsers do).
+    private static func appendEscaped(_ text: String, attribute: Bool, into out: inout String) {
+        var needs = false
+        for b in text.utf8 where b == 0x26 || b == 0x3C || b == 0x3E || b == 0xC2 || (attribute && b == 0x22) {
+            needs = true
+            break
+        }
+        guard needs else { out += text; return }
+        for scalar in text.unicodeScalars {
+            switch scalar {
+            case "&": out += "&amp;"
+            case "\u{A0}": out += "&nbsp;"
+            case "<": out += "&lt;"
+            case ">": out += "&gt;"
+            case "\"" where attribute: out += "&quot;"
+            default: out.unicodeScalars.append(scalar)
+            }
+        }
     }
 
     /// The HTML fragment parsing algorithm, run with `context` as the context
