@@ -308,6 +308,7 @@ struct JeffJSTestRunner {
             ("ArrayPushOverride", { $0.testArrayPushOverride() }),
             ("PlainCallThis", { $0.testPlainCallThis() }),
             ("ElementLangDir", { $0.testElementLangDir() }),
+            ("ParameterScope", { $0.testParameterScope() }),
         ]
     }
 

@@ -119,6 +119,24 @@ class JeffJSFunctionDefCompiler {
     // -- Function identity --
     var funcName: JSAtom = 0
     var hasSimpleParameterList: Bool = true
+    /// The formals contain an expression: a default (`b = 1`), a pattern with
+    /// a default or a computed key, or a rest pattern holding one
+    /// (ContainsExpression, ES §15.1.2). Such a function gets a separate
+    /// parameter environment (`paramScope`), see FunctionDeclarationInstantiation.
+    var hasParameterExpressions: Bool = false
+    /// Scope index of the parameter environment when `hasParameterExpressions`
+    /// (ES §10.2.11 steps 19-28), else -1. Every named parameter is a lexical
+    /// binding there, initialised left to right (TDZ for later parameters),
+    /// and so is the `arguments` object. Scope 0, the function body's var
+    /// environment, has it as parent: body code sees the parameters unless a
+    /// body `var` of the same name shadows them, which starts out with the
+    /// parameter's value (step 28.f.i.4). Parameter expressions resolve in the
+    /// parameter scope and never see the body's vars.
+    var paramScope: Int = -1
+    /// Local slot of the implicit `arguments` binding, or -1.
+    var argumentsVarIdx: Int = -1
+    /// A parameter (plain, rest or inside a pattern) is named `arguments`.
+    var paramNamedArguments: Bool = false
     var isDerivedClassConstructor: Bool = false
     /// Base-class constructor: run the instance field initializers before the
     /// body (a derived constructor runs them right after `super()` returns).
@@ -448,9 +466,11 @@ struct JeffJSCompiler {
         // TDZ: scope 0 (function body scope) has no enter_scope opcode,
         // so we must insert set_loc_uninitialized opcodes for lexical
         // variables in scope 0 at the beginning of the bytecode.
+        // The parameter scope (paramScope) has no enter_scope either: its
+        // parameters are in their TDZ from the start of the call.
         var scope0TdzBytes: [UInt8] = []
-        if fd.scopes.count > 0 {
-            var s0VarIdx = fd.scopes[0].first
+        for entryScope in [0, fd.paramScope] where entryScope >= 0 && entryScope < fd.scopes.count {
+            var s0VarIdx = fd.scopes[entryScope].first
             while s0VarIdx >= 0 && s0VarIdx < fd.vars.count {
                 if fd.vars[s0VarIdx].isLexical {
                     scope0TdzBytes.append(UInt8(truncatingIfNeeded: JeffJSOpcode.set_loc_uninitialized.rawValue))
@@ -1240,7 +1260,9 @@ struct JeffJSCompiler {
                                       scopeLevel: Int) -> (Int, JeffJSVarDef)? {
         // Walk scope chain from innermost to outermost
         var scope = scopeLevel
+        var reachedVarScope = false
         while scope >= 0 && scope < fd.scopes.count {
+            if scope == 0 { reachedVarScope = true }
             var varIdx = fd.scopes[scope].first
             while varIdx >= 0 && varIdx < fd.vars.count {
                 if fd.vars[varIdx].varName == name {
@@ -1250,6 +1272,9 @@ struct JeffJSCompiler {
             }
             scope = fd.scopes[scope].parent
         }
+        // A parameter expression (a chain rooted at the separate parameter
+        // scope, which is outside scope 0) never sees the body's `var`s.
+        if !reachedVarScope && fd.paramScope >= 0 { return nil }
         // Also check scope 0 variables that might not be in any scope chain.
         // Skip ALL lexically-scoped variables (let, const, catch, for-loop let).
         // These must only be found via their scope in the walk above. If the

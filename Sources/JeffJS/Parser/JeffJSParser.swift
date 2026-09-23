@@ -172,6 +172,14 @@ final class JeffJSParser {
     /// See emitFClosure / emitNamedEvaluation: bytecode offset just past the
     /// most recently emitted anonymous closure, or -1.
     var lastAnonClosureEnd: Int = -1
+    /// The function whose formal parameters are being bound (pattern replay
+    /// in emitParameterInitializers), or nil. A binding named `arguments`
+    /// declared for it is a parameter name (ES §10.2.11 step 17).
+    var parsingParametersOf: JeffJSFunctionDefCompiler? = nil
+    var parsingParameters: Bool {
+        get { parsingParametersOf != nil && parsingParametersOf === fd }
+        set { parsingParametersOf = newValue ? fd : nil }
+    }
 
     // -- Block environment stack (for break/continue) --
     var blockEnvs: [JeffJSBlockEnv] = []
@@ -539,6 +547,131 @@ final class JeffJSParser {
         let idx = fd.cpool.count
         fd.cpool.append(val)
         return idx
+    }
+
+    /// Open the separate parameter environment of a function whose formals
+    /// contain expressions (ES §10.2.11 steps 19-20, 28): a new scope,
+    /// outside scope 0, that becomes the parent of scope 0. The parameter
+    /// prologue is parsed in it; the body then continues in scope 0.
+    func openParameterScopeIfNeeded() {
+        guard fd.hasParameterExpressions, fd.paramScope < 0 else { return }
+        let idx = fd.scopes.count
+        var scope = JeffJSScopeDef()
+        scope.parent = -1
+        scope.first = -1
+        fd.scopes.append(scope)
+        fd.scopes[0].parent = idx
+        fd.paramScope = idx
+        fd.curScope = idx
+        // A named function expression's self binding is outside the
+        // parameters (its funcEnv is their parent), so parameter expressions
+        // must see it: move it from scope 0 to the tail of the parameter
+        // scope, where parameters (declared later, so earlier in the list)
+        // and body vars (scope 0, searched first from the body) shadow it.
+        let selfIdx = fd.funcNameVarIdx
+        if selfIdx >= 0 && selfIdx < fd.vars.count && fd.vars[selfIdx].scopeLevel == 0 {
+            if fd.scopes[0].first == selfIdx {
+                fd.scopes[0].first = fd.vars[selfIdx].scopeNext
+            } else {
+                var v = fd.scopes[0].first
+                while v >= 0 && v < fd.vars.count {
+                    if fd.vars[v].scopeNext == selfIdx {
+                        fd.vars[v].scopeNext = fd.vars[selfIdx].scopeNext
+                        break
+                    }
+                    v = fd.vars[v].scopeNext
+                }
+            }
+            fd.vars[selfIdx].scopeLevel = idx
+            fd.vars[selfIdx].scopeNext = -1
+            fd.scopes[idx].first = selfIdx
+        }
+    }
+
+    /// The parts of FunctionDeclarationInstantiation (ES §10.2.11) that need
+    /// the whole body, run once it is parsed:
+    ///
+    /// - Steps 15-18: no `arguments` object when a parameter is named
+    ///   `arguments`, or, without parameter expressions, when the body has a
+    ///   top-level function or lexical declaration of that name (a plain
+    ///   `var arguments` does not suppress it: it is the same binding). The
+    ///   implicit binding is renamed away so it resolves nowhere.
+    /// - Step 28: with a separate parameter scope, each body `var` (and
+    ///   top-level function) named like a parameter binding, `arguments`
+    ///   included, starts out with that binding's value. The copies go
+    ///   between the parameter prologue and the hoisted function
+    ///   declarations (step 36 then overwrites a function's binding).
+    func finishFunctionDeclarationInstantiation() {
+        let argumentsAtom = JSPredefinedAtom.arguments_.rawValue
+        let argIdx = fd.argumentsVarIdx
+        if argIdx >= 0 {
+            var suppress = fd.paramNamedArguments
+            if !suppress && fd.paramScope < 0 {
+                var v = fd.scopes[0].first
+                while v >= 0 && v < fd.vars.count {
+                    let vd = fd.vars[v]
+                    if v != argIdx && vd.varName == argumentsAtom &&
+                       (vd.isLexical || vd.varKind == JSVarKindEnum.JS_VAR_FUNCTION_DECL.rawValue) {
+                        suppress = true
+                        break
+                    }
+                    v = vd.scopeNext
+                }
+            }
+            if suppress {
+                fd.vars[argIdx].varName = JeffJSAtomID.JS_ATOM_NULL.rawValue
+                fd.argumentsVarIdx = -1
+                fd.argumentsProloguePos = -1
+            }
+        }
+
+        let paramScope = fd.paramScope
+        guard paramScope >= 0 else { return }
+        var paramNames = Set<JSAtom>()
+        var p = fd.scopes[paramScope].first
+        while p >= 0 && p < fd.vars.count {
+            if fd.vars[p].varName != 0 && p != fd.funcNameVarIdx { paramNames.insert(fd.vars[p].varName) }
+            p = fd.vars[p].scopeNext
+        }
+        var copied = Set<JSAtom>()
+        var copyNames: [JSAtom] = []
+        var v = fd.scopes[0].first
+        while v >= 0 && v < fd.vars.count {
+            let vd = fd.vars[v]
+            if !vd.isLexical && v != fd.funcNameVarIdx && paramNames.contains(vd.varName)
+                && !copied.contains(vd.varName) {
+                copied.insert(vd.varName)
+                copyNames.append(vd.varName)
+            }
+            v = vd.scopeNext
+        }
+        guard !copyNames.isEmpty else { return }
+        if copied.contains(argumentsAtom) { fd.usesArguments = true }
+        // Emit at the end, then move the bytes to the body start.
+        let start = fd.byteCode.len
+        let savedWith = fd.withVarStack
+        fd.withVarStack = []
+        for name in copyNames {
+            emitOp(.scope_get_var)
+            emitAtom(name)
+            emitU16(UInt16(paramScope))
+            emitOp(.scope_put_var)
+            emitAtom(name)
+            emitU16(0)
+        }
+        fd.withVarStack = savedWith
+        let bytes = Array(fd.byteCode.buf[start ..< fd.byteCode.len])
+        fd.byteCode.buf.removeSubrange(start ..< fd.byteCode.buf.count)
+        fd.byteCode.len = start
+        let pos = fd.bodyBytecodeStart
+        fd.byteCode.buf.insert(contentsOf: bytes, at: pos)
+        fd.byteCode.len += bytes.count
+        // The copies precede the hoisted declarations: body start moves past.
+        fd.bodyBytecodeStart += bytes.count
+        fd.hoistedFuncDeclRanges = fd.hoistedFuncDeclRanges.map {
+            ($0.0 >= pos ? $0.0 + bytes.count : $0.0,
+             $0.1 >= pos ? $0.1 + bytes.count : $0.1)
+        }
     }
 
     /// Insert the deferred mapped-arguments prologue at the position recorded
@@ -1168,6 +1301,9 @@ final class JeffJSParser {
     @discardableResult
     func defineVar(_ name: JSAtom, isConst: Bool = false, isLexical: Bool = false,
                    varKind: Int = JSVarKindEnum.JS_VAR_NORMAL.rawValue) -> Int {
+        if name == JSPredefinedAtom.arguments_.rawValue && parsingParameters {
+            fd.paramNamedArguments = true
+        }
         var vd = JeffJSVarDef()
         vd.varName = name
         vd.scopeLevel = fd.curScope
@@ -1209,14 +1345,22 @@ final class JeffJSParser {
             }
             return -1
         }
+        if name == JSPredefinedAtom.arguments_.rawValue && parsingParameters {
+            fd.paramNamedArguments = true
+        }
         // Not the named function expression's self-reference: that binding
-        // is outside the function's scopes, a body `var` shadows it.
+        // is outside the function's scopes, a body `var` shadows it. Nor a
+        // binding of a separate parameter scope: with parameter expressions
+        // a body `var` is its own binding, initialised from the parameter of
+        // the same name (finishFunctionDeclarationInstantiation).
+        let paramScope = fd.paramScope
         if let i = fd.vars.indices.first(where: {
             fd.vars[$0].varName == name && !fd.vars[$0].isLexical && $0 != fd.funcNameVarIdx
+                && (paramScope < 0 || fd.vars[$0].scopeLevel != paramScope)
         }) {
             return i
         }
-        if fd.args.contains(where: { $0.varName == name }) {
+        if paramScope < 0 && fd.args.contains(where: { $0.varName == name }) {
             return -1
         }
         // In the function's var scope (scope 0), not the block being parsed:
@@ -3292,7 +3436,7 @@ final class JeffJSParser {
                     var arg = JeffJSVarDef()
                     arg.varName = 0
                     childFd.args.append(arg)
-                    skipDestructuringPattern()
+                    if skipDestructuringPattern() { childFd.hasParameterExpressions = true }
                     savedDestructs.append(saved)
                 } else {
                     syntaxError("expected rest parameter name or pattern")
@@ -3324,11 +3468,12 @@ final class JeffJSParser {
                 childFd.args.append(arg)
 
                 // Skip the destructuring pattern
-                skipDestructuringPattern()
+                if skipDestructuringPattern() { childFd.hasParameterExpressions = true }
 
                 // Also skip a default value if present: ({x, y} = {x: 1, y: 2}).
                 // parseNestedDestructuringElement re-reads it on replay.
                 if tok == 0x3D { // '='
+                    childFd.hasParameterExpressions = true
                     if firstDefaultIndex == nil { firstDefaultIndex = paramCount }
                     next()
                     skipExpression()
@@ -3356,6 +3501,7 @@ final class JeffJSParser {
                 if tok == 0x3D { // '='
                     next()
                     childFd.hasSimpleParameterList = false
+                    childFd.hasParameterExpressions = true
                     if firstDefaultIndex == nil { firstDefaultIndex = paramCount }
 
                     // Save state AFTER consuming '=', before the default expression
@@ -3434,22 +3580,34 @@ final class JeffJSParser {
         // Building it unconditionally dominated the cost of every JS call.
         // The special_object bytecode is inserted at this offset after body
         // parsing — see the `usesArguments` block below.
-        if fd.argumentsAllowed {
-            let argumentsAtom = JSPredefinedAtom.arguments_.rawValue
+        //
+        // With parameter expressions the parameters, and `arguments`, live in
+        // a separate parameter scope (ES §10.2.11 step 20 onwards).
+        openParameterScopeIfNeeded()
+        let argumentsAtom = JSPredefinedAtom.arguments_.rawValue
+        // Step 15-18: a parameter named `arguments` means no arguments object.
+        if fd.args.contains(where: { $0.varName == argumentsAtom }) {
+            fd.paramNamedArguments = true
+        }
+        if fd.argumentsAllowed && !fd.paramNamedArguments {
             fd.hasArguments = true
-            _ = defineVar(argumentsAtom)
+            fd.argumentsVarIdx = defineVar(argumentsAtom)
             fd.argumentsProloguePos = fd.byteCode.len
             fd.argumentsPrologueScope = fd.curScope
         }
 
-        // -- Parameter initializers, left to right --
-        emitParameterInitializers(defaults: defaults, rest: rest, destructs: destructs)
-
         // A base-class constructor runs the instance field initializers
-        // before its own body (QuickJS emit_class_field_init).
+        // before its own body (QuickJS emit_class_field_init), and before
+        // its parameter initializers: [[Construct]] does
+        // InitializeInstanceElements before evaluating the body (ES §10.2.2
+        // step 6.b), so `constructor(a = this.f)` sees the field.
         if fd.emitFieldInitAtBodyStart {
             emitClassFieldInit()
         }
+
+        // -- Parameter initializers, left to right --
+        emitParameterInitializers(defaults: defaults, rest: rest, destructs: destructs)
+        fd.curScope = 0   // the body runs in the var environment
 
         // Mark body start for function declaration hoisting
         fd.bodyBytecodeStart = fd.byteCode.len
@@ -3457,6 +3615,8 @@ final class JeffJSParser {
         while tok != 0x7D && tok != JSTokenType.TOK_EOF.rawValue && !shouldAbort {
             parseSourceElement()
         }
+
+        finishFunctionDeclarationInstantiation()
 
         // Insert the deferred `arguments` prologue if the body referenced it.
         // Safe pre-resolveLabels: label addresses are re-derived by rescanning
@@ -3524,24 +3684,74 @@ final class JeffJSParser {
     ///                    when the argument is undefined>
     ///   ...name          rest i; <store name>
     ///   ...pattern       rest i; <pattern>
+    ///
+    /// With parameter expressions (`fd.paramScope >= 0`) every named
+    /// parameter is instead a lexical binding of the parameter scope,
+    /// initialised in that order, so an initializer that reads a later
+    /// parameter (or itself) throws ReferenceError (ES §10.2.11 step 26,
+    /// IteratorBindingInitialization with environment = the parameter env):
+    ///
+    ///   name             get_arg i; scope_put_var_init name
+    ///   name = expr      get_arg i; dup; undefined; strict_eq; if_false L;
+    ///                    drop; <expr>; L: scope_put_var_init name
+    ///   pattern / rest   as above, binding lexically in the parameter scope
     func emitParameterInitializers(defaults: [JeffJSSavedDefaultParam],
                                    rest: JeffJSRestParamInfo?,
                                    destructs: [JeffJSSavedDestructParam]) {
         enum Step {
+            case plain(Int, JSAtom)
             case initializer(JeffJSSavedDefaultParam)
             case pattern(JeffJSSavedDestructParam)
             case restName(JeffJSRestParamInfo)
         }
+        let paramScope = fd.paramScope
         var steps: [(index: Int, step: Step)] = []
         steps.reserveCapacity(defaults.count + destructs.count + 1)
         for d in defaults { steps.append((d.argIndex, .initializer(d))) }
         for d in destructs { steps.append((d.argIndex, .pattern(d))) }
         if let r = rest { steps.append((r.argIndex, .restName(r))) }
+        if paramScope >= 0 {
+            let owned = Set(steps.map { $0.index })
+            for (i, a) in fd.args.enumerated() where a.varName != 0 && !owned.contains(i) {
+                steps.append((i, .plain(i, a.varName)))
+            }
+        }
         // Each formal owns one index, so the order is total.
         steps.sort { $0.index < $1.index }
 
+        // Names bound inside patterns are only seen on replay; note one
+        // called `arguments` (step 17-18) as it is declared.
+        let savedParsingParameters = parsingParameters
+        parsingParameters = true
+        defer { parsingParameters = savedParsingParameters }
+
         for (_, step) in steps {
             switch step {
+            case .plain(let argIndex, let name):
+                emitOp(.get_arg)
+                emitU16(UInt16(argIndex))
+                defineVar(name, isLexical: true)
+                emitScopePutVarInit(name, scopeLevel: paramScope)
+
+            case .initializer(let dflt) where paramScope >= 0:
+                let endLabel = newLabel()
+                emitOp(.get_arg)
+                emitU16(UInt16(dflt.argIndex))
+                emitOp(.dup)
+                emitOp(.undefined)
+                emitOp(.strict_eq)
+                emitIfFalse(endLabel) // not undefined: keep the argument
+                emitOp(.drop)
+                replayParameterTokens(bufPtr: dflt.bufPtr, lineNum: dflt.lineNum, token: dflt.token,
+                                      gotLF: dflt.gotLF, lastLineNum: dflt.lastLineNum,
+                                      lastPtr: dflt.lastPtr, templateNestLevel: dflt.templateNestLevel) {
+                    parseAssignExpr()
+                    emitNamedEvaluation(dflt.paramName)
+                }
+                emitLabel(endLabel)
+                defineVar(dflt.paramName, isLexical: true)
+                emitScopePutVarInit(dflt.paramName, scopeLevel: paramScope)
+
             case .initializer(let dflt):
                 let endLabel = newLabel()
                 emitOp(.get_arg)
@@ -3553,6 +3763,7 @@ final class JeffJSParser {
                                       gotLF: dflt.gotLF, lastLineNum: dflt.lastLineNum,
                                       lastPtr: dflt.lastPtr, templateNestLevel: dflt.templateNestLevel) {
                     parseAssignExpr()
+                    emitNamedEvaluation(dflt.paramName)
                 }
                 emitOp(.put_arg)
                 emitU16(UInt16(dflt.argIndex))
@@ -3568,12 +3779,14 @@ final class JeffJSParser {
                 replayParameterTokens(bufPtr: dp.bufPtr, lineNum: dp.lineNum, token: dp.token,
                                       gotLF: dp.gotLF, lastLineNum: dp.lastLineNum,
                                       lastPtr: dp.lastPtr, templateNestLevel: dp.templateNestLevel) {
+                    // In a parameter scope the names are lexical there.
+                    let lexical = paramScope >= 0
                     if dp.isRest {
-                        parseDestructuringBinding(kind: .binding)
+                        parseDestructuringBinding(kind: .binding, isLexical: lexical)
                     } else {
                         // Pattern plus its optional `= initializer`, which
                         // replaces the argument when that is undefined.
-                        parseNestedDestructuringElement(kind: .binding, isLexical: false, isConst: false)
+                        parseNestedDestructuringElement(kind: .binding, isLexical: lexical, isConst: false)
                     }
                 }
 
@@ -3582,7 +3795,7 @@ final class JeffJSParser {
                 // at argIndex; bind it to the rest parameter's name.
                 emitOp(.rest)
                 emitU16(UInt16(restInfo.argIndex))
-                _ = defineVar(restInfo.paramName)
+                _ = defineVar(restInfo.paramName, isLexical: paramScope >= 0)
                 emitScopePutVarInit(restInfo.paramName, scopeLevel: fd.curScope)
             }
         }
@@ -3607,13 +3820,18 @@ final class JeffJSParser {
         fd = childFd
 
         // -- Parameter initializers, left to right --
+        openParameterScopeIfNeeded()
         emitParameterInitializers(defaults: defaults, rest: rest, destructs: destructs)
+        fd.curScope = 0   // the body runs in the var environment
+        // Hoisted function declarations go after the parameter prologue.
+        fd.bodyBytecodeStart = fd.byteCode.len
 
         if tok == 0x7B { // '{' -- block body
             next()
             while tok != 0x7D && tok != JSTokenType.TOK_EOF.rawValue && !shouldAbort {
                 parseSourceElement()
             }
+            finishFunctionDeclarationInstantiation()
             if isAsync {
                 emitOp(.undefined)
                 emitOp(.return_async)
@@ -3647,13 +3865,30 @@ final class JeffJSParser {
     }
 
     /// Skip a destructuring pattern without emitting bytecode (for parameters).
-    func skipDestructuringPattern() {
+    /// Returns true when the pattern may contain an expression (ES §15.1.2
+    /// ContainsExpression): an `=` default anywhere, or a `[` directly inside
+    /// an object pattern (a computed key; a nested array pattern as a
+    /// property value is counted too, which only costs the separate
+    /// parameter environment, never correctness).
+    @discardableResult
+    func skipDestructuringPattern() -> Bool {
         var depth = 0
+        var openers: [Int] = []
+        var containsExpression = false
         repeat {
-            if tok == 0x7B || tok == 0x5B { depth += 1 }
-            if tok == 0x7D || tok == 0x5D { depth -= 1 }
+            if tok == 0x3D { containsExpression = true }
+            if tok == 0x7B || tok == 0x5B {
+                if tok == 0x5B && openers.last == 0x7B { containsExpression = true }
+                openers.append(tok)
+                depth += 1
+            }
+            if tok == 0x7D || tok == 0x5D {
+                depth -= 1
+                if !openers.isEmpty { openers.removeLast() }
+            }
             next()
         } while depth > 0 && tok != JSTokenType.TOK_EOF.rawValue && !shouldAbort
+        return containsExpression
     }
 
     /// Skip an expression without emitting bytecode (for default parameter values).
@@ -5267,6 +5502,9 @@ final class JeffJSParser {
 
         if !defaults.isEmpty || rest != nil {
             childFd.hasSimpleParameterList = false
+        }
+        if !defaults.isEmpty {
+            childFd.hasParameterExpressions = true
         }
 
         for atom in paramAtoms {
