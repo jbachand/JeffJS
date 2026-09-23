@@ -132,9 +132,13 @@ final class JeffJSWebSocketBridge {
                     }
                     self.receiveLoop(id: id)
                 case .failure(let error):
+                    // Two calls with the same table value: hold it across both
+                    // (the error handler may close every socket).
+                    cb.dupValue()
                     self.fireCallback(ctx: ctx, cb: cb, type: "error", data: error.localizedDescription, code: nil, reason: nil)
                     self.fireCallback(ctx: ctx, cb: cb, type: "close", data: nil, code: 1006, reason: error.localizedDescription)
                     self.cleanup(id: id)
+                    cb.freeValue()
                 }
             }
         }
@@ -186,8 +190,14 @@ final class JeffJSWebSocketBridge {
         let dataArg = data.map { ctx.newStringValue($0) } ?? JeffJSValue.null
         let codeArg = code.map { JeffJSValue.newInt32(Int32($0)) } ?? JeffJSValue.null
         let reasonArg = reason.map { ctx.newStringValue($0) } ?? JeffJSValue.null
-        _ = ctx.call(cb, this: JeffJSValue.undefined,
-                     args: [typeArg, dataArg, codeArg, reasonArg])
+        // `cb` is borrowed from `callbacks`, which cleanup(id)/closeAll()
+        // release: call retained so the running callback outlives that.
+        let result = ctx.callRetained(cb, this: JeffJSValue.undefined,
+                                      args: [typeArg, dataArg, codeArg, reasonArg])
+        result.freeValue()
+        typeArg.freeValue()
+        dataArg.freeValue()
+        reasonArg.freeValue()
         _ = ctx.rt.executePendingJobs()
     }
 

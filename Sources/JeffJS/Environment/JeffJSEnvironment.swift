@@ -718,11 +718,14 @@ public final class JeffJSEnvironment {
         timer.schedule(deadline: .now() + .milliseconds(Int(interval)),
                        repeating: .milliseconds(Int(interval)))
         timer.setEventHandler { [weak self] in
-            guard let self, let cb = self.timerCallbacks[id] else { return }
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                // Look the callback up when the task runs, not when the timer
+                // fired: a clearInterval in between has already released it.
+                guard let self, let cb = self.timerCallbacks[id] else { return }
                 JeffJSGCObjectHeader.activeRuntime = self.context.rt
-                let result = self.context.call(cb, this: .undefined, args: [])
+                // The table holds the only reference, and clearInterval(id)
+                // inside the callback releases it: the call holds its own.
+                let result = self.context.callRetained(cb, this: .undefined, args: [])
                 result.freeValue()
                 self.drainJobs()
             }

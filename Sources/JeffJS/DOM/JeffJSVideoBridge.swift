@@ -212,8 +212,12 @@ final class JeffJSVideoBridge {
             let callback = args.count > 1 ? args[1] : JeffJSValue.undefined
             guard !callback.isUndefined && !callback.isNull else { return JeffJSValue.undefined }
 
+            // Replacing a registration releases the previous callback (it
+            // leaked); a callback re-registering from inside itself is safe
+            // because fireEventCallback holds its own reference for the call.
             let duped = callback.dupValue()
-            self.eventCallbacks[idStr] = duped
+            let previous = self.eventCallbacks.updateValue(duped, forKey: idStr)
+            previous?.freeValue()
 
             self.provider?.setEventCallback(nodeID: nodeID) { [weak self] eventName, detail in
                 Task { @MainActor [weak self] in
@@ -228,7 +232,9 @@ final class JeffJSVideoBridge {
 
     // MARK: - Event Dispatch
 
-    private func fireEventCallback(nodeIDStr: String, eventName: String, detail: [String: Any]) {
+    /// Delivers one media event to the node's registered callback. Internal
+    /// (not private) so the conformance suite can drive it without a player.
+    func fireEventCallback(nodeIDStr: String, eventName: String, detail: [String: Any]) {
         guard let ctx, let cb = eventCallbacks[nodeIDStr] else { return }
         let nameArg = ctx.newStringValue(eventName)
         let detailObj = ctx.newPlainObject()
@@ -241,7 +247,12 @@ final class JeffJSVideoBridge {
                 ctx.setPropertyStr(obj: detailObj, name: key, value: b ? .JS_TRUE : .JS_FALSE)
             }
         }
-        _ = ctx.call(cb, this: JeffJSValue.undefined, args: [nameArg, detailObj])
+        // `cb` is borrowed from the registration table, which the callback
+        // can replace (registerEventCallback) while it runs: call retained.
+        let result = ctx.callRetained(cb, this: JeffJSValue.undefined, args: [nameArg, detailObj])
+        result.freeValue()
+        nameArg.freeValue()
+        detailObj.freeValue()
         _ = ctx.rt.executePendingJobs()
     }
 

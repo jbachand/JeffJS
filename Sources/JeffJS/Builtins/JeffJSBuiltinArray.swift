@@ -649,7 +649,11 @@ struct JeffJSBuiltinArray {
             }
         }
 
-        if sortError { return .exception }
+        if sortError {
+            // The collected elements are owned (they were leaked on a throw).
+            for el in elements { el.value.freeValue() }
+            return .exception
+        }
 
         // Write back sorted elements
         var writeIdx: Int64 = 0

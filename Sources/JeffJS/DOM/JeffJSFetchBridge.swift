@@ -392,7 +392,9 @@ final class JeffJSFetchBridge {
 
     /// Invoke a JS callback and check for exceptions.
     private func invokeCallback(ctx: JeffJSContext, cb: JeffJSValue, args: [JeffJSValue], label: String) {
-        let result = ctx.call(cb, this: .undefined, args: args)
+        // `cb` is borrowed from storedCallbacks, which cancelAll() (navigation
+        // teardown, reachable from the callback) releases: call retained.
+        let result = ctx.callRetained(cb, this: .undefined, args: args)
         if result.isException {
             let exc = ctx.getException()
             let errMsg = ctx.toSwiftString(exc) ?? "unknown"

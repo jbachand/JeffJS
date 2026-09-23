@@ -275,4 +275,26 @@ final class RefcountLeakTests: XCTestCase {
         XCTAssertFalse(alive.toBool(), "the prototype outlived its 100 000 instances")
         alive.freeValue()
     }
+
+    // MARK: - Retained native -> JS calls (JeffJSContext.callRetained)
+
+    func testRetainedCallbackSitesDoNotLeak() {
+        // The call holds its own references to the function, receiver and
+        // arguments and must give every one back.
+        assertFlat("getter call",
+                   "var o={ get x(){ return {} } }; for (var i=0;i<$N;i++){ var v=o.x; v=null; }")
+        assertFlat("inherited setter call",
+                   "var p={ set x(v){ this._x=v } }; var o=Object.create(p); for (var i=0;i<$N;i++){ o.x={}; }")
+        assertFlat("getter that deletes itself",
+                   "for (var i=0;i<$N;i++){ var o={ get x(){ delete this.x; return 1 } }; o.x; o=null; }")
+        assertFlat("Map.forEach",
+                   "var m=new Map([[{},{}],[{},{}]]); for (var i=0;i<$N/10;i++){ m.forEach(function(v,k){ return {} }); }")
+        assertFlat("Map.forEach deleting its entry",
+                   "for (var i=0;i<$N/10;i++){ var m=new Map([[{},{}]]); m.forEach(function(v,k){ m.delete(k) }); m=null; }")
+        // Revocation keeps target and handler until the proxy dies.
+        assertFlat("revoked proxies",
+                   "for (var i=0;i<$N/10;i++){ var r=Proxy.revocable({}, {get:function(){ r.revoke(); return 1 }}); r.proxy.x; r=null; }")
+        assertFlat("sort comparator that throws",
+                   "var a=[{},{},{}]; for (var i=0;i<$N/10;i++){ try { a.sort(function(){ throw 0 }) } catch(e){} }")
+    }
 }

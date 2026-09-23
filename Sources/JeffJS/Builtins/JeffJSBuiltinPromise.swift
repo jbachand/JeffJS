@@ -821,10 +821,13 @@ struct JeffJSBuiltinPromise {
             let onFinally = onFinallyRef.value
             let callResult = c.callFunction(func_: onFinally, this: .undefined, args: [])
             if callResult.isException { return callResult }
-            c.freeValue(callResult)
 
-            // Return Promise.resolve(callResult).then(() => value)
+            // Return Promise.resolve(callResult).then(() => value). The call
+            // result is released after Promise.resolve borrowed it (it was
+            // released first, so a promise returned by onFinally was freed
+            // before it was adopted).
             let resolved = JeffJSBuiltinPromise.resolve(ctx: c, this: ctorToUse, args: [callResult])
+            c.freeValue(callResult)
             if resolved.isException { return resolved }
 
             let returnValue = value.dupValue()
@@ -844,9 +847,9 @@ struct JeffJSBuiltinPromise {
             let onFinally = onFinallyRef.value
             let callResult = c.callFunction(func_: onFinally, this: .undefined, args: [])
             if callResult.isException { return callResult }
-            c.freeValue(callResult)
 
             let resolved = JeffJSBuiltinPromise.resolve(ctx: c, this: ctorToUse, args: [callResult])
+            c.freeValue(callResult)   // after Promise.resolve borrowed it (see thenFinally)
             if resolved.isException { return resolved }
 
             let thrownReason = reason.dupValue()

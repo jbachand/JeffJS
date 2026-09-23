@@ -300,6 +300,7 @@ struct JeffJSTestRunner {
             ("AssignmentPatterns", { $0.testAssignmentPatterns() }),
             ("IteratorClose", { $0.testIteratorClose() }),
             ("FreedValueTouches", { $0.testFreedValueTouches() }),
+            ("CallbackRetention", { $0.testCallbackRetention() }),
             ("HTMLParsing", { $0.testHTMLParsing() }),
             ("DOMBridgeRung15", { $0.testDOMBridgeRung15() }),
             ("DOMScriptPrepare", { $0.testDOMScriptPrepare() }),

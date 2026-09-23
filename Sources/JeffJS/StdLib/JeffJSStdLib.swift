@@ -639,13 +639,20 @@ struct JeffJSStdLib {
         for id in timerIDs {
             guard let entry = state.timers[id], !entry.cancelled else { continue }
             if entry.fireTime <= now {
-                // Fire the callback
-                _ = ctx.call(entry.callback, thisArg: .undefined, args: entry.args)
+                // Fire the callback. The entry's references are the only ones:
+                // clearTimeout/clearInterval(id) from inside the callback
+                // releases them (cancelTimer), so the call holds its own.
+                let result = ctx.callRetained(entry.callback, this: .undefined, args: entry.args)
+                result.freeValue()
                 // Drain microtask queue so Promise reactions fire immediately
                 _ = ctx.rt.executePendingJobs()
                 fired += 1
 
-                if entry.isInterval && !entry.cancelled {
+                if entry.cancelled {
+                    // Cancelled from inside the callback: cancelTimer already
+                    // released the callback and args and removed the entry
+                    // (releasing them again here was a double free).
+                } else if entry.isInterval {
                     // Reschedule
                     entry.fireTime = now + (entry.interval / 1000.0)
                 } else {
@@ -1579,7 +1586,11 @@ struct JeffJSStdLib {
         // Enqueue as a job on the context's job queue
         let duped = callback.dupValue()
         ctx.rt.enqueueJob(ctx: ctx, jobFunc: { ctx, _, _ in
-            return ctx.call(duped, thisArg: .undefined, args: [])
+            // The job owns the callback (a job runs once): release it after
+            // the call — it was never released.
+            let r = ctx.call(duped, thisArg: .undefined, args: [])
+            duped.freeValue()
+            return r
         }, args: [])
         return .undefined
     }

@@ -630,19 +630,23 @@ func js_map_forEach(_ ctx: JeffJSContext,
 
     // Iterate in insertion order. We walk the record array, skipping empties.
     // We must tolerate additions/deletions during iteration.
+    // The key and value are borrowed from the record, which the callback may
+    // delete (or clear) while it runs — that releases them, so the call holds
+    // its own references (QuickJS js_map_forEach dups them for this reason).
     var i = 0
     while i < s.records.count {
         let rec = s.records[i]
         if !rec.empty {
+            let result: JeffJSValue
             if baseMagic == MAGIC_SET {
                 // callback(value, value, set) — per spec, Set forEach passes (value, value, set)
-                let result = ctx.callFunction(callback, thisVal: thisArg, args: [rec.key, rec.key, thisVal])
-                if result.isException { return .exception }
+                result = ctx.callRetained(callback, this: thisArg, args: [rec.key, rec.key, thisVal])
             } else {
                 // callback(value, key, map) — per spec, Map forEach passes (value, key, map)
-                let result = ctx.callFunction(callback, thisVal: thisArg, args: [rec.value, rec.key, thisVal])
-                if result.isException { return .exception }
+                result = ctx.callRetained(callback, this: thisArg, args: [rec.value, rec.key, thisVal])
             }
+            if result.isException { return .exception }
+            result.freeValue()
         }
         i += 1
     }

@@ -1106,7 +1106,7 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     // "Pattern ownership" in JeffJSBuiltinRegExp.swift).
     if case .regexp(let pattern, _) = savedPayload { js_regexp_releasePattern(pattern) }
     // A proxy owns its target and handler (dup'd by createProxyObject;
-    // revocation frees them and leaves undefined behind).
+    // revocation only sets isRevoked, so they are released here).
     if case .proxyData(let pd) = savedPayload {
         freeValue(rt, pd.target)
         freeValue(rt, pd.handler)

@@ -2323,11 +2323,12 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                       case .proxyData(var pd) = proxyObj.payload else {
                     return .JS_UNDEFINED
                 }
+                // Only mark it revoked: target and handler stay owned until
+                // the proxy is finalized. A trap that revokes its own proxy is
+                // still running with the handler as `this` and the target as
+                // an argument, both borrowed from here (QuickJS
+                // js_proxy_revoke keeps them for the same reason).
                 if !pd.isRevoked {
-                    pd.target.freeValue()
-                    pd.handler.freeValue()
-                    pd.target = .undefined
-                    pd.handler = .undefined
                     pd.isRevoked = true
                     proxyObj.payload = .proxyData(pd)
                 }
@@ -4657,8 +4658,11 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             if let e = jsObj.extra(at: ownIdx) {
                 // Accessor property — call the getter
                 if e.kind == .getset, let getterObj = e.getter {
+                    // The slot's reference is borrowed: a getter that
+                    // redefines or deletes its own property frees it mid-call
+                    // (QuickJS dups the getter here for the same reason).
                     let getterVal = JeffJSValue.makeObject(getterObj)
-                    return callFunction(getterVal, thisVal: receiver, args: [])
+                    return callRetainingFunction(getterVal, this: receiver, args: [])
                 }
                 // Mapped arguments: the slot aliases a live parameter.
                 if e.kind == .varRef, let vr = e.varRef {
@@ -4711,8 +4715,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             if pIdx >= 0, p.shape != nil, pIdx < p.propValues.count {
                 if let e = p.extra(at: pIdx) {
                     if e.kind == .getset, let getterObj = e.getter {
+                        // Borrowed from the prototype's slot: see the own-
+                        // property branch above.
                         let getterVal = JeffJSValue.makeObject(getterObj)
-                        return callFunction(getterVal, thisVal: receiver, args: [])
+                        return callRetainingFunction(getterVal, this: receiver, args: [])
                     }
                     return .JS_UNDEFINED
                 }
@@ -4899,8 +4905,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                     // setter's return value. It released neither, so every
                     // `o.s = {…}` on an accessor property — including the
                     // `__proto__` setter — left one permanent reference on the
-                    // object assigned.
-                    let result = callFunction(setterVal, thisVal: obj, args: [value])
+                    // object assigned. The setter itself is borrowed from the
+                    // slot, which it may redefine while it runs: call retained.
+                    let result = callRetainingFunction(setterVal, this: obj, args: [value])
                     value.freeValue()
                     result.freeValue()
                     if result.isException { return -1 }
@@ -4940,7 +4947,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                     if let e = p.extra(at: pIdx), e.kind == .getset, let setterObj = e.setter {
                         let setterVal = JeffJSValue.makeObject(setterObj)
                         // Same ownership as the own-accessor branch above.
-                        let result = callFunction(setterVal, thisVal: obj, args: [value])
+                        let result = callRetainingFunction(setterVal, this: obj, args: [value])
                         value.freeValue()
                         result.freeValue()
                         if result.isException { return -1 }
@@ -5590,6 +5597,45 @@ extension JeffJSContext {
         // Dispatch to the full callFunction path which handles both
         // C functions and bytecode functions (arrow functions, closures, etc.)
         return callFunction(fn, thisVal: thisVal, args: args)
+    }
+
+    /// Calls `fn` while holding this call's own reference to the function,
+    /// the receiver and every argument, released when the call returns.
+    ///
+    /// `callFunction` borrows all of them (QuickJS `JS_Call`; the Round-9
+    /// convention): the caller's references must outlive the call. That holds
+    /// for values on the interpreter stack, owned lookups (`getProperty*`) and
+    /// a builtin's own arguments, but not for a value native code reads out of
+    /// storage the callee can change while it runs — a callback table that
+    /// `clearInterval` / re-registration frees from inside the callback, an
+    /// accessor slot the getter or setter redefines, a Map record the
+    /// `forEach` callback deletes. There the callee's own function object
+    /// (with its closure variables) or its arguments would be freed mid-call,
+    /// and the next closure read sees `undefined` or a recycled object. Those
+    /// sites call through here instead of `call`/`callFunction`.
+    func callRetained(_ fn: JeffJSValue, this thisVal: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        fn.dupValue()
+        thisVal.dupValue()
+        for a in args { a.dupValue() }
+        let result = callFunction(fn, thisVal: thisVal, args: args)
+        for a in args { a.freeValue() }
+        thisVal.freeValue()
+        fn.freeValue()
+        return result
+    }
+
+    /// `callRetained` for accessor calls, which only need the function
+    /// pinned: the getter / setter is borrowed from the property slot it may
+    /// redefine or delete, while the receiver and the setter's value are owned
+    /// by the caller for the whole call (QuickJS dups just the function in
+    /// JS_GetPropertyInternal / call_setter). Inline refcount paths: this sits
+    /// on every accessor read and write.
+    @inline(__always)
+    func callRetainingFunction(_ fn: JeffJSValue, this thisVal: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        fn.dupValueFast()
+        let result = callFunction(fn, thisVal: thisVal, args: args)
+        fn.freeValueFast()
+        return result
     }
 
     func callMethod(_ obj: JeffJSValue, name: String, args: [JeffJSValue]) -> JeffJSValue {

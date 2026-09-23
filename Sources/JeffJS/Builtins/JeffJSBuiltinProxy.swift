@@ -196,7 +196,10 @@ func js_proxy_revoke_func(_ ctx: JeffJSContext,
         return .undefined
     }
 
-    // Revoke: set is_revoked on the proxy, release target and handler.
+    // Revoke: set is_revoked on the proxy. Target and handler stay owned
+    // until the proxy is finalized: a trap that revokes its own proxy is still
+    // running with them borrowed as `this` and an argument (QuickJS
+    // js_proxy_revoke keeps them for the same reason).
     guard let proxyObj = data.proxyValue.toObject(),
           proxyObj.classID == JeffJSClassID.proxy.rawValue,
           case .proxyData(var pd) = proxyObj.payload else {
@@ -204,10 +207,6 @@ func js_proxy_revoke_func(_ ctx: JeffJSContext,
     }
 
     if !pd.isRevoked {
-        pd.target.freeValue()
-        pd.handler.freeValue()
-        pd.target = .undefined
-        pd.handler = .undefined
         pd.isRevoked = true
         proxyObj.payload = .proxyData(pd)
     }
