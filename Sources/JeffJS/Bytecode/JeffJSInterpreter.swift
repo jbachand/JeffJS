@@ -782,8 +782,10 @@ extension JeffJSContext {
             _ = throwSyntaxError(message: "'super' keyword unexpected here")
             return .exception
         case .varObject:
-            // Variable environment object for `with` statement
-            return newObject()
+            // Variable object of a sloppy function with a direct eval: holds
+            // the eval code's `var`/function declarations. No prototype, so
+            // `x in varObj` sees only declared names.
+            return newObjectProto(proto: .null)
         case .importMeta:
             // import.meta -- return a basic object for now
             return newObject()
@@ -1379,25 +1381,109 @@ extension JeffJSContext {
         }
     }
 
-    // MARK: - Eval / Import Stubs
+    // MARK: - Direct eval
 
-    /// Direct eval (called from within bytecode).
-    /// Note: direct eval should use the calling scope's variable environment,
-    /// but currently uses global scope. The `scope` parameter is reserved for
-    /// future per-scope eval support.
-    ///
-    /// KNOWN LIMITATION: This should use JS_EVAL_TYPE_DIRECT to inherit the
-    /// calling scope's variable environment (let/const bindings, closures,
-    /// etc.), but currently uses JS_EVAL_TYPE_GLOBAL. Fixing this requires
-    /// passing the caller's scope chain into the eval compilation, which is
-    /// not yet implemented. As a result, direct eval cannot see local
-    /// variables from the enclosing function scope.
-    func evalDirect(args: [JeffJSValue], scope: Int, frame: JeffJSStackFrame) -> JeffJSValue {
-        guard let arg0 = args.first, arg0.isString, let str = arg0.stringValue else {
-            return args.first ?? .undefined
+    /// `eval(...)` in call position (the `eval` / `apply_eval` opcodes).
+    /// When the callee is this realm's %eval% it is a direct eval (ES
+    /// §19.2.1.1 PerformEval with direct = true): the code runs in the
+    /// caller's scope, with the caller's `this`, `new.target` and home
+    /// object. Any other callee (a shadowing local `eval`, a replaced
+    /// `window.eval`) is an ordinary call. Borrows every argument.
+    func directEvalOrCall(funcVal: JeffJSValue, thisVal: JeffJSValue, args: [JeffJSValue],
+                          callerFB: JeffJSFunctionBytecode, site: Int,
+                          frame: JeffJSStackFrame) -> JeffJSValue {
+        guard let fo = funcVal.toObject(), let eo = evalObj.toObject(), fo === eo else {
+            return callFunction(funcVal, thisVal: thisVal, args: args)
         }
-        // TODO: Use JS_EVAL_TYPE_DIRECT with scope chain access once implemented.
-        return eval(input: str.toSwiftString(), filename: "<eval>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+        guard let arg0 = args.first else { return .undefined }
+        guard arg0.isString, let str = arg0.stringValue else { return arg0.dupValue() }
+        guard let sites = callerFB.evalSites, site < sites.count else {
+            // Bytecode without call-site records: global semantics.
+            return eval(input: str.toSwiftString(), filename: "<eval>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+        }
+        return performDirectEval(source: str.toSwiftString(), site: sites[site],
+                                 callerFB: callerFB, frame: frame)
+    }
+
+    /// Compile `source` against the call site's bindings (see
+    /// JeffJSEvalSite) and run it as a closure of the caller's frame.
+    private func performDirectEval(source: String, site: JeffJSEvalSite,
+                                   callerFB: JeffJSFunctionBytecode,
+                                   frame: JeffJSStackFrame) -> JeffJSValue {
+        if rt.checkStackOverflow() {
+            return throwInternalError(message: "Maximum call stack size exceeded")
+        }
+        let parseState = JeffJSParseState(source: source, filename: "<eval>", ctx: self)
+        parseState.allowHTMLComments = true
+        let fd = JeffJSFunctionDefCompiler()
+        fd.filename = rt.findAtom("<eval>")
+        fd.source = source
+        fd.sourceText = JeffJSSourceText(bytes: parseState.buf)
+        fd.sourceStart = 0
+        fd.sourceEnd = parseState.buf.count
+        fd.isDirectOrIndirectEval = true
+        fd.evalSite = site
+        if site.isStrict { fd.jsMode = JS_MODE_STRICT }
+        let parser = JeffJSParser(s: parseState, fd: fd)
+        parser.parseProgram()
+        if parser.hasError || fd.byteCode.error {
+            return throwSyntaxError(message: parseState.lastErrorMessage ?? "Parse error in eval code")
+        }
+        if fd.byteCode.len == 0 { return .undefined }
+        guard let fb = JeffJSCompiler.createFunction(ctx: self, fd: fd) else {
+            if !rt.currentException.isNull && !rt.currentException.isUndefined { return .exception }
+            return throwInternalError(message: "Compilation failed for eval code")
+        }
+
+        // The eval code's closure vars name slots of the caller's frame
+        // (isLocal) or the caller's own var_refs, exactly like a function
+        // literal in the caller (createClosure).
+        let obj = JeffJSObject()
+        obj.classID = JeffJSClassID.bytecodeFunction.rawValue
+        obj.extensible = true
+        var callerRefs: [JeffJSVarRef?] = []
+        var home: JeffJSObject? = nil
+        if let co = frame.curFunc.toObject() {
+            callerRefs = co.varRefsFast
+            if case .bytecodeFunc(_, _, let h) = co.payload { home = h }
+        }
+        var refs: [JeffJSVarRef?] = []
+        refs.reserveCapacity(fb.closureVarsList.count)
+        for cv in fb.closureVarsList {
+            guard cv.isLocal else {
+                refs.append(cv.varIdx < callerRefs.count ? callerRefs[cv.varIdx] : nil)
+                continue
+            }
+            if let vr = frame.liveVarRefs.first(where: {
+                $0.isArg == cv.isArg && $0.varIdx == UInt16(cv.varIdx) && !$0.isDetached }) {
+                refs.append(vr)
+                continue
+            }
+            let vr = JeffJSVarRef(isDetached: false, isArg: cv.isArg,
+                                  varIdx: UInt16(cv.varIdx), parentFrame: frame)
+            if !callerFB.isGenerator, !callerFB.isAsyncFunc, let b = frame.buf {
+                if cv.isArg {
+                    if cv.varIdx < frame.bufVarBase { vr.slot = b + cv.varIdx }
+                } else {
+                    vr.slot = b + frame.bufVarBase + cv.varIdx
+                }
+            }
+            frame.liveVarRefs.append(vr)
+            frame.hasLiveVarRefs = true
+            refs.append(vr)
+        }
+        obj.payload = .bytecodeFunc(functionBytecode: fb, varRefs: refs, homeObject: home)
+        obj.fbFast = fb
+        obj.varRefsFast = refs
+        let proto = functionProto.toObject()
+        obj.shape = jeffJS_rootShape(self, proto: proto)
+        obj.proto = proto
+        let funcVal = JeffJSValue.makeObject(obj)
+        let result = JeffJSInterpreter.callInternal(ctx: self, funcObj: funcVal,
+                                                    thisVal: frame.thisVal, args: [],
+                                                    newTarget: frame.newTarget)
+        funcVal.freeValue()
+        return result
     }
 
     /// Creates a new RegExp object.
@@ -6547,9 +6633,9 @@ struct JeffJSInterpreter {
         if fb0.isArrow, let arrowThis = obj.arrowThisVal {
             frame.thisVal = arrowThis
         }
-        // new.target (borrowed from the constructor call site; releaseFrame
-        // resets it).
-        if isConstructor { frame.newTarget = newTarget }
+        // new.target (borrowed from the constructor call site, or the
+        // caller's for direct-eval code; releaseFrame resets it).
+        frame.newTarget = newTarget
         frame.argCount = args.count
         // No padding append: `buf` carries the undefined-padded arg slots, and
         // every argBuf consumer (varRef pvalue, detach, syncBufToFrame) bounds-
@@ -8325,11 +8411,22 @@ struct JeffJSInterpreter {
                 break dispatchLoop
 
             case .eval:
+                // [func, args...] (or [this, func, args...] with the site's
+                // top bit: `eval(...)` inside a `with` body).
+                frame.curPC = pc
                 let argc = Int(readU16(bc, pc + 1))
-                let scope = Int(readU16(bc, pc + 3))
-                var evalArgs = [JeffJSValue]()
-                for _ in 0..<argc { sp -= 1; evalArgs.insert(buf[sp], at: 0) }
-                let result = ctx.evalDirect(args: evalArgs, scope: scope, frame: frame)
+                let siteRaw = Int(readU16(bc, pc + 3))
+                var evalArgs = [JeffJSValue](repeating: .undefined, count: argc)
+                for i in stride(from: argc - 1, through: 0, by: -1) {
+                    evalArgs[i] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                }
+                let evalFunc = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let evalThis: JeffJSValue = siteRaw & 0x8000 != 0
+                    ? jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) : .undefined
+                let result = ctx.directEvalOrCall(funcVal: evalFunc, thisVal: evalThis, args: evalArgs,
+                                                  callerFB: fb, site: siteRaw & 0x7FFF, frame: frame)
+                evalFunc.freeValue(); evalThis.freeValue()
+                for a in evalArgs { a.freeValue() }
                 if result.isException {
                     retVal = .exception
                     break dispatchLoop
@@ -8338,10 +8435,17 @@ struct JeffJSInterpreter {
                 pc += 5
 
             case .apply_eval:
-                let argc = Int(readU16(bc, pc + 1))
-                var evalArgs = [JeffJSValue]()
-                for _ in 0..<argc { sp -= 1; evalArgs.insert(buf[sp], at: 0) }
-                let result = ctx.evalDirect(args: evalArgs, scope: 0, frame: frame)
+                // [this, func, argsArray]: `eval(...spread)`
+                frame.curPC = pc
+                let site = Int(readU16(bc, pc + 1))
+                let argsArray = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let evalFunc = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let evalThis = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                let evalArgs = ctx.arrayToArgs(argsArray)   // owned copies
+                let result = ctx.directEvalOrCall(funcVal: evalFunc, thisVal: evalThis, args: evalArgs,
+                                                  callerFB: fb, site: site & 0x7FFF, frame: frame)
+                argsArray.freeValue(); evalFunc.freeValue(); evalThis.freeValue()
+                for a in evalArgs { a.freeValue() }
                 if result.isException {
                     retVal = .exception
                     break dispatchLoop

@@ -209,6 +209,13 @@ final class JeffJSParser {
     /// `obj[key]` was kept as [obj, value] because a call follows: emit call_method.
     var pendingMethodCall: Bool = false
 
+    /// Bytecode length just after the identifier `eval` was emitted as an
+    /// expression (and the function it was emitted into). A call whose
+    /// callee ends exactly there is a direct eval (ES §13.3.6.1: a plain
+    /// identifier reference, possibly parenthesized). -1 = none.
+    var lastEvalCalleeEnd: Int = -1
+    var lastEvalCalleeFd: JeffJSFunctionDefCompiler? = nil
+
     /// Counter for the synthetic class-scope variables (computed field keys,
     /// deferred static initializers). Unique per compilation unit.
     var syntheticClassVarCounter: Int = 0
@@ -735,6 +742,31 @@ final class JeffJSParser {
             if f.argumentsAllowed { break }
             cur = f.parent
         }
+    }
+
+    /// A direct eval call site in `fd`: its bindings must stay reachable by
+    /// name (resolveVariables records them per site), and in a sloppy
+    /// function the eval code's `var`/function declarations need a variable
+    /// object — the body's, or for a call in the formal parameters the one
+    /// outside the parameter scope (ES §10.2.11 step 20).
+    func noteDirectEvalCall() {
+        fd.hasEval = true
+        guard fd.parent != nil, fd.jsMode & JS_MODE_STRICT == 0 else { return }
+        var inBody = fd.paramScope < 0
+        var sc = fd.curScope
+        while !inBody && sc >= 0 && sc < fd.scopes.count {
+            if sc == 0 { inBody = true }
+            sc = fd.scopes[sc].parent
+        }
+        if inBody ? fd.varObjIdx >= 0 : fd.argVarObjIdx >= 0 { return }
+        // A plain slot in scope 0 (never a TDZ binding); resolveVariables
+        // creates the object at function entry. The names cannot be written
+        // as identifiers.
+        let saved = fd.curScope
+        fd.curScope = 0
+        let idx = defineVar(getAtom(inBody ? "*var*" : "*argvar*"))
+        fd.curScope = saved
+        if inBody { fd.varObjIdx = idx } else { fd.argVarObjIdx = idx }
     }
 
     /// One loop step of `for (... of ...)` / `for await (... of ...)`.
@@ -1325,6 +1357,32 @@ final class JeffJSParser {
         return idx
     }
 
+    /// Where the top-level `var` and function declarations of the script
+    /// being parsed go (only meaningful while `fd.parent == nil`).
+    enum ProgramVarMode {
+        /// Properties of the global object (a script, an indirect eval, or
+        /// a sloppy direct eval whose caller is global code).
+        case global
+        /// The variable environment of the function that called a sloppy
+        /// direct eval: an existing var/parameter binding of that function,
+        /// or a new property of its variable object (EvalDeclarationInstantiation).
+        case callerVarEnv
+        /// Locals of the eval code itself (strict direct eval: a fresh var
+        /// environment, ES §19.2.1.1 step 16-17).
+        case local
+    }
+
+    var programVarMode: ProgramVarMode {
+        guard let site = fd.evalSite else { return .global }
+        if fd.jsMode & JS_MODE_STRICT != 0 { return .local }
+        return site.varEnvName != 0 ? .callerVarEnv : .global
+    }
+
+    /// The first binding named `name` visible at the direct-eval call site.
+    func evalSiteItem(_ name: JSAtom) -> JeffJSEvalItem? {
+        return fd.evalSite?.items.first(where: { $0.name == name })
+    }
+
     /// Declare `name` as a `var` binding (VarDeclaredNames, ES §14.3.2,
     /// §10.2.11 FunctionDeclarationInstantiation steps 27-28). `var` is
     /// function-scoped with one binding per name: a `var` that names a
@@ -1337,7 +1395,7 @@ final class JeffJSParser {
     /// of an enclosing block (B.3.4) and `with` objects.
     @discardableResult
     func declareVarBinding(_ name: JSAtom) -> Int {
-        if fd.parent == nil {
+        if fd.parent == nil && programVarMode != .local {
             // Same rule as parseVarDeclaration's global `var`: parseProgram
             // hoists a define_var for it to the start of the script.
             if !fd.hoistedGlobalVarAtoms.contains(name) {
@@ -1610,11 +1668,54 @@ final class JeffJSParser {
             parseSourceElement()
         }
 
+        // Direct eval: EvalDeclarationInstantiation step 3 — a `var` or
+        // function declaration may not hoist over a lexical binding between
+        // the call site and the var environment.
+        if fd.evalSite != nil && programVarMode != .local {
+            let decls = fd.hoistedGlobalVarAtoms.map { ($0, true) } + fd.evalFuncDeclNames.map { ($0, false) }
+            for (name, isVar) in decls {
+                guard let item = evalSiteItem(name), !item.isDynamic, item.region == 0 else { continue }
+                // Annex B.3.4: a `var` may redeclare a simple catch parameter.
+                if isVar && item.varKind == JSVarKindEnum.JS_VAR_CATCH.rawValue { continue }
+                let text = s.ctx?.atomName(name) ?? "?"
+                syntaxError("Identifier '\(text)' has already been declared")
+                return
+            }
+        }
+
         // Hoist top-level `var` declarations: insert `define_var` instructions
         // at position 0 so variables exist (as undefined) from the start.
         // This must happen before patchCompletionDrops because the bytecode
         // positions shift when we insert bytes at the front.
-        if !fd.hoistedGlobalVarAtoms.isEmpty {
+        if !fd.hoistedGlobalVarAtoms.isEmpty && programVarMode == .callerVarEnv,
+           let site = fd.evalSite {
+            // Sloppy direct eval in a function: each new `var` becomes an
+            // undefined property of the caller's variable object unless one
+            // is already there (a repeated eval keeps the value); a name the
+            // caller's var environment already binds needs nothing.
+            let start = fd.byteCode.len
+            for atom in fd.hoistedGlobalVarAtoms {
+                if let item = evalSiteItem(atom), item.region == 1, !item.isDynamic { continue }
+                // (No `drop`: see the function declaration case.)
+                let skip = newLabel()
+                emitOp(.push_atom_value); emitAtom(atom)                  // [key]
+                emitScopeGetVar(site.varEnvName, scopeLevel: 0)          // [key, vo]
+                emitOp(.in_)                                              // [has]
+                emitIfTrue(skip)                                          // []
+                emitScopeGetVar(site.varEnvName, scopeLevel: 0)          // [vo]
+                emitOp(.undefined)                                        // [vo, undefined]
+                emitPutField(atom)                                        // []
+                emitLabel(skip)
+            }
+            let prefix = Array(fd.byteCode.buf[start ..< fd.byteCode.len])
+            fd.byteCode.buf.removeSubrange(start ..< fd.byteCode.buf.count)
+            fd.byteCode.len = start
+            fd.byteCode.buf.insert(contentsOf: prefix, at: 0)
+            fd.byteCode.len += prefix.count
+            fd.hoistedFuncDeclRanges = fd.hoistedFuncDeclRanges.map {
+                ($0.0 + prefix.count, $0.1 + prefix.count)
+            }
+        } else if !fd.hoistedGlobalVarAtoms.isEmpty {
             // Build the define_var bytes for each atom
             var prefix = [UInt8]()
             for atom in fd.hoistedGlobalVarAtoms {
@@ -2826,6 +2927,12 @@ final class JeffJSParser {
     /// The `return_async` opcode tells the interpreter to return the value to
     /// callFunction, which wraps it in Promise.resolve().
     func parseReturnStatement() {
+        // Eval code is a Script: `return` outside a function is an early
+        // error there (direct eval only; top-level scripts keep accepting it).
+        if fd.parent == nil && fd.evalSite != nil {
+            syntaxError("'return' outside of function")
+            return
+        }
         expect(JSTokenType.TOK_RETURN.rawValue)
 
         let isAsync = fd.funcKind == JSFunctionKindEnum.JS_FUNC_ASYNC.rawValue ||
@@ -3168,9 +3275,23 @@ final class JeffJSParser {
         // Top-level `var` in global eval: hoist to global object so the variable
         // is accessible from any scope (Promise reaction jobs, async callbacks,
         // other eval calls). `let`/`const` remain block-scoped.
-        let isGlobalVar = !isLexical && fd.parent == nil
+        let isGlobalVar = !isLexical && fd.parent == nil && programVarMode != .local
 
-        if isGlobalVar {
+        if isGlobalVar && fd.evalSite != nil {
+            // Direct eval: parseProgram declares the name in the caller's
+            // var environment; the initializer is a plain assignment that
+            // resolves through the caller's scope chain (a `with` object in
+            // it included, ES §19.2.1.3).
+            if !fd.hoistedGlobalVarAtoms.contains(varName) {
+                fd.hoistedGlobalVarAtoms.append(varName)
+            }
+            if tok == 0x3D { // '='
+                next()
+                parseAssignExpr()
+                emitNamedEvaluation(varName)
+                emitScopePutVar(varName, scopeLevel: fd.curScope)
+            }
+        } else if isGlobalVar {
             // Emit define_var to create the property on the global object.
             // Do NOT also create a local variable — that would create two copies
             // where closures capture the local but assignments go to global.
@@ -3364,7 +3485,27 @@ final class JeffJSParser {
         emitFClosure(cpoolIdx, anonymous: funcName == 0)
 
         if !isExpression && funcName != 0 {
-            if fd.parent == nil {
+            if fd.parent == nil && programVarMode == .callerVarEnv {
+                // Sloppy direct eval in a function: the declaration binds in
+                // the caller's var environment — its existing var/parameter
+                // of that name, else a property of its variable object
+                // (EvalDeclarationInstantiation steps 16-17). Hoisted like
+                // any function declaration.
+                let fclosureStart = fd.byteCode.len - 5
+                fd.evalFuncDeclNames.append(funcName)
+                if let item = evalSiteItem(funcName), item.region == 1, !item.isDynamic {
+                    emitScopePutVar(funcName, scopeLevel: fd.curScope)
+                } else if let site = fd.evalSite {
+                    // A plain store on the prototype-less variable object
+                    // defines the property. No trailing `drop`: the program
+                    // completion-value pass would take it for a statement's.
+                    emitScopeGetVar(site.varEnvName, scopeLevel: fd.curScope)  // [f, varObj]
+                    emitOp(.swap)                                               // [varObj, f]
+                    emitPutField(funcName)                                      // []
+                }
+                fd.hoistedFuncDeclRanges.append((fclosureStart, fd.byteCode.len))
+            } else if fd.parent == nil && programVarMode == .global {
+                if fd.evalSite != nil { fd.evalFuncDeclNames.append(funcName) }
                 // Top-level function declaration in global eval: hoist to global object
                 // via define_func so it's accessible from any scope (e.g., Promise
                 // reaction jobs, async callbacks, other eval calls).
@@ -4125,11 +4266,16 @@ final class JeffJSParser {
     func parseExpression() {
         parseAssignExpr()
 
+        var hadComma = false
         while tok == 0x2C && !shouldAbort { // ','
             next()
             emitOp(.drop) // discard left value
             parseAssignExpr()
+            hadComma = true
         }
+        // `(0, eval)(src)` ends in the same bytecode as `eval(src)` but is an
+        // indirect eval: the comma operator yields a value, not a reference.
+        if hadComma { lastEvalCalleeEnd = -1 }
     }
 
     /// Parse an assignment expression.
@@ -5125,6 +5271,12 @@ final class JeffJSParser {
                 lastExprWasSuper = false
                 let isMethodCall = pendingMethodCall
                 pendingMethodCall = false
+                // Direct eval: the callee is exactly the identifier `eval`
+                // (ES §13.3.6.1); whether it is %eval% is decided at run time.
+                let isDirectEval = !isSuperCall && lastEvalCalleeFd === fd
+                    && lastEvalCalleeEnd == fd.byteCode.len
+                lastEvalCalleeEnd = -1
+                lastEvalCalleeFd = nil
 
                 if isSuperCall {
                     // super(args) in a derived constructor: [[Construct]] the
@@ -5193,6 +5345,24 @@ final class JeffJSParser {
                     // A derived class initialises its instance fields as soon
                     // as super() returns, before the rest of the body.
                     emitClassFieldInit()
+                } else if isDirectEval {
+                    // `eval(...)`; in a `with` body the callee took the
+                    // two-slot form [receiver, func] (isMethodCall), flagged
+                    // in the top bit of the site operand.
+                    noteDirectEvalCall()
+                    let site = UInt16(fd.curScope)
+                    if hasSpread {
+                        if !isMethodCall {
+                            emitOp(.undefined)   // [func, argsArray, undefined]
+                            emitOp(.rot3r)       // [undefined, func, argsArray]
+                        }
+                        emitOp(.apply_eval)      // [this, func, argsArray] -> result
+                        emitU16(site)
+                    } else {
+                        emitOp(.eval)
+                        emitU16(UInt16(argc))
+                        emitU16(site | (isMethodCall ? 0x8000 : 0))
+                    }
                 } else if isMethodCall {
                     // [receiver, func, args...]: obj[key](...) and super.m(...)
                     if hasSpread {
@@ -6085,6 +6255,10 @@ final class JeffJSParser {
                 pendingMethodCall = true
             } else {
                 emitScopeGetVar(atom, scopeLevel: fd.curScope)
+            }
+            if atom == JSPredefinedAtom.eval_.rawValue {
+                lastEvalCalleeEnd = fd.byteCode.len
+                lastEvalCalleeFd = fd
             }
 
         case 0x28: // '(' -- grouping or arrow params

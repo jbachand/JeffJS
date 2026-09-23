@@ -359,6 +359,10 @@ class JeffJSFunctionBytecode {
     /// Byte length of the span; -1 when no span was recorded.
     var sourceLen: Int32 = -1
 
+    /// Direct `eval` call sites of this function (see JeffJSEvalSite), nil
+    /// when it has none. Indexed by the `eval`/`apply_eval` site operand.
+    var evalSites: [JeffJSEvalSite]? = nil
+
     /// The function's own source text, exactly as written (QuickJS
     /// `js_function_toString`). nil when it was not recorded.
     var sourceSpanText: String? {

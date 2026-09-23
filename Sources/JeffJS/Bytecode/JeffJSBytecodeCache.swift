@@ -71,6 +71,9 @@ private func packFlags(_ fb: JeffJSFunctionBytecode) -> UInt16 {
     if fb.hasDebug                      { flags |= 1 << 12 }
     if fb.readOnly                      { flags |= 1 << 13 }
     if fb.backtrace                     { flags |= 1 << 14 }
+    // Direct-eval call sites follow the self-reference slot. Blobs without
+    // one are byte-identical to before, so no compilerVersion bump.
+    if fb.evalSites != nil              { flags |= 1 << 15 }
     return flags
 }
 
@@ -423,6 +426,28 @@ struct JeffJSBytecodeSerializer {
             writeU32(UInt32(bitPattern: Int32(truncatingIfNeeded: cv.varIdx)))
         }
         writeU32(UInt32(bitPattern: Int32(truncatingIfNeeded: fb.selfRefVarIdx)))
+        if let sites = fb.evalSites {
+            writeU16(UInt16(sites.count))
+            for site in sites {
+                writeU8(site.isStrict ? 1 : 0)
+                writeU32(site.varEnvName == 0 ? UInt32.max
+                         : ((rt != nil) ? atomTable.intern(site.varEnvName, rt: rt!) : site.varEnvName))
+                writeU32(UInt32(site.items.count))
+                for it in site.items {
+                    writeU32((rt != nil) ? atomTable.intern(it.name, rt: rt!) : it.name)
+                    var f: UInt8 = 0
+                    if it.isLocal { f |= 1 }
+                    if it.isArg { f |= 2 }
+                    if it.isConst { f |= 4 }
+                    if it.isLexical { f |= 8 }
+                    if it.isDynamic { f |= 16 }
+                    writeU8(f)
+                    writeU8(UInt8(truncatingIfNeeded: it.varKind))
+                    writeU8(it.region)
+                    writeU32(UInt32(bitPattern: Int32(truncatingIfNeeded: it.idx)))
+                }
+            }
+        }
     }
 
     // MARK: Constant Pool Entry
@@ -594,6 +619,7 @@ struct JeffJSBytecodeDeserializer {
         // lineNum(4) + colNum(4) + sourceStart(4) + sourceLen(4)
         let headerSize = 4 + 1 + 2 + 2 + 2 + 2 + 4 + 2 + 2 + 4 + 4 + 4 + 4
         guard pos + headerSize <= data.count else { return false }
+        let flags = Int(data[pos + 5]) | (Int(data[pos + 6]) << 8)
         pos += headerSize
 
         // Bytecode bytes: length(4) + data
@@ -623,6 +649,18 @@ struct JeffJSBytecodeDeserializer {
         guard pos + 1 < data.count else { return false }
         let cvCount = Int(data[pos]) | (Int(data[pos + 1]) << 8)
         pos += 2 + cvCount * 10 + 4
+        // Direct-eval call sites: u16 count, then per site u8 strict,
+        // u32 varEnvName, u32 item count, 11 bytes per item.
+        if flags & (1 << 15) != 0 {
+            guard pos + 1 < data.count else { return false }
+            let siteCount = Int(data[pos]) | (Int(data[pos + 1]) << 8)
+            pos += 2
+            for _ in 0 ..< siteCount {
+                guard pos + 8 < data.count else { return false }
+                let items = Int(readU32LE(data, pos + 5))
+                pos += 9 + items * 11
+            }
+        }
 
         return pos <= data.count
     }
@@ -677,6 +715,14 @@ struct JeffJSBytecodeDeserializer {
         guard pos + 1 < data.count else { return nil }
         let v = UInt16(data[pos]) | (UInt16(data[pos + 1]) << 8)
         pos += 2; return v
+    }
+
+    /// An atom operand as written by the serializer: a table index when a
+    /// remapper is present, else the raw atom.
+    private func remapAtomRef(_ ref: UInt32) -> JSAtom? {
+        guard let remapper else { return ref }
+        guard Int(ref) < remapper.indexToAtom.count else { return nil }
+        return remapper.indexToAtom[Int(ref)]
     }
 
     private mutating func readU32() -> UInt32? {
@@ -771,6 +817,38 @@ struct JeffJSBytecodeDeserializer {
             closureVars.append(cv)
         }
         guard let selfRefRaw = readU32() else { return nil }
+        var evalSites: [JeffJSEvalSite]? = nil
+        if flags & (1 << 15) != 0 {
+            guard let siteCount = readU16() else { return nil }
+            var sites: [JeffJSEvalSite] = []
+            for _ in 0 ..< siteCount {
+                guard let strict = readU8(), let envRef = readU32(), let itemCount = readU32() else { return nil }
+                let site = JeffJSEvalSite()
+                site.isStrict = strict != 0
+                if envRef != UInt32.max {
+                    guard let a = remapAtomRef(envRef) else { return nil }
+                    site.varEnvName = a
+                }
+                for _ in 0 ..< itemCount {
+                    guard let nameRef = readU32(), let f = readU8(), let kind = readU8(),
+                          let region = readU8(), let idxRaw = readU32(),
+                          let name = remapAtomRef(nameRef) else { return nil }
+                    var it = JeffJSEvalItem()
+                    it.name = name
+                    it.isLocal = (f & 1) != 0
+                    it.isArg = (f & 2) != 0
+                    it.isConst = (f & 4) != 0
+                    it.isLexical = (f & 8) != 0
+                    it.isDynamic = (f & 16) != 0
+                    it.varKind = Int(kind)
+                    it.region = region
+                    it.idx = Int(Int32(bitPattern: idxRaw))
+                    site.items.append(it)
+                }
+                sites.append(site)
+            }
+            evalSites = sites
+        }
 
         // Construct fresh JeffJSFunctionBytecode
         let fb = JeffJSFunctionBytecode()
@@ -796,6 +874,7 @@ struct JeffJSBytecodeDeserializer {
         unpackFlags(flags, into: fb)
         fb.closureVarsList = closureVars
         fb.selfRefVarIdx = Int(Int32(bitPattern: selfRefRaw))
+        fb.evalSites = evalSites
         // Trace regions are derived from the final bytecode (not stored):
         // recompute them so cached code runs with the same loop traces.
         JeffJSCompiler.fuseBasicBlocks(fb)
