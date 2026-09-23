@@ -369,8 +369,8 @@ final class HTMLTreeBuilder {
                 // Foreign content: keep `viewBox` as authored and register the
                 // lowercase alias so `attributes["viewbox"]` still resolves.
                 element.setAttributePreservingCase(name: attribute.name, value: attribute.value)
-            } else if element.attributes[attribute.name] == nil {
-                element.attributes[attribute.name] = attribute.value
+            } else {
+                element.appendParsedAttribute(name: attribute.name, value: attribute.value)
             }
         }
         return element
@@ -1214,7 +1214,7 @@ final class HTMLTreeBuilder {
     private func mergeAttributes(_ attributes: [HTMLAttribute], into node: DOMNode?) {
         guard let node else { return }
         for attribute in attributes where node.attributes[attribute.name] == nil {
-            node.attributes[attribute.name] = attribute.value
+            node.appendParsedAttribute(name: attribute.name, value: attribute.value)
         }
     }
 
@@ -1963,6 +1963,20 @@ final class HTMLTreeBuilder {
             insertForeignElement(tag: name, attributes: attributes, namespace: namespace, selfClosing: selfClosing)
 
         case .endTag(let name):
+            // `</br>` and `</p>` break out like the start tags above
+            // (§13.2.6.5): pop to an HTML element or integration point, then
+            // reprocess in HTML content, where `</br>` is a `<br>` and a
+            // `</p>` without an open `p` inserts an empty one.
+            if name == "br" || name == "p" {
+                while let node = currentNode, !node.isHTMLNamespace,
+                      !isHTMLIntegrationPoint(node),
+                      !(node.namespaceURI == DOMNode.mathmlNamespace
+                        && HTMLElements.mathmlTextIntegration.contains(node.tagName ?? "")) {
+                    openElements.removeLast()
+                }
+                process(token, in: mode)
+                return
+            }
             if name == "script", let node = currentNode,
                node.namespaceURI == DOMNode.svgNamespace, node.tagName == "script" {
                 openElements.removeLast()

@@ -50,6 +50,67 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
         return attributes.filter { !aliasAttributeKeys.contains($0.key) }
     }
 
+    /// Attribute names in the order they were added (DOM §4.9: an element's
+    /// attribute list is ordered — source order for parsed elements, append
+    /// order for `setAttribute`). `attributes` is a dictionary, so the order
+    /// lives here; it may hold stale names (a host that mutates `attributes`
+    /// directly) and never lists aliases — read it through
+    /// `orderedAttributeNames`.
+    private var attributeOrder: [String] = []
+
+    /// The exposed attribute names in attribute-list order: the recorded
+    /// order first, then any name the dictionary gained without going through
+    /// the setters (sorted, so the result stays deterministic).
+    public var orderedAttributeNames: [String] {
+        var seen = Set<String>()
+        var names: [String] = []
+        names.reserveCapacity(attributes.count)
+        for name in attributeOrder where attributes[name] != nil && !aliasAttributeKeys.contains(name) {
+            if seen.insert(name).inserted { names.append(name) }
+        }
+        if names.count < attributes.count - aliasAttributeKeys.count {
+            for name in attributes.keys.sorted() where !seen.contains(name) && !aliasAttributeKeys.contains(name) {
+                names.append(name)
+            }
+        }
+        return names
+    }
+
+    /// `(name, value)` pairs in attribute-list order (serialisation, cloning).
+    public var orderedAttributes: [(name: String, value: String)] {
+        orderedAttributeNames.compactMap { name in attributes[name].map { (name, $0) } }
+    }
+
+    /// Records `name` at the end of the attribute list if it is new.
+    private func noteAttributeAdded(_ name: String, wasPresent: Bool) {
+        if !wasPresent { attributeOrder.append(name) }
+    }
+
+    /// Appends an attribute the parser tokenised, keeping source order. The
+    /// first occurrence of a duplicate name wins (HTML §13.2.5.33).
+    func appendParsedAttribute(name: String, value: String) {
+        guard attributes[name] == nil else { return }
+        attributes[name] = value
+        attributeOrder.append(name)
+    }
+
+    /// Copies `other`'s attribute list (values and order) — the cloning steps.
+    func copyAttributes(from other: DOMNode) {
+        attributes = other.attributes
+        aliasAttributeKeys = other.aliasAttributeKeys
+        attributeOrder = other.orderedAttributeNames
+        _cachedClassList = nil
+        _cachedClassNames = nil
+    }
+
+    /// The document this node belongs to while it is not in a document's tree
+    /// (DOM "node document"). Nil means the page document. Only a subtree's
+    /// top node carries it: every node of a detached subtree shares its top's
+    /// node document, and a node in a document's tree belongs to that
+    /// document. Set by the DOM bridge when a node is created for, adopted
+    /// into or removed from another document's tree.
+    weak var nodeDocument: DOMNode?
+
     /// Document-level quirks mode, decided by the parser from the DOCTYPE.
     /// Only meaningful on a `.document` node.
     public enum QuirksMode: String, Sendable {
@@ -157,6 +218,9 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
         self.tagName = tagName
         self.attributes = attributes
         self.textContent = textContent
+        // A dictionary has no order; sort so a factory-built element at least
+        // serialises deterministically.
+        if !attributes.isEmpty { self.attributeOrder = attributes.keys.sorted() }
     }
 
     /// Invalidate cached classList when class attribute may have changed.
@@ -429,6 +493,7 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
 
     public func setAttribute(name: String, value: String) {
         let lower = name.lowercased()
+        noteAttributeAdded(lower, wasPresent: attributes[lower] != nil)
         attributes[lower] = value
         invalidateClassListIfNeeded(lower)
     }
@@ -436,10 +501,12 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
     public func removeAttribute(name: String) {
         let lower = name.lowercased()
         attributes.removeValue(forKey: lower)
+        if let index = attributeOrder.firstIndex(of: lower) { attributeOrder.remove(at: index) }
         invalidateClassListIfNeeded(lower)
     }
 
     public func setAttributePreservingCase(name: String, value: String) {
+        noteAttributeAdded(name, wasPresent: attributes[name] != nil)
         attributes[name] = value
         let lower = name.lowercased()
         if lower != name {
@@ -451,6 +518,7 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
 
     public func removeAttributePreservingCase(name: String) {
         attributes.removeValue(forKey: name)
+        if let index = attributeOrder.firstIndex(of: name) { attributeOrder.remove(at: index) }
         let lower = name.lowercased()
         if lower != name || aliasAttributeKeys.contains(lower) {
             attributes.removeValue(forKey: lower)
