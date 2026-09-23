@@ -300,6 +300,7 @@ struct JeffJSTestRunner {
             ("FreedValueTouches", { $0.testFreedValueTouches() }),
             ("HTMLParsing", { $0.testHTMLParsing() }),
             ("DOMBridgeRung15", { $0.testDOMBridgeRung15() }),
+            ("DOMScriptPrepare", { $0.testDOMScriptPrepare() }),
         ]
     }
 

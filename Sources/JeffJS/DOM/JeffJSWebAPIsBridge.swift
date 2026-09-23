@@ -88,7 +88,10 @@ final class JeffJSWebAPIsBridge {
         }, length: 0)
 
         // performance.timeOrigin
-        _ = ctx.setPropertyStr(obj: perf, name: "timeOrigin", value: .newFloat64(startMS))
+        // HR-Time §5: the time origin in Unix-epoch ms (startMS is on the
+        // CFAbsoluteTime 2001 epoch), so `timeOrigin + now()` ~= Date.now().
+        _ = ctx.setPropertyStr(obj: perf, name: "timeOrigin",
+                               value: .newFloat64(startMS + Date.timeIntervalBetween1970AndReferenceDate * 1000))
 
         // performance.mark(name)
         ctx.setPropertyFunc(obj: perf, name: "mark", fn: { [weak self] ctx, _, args in

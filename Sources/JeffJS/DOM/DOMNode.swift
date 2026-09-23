@@ -111,6 +111,21 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
     /// into or removed from another document's tree.
     weak var nodeDocument: DOMNode?
 
+    /// HTML §4.12.1.1 "already started" for a `<script>` element. Once true the
+    /// element is never prepared (run) again: set by the DOM bridge when it
+    /// hands a script to the host (`onScriptExecution`), by the bridge for the
+    /// scripts already in the document when it registers, and for every script
+    /// the fragment parser creates (innerHTML / outerHTML / insertAdjacentHTML /
+    /// DOMParser). Hosts that prepare parser-inserted scripts themselves should
+    /// set it too. Copied by `cloneNode` (the script cloning steps).
+    public var scriptAlreadyStarted = false
+
+    /// HTML §4.12.1 "non-blocking" (surfaced as `script.async` without an
+    /// `async` attribute): initially set; the HTML parser unsets it on the
+    /// scripts it creates, and the `async` IDL setter / an `async` attribute
+    /// change clear it. Only meaningful on `<script>`.
+    public var scriptNonBlocking = true
+
     /// Document-level quirks mode, decided by the parser from the DOCTYPE.
     /// Only meaningful on a `.document` node.
     public enum QuirksMode: String, Sendable {

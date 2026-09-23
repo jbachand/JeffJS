@@ -693,7 +693,8 @@ struct JeffJSStdLib {
 
         // performance.timeOrigin — the time when the context was created
         // Store as a double property (Unix timestamp in ms)
-        let timeOriginMS = state.timeOrigin * 1000.0
+        // HR-Time §5: Unix-epoch ms (state.timeOrigin is CFAbsoluteTime, 2001 epoch).
+        let timeOriginMS = (state.timeOrigin + Date.timeIntervalBetween1970AndReferenceDate) * 1000.0
         let timeOriginVal = JeffJSValue.newFloat64(timeOriginMS)
         _ = ctx.setPropertyStr(obj: perfObj, name: "timeOrigin", value: timeOriginVal)
 

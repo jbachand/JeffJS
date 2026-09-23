@@ -157,6 +157,7 @@ extension JeffJSDOMBridge {
             n.nodeDocument = nil
         }
         queueChildListRecord(target: parent, added: nodes, removed: [], previous: previous, next: ref)
+        runScriptInsertionSteps(inserted: nodes, parent: parent)
     }
 
     /// Empties a DocumentFragment (one record on the fragment) and returns
@@ -213,6 +214,7 @@ extension JeffJSDOMBridge {
         }
         if !added.isEmpty || !removed.isEmpty {
             queueChildListRecord(target: parent, added: added, removed: removed, previous: nil, next: nil)
+            runScriptInsertionSteps(inserted: added, parent: parent)
         }
     }
 
@@ -254,6 +256,7 @@ extension JeffJSDOMBridge {
         queueChildListRecord(target: parent, added: flat, removed: [old], previous: previous,
                              next: (reference?.parent === parent) ? reference : nil)
         nodeLeftTree(old)
+        runScriptInsertionSteps(inserted: flat, parent: parent)
     }
 
     /// DOM "convert nodes into a node" for append/prepend/before/after/
@@ -330,6 +333,12 @@ extension JeffJSDOMBridge {
 
     private func attributeChanged(_ node: DOMNode, name: String, oldValue: String?, newValue: String?) {
         queueAttributeRecord(target: node, name: name, oldValue: oldValue)
+        if Self.isHTMLScript(node) {
+            // HTML §4.12.1: an `async` attribute change clears "non-blocking";
+            // a `src` set where there was none prepares a connected script.
+            if name == "async" { node.scriptNonBlocking = false }
+            if name == "src", oldValue == nil, newValue != nil { scriptSrcAttributeAdded(node) }
+        }
         // HTML §4.11.1: a details element's open attribute added or removed
         // queues a `toggle` event.
         if name == "open", (oldValue != nil) != (newValue != nil),

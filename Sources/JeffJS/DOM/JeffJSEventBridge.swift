@@ -747,6 +747,17 @@ final class JeffJSEventBridge {
             if handler.isFunction {
                 let r = ctx.call(handler, this: currentTarget, args: [event])
                 reportExceptionIfNeeded(r, ctx: ctx, label: "on\(type) handler")
+                // HTML §8.1.8.1 "the event handler processing algorithm": a
+                // return value of false cancels the event (true for window's
+                // onerror, an OnErrorEventHandler).
+                if r.isBool {
+                    let windowError = type == "error" && eventTargetKey(ctx: ctx, value: currentTarget) == "window"
+                    if r.toBool() == windowError {
+                        let pd = ctx.getPropertyStr(obj: event, name: "preventDefault")
+                        if pd.isFunction { ctx.call(pd, this: event, args: []).freeValue() }
+                        pd.freeValue()
+                    }
+                }
                 r.freeValue()
             } else if handler.isException {
                 reportExceptionIfNeeded(handler, ctx: ctx, label: "on\(type) handler")

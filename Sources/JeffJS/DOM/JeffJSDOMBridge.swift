@@ -39,7 +39,12 @@ final class JeffJSDOMBridge {
     private(set) var root: DOMNode
     private let baseURL: URL
     private let onMutated: JeffJSDOMMutationObserver?
-    private let onScriptExecution: ((DOMNode) -> Void)?
+    /// Host script runner: called once per script-inserted `<script>` element
+    /// the page made ready to run, with that element, already marked
+    /// `scriptAlreadyStarted` (HTML §4.12.1.1). Inline classic scripts must be
+    /// executed before the callback returns. Full contract at the top of
+    /// `JeffJSDOMBridge+Scripts.swift`.
+    let onScriptExecution: ((DOMNode) -> Void)?
 
     /// Called when a JS event listener throws an exception.
     var onError: ((String) -> Void)?
@@ -130,7 +135,7 @@ final class JeffJSDOMBridge {
     var dirtyTextareas: Set<UUID> = []
 
     /// The `<script>` element currently being evaluated (`document.currentScript`).
-    private var currentScriptNode: DOMNode?
+    var currentScriptNode: DOMNode?
 
     /// Shared `item`/`namedItem` implementations spliced onto every array
     /// returned by `wrapElementArray` (HTMLCollection/NodeList shape).
@@ -181,6 +186,15 @@ final class JeffJSDOMBridge {
     /// `__nativeGetComputedStyleValue(nodeID, property)`, then the inline
     /// style and the UA defaults.
     var computedStyleProvider: ((_ node: DOMNode, _ property: String) -> String?)?
+
+    /// Host hook for the page-visible content attribute of a form control
+    /// whose `attributes` slot holds its *state* (value / checked /
+    /// selected): return `.some(content)` (`nil` = absent) to override,
+    /// `.none` when `attributes[name]` is the content attribute. Consulted
+    /// by getAttribute, hasAttribute, getAttributeNames, hasAttributes,
+    /// toggleAttribute and the HTML serializer (innerHTML/outerHTML), only
+    /// for the names in `contentAttributeOverrideNames`.
+    var contentAttributeOverride: ((_ node: DOMNode, _ name: String) -> String??)?
 
     var clickInProgress: Set<UUID> = []
     /// Details elements with a queued `toggle` task -> the old `open` state.
@@ -331,11 +345,20 @@ final class JeffJSDOMBridge {
         currentScriptNode = node
     }
 
+    /// Elements whose `src` IDL attribute reflects as a URL.
+    static let urlSrcTags: Set<String> = ["script", "img", "iframe", "frame", "embed", "audio", "video", "source", "track", "input"]
+
     // MARK: - Registration Entry Point
 
     /// Registers `document` and `window` objects on the JeffJS context's global scope.
     func register(on ctx: JeffJSContext) {
         jsContext = ctx
+        // The scripts already in the document were parser-inserted and are
+        // the host's to run: moving one later must not run it again. Only the
+        // ones the parser's own "prepare" would have started (§4.12.1.1: an
+        // empty or non-JavaScript one stays startable, e.g. a consent
+        // manager's `type="text/plain"` script cloned with a real type).
+        Self.markScriptsAlreadyStarted(in: [root], onlyIfWouldStart: true)
         let global = ctx.getGlobalObject()
 
         // -- window alias --
@@ -389,6 +412,14 @@ final class JeffJSDOMBridge {
             let html = ctx.toSwiftString(args.first ?? .undefined) ?? ""
             return self.parseDetachedDocument(html: html, ctx: ctx)
         }, length: 1)
+
+        // on* handlers on window (GlobalEventHandlers + WindowEventHandlers)
+        // and document; `'ontouchstart' in window` is true as on iOS.
+        installEventHandlerAccessors(on: global, names: Self.elementEventHandlerNames + Self.windowEventHandlerNames, ctx: ctx)
+        if let docValue = documentJSValue { installEventHandlerAccessors(on: docValue, names: Self.elementEventHandlerNames + ["onreadystatechange", "onvisibilitychange", "onpointerlockchange", "onpointerlockerror", "onfullscreenchange", "onfullscreenerror", "onselectionchange"], ctx: ctx) }
+
+        // CSS.escape (CSSOM §2.1).
+        installCSSNamespace(on: global, ctx: ctx)
 
         // MutationObserver (DOM §4.3), native: replaces any stub installed
         // earlier; host polyfills test `typeof MutationObserver` and skip.
@@ -446,6 +477,7 @@ final class JeffJSDOMBridge {
     // MARK: - Document Methods
 
     private func registerDocumentMethods(on doc: JeffJSValue, ctx: JeffJSContext) {
+        registerContextualFragment(on: doc, ctx: ctx)
         // getElementById
         ctx.setPropertyFunc(obj: doc, name: "getElementById", fn: { [weak self] ctx, thisVal, args in
             guard let self, let idStr = self.extractString(ctx: ctx, args: args, index: 0) else {
@@ -714,7 +746,11 @@ final class JeffJSDOMBridge {
     /// with scripting DISABLED (`<noscript>` content becomes elements), and its
     /// mode (`compatMode`) is whatever its own DOCTYPE decided.
     func parseDetachedDocument(html: String, ctx: JeffJSContext) -> JeffJSValue {
-        wrapDetachedDocument(HTMLParser.parse(html, scriptingEnabled: false), ctx: ctx)
+        // DOMParser / parseHTMLUnsafe documents: their scripts never run,
+        // not even once adopted into the page (HTML §8.5.1).
+        let doc = HTMLParser.parse(html, scriptingEnabled: false)
+        Self.markScriptsAlreadyStarted(in: [doc])
+        return wrapDetachedDocument(doc, ctx: ctx)
     }
 
     /// `createElementNS(namespace, qualifiedName)` arguments -> an element.
@@ -1084,30 +1120,17 @@ final class JeffJSDOMBridge {
         // Register __get_*/__set_* native functions on the prototype
         registerElementPropertyAccessors(on: proto, ctx: ctx)
 
+        // HTMLScriptElement IDL (async/defer/noModule/text/...)
+        registerScriptElementAccessors(on: proto, ctx: ctx)
+
         // Install accessor properties (textContent, className, etc.) on the prototype
         installElementPropertyShim(on: proto, ctx: ctx)
 
-        // Install on* event handler properties (initially null) so that
-        // Preact's `'onclick' in element` check returns true, causing it to
-        // use lowercase event names ('click') that match our event dispatch.
-        let eventNames = [
-            "onclick", "ondblclick", "onmousedown", "onmouseup", "onmousemove",
-            "onmouseover", "onmouseout", "onmouseenter", "onmouseleave",
-            "onkeydown", "onkeyup", "onkeypress",
-            "onfocus", "onblur", "onfocusin", "onfocusout",
-            "oninput", "onchange", "onsubmit", "onreset",
-            "ontouchstart", "ontouchend", "ontouchmove", "ontouchcancel",
-            "onpointerdown", "onpointerup", "onpointermove",
-            "onpointerover", "onpointerout", "onpointerenter", "onpointerleave",
-            "onscroll", "onwheel", "onresize",
-            "ondrag", "ondragstart", "ondragend", "ondragover", "ondragenter", "ondragleave", "ondrop",
-            "onanimationstart", "onanimationend", "onanimationiteration",
-            "ontransitionend", "onload", "onerror",
-            "oncontextmenu", "onselect", "oncopy", "oncut", "onpaste",
-        ]
-        for name in eventNames {
-            ctx.setPropertyStr(obj: proto, name: name, value: .null)
-        }
+        // on* event handler IDL attributes (HTML §8.1.8.1): accessors that
+        // read null until set, store a function/object (anything else is
+        // null), and are what the event dispatch invokes. Preact's
+        // `'onclick' in element` check relies on them being present.
+        installEventHandlerAccessors(on: proto, names: Self.elementEventHandlerNames, ctx: ctx)
 
         // Node.* constants are also exposed on every node instance.
         let nodeConstants: [(String, Int32)] = [
@@ -1147,7 +1170,7 @@ final class JeffJSDOMBridge {
             // element's `viewBox` is looked up as written (the lowercase alias
             // the parser registers keeps the lenient spelling working).
             let value = targetNode.isHTMLNamespace
-                ? targetNode.attributes[name.lowercased()]
+                ? self.pageAttribute(targetNode, name.lowercased())
                 : (targetNode.attributes[name] ?? targetNode.attributes[name.lowercased()])
             guard let value else { return JeffJSValue.null }
             return ctx.newStringValue(value)
@@ -1187,7 +1210,7 @@ final class JeffJSDOMBridge {
                 return JeffJSValue.JS_FALSE
             }
             if !targetNode.isHTMLNamespace, targetNode.attributes[name] != nil { return .newBool(true) }
-            return .newBool(targetNode.attributes[name.lowercased()] != nil)
+            return .newBool(self.pageAttribute(targetNode, name.lowercased()) != nil)
         }, length: 1)
 
         // getAttributeNames() -> array of strings
@@ -1196,7 +1219,14 @@ final class JeffJSDOMBridge {
             guard let targetNode = self.extractNode(from: thisVal) else { return ctx.newArray() }
             let arr = ctx.newArray()
             // Attribute-list order (source order, then append order).
-            let keys = targetNode.orderedAttributeNames
+            var keys = targetNode.orderedAttributeNames
+            if self.contentAttributeOverride != nil {
+                keys = keys.filter { self.pageAttribute(targetNode, $0) != nil }
+                for name in Self.contentAttributeOverrideNames.sorted()
+                where targetNode.attributes[name] == nil && self.pageAttribute(targetNode, name) != nil {
+                    keys.append(name)
+                }
+            }
             for (i, key) in keys.enumerated() {
                 ctx.setPropertyUint32(obj: arr, index: UInt32(i), value: ctx.newStringValue(key))
             }
@@ -1428,6 +1458,10 @@ final class JeffJSDOMBridge {
         // hasAttributes() -> bool
         ctx.setPropertyFunc(obj: el, name: "hasAttributes", fn: { [weak self] ctx, thisVal, _ in
             guard let self, let targetNode = self.extractNode(from: thisVal) else { return .newBool(false) }
+            if self.contentAttributeOverride != nil {
+                return .newBool(targetNode.orderedAttributeNames.contains { self.pageAttribute(targetNode, $0) != nil }
+                    || Self.contentAttributeOverrideNames.contains { self.pageAttribute(targetNode, $0) != nil })
+            }
             return .newBool(!targetNode.attributes.isEmpty)
         }, length: 0)
 
@@ -1436,7 +1470,7 @@ final class JeffJSDOMBridge {
             guard let self, let targetNode = self.extractNode(from: thisVal),
                   let rawName = self.extractString(ctx: ctx, args: args, index: 0) else { return .newBool(false) }
             let name = rawName.lowercased()
-            let present = targetNode.attributes[name] != nil
+            let present = self.pageAttribute(targetNode, name) != nil
             let hasForce = args.count >= 2 && !args[1].isUndefined
             let shouldSet = hasForce ? args[1].toBool() : !present
             if shouldSet {
@@ -1809,14 +1843,22 @@ final class JeffJSDOMBridge {
         ctx.setPropertyFunc(obj: el, name: "__get_hidden", fn: { [weak self] ctx, thisVal, _ in
             guard let self else { return JeffJSValue.JS_FALSE }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.JS_FALSE }
-            return .newBool(targetNode.attributes["hidden"] != nil)
+            // HTML §6.1: the enumerated attribute's "until-found" state reads
+            // as that string; any other present value is the hidden state.
+            guard let v = targetNode.attributes["hidden"] else { return JeffJSValue.JS_FALSE }
+            if v.lowercased() == "until-found" { return ctx.newStringValue("until-found") }
+            return JeffJSValue.JS_TRUE
         }, length: 0)
 
         ctx.setPropertyFunc(obj: el, name: "__set_hidden", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.undefined }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.undefined }
-            let hidden = !args.isEmpty && args[0].toBool()
-            if hidden {
+            let value = args.first ?? .undefined
+            // "until-found" (ASCII case-insensitive) sets that keyword; any
+            // other truthy value sets "", a falsy one removes the attribute.
+            if value.isString, let str = ctx.toSwiftString(value), str.lowercased() == "until-found" {
+                self.setAttributeValue(targetNode, name: "hidden", value: "until-found")
+            } else if ctx.toBool(value) {
                 self.setAttributeValue(targetNode, name: "hidden", value: "")
             } else {
                 self.removeAttributeValue(targetNode, name: "hidden")
@@ -1829,7 +1871,16 @@ final class JeffJSDOMBridge {
         ctx.setPropertyFunc(obj: el, name: "__get_src", fn: { [weak self] ctx, thisVal, _ in
             guard let self else { return ctx.newStringValue("") }
             guard let targetNode = self.extractNode(from: thisVal) else { return ctx.newStringValue("") }
-            return ctx.newStringValue(targetNode.attributes["src"] ?? "")
+            // HTML "reflect as a URL" for the elements whose `src` is a URL:
+            // resolved against the document base (the raw value when it does
+            // not parse). Loaders take their own base from
+            // `document.currentScript.src`.
+            let raw = targetNode.attributes["src"] ?? ""
+            if !raw.isEmpty, targetNode.isHTMLNamespace, Self.urlSrcTags.contains(targetNode.tagName ?? ""),
+               let url = JeffJSHyperlinkURL(raw, base: self.documentBaseURL()) {
+                return ctx.newStringValue(url.href)
+            }
+            return ctx.newStringValue(raw)
         }, length: 0)
 
         ctx.setPropertyFunc(obj: el, name: "__set_src", fn: { [weak self] ctx, thisVal, args in
@@ -2033,7 +2084,10 @@ final class JeffJSDOMBridge {
         ctx.setPropertyFunc(obj: el, name: "__get_classList", fn: { [weak self] ctx, thisVal, _ in
             guard let self else { return ctx.newObject() }
             guard let targetNode = self.extractNode(from: thisVal) else { return ctx.newObject() }
-            if let cached = self.classListCache[targetNode.id] { return cached.dupValue() }
+            if let cached = self.classListCache[targetNode.id] {
+                self.syncTokenListIndices(cached, DOMNode.orderedTokenSet(targetNode.attributes["class"] ?? ""), ctx: ctx)
+                return cached.dupValue()
+            }
             let list = self.buildClassListObject(for: targetNode, ctx: ctx)
             self.classListCache[targetNode.id] = list.dupValue()
             return list
@@ -2216,7 +2270,7 @@ final class JeffJSDOMBridge {
             ("clientTop", false), ("clientLeft", false),
             ("scrollWidth", false), ("scrollHeight", false),
             ("scrollTop", true), ("scrollLeft", true),
-        ]
+        ] + Self.scriptIDLNames.map { ($0, true) }
 
         for (name, hasSetter) in props {
             let getter = ctx.getPropertyStr(obj: el, name: "__get_\(name)")
@@ -2687,54 +2741,71 @@ final class JeffJSDOMBridge {
         func tokens() -> [String] {
             DOMNode.orderedTokenSet(node.attributes[attribute] ?? "")
         }
+        // DOM §7.1 "update steps": no attribute is created for an empty set.
         let store: ([String]) -> Void = { [weak self] list in
-            self?.setAttributeValue(node, name: attribute, value: list.joined(separator: " "))
+            guard let self else { return }
+            if list.isEmpty, node.attributes[attribute] == nil { return }
+            self.setAttributeValue(node, name: attribute, value: list.joined(separator: " "))
+        }
+        // DOM §7.1 validation: "" is a SyntaxError, ASCII whitespace an
+        // InvalidCharacterError. Returns the thrown exception or nil.
+        func validate(_ bridge: JeffJSDOMBridge, _ ctx: JeffJSContext, _ tokens: [String]) -> JeffJSValue? {
+            for t in tokens {
+                if t.isEmpty {
+                    return bridge.throwDOMException(ctx: ctx, name: "SyntaxError", message: "The token provided must not be empty.")
+                }
+                if t.unicodeScalars.contains(where: { DOMNode.isASCIIWhitespace($0) }) {
+                    return bridge.throwDOMException(ctx: ctx, name: "InvalidCharacterError",
+                        message: "The token provided ('\(t)') contains HTML space characters, which are not valid in tokens.")
+                }
+            }
+            return nil
+        }
+        func strings(_ ctx: JeffJSContext, _ args: [JeffJSValue]) -> [String] {
+            args.map { ctx.toSwiftString($0) ?? "" }
         }
 
-        // add(cls, ...)
-        ctx.setPropertyFunc(obj: obj, name: "add", fn: { [weak self] ctx, _, args in
+        // add(token, ...)
+        ctx.setPropertyFunc(obj: obj, name: "add", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.undefined }
+            let add = strings(ctx, args)
+            if let exc = validate(self, ctx, add) { return exc }
             var list = tokens()
-            for arg in args {
-                if let cls = ctx.toSwiftString(arg), !cls.isEmpty, !list.contains(cls) {
-                    list.append(cls)
-                }
-            }
+            for cls in add where !list.contains(cls) { list.append(cls) }
             store(list)
+            self.syncTokenListIndices(thisVal, list, ctx: ctx)
             self.notifyMutation(for: node)
             return JeffJSValue.undefined
-        }, length: 1)
+        }, length: 0)
 
-        // remove(cls, ...)
-        ctx.setPropertyFunc(obj: obj, name: "remove", fn: { [weak self] ctx, _, args in
+        // remove(token, ...)
+        ctx.setPropertyFunc(obj: obj, name: "remove", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.undefined }
+            let remove = strings(ctx, args)
+            if let exc = validate(self, ctx, remove) { return exc }
             var list = tokens()
-            for arg in args {
-                if let cls = ctx.toSwiftString(arg) {
-                    list.removeAll { $0 == cls }
-                }
-            }
+            list.removeAll { remove.contains($0) }
             store(list)
+            self.syncTokenListIndices(thisVal, list, ctx: ctx)
             self.notifyMutation(for: node)
             return JeffJSValue.undefined
-        }, length: 1)
+        }, length: 0)
 
-        // toggle(cls, force?) -> bool
-        ctx.setPropertyFunc(obj: obj, name: "toggle", fn: { [weak self] ctx, _, args in
-            guard let self, let cls = self.extractString(ctx: ctx, args: args, index: 0), !cls.isEmpty else {
-                return .newBool(false)
-            }
+        // toggle(token, force?) -> bool
+        ctx.setPropertyFunc(obj: obj, name: "toggle", fn: { [weak self] ctx, thisVal, args in
+            guard let self else { return .newBool(false) }
+            let cls = ctx.toSwiftString(args.first ?? .undefined) ?? ""
+            if let exc = validate(self, ctx, [cls]) { return exc }
             var list = tokens()
+            let present = list.contains(cls)
             let hasForce = args.count >= 2 && !args[1].isUndefined
-            let shouldAdd = hasForce ? args[1].toBool() : !list.contains(cls)
-            if shouldAdd {
-                if !list.contains(cls) { list.append(cls) }
-            } else {
-                list.removeAll { $0 == cls }
-            }
+            let force = hasForce ? ctx.toBool(args[1]) : !present
+            if present == force { return .newBool(present) }   // nothing to do
+            if force { list.append(cls) } else { list.removeAll { $0 == cls } }
             store(list)
+            self.syncTokenListIndices(thisVal, list, ctx: ctx)
             self.notifyMutation(for: node)
-            return .newBool(shouldAdd)
+            return .newBool(force)
         }, length: 1)
 
         // contains(cls) -> bool
@@ -2744,20 +2815,23 @@ final class JeffJSDOMBridge {
         }, length: 1)
 
         // replace(oldCls, newCls) -> bool
-        ctx.setPropertyFunc(obj: obj, name: "replace", fn: { [weak self] ctx, _, args in
-            guard let self, args.count >= 2,
-                  let oldCls = ctx.toSwiftString(args[0]),
-                  let newCls = ctx.toSwiftString(args[1]) else {
-                return .newBool(false)
+        ctx.setPropertyFunc(obj: obj, name: "replace", fn: { [weak self] ctx, thisVal, args in
+            guard let self else { return .newBool(false) }
+            guard args.count >= 2 else {
+                return ctx.throwTypeError(message: "Failed to execute 'replace' on 'DOMTokenList': 2 arguments required, but only \(args.count) present.")
             }
+            let oldCls = ctx.toSwiftString(args[0]) ?? "", newCls = ctx.toSwiftString(args[1]) ?? ""
+            if let exc = validate(self, ctx, [oldCls, newCls]) { return exc }
             var list = tokens()
             guard let idx = list.firstIndex(of: oldCls) else { return .newBool(false) }
-            if list.contains(newCls) {
-                list.remove(at: idx)
+            // DOM §7.1 "replace": the first of old/new keeps the position.
+            if let newIdx = list.firstIndex(of: newCls) {
+                if newIdx < idx { list.remove(at: idx) } else { list[idx] = newCls; list.remove(at: newIdx) }
             } else {
                 list[idx] = newCls
             }
             store(list)
+            self.syncTokenListIndices(thisVal, list, ctx: ctx)
             self.notifyMutation(for: node)
             return .newBool(true)
         }, length: 2)
@@ -2832,6 +2906,7 @@ final class JeffJSDOMBridge {
             self.notifyMutation(for: node)
             return .undefined
         }, name: "set value", length: 1)
+        // (the indices are re-synced by the classList/relList getters too)
         ctx.setPropertyGetSet(obj: obj, name: "value", getter: valueGetter, setter: valueSetter)
 
         for (i, cls) in tokens().enumerated() {
@@ -2839,6 +2914,20 @@ final class JeffJSDOMBridge {
         }
 
         return obj
+    }
+
+    /// Keeps a cached DOMTokenList's indexed properties equal to `list`
+    /// (the object outlives attribute changes made by other APIs).
+    func syncTokenListIndices(_ obj: JeffJSValue, _ list: [String], ctx: JeffJSContext) {
+        guard obj.isObject else { return }
+        for (i, t) in list.enumerated() {
+            ctx.setPropertyUint32(obj: obj, index: UInt32(i), value: ctx.newStringValue(t))
+        }
+        var i = UInt32(list.count)
+        while ctx.hasPropertyByIndex(obj: obj, index: i) {
+            _ = ctx.deletePropertyByIndex(obj: obj, index: i)
+            i += 1
+        }
     }
 
     /// The content fragment backing a `<template>` element. Created on first use;
@@ -2925,11 +3014,12 @@ final class JeffJSDOMBridge {
     }
 
     /// Notifies the mutation observer of a change to the given node.
+    ///
+    /// Scripts are no longer started from here: the insertion and attribute
+    /// algorithms prepare them (`JeffJSDOMBridge+Scripts.swift`), once per
+    /// script, with the <script> element itself.
     func notifyMutation(for node: DOMNode) {
         onMutated?([node.id])
-        if node.tagName == "script", node.parent != nil {
-            onScriptExecution?(node)
-        }
     }
 
     /// Finds the first element node matching a predicate (DFS).
@@ -3079,6 +3169,8 @@ final class JeffJSDOMBridge {
                 namespace: node.namespaceURI
             )
             cloned.copyAttributes(from: node)
+            // HTML §4.12.1 script cloning steps: "already started" is copied.
+            cloned.scriptAlreadyStarted = node.scriptAlreadyStarted
             if deep {
                 // A template's contents are cloned with it (HTML §4.12.3
                 // cloning steps); they sit in its content fragment.
@@ -3241,7 +3333,15 @@ final class JeffJSDOMBridge {
             out += "<"
             out += tag
             // Attribute-list order (source order, then append order).
-            for (key, val) in node.orderedAttributes {
+            var attrs = node.orderedAttributes
+            if contentAttributeOverride != nil, node.nodeType == .element {
+                attrs = attrs.compactMap { pair in pageAttribute(node, pair.name).map { (name: pair.name, value: $0) } }
+                for name in Self.contentAttributeOverrideNames.sorted()
+                where node.attributes[name] == nil {
+                    if let v = pageAttribute(node, name) { attrs.append((name: name, value: v)) }
+                }
+            }
+            for (key, val) in attrs {
                 out += " "
                 out += key
                 out += "=\""
@@ -3282,12 +3382,18 @@ final class JeffJSDOMBridge {
     /// The HTML fragment parsing algorithm, run with `context` as the context
     /// element — which is what makes `table.innerHTML = "<tr>…"` keep its rows
     /// instead of foster-parenting them out of the table.
-    static func parseHTMLFragment(_ html: String, context: DOMNode? = nil) -> [DOMNode] {
-        HTMLParser.parseFragment(
+    /// Scripts it creates are marked "already started" (HTML §13.4: markup
+    /// inserted with innerHTML/outerHTML/insertAdjacentHTML never runs its
+    /// scripts); `createContextualFragment` passes false (DOM Parsing §7.1
+    /// "unmark all scripts as already started").
+    static func parseHTMLFragment(_ html: String, context: DOMNode? = nil, markScriptsStarted: Bool = true) -> [DOMNode] {
+        let nodes = HTMLParser.parseFragment(
             html,
             context: context?.tagName,
             contextNamespace: context?.namespaceURI
         )
+        if markScriptsStarted { markScriptsAlreadyStarted(in: nodes) }
+        return nodes
     }
 
     // MARK: - Inline Style Helpers

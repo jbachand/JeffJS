@@ -364,6 +364,8 @@ final class HTMLTreeBuilder {
         // adjustment tables already re-cased it, so `preserveCase: true` here
         // just avoids a `lowercased()` allocation per element.
         let element = DOMNode.element(tag: tag, preserveCase: true, namespace: namespace)
+        // HTML §4.12.1: the parser unsets "non-blocking" on scripts it creates.
+        if tag == "script" { element.scriptNonBlocking = false }
         for attribute in attributes {
             if preserveCase, attribute.name.contains(where: { $0.isUppercase }) {
                 // Foreign content: keep `viewBox` as authored and register the

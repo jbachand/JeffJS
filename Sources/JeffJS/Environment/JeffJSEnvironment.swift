@@ -99,7 +99,12 @@ public final class JeffJSEnvironment {
     public var onConsoleMessage: ((_ level: String, _ message: String) -> Void)?
     /// Called when JS mutates the DOM tree (node IDs that changed).
     public var onDOMMutation: ((_ mutatedNodeIDs: Set<UUID>) -> Void)?
-    /// Called when JS executes a dynamic script node.
+    /// Called with a script-inserted `<script>` element the page made ready to
+    /// run (HTML §4.12.1.1 "prepare the script element": inserted and connected,
+    /// children changed, or `src` set; once per element — see
+    /// `JeffJSDOMBridge+Scripts.swift` for the full contract). When nil, the
+    /// environment runs it itself (inline classic scripts synchronously,
+    /// `file:` scripts from a task, then `load` / `error`).
     public var onScriptExecution: ((_ scriptNode: DOMNode) -> Void)?
     /// Called to look up computed style values for getComputedStyle().
     public var computedStyleLookup: ((_ nodeID: UUID, _ property: String) -> String?)?
@@ -195,7 +200,15 @@ public final class JeffJSEnvironment {
                 }
             },
             onScriptExecution: { [weak self] scriptNode in
-                self?.onScriptExecution?(scriptNode)
+                guard let self else { return }
+                // The bridge prepared it (connected, already started, runnable
+                // type). Without a host runner, run it here: inline classic
+                // scripts synchronously, file: URLs from a task, then load/error.
+                if let host = self.onScriptExecution {
+                    host(scriptNode)
+                } else {
+                    self.domBridge?.runScriptElementDefault(scriptNode)
+                }
             }
         )
         domBridge.onError = { [weak self] msg in
