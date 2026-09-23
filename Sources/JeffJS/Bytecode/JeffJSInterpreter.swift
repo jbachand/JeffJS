@@ -1592,14 +1592,22 @@ extension JeffJSContext {
     }
 
     /// Sets a property using a dynamic key (string, number, or symbol).
-    func setPropertyValue(obj: JeffJSValue, prop: JeffJSValue, val: JeffJSValue) -> Bool {
+    /// `strict: false` is sloppy-mode PutValue: a refused write (read-only
+    /// property, non-extensible target) is ignored instead of thrown.
+    func setPropertyValue(obj: JeffJSValue, prop: JeffJSValue, val: JeffJSValue,
+                          strict: Bool = true) -> Bool {
+        @inline(__always) func put(_ atom: UInt32) -> Bool {
+            return setPropertyChecked(obj: obj, atom: atom, value: val, strict: strict) >= 0
+        }
         if prop.isInt {
-            return setPropertyUint32(obj: obj, index: UInt32(bitPattern: prop.toInt32()),
-                                     value: val) >= 0
+            let atom = rt.newAtomUInt32(UInt32(bitPattern: prop.toInt32()))
+            let result = put(atom)
+            rt.freeAtom(atom)
+            return result
         }
         if prop.isString, let str = prop.stringValue {
             let atom = rt.findAtom(jsString: str)
-            let result = setProperty(obj: obj, atom: atom, value: val) >= 0
+            let result = put(atom)
             rt.freeAtom(atom)
             // Don't free atom — setProperty stores it in the shape.
             return result
@@ -1609,12 +1617,15 @@ extension JeffJSContext {
             if d >= 0 && d <= Double(UInt32.max) {
                 let u = UInt32(d)
                 if Double(u) == d {
-                    return setPropertyUint32(obj: obj, index: u, value: val) >= 0
+                    let atom = rt.newAtomUInt32(u)
+                    let result = put(atom)
+                    rt.freeAtom(atom)
+                    return result
                 }
             }
             let key = JeffJSTypeConvert.formatNumber(d)
             let atom = rt.findAtom(key)
-            let result = setProperty(obj: obj, atom: atom, value: val) >= 0
+            let result = put(atom)
             rt.freeAtom(atom)
             // Don't free atom — setProperty stores it in the shape.
             return result
@@ -1622,7 +1633,7 @@ extension JeffJSContext {
         if prop.isSymbol {
             if let symStr = prop.toPtr() as? JeffJSString {
                 let atom = rt.symbolAtom(for: symStr)
-                return setProperty(obj: obj, atom: atom, value: val) >= 0
+                return put(atom)
             }
         }
         // Fallback: convert to string
@@ -1630,7 +1641,7 @@ extension JeffJSContext {
         if strVal.isException { return false }
         if let str = strVal.stringValue {
             let atom = rt.findAtom(str.toSwiftString())
-            let result = setProperty(obj: obj, atom: atom, value: val) >= 0
+            let result = put(atom)
             rt.freeAtom(atom)
             // Don't free atom — setProperty stores it in the shape.
             return result
@@ -1639,28 +1650,38 @@ extension JeffJSContext {
     }
 
     /// Deletes a property using a dynamic key (string, number, or symbol).
-    func deletePropertyValue(obj: JeffJSValue, key: JeffJSValue) -> Bool {
+    func deletePropertyValue(obj: JeffJSValue, key: JeffJSValue, flags: Int = 0) -> Bool {
         if key.isString, let str = key.stringValue {
             let atom = rt.findAtom(str.toSwiftString())
-            let result = deleteProperty(obj: obj, atom: atom)
+            let result = deleteProperty(obj: obj, atom: atom, flags: flags)
             rt.freeAtom(atom)
             return result
         }
         if key.isInt {
             let atom = rt.newAtomUInt32(UInt32(bitPattern: key.toInt32()))
-            let result = deleteProperty(obj: obj, atom: atom)
+            let result = deleteProperty(obj: obj, atom: atom, flags: flags)
             rt.freeAtom(atom)
             return result
         }
         if key.isFloat64 {
             let k = JeffJSTypeConvert.formatNumber(key.toFloat64())
             let atom = rt.findAtom(k)
-            let result = deleteProperty(obj: obj, atom: atom)
+            let result = deleteProperty(obj: obj, atom: atom, flags: flags)
             rt.freeAtom(atom)
             return result
         }
         if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
-            return deleteProperty(obj: obj, atom: rt.symbolAtom(for: symStr))
+            return deleteProperty(obj: obj, atom: rt.symbolAtom(for: symStr), flags: flags)
+        }
+        // Any other key (boolean, null, object): ToPropertyKey.
+        let strVal = JeffJSTypeConvert.toString(ctx: self, val: key)
+        if strVal.isException { return false }
+        defer { strVal.freeValue() }
+        if let str = strVal.stringValue {
+            let atom = rt.findAtom(str.toSwiftString())
+            let result = deleteProperty(obj: obj, atom: atom, flags: flags)
+            rt.freeAtom(atom)
+            return result
         }
         return false
     }
@@ -2238,9 +2259,16 @@ extension JeffJSContext {
             // Fast-array elements are not shape properties: enumerate their
             // indices (present, i.e. not a hole) first.
             if let snap = cur.arraySnapshot() {
+                let attrs = cur._fastArrayValues?.attrs
                 var i = 0
                 while i < snap.count && i < snap.values.count {
-                    if !snap.values[i].isUninitialized { intKeys.append(UInt32(i)) }
+                    if !snap.values[i].isUninitialized {
+                        // defineProperty(arr, i, {enumerable: false})
+                        if let a = attrs, i < a.count, a[i] & JeffJSFastArrayStorage.attrEnumerable == 0 {
+                            i += 1; continue
+                        }
+                        intKeys.append(UInt32(i))
+                    }
                     i += 1
                 }
             }
@@ -3630,8 +3658,8 @@ private func executeFastTrace(
             let objV = buf[sp - 3]
             guard key.isInt, let jsObj = objV.obj,
                   jsObj.classID == JeffJSClassID.array.rawValue,
-                  let storage = jsObj._fastArrayValues else {
-                resume = pc; break traceLoop // deopt: only the ref-type storage is safe to poke here
+                  let storage = jsObj._fastArrayValues, !storage.checked else {
+                resume = pc; break traceLoop // deopt: only the ref-type storage is safe to poke here (and not frozen/sealed)
             }
             let idx = key.toInt32()
             // In-bounds overwrite only — growth/length updates take the slow path.
@@ -4914,8 +4942,8 @@ private func executeFastTraceLean(
             let objV = buf[sp - 3]
             guard key.isInt, let jsObj = objV.obj,
                   jsObj.classID == JeffJSClassID.array.rawValue,
-                  let storage = jsObj._fastArrayValues else {
-                ctx.interruptCounter = interrupt; return pc // deopt: only the ref-type storage is safe to poke here
+                  let storage = jsObj._fastArrayValues, !storage.checked else {
+                ctx.interruptCounter = interrupt; return pc // deopt: only the ref-type storage is safe to poke here (and not frozen/sealed)
             }
             let idx = key.toInt32()
             // In-bounds overwrite only — growth/length updates take the slow path.
@@ -8971,11 +8999,12 @@ struct JeffJSInterpreter {
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                // Dense-array in-bounds overwrite fast path. Growth, holes and
-                // length updates take the full setPropertyValue path.
+                // Dense-array in-bounds overwrite fast path. Growth, holes,
+                // length updates and frozen/sealed/non-extensible arrays
+                // (`storage.checked`) take the full setPropertyValue path.
                 if key.isInt, let jsObj = obj.obj,
                    jsObj.classID == JeffJSClassID.array.rawValue,
-                   let storage = jsObj._fastArrayValues {
+                   let storage = jsObj._fastArrayValues, !storage.checked {
                     let idx = key.toInt32()
                     if idx >= 0, UInt32(idx) < storage.count, Int(idx) < storage.values.count {
                         let old = storage.values[Int(idx)]
@@ -8986,7 +9015,10 @@ struct JeffJSInterpreter {
                         continue dispatchLoop
                     }
                 }
-                let ok = ctx.setPropertyValue(obj: obj, prop: key, val: val)
+                // Sloppy code ignores a refused write (read-only element,
+                // non-extensible target); strict code throws.
+                let ok = ctx.setPropertyValue(obj: obj, prop: key, val: val,
+                                              strict: fb.isStrictMode)
                 obj.freeValue()
                 if !ok {
                     retVal = .exception
@@ -11009,8 +11041,17 @@ struct JeffJSInterpreter {
             case .delete_:
                 let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                let ok = ctx.deletePropertyValue(obj: obj, key: key)
+                // Strict code: a refused delete (non-configurable property)
+                // is a TypeError (ES §13.5.1.2 step 5.e), thrown by
+                // [[Delete]] itself under JS_PROP_THROW.
+                let strictDelete = fb.isStrictMode && obj.isObject
+                let ok = ctx.deletePropertyValue(obj: obj, key: key,
+                                                 flags: strictDelete ? JS_PROP_THROW : 0)
                 obj.freeValue(); key.freeValue()
+                if !ok && strictDelete {
+                    retVal = .exception
+                    break dispatchLoop
+                }
                 buf[sp] = .newBool(ok); sp += 1
                 pc += 1
 

@@ -236,12 +236,30 @@ extension JeffJSContext {
         // described.
         if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
 
-        // Fast-array elements are not shape properties: they are always
-        // { writable: true, enumerable: true, configurable: true }.
+        // Fast-array elements are not shape properties: their attributes
+        // live in the element storage (all true unless defineProperty,
+        // seal or freeze changed them).
         if rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom),
            jsObj.hasArrayElement(idx) {
+            let bits = jsObj._fastArrayValues?.attr(Int(idx)) ?? JeffJSFastArrayStorage.attrDefault
             let desc = newPlainObject()
             _ = setPropertyStr(obj: desc, name: "value", value: jsObj.getArrayElement(idx).dupValue())
+            _ = setPropertyStr(obj: desc, name: "writable",
+                               value: .newBool(bits & JeffJSFastArrayStorage.attrWritable != 0))
+            _ = setPropertyStr(obj: desc, name: "enumerable",
+                               value: .newBool(bits & JeffJSFastArrayStorage.attrEnumerable != 0))
+            _ = setPropertyStr(obj: desc, name: "configurable",
+                               value: .newBool(bits & JeffJSFastArrayStorage.attrConfigurable != 0))
+            return desc
+        }
+        // Typed-array elements (ES §10.4.5.1): writable, enumerable and
+        // configurable data properties while in bounds.
+        if jeffJS_isTypedArrayClass(jsObj.classID), rt.atomIsArrayIndex(atom),
+           let idx = rt.atomToUInt32(atom), Int(idx) < typedArrayElementCount(jsObj) {
+            let v = getProperty(obj: obj, atom: atom)
+            if v.isException { return v }
+            let desc = newPlainObject()
+            _ = setPropertyStr(obj: desc, name: "value", value: v)
             _ = setPropertyStr(obj: desc, name: "writable", value: .JS_TRUE)
             _ = setPropertyStr(obj: desc, name: "enumerable", value: .JS_TRUE)
             _ = setPropertyStr(obj: desc, name: "configurable", value: .JS_TRUE)
@@ -509,10 +527,12 @@ extension JeffJSContext {
         if wantStrings {
             if let snap = jsObj.arraySnapshot() {
                 let values = snap.values, count = snap.count
+                let attrs = enumOnly ? jsObj._fastArrayValues?.attrs : nil
                 for i in 0..<count {
                     // Only a hole is absent; an explicit `undefined` element is
                     // still an own property.
                     if i < values.count && !values[i].isUninitialized {
+                        if let a = attrs, i < a.count, a[i] & JeffJSFastArrayStorage.attrEnumerable == 0 { continue }
                         intKeys.append((UInt32(i), intKeyString(i)))
                     }
                 }
@@ -601,7 +621,7 @@ extension JeffJSContext {
             return throwTypeError(message: "not an object")
         }
         materializeDeferredOwnProps(obj)
-        obj.extensible = false
+        obj.makeNonExtensible()
         return .undefined
     }
 
@@ -662,7 +682,17 @@ extension JeffJSContext {
             return throwTypeError(message: "not an object")
         }
         materializeDeferredOwnProps(jsObj)
-        jsObj.extensible = false
+        // A typed array's elements cannot be made non-configurable (ES
+        // §10.4.5.3 rejects it), so SetIntegrityLevel throws once there is
+        // one — after PreventExtensions, as in the spec.
+        if jeffJS_isTypedArrayClass(jsObj.classID), typedArrayElementCount(jsObj) > 0 {
+            jsObj.extensible = false
+            return throwTypeError(message: "Cannot \(level == .frozen ? "freeze" : "seal") array buffer views with elements")
+        }
+        jsObj.makeNonExtensible()
+        if jsObj.classID == JeffJSClassID.array.rawValue {
+            applyArrayIntegrityLevel(jsObj, level: level)
+        }
         prepareShapeUpdate(self, jsObj)   // flags are per-object: unshare first
         if let shape = jsObj.shape {
             for i in 0 ..< shape.prop.count where shape.prop[i].atom != 0 {
@@ -675,9 +705,26 @@ extension JeffJSContext {
         return obj
     }
 
+    /// Element count of a typed array view (0 when detached).
+    func typedArrayElementCount(_ o: JeffJSObject) -> Int {
+        guard case .typedArray(let ta) = o.payload else { return 0 }
+        guard let bufObj = ta.buffer, case .arrayBuffer(let ab) = bufObj.payload, !ab.detached else { return 0 }
+        return Int(ta.length)
+    }
+
     func testIntegrityLevel(_ obj: JeffJSValue, level: JeffJSIntegrityLevel) -> Bool {
         guard let jsObj = obj.toObject() else { return true }
         if jsObj.extensible { return false }
+        // Elements are own properties too: a fast array's carry their own
+        // attribute bits, and a typed array's are always writable and
+        // configurable.
+        if jsObj.classID == JeffJSClassID.array.rawValue,
+           !arrayElementsSatisfy(jsObj, level: level) {
+            return false
+        }
+        if jeffJS_isTypedArrayClass(jsObj.classID), typedArrayElementCount(jsObj) > 0 {
+            return false
+        }
         if let shape = jsObj.shape {
             for sp in shape.prop where sp.atom != 0 {
                 if sp.flags.contains(.configurable) { return false }

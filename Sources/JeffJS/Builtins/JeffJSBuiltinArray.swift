@@ -239,7 +239,12 @@ struct JeffJSBuiltinArray {
                     val = mapped
                 }
 
-                ctx.setPropertyByIndex(obj: arr, index: UInt32(k), value: val)
+                // CreateDataPropertyOrThrow: a frozen constructed result throws.
+                if !putIndex(ctx: ctx, arr, k, val) {
+                    ctx.iteratorClose(iter: iter, isThrow: true)
+                    arr.freeValue()
+                    return .exception
+                }
 
                 k += 1
             }
@@ -279,7 +284,7 @@ struct JeffJSBuiltinArray {
                 val = mapped
             }
 
-            ctx.setPropertyByIndex(obj: arr, index: UInt32(k), value: val)
+            if !putIndex(ctx: ctx, arr, k, val) { arr.freeValue(); return .exception }
 
             k += 1
         }
@@ -306,7 +311,8 @@ struct JeffJSBuiltinArray {
         }
 
         for i in 0..<len {
-            ctx.setPropertyByIndex(obj: arr, index: UInt32(i), value: args[i].dupValue())   // the setter takes ownership; args are borrowed
+            // The setter takes ownership; args are borrowed.
+            if !putIndex(ctx: ctx, arr, Int64(i), args[i].dupValue()) { arr.freeValue(); return .exception }
         }
 
         ctx.setArrayLength(arr, Int64(len))
@@ -338,11 +344,12 @@ struct JeffJSBuiltinArray {
         }
 
         for i in 0..<args.count {
-            ctx.setPropertyByIndex(obj: obj, index: UInt32(len), value: args[i].dupValue())   // the setter takes ownership; args are borrowed
+            // The setter takes ownership; args are borrowed.
+            if !putIndex(ctx: ctx, obj, len, args[i].dupValue()) { return .exception }
             len += 1
         }
 
-        setLength(ctx: ctx, obj: obj, length: len)
+        if setLength(ctx: ctx, obj: obj, length: len) < 0 { return .exception }
 
         return ctx.newInt64(len)
     }
@@ -358,7 +365,7 @@ struct JeffJSBuiltinArray {
         if len < 0 { return .exception }
 
         if len == 0 {
-            setLength(ctx: ctx, obj: obj, length: 0)
+            if setLength(ctx: ctx, obj: obj, length: 0) < 0 { return .exception }
             return .undefined
         }
 
@@ -366,9 +373,9 @@ struct JeffJSBuiltinArray {
         let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(len))
         if val.isException { return val }
 
-        _ = ctx.deletePropertyByIndex(obj: obj, index: UInt32(len))
+        if !deleteIndex(ctx: ctx, obj, len) { val.freeValue(); return .exception }
 
-        setLength(ctx: ctx, obj: obj, length: len)
+        if setLength(ctx: ctx, obj: obj, length: len) < 0 { val.freeValue(); return .exception }
 
         return val
     }
@@ -384,7 +391,7 @@ struct JeffJSBuiltinArray {
         if len < 0 { return .exception }
 
         if len == 0 {
-            setLength(ctx: ctx, obj: obj, length: 0)
+            if setLength(ctx: ctx, obj: obj, length: 0) < 0 { return .exception }
             return .undefined
         }
 
@@ -398,18 +405,18 @@ struct JeffJSBuiltinArray {
 
             if has {
                 let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
-                if val.isException { return val }
-                ctx.setPropertyByIndex(obj: obj, index: UInt32(k - 1), value: val)
+                if val.isException { first.freeValue(); return val }
+                if !putIndex(ctx: ctx, obj, k - 1, val) { first.freeValue(); return .exception }
             } else {
-                _ = ctx.deletePropertyByIndex(obj: obj, index: UInt32(k - 1))
+                if !deleteIndex(ctx: ctx, obj, k - 1) { first.freeValue(); return .exception }
             }
             k += 1
         }
 
-        _ = ctx.deletePropertyByIndex(obj: obj, index: UInt32(len - 1))
+        if !deleteIndex(ctx: ctx, obj, len - 1) { first.freeValue(); return .exception }
 
         len -= 1
-        setLength(ctx: ctx, obj: obj, length: len)
+        if setLength(ctx: ctx, obj: obj, length: len) < 0 { first.freeValue(); return .exception }
 
         return first
     }
@@ -441,22 +448,23 @@ struct JeffJSBuiltinArray {
                 if has {
                     let val = ctx.getPropertyByIndex(obj: obj, index: from)
                     if val.isException { return val }
-                    ctx.setPropertyByIndex(obj: obj, index: to, value: val)
+                    if !putIndex(ctx: ctx, obj, Int64(to), val) { return .exception }
                 } else {
-                    _ = ctx.deletePropertyByIndex(obj: obj, index: to)
+                    if !deleteIndex(ctx: ctx, obj, Int64(to)) { return .exception }
                 }
                 k -= 1
             }
 
             // Insert new elements at the beginning
             for i in 0..<args.count {
-                ctx.setPropertyByIndex(obj: obj, index: UInt32(i), value: args[i].dupValue())   // the setter takes ownership; args are borrowed
+                // The setter takes ownership; args are borrowed.
+                if !putIndex(ctx: ctx, obj, Int64(i), args[i].dupValue()) { return .exception }
             }
 
             len += argCount
         }
 
-        setLength(ctx: ctx, obj: obj, length: len)
+        if setLength(ctx: ctx, obj: obj, length: len) < 0 { return .exception }
 
         return ctx.newInt64(len)
     }
@@ -535,10 +543,10 @@ struct JeffJSBuiltinArray {
 
                 if has {
                     let val = ctx.getPropertyByIndex(obj: obj, index: from)
-                    if val.isException { return val }
-                    ctx.setPropertyByIndex(obj: obj, index: to, value: val)
+                    if val.isException { result.freeValue(); return val }
+                    if !putIndex(ctx: ctx, obj, Int64(to), val) { result.freeValue(); return .exception }
                 } else {
-                    _ = ctx.deletePropertyByIndex(obj: obj, index: to)
+                    if !deleteIndex(ctx: ctx, obj, Int64(to)) { result.freeValue(); return .exception }
                 }
                 k += 1
             }
@@ -546,7 +554,7 @@ struct JeffJSBuiltinArray {
             var j = len
             while j > len - actualDeleteCount + itemCount {
                 j -= 1
-                _ = ctx.deletePropertyByIndex(obj: obj, index: UInt32(j))
+                if !deleteIndex(ctx: ctx, obj, j) { result.freeValue(); return .exception }
             }
         } else if itemCount > actualDeleteCount {
             // Shift up
@@ -560,21 +568,23 @@ struct JeffJSBuiltinArray {
 
                 if has {
                     let val = ctx.getPropertyByIndex(obj: obj, index: from)
-                    if val.isException { return val }
-                    ctx.setPropertyByIndex(obj: obj, index: to, value: val)
+                    if val.isException { result.freeValue(); return val }
+                    if !putIndex(ctx: ctx, obj, Int64(to), val) { result.freeValue(); return .exception }
                 } else {
-                    _ = ctx.deletePropertyByIndex(obj: obj, index: to)
+                    if !deleteIndex(ctx: ctx, obj, Int64(to)) { result.freeValue(); return .exception }
                 }
             }
         }
 
         // Insert new items
         for i in 0..<Int(itemCount) {
-            ctx.setPropertyByIndex(obj: obj, index: UInt32(actualStart + Int64(i)), value: args[i + 2].dupValue())
+            if !putIndex(ctx: ctx, obj, actualStart + Int64(i), args[i + 2].dupValue()) {
+                result.freeValue(); return .exception
+            }
         }
 
         let newLen = len - actualDeleteCount + itemCount
-        setLength(ctx: ctx, obj: obj, length: newLen)
+        if setLength(ctx: ctx, obj: obj, length: newLen) < 0 { result.freeValue(); return .exception }
 
         return result
     }
@@ -655,22 +665,27 @@ struct JeffJSBuiltinArray {
             return .exception
         }
 
-        // Write back sorted elements
+        // Write back sorted elements: Set(obj, j, v, true) for every one,
+        // so a frozen array throws even when already in order (§23.1.3.30).
         var writeIdx: Int64 = 0
-        for elem in elements {
-            ctx.setPropertyByIndex(obj: obj, index: UInt32(writeIdx), value: elem.value)
+        for (n, elem) in elements.enumerated() {
+            if !putIndex(ctx: ctx, obj, writeIdx, elem.value) {
+                // The rest were never handed to the setter.
+                for rest in elements[(n + 1)...] { rest.value.freeValue() }
+                return .exception
+            }
             writeIdx += 1
         }
 
         // Write undefineds
         for _ in 0..<undefinedCount {
-            ctx.setPropertyByIndex(obj: obj, index: UInt32(writeIdx), value: .undefined)
+            if !putIndex(ctx: ctx, obj, writeIdx, .undefined) { return .exception }
             writeIdx += 1
         }
 
         // Delete holes at the end
         while writeIdx < len {
-            _ = ctx.deletePropertyByIndex(obj: obj, index: UInt32(writeIdx))
+            if !deleteIndex(ctx: ctx, obj, writeIdx) { return .exception }
             writeIdx += 1
         }
 
@@ -700,20 +715,20 @@ struct JeffJSBuiltinArray {
                 let lowerVal = ctx.getPropertyByIndex(obj: obj, index: UInt32(lower))
                 if lowerVal.isException { return lowerVal }
                 let upperVal = ctx.getPropertyByIndex(obj: obj, index: UInt32(upper))
-                if upperVal.isException { return upperVal }
+                if upperVal.isException { lowerVal.freeValue(); return upperVal }
 
-                ctx.setPropertyByIndex(obj: obj, index: UInt32(lower), value: upperVal)
-                ctx.setPropertyByIndex(obj: obj, index: UInt32(upper), value: lowerVal)
+                if !putIndex(ctx: ctx, obj, lower, upperVal) { lowerVal.freeValue(); return .exception }
+                if !putIndex(ctx: ctx, obj, upper, lowerVal) { return .exception }
             } else if !lowerExists && upperExists {
                 let upperVal = ctx.getPropertyByIndex(obj: obj, index: UInt32(upper))
                 if upperVal.isException { return upperVal }
-                ctx.setPropertyByIndex(obj: obj, index: UInt32(lower), value: upperVal)
-                _ = ctx.deletePropertyByIndex(obj: obj, index: UInt32(upper))
+                if !putIndex(ctx: ctx, obj, lower, upperVal) { return .exception }
+                if !deleteIndex(ctx: ctx, obj, upper) { return .exception }
             } else if lowerExists && !upperExists {
                 let lowerVal = ctx.getPropertyByIndex(obj: obj, index: UInt32(lower))
                 if lowerVal.isException { return lowerVal }
-                _ = ctx.deletePropertyByIndex(obj: obj, index: UInt32(lower))
-                ctx.setPropertyByIndex(obj: obj, index: UInt32(upper), value: lowerVal)
+                if !deleteIndex(ctx: ctx, obj, lower) { lowerVal.freeValue(); return .exception }
+                if !putIndex(ctx: ctx, obj, upper, lowerVal) { return .exception }
             }
             // Both absent: no-op
 
@@ -743,7 +758,8 @@ struct JeffJSBuiltinArray {
 
         var i = k
         while i < final_ {
-            ctx.setPropertyByIndex(obj: obj, index: UInt32(i), value: value.dupValue())   // the setter takes ownership
+            // The setter takes ownership.
+            if !putIndex(ctx: ctx, obj, i, value.dupValue()) { return .exception }
             i += 1
         }
 
@@ -788,9 +804,9 @@ struct JeffJSBuiltinArray {
             if has {
                 let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(from))
                 if val.isException { return val }
-                ctx.setPropertyByIndex(obj: obj, index: UInt32(to), value: val)
+                if !putIndex(ctx: ctx, obj, to, val) { return .exception }
             } else {
-                _ = ctx.deletePropertyByIndex(obj: obj, index: UInt32(to))
+                if !deleteIndex(ctx: ctx, obj, to) { return .exception }
             }
 
             from += direction
@@ -1965,12 +1981,30 @@ struct JeffJSBuiltinArray {
         return (r, pinned)
     }
 
-    /// Set the "length" property of an object.
-    /// Returns 0 on success, -1 on failure.
+    /// Set the "length" property of an object: `Set(O, "length", len, true)`.
+    /// Returns 0 on success, -1 with a pending exception on failure (a
+    /// frozen array or a read-only length).
     @discardableResult
     private static func setLength(ctx: JeffJSContext, obj: JeffJSValue, length: Int64) -> Int {
         return ctx.setProperty(obj: obj, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
-                               value: ctx.newInt64(length))
+                               value: ctx.newInt64(length)) < 0 ? -1 : 0
+    }
+
+    /// `Set(O, k, v, true)` (consumes `v`): false with a pending TypeError
+    /// when the write is refused (read-only element, non-extensible array).
+    @inline(__always)
+    private static func putIndex(ctx: JeffJSContext, _ obj: JeffJSValue, _ k: Int64,
+                                 _ v: JeffJSValue) -> Bool {
+        return ctx.setProperty(obj: obj, atom: UInt32(truncatingIfNeeded: k) | 0x80000000, value: v) >= 0
+    }
+
+    /// `DeletePropertyOrThrow(O, k)`: false with a pending TypeError when
+    /// the element is non-configurable (sealed / frozen array).
+    @inline(__always)
+    private static func deleteIndex(ctx: JeffJSContext, _ obj: JeffJSValue, _ k: Int64) -> Bool {
+        // [[Delete]] under JS_PROP_THROW throws whenever it answers false.
+        return ctx.deleteProperty(obj: obj, atom: UInt32(truncatingIfNeeded: k) | 0x80000000,
+                                  flags: JS_PROP_THROW)
     }
 
     /// Resolve a relative index argument to an absolute index.

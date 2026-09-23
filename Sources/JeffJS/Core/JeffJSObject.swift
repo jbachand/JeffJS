@@ -1269,10 +1269,54 @@ final class JeffJSPropertyExtra {
 final class JeffJSFastArrayStorage {
     var values: ContiguousArray<JeffJSValue>
     var count: UInt32
+    /// Per-element attribute bits (`attrWritable|attrEnumerable|
+    /// attrConfigurable`), parallel to `values`. nil while every element is
+    /// an ordinary `{writable, enumerable, configurable}` data property,
+    /// which is the only state the unchecked fast paths may assume.
+    var attrs: ContiguousArray<UInt8>? = nil
+    /// Set once element writes need the checked path (ES §10.1.9 [[Set]],
+    /// §10.4.2.1 array [[DefineOwnProperty]]): the owner is non-extensible,
+    /// its `length` is non-writable, or some element has non-default
+    /// attributes (`attrs`). Every unchecked element write — the
+    /// interpreter's `put_array_el` fast paths and setPropertyInternal's
+    /// element store — tests this one flag and takes
+    /// `JeffJSContext.setArrayElementChecked` instead. Never cleared.
+    var checked: Bool = false
+
+    static let attrWritable: UInt8 = 1
+    static let attrEnumerable: UInt8 = 2
+    static let attrConfigurable: UInt8 = 4
+    static let attrDefault: UInt8 = 7
 
     init(values: ContiguousArray<JeffJSValue>, count: UInt32) {
         self.values = values
         self.count = count
+    }
+
+    /// True when index `i` holds an element (not a hole, not past the end).
+    @inline(__always)
+    func isPresent(_ i: Int) -> Bool {
+        return i >= 0 && i < Int(count) && i < values.count && !values[i].isUninitialized
+    }
+
+    /// Attribute bits of element `i` (meaningful only while it is present).
+    @inline(__always)
+    func attr(_ i: Int) -> UInt8 {
+        guard let a = attrs, i < a.count else { return JeffJSFastArrayStorage.attrDefault }
+        return a[i]
+    }
+
+    /// Set the attribute bits of element `i`; any non-default value switches
+    /// the array to the checked write path.
+    func setAttr(_ i: Int, _ bits: UInt8) {
+        if attrs == nil {
+            if bits == JeffJSFastArrayStorage.attrDefault { return }
+            attrs = ContiguousArray(repeating: JeffJSFastArrayStorage.attrDefault,
+                                    count: max(values.count, i + 1))
+        }
+        while attrs!.count <= i { attrs!.append(JeffJSFastArrayStorage.attrDefault) }
+        attrs![i] = bits
+        if bits != JeffJSFastArrayStorage.attrDefault { checked = true }
     }
 
     /// Append a value and return the new count.
@@ -1962,6 +2006,8 @@ extension JeffJSObject {
             guard index < storage.count, Int(index) < storage.values.count else { return false }
             storage.values[Int(index)].freeValue()
             storage.values[Int(index)] = .uninitialized
+            // A later add at this index is a fresh default property.
+            if storage.attrs != nil { storage.setAttr(Int(index), JeffJSFastArrayStorage.attrDefault) }
             return true
         }
         if case .array(let size, var vals, let count) = payload {
@@ -1983,6 +2029,17 @@ extension JeffJSObject {
         guard case .array(_, let vals, let count) = payload else { return nil }
         let st = JeffJSFastArrayStorage(values: ContiguousArray(vals), count: count)
         _fastArrayValues = st
+        return st
+    }
+
+    /// Switch this array's element writes to the checked path (see
+    /// `JeffJSFastArrayStorage.checked`), materialising the ref-type storage
+    /// if the elements still live in the `.array` payload. Returns the
+    /// storage, or nil when the object has no fast elements.
+    @discardableResult
+    func markArrayWritesChecked() -> JeffJSFastArrayStorage? {
+        guard let st = fastArrayStorage() else { return nil }
+        st.checked = true
         return st
     }
 
@@ -2042,6 +2099,10 @@ extension JeffJSObject {
                 storage.values[i].freeValue(); storage.values[i] = .undefined; i += 1
             }
             storage.count = UInt32(max(newLen, 0))
+            if var a = storage.attrs, a.count > max(newLen, 0) {
+                a.removeSubrange(max(newLen, 0)...)
+                storage.attrs = a
+            }
         } else if case .array(let size, var vals, let count) = payload {
             let cur = Int(count)
             if newLen >= cur { return }
