@@ -3612,6 +3612,16 @@ final class JeffJSParser {
         // Mark body start for function declaration hoisting
         fd.bodyBytecodeStart = fd.byteCode.len
 
+        // A generator's call runs FunctionDeclarationInstantiation and then
+        // suspends (ES §27.5.3.1 / §27.6.3.2; QuickJS OP_initial_yield). The
+        // opcode sits at the body start, so the step-28 copies and the hoisted
+        // function declarations, both inserted AT bodyBytecodeStart, land
+        // before it and run at call time too; the first next() resumes here.
+        if fd.funcKind == JSFunctionKindEnum.JS_FUNC_GENERATOR.rawValue ||
+           fd.funcKind == JSFunctionKindEnum.JS_FUNC_ASYNC_GENERATOR.rawValue {
+            emitOp(.initial_yield)
+        }
+
         while tok != 0x7D && tok != JSTokenType.TOK_EOF.rawValue && !shouldAbort {
             parseSourceElement()
         }
@@ -7543,6 +7553,16 @@ final class JeffJSParser {
     /// Parse: yield [* AssignmentExpression]
     ///      | yield [AssignmentExpression]
     func parseYieldExpression() {
+        // A generator's formals are evaluated by the call, before the
+        // generator object exists: ES §15.5.1 makes a YieldExpression in
+        // FormalParameters an early error (QuickJS: "yield in default
+        // expression").
+        if parsingParameters &&
+           (fd.funcKind == JSFunctionKindEnum.JS_FUNC_GENERATOR.rawValue ||
+            fd.funcKind == JSFunctionKindEnum.JS_FUNC_ASYNC_GENERATOR.rawValue) {
+            syntaxError("yield is not allowed in formal parameters")
+            return
+        }
         expect(JSTokenType.TOK_YIELD.rawValue)
 
         if s.gotLF || tok == 0x3B || tok == 0x7D || tok == 0x29 || tok == 0x5D ||
@@ -7573,6 +7593,14 @@ final class JeffJSParser {
 
     /// Parse: await UnaryExpression
     func parseAwaitExpression() {
+        // Likewise for an AwaitExpression in an async function's formals
+        // (ES §15.8.1, §15.6.1).
+        if parsingParameters &&
+           (fd.funcKind == JSFunctionKindEnum.JS_FUNC_ASYNC.rawValue ||
+            fd.funcKind == JSFunctionKindEnum.JS_FUNC_ASYNC_GENERATOR.rawValue) {
+            syntaxError("await is not allowed in formal parameters")
+            return
+        }
         expect(JSTokenType.TOK_AWAIT.rawValue)
         parseUnaryExpr()
         emitOp(.await_)

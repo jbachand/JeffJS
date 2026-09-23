@@ -445,16 +445,14 @@ extension JeffJSContext {
                 return fn(self, thisVal, args, nil, Int(magic))
             }
         }
-        // Generator function path: create a generator object and save the
-        // initial interpreter state so that the first .next() call starts
-        // execution from the beginning of the generator body.
-        //
-        // QuickJS emits an `initial_yield` opcode at the top of every
-        // generator body.  The JeffJS parser/compiler does NOT emit this
-        // opcode, so we synthesise the effect here: build a
-        // GeneratorSavedState that points to pc=0 (the very first
-        // bytecode) and mark it as isInitialYield so that the first
-        // resumption doesn't push a spurious value onto the stack.
+        // Generator function path (ES §27.5.3.1 EvaluateGeneratorBody /
+        // §27.6.3.2 EvaluateAsyncGeneratorBody): FunctionDeclarationInstantiation
+        // — `this`/`arguments` binding, parameter defaults and destructuring,
+        // hoisted function declarations — runs NOW, at call time, so a
+        // throwing default or a bad destructuring argument throws from the
+        // call itself. The parser emits `initial_yield` right after that
+        // prologue (QuickJS does the same); the activation suspends there and
+        // the first `next()` resumes into the body proper.
         if case .bytecodeFunc(let fbOpt, _, _) = obj.payload,
            let fb = fbOpt, fb.isGenerator {
             // An `async function*` produces an AsyncGenerator, whose
@@ -467,40 +465,44 @@ extension JeffJSContext {
                 : JSClassID.JS_CLASS_GENERATOR.rawValue)
             if genObj.isException { return .exception }
 
-            // Build initial varBuf / argBuf that callInternal would create.
-            // This replicates the frame setup at the top of callInternal.
-            let varCount = Int(fb.varCount)
-            let initVarBuf = [JeffJSValue](repeating: .undefined, count: varCount)
-            let argSlots = Int(fb.argCount)
-            // callFunction borrows its arguments for every callee kind; the
-            // generator keeps them past this call, so it takes its own
-            // references (released at completion or in
-            // JeffJSGeneratorData.deinit).
-            var initArgBuf = args.map { $0.dupValue() }
-            if initArgBuf.count < argSlots {
-                initArgBuf.append(contentsOf:
-                    [JeffJSValue](repeating: .undefined,
-                                  count: argSlots - initArgBuf.count))
-            }
-
-            // Initialize generator data with the saved state pointing
-            // to pc=0 (start of the generator body).
             let genData = JeffJSGeneratorData()
-            genData.state = .suspended_start
-            // The generator outlives this call: it takes its own references to
-            // its function and `this` (both borrowed here), released when it
-            // completes or is dropped.
-            genData.savedState = GeneratorSavedState(
-                pc: 0,
-                sp: 0,
-                stack: [],
-                varBuf: initVarBuf,
-                argBuf: initArgBuf,
-                funcObj: funcVal.dupValue(),
-                thisVal: thisVal.dupValue(),
-                isInitialYield: true)
+            // .executing while the prologue runs: an exception thrown before
+            // initial_yield makes the activation epilogue release the locals
+            // and arguments (it only does so for a generator that did not
+            // suspend).
+            genData.state = .executing
             genObj.toObject()?.payload = .generatorData(genData)
 
+            // callFunction borrows its arguments, function and `this`; the
+            // generator keeps them past this call (initial_yield moves them
+            // into its saved state), so it takes its own references.
+            let ownFunc = funcVal.dupValue()
+            let ownThis = thisVal.dupValue()
+            let result = JeffJSInterpreter.callInternal(
+                ctx: self,
+                funcObj: ownFunc,
+                thisVal: ownThis,
+                args: args.map { $0.dupValue() },
+                flags: JS_CALL_FLAG_GENERATOR,
+                generatorObject: genObj)
+
+            if result.isException {
+                // The frame released the arguments and locals; the function
+                // and `this` references are ours to drop.
+                genData.state = .completed
+                genData.savedState = nil
+                ownThis.freeValue(); ownFunc.freeValue()
+                genObj.freeValue()
+                return .exception
+            }
+            result.freeValue()
+            if genData.savedState == nil {
+                // No initial_yield (bytecode from before it was emitted, e.g. a
+                // stale cache entry): the body ran to completion here. Nothing
+                // better can be done than handing back a finished generator.
+                genData.state = .completed
+                ownThis.freeValue(); ownFunc.freeValue()
+            }
             return genObj
         }
         // Async function path: create a pending Promise, run the body.
@@ -10467,9 +10469,20 @@ struct JeffJSInterpreter {
             case .initial_yield:
                 // Save the current execution state into the generator object's
                 // JeffJSGeneratorData so that the first .next() call can resume
-                // execution right after this opcode.
+                // execution right after this opcode. Everything before it is
+                // FunctionDeclarationInstantiation, run by the call itself.
                 if let genObj = generatorObject.toObject(),
                    case .generatorData(let genData) = genObj.payload {
+                    // The resumed frame lays out exactly fb.argCount argument
+                    // slots, so save that many: missing arguments as their
+                    // (possibly reassigned) undefined slots, and surplus
+                    // arguments dropped — `arguments` and rest parameters,
+                    // their only readers, were built above.
+                    let formalCount = Int(fb.argCount)
+                    if varBase > formalCount {
+                        for i in formalCount ..< varBase { buf[i].freeValue(); buf[i] = .undefined }
+                    }
+                    frame.argCount = formalCount
                     // Sync buf → frame for saved state
                     jeffJS_syncBufToFrame(frame, buf, varBase)
                     // Save value-stack region
@@ -12052,7 +12065,7 @@ struct JeffJSInterpreter {
         if !fb.isGenerator, !fb.isAsyncFunc, !frame.hasLiveVarRefs {
             var i = varBase
             while i < spBase { buf[i].freeValue(); i += 1 }
-        } else if fb.isGenerator, !fb.isAsyncFunc, !frame.hasLiveVarRefs,
+        } else if fb.isGenerator, !fb.isAsyncFunc || resumeState == nil, !frame.hasLiveVarRefs,
                   let genObj = generatorObject.toObject(),
                   case .generatorData(let genData) = genObj.payload,
                   genData.state == .executing {

@@ -1036,7 +1036,10 @@ final class JeffJSBytecodeCache {
     //     empty-string atom.
     // Still 12: the cache-key fix below changes the *entry* layout (diskVersion
     // 3 -> 4), not the JFBC blob, which precompiled bundles also use.
-    static let compilerVersion: UInt64 = 12  // 2026-09-21: JFBC v6 (wide-opcode-aware atom walk, tagged atom table)
+    // 13 = generators emit `initial_yield` after FunctionDeclarationInstantiation
+    //   and the call runs up to it; a v12 generator body (no initial_yield)
+    //   would run to completion at call time.
+    static let compilerVersion: UInt64 = 13  // 2026-09-23: generator initial_yield
 
     /// Lazily-initialized disk cache directory.
     /// Automatically clears cached .jfbc files when the app binary changes (new build).

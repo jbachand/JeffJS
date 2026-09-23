@@ -309,6 +309,7 @@ struct JeffJSTestRunner {
             ("PlainCallThis", { $0.testPlainCallThis() }),
             ("ElementLangDir", { $0.testElementLangDir() }),
             ("ParameterScope", { $0.testParameterScope() }),
+            ("GeneratorInstantiation", { $0.testGeneratorInstantiation() }),
         ]
     }
 
