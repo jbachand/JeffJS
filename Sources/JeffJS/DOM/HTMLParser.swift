@@ -144,12 +144,16 @@ final class HTMLTreeBuilder {
         fragmentParsing = true
         document.quirksMode = .noQuirks
 
-        let contextTag = (context ?? "body").lowercased()
-        let ctx = DOMNode.element(tag: contextTag, namespace: contextNamespace)
+        // A foreign (SVG/MathML) context keeps its name's case — `foreignObject`
+        // is an HTML integration point only under that spelling — and never
+        // switches the tokenizer: an SVG <style>/<script>/<title> is not RAWTEXT.
+        let htmlContext = contextNamespace == nil || contextNamespace == DOMNode.htmlNamespace
+        let contextTag = htmlContext ? (context ?? "body").lowercased() : (context ?? "body")
+        let ctx = DOMNode.element(tag: contextTag, preserveCase: !htmlContext, namespace: contextNamespace)
         contextElement = ctx
 
         // The tokenizer starts in the state the context element implies.
-        switch contextTag {
+        switch htmlContext ? contextTag : "" {
         case "title", "textarea": tokenizer.contentState = .rcdata
         case "style", "xmp", "iframe", "noembed", "noframes": tokenizer.contentState = .rawtext
         case "script": tokenizer.contentState = .scriptData
@@ -161,12 +165,12 @@ final class HTMLTreeBuilder {
         let root = DOMNode.element(tag: "html")
         document.appendChild(root)
         openElements = [root]
-        if contextTag == "template" { templateModes.append(.inTemplate) }
+        if htmlContext, contextTag == "template" { templateModes.append(.inTemplate) }
         resetInsertionModeAppropriately()
 
         // The form pointer is seeded from the context element's ancestors; a
         // detached innerHTML context has none, so this is just the element.
-        if contextTag == "form" { formElement = ctx }
+        if htmlContext, contextTag == "form" { formElement = ctx }
 
         run()
         return root.children
@@ -572,8 +576,13 @@ final class HTMLTreeBuilder {
         case .comment(let data):
             insertComment(data, target: document)
         case .doctype(let doctype):
-            // No DocumentType node is materialised (nothing downstream reads
-            // one); the DOCTYPE's whole effect is the quirks-mode decision.
+            // §13.2.6.4.1: append a DocumentType node to the Document, then
+            // decide the quirks mode from the token.
+            document.appendChild(DOMNode.documentType(
+                name: doctype.name ?? "",
+                publicId: doctype.publicId ?? "",
+                systemId: doctype.systemId ?? ""
+            ))
             document.quirksMode = Self.quirksMode(for: doctype)
             mode = .beforeHTML
         default:
@@ -1942,7 +1951,12 @@ final class HTMLTreeBuilder {
                         && HTMLElements.mathmlTextIntegration.contains(node.tagName ?? "")) {
                     openElements.removeLast()
                 }
-                dispatch(token)
+                // "Reprocess the token according to the rules given in the
+                // section corresponding to the current insertion mode in HTML
+                // content" — not through the dispatcher: in a fragment with a
+                // foreign context the adjusted current node stays foreign, and
+                // dispatching again would loop.
+                process(token, in: mode)
                 return
             }
             guard let namespace = adjustedCurrentNode?.namespaceURI else { return }

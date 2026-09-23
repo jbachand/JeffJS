@@ -79,6 +79,25 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
     // Text/comment content
     public internal(set) var textContent: String?
 
+    /// True for a `DocumentType` node (`<!DOCTYPE …>`, DOM §4.6).
+    ///
+    /// A doctype is carried as a `.comment`-typed node with this flag rather
+    /// than as its own `NodeType` case: every consumer that walks the tree
+    /// (style, layout, rendering, the host's own bridges) already skips
+    /// comments, and hosts switch exhaustively over `NodeType`. The JS bridge
+    /// reports it as nodeType 10. Name and identifiers live in
+    /// `doctypeName` / `doctypePublicId` / `doctypeSystemId`.
+    public private(set) var isDocumentType = false
+    public var doctypeName: String { isDocumentType ? (attributes["name"] ?? "") : "" }
+    public var doctypePublicId: String { isDocumentType ? (attributes["publicId"] ?? "") : "" }
+    public var doctypeSystemId: String { isDocumentType ? (attributes["systemId"] ?? "") : "" }
+
+    /// The document's `DocumentType` child, if any (`document.doctype`).
+    public var doctype: DOMNode? {
+        guard nodeType == .document else { return nil }
+        return children.first { $0.isDocumentType }
+    }
+
     public enum NodeType: Sendable, Hashable {
         case document
         case documentFragment
@@ -115,6 +134,15 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
 
     public static func comment(_ content: String) -> DOMNode {
         DOMNode(nodeType: .comment, tagName: nil, attributes: [:], textContent: content)
+    }
+
+    /// A `DocumentType` node (see `isDocumentType`).
+    public static func documentType(name: String, publicId: String = "", systemId: String = "") -> DOMNode {
+        let node = DOMNode(nodeType: .comment, tagName: nil,
+                           attributes: ["name": name, "publicId": publicId, "systemId": systemId],
+                           textContent: nil)
+        node.isDocumentType = true
+        return node
     }
 
     /// Cached class list, invalidated when the `class` attribute changes.
@@ -376,6 +404,19 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
         return old
     }
 
+    /// Empties the children array and returns what was there WITHOUT touching
+    /// the nodes' parent pointers — for callers that have already re-parented
+    /// them (`appendChild` elsewhere) and only need the old array gone.
+    /// `clearChildren()` would nil the new parents out from under them.
+    @discardableResult
+    func detachChildrenArray() -> [DOMNode] {
+        childrenLock.lock()
+        let old = _children
+        _children.removeAll()
+        childrenLock.unlock()
+        return old
+    }
+
     public func clearChildren() {
         childrenLock.lock()
         let old = _children
@@ -410,7 +451,11 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
 
     public func removeAttributePreservingCase(name: String) {
         attributes.removeValue(forKey: name)
-        attributes.removeValue(forKey: name.lowercased())
+        let lower = name.lowercased()
+        if lower != name || aliasAttributeKeys.contains(lower) {
+            attributes.removeValue(forKey: lower)
+            aliasAttributeKeys.remove(lower)
+        }
         invalidateClassListIfNeeded("class")
     }
 
