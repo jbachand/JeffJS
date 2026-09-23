@@ -294,6 +294,7 @@ struct JeffJSTestRunner {
             ("FunctionToString", { $0.testFunctionToString() }),
             ("InOperator", { $0.testInOperator() }),
             ("DOMEvents", { $0.testDOMEvents() }),
+            ("FreedValueTouches", { $0.testFreedValueTouches() }),
         ]
     }
 
