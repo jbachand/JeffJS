@@ -405,6 +405,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         JeffJSGCObjectHeader.activeRuntime = rt
         self.rt = rt
         self.header = JeffJSGCObjectHeader()
+        defer { if jeffJSZombiesEnabled { JeffJSZombieDebug.context = self } }
         self.header.gcObjType = .jsObject
         self.link = ListNode()
 

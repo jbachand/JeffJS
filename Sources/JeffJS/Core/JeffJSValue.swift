@@ -480,18 +480,18 @@ struct JeffJSValue {
         case Self._stringTag:
             // All string representations share JeffJSStringBase: one cast.
             let sb = unsafeBitCast(ptr, to: JeffJSStringBase.self)
-            if sb.freeMark { JeffJSZombieDebug.reportString("DUP", "string rc=\(sb.refCount)") }
+            if sb.freeMark { JeffJSZombieDebug.reportString("DUP", "string rc=\(sb.refCount)", sb) }
             sb.refCount += 1
         case Self._symbolTag:
             let ref = Unmanaged<AnyObject>.fromOpaque(ptr).takeUnretainedValue()
             if let s = ref as? JeffJSString {
-                if s.freeMark { JeffJSZombieDebug.reportString("DUP", "JeffJSString rc=\(s.refCount)") }
+                if s.freeMark { JeffJSZombieDebug.reportString("DUP", "JeffJSString rc=\(s.refCount)", s) }
                 s.refCount += 1
             } else if let r = ref as? JeffJSStringRope {
-                if r.freeMark { JeffJSZombieDebug.reportString("DUP", "JeffJSStringRope rc=\(r.refCount)") }
+                if r.freeMark { JeffJSZombieDebug.reportString("DUP", "JeffJSStringRope rc=\(r.refCount)", r) }
                 r.refCount += 1
             } else if let b = ref as? JeffJSStringBuffer {
-                if b.freeMark { JeffJSZombieDebug.reportString("DUP", "JeffJSStringBuffer rc=\(b.refCount)") }
+                if b.freeMark { JeffJSZombieDebug.reportString("DUP", "JeffJSStringBuffer rc=\(b.refCount)", b) }
                 b.refCount += 1
             }
         case Self._moduleTag:
@@ -568,7 +568,7 @@ struct JeffJSValue {
             if fb.refCount == 0 { _freeFBSlow(fb) }
         case Self._stringTag:
             let sb = unsafeBitCast(ptr, to: JeffJSStringBase.self)
-            if sb.freeMark { JeffJSZombieDebug.reportString("FREE", "string rc=\(sb.refCount)") }
+            if sb.freeMark { JeffJSZombieDebug.reportString("FREE", "string rc=\(sb.refCount)", sb) }
             guard sb.refCount > 0 else { return }
             sb.refCount -= 1
             if sb.refCount == 0 {
@@ -587,7 +587,7 @@ struct JeffJSValue {
         case Self._symbolTag:
             let ref = Unmanaged<AnyObject>.fromOpaque(ptr).takeUnretainedValue()
             if let s = ref as? JeffJSString {
-                if s.freeMark { JeffJSZombieDebug.reportString("FREE", "JeffJSString rc=\(s.refCount)") }
+                if s.freeMark { JeffJSZombieDebug.reportString("FREE", "JeffJSString rc=\(s.refCount)", s) }
                 guard s.refCount > 0 else { return }
                 s.refCount -= 1
                 if s.refCount == 0 {
@@ -599,7 +599,7 @@ struct JeffJSValue {
                     }
                 }
             } else if let r = ref as? JeffJSStringRope {
-                if r.freeMark { JeffJSZombieDebug.reportString("FREE", "JeffJSStringRope rc=\(r.refCount)") }
+                if r.freeMark { JeffJSZombieDebug.reportString("FREE", "JeffJSStringRope rc=\(r.refCount)", r) }
                 guard r.refCount > 0 else { return }
                 r.refCount -= 1
                 if r.refCount == 0 {
@@ -613,7 +613,7 @@ struct JeffJSValue {
                     }
                 }
             } else if let b = ref as? JeffJSStringBuffer {
-                if b.freeMark { JeffJSZombieDebug.reportString("FREE", "JeffJSStringBuffer rc=\(b.refCount)") }
+                if b.freeMark { JeffJSZombieDebug.reportString("FREE", "JeffJSStringBuffer rc=\(b.refCount)", b) }
                 guard b.refCount > 0 else { return }
                 b.refCount -= 1
                 if b.refCount == 0 {
