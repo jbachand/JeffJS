@@ -607,7 +607,9 @@ struct JeffJSStdLib {
         if idVal.isInt {
             id = idVal.toInt32()
         } else if idVal.isFloat64 {
-            id = Int32(idVal.toFloat64())
+            let d = idVal.toFloat64()   // `Int32(d)` trapped on NaN/Infinity/huge ids
+            guard d.isFinite, d >= Double(Int32.min), d <= Double(Int32.max) else { return .undefined }
+            id = Int32(d)
         } else {
             return .undefined
         }

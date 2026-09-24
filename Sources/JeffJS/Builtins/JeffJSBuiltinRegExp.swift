@@ -1049,7 +1049,9 @@ func js_regexp_Symbol_matchAll(
     jeffJS_appendOwnProperty(ctx, regexpCopy,
                              atom: JeffJSAtomID.JS_ATOM_lastIndex.rawValue,
                              flags: [.writable],
-                             value: JeffJSValue.newInt32(Int32(origLastIndex)))
+                             value: origLastIndex >= 0 && origLastIndex <= Int(Int32.max)
+                                ? JeffJSValue.newInt32(Int32(origLastIndex))
+                                : JeffJSValue.newFloat64(Double(max(origLastIndex, 0))))
 
     // Create the iterator object.
     let iterData = JSRegExpStringIteratorData(
@@ -1627,7 +1629,8 @@ private func js_regexp_getLastIndex(_ obj: JeffJSObject) -> Int {
             if v.isInt {
                 return Int(v.toInt32())
             } else if v.isFloat64 {
-                return Int(v.toFloat64())
+                // `Int(d)` trapped on `re.lastIndex = Infinity` / 1e20.
+                return jeffJS_intArg(v.toFloat64())
             }
         }
     }
@@ -1638,7 +1641,9 @@ private func js_regexp_getLastIndex(_ obj: JeffJSObject) -> Int {
 ///
 /// Uses the fast path (property index 0).
 private func js_regexp_setLastIndex(_ obj: JeffJSObject, value: Int) {
-    let v = JeffJSValue.newInt32(Int32(value))
+    // `Int32(value)` trapped past 2^31 (a lastIndex advanced from 2^53).
+    let v = value >= Int(Int32.min) && value <= Int(Int32.max)
+        ? JeffJSValue.newInt32(Int32(value)) : JeffJSValue.newFloat64(Double(value))
     if !obj.propValues.isEmpty {
         obj.setPropEntry(at: 0, .value(v))
     } else {

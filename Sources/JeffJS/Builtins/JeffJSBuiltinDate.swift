@@ -44,10 +44,10 @@ private func timeWithinDay(_ t: Double) -> Double {
 
 /// DaysInYear(y) — number of days in year y.
 private func daysInYear(_ y: Double) -> Double {
-    let yi = Int(y)
-    if yi % 4 != 0 { return 365 }
-    if yi % 100 != 0 { return 366 }
-    if yi % 400 != 0 { return 365 }
+    // Double remainders: `Int(y)` trapped for years like 1e20 (`Date.UTC(1e20)`).
+    if y.truncatingRemainder(dividingBy: 4) != 0 { return 365 }
+    if y.truncatingRemainder(dividingBy: 100) != 0 { return 366 }
+    if y.truncatingRemainder(dividingBy: 400) != 0 { return 365 }
     return 366
 }
 
@@ -194,6 +194,9 @@ private func makeDay(_ year: Double, _ month: Double, _ date: Double) -> Double 
     let dt = Darwin.trunc(date)
 
     let ym = y + Darwin.floor(m / 12.0)
+    // No time value lies this far out (±275,760 years is the limit); V8 uses the
+    // same ±1,000,000 year cut-off. Keeps every conversion below in range.
+    if Swift.abs(ym) > 1_000_000 { return Double.nan }
     let mn = m.truncatingRemainder(dividingBy: 12)
     let mnAdj = mn < 0 ? mn + 12 : mn
 

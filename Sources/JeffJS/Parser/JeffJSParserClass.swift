@@ -553,7 +553,7 @@ extension JeffJSParser {
                 }
                 next()
             } else if tok == JSTokenType.TOK_NUMBER.rawValue {
-                propAtom = getAtom(String(format: "%.0f", s.token.numValue))
+                propAtom = getAtom(JeffJSBuiltinNumber.numberToStringBase10(s.token.numValue))  // "%.0f" named `1.5(){}` "2"
                 next()
             } else if tok == JSTokenType.TOK_PRIVATE_NAME.rawValue {
                 propAtom = s.token.identAtom

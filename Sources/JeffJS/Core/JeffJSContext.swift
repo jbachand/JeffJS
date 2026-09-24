@@ -4971,7 +4971,16 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                         let lengthAtom = JeffJSAtomID.JS_ATOM_length.rawValue
                         let lenIdx = jeffJS_findOwnPropertyIndex(obj: jsObj, atom: lengthAtom)
                         if lenIdx >= 0, lenIdx < jsObj.propValues.count {
-                            jsObj.propValues[lenIdx] = .newInt32(Int32(arrCount)); jsObj.setExtraSlot(lenIdx, nil)
+                            // Only ever grow `length`: it can exceed the dense
+                            // count (`new Array(10)`, `a.length = 10`), and
+                            // `c = new Array(10); c[0] = 1` made it 1.
+                            let cur = jsObj.propValues[lenIdx]
+                            let curLen: Double = cur.isInt ? Double(cur.toInt32()) : (cur.isFloat64 ? cur.toFloat64() : 0)
+                            if Double(arrCount) > curLen {
+                                jsObj.propValues[lenIdx] = arrCount <= Int(Int32.max)
+                                    ? .newInt32(Int32(arrCount)) : .newFloat64(Double(arrCount))
+                                jsObj.setExtraSlot(lenIdx, nil)
+                            }
                         }
                     }
                     return 1
@@ -5121,14 +5130,16 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // integer-indexed element via the shape-based fallback path.
         if jsObj.classID == JeffJSClassID.array.rawValue {
             if rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom) {
-                let newLen = Int32(idx) + 1
+                // In Int64/Double: `Int32(idx) + 1` trapped for indices >= 2^31 - 1.
+                let newLen = Int64(idx) + 1
                 let lengthAtom = JeffJSAtomID.JS_ATOM_length.rawValue
                 let (lenProp, _) = jeffJS_findOwnProperty(obj: jsObj, atom: lengthAtom)
                 if lenProp != nil {
                     let curLen = jsObj.getOwnPropertyValue(atom: lengthAtom)
-                    let curLenVal = curLen.isInt ? curLen.toInt32() : Int32(0)
-                    if newLen > curLenVal {
-                        jsObj.setOwnPropertyValue(atom: lengthAtom, value: .newInt32(newLen))
+                    let curLenVal: Double = curLen.isInt ? Double(curLen.toInt32()) : (curLen.isFloat64 ? curLen.toFloat64() : 0)
+                    if Double(newLen) > curLenVal {
+                        jsObj.setOwnPropertyValue(atom: lengthAtom, value: newLen <= Int64(Int32.max)
+                            ? .newInt32(Int32(newLen)) : .newFloat64(Double(newLen)))
                     }
                 }
             }
@@ -5658,24 +5669,66 @@ extension JeffJSContext {
 
     // -- Property by index (for arrays) --
 
-    func getPropertyByIndex(obj: JeffJSValue, index: UInt32) -> JeffJSValue {
-        let atom = UInt32(index) | 0x80000000  // JS_ATOM_TAG_INT
+    // Indices up to 2^31-1 are tagged-int atoms; larger ones (up to 2^53-1,
+    // array-likes such as `{length: 2**32 + 5}`) are numeric-string atoms, as
+    // in QuickJS JS_NewAtomInt64. Was `UInt32(index) | TAG_INT`: indices at or
+    // past 2^31 aliased small ones and `UInt32(k)` at the call sites trapped
+    // at 2^32.
+
+    /// The property key for integer index `k` (owned; release with `freeIndexAtom`).
+    @inline(__always)
+    func indexAtom(_ k: Int64) -> JSAtom {
+        if k >= 0 && k <= Int64(JS_ATOM_MAX_INT) { return UInt32(k) | JS_ATOM_TAG_INT }
+        return rt.findAtom(String(k))
+    }
+
+    @inline(__always)
+    func freeIndexAtom(_ atom: JSAtom) {
+        if (atom & JS_ATOM_TAG_INT) == 0 { rt.freeAtom(atom) }
+    }
+
+    func getPropertyByIndex(obj: JeffJSValue, index64 index: Int64) -> JeffJSValue {
+        let atom = indexAtom(index)
+        defer { freeIndexAtom(atom) }
         return getProperty(obj: obj, atom: atom)
     }
 
-    func setPropertyByIndex(obj: JeffJSValue, index: UInt32, value: JeffJSValue) {
-        let atom = UInt32(index) | 0x80000000
+    func setPropertyByIndex(obj: JeffJSValue, index64 index: Int64, value: JeffJSValue) {
+        let atom = indexAtom(index)
+        defer { freeIndexAtom(atom) }
         _ = setProperty(obj: obj, atom: atom, value: value)
     }
 
-    func hasPropertyByIndex(obj: JeffJSValue, index: UInt32) -> Bool {
-        let atom = UInt32(index) | 0x80000000
+    func hasPropertyByIndex(obj: JeffJSValue, index64 index: Int64) -> Bool {
+        let atom = indexAtom(index)
+        defer { freeIndexAtom(atom) }
         return hasProperty(obj: obj, atom: atom)
     }
 
-    func deletePropertyByIndex(obj: JeffJSValue, index: UInt32) -> Bool {
-        let atom = UInt32(index) | 0x80000000
+    func deletePropertyByIndex(obj: JeffJSValue, index64 index: Int64) -> Bool {
+        let atom = indexAtom(index)
+        defer { freeIndexAtom(atom) }
         return deleteProperty(obj: obj, atom: atom)
+    }
+
+    func getPropertyByIndex(obj: JeffJSValue, index: UInt32) -> JeffJSValue {
+        if index <= JS_ATOM_MAX_INT { return getProperty(obj: obj, atom: index | JS_ATOM_TAG_INT) }
+        return getPropertyByIndex(obj: obj, index64: Int64(index))
+    }
+
+    func setPropertyByIndex(obj: JeffJSValue, index: UInt32, value: JeffJSValue) {
+        if index <= JS_ATOM_MAX_INT { _ = setProperty(obj: obj, atom: index | JS_ATOM_TAG_INT, value: value); return }
+        setPropertyByIndex(obj: obj, index64: Int64(index), value: value)
+    }
+
+    func hasPropertyByIndex(obj: JeffJSValue, index: UInt32) -> Bool {
+        if index <= JS_ATOM_MAX_INT { return hasProperty(obj: obj, atom: index | JS_ATOM_TAG_INT) }
+        return hasPropertyByIndex(obj: obj, index64: Int64(index))
+    }
+
+    func deletePropertyByIndex(obj: JeffJSValue, index: UInt32) -> Bool {
+        if index <= JS_ATOM_MAX_INT { return deleteProperty(obj: obj, atom: index | JS_ATOM_TAG_INT) }
+        return deletePropertyByIndex(obj: obj, index64: Int64(index))
     }
 
     // -- Function registration --
@@ -6053,3 +6106,57 @@ func jeffJS_unwrapSymbolObject(_ v: JeffJSValue) -> JeffJSValue? {
     if case .objectData(let inner) = obj.payload, inner.isSymbol { return inner }
     return nil
 }
+
+// MARK: - Checked Double -> integer conversions for builtins
+//
+// `Int64(d)` / `Int(d)` / `UInt32(d)` trap (EXC_BREAKPOINT, "Double value cannot
+// be converted …") when `d` is NaN, ±Infinity or out of range, and
+// ToIntegerOrInfinity hands builtins exactly those values: `a.splice(0, Infinity)`,
+// `a.slice(-Infinity)`, `s.lastIndexOf(x, 1e20)` are all legal JS. Every builtin
+// that turns an argument into an index or a count goes through one of these.
+
+/// ES "relative index" (splice/slice/fill/copyWithin/at …): an integral
+/// ToIntegerOrInfinity result → absolute index in [0, len]; negative values
+/// count from the end. NaN is 0.
+@inline(__always)
+func jeffJS_relativeIndex(_ d: Double, _ len: Int64) -> Int64 {
+    if d.isNaN { return 0 }
+    if d < 0 {
+        if d <= -Double(len) { return 0 }
+        return len + Int64(d)          // -len < d < 0: in range
+    }
+    if d >= Double(len) { return len }
+    return Int64(d)
+}
+
+/// Saturating Double → Int64 (NaN → 0, ±Infinity / out of range → min/max).
+@inline(__always)
+func jeffJS_clampToInt64(_ d: Double) -> Int64 {
+    if d.isNaN { return 0 }
+    if d >= 9223372036854775807.0 { return .max }
+    if d <= -9223372036854775808.0 { return .min }
+    return Int64(d)
+}
+
+/// Saturating Double → Int (NaN → 0).
+@inline(__always)
+func jeffJS_clampToInt(_ d: Double) -> Int {
+    return Int(jeffJS_clampToInt64(d))
+}
+
+/// ToIntegerOrInfinity of a number for index/length/offset arguments, as an
+/// Int saturated to ±2^53: NaN → 0, fractions truncate, ±Infinity and huge
+/// values → ±2^53 (larger than any buffer or array, so the callers' clamps and
+/// RangeError checks see them as out of range; sums with a length cannot
+/// overflow). `Int(d)` trapped on all of those.
+@inline(__always)
+func jeffJS_intArg(_ d: Double) -> Int {
+    if d.isNaN { return 0 }
+    if d >= 9007199254740992.0 { return 9007199254740992 }
+    if d <= -9007199254740992.0 { return -9007199254740992 }
+    return Int(d)
+}
+
+/// Largest ArrayBuffer / typed-array byte length (QuickJS: INT32_MAX). Past it
+/// CreateByteDataBlock throws a RangeError instead of trying the allocation.
+let jeffJS_maxByteLength: Int = Int(Int32.max)

@@ -842,8 +842,10 @@ struct JeffJSBuiltinString {
             let numPos = ctx.toNumber(args[1])
             if numPos.isException { return .exception }
             let d = ctx.extractDouble(numPos)
-            if !d.isNaN && d.isFinite {
-                pos = max(0, min(Int(d), str.count))
+            // NaN → +Infinity (search the whole string); ±Infinity and huge
+            // values clamp (`Int(d)` trapped on 1e20).
+            if !d.isNaN {
+                pos = clampIndex(d, str.count)
             }
         }
         let result = lastIndexOfInternal(str, searchStr, pos)
@@ -1517,22 +1519,21 @@ struct JeffJSBuiltinString {
             return .exception
         }
         let countVal = args.isEmpty ? JeffJSValue.newInt32(0) : args[0]
-        let n = ctx.toInteger(countVal)
+        let n = ctx.toInteger(countVal)   // one ToNumber (valueOf runs once)
         if n.isException { return .exception }
-        let count = ctx.extractInt(n)
-        if count < 0 {
+        let d = ctx.extractDouble(n)
+        if d < 0 || d.isInfinite {
             return ctx.throwRangeError("Invalid count value")
         }
-        let d = ctx.extractDouble(ctx.toNumber(countVal))
-        if d == Double.infinity {
-            return ctx.throwRangeError("Invalid count value")
-        }
-        if count == 0 || str.isEmpty {
+        if d == 0 || str.isEmpty {
             return ctx.newStringValue("")
         }
-        if str.count * count > JS_STRING_LEN_MAX {
+        // Compare in Double: `str.count * count` overflowed Int (a trap) for
+        // counts like 1e20.
+        if Double(str.count) * d > Double(JS_STRING_LEN_MAX) {
             return ctx.throwRangeError("Invalid string length")
         }
+        let count = Int(d)
         var result = [UInt16]()
         result.reserveCapacity(str.count * count)
         for _ in 0..<count {
