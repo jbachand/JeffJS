@@ -1338,8 +1338,7 @@ extension JeffJSContext {
     }
 
     func throwRangeError(_ msg: String) -> JeffJSValue {
-        rt.currentException = newStringValue(msg)
-        return .exception
+        return throwRangeError(message: msg)
     }
 
     // MARK: - Global Object

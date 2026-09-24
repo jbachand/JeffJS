@@ -237,6 +237,141 @@ private func formatDoubleFree(_ d: Double) -> String {
     return s
 }
 
+// MARK: - Exact decimal expansion
+
+/// The exact decimal expansion of a finite, non-zero double's magnitude:
+/// `|d| = 0.D1 D2 D3 … × 10^exponent`, with `D1 != 0` and no trailing zero digits.
+///
+/// Every binary double has a finite decimal expansion (at most 767 significant
+/// digits), so rounding decisions made on these digits are exact. That is what
+/// ECMA-262 asks of toFixed / toExponential / toPrecision ("let n be an integer
+/// for which n / 10^f - x is as close to zero as possible; if there are two such
+/// n, pick the larger n"): round half up on the exact value. Scaling by powers of
+/// ten in floating point, `log10`, or printf's round-half-even cannot give that.
+private func exactDecimalDigits(_ d: Double) -> (digits: [UInt8], exponent: Int) {
+    let a = Swift.abs(d)
+    var mant = a.significandBitPattern
+    var e2: Int
+    if a.exponentBitPattern == 0 {
+        e2 = -1074
+    } else {
+        mant |= (UInt64(1) << 52)
+        e2 = Int(a.exponentBitPattern) - 1075
+    }
+    let tz = mant.trailingZeroBitCount
+    mant >>= UInt64(tz)
+    e2 += tz
+
+    // Little-endian base-1e9 bignum holding N, with |d| = N × 10^(-scale).
+    let base: UInt64 = 1_000_000_000
+    var limbs: [UInt32] = []
+    var m = mant
+    while m > 0 { limbs.append(UInt32(m % base)); m /= base }
+    func mul(_ f: UInt64) {
+        var carry: UInt64 = 0
+        for i in 0 ..< limbs.count {
+            let p = UInt64(limbs[i]) * f + carry
+            limbs[i] = UInt32(p % base)
+            carry = p / base
+        }
+        while carry > 0 { limbs.append(UInt32(carry % base)); carry /= base }
+    }
+    var scale = 0
+    if e2 > 0 {
+        var k = e2
+        while k >= 28 { mul(UInt64(1) << 28); k -= 28 }
+        if k > 0 { mul(UInt64(1) << UInt64(k)) }
+    } else if e2 < 0 {
+        // m × 2^-k = m × 5^k × 10^-k
+        var k = -e2
+        scale = k
+        while k >= 13 { mul(1_220_703_125); k -= 13 }  // 5^13
+        if k > 0 {
+            var p: UInt64 = 1
+            for _ in 0 ..< k { p *= 5 }
+            mul(p)
+        }
+    }
+
+    var digits: [UInt8] = []
+    digits.reserveCapacity(limbs.count * 9)
+    for ch in String(limbs[limbs.count - 1]).utf8 { digits.append(ch &- 48) }
+    if limbs.count >= 2 {
+        for i in stride(from: limbs.count - 2, through: 0, by: -1) {
+            var v = limbs[i]
+            var chunk = [UInt8](repeating: 0, count: 9)
+            for j in stride(from: 8, through: 0, by: -1) {
+                chunk[j] = UInt8(v % 10)
+                v /= 10
+            }
+            digits.append(contentsOf: chunk)
+        }
+    }
+    let exponent = digits.count - scale
+    while let last = digits.last, last == 0 { digits.removeLast() }
+    return (digits, exponent)
+}
+
+/// The shortest digits that round-trip to `|d|` (Number::toString's digits):
+/// `|d| = 0.D1 D2 … × 10^exponent`, `D1 != 0`, no trailing zeros. `d` finite, non-zero.
+private func shortestDecimalDigits(_ d: Double) -> (digits: [UInt8], exponent: Int) {
+    // Swift's description is the shortest round-trip, closest representation.
+    let s = "\(Swift.abs(d))"
+    var mantissa = Substring(s)
+    var exp10 = 0
+    if let eIdx = s.firstIndex(where: { $0 == "e" || $0 == "E" }) {
+        mantissa = s[s.startIndex ..< eIdx]
+        exp10 = Int(s[s.index(after: eIdx)...]) ?? 0
+    }
+    var digits: [UInt8] = []
+    var pointPos: Int? = nil
+    for ch in mantissa.utf8 {
+        if ch == 46 { pointPos = digits.count } else if ch >= 48 && ch <= 57 { digits.append(ch - 48) }
+    }
+    var exponent = (pointPos ?? digits.count) + exp10
+    while let first = digits.first, first == 0 { digits.removeFirst(); exponent -= 1 }
+    while let last = digits.last, last == 0 { digits.removeLast() }
+    return (digits, exponent)
+}
+
+/// Keeps the first `count` digits of `0.D` (zero-padded), rounding half up on the
+/// rest. When the rounding carries out of the leading digit the result is `1`
+/// followed by `count` zeros (`count + 1` digits) and `carried` is true.
+/// `count <= 0` rounds to nothing, or to a lone carried `1` when `count == 0` and
+/// the leading digit is >= 5.
+private func roundDigitsHalfUp(_ digits: [UInt8], count: Int) -> (digits: [UInt8], carried: Bool) {
+    if count < 0 { return ([], false) }
+    if count == 0 {
+        if let first = digits.first, first >= 5 { return ([1], true) }
+        return ([], false)
+    }
+    var r = Array(digits.prefix(count))
+    while r.count < count { r.append(0) }
+    if digits.count > count && digits[count] >= 5 {
+        var i = count - 1
+        while i >= 0 {
+            if r[i] == 9 { r[i] = 0; i -= 1 } else { r[i] += 1; break }
+        }
+        if i < 0 {
+            r.insert(1, at: 0)
+            return (r, true)
+        }
+    }
+    return (r, false)
+}
+
+@inline(__always)
+private func digitString<S: Sequence>(_ digits: S) -> String where S.Element == UInt8 {
+    var s = ""
+    for d in digits { s.unicodeScalars.append(Unicode.Scalar(d + 48)) }
+    return s
+}
+
+@inline(__always)
+private func exponentSuffix(_ e: Int) -> String {
+    return (e < 0 ? "e-" : "e+") + String(Swift.abs(e))
+}
+
 // MARK: - Fixed fractional digits (toFixed)
 
 /// Format a double with exactly `nDigits` fractional digits.
@@ -257,165 +392,112 @@ func jsFcvt1(_ d: Double, nDigits: Int, format: DtoaFormat) -> String {
     }
 }
 
-/// Internal: format with fixed fractional digits.
+/// ES2025 §21.1.3.3 Number.prototype.toFixed steps 5–12 for a finite `d` with
+/// `|d| < 1e21` (callers handle the rest): exactly `nDigits` fractional digits,
+/// ties rounded up (away from zero), "-" only for `d < 0` (so `-0` gives "0.00"
+/// while `-0.0001` gives "-0.00").
 private func formatDoubleFrac(_ d: Double, nDigits: Int) -> String {
     if d.isNaN { return "NaN" }
     if d.isInfinite { return d < 0 ? "-Infinity" : "Infinity" }
+    let f = max(nDigits, 0)
+    if Swift.abs(d) >= 1e21 { return formatDoubleFree(d) }
 
-    let clamped = max(nDigits, 0)
-    let negative = d < 0 || jsIsNegativeZero(d)
-    let absVal = abs(d)
-
-    if clamped == 0 {
-        // Round to nearest integer.
-        let rounded = absVal.rounded(.toNearestOrEven)
-        let intVal = UInt64(rounded)
-        let s = String(intVal)
-        return negative ? "-\(s)" : s
+    var m: String
+    if d == 0 {
+        m = "0"
+    } else {
+        let (digits, exponent) = exactDecimalDigits(d)
+        let (n, _) = roundDigitsHalfUp(digits, count: exponent + f)
+        m = n.isEmpty ? "0" : digitString(n)
     }
-
-    // Use a high-precision approach: multiply by 10^nDigits, round, then
-    // insert the decimal point.
-    let scale = pow(10.0, Double(clamped))
-    let scaled = (absVal * scale).rounded(.toNearestOrEven)
-
-    // Guard against overflow of UInt64.
-    if scaled >= Double(UInt64.max) || scaled.isInfinite {
-        // Fall back to String(format:) for very large values.
-        let fmt = String(format: "%.\(clamped)f", d)
-        return fmt
+    if f != 0 {
+        var k = m.count
+        if k <= f {
+            m = String(repeating: "0", count: f + 1 - k) + m
+            k = f + 1
+        }
+        let a = m.prefix(k - f)
+        let b = m.suffix(f)
+        m = a + "." + b
     }
-
-    let intScaled = UInt64(scaled)
-    var digits = String(intScaled)
-
-    // Pad with leading zeros if necessary.
-    while digits.count <= clamped {
-        digits = "0" + digits
-    }
-
-    let intPartLen = digits.count - clamped
-    let intPart = String(digits.prefix(intPartLen))
-    let fracPart = String(digits.suffix(clamped))
-
-    var result = intPart + "." + fracPart
-    if negative {
-        result = "-" + result
-    }
-    return result
+    return d < 0 ? "-" + m : m
 }
 
 // MARK: - Fixed significant digits (toPrecision)
 
-/// Internal: format with fixed number of significant digits.
+/// ES2025 §21.1.3.5 Number.prototype.toPrecision steps 8–13 for a finite `d`:
+/// exactly `nDigits` significant digits (trailing zeros kept), ties rounded up,
+/// exponential notation when the exponent is < -6 or >= the precision (only if
+/// `expEnabled`; otherwise always positional). `-0` formats like `0`.
 private func formatDoubleFixed(_ d: Double, nDigits: Int, expEnabled: Bool) -> String {
     if d.isNaN { return "NaN" }
     if d.isInfinite { return d < 0 ? "-Infinity" : "Infinity" }
+    let p = max(nDigits, 1)
 
-    let negative = d < 0 || jsIsNegativeZero(d)
-    let absVal = abs(d)
-    let prec = max(nDigits, 1)
-
-    if absVal == 0 {
-        var s = "0"
-        if prec > 1 {
-            s += "."
-            for _ in 0 ..< (prec - 1) {
-                s += "0"
-            }
-        }
-        return negative ? "-\(s)" : s
-    }
-
-    // Determine the order of magnitude.
-    let logVal = Foundation.log10(absVal)
-    let exponent = Int(Foundation.floor(logVal))
-
-    // Decide whether to use exponential notation.
-    if expEnabled && (exponent >= prec || exponent < -4) {
-        return formatDoubleExponential(d, nDigits: prec - 1)
-    }
-
-    // Number of fractional digits needed.
-    let fracDigits = prec - exponent - 1
-
-    if fracDigits >= 0 {
-        return formatDoubleFrac(d, nDigits: fracDigits)
+    var m: [UInt8]
+    var e: Int
+    if d == 0 {
+        m = [UInt8](repeating: 0, count: p)
+        e = 0
     } else {
-        // More integer digits than precision — round and pad with zeros.
-        let scale = pow(10.0, Double(-fracDigits))
-        let rounded = (absVal / scale).rounded(.toNearestOrEven) * scale
-        let intVal = UInt64(rounded)
-        let s = String(intVal)
-        return negative ? "-\(s)" : s
+        let (digits, exponent) = exactDecimalDigits(d)
+        let (r, carried) = roundDigitsHalfUp(digits, count: p)
+        m = r
+        e = exponent - 1
+        if carried {
+            m.removeLast()
+            e += 1
+        }
     }
+    let s = d < 0 ? "-" : ""
+
+    if expEnabled && (e < -6 || e >= p) {
+        var out = s + digitString(m[0 ..< 1])
+        if p != 1 { out += "." + digitString(m[1...]) }
+        return out + exponentSuffix(e)
+    }
+    if e >= p - 1 {
+        return s + digitString(m) + String(repeating: "0", count: e - (p - 1))
+    }
+    if e >= 0 {
+        return s + digitString(m[0 ... e]) + "." + digitString(m[(e + 1)...])
+    }
+    return s + "0." + String(repeating: "0", count: -(e + 1)) + digitString(m)
 }
 
 // MARK: - Exponential notation (toExponential)
 
-/// Format a double in exponential notation with `nFracDigits` fractional digits.
-/// Mirrors the `toExponential` path in QuickJS.
+/// ES2025 §21.1.3.2 Number.prototype.toExponential steps 7–15 for a finite `d`:
+/// `nDigits` fractional digits, ties rounded up; `nDigits < 0` means
+/// "fractionDigits undefined": as many digits as needed to identify the value
+/// (the shortest round-trip digits). `-0` formats like `0`.
 private func formatDoubleExponential(_ d: Double, nDigits: Int) -> String {
     if d.isNaN { return "NaN" }
     if d.isInfinite { return d < 0 ? "-Infinity" : "Infinity" }
 
-    let negative = d < 0 || jsIsNegativeZero(d)
-    let absVal = abs(d)
-
-    if absVal == 0.0 {
-        var s = negative ? "-0" : "0"
-        if nDigits > 0 {
-            s += "."
-            for _ in 0 ..< nDigits {
-                s += "0"
-            }
-        }
-        s += "e+0"
-        return s
-    }
-
-    let logVal = Foundation.log10(absVal)
-    var exponent = Int(Foundation.floor(logVal))
-
-    // Normalise the mantissa to [1, 10).
-    var mantissa = absVal / pow(10.0, Double(exponent))
-
-    // Correct for floating-point imprecision in log10.
-    if mantissa >= 10.0 {
-        mantissa /= 10.0
-        exponent += 1
-    } else if mantissa < 1.0 {
-        mantissa *= 10.0
-        exponent -= 1
-    }
-
-    // Round the mantissa to the requested number of fractional digits.
-    let scale = pow(10.0, Double(nDigits))
-    mantissa = (mantissa * scale).rounded(.toNearestOrEven) / scale
-
-    // If rounding pushed mantissa to 10, adjust.
-    if mantissa >= 10.0 {
-        mantissa /= 10.0
-        exponent += 1
-    }
-
-    // Build the mantissa string.
-    var mStr: String
-    if nDigits <= 0 {
-        mStr = String(Int(mantissa.rounded()))
+    var m: [UInt8]
+    var e: Int
+    if d == 0 {
+        m = [UInt8](repeating: 0, count: max(nDigits, 0) + 1)
+        e = 0
+    } else if nDigits < 0 {
+        let (digits, exponent) = shortestDecimalDigits(d)
+        m = digits
+        e = exponent - 1
     } else {
-        mStr = formatDoubleFrac(mantissa, nDigits: nDigits)
+        let (digits, exponent) = exactDecimalDigits(d)
+        let (r, carried) = roundDigitsHalfUp(digits, count: nDigits + 1)
+        m = r
+        e = exponent - 1
+        if carried {
+            m.removeLast()
+            e += 1
+        }
     }
-
-    // Build the exponent string.
-    let expSign = exponent >= 0 ? "+" : "-"
-    let expStr = String(abs(exponent))
-
-    var result = mStr + "e" + expSign + expStr
-    if negative && !result.hasPrefix("-") {
-        result = "-" + result
-    }
-    return result
+    var out = d < 0 ? "-" : ""
+    out += digitString(m[0 ..< 1])
+    if m.count > 1 { out += "." + digitString(m[1...]) }
+    return out + exponentSuffix(e)
 }
 
 // MARK: - Non-decimal Radix Formatting
@@ -920,12 +1002,13 @@ func jsNumberToFixed(_ d: Double, fractionDigits: Int) -> String {
 }
 
 /// Implementation of `Number.prototype.toExponential(fractionDigits)`.
+/// `nil` = fractionDigits undefined (shortest round-trip digits).
 /// Mirrors `js_number_toExponential` in QuickJS.
-func jsNumberToExponential(_ d: Double, fractionDigits: Int) -> String {
+func jsNumberToExponential(_ d: Double, fractionDigits: Int?) -> String {
     if d.isNaN { return "NaN" }
     if d.isInfinite { return d < 0 ? "-Infinity" : "Infinity" }
-    let clamped = max(0, min(fractionDigits, 100))
-    return formatDoubleExponential(d, nDigits: clamped)
+    guard let f = fractionDigits else { return formatDoubleExponential(d, nDigits: -1) }
+    return formatDoubleExponential(d, nDigits: max(0, min(f, 100)))
 }
 
 /// Implementation of `Number.prototype.toPrecision(precision)`.

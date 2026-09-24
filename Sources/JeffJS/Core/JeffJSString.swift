@@ -557,12 +557,34 @@ private let kMaxRopeDepth: UInt8 = 32
 /// with geometric growth. On subsequent concats, if the left operand is already
 /// a buffer, we append directly (amortized O(1)). This turns the `s += "x"`
 /// loop pattern from O(n^2) to O(n).
-func jeffJS_concatStrings(s1: JeffJSValue, s2: JeffJSValue) -> JeffJSValue {
-    // Phase 4 fast path: left operand is already a buffer accumulator.
-    // Append right operand directly — amortized O(1).
+///
+/// Appending into the left buffer mutates it, so every other holder of that
+/// string would see the new text (a string value must never change). It is
+/// done in place only when the caller can account for every reference to
+/// `s1`: `ownedRefs` is how many references the caller knows to be its own
+/// (its operand-stack slot, plus the local variable the result is about to
+/// replace for `l = l + x` / `l += x`); 0, the default, never mutates `s1`.
+/// Otherwise the storage is handed to a new buffer (see
+/// JeffJSStringBuffer.handOff), still O(1) per append.
+/// (netflix's emotion serializer returned `styles: l` and later computed
+/// `n.styles + ";"`: the in-place append grew the cached `styles` string on
+/// every render, so every class-name hash differed from the server's.)
+func jeffJS_concatStrings(s1: JeffJSValue, s2: JeffJSValue, ownedRefs: Int = 0) -> JeffJSValue {
+    // Phase 4 fast path: left operand is a buffer accumulator nobody else
+    // holds. Append right operand directly — amortized O(1).
     if let sb = s1.stringBase, sb.kind == JeffJSStringBase.kindBuffer {
-        unsafeDowncast(sb, to: JeffJSStringBuffer.self).concatValue(s2)
-        return s1.dupValue()  // caller may free s1; return owned copy
+        let b1 = unsafeDowncast(sb, to: JeffJSStringBuffer.self)
+        if b1.holdsStorage {
+            if ownedRefs > 0 && sb.refCount <= ownedRefs && s2.stringBase !== sb {
+                b1.concatValue(s2)
+                return s1.dupValue()  // caller may free s1; return owned copy
+            }
+            // Shared (or unknown): continue the text in a new buffer that
+            // takes over the storage; s1 keeps its contents.
+            let nb = b1.handOff()
+            nb.concatValue(s2)
+            return JeffJSValue.mkPtr(tag: .string, ptr: nb)
+        }
     }
 
     // Lengths/widths WITHOUT flattening: `stringValue` flattens ropes, which
@@ -836,13 +858,81 @@ final class JeffJSStringBuffer: JeffJSStringBase {
     /// Initial allocation.
     private static let kInitialCapacity = 256
 
+    // -- Accumulator hand-off ----------------------------------------------------
+    //
+    // A buffer that is a string *value* (the `s += x` accumulator) must never
+    // change: other variables, properties or caches may hold it. Appending
+    // therefore either happens in place when the caller proves it holds every
+    // reference (jeffJS_concatStrings' `ownedRefs`), or hands the storage to
+    // a new buffer (`handOff`): the old buffer keeps its `size` and becomes a
+    // frozen view of the first `size` code units of the storage, which is only
+    // ever appended to (by whichever buffer holds it now), so the view never
+    // changes. Both are O(1) plus the appended length.
+
+    /// The newer buffer this one's storage moved to, or nil if it holds it.
+    private var forward: JeffJSStringBuffer? = nil
+
+    /// True while this buffer holds its own storage (appends can extend it).
+    var holdsStorage: Bool { forward == nil }
+
+    /// The buffer that currently holds this one's code units.
+    private var holder: JeffJSStringBuffer {
+        guard var h = forward else { return self }
+        while let f = h.forward { h = f }
+        forward = h   // path compression
+        return h
+    }
+
+    /// Continue this buffer's text in a new buffer that takes over the
+    /// storage; this one becomes an immutable view of its current contents.
+    func handOff() -> JeffJSStringBuffer {
+        let nb = JeffJSStringBuffer(handOffFrom: self)
+        swap(&nb.buf8, &buf8)
+        nb.buf16 = buf16
+        buf16 = nil
+        forward = nb
+        return nb
+    }
+
+    private init(handOffFrom b: JeffJSStringBuffer) {
+        self.ctx = nil   // unused by the buffer; a weak copy per append is costly
+        self.buf8 = []
+        self.buf16 = nil
+        self.size = b.size
+        self.isWideChar = b.isWideChar
+        self.hasError = b.hasError
+        self.flatCache = b.flatCache
+        super.init(refCount: 1, kind: JeffJSStringBase.kindBuffer)
+    }
+
+    /// Before any append: drop the flat cache, and take a private copy of the
+    /// text if the storage has been handed off.
+    @inline(__always)
+    private func beginAppend() {
+        flatCache = nil
+        if forward != nil { detach() }
+    }
+
+    private func detach() {
+        let h = holder
+        if isWideChar {
+            buf16 = Array(h.buf16!.prefix(size))
+            buf8 = []
+        } else {
+            buf8 = Array(h.buf8.prefix(size))
+            buf16 = nil
+        }
+        forward = nil
+    }
+
     // -- Internal buffer access (for flattenInto helpers) --------------------
 
     /// Read-only access to the 8-bit backing store (for rope flattening).
-    var _buf8Access: [UInt8] { buf8 }
+    /// Only the first `size` code units belong to this buffer.
+    var _buf8Access: [UInt8] { holder.buf8 }
 
     /// Read-only access to the 16-bit backing store (for rope flattening).
-    var _buf16Access: [UInt16]? { buf16 }
+    var _buf16Access: [UInt16]? { holder.buf16 }
 
     // -- Lifecycle -----------------------------------------------------------
 
@@ -882,7 +972,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
 
     /// Append a single byte (Latin-1 code point).
     func putc8(_ c: UInt8) {
-        flatCache = nil
+        beginAppend()
         guard !hasError else { return }
         if isWideChar {
             buf16!.append(UInt16(c))
@@ -894,7 +984,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
 
     /// Append a 16-bit code unit.  Widens the buffer if necessary.
     func putc16(_ c: UInt16) {
-        flatCache = nil
+        beginAppend()
         guard !hasError else { return }
         if c <= 0xFF && !isWideChar {
             buf8.append(UInt8(c))
@@ -909,7 +999,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
     /// Append a Unicode code point.  If the code point is in the supplementary
     /// planes (> 0xFFFF) it is encoded as a surrogate pair.
     func putc(_ codePoint: UInt32) {
-        flatCache = nil
+        beginAppend()
         guard !hasError else { return }
         if codePoint < 0x100 && !isWideChar {
             buf8.append(UInt8(codePoint))
@@ -932,7 +1022,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
     /// Append a Swift `String` interpreted as Latin-1 (only the low byte of
     /// each scalar is used).  This is the equivalent of QuickJS `string_buffer_puts8`.
     func puts8(_ string: String) {
-        flatCache = nil
+        beginAppend()
         guard !hasError else { return }
         for scalar in string.unicodeScalars {
             let c = UInt8(scalar.value & 0xFF)
@@ -947,7 +1037,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
 
     /// Append raw 16-bit data.
     func puts16(_ data: [UInt16]) {
-        flatCache = nil
+        beginAppend()
         guard !hasError else { return }
         if !isWideChar { widenTo16() }
         buf16!.append(contentsOf: data)
@@ -956,7 +1046,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
 
     /// Append the full contents of a `JeffJSString`.
     func concat(_ str: JeffJSString) {
-        flatCache = nil
+        beginAppend()
         guard !hasError else { return }
         switch str.storage {
         case .str8(let data):
@@ -978,7 +1068,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
 
     /// Append `count` copies of the code unit `c`.
     func fill(_ c: UInt32, count: Int) {
-        flatCache = nil
+        beginAppend()
         guard !hasError, count > 0 else { return }
         if c > 0xFF || isWideChar {
             if !isWideChar { widenTo16() }
@@ -1000,7 +1090,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
     /// Append the string content of a JeffJSValue (flat string, rope, or buffer).
     /// Used by `jeffJS_concatStrings` to append the right operand into this buffer.
     func concatValue(_ val: JeffJSValue) {
-        flatCache = nil
+        beginAppend()
         guard !hasError, let sb = val.stringBase else { return }
         switch sb.kind {
         case JeffJSStringBase.kindFlat:   concat(unsafeDowncast(sb, to: JeffJSString.self))
@@ -1017,20 +1107,21 @@ final class JeffJSStringBuffer: JeffJSStringBase {
 
     /// Append the contents of another buffer.
     func concatBuffer(_ other: JeffJSStringBuffer) {
-        flatCache = nil
+        beginAppend()
         guard !hasError else { return }
+        let src = other.holder
         if other.isWideChar {
-            if let otherBuf = other.buf16 {
+            if let otherBuf = src.buf16 {
+                let part = Array(otherBuf.prefix(other.size))
                 if !isWideChar { widenTo16() }
-                buf16!.append(contentsOf: otherBuf.prefix(other.size))
+                buf16!.append(contentsOf: part)
             }
         } else {
+            let part = Array(src.buf8.prefix(other.size))
             if isWideChar {
-                for i in 0 ..< other.size {
-                    buf16!.append(UInt16(other.buf8[i]))
-                }
+                for c in part { buf16!.append(UInt16(c)) }
             } else {
-                buf8.append(contentsOf: other.buf8.prefix(other.size))
+                buf8.append(contentsOf: part)
             }
         }
         size += other.size
@@ -1046,8 +1137,9 @@ final class JeffJSStringBuffer: JeffJSStringBase {
     }
 
     private func materializeFlat() -> JeffJSString {
+        let h = holder
         if isWideChar {
-            let buf = buf16!
+            let buf = h.buf16!
             var canNarrow = true
             for i in 0 ..< size {
                 if buf[i] > 0xFF { canNarrow = false; break }
@@ -1069,16 +1161,17 @@ final class JeffJSStringBuffer: JeffJSStringBase {
             return JeffJSString(refCount: 1,
                                 len: size,
                                 isWideChar: false,
-                                storage: .str8(Array(buf8.prefix(size))))
+                                storage: .str8(Array(h.buf8.prefix(size))))
         }
     }
 
     /// Convert buffer contents to a Swift String.
     func toSwiftString() -> String {
-        if isWideChar, let buf = buf16 {
+        let h = holder
+        if isWideChar, let buf = h.buf16 {
             return jeffJS_swiftStringFromUTF16(buf, count: size)
         } else {
-            return jeffJS_swiftStringFromLatin1(buf8, count: size)
+            return jeffJS_swiftStringFromLatin1(h.buf8, count: size)
         }
     }
 
@@ -1096,6 +1189,7 @@ final class JeffJSStringBuffer: JeffJSStringBase {
     /// After this call the buffer is invalidated (reset to empty).
     func end() -> JeffJSString? {
         guard !hasError else { return nil }
+        if forward != nil { detach() }
 
         let result: JeffJSString
         if isWideChar {
@@ -1136,6 +1230,8 @@ final class JeffJSStringBuffer: JeffJSStringBase {
     }
 
     private func resetInternal() {
+        forward = nil
+        flatCache = nil
         buf8.removeAll(keepingCapacity: false)
         buf16 = nil
         size = 0

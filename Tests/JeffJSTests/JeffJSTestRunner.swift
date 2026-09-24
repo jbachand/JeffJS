@@ -316,6 +316,9 @@ struct JeffJSTestRunner {
             ("SelectorMatchingCache", { $0.testSelectorMatchingCache() }),
             ("ParserNesting", { $0.testParserNesting() }),
             ("DOMThreadSafety", { $0.testDOMThreadSafety() }),
+            ("NumberFormatting", { $0.testNumberFormatting() }),
+            ("CallThis", { $0.testCallThis() }),
+            ("StringConcat", { $0.testStringConcat() }),
         ]
     }
 
