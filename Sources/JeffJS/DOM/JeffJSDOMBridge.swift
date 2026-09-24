@@ -1123,6 +1123,9 @@ final class JeffJSDOMBridge {
         // HTMLScriptElement IDL (async/defer/noModule/text/...)
         registerScriptElementAccessors(on: proto, ctx: ctx)
 
+        // HTMLInputElement.defaultChecked (reflects the `checked` content attribute)
+        registerFormControlAccessors(on: proto, ctx: ctx)
+
         // Install accessor properties (textContent, className, etc.) on the prototype
         installElementPropertyShim(on: proto, ctx: ctx)
 
@@ -2290,7 +2293,7 @@ final class JeffJSDOMBridge {
             ("clientTop", false), ("clientLeft", false),
             ("scrollWidth", false), ("scrollHeight", false),
             ("scrollTop", true), ("scrollLeft", true),
-        ] + Self.scriptIDLNames.map { ($0, true) }
+        ] + Self.scriptIDLNames.map { ($0, true) } + Self.formControlIDLNames.map { ($0, true) }
 
         for (name, hasSetter) in props {
             let getter = ctx.getPropertyStr(obj: el, name: "__get_\(name)")

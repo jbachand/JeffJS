@@ -12,6 +12,8 @@
 //     host's Range / document.write polyfills call it).
 //   - contentAttributeOverride: lets a host whose `attributes` hold a form
 //     control's *state* report the page's content attribute instead.
+//   - HTMLInputElement.defaultChecked (netflix.com: React's input update
+//     assigns it), an accessor on the shared prototype like value/checked.
 
 import Foundation
 
@@ -184,6 +186,47 @@ extension JeffJSDOMBridge {
             let text = ctx.toSwiftString(value) ?? ""
             self.maybeCollectDetachedNodes()
             self.replaceAllChildren(of: node, with: text.isEmpty ? [] : [DOMNode.text(text)])
+            self.notifyMutation(for: node)
+            return .undefined
+        }, length: 1)
+    }
+
+    // MARK: - Form control IDL
+
+    /// Form control IDL attributes beyond value / defaultValue / checked;
+    /// accessors on the shared element prototype like every other IDL
+    /// attribute (WebIDL §3.7.6: configurable, enumerable, get + set), so a
+    /// page may shadow one on an instance with `Object.defineProperty` and
+    /// `delete` it again (React's input value tracking does both).
+    static let formControlIDLNames: [String] = ["defaultChecked"]
+
+    func registerFormControlAccessors(on el: JeffJSValue, ctx: JeffJSContext) {
+        func isInput(_ n: DOMNode) -> Bool {
+            n.nodeType == .element && n.isHTMLNamespace && n.tagName == "input"
+        }
+        // HTML §4.10.5: defaultChecked reflects the `checked` content
+        // attribute (the page's, when the host keeps the checkedness in
+        // `attributes`). Other elements have no such member: undefined, and
+        // an assignment makes an ordinary own property.
+        ctx.setPropertyFunc(obj: el, name: "__get_defaultChecked", fn: { [weak self] _, thisVal, _ in
+            guard let self, let node = self.extractNode(from: thisVal), isInput(node) else { return .undefined }
+            return .newBool(self.pageAttribute(node, "checked") != nil)
+        }, length: 0)
+        ctx.setPropertyFunc(obj: el, name: "__set_defaultChecked", fn: { [weak self] ctx, thisVal, args in
+            guard let self, let node = self.extractNode(from: thisVal) else { return .undefined }
+            let value = args.first ?? .undefined
+            guard isInput(node) else {
+                let atom = ctx.rt.findAtom("defaultChecked")
+                _ = ctx.definePropertyValue(obj: thisVal, atom: atom, value: value,
+                                            flags: JS_PROP_WRITABLE | JS_PROP_ENUMERABLE | JS_PROP_CONFIGURABLE)
+                ctx.rt.freeAtom(atom)
+                return .undefined
+            }
+            if ctx.toBool(value) {
+                if self.pageAttribute(node, "checked") == nil { self.setAttributeValue(node, name: "checked", value: "") }
+            } else if self.pageAttribute(node, "checked") != nil {
+                self.removeAttributeValue(node, name: "checked")
+            }
             self.notifyMutation(for: node)
             return .undefined
         }, length: 1)

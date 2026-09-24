@@ -1152,11 +1152,30 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // work. The check now sits just above jeffJS_addProperty below.
 
         // Determine property type flags for the shape
-        let typeFlags: JeffJSPropertyFlags
+        var typeFlags: JeffJSPropertyFlags
         if (flags & JS_PROP_TMASK) == JS_PROP_GETSET {
             typeFlags = .getset
         } else {
             typeFlags = .normal
+        }
+
+        // A generic descriptor (only enumerable/configurable, ES2023 6.2.6.3)
+        // never changes the kind of an existing property: 10.1.6.3 converts
+        // only for a data descriptor over an accessor or the reverse. React's
+        // input value tracker does `Object.defineProperty(node, 'value',
+        // {configurable, get, set})` and then `Object.defineProperty(node,
+        // 'value', {enumerable})`; the second call used to turn the accessor
+        // into a non-writable data property holding undefined, so every later
+        // `node.value = x` in React's strict code threw "Cannot assign to read
+        // only property" (netflix.com unmounted its whole tree).
+        var keepAccessor = false
+        if (flags & JS_PROP_DEFINE_PROPERTY) != 0, typeFlags == .normal,
+           (flags & (JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE)) == 0,
+           let shape = jsObj.shape,
+           let idx = findShapeProperty(shape, atom) ?? shape.prop.firstIndex(where: { $0.atom == atom && $0.atom != 0 }),
+           idx < shape.prop.count, shape.prop[idx].flags.isGetSet {
+            typeFlags = .getset
+            keepAccessor = true
         }
 
         // Build combined flags for addProperty
@@ -1244,7 +1263,12 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 } else {
                     oldData = jsObj.propValues[idx]
                 }
-                if (flags & JS_PROP_TMASK) == JS_PROP_GETSET {
+                if keepAccessor {
+                    // Generic descriptor over an accessor: the getter and the
+                    // setter stay; only the attribute bits change (below).
+                    oldGetter = nil
+                    oldSetter = nil
+                } else if (flags & JS_PROP_TMASK) == JS_PROP_GETSET {
                     // Merge getter/setter: when defining only the getter or only the
                     // setter on an existing accessor, keep the other half intact.
                     let existingGetter = oldGetter
