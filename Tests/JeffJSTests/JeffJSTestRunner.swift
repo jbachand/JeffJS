@@ -320,6 +320,7 @@ struct JeffJSTestRunner {
             ("CallThis", { $0.testCallThis() }),
             ("StringConcat", { $0.testStringConcat() }),
             ("ParameterOwnership", { $0.testParameterOwnership() }),
+            ("IndexArguments", { $0.testIndexArguments() }),
         ]
     }
 

@@ -218,7 +218,9 @@ private let keywordTable: [(String, Int)] = [
     ("yield",       JSTokenType.TOK_YIELD.rawValue),
     ("await",       JSTokenType.TOK_AWAIT.rawValue),
     ("of",          JSTokenType.TOK_OF.rawValue),
-    ("accessor",    JSTokenType.TOK_ACCESSOR.rawValue),
+    // "accessor" is not a keyword: it is only contextual inside a class body
+    // (decorators proposal) and a valid identifier / property name everywhere
+    // else (`{accessor: 1}`, `o.accessor`, `static accessor(e)` — lowes.com).
 ]
 
 /// Keyword token -> its source spelling (for keywords used as property
@@ -970,8 +972,7 @@ extension JeffJSParseState {
         case 8:
             switch b[s] {
             case 0x61: // a
-                if b[s + 1] == 0x63 && b[s + 2] == 0x63 && b[s + 3] == 0x65 && b[s + 4] == 0x73 && b[s + 5] == 0x73 && b[s + 6] == 0x6F && b[s + 7] == 0x72 { return JSTokenType.TOK_ACCESSOR.rawValue } // accessor
-                return 0
+                return 0 // "accessor" is an identifier, see keywordTable
             case 0x63: // c
                 if b[s + 1] == 0x6F && b[s + 2] == 0x6E && b[s + 3] == 0x74 && b[s + 4] == 0x69 && b[s + 5] == 0x6E && b[s + 6] == 0x75 && b[s + 7] == 0x65 { return JSTokenType.TOK_CONTINUE.rawValue } // continue
                 return 0

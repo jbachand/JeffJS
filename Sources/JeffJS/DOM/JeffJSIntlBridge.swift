@@ -152,7 +152,8 @@ final class JeffJSIntlBridge {
 
     private func optInt(_ ctx: JeffJSContext, _ obj: JeffJSValue, _ name: String) -> Int? {
         guard let d = optDouble(ctx, obj, name) else { return nil }
-        return Int(d)
+        // Saturate: `Int(1e20)` trapped; callers range-check (RangeError).
+        return Int(max(-1e9, min(1e9, d)))
     }
 
     private func optBool(_ ctx: JeffJSContext, _ obj: JeffJSValue, _ name: String) -> Bool? {
@@ -1340,8 +1341,8 @@ extension JeffJSIntlBridge {
                 return ctx.throwRangeError(
                     message: "Value \(type) out of range for Intl.PluralRules options property type")
             }
-            let minFrac = self.optInt(ctx, options, "minimumFractionDigits") ?? 0
-            let maxFrac = self.optInt(ctx, options, "maximumFractionDigits") ?? max(3, minFrac)
+            let minFrac = min(max(self.optInt(ctx, options, "minimumFractionDigits") ?? 0, 0), 100)
+            let maxFrac = min(max(self.optInt(ctx, options, "maximumFractionDigits") ?? max(3, minFrac), 0), 100)
             let cats = type == "ordinal" ? ["few", "one", "other", "two"] : ["one", "other"]
             let entries: [(String, JeffJSValue)] = [
                 ("locale", ctx.newStringValue(tag)),
@@ -1358,8 +1359,8 @@ extension JeffJSIntlBridge {
             guard let self, args.count > 1 else { return ctx.newStringValue("other") }
             let tag = self.optString(ctx, args[0], "locale") ?? "en"
             let type = self.optString(ctx, args[0], "type") ?? "cardinal"
-            let minFrac = self.optInt(ctx, args[0], "minimumFractionDigits") ?? 0
-            let maxFrac = self.optInt(ctx, args[0], "maximumFractionDigits") ?? 3
+            let minFrac = min(max(self.optInt(ctx, args[0], "minimumFractionDigits") ?? 0, 0), 100)
+            let maxFrac = min(max(self.optInt(ctx, args[0], "maximumFractionDigits") ?? 3, 0), 100)
             let v = ctx.toFloat64(args[1]) ?? Double.nan
             if v.isNaN || v.isInfinite { return ctx.newStringValue("other") }
             let digits = JeffJSIntlBridge.fractionDigitCount(v, minFrac: minFrac, maxFrac: maxFrac)

@@ -251,18 +251,22 @@ struct JeffJSBuiltinFunction {
         if targetObj.needsLazyNameLength { ctx.materializeFunctionNameLength(targetObj) }
 
         // length = max(0, target.length - bound argument count).
-        var targetLength: Int32 = 0
+        // In Double: a target length of 1e20 / 2^53 / Infinity is legal
+        // (`Int32(d)` trapped); ToIntegerOrInfinity, NaN → 0.
+        var targetLength: Double = 0
         let targetLengthVal = targetObj.getOwnPropertyValue(
             atom: JeffJSAtomID.JS_ATOM_length.rawValue)
         if targetLengthVal.isInt {
-            targetLength = targetLengthVal.toInt32()
+            targetLength = Double(targetLengthVal.toInt32())
         } else if targetLengthVal.isFloat64 {
             let d = targetLengthVal.toFloat64()
-            if d.isFinite { targetLength = Int32(d) }
+            if !d.isNaN { targetLength = d.isInfinite ? d : d.rounded(.towardZero) }
         } else if let fb = targetObj.fbFast {
-            targetLength = Int32(fb.argCount)
+            targetLength = Double(fb.argCount)
         }
-        let newLength = max(Int32(0), targetLength - Int32(boundArgs.count))
+        let newLengthD = max(0, targetLength - Double(boundArgs.count))
+        let newLengthVal: JeffJSValue = newLengthD <= Double(Int32.max)
+            ? .newInt32(Int32(newLengthD)) : .newFloat64(newLengthD)
         // name = "bound " + target.name (an empty string when the target has
         // no string-valued name, per ES §10.4.1.3).
         var targetName = ""
@@ -288,7 +292,7 @@ struct JeffJSBuiltinFunction {
         _ = ctx.definePropertyValue(obj: boundVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
                                     value: ctx.newStringValue(boundName), flags: JS_PROP_CONFIGURABLE)
         _ = ctx.definePropertyValue(obj: boundVal, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
-                                    value: .newInt32(newLength), flags: JS_PROP_CONFIGURABLE)
+                                    value: newLengthVal, flags: JS_PROP_CONFIGURABLE)
         return boundVal
     }
 
@@ -448,7 +452,14 @@ struct JeffJSBuiltinFunction {
             return Array(snap.values.prefix(actualCount))
         }
 
-        // General path: read indexed properties
+        // General path: read indexed properties. An array-like's length is
+        // arbitrary (`{length: 2**32 + 1}`): reserving/looping that many
+        // slots hung or exhausted memory. QuickJS throws "too many arguments"
+        // past 65,535; allow more (engines differ) but not unbounded.
+        if length > 10_000_000 {
+            _ = ctx.throwRangeError(message: "too many arguments in function call")
+            return nil
+        }
         var result: [JeffJSValue] = []
         result.reserveCapacity(length)
         for i in 0..<length {

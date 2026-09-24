@@ -648,7 +648,7 @@ public final class JeffJSEnvironment {
         // clearTimeout(id)
         ctx.setPropertyFunc(obj: global, name: "clearTimeout", fn: { [weak self] ctx, _, args in
             guard let self else { return JeffJSValue.undefined }
-            let id = args.count > 0 ? Int(ctx.toFloat64(args[0]) ?? 0) : 0
+            let id = args.count > 0 ? jeffJS_clampToInt(ctx.toFloat64(args[0]) ?? 0) : 0
             self.gcdClearTimeout(id)
             return JeffJSValue.undefined
         }, length: 1)
@@ -665,7 +665,7 @@ public final class JeffJSEnvironment {
         // clearInterval(id)
         ctx.setPropertyFunc(obj: global, name: "clearInterval", fn: { [weak self] ctx, _, args in
             guard let self else { return JeffJSValue.undefined }
-            let id = args.count > 0 ? Int(ctx.toFloat64(args[0]) ?? 0) : 0
+            let id = args.count > 0 ? jeffJS_clampToInt(ctx.toFloat64(args[0]) ?? 0) : 0
             self.gcdClearInterval(id)
             return JeffJSValue.undefined
         }, length: 1)
@@ -681,7 +681,7 @@ public final class JeffJSEnvironment {
         // cancelAnimationFrame(id)
         ctx.setPropertyFunc(obj: global, name: "cancelAnimationFrame", fn: { [weak self] ctx, _, args in
             guard let self else { return JeffJSValue.undefined }
-            let id = args.count > 0 ? Int(ctx.toFloat64(args[0]) ?? 0) : 0
+            let id = args.count > 0 ? jeffJS_clampToInt(ctx.toFloat64(args[0]) ?? 0) : 0
             self.gcdClearTimeout(id)
             return JeffJSValue.undefined
         }, length: 1)
@@ -706,7 +706,7 @@ public final class JeffJSEnvironment {
             }
         }
         timeoutItems[id] = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(delayMs)), execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(delayMs.isFinite ? min(max(delayMs, 0), Double(Int32.max)) : 0)), execute: item)
         return id
     }
 
@@ -724,7 +724,7 @@ public final class JeffJSEnvironment {
         timerCallbacks[id] = duped
 
         let timer = DispatchSource.makeTimerSource(queue: .main)
-        let interval = max(1, delayMs)
+        let interval = delayMs.isFinite ? min(max(1, delayMs), Double(Int32.max)) : 1  // Int(Infinity) trapped
         timer.schedule(deadline: .now() + .milliseconds(Int(interval)),
                        repeating: .milliseconds(Int(interval)))
         timer.setEventHandler { [weak self] in

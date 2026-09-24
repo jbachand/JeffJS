@@ -5673,17 +5673,12 @@ final class JeffJSParser {
         emitIfTrue(optNullTarget)
 
         if tok == 0x28 { // '?.(args)'
-            next()
-            var argc = 0
-            while tok != 0x29 && tok != JSTokenType.TOK_EOF.rawValue && !shouldAbort {
-                parseAssignExpr()
-                argc += 1
-                if argc > JeffJSParser.maxCallArguments { tooManyArguments(); return }
-                if tok == 0x2C { next() }
-            }
-            expect(0x29)
-            if optWasMethod { emitCallMethod(argc) } else { emitCall(argc) }
-        } else if tok == 0x5B { // '?.[expr]'
+            // Same argument list as a plain call, spread included
+            // (`e?.(...a)` was a SyntaxError; cnn.com's video player).
+            // Never a direct eval: the callee test emitted code after it.
+            pendingMethodCall = optWasMethod
+            parseCallArguments()
+        } else if tok == 0x5B { // '?.[expr]''
             next()
             parseExpression()
             expect(0x5D)
@@ -6988,14 +6983,8 @@ final class JeffJSParser {
             propAtom = getAtom(s.token.strValue)
             next()
         } else if tok == JSTokenType.TOK_NUMBER.rawValue {
-            let numStr: String
-            let val = s.token.numValue
-            if let iv = Int32(exactly: val), Double(iv) == val {
-                numStr = String(iv)
-            } else {
-                numStr = String(val)
-            }
-            propAtom = getAtom(numStr)
+            // ES Number::toString: `String(Double)` gave "4294967296.0".
+            propAtom = getAtom(JeffJSBuiltinNumber.numberToStringBase10(s.token.numValue))
             next()
         } else if isKeywordToken(tok) {
             // Keywords are valid as property names in object literals and class bodies.
@@ -7899,7 +7888,9 @@ final class JeffJSParser {
                 propAtom = getAtom(s.token.strValue)
                 next()
             } else if tok == JSTokenType.TOK_NUMBER.rawValue {
-                propAtom = getAtom(String(s.token.numValue))
+                // ES Number::toString: `String(Double)` gave "0.0", so
+                // `var {0: x} = o` read the wrong key.
+                propAtom = getAtom(JeffJSBuiltinNumber.numberToStringBase10(s.token.numValue))
                 next()
             } else if isKeywordToken(tok) {
                 let kwName = keywordTokenName(tok)

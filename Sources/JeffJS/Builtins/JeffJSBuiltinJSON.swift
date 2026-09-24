@@ -233,8 +233,8 @@ struct JeffJSBuiltinJSON {
             }
 
             if spaceArg.isNumber {
-                let n = Int(spaceArg.toNumber())
-                let count = max(0, min(n, 10))
+                // min(10, ToIntegerOrInfinity(space)); `Int(Infinity)` trapped.
+                let count = Int(jeffJS_clampToInt64(min(10, max(0, spaceArg.toNumber().rounded(.towardZero)))))
                 if count > 0 {
                     sCtx.gap = String(repeating: " ", count: count)
                 }

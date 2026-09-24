@@ -272,10 +272,10 @@ func jsArrayBuffer_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
     var byteLength = 0
     if argv.count >= 1 {
         if argv[0].isInt { byteLength = Int(argv[0].toInt32()) }
-        else if argv[0].isFloat64 { byteLength = Int(argv[0].toFloat64()) }
+        else if argv[0].isFloat64 { byteLength = jeffJS_intArg(argv[0].toFloat64()) }
     }
-    if byteLength < 0 {
-        return ctx.throwTypeError("Invalid array buffer length")
+    if byteLength < 0 || byteLength > jeffJS_maxByteLength {
+        return ctx.throwRangeError("Invalid array buffer length")
     }
 
     // Check for options { maxByteLength } for resizable buffers.
@@ -287,9 +287,12 @@ func jsArrayBuffer_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
             let mbVal = optsObj.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_maxByteLength.rawValue)
             if !mbVal.isUndefined {
                 if mbVal.isInt { maxByteLength = Int(mbVal.toInt32()) }
-                else if mbVal.isFloat64 { maxByteLength = Int(mbVal.toFloat64()) }
+                else if mbVal.isFloat64 { maxByteLength = jeffJS_intArg(mbVal.toFloat64()) }
                 if maxByteLength < byteLength {
                     return ctx.throwTypeError("maxByteLength must be >= byteLength")
+                }
+                if maxByteLength > jeffJS_maxByteLength {
+                    return ctx.throwRangeError("Invalid array buffer max length")
                 }
                 isResizable = true
             }
@@ -339,12 +342,12 @@ func jsArrayBuffer_slice(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
     var end = len
 
     if argv.count >= 1 {
-        start = argv[0].isInt ? Int(argv[0].toInt32()) : { let d = argv[0].toNumber(); return (d.isFinite && abs(d) < Double(Int.max / 2)) ? Int(d) : 0 }()
+        start = argv[0].isInt ? Int(argv[0].toInt32()) : jeffJS_intArg(argv[0].toNumber())
         if start < 0 { start = max(len + start, 0) }
         start = min(start, len)
     }
     if argv.count >= 2, !argv[1].isUndefined {
-        end = argv[1].isInt ? Int(argv[1].toInt32()) : { let _d = argv[1].toNumber(); return _d.isFinite ? Int(_d) : 0 }()
+        end = argv[1].isInt ? Int(argv[1].toInt32()) : jeffJS_intArg(argv[1].toNumber())
         if end < 0 { end = max(len + end, 0) }
         end = min(end, len)
     }
@@ -367,8 +370,8 @@ func jsArrayBuffer_resize(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
         return ctx.throwTypeError("ArrayBuffer is detached")
     }
     guard argv.count >= 1 else { return ctx.throwTypeError("missing argument") }
-    let newLen = argv[0].isInt ? Int(argv[0].toInt32()) : { let _d = argv[0].toNumber(); return _d.isFinite ? Int(_d) : 0 }()
-    if newLen < 0 { return ctx.throwTypeError("Invalid length") }
+    let newLen = argv[0].isInt ? Int(argv[0].toInt32()) : jeffJS_intArg(argv[0].toNumber())
+    if newLen < 0 || newLen > jeffJS_maxByteLength { return ctx.throwRangeError("Invalid length") }
 
     if newLen > ab.byteLength {
         ab.data.append(contentsOf: [UInt8](repeating: 0, count: newLen - ab.byteLength))
@@ -388,9 +391,9 @@ func jsArrayBuffer_transfer(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 
     var newLen = ab.byteLength
     if argv.count >= 1, !argv[0].isUndefined {
-        newLen = argv[0].isInt ? Int(argv[0].toInt32()) : { let _d = argv[0].toNumber(); return _d.isFinite ? Int(_d) : 0 }()
+        newLen = argv[0].isInt ? Int(argv[0].toInt32()) : jeffJS_intArg(argv[0].toNumber())
     }
-    if newLen < 0 { return ctx.throwTypeError("Invalid length") }
+    if newLen < 0 || newLen > jeffJS_maxByteLength { return ctx.throwRangeError("Invalid length") }
 
     let newAB = JeffJSArrayBuffer(byteLength: newLen)
     let copyLen = min(ab.byteLength, newLen)
@@ -443,9 +446,9 @@ func jsSharedArrayBuffer_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValu
                                      _ argv: [JeffJSValue]) -> JeffJSValue {
     var byteLength = 0
     if argv.count >= 1 {
-        byteLength = argv[0].isInt ? Int(argv[0].toInt32()) : { let _d = argv[0].toNumber(); return _d.isFinite ? Int(_d) : 0 }()
+        byteLength = argv[0].isInt ? Int(argv[0].toInt32()) : jeffJS_intArg(argv[0].toNumber())
     }
-    if byteLength < 0 { return ctx.throwTypeError("Invalid SharedArrayBuffer length") }
+    if byteLength < 0 || byteLength > jeffJS_maxByteLength { return ctx.throwRangeError("Invalid SharedArrayBuffer length") }
 
     let ab = JeffJSArrayBuffer(byteLength: byteLength)
     ab.shared = true
@@ -454,7 +457,8 @@ func jsSharedArrayBuffer_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValu
     if argv.count >= 2, argv[1].isObject, let opts = argv[1].toObject() {
         let mbVal = opts.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_maxByteLength.rawValue)
         if !mbVal.isUndefined {
-            let mb = mbVal.isInt ? Int(mbVal.toInt32()) : { let _d = mbVal.toNumber(); return _d.isFinite ? Int(_d) : 0 }()
+            let mb = mbVal.isInt ? Int(mbVal.toInt32()) : jeffJS_intArg(mbVal.toNumber())
+            if mb > jeffJS_maxByteLength { return ctx.throwRangeError("Invalid SharedArrayBuffer max length") }
             if mb >= byteLength { ab.data.reserveCapacity(mb) }
         }
     }
@@ -471,8 +475,9 @@ func jsSharedArrayBuffer_grow(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
         return ctx.throwTypeError("not a SharedArrayBuffer")
     }
     guard argv.count >= 1 else { return ctx.throwTypeError("missing argument") }
-    let newLen = argv[0].isInt ? Int(argv[0].toInt32()) : { let _d = argv[0].toNumber(); return _d.isFinite ? Int(_d) : 0 }()
+    let newLen = argv[0].isInt ? Int(argv[0].toInt32()) : jeffJS_intArg(argv[0].toNumber())
     if newLen < ab.byteLength { return ctx.throwTypeError("Cannot shrink SharedArrayBuffer") }
+    if newLen > jeffJS_maxByteLength { return ctx.throwRangeError("Invalid length") }
     ab.data.append(contentsOf: [UInt8](repeating: 0, count: newLen - ab.byteLength))
     ab.byteLength = newLen
     return .undefined
@@ -562,7 +567,7 @@ func jsTypedArray_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
         }
         var byteOff = 0
         if argv.count >= 2, !argv[1].isUndefined {
-            byteOff = argv[1].isInt ? Int(argv[1].toInt32()) : { let _d = argv[1].toNumber(); return _d.isFinite ? Int(_d) : 0 }()
+            byteOff = argv[1].isInt ? Int(argv[1].toInt32()) : jeffJS_intArg(argv[1].toNumber())
         }
         if byteOff < 0 || byteOff % info.bytesPerElement != 0 {
             return ctx.throwTypeError("Invalid byteOffset")
@@ -570,7 +575,7 @@ func jsTypedArray_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 
         var length: Int
         if argv.count >= 3, !argv[2].isUndefined {
-            length = argv[2].isInt ? Int(argv[2].toInt32()) : { let _d = argv[2].toNumber(); return _d.isFinite ? Int(_d) : 0 }()
+            length = argv[2].isInt ? Int(argv[2].toInt32()) : jeffJS_intArg(argv[2].toNumber())
             if length < 0 || byteOff + length * info.bytesPerElement > ab.byteLength {
                 return ctx.throwTypeError("Invalid length")
             }
@@ -588,8 +593,10 @@ func jsTypedArray_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
         ta.length = length
     } else if argv[0].isInt || argv[0].isFloat64 {
         // new TypedArray(length)
-        let length = argv[0].isInt ? Int(argv[0].toInt32()) : { let _d = argv[0].toNumber(); return _d.isFinite ? Int(_d) : 0 }()
-        if length < 0 { return ctx.throwTypeError("Invalid typed array length") }
+        let length = argv[0].isInt ? Int(argv[0].toInt32()) : jeffJS_intArg(argv[0].toNumber())
+        if length < 0 || length > jeffJS_maxByteLength / info.bytesPerElement {
+            return ctx.throwRangeError("Invalid typed array length")
+        }
         let byteLen = length * info.bytesPerElement
         let ab = JeffJSArrayBuffer(byteLength: byteLen)
         let bufObj = jeffJS_createObject(ctx: ctx, proto: nil, classID: UInt16(JeffJSClassID.arrayBuffer.rawValue))
@@ -605,8 +612,11 @@ func jsTypedArray_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
         let lenVal = ctx.getPropertyStr(obj: srcVal, name: "length")
         let srcLen: Int
         if lenVal.isInt { srcLen = Int(lenVal.toInt32()) }
-        else if lenVal.isFloat64 { srcLen = Int(lenVal.toFloat64()) }
+        else if lenVal.isFloat64 { srcLen = max(0, jeffJS_intArg(lenVal.toFloat64())) }
         else { srcLen = 0 }
+        if srcLen > jeffJS_maxByteLength / info.bytesPerElement {
+            return ctx.throwRangeError("Invalid typed array length")
+        }
 
         let byteLen = srcLen * info.bytesPerElement
         let ab = JeffJSArrayBuffer(byteLength: byteLen)
@@ -647,7 +657,7 @@ func jsTypedArray_at(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Jeff
         return ctx.throwTypeError("not a typed array or buffer detached")
     }
     guard let info = typedArrayInfo(forClassID: ta.classID) else { return .undefined }
-    var idx = argv.count >= 1 ? (argv[0].isInt ? Int(argv[0].toInt32()) : { let _d = argv[0].toNumber(); return _d.isFinite ? Int(_d) : 0 }()) : 0
+    var idx = argv.count >= 1 ? (argv[0].isInt ? Int(argv[0].toInt32()) : jeffJS_intArg(argv[0].toNumber())) : 0
     if idx < 0 { idx += ta.length }
     if idx < 0 || idx >= ta.length { return .undefined }
     return info.readElement(ab.data, offset: ta.byteOffset + idx * info.bytesPerElement)
@@ -693,7 +703,7 @@ func jsTypedArray_set(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Jef
     guard let info = typedArrayInfo(forClassID: ta.classID) else { return .undefined }
     var targetOffset = 0
     if argv.count >= 2, !argv[1].isUndefined {
-        targetOffset = argv[1].isInt ? Int(argv[1].toInt32()) : { let _d = argv[1].toNumber(); return _d.isFinite ? Int(_d) : 0 }()
+        targetOffset = argv[1].isInt ? Int(argv[1].toInt32()) : jeffJS_intArg(argv[1].toNumber())
     }
     if targetOffset < 0 { return ctx.throwTypeError("Invalid offset") }
 
@@ -725,8 +735,8 @@ func jsTypedArray_slice(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [J
     guard let info = typedArrayInfo(forClassID: ta.classID) else { return .undefined }
 
     let len = ta.length
-    var start = argv.count >= 1 ? (argv[0].isInt ? Int(argv[0].toInt32()) : { let _d = argv[0].toNumber(); return _d.isFinite ? Int(_d) : 0 }()) : 0
-    var end = argv.count >= 2 && !argv[1].isUndefined ? (argv[1].isInt ? Int(argv[1].toInt32()) : { let _d = argv[1].toNumber(); return _d.isFinite ? Int(_d) : 0 }()) : len
+    var start = argv.count >= 1 ? (argv[0].isInt ? Int(argv[0].toInt32()) : jeffJS_intArg(argv[0].toNumber())) : 0
+    var end = argv.count >= 2 && !argv[1].isUndefined ? (argv[1].isInt ? Int(argv[1].toInt32()) : jeffJS_intArg(argv[1].toNumber())) : len
 
     if start < 0 { start = max(len + start, 0) }; start = min(start, len)
     if end < 0 { end = max(len + end, 0) }; end = min(end, len)
@@ -763,8 +773,8 @@ func jsTypedArray_subarray(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
     guard let info = typedArrayInfo(forClassID: ta.classID) else { return .undefined }
 
     let len = ta.length
-    var start = argv.count >= 1 ? (argv[0].isInt ? Int(argv[0].toInt32()) : { let _d = argv[0].toNumber(); return _d.isFinite ? Int(_d) : 0 }()) : 0
-    var end = argv.count >= 2 && !argv[1].isUndefined ? (argv[1].isInt ? Int(argv[1].toInt32()) : { let _d = argv[1].toNumber(); return _d.isFinite ? Int(_d) : 0 }()) : len
+    var start = argv.count >= 1 ? (argv[0].isInt ? Int(argv[0].toInt32()) : jeffJS_intArg(argv[0].toNumber())) : 0
+    var end = argv.count >= 2 && !argv[1].isUndefined ? (argv[1].isInt ? Int(argv[1].toInt32()) : jeffJS_intArg(argv[1].toNumber())) : len
 
     if start < 0 { start = max(len + start, 0) }; start = min(start, len)
     if end < 0 { end = max(len + end, 0) }; end = min(end, len)
@@ -788,19 +798,22 @@ func jsTypedArray_fill(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Je
     guard let (ta, ab) = validateTypedArray(thisVal) else {
         return ctx.throwTypeError("not a typed array")
     }
-    guard let info = typedArrayInfo(forClassID: ta.classID) else { return thisVal }
+    guard let info = typedArrayInfo(forClassID: ta.classID) else { return thisVal.dupValue() }
     let fillVal = argv.count >= 1 ? argv[0] : JeffJSValue.undefined
     let len = ta.length
-    var start = argv.count >= 2 ? (argv[1].isInt ? Int(argv[1].toInt32()) : { let _d = argv[1].toNumber(); return _d.isFinite ? Int(_d) : 0 }()) : 0
-    var end = argv.count >= 3 && !argv[2].isUndefined ? (argv[2].isInt ? Int(argv[2].toInt32()) : { let _d = argv[2].toNumber(); return _d.isFinite ? Int(_d) : 0 }()) : len
+    var start = argv.count >= 2 ? (argv[1].isInt ? Int(argv[1].toInt32()) : jeffJS_intArg(argv[1].toNumber())) : 0
+    var end = argv.count >= 3 && !argv[2].isUndefined ? (argv[2].isInt ? Int(argv[2].toInt32()) : jeffJS_intArg(argv[2].toNumber())) : len
     if start < 0 { start = max(len + start, 0) }; start = min(start, len)
     if end < 0 { end = max(len + end, 0) }; end = min(end, len)
 
-    var data = ab.data
-    for i in start..<end {
-        info.writeElement(&data, offset: ta.byteOffset + i * info.bytesPerElement, value: fillVal)
+    // `start..<end` trapped when start > end (`ta.fill(0, 5, 2)`).
+    if start < end {
+        var data = ab.data
+        for i in start..<end {
+            info.writeElement(&data, offset: ta.byteOffset + i * info.bytesPerElement, value: fillVal)
+        }
+        ab.data = data
     }
-    ab.data = data
     return thisVal.dupValue()   // the caller releases this argument; the result is a new reference
 }
 
@@ -809,18 +822,20 @@ func jsTypedArray_copyWithin(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ arg
     guard let (ta, ab) = validateTypedArray(thisVal) else {
         return ctx.throwTypeError("not a typed array")
     }
-    guard let info = typedArrayInfo(forClassID: ta.classID) else { return thisVal }
+    guard let info = typedArrayInfo(forClassID: ta.classID) else { return thisVal.dupValue() }
     let len = ta.length
-    var target = argv.count >= 1 ? (argv[0].isInt ? Int(argv[0].toInt32()) : { let _d = argv[0].toNumber(); return _d.isFinite ? Int(_d) : 0 }()) : 0
-    var start = argv.count >= 2 ? (argv[1].isInt ? Int(argv[1].toInt32()) : { let _d = argv[1].toNumber(); return _d.isFinite ? Int(_d) : 0 }()) : 0
-    var end = argv.count >= 3 && !argv[2].isUndefined ? (argv[2].isInt ? Int(argv[2].toInt32()) : { let _d = argv[2].toNumber(); return _d.isFinite ? Int(_d) : 0 }()) : len
+    var target = argv.count >= 1 ? (argv[0].isInt ? Int(argv[0].toInt32()) : jeffJS_intArg(argv[0].toNumber())) : 0
+    var start = argv.count >= 2 ? (argv[1].isInt ? Int(argv[1].toInt32()) : jeffJS_intArg(argv[1].toNumber())) : 0
+    var end = argv.count >= 3 && !argv[2].isUndefined ? (argv[2].isInt ? Int(argv[2].toInt32()) : jeffJS_intArg(argv[2].toNumber())) : len
 
     if target < 0 { target = max(len + target, 0) }; target = min(target, len)
     if start < 0 { start = max(len + start, 0) }; start = min(start, len)
     if end < 0 { end = max(len + end, 0) }; end = min(end, len)
 
     let count = min(end - start, len - target)
-    if count <= 0 { return thisVal }
+    // The result is a new reference: returning the borrowed `thisVal` here
+    // released the typed array once too often (use-after-free, SIGSEGV).
+    if count <= 0 { return thisVal.dupValue() }
 
     let bpe = info.bytesPerElement
     let srcByteOff = ta.byteOffset + start * bpe
@@ -839,7 +854,7 @@ func jsTypedArray_reverse(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: 
     guard let (ta, ab) = validateTypedArray(thisVal) else {
         return ctx.throwTypeError("not a typed array")
     }
-    guard let info = typedArrayInfo(forClassID: ta.classID) else { return thisVal }
+    guard let info = typedArrayInfo(forClassID: ta.classID) else { return thisVal.dupValue() }
     let bpe = info.bytesPerElement
     var data = ab.data
     var lo = 0
@@ -863,8 +878,9 @@ func jsTypedArray_indexOf(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: 
     guard let (ta, ab) = validateTypedArray(thisVal) else { return .newInt32(-1) }
     guard let info = typedArrayInfo(forClassID: ta.classID) else { return .newInt32(-1) }
     let searchVal = argv.count >= 1 ? argv[0] : JeffJSValue.undefined
-    var from = argv.count >= 2 ? (argv[1].isInt ? Int(argv[1].toInt32()) : { let _d = argv[1].toNumber(); return _d.isFinite ? Int(_d) : 0 }()) : 0
+    var from = argv.count >= 2 ? (argv[1].isInt ? Int(argv[1].toInt32()) : jeffJS_intArg(argv[1].toNumber())) : 0
     if from < 0 { from = max(ta.length + from, 0) }
+    if from >= ta.length { return .newInt32(-1) }   // `from..<length` trapped past the end
 
     for i in from..<ta.length {
         let elem = info.readElement(ab.data, offset: ta.byteOffset + i * info.bytesPerElement)
@@ -878,7 +894,7 @@ func jsTypedArray_lastIndexOf(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ ar
     guard let (ta, ab) = validateTypedArray(thisVal) else { return .newInt32(-1) }
     guard let info = typedArrayInfo(forClassID: ta.classID) else { return .newInt32(-1) }
     let searchVal = argv.count >= 1 ? argv[0] : JeffJSValue.undefined
-    var from = argv.count >= 2 ? (argv[1].isInt ? Int(argv[1].toInt32()) : { let _d = argv[1].toNumber(); return _d.isFinite ? Int(_d) : 0 }()) : ta.length - 1
+    var from = argv.count >= 2 ? (argv[1].isInt ? Int(argv[1].toInt32()) : jeffJS_intArg(argv[1].toNumber())) : ta.length - 1
     if from < 0 { from = ta.length + from }
     from = min(from, ta.length - 1)
 
@@ -953,7 +969,7 @@ func jsDataView_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 
     var byteOff = 0
     if argv.count >= 2, !argv[1].isUndefined {
-        byteOff = argv[1].isInt ? Int(argv[1].toInt32()) : { let _d = argv[1].toNumber(); return _d.isFinite ? Int(_d) : 0 }()
+        byteOff = argv[1].isInt ? Int(argv[1].toInt32()) : jeffJS_intArg(argv[1].toNumber())
     }
     if byteOff < 0 || byteOff > ab.byteLength {
         return ctx.throwTypeError("Invalid byteOffset")
@@ -961,7 +977,7 @@ func jsDataView_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 
     var byteLen = ab.byteLength - byteOff
     if argv.count >= 3, !argv[2].isUndefined {
-        byteLen = argv[2].isInt ? Int(argv[2].toInt32()) : { let _d = argv[2].toNumber(); return _d.isFinite ? Int(_d) : 0 }()
+        byteLen = argv[2].isInt ? Int(argv[2].toInt32()) : jeffJS_intArg(argv[2].toNumber())
         if byteLen < 0 || byteOff + byteLen > ab.byteLength {
             return ctx.throwTypeError("Invalid byteLength")
         }
@@ -989,7 +1005,7 @@ private func dataViewGet(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
     }
 
     guard argv.count >= 1 else { return ctx.throwTypeError("missing byte offset") }
-    let byteOffset = argv[0].isInt ? Int(argv[0].toInt32()) : { let _d = argv[0].toNumber(); return _d.isFinite ? Int(_d) : 0 }()
+    let byteOffset = argv[0].isInt ? Int(argv[0].toInt32()) : jeffJS_intArg(argv[0].toNumber())
     if byteOffset < 0 || byteOffset + bytesPerElement > ta.byteLength {
         return ctx.throwTypeError("byte offset out of range")
     }
@@ -1012,7 +1028,7 @@ private func dataViewSet(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
     }
 
     guard argv.count >= 2 else { return ctx.throwTypeError("missing arguments") }
-    let byteOffset = argv[0].isInt ? Int(argv[0].toInt32()) : { let _d = argv[0].toNumber(); return _d.isFinite ? Int(_d) : 0 }()
+    let byteOffset = argv[0].isInt ? Int(argv[0].toInt32()) : jeffJS_intArg(argv[0].toNumber())
     if byteOffset < 0 || byteOffset + bytesPerElement > ta.byteLength {
         return ctx.throwTypeError("byte offset out of range")
     }
@@ -1141,21 +1157,21 @@ func jsDataView_getFloat16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
 
 func jsDataView_setInt8(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewSet(ctx, thisVal, argv, bytesPerElement: 1) { data, off, val, _ in
-        let v = val.isInt ? val.toInt32() : Int32(val.toNumber())
+        let v = val.isInt ? val.toInt32() : JeffJSTypeConvert.doubleToInt32(val.toNumber())  // ToInt32; `Int32(d)` trapped
         data[off] = UInt8(bitPattern: Int8(truncatingIfNeeded: v))
     }
 }
 
 func jsDataView_setUint8(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewSet(ctx, thisVal, argv, bytesPerElement: 1) { data, off, val, _ in
-        let v = val.isInt ? val.toInt32() : Int32(val.toNumber())
+        let v = val.isInt ? val.toInt32() : JeffJSTypeConvert.doubleToInt32(val.toNumber())  // ToInt32; `Int32(d)` trapped
         data[off] = UInt8(truncatingIfNeeded: v)
     }
 }
 
 func jsDataView_setInt16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewSet(ctx, thisVal, argv, bytesPerElement: 2) { data, off, val, le in
-        let v = val.isInt ? val.toInt32() : Int32(val.toNumber())
+        let v = val.isInt ? val.toInt32() : JeffJSTypeConvert.doubleToInt32(val.toNumber())  // ToInt32; `Int32(d)` trapped
         var raw = UInt16(bitPattern: Int16(truncatingIfNeeded: v))
         if !le { raw = raw.byteSwapped }
         data[off] = UInt8(raw & 0xFF); data[off+1] = UInt8((raw >> 8) & 0xFF)
@@ -1164,7 +1180,7 @@ func jsDataView_setInt16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [
 
 func jsDataView_setUint16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewSet(ctx, thisVal, argv, bytesPerElement: 2) { data, off, val, le in
-        let v = val.isInt ? val.toInt32() : Int32(val.toNumber())
+        let v = val.isInt ? val.toInt32() : JeffJSTypeConvert.doubleToInt32(val.toNumber())  // ToInt32; `Int32(d)` trapped
         var raw = UInt16(truncatingIfNeeded: v)
         if !le { raw = raw.byteSwapped }
         data[off] = UInt8(raw & 0xFF); data[off+1] = UInt8((raw >> 8) & 0xFF)
@@ -1173,7 +1189,7 @@ func jsDataView_setUint16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: 
 
 func jsDataView_setInt32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewSet(ctx, thisVal, argv, bytesPerElement: 4) { data, off, val, le in
-        let v = val.isInt ? val.toInt32() : Int32(val.toNumber())
+        let v = val.isInt ? val.toInt32() : JeffJSTypeConvert.doubleToInt32(val.toNumber())  // ToInt32; `Int32(d)` trapped
         var raw = UInt32(bitPattern: v)
         if !le { raw = raw.byteSwapped }
         data[off] = UInt8(raw & 0xFF); data[off+1] = UInt8((raw>>8)&0xFF); data[off+2] = UInt8((raw>>16)&0xFF); data[off+3] = UInt8((raw>>24)&0xFF)
@@ -1183,7 +1199,7 @@ func jsDataView_setInt32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [
 func jsDataView_setUint32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewSet(ctx, thisVal, argv, bytesPerElement: 4) { data, off, val, le in
         let d = val.isInt ? Double(val.toInt32()) : val.toNumber()
-        var raw = UInt32(d.isNaN ? 0 : d)
+        var raw = JeffJSTypeConvert.doubleToUInt32(d)  // ToUint32; `UInt32(d)` trapped
         if !le { raw = raw.byteSwapped }
         data[off] = UInt8(raw & 0xFF); data[off+1] = UInt8((raw>>8)&0xFF); data[off+2] = UInt8((raw>>16)&0xFF); data[off+3] = UInt8((raw>>24)&0xFF)
     }

@@ -143,7 +143,7 @@ struct JeffJSBuiltinArray {
 
         // Multiple arguments or single non-numeric: Array(element0, element1, ...)
         for i in 0..<args.count {
-            ctx.setPropertyByIndex(obj: arr, index: UInt32(i), value: args[i].dupValue())   // the setter takes ownership; args are borrowed
+            ctx.setPropertyByIndex(obj: arr, index64: Int64(i), value: args[i].dupValue())   // the setter takes ownership; args are borrowed
         }
 
         ctx.setArrayLength(arr, Int64(args.count))
@@ -273,7 +273,7 @@ struct JeffJSBuiltinArray {
 
         var k: Int64 = 0
         while k < len {
-            var val = ctx.getPropertyByIndex(obj: arrayLike, index: UInt32(k))
+            var val = ctx.getPropertyByIndex(obj: arrayLike, index64: Int64(k))
             if val.isException { arr.freeValue(); return val }
 
             if mapping {
@@ -370,7 +370,7 @@ struct JeffJSBuiltinArray {
         }
 
         len -= 1
-        let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(len))
+        let val = ctx.getPropertyByIndex(obj: obj, index64: Int64(len))
         if val.isException { return val }
 
         if !deleteIndex(ctx: ctx, obj, len) { val.freeValue(); return .exception }
@@ -401,10 +401,10 @@ struct JeffJSBuiltinArray {
         // Shift all elements down by 1
         var k: Int64 = 1
         while k < len {
-            let has = ctx.hasPropertyByIndex(obj: obj, index: UInt32(k))
+            let has = ctx.hasPropertyByIndex(obj: obj, index64: Int64(k))
 
             if has {
-                let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
+                let val = ctx.getPropertyByIndex(obj: obj, index64: Int64(k))
                 if val.isException { first.freeValue(); return val }
                 if !putIndex(ctx: ctx, obj, k - 1, val) { first.freeValue(); return .exception }
             } else {
@@ -483,14 +483,7 @@ struct JeffJSBuiltinArray {
         // Resolve start
         var actualStart: Int64
         if args.count > 0 {
-            let rs = ctx.toIntegerOrInfinity(args[0])
-            if rs == -.infinity {
-                actualStart = 0
-            } else if rs < 0 {
-                actualStart = max(len + Int64(rs), 0)
-            } else {
-                actualStart = min(Int64(rs), len)
-            }
+            actualStart = jeffJS_relativeIndex(ctx.toIntegerOrInfinity(args[0]), len)
         } else {
             actualStart = 0
         }
@@ -505,7 +498,7 @@ struct JeffJSBuiltinArray {
             actualDeleteCount = len - actualStart
         } else {
             let dc = ctx.toIntegerOrInfinity(args[1])
-            actualDeleteCount = min(max(Int64(dc), 0), len - actualStart)
+            actualDeleteCount = min(max(jeffJS_clampToInt64(dc), 0), len - actualStart)
         }
 
         // Check length overflow
@@ -525,7 +518,7 @@ struct JeffJSBuiltinArray {
             if has {
                 let val = ctx.getPropertyByIndex(obj: obj, index: from)
                 if val.isException { return val }
-                ctx.setPropertyByIndex(obj: result, index: UInt32(i), value: val)
+                ctx.setPropertyByIndex(obj: result, index64: Int64(i), value: val)
             }
         }
         ctx.setArrayLength(result, actualDeleteCount)
@@ -707,25 +700,25 @@ struct JeffJSBuiltinArray {
         while lower < middle {
             let upper = len - lower - 1
 
-            let lowerExists = ctx.hasPropertyByIndex(obj: obj, index: UInt32(lower))
+            let lowerExists = ctx.hasPropertyByIndex(obj: obj, index64: Int64(lower))
 
-            let upperExists = ctx.hasPropertyByIndex(obj: obj, index: UInt32(upper))
+            let upperExists = ctx.hasPropertyByIndex(obj: obj, index64: Int64(upper))
 
             if lowerExists && upperExists {
-                let lowerVal = ctx.getPropertyByIndex(obj: obj, index: UInt32(lower))
+                let lowerVal = ctx.getPropertyByIndex(obj: obj, index64: Int64(lower))
                 if lowerVal.isException { return lowerVal }
-                let upperVal = ctx.getPropertyByIndex(obj: obj, index: UInt32(upper))
+                let upperVal = ctx.getPropertyByIndex(obj: obj, index64: Int64(upper))
                 if upperVal.isException { lowerVal.freeValue(); return upperVal }
 
                 if !putIndex(ctx: ctx, obj, lower, upperVal) { lowerVal.freeValue(); return .exception }
                 if !putIndex(ctx: ctx, obj, upper, lowerVal) { return .exception }
             } else if !lowerExists && upperExists {
-                let upperVal = ctx.getPropertyByIndex(obj: obj, index: UInt32(upper))
+                let upperVal = ctx.getPropertyByIndex(obj: obj, index64: Int64(upper))
                 if upperVal.isException { return upperVal }
                 if !putIndex(ctx: ctx, obj, lower, upperVal) { return .exception }
                 if !deleteIndex(ctx: ctx, obj, upper) { return .exception }
             } else if lowerExists && !upperExists {
-                let lowerVal = ctx.getPropertyByIndex(obj: obj, index: UInt32(lower))
+                let lowerVal = ctx.getPropertyByIndex(obj: obj, index64: Int64(lower))
                 if lowerVal.isException { return lowerVal }
                 if !deleteIndex(ctx: ctx, obj, lower) { lowerVal.freeValue(); return .exception }
                 if !putIndex(ctx: ctx, obj, upper, lowerVal) { return .exception }
@@ -799,10 +792,10 @@ struct JeffJSBuiltinArray {
         }
 
         while count > 0 {
-            let has = ctx.hasPropertyByIndex(obj: obj, index: UInt32(from))
+            let has = ctx.hasPropertyByIndex(obj: obj, index64: Int64(from))
 
             if has {
-                let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(from))
+                let val = ctx.getPropertyByIndex(obj: obj, index64: Int64(from))
                 if val.isException { return val }
                 if !putIndex(ctx: ctx, obj, to, val) { return .exception }
             } else {
@@ -849,12 +842,12 @@ struct JeffJSBuiltinArray {
                 }
 
                 for k in 0..<itemLen {
-                    let has = ctx.hasPropertyByIndex(obj: item, index: UInt32(k))
+                    let has = ctx.hasPropertyByIndex(obj: item, index64: Int64(k))
 
                     if has {
-                        let val = ctx.getPropertyByIndex(obj: item, index: UInt32(k))
+                        let val = ctx.getPropertyByIndex(obj: item, index64: Int64(k))
                         if val.isException { return val }
-                        ctx.setPropertyByIndex(obj: result, index: UInt32(n), value: val)
+                        ctx.setPropertyByIndex(obj: result, index64: Int64(n), value: val)
                     }
                     n += 1
                 }
@@ -862,7 +855,7 @@ struct JeffJSBuiltinArray {
                 if n >= MAX_SAFE_INTEGER {
                     return ctx.throwTypeError(message: "Array.prototype.concat: array length overflow")
                 }
-                ctx.setPropertyByIndex(obj: result, index: UInt32(n), value: item.dupValue())   // args are borrowed
+                ctx.setPropertyByIndex(obj: result, index64: Int64(n), value: item.dupValue())   // args are borrowed
                 n += 1
             }
         }
@@ -898,7 +891,7 @@ struct JeffJSBuiltinArray {
             if i > 0 {
                 result += sep
             }
-            let elem = ctx.getPropertyByIndex(obj: obj, index: UInt32(i))
+            let elem = ctx.getPropertyByIndex(obj: obj, index64: Int64(i))
             if elem.isException { return elem }
 
             if !elem.isNullOrUndefined {
@@ -933,12 +926,12 @@ struct JeffJSBuiltinArray {
         var n: Int64 = 0
         var i = k
         while i < final_ {
-            let has = ctx.hasPropertyByIndex(obj: obj, index: UInt32(i))
+            let has = ctx.hasPropertyByIndex(obj: obj, index64: Int64(i))
 
             if has {
-                let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(i))
+                let val = ctx.getPropertyByIndex(obj: obj, index64: Int64(i))
                 if val.isException { return val }
-                ctx.setPropertyByIndex(obj: result, index: UInt32(n), value: val)
+                ctx.setPropertyByIndex(obj: result, index64: Int64(n), value: val)
             }
             i += 1
             n += 1
@@ -968,11 +961,7 @@ struct JeffJSBuiltinArray {
         if args.count > 1 {
             let nv = ctx.toIntegerOrInfinity(args[1])
             if nv >= Double(len) { return ctx.newInt64(-1) }
-            if nv >= 0 {
-                k = Int64(nv)
-            } else {
-                k = max(len + Int64(nv), 0)
-            }
+            k = jeffJS_relativeIndex(nv, len)
         } else {
             k = 0
         }
@@ -1009,19 +998,19 @@ struct JeffJSBuiltinArray {
         if args.count > 1 {
             let nv = ctx.toIntegerOrInfinity(args[1])
             if nv >= 0 {
-                k = min(Int64(nv), len - 1)
+                k = min(jeffJS_clampToInt64(nv), len - 1)
             } else {
-                k = len + Int64(nv)
+                k = nv <= -Double(len) ? -1 : len + Int64(nv)
             }
         } else {
             k = len - 1
         }
 
         while k >= 0 {
-            let has = ctx.hasPropertyByIndex(obj: obj, index: UInt32(k))
+            let has = ctx.hasPropertyByIndex(obj: obj, index64: Int64(k))
 
             if has {
-                let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
+                let val = ctx.getPropertyByIndex(obj: obj, index64: Int64(k))
                 if val.isException { return val }
 
                 if strictEqual(ctx: ctx, val, searchElement) {
@@ -1053,11 +1042,7 @@ struct JeffJSBuiltinArray {
         if args.count > 1 {
             let nv = ctx.toIntegerOrInfinity(args[1])
             if nv >= Double(len) { return .JS_FALSE }
-            if nv >= 0 {
-                k = Int64(nv)
-            } else {
-                k = max(len + Int64(nv), 0)
-            }
+            k = jeffJS_relativeIndex(nv, len)
         } else {
             k = 0
         }
@@ -1212,7 +1197,7 @@ struct JeffJSBuiltinArray {
             // Sparse: store the present results individually; the result's
             // length is already `len`.
             for (i, v) in out.enumerated() where !v.isUninitialized {
-                ctx.setPropertyByIndex(obj: result, index: UInt32(i), value: v)
+                ctx.setPropertyByIndex(obj: result, index64: Int64(i), value: v)
             }
             return result
         }
@@ -1224,7 +1209,7 @@ struct JeffJSBuiltinArray {
                                                  thisArg: thisArg, element: e, cbArgs: &cbArgs)
             pinned.freeValue()
             if r.isException { return r }
-            ctx.setPropertyByIndex(obj: result, index: UInt32(e.index), value: r)
+            ctx.setPropertyByIndex(obj: result, index64: Int64(e.index), value: r)
         }
         return result
     }
@@ -1273,7 +1258,7 @@ struct JeffJSBuiltinArray {
                 // pinned one was handed over, so take a fresh one.
                 let keep = pinned
                 if plainResult { kept.append(keep) }
-                else { ctx.setPropertyByIndex(obj: result, index: UInt32(to), value: keep) }
+                else { ctx.setPropertyByIndex(obj: result, index64: Int64(to), value: keep) }
                 to += 1
             } else {
                 pinned.freeValue()
@@ -1428,7 +1413,7 @@ struct JeffJSBuiltinArray {
 
         var k = len - 1
         while k >= 0 {
-            let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
+            let val = ctx.getPropertyByIndex(obj: obj, index64: Int64(k))
             if val.isException { return val }
 
             let kVal = ctx.newInt64(k)
@@ -1463,7 +1448,7 @@ struct JeffJSBuiltinArray {
 
         var k = len - 1
         while k >= 0 {
-            let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
+            let val = ctx.getPropertyByIndex(obj: obj, index64: Int64(k))
             if val.isException { return val }
 
             let kVal = ctx.newInt64(k)
@@ -1552,10 +1537,10 @@ struct JeffJSBuiltinArray {
         } else {
             var kPresent = false
             while k >= 0 {
-                let has = ctx.hasPropertyByIndex(obj: obj, index: UInt32(k))
+                let has = ctx.hasPropertyByIndex(obj: obj, index64: Int64(k))
 
                 if has {
-                    accumulator = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
+                    accumulator = ctx.getPropertyByIndex(obj: obj, index64: Int64(k))
                     if accumulator.isException { return accumulator }
                     kPresent = true
                     k -= 1
@@ -1569,10 +1554,10 @@ struct JeffJSBuiltinArray {
         }
 
         while k >= 0 {
-            let has = ctx.hasPropertyByIndex(obj: obj, index: UInt32(k))
+            let has = ctx.hasPropertyByIndex(obj: obj, index64: Int64(k))
 
             if has {
-                let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
+                let val = ctx.getPropertyByIndex(obj: obj, index64: Int64(k))
                 if val.isException { return val }
 
                 let kVal = ctx.newInt64(k)
@@ -1602,10 +1587,10 @@ struct JeffJSBuiltinArray {
 
         for k in 0..<len {
             let from = len - k - 1
-            let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(from))
+            let val = ctx.getPropertyByIndex(obj: obj, index64: Int64(from))
             if val.isException { return val }
 
-            ctx.setPropertyByIndex(obj: result, index: UInt32(k), value: val)
+            ctx.setPropertyByIndex(obj: result, index64: Int64(k), value: val)
         }
 
         return result
@@ -1632,9 +1617,9 @@ struct JeffJSBuiltinArray {
         if result.isException { return result }
 
         for k in 0..<len {
-            let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
+            let val = ctx.getPropertyByIndex(obj: obj, index64: Int64(k))
             if val.isException { return val }
-            ctx.setPropertyByIndex(obj: result, index: UInt32(k), value: val)
+            ctx.setPropertyByIndex(obj: result, index64: Int64(k), value: val)
         }
 
         // Sort the copy in place
@@ -1657,14 +1642,7 @@ struct JeffJSBuiltinArray {
         // Resolve start
         var actualStart: Int64
         if args.count > 0 {
-            let rs = ctx.toIntegerOrInfinity(args[0])
-            if rs == -.infinity {
-                actualStart = 0
-            } else if rs < 0 {
-                actualStart = max(len + Int64(rs), 0)
-            } else {
-                actualStart = min(Int64(rs), len)
-            }
+            actualStart = jeffJS_relativeIndex(ctx.toIntegerOrInfinity(args[0]), len)
         } else {
             actualStart = 0
         }
@@ -1677,7 +1655,7 @@ struct JeffJSBuiltinArray {
             actualDeleteCount = len - actualStart
         } else {
             let dc = ctx.toIntegerOrInfinity(args[1])
-            actualDeleteCount = min(max(Int64(dc), 0), len - actualStart)
+            actualDeleteCount = min(max(jeffJS_clampToInt64(dc), 0), len - actualStart)
         }
 
         let newLen = len + insertCount - actualDeleteCount
@@ -1693,16 +1671,16 @@ struct JeffJSBuiltinArray {
 
         // Copy elements before actualStart
         while r < actualStart {
-            let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(r))
+            let val = ctx.getPropertyByIndex(obj: obj, index64: Int64(r))
             if val.isException { return val }
-            ctx.setPropertyByIndex(obj: result, index: UInt32(i), value: val)
+            ctx.setPropertyByIndex(obj: result, index64: Int64(i), value: val)
             i += 1
             r += 1
         }
 
         // Insert new items
         for j in 0..<Int(insertCount) {
-            ctx.setPropertyByIndex(obj: result, index: UInt32(i), value: args[j + 2].dupValue())
+            ctx.setPropertyByIndex(obj: result, index64: Int64(i), value: args[j + 2].dupValue())
             i += 1
         }
 
@@ -1711,9 +1689,9 @@ struct JeffJSBuiltinArray {
 
         // Copy remaining elements
         while r < len {
-            let val = ctx.getPropertyByIndex(obj: obj, index: UInt32(r))
+            let val = ctx.getPropertyByIndex(obj: obj, index64: Int64(r))
             if val.isException { return val }
-            ctx.setPropertyByIndex(obj: result, index: UInt32(i), value: val)
+            ctx.setPropertyByIndex(obj: result, index64: Int64(i), value: val)
             i += 1
             r += 1
         }
@@ -1756,10 +1734,10 @@ struct JeffJSBuiltinArray {
             if k == actualIndex {
                 val = value
             } else {
-                val = ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
+                val = ctx.getPropertyByIndex(obj: obj, index64: Int64(k))
                 if val.isException { return val }
             }
-            ctx.setPropertyByIndex(obj: result, index: UInt32(k), value: val)
+            ctx.setPropertyByIndex(obj: result, index64: Int64(k), value: val)
         }
 
         return result
@@ -1790,7 +1768,7 @@ struct JeffJSBuiltinArray {
             return .undefined
         }
 
-        return ctx.getPropertyByIndex(obj: obj, index: UInt32(k))
+        return ctx.getPropertyByIndex(obj: obj, index64: Int64(k))
     }
 
     // MARK: - Conversion methods
@@ -1834,7 +1812,7 @@ struct JeffJSBuiltinArray {
             if i > 0 {
                 result += ","
             }
-            let elem = ctx.getPropertyByIndex(obj: obj, index: UInt32(i))
+            let elem = ctx.getPropertyByIndex(obj: obj, index64: Int64(i))
             if elem.isException { return elem }
 
             if !elem.isNullOrUndefined {
@@ -1943,12 +1921,12 @@ struct JeffJSBuiltinArray {
                     if visitHoles { return Element(index: index, value: .undefined, owned: false) }
                     continue
                 }
-                if !ctx.hasPropertyByIndex(obj: obj, index: UInt32(index)) {
+                if !ctx.hasPropertyByIndex(obj: obj, index64: Int64(index)) {
                     if visitHoles { return Element(index: index, value: .undefined, owned: false) }
                     continue
                 }
                 // May be .exception: callers check before using the value.
-                let v = ctx.getPropertyByIndex(obj: obj, index: UInt32(index))
+                let v = ctx.getPropertyByIndex(obj: obj, index64: Int64(index))
                 return Element(index: index, value: v, owned: true)
             }
             return nil
@@ -1997,7 +1975,9 @@ struct JeffJSBuiltinArray {
     @inline(__always)
     private static func putIndex(ctx: JeffJSContext, _ obj: JeffJSValue, _ k: Int64,
                                  _ v: JeffJSValue) -> Bool {
-        return ctx.setProperty(obj: obj, atom: UInt32(truncatingIfNeeded: k) | 0x80000000, value: v) >= 0
+        let atom = ctx.indexAtom(k)
+        defer { ctx.freeIndexAtom(atom) }
+        return ctx.setProperty(obj: obj, atom: atom, value: v) >= 0
     }
 
     /// `DeletePropertyOrThrow(O, k)`: false with a pending TypeError when
@@ -2005,8 +1985,9 @@ struct JeffJSBuiltinArray {
     @inline(__always)
     private static func deleteIndex(ctx: JeffJSContext, _ obj: JeffJSValue, _ k: Int64) -> Bool {
         // [[Delete]] under JS_PROP_THROW throws whenever it answers false.
-        return ctx.deleteProperty(obj: obj, atom: UInt32(truncatingIfNeeded: k) | 0x80000000,
-                                  flags: JS_PROP_THROW)
+        let atom = ctx.indexAtom(k)
+        defer { ctx.freeIndexAtom(atom) }
+        return ctx.deleteProperty(obj: obj, atom: atom, flags: JS_PROP_THROW)
     }
 
     /// Resolve a relative index argument to an absolute index.
@@ -2017,12 +1998,7 @@ struct JeffJSBuiltinArray {
         if arg.isUndefined {
             return defaultVal
         }
-        let nv = ctx.toIntegerOrInfinity(arg)
-        if nv == -.infinity { return 0 }
-        if nv < 0 {
-            return max(length + Int64(nv), 0)
-        }
-        return min(Int64(nv), length)
+        return jeffJS_relativeIndex(ctx.toIntegerOrInfinity(arg), length)
     }
 
     /// Check if an object is concat spreadable (has Symbol.isConcatSpreadable or is an array).
@@ -2114,10 +2090,10 @@ struct JeffJSBuiltinArray {
         var targetIndex = start
 
         for sourceIndex in 0..<sourceLen {
-            let has = ctx.hasPropertyByIndex(obj: source, index: UInt32(sourceIndex))
+            let has = ctx.hasPropertyByIndex(obj: source, index64: Int64(sourceIndex))
 
             if has {
-                var element = ctx.getPropertyByIndex(obj: source, index: UInt32(sourceIndex))
+                var element = ctx.getPropertyByIndex(obj: source, index64: Int64(sourceIndex))
                 if element.isException { return -1 }
 
                 if !mapperFunction.isUndefined {
@@ -2144,7 +2120,7 @@ struct JeffJSBuiltinArray {
                 } else {
                     if targetIndex >= MAX_SAFE_INTEGER { return -1 }
 
-                    ctx.setPropertyByIndex(obj: target, index: UInt32(targetIndex), value: element)
+                    ctx.setPropertyByIndex(obj: target, index64: Int64(targetIndex), value: element)
                     targetIndex += 1
                 }
             }
