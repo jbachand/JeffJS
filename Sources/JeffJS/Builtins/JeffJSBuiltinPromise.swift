@@ -94,15 +94,13 @@ private final class ResolvingFunctionsData {
 
     init(promiseObj: JeffJSObject?) {
         self.promiseObj = promiseObj
-        // A JS reference too: a pending promise whose only holders are its
-        // resolving functions (e.g. a temporary `p.then(...)` receiver) must
-        // keep its reaction list until resolve/reject runs. Released when the
-        // last resolving function lets go of this record.
-        if let o = promiseObj { o.refCount += 1 }
-    }
-
-    deinit {
-        if let o = promiseObj { JeffJSValue.makeObjectRecycled(o).freeValue() }
+        // The JS reference that keeps a pending promise alive while only its
+        // resolving functions hold it (a temporary `p.then(...)` receiver)
+        // is owned by each function object itself, in its `arrowThisVal`
+        // slot (see createResolvingFunctions): there the cycle collector
+        // sees it. Held in here it was an edge no collection could follow,
+        // so every promise whose resolver was stored next to it
+        // (`this.p = new Promise(r => this.r = r)`) was immortal.
     }
 }
 
@@ -1021,6 +1019,13 @@ struct JeffJSBuiltinPromise {
             return JeffJSValue.undefined
         }
 
+        // Each resolving function owns one counted reference to its promise,
+        // in the native capture slot the collector marks and freeObject
+        // releases (`arrowThisVal`: only read as `this` for bytecode arrows).
+        if promise.isObject {
+            resolveFunc.toObject()?.arrowThisVal = promise.dupValue()
+            rejectFunc.toObject()?.arrowThisVal = promise.dupValue()
+        }
         return (resolve: resolveFunc, reject: rejectFunc)
     }
 

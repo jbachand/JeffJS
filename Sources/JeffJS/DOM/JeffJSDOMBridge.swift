@@ -2876,10 +2876,12 @@ final class JeffJSDOMBridge {
         ctx.setPropertyFunc(obj: obj, name: "forEach", fn: { ctx, thisVal, args in
             guard let callback = args.first, callback.isObject else { return JeffJSValue.undefined }
             let thisArg = args.count > 1 ? args[1] : JeffJSValue.undefined
+            // The callee borrows its arguments: the token string is ours to free.
             for (i, token) in tokens().enumerated() {
-                let r = ctx.call(callback, this: thisArg, args: [
-                    ctx.newStringValue(token), .newInt32(Int32(i)), thisVal.dupValue()
-                ])
+                let tokenVal = ctx.newStringValue(token)
+                let r = ctx.callRetained(callback, this: thisArg, args: [tokenVal, .newInt32(Int32(i)), thisVal])
+                tokenVal.freeValue()
+                if r.isException { return r }
                 r.freeValue()
             }
             return JeffJSValue.undefined

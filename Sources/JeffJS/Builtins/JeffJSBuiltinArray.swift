@@ -1433,11 +1433,12 @@ struct JeffJSBuiltinArray {
 
             let kVal = ctx.newInt64(k)
             let testResult = ctx.call(callbackFn, this: thisArg, args: [val, kVal, obj])
-            if testResult.isException { return testResult }
+            if testResult.isException { val.freeValue(); return testResult }
 
             if ctx.toBoolFree(testResult) {
                 return val
             }
+            val.freeValue()
             k -= 1
         }
 
@@ -1467,6 +1468,7 @@ struct JeffJSBuiltinArray {
 
             let kVal = ctx.newInt64(k)
             let testResult = ctx.call(callbackFn, this: thisArg, args: [val, kVal, obj])
+            val.freeValue()
             if testResult.isException { return testResult }
 
             if ctx.toBoolFree(testResult) {

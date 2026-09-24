@@ -363,7 +363,12 @@ extension JeffJSContext {
         if callDepth > JeffJSInterpreter.maxCallDepth {
             return throwInternalError(message: "Maximum call stack size exceeded")
         }
-        if callDepth == 1 { rt.updateStackLimitForCurrentThread() }
+        if callDepth == 1 {
+            rt.updateStackLimitForCurrentThread()
+            // A task boundary: the host is calling in from its event loop.
+            jeffJS_idleGCTick(rt)
+            jeffJS_heapCensusTick(rt)
+        }
         if rt.checkStackOverflow() {
             return throwInternalError(message: "Maximum call stack size exceeded")
         }
@@ -3490,44 +3495,47 @@ private func executeFastTrace(
             guard idx < varRefsRawCount, let u = varRefsRaw![idx] else { resume = pc; break traceLoop }
             let v: JeffJSValue
             if isStoreOpcode(bc, pc + 3, bcLen) { v = buf[sp - 1].dupValue() } else { sp -= 1; v = buf[sp] }
-            u._withUnsafeGuaranteedRef { vr in if vr.isDetached { vr.value = v } else { vr.pvalue = v } }
+            u._withUnsafeGuaranteedRef { vr in vr.store(v) }
             pc += 3
 
         case .put_var_ref_check:
             let idx = Int(readU16(bc, pc + 1))
             guard idx < varRefsRawCount, let u = varRefsRaw![idx] else { resume = pc; break traceLoop }
             if u._withUnsafeGuaranteedRef({ $0.isDetached ? $0.value : $0.pvalue }).isUninitialized { resume = pc; break traceLoop }
-            let v: JeffJSValue
-            if isStoreOpcode(bc, pc + 3, bcLen) { v = buf[sp - 1].dupValue() } else { sp -= 1; v = buf[sp] }
-            u._withUnsafeGuaranteedRef { vr in if vr.isDetached { vr.value = v } else { vr.pvalue = v } }
+            // Always consumes its operand, like the main loop's: the compiler
+            // emits `dup` before it when the value is used (`y = (v = x)` is
+            // `dup; put_var_ref_check; put_loc`), so the chained-store peek
+            // (`isStoreOpcode`) kept an extra reference on every such store.
+            sp -= 1; let v = buf[sp]
+            u._withUnsafeGuaranteedRef { vr in vr.store(v) }
             pc += 3
 
         case .put_var_ref_check_init:
             let idx = Int(readU16(bc, pc + 1))
             guard idx < varRefsRawCount, let u = varRefsRaw![idx] else { resume = pc; break traceLoop }
             sp -= 1; let v = buf[sp]
-            u._withUnsafeGuaranteedRef { vr in if vr.isDetached { vr.value = v } else { vr.pvalue = v } }
+            u._withUnsafeGuaranteedRef { vr in vr.store(v) }
             pc += 3
 
         case .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3:
             let idx = Int(opByte) - Int(UInt8(truncatingIfNeeded: JeffJSOpcode.put_var_ref0.rawValue))
             guard idx < varRefsRawCount, let u = varRefsRaw![idx] else { resume = pc; break traceLoop }
             sp -= 1; let v = buf[sp]
-            u._withUnsafeGuaranteedRef { vr in if vr.isDetached { vr.value = v } else { vr.pvalue = v } }
+            u._withUnsafeGuaranteedRef { vr in vr.store(v) }
             pc += 1
 
         case .set_var_ref:
             let idx = Int(readU16(bc, pc + 1))
             guard idx < varRefsRawCount, let u = varRefsRaw![idx] else { resume = pc; break traceLoop }
             let v = buf[sp - 1].dupValue()
-            u._withUnsafeGuaranteedRef { vr in if vr.isDetached { vr.value = v } else { vr.pvalue = v } }
+            u._withUnsafeGuaranteedRef { vr in vr.store(v) }
             pc += 3
 
         case .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3:
             let idx = Int(opByte) - Int(UInt8(truncatingIfNeeded: JeffJSOpcode.set_var_ref0.rawValue))
             guard idx < varRefsRawCount, let u = varRefsRaw![idx] else { resume = pc; break traceLoop }
             let v = buf[sp - 1].dupValue()
-            u._withUnsafeGuaranteedRef { vr in if vr.isDetached { vr.value = v } else { vr.pvalue = v } }
+            u._withUnsafeGuaranteedRef { vr in vr.store(v) }
             pc += 1
 
         // ------------------------------------------------------------------
@@ -9517,12 +9525,12 @@ struct JeffJSInterpreter {
                 if isStoreOpcode(bc, pc + 3, bcLen) {
                     let val = buf[sp - 1].dupValue()
                     if idx < varRefs.count, let vr = varRefs[idx] {
-                        if vr.isDetached { vr.value = val } else { vr.pvalue = val }
+                        vr.store(val)
                     }
                 } else {
                     let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                     if idx < varRefs.count, let vr = varRefs[idx] {
-                        if vr.isDetached { vr.value = val } else { vr.pvalue = val }
+                        vr.store(val)
                     }
                 }
                 pc += 3
@@ -9531,7 +9539,7 @@ struct JeffJSInterpreter {
                 let idx = Int(readU16(bc, pc + 1))
                 if idx < varRefs.count, let vr = varRefs[idx] {
                     let val = buf[sp - 1].dupValue()
-                    if vr.isDetached { vr.value = val } else { vr.pvalue = val }
+                    vr.store(val)
                 }
                 pc += 3
 
@@ -9551,15 +9559,15 @@ struct JeffJSInterpreter {
             case .get_var_ref2: if varRefs.count > 2, let vr = varRefs[2] { buf[sp] = vr.isDetached ? vr.value.dupValue() : vr.pvalue.dupValue(); sp += 1 } else { buf[sp] = .undefined; sp += 1 }; pc += 1
             case .get_var_ref3: if varRefs.count > 3, let vr = varRefs[3] { buf[sp] = vr.isDetached ? vr.value.dupValue() : vr.pvalue.dupValue(); sp += 1 } else { buf[sp] = .undefined; sp += 1 }; pc += 1
 
-            case .put_var_ref0: if varRefs.count > 0, let vr = varRefs[0] { let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); if vr.isDetached { vr.value = v } else { vr.pvalue = v } } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
-            case .put_var_ref1: if varRefs.count > 1, let vr = varRefs[1] { let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); if vr.isDetached { vr.value = v } else { vr.pvalue = v } } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
-            case .put_var_ref2: if varRefs.count > 2, let vr = varRefs[2] { let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); if vr.isDetached { vr.value = v } else { vr.pvalue = v } } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
-            case .put_var_ref3: if varRefs.count > 3, let vr = varRefs[3] { let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); if vr.isDetached { vr.value = v } else { vr.pvalue = v } } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
+            case .put_var_ref0: if varRefs.count > 0, let vr = varRefs[0] { let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); vr.store(v) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
+            case .put_var_ref1: if varRefs.count > 1, let vr = varRefs[1] { let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); vr.store(v) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
+            case .put_var_ref2: if varRefs.count > 2, let vr = varRefs[2] { let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); vr.store(v) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
+            case .put_var_ref3: if varRefs.count > 3, let vr = varRefs[3] { let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); vr.store(v) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
 
-            case .set_var_ref0: if varRefs.count > 0, let vr = varRefs[0] { let v = buf[sp - 1].dupValue(); if vr.isDetached { vr.value = v } else { vr.pvalue = v } }; pc += 1
-            case .set_var_ref1: if varRefs.count > 1, let vr = varRefs[1] { let v = buf[sp - 1].dupValue(); if vr.isDetached { vr.value = v } else { vr.pvalue = v } }; pc += 1
-            case .set_var_ref2: if varRefs.count > 2, let vr = varRefs[2] { let v = buf[sp - 1].dupValue(); if vr.isDetached { vr.value = v } else { vr.pvalue = v } }; pc += 1
-            case .set_var_ref3: if varRefs.count > 3, let vr = varRefs[3] { let v = buf[sp - 1].dupValue(); if vr.isDetached { vr.value = v } else { vr.pvalue = v } }; pc += 1
+            case .set_var_ref0: if varRefs.count > 0, let vr = varRefs[0] { let v = buf[sp - 1].dupValue(); vr.store(v) }; pc += 1
+            case .set_var_ref1: if varRefs.count > 1, let vr = varRefs[1] { let v = buf[sp - 1].dupValue(); vr.store(v) }; pc += 1
+            case .set_var_ref2: if varRefs.count > 2, let vr = varRefs[2] { let v = buf[sp - 1].dupValue(); vr.store(v) }; pc += 1
+            case .set_var_ref3: if varRefs.count > 3, let vr = varRefs[3] { let v = buf[sp - 1].dupValue(); vr.store(v) }; pc += 1
 
             // -----------------------------------------------------------------
             // TDZ (Temporal Dead Zone) Operations
@@ -9642,7 +9650,7 @@ struct JeffJSInterpreter {
                         retVal = .exception
                         break dispatchLoop
                     }
-                    if vr.isDetached { vr.value = val } else { vr.pvalue = val }
+                    vr.store(val)
                 }
                 pc += 3
 
@@ -9650,7 +9658,7 @@ struct JeffJSInterpreter {
                 let idx = Int(readU16(bc, pc + 1))
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if idx < varRefs.count, let vr = varRefs[idx] {
-                    if vr.isDetached { vr.value = val } else { vr.pvalue = val }
+                    vr.store(val)
                 }
                 pc += 3
 

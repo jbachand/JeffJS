@@ -553,10 +553,29 @@ final class JeffJSRuntime {
     var gcTmpObjects: ContiguousArray<Unmanaged<JeffJSGCObjectHeader>> = []
     /// Map from ObjectIdentifier to JeffJSWeakRef for quick lookup.
     var gcWeakRefMap: [ObjectIdentifier: JeffJSWeakRef] = [:]
+    /// WeakMap/WeakSet records by key object (the keys are not owned; see
+    /// "Weak collections" in JeffJSBuiltinMap.swift). A key with entries here
+    /// has a non-zero `weakrefCount`.
+    var weakMapKeyRecords: [ObjectIdentifier: [JeffJSMapRecord]] = [:]
     /// Number of completed collections (diagnostics, `__gcStats()` in the CLI).
     var gcRuns: Int = 0
     /// Total objects reclaimed as unreachable cycles (diagnostics).
     var gcCyclesFreed: Int = 0
+    /// Idle-collection bookkeeping (`jeffJS_idleGCTick`): when the last
+    /// collection ended, how long it took, the live heap it left, and how
+    /// many collections the idle trigger started.
+    var gcLastEnd: Double = 0
+    var gcLastDuration: Double = 0
+    var gcLiveAfterLast: Int = 0
+    var gcIdleRuns: Int = 0
+    /// Multiplier on the idle-collection interval, doubled by every idle
+    /// collection that reclaimed little (see `jeffJS_idleGCTickSlow`).
+    var gcIdleBackoff: Int = 1
+    /// Heap census state (JeffJSHeapCensus.swift, JEFFJS_HEAP_CENSUS_S).
+    var heapCensusPrevious: [String: Int] = [:]
+    var heapCensusLastTime: Double = 0
+    var heapCensusStartTime: Double = 0
+    var heapCensusCalls: Int = 0
 
     /// Per-runtime bytecode cache. Atom IDs in bytecode are runtime-specific,
     /// so the cache must be scoped to the runtime that compiled them.

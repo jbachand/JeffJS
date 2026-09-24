@@ -193,11 +193,14 @@ private func mapStateInsert(_ s: JeffJSMapState, key: JeffJSValue, value: JeffJS
     rec.link.insertBefore(s.recordListSentinel)
 
     s.count += 1
+    // Weak collections do not own their keys: give back the reference every
+    // caller passes in (it still holds its own, so this never frees).
+    if s.isWeak, jeffJS_weakKeyAttach(rec) { key.freeValue() }
     return rec
 }
 
 /// Delete a record by index, marking it empty.
-private func mapStateDelete(_ s: JeffJSMapState, index: Int) {
+private func mapStateDelete(_ s: JeffJSMapState, index: Int, keyOwned: Bool = true) {
     guard index >= 0 && index < s.records.count else { return }
     let rec = s.records[index]
     if rec.empty { return }
@@ -222,14 +225,35 @@ private func mapStateDelete(_ s: JeffJSMapState, index: Int) {
     // Remove from insertion-order list.
     rec.link.remove()
 
-    // Mark empty; release key/value.
-    rec.key.freeValue()
-    rec.value.freeValue()
+    // Mark empty, then release key/value (a release can re-enter the map).
+    let key = rec.key, value = rec.value
     rec.key = .undefined
     rec.value = .undefined
     rec.empty = true
-
     s.count -= 1
+    if rec.weakKey { jeffJS_weakKeyDetach(rec, key: key) } else if keyOwned { key.freeValue() }
+    value.freeValue()
+    mapStateCompactIfSparse(s)
+}
+
+/// Deleted records stay in `records` (iterators and `forEach` address it by
+/// index), so a map used as a queue — set, delete, set, delete — grew its
+/// table without bound. Rebuild it once three quarters of it is holes and
+/// nothing is walking it.
+private func mapStateCompactIfSparse(_ s: JeffJSMapState) {
+    let n = s.records.count
+    guard n >= 32, s.count * 4 < n, s.iterating == 0 else { return }
+    let live = s.records.filter { !$0.empty }
+    s.records = live
+    var size = JS_MAP_INITIAL_HASH_SIZE
+    while live.count * 4 >= size * 3 { size *= 2 }
+    s.hashSize = size
+    s.hashTable = [Int](repeating: -1, count: size)
+    for (i, rec) in live.enumerated() {
+        let h = Int(mapHashKey(rec.key) % UInt32(size))
+        rec.hashNext = s.hashTable[h]
+        s.hashTable[h] = i
+    }
 }
 
 /// Clear all records in a map state.
@@ -237,12 +261,13 @@ private func mapStateClear(_ s: JeffJSMapState) {
     for i in 0..<s.records.count {
         let rec = s.records[i]
         if !rec.empty {
-            rec.key.freeValue()
-            rec.value.freeValue()
+            let key = rec.key, value = rec.value
             rec.key = .undefined
             rec.value = .undefined
             rec.empty = true
             rec.link.remove()
+            if rec.weakKey { jeffJS_weakKeyDetach(rec, key: key) } else { key.freeValue() }
+            value.freeValue()
         }
     }
     s.records.removeAll()
@@ -265,7 +290,7 @@ func jeffJS_mapStateFree(_ s: JeffJSMapState) {
     var pending: [JeffJSValue] = []
     pending.reserveCapacity(s.count * 2)
     for rec in s.records where !rec.empty {
-        pending.append(rec.key)
+        if rec.weakKey { jeffJS_weakKeyDetach(rec, key: rec.key) } else { pending.append(rec.key) }
         pending.append(rec.value)
         rec.key = .undefined
         rec.value = .undefined
@@ -633,6 +658,8 @@ func js_map_forEach(_ ctx: JeffJSContext,
     // The key and value are borrowed from the record, which the callback may
     // delete (or clear) while it runs — that releases them, so the call holds
     // its own references (QuickJS js_map_forEach dups them for this reason).
+    s.iterating += 1
+    defer { s.iterating -= 1 }
     var i = 0
     while i < s.records.count {
         let rec = s.records[i]
@@ -768,6 +795,11 @@ final class JSMapIteratorData {
     var done: Bool = false
 
     init() {}
+
+    /// An abandoned iterator stops pinning the map's record indices.
+    deinit {
+        if !done, let s = mapState { s.iterating -= 1 }
+    }
 }
 
 /// Create a map/set iterator. `magic` encodes base type + iterator kind.
@@ -806,6 +838,7 @@ func js_map_iterator_create(_ ctx: JeffJSContext,
     let iterData = JSMapIteratorData()
     iterData.obj = thisVal.dupValue()
     iterData.mapState = s
+    s.iterating += 1
     iterData.curIndex = 0
     iterData.kind = iterKind
     iterData.done = false
@@ -862,6 +895,7 @@ func js_map_iterator_next(_ ctx: JeffJSContext,
 
     if iterData.curIndex >= s.records.count {
         iterData.done = true
+        s.iterating -= 1
         iterData.obj.freeValue()
         iterData.obj = .undefined
         pdone?.pointee = 1
@@ -1513,5 +1547,88 @@ struct JeffJSBuiltinMap {
                 ctx.setPropertyFunc(obj: obj, name: entry.name, fn: wrapper, length: entry.length)
             }
         }
+    }
+}
+
+
+// MARK: - Weak collections
+
+/// WeakMap / WeakSet hold their keys weakly (ES §24.3, §24.4). They used to
+/// dup every key like a Map, so each entry pinned its key — and through the
+/// value usually the key's whole subgraph — for as long as the collection
+/// lived, which for the usual module-level cache (or Babel's per-class
+/// private-field WeakMap) is forever: every instance ever keyed leaked.
+///
+/// Now a weak record owns only its value. The key object lists its records in
+/// `rt.weakMapKeyRecords` and counts them in `weakrefCount` (a plain field,
+/// the cheap test `freeObject` and the collector use), and carries a non-nil
+/// `firstWeakRef` so `freeObject` calls `weakrefFree` for it and the recycle
+/// pool leaves it alone. When the key dies, `jeffJS_weakKeyDied` removes its
+/// records from their collections and releases the values.
+///
+/// For the cycle collector a record's value is a child of its **key**, not of
+/// the collection (an ephemeron, see `markObject`): `wm.set(o, { o })` is
+/// garbage as soon as `o` is unreachable, although `wm` itself lives on.
+final class JeffJSWeakKeyMarker {
+    static let shared = JeffJSWeakKeyMarker()
+}
+
+@inline(__always)
+private func jeffJS_weakKeyRuntime(_ o: JeffJSObject) -> JeffJSRuntime? {
+    o.ownerRuntime ?? JeffJSGCObjectHeader.activeRuntime
+}
+
+/// Registers `rec` (just inserted, weak collection) on its key object.
+/// False when the key is not an object or has no runtime: the record then
+/// keeps owning its key like a strong collection would.
+func jeffJS_weakKeyAttach(_ rec: JeffJSMapRecord) -> Bool {
+    guard rec.key.isObject, let o = rec.key.toObject(), let rt = jeffJS_weakKeyRuntime(o) else { return false }
+    rt.weakMapKeyRecords[ObjectIdentifier(o), default: []].append(rec)
+    o.weakrefCount += 1
+    if o.firstWeakRef == nil { o.firstWeakRef = JeffJSWeakKeyMarker.shared }
+    rec.weakKey = true
+    return true
+}
+
+/// Unregisters a weak record that is being removed from its collection
+/// (`delete`, or the collection died). `key` is the record's former key.
+func jeffJS_weakKeyDetach(_ rec: JeffJSMapRecord, key: JeffJSValue) {
+    guard rec.weakKey else { return }
+    rec.weakKey = false
+    guard let o = key.toObject(), let rt = jeffJS_weakKeyRuntime(o) else { return }
+    let id = ObjectIdentifier(o)
+    if var list = rt.weakMapKeyRecords[id] {
+        if let i = list.firstIndex(where: { $0 === rec }) { list.remove(at: i) }
+        if list.isEmpty { rt.weakMapKeyRecords.removeValue(forKey: id) } else { rt.weakMapKeyRecords[id] = list }
+    }
+    if o.weakrefCount > 0 { o.weakrefCount -= 1 }
+}
+
+/// The key object `o` is being freed: drop every weak record keyed by it and
+/// release the values. Called from `weakrefFree`.
+func jeffJS_weakKeyDied(_ rt: JeffJSRuntime, _ o: JeffJSObject) {
+    o.weakrefCount = 0
+    guard let recs = rt.weakMapKeyRecords.removeValue(forKey: ObjectIdentifier(o)) else { return }
+    for rec in recs where rec.weakKey && !rec.empty {
+        rec.weakKey = false          // the table entry is gone already
+        guard let s = rec.map else { continue }
+        let idx = mapStateFind(s, key: rec.key)
+        if idx >= 0, s.records[idx] === rec {
+            // The key is not owned: mapStateDelete must not release it.
+            let rec2 = s.records[idx]
+            let value = rec2.value
+            rec2.value = .undefined
+            mapStateDelete(s, index: idx, keyOwned: false)
+            value.freeValue()
+        }
+    }
+}
+
+/// Marks the values of the weak records keyed by `o` (see above).
+@inline(never)
+func jeffJS_markWeakKeyValues(_ rt: JeffJSRuntime, _ o: JeffJSObject, _ markFunc: JeffJSMarkFunc) {
+    guard let recs = rt.weakMapKeyRecords[ObjectIdentifier(o)] else { return }
+    for rec in recs where rec.weakKey && !rec.empty {
+        if let c = rec.value.toGCObjectHeader() { markFunc(rt, c) }
     }
 }
