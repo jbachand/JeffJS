@@ -236,21 +236,52 @@ final class JeffJSParser {
     var hasError: Bool = false
 
     // -- Safety limits to prevent OOM from parser bugs or adversarial input --
-    /// Maximum recursion depth for the parser. Complex JS can nest expressions
-    /// deeply (e.g., chained ternaries, nested calls). Kept conservative to
-    /// avoid stack overflow on iOS devices (512KB thread stack).
-    static let maxRecursionDepth = 200
-    /// Maximum scope nesting depth.
-    static let maxScopeDepth = 256
+    //
+    // Nesting depth is bounded by the native stack, not by a count (QuickJS:
+    // `js_check_stack_overflow` in `js_parse_unary` / `js_parse_assign_expr`
+    // / `js_parse_statement_or_decl` / `js_parse_postfix_expr`). A fixed
+    // count is wrong both ways: the old limit of 200 levels rejected ordinary
+    // minified code (recaptcha__en.js nests ~70 parenthesised assignments,
+    // and each parenthesis costs three counted frames), while an uncounted
+    // path (right-associative `**`) still recursed until SIGBUS. Binary
+    // operator chains of any length (`a + b + ... `, `a || b || ...`) do not
+    // recurse per operand at all (see parseBinaryExpr), so only genuinely
+    // nested constructs reach this guard.
+    /// Bytes kept free below the deepest parser frame: room for the frames
+    /// between two checks (one nesting level, much bigger in Debug), the
+    /// error path, and leaf work such as tokenizing or compiling a regexp
+    /// literal.
+    static let stackSafetyMargin: UInt = 128 * 1024
     /// Maximum bytecode buffer size in bytes (50 MB).
     /// This is a hard cap — if we exceed it, we abort with a syntax error.
     static let maxBytecodeSize = 50 * 1024 * 1024
 
-    /// Current recursion depth. Incremented when entering expression/statement
-    /// sub-parsers and decremented on exit.
+    /// Current recursion depth (diagnostics only; the limit is the stack).
     var recursionDepth: Int = 0
-    /// Current scope nesting depth.
+    /// Current scope nesting depth (diagnostics only).
     var scopeDepth: Int = 0
+    /// Lowest stack address a parser frame may reach, derived from the stack
+    /// of the thread that created the parser (parsing is synchronous on that
+    /// thread). 0 disables the check (stack bounds unavailable).
+    let stackLimit: UInt = JeffJSParser.stackLimitForCurrentThread()
+
+    /// `floor + margin` for the calling thread's stack. Main thread, a
+    /// 512 KB GCD worker and the app's 16 MB polyfill thread all get the
+    /// depth their stack actually allows.
+    static func stackLimitForCurrentThread() -> UInt {
+        let thread = pthread_self()
+        let top = UInt(bitPattern: pthread_get_stackaddr_np(thread))
+        let size = UInt(pthread_get_stacksize_np(thread))
+        guard size > 0, top > size else { return 0 }
+        return top - size + Swift.min(stackSafetyMargin, size / 4)
+    }
+
+    /// Address of a local in the caller's frame: the current stack depth.
+    @inline(__always)
+    static func currentStackAddress() -> UInt {
+        var marker: UInt8 = 0
+        return withUnsafeMutablePointer(to: &marker) { UInt(bitPattern: $0) }
+    }
 
     /// Check whether we have hit any limit (error, recursion, bytecode size).
     /// Every loop and recursive call in the parser should consult this.
@@ -259,22 +290,33 @@ final class JeffJSParser {
         return hasError || fd.byteCode.error
     }
 
-    /// Increment recursion depth and check the limit.
+    /// Increment recursion depth and check the stack.
     /// Returns `true` if parsing may continue, `false` if the limit was hit.
     @inline(__always)
     @discardableResult
     func enterRecursion() -> Bool {
         recursionDepth += 1
-        if recursionDepth > JeffJSParser.maxRecursionDepth {
-            syntaxError("expression too deeply nested (recursion limit \(JeffJSParser.maxRecursionDepth) exceeded)")
+        if JeffJSParser.currentStackAddress() < stackLimit {
+            stackOverflow()
             return false
         }
         // Also check if the bytecode buffer blew its cap
         if fd.byteCode.len > JeffJSParser.maxBytecodeSize {
-            syntaxError("bytecode size limit exceeded (\(JeffJSParser.maxBytecodeSize) bytes)")
+            bytecodeTooLarge()
             return false
         }
         return true
+    }
+
+    /// Same message and error class as QuickJS (`SyntaxError: stack overflow`).
+    @inline(never)
+    func stackOverflow() {
+        syntaxError("stack overflow")
+    }
+
+    @inline(never)
+    func bytecodeTooLarge() {
+        syntaxError("bytecode size limit exceeded (\(JeffJSParser.maxBytecodeSize) bytes)")
     }
 
     /// Decrement recursion depth.
@@ -308,12 +350,19 @@ final class JeffJSParser {
     @discardableResult
     func expect(_ type: Int) -> Bool {
         if tok != type {
-            let expected = tokenName(type)
-            let got = tokenName(tok)
-            syntaxError("expected '\(expected)' but got '\(got)'")
+            expectFailed(type)
             return false
         }
         return next()
+    }
+
+    /// Out of line so the message formatting does not enlarge the frame of
+    /// every (recursive) caller of expect.
+    @inline(never)
+    func expectFailed(_ type: Int) {
+        let expected = tokenName(type)
+        let got = tokenName(tok)
+        syntaxError("expected '\(expected)' but got '\(got)'")
     }
 
     /// Expect a semicolon: real ';', ASI via newline, '}', or EOF.
@@ -1295,12 +1344,16 @@ final class JeffJSParser {
     /// Push a new lexical scope. Returns the scope index.
     @discardableResult
     func pushScope() -> Int {
-        scopeDepth += 1
-        if scopeDepth > JeffJSParser.maxScopeDepth {
-            syntaxError("scope nesting too deep (limit \(JeffJSParser.maxScopeDepth) exceeded)")
-            scopeDepth -= 1
-            return fd.curScope // return current scope to avoid crash
+        // No fixed cap on block nesting (it was 256, where QuickJS parses
+        // thousands of nested blocks): every construct that nests scopes
+        // goes through parseStatement / parseAssignExpr, whose stack check
+        // bounds it.
+        // Scope indices are u16 bytecode operands (enter_scope, scope_*_var).
+        if fd.scopes.count >= Int(UInt16.max) {
+            syntaxError("too many scopes")
+            return fd.curScope
         }
+        scopeDepth += 1
         let idx = fd.scopes.count
         var scope = JeffJSScopeDef()
         scope.parent = fd.curScope
@@ -1906,6 +1959,7 @@ final class JeffJSParser {
     }
 
     /// Parse a single source element (statement or declaration).
+    @inline(never)
     func parseSourceElement() {
         guard !shouldAbort else { return }
 
@@ -3953,6 +4007,7 @@ final class JeffJSParser {
     }
 
     /// Parse an arrow function body (concise or block).
+    @inline(never)
     func parseArrowFunctionBody(childFd: JeffJSFunctionDefCompiler, isAsync: Bool,
                                 defaults: [JeffJSSavedDefaultParam] = [],
                                 rest: JeffJSRestParamInfo? = nil,
@@ -4304,461 +4359,535 @@ final class JeffJSParser {
         exprStartPtr = s.token.ptr
         defer { exprStartPtr = savedExprStart }
 
-        // Check for yield
-        if tok == JSTokenType.TOK_YIELD.rawValue {
+        // This frame is live across every nested expression (each `(`, `[`,
+        // call argument and arrow body passes through here), so the rare
+        // forms live in out-of-line helpers and only a few words stay here.
+        switch tok {
+        case JSTokenType.TOK_YIELD.rawValue:
             parseYieldExpression()
             return
-        }
 
-        // ---- Arrow function early detection: IDENT '=>' ----
-        // Check BEFORE parsing as a ternary/binary expression so that the
-        // identifier is NOT emitted as a scope_get_var. This is the spec-
-        // compliant location for ArrowFunction (AssignmentExpression).
-        if tok == JSTokenType.TOK_IDENT.rawValue && !s.gotLF {
-            let peeked = s.simpleNextToken()
-            if peeked == JSTokenType.TOK_ARROW.rawValue {
+        case JSTokenType.TOK_IDENT.rawValue:
+            // ---- Arrow function early detection: IDENT '=>' ----
+            // Check BEFORE parsing as a ternary/binary expression so that the
+            // identifier is NOT emitted as a scope_get_var. This is the spec-
+            // compliant location for ArrowFunction (AssignmentExpression).
+            if !s.gotLF && nextTokenIsArrow() {
                 let atom = s.token.identAtom
                 next() // consume identifier
                 next() // consume '=>'
                 emitArrowFunction(paramAtoms: [atom], isAsync: false)
                 return
             }
-        }
+            // ---- Async arrow function early detection ----
+            if isAsyncIdent() && parseAsyncArrowIfPresent() { return }
 
-        // ---- Async arrow function early detection ----
-        // async () => ..., async (a, b) => ..., async x => ...
-        // Note: the spec's [no LineTerminator here] is between 'async' and the
-        // parameter list, NOT before 'async'. We check s.gotLF AFTER consuming
-        // 'async' to correctly detect the line terminator position.
-        if tok == JSTokenType.TOK_IDENT.rawValue && isIdent("async") {
-            let peekTok = s.simpleNextToken()
-            if peekTok == 0x28 { // '(' — could be async arrow
-                let savedBc = fd.byteCode.len
-                let savedBufPtr = s.bufPtr
-                let savedLineNum = s.lineNum
-                let savedToken = s.token
-                let savedGotLF = s.gotLF
-                let savedLastLineNum = s.lastLineNum
-                let savedLastPtr = s.lastPtr
-                let savedTemplateNest = s.templateNestLevel
-                let savedLastTokenType = s.lastTokenType
+        case 0x28: // '(' -- arrow parameter list?
+            if parseParenArrowIfPresent() { return }
 
-                next() // consume 'async'
-                // [no LineTerminator here] between async and (
-                if !s.gotLF {
-                    // async (pattern, ...) => — the ident-only scanner below
-                    // does not accept patterns.
-                    if let full = scanFullArrowFromParen(), full.contains(where: { $0.atom == 0 }) {
-                        next() // consume '('
-                        emitPatternArrowFunction(isAsync: true)
-                        return
-                    }
-                    next() // consume '('
-                    if tok == 0x29 { // ')' — async () =>
-                        next()
-                        if tok == JSTokenType.TOK_ARROW.rawValue {
-                            next()
-                            emitArrowFunction(paramAtoms: [], isAsync: true)
-                            return
-                        }
-                    } else if let arrowParams = scanParenArrowParams() {
-                        let (dflts, rst) = consumeParenArrowParams(arrowParams)
-                        emitArrowFunction(paramAtoms: arrowParams.map { $0.atom }, isAsync: true,
-                                          defaults: dflts, rest: rst)
-                        return
-                    }
-                }
-                // Not an async arrow — restore state fully
-                fd.byteCode.len = savedBc
-                s.bufPtr = savedBufPtr
-                s.lineNum = savedLineNum
-                s.token = savedToken
-                s.gotLF = savedGotLF
-                s.lastLineNum = savedLastLineNum
-                s.lastPtr = savedLastPtr
-                s.templateNestLevel = savedTemplateNest
-                s.lastTokenType = savedLastTokenType
-            } else if peekTok == JSTokenType.TOK_IDENT.rawValue {
-                // async x => ...
-                let savedBc = fd.byteCode.len
-                let savedBufPtr = s.bufPtr
-                let savedLineNum = s.lineNum
-                let savedToken = s.token
-                let savedGotLF = s.gotLF
-                let savedLastLineNum = s.lastLineNum
-                let savedLastPtr = s.lastPtr
-                let savedTemplateNest = s.templateNestLevel
-                let savedLastTokenType = s.lastTokenType
+        case 0x5B, 0x7B: // '[' / '{' -- maybe a destructuring assignment
+            parsePatternOrConditionalAssignExpr()
+            return
 
-                next() // consume 'async'
-                // [no LineTerminator here] between async and param
-                if !s.gotLF {
-                    let paramAtom = s.token.identAtom
-                    next() // consume param name
-                    if tok == JSTokenType.TOK_ARROW.rawValue {
-                        next()
-                        emitArrowFunction(paramAtoms: [paramAtom], isAsync: true)
-                        return
-                    }
-                }
-                // Not arrow — restore state fully
-                fd.byteCode.len = savedBc
-                s.bufPtr = savedBufPtr
-                s.lineNum = savedLineNum
-                s.token = savedToken
-                s.gotLF = savedGotLF
-                s.lastLineNum = savedLastLineNum
-                s.lastPtr = savedLastPtr
-                s.templateNestLevel = savedTemplateNest
-                s.lastTokenType = savedLastTokenType
-            }
-        }
-
-        // ---- Arrow function early detection: '(' params ')' '=>' ----
-        // Also check for parenthesized arrow params before parsing as
-        // an expression. Uses the same lookahead scanner as parsePrimaryExpr.
-        if tok == 0x28 { // '('
-            let parenResult = scanFullArrowFromParen()
-            if let params = parenResult {
-                // Confirmed arrow: consume '(' then params then ')' then '=>'
-                let hasDestructuring = params.contains(where: { $0.atom == 0 })
-                next() // consume '('
-                if params.isEmpty {
-                    // () => ...
-                    expect(0x29) // ')'
-                    expect(JSTokenType.TOK_ARROW.rawValue)
-                    emitArrowFunction(paramAtoms: [], isAsync: false)
-                } else if hasDestructuring {
-                    emitPatternArrowFunction(isAsync: false)
-                } else {
-                    let (dflts, rst) = consumeParenArrowParams(params)
-                    emitArrowFunction(paramAtoms: params.map { $0.atom }, isAsync: false,
-                                      defaults: dflts, rest: rst)
-                }
-                return
-            }
+        default:
+            break
         }
 
         // Save bytecode position before parsing LHS — we may need to rewrite
         // the last emitted GET into a PUT for assignment.
         let lhsBcStart = fd.byteCode.len
-
-        // Save tokenizer state before LHS — needed to rewind if LHS turns out
-        // to be a destructuring assignment pattern ([a,b] = ... or {a,b} = ...).
-        let lhsTokIsBracketOrBrace = (tok == 0x5B || tok == 0x7B)
-        let savedLhsBufPtr = s.bufPtr
-        let savedLhsLineNum = s.lineNum
-        let savedLhsToken = s.token
-        let savedLhsGotLF = s.gotLF
-        let savedLhsLastLineNum = s.lastLineNum
-        let savedLhsLastPtr = s.lastPtr
-        let savedLhsTemplateNest = s.templateNestLevel
-        let savedLhsLastTokenType = s.lastTokenType
-        let savedLhsChildCount = fd.childFunctions.count
-
         parseTernaryExpr()
         guard !shouldAbort else { return }
-
-        // Check for assignment operator
         if let assignOp = getAssignOp(tok) {
-            next() // consume the operator
-
-            if assignOp == .plain {
-                // Check for destructuring assignment: [a, b] = expr or {a, b} = expr
-                // The LHS was parsed as an array/object literal. Detect this by
-                // checking if the first opcode is .object (array literal sentinel).
-                if lhsTokIsBracketOrBrace {
-                    let firstLhsOp = peekOpcodeAt(lhsBcStart)
-                    if firstLhsOp == .object || firstLhsOp == .dup {
-                        // Rewind bytecode and tokenizer to re-parse as destructuring.
-                        fd.byteCode.len = lhsBcStart
-                        if fd.childFunctions.count > savedLhsChildCount {
-                            fd.childFunctions.removeSubrange(savedLhsChildCount...)
-                        }
-
-                        // Save tokenizer at the '=' position (already consumed)
-                        let eqBufPtr = s.bufPtr
-                        let eqLineNum = s.lineNum
-                        let eqToken = s.token
-                        let eqGotLF = s.gotLF
-                        let eqLastLineNum = s.lastLineNum
-                        let eqLastPtr = s.lastPtr
-                        let eqTemplateNest = s.templateNestLevel
-                        let eqLastTokenType = s.lastTokenType
-
-                        // First parse the RHS (we need its value on the stack
-                        // before the destructuring pattern consumes it).
-                        parseAssignExpr()
-
-                        // Save position after RHS
-                        let afterRhsBufPtr = s.bufPtr
-                        let afterRhsLineNum = s.lineNum
-                        let afterRhsToken = s.token
-                        let afterRhsGotLF = s.gotLF
-                        let afterRhsLastLineNum = s.lastLineNum
-                        let afterRhsLastPtr = s.lastPtr
-                        let afterRhsTemplateNest = s.templateNestLevel
-                        let afterRhsLastTokenType = s.lastTokenType
-
-                        // Rewind to the LHS pattern
-                        s.bufPtr = savedLhsBufPtr
-                        s.lineNum = savedLhsLineNum
-                        s.token = savedLhsToken
-                        s.gotLF = savedLhsGotLF
-                        s.lastLineNum = savedLhsLastLineNum
-                        s.lastPtr = savedLhsLastPtr
-                        s.templateNestLevel = savedLhsTemplateNest
-                        s.lastTokenType = savedLhsLastTokenType
-
-                        // Parse the destructuring pattern in assignment mode
-                        // `({a} = o)` / `[a] = arr` are expressions whose
-                        // value is the RHS: leave it on the stack.
-                        parseDestructuringBinding(kind: .assignment, leaveSource: true)
-
-                        // Restore to after RHS
-                        s.bufPtr = afterRhsBufPtr
-                        s.lineNum = afterRhsLineNum
-                        s.token = afterRhsToken
-                        s.gotLF = afterRhsGotLF
-                        s.lastLineNum = afterRhsLastLineNum
-                        s.lastPtr = afterRhsLastPtr
-                        s.templateNestLevel = afterRhsTemplateNest
-                        s.lastTokenType = afterRhsLastTokenType
-                        return
-                    }
-                }
-                // Simple assignment: find the LAST get opcode emitted by the
-                // LHS and replace it with the corresponding put.
-                //
-                // For `a = expr`:   LHS emits scope_get_var(a)
-                // For `o.x = expr`: LHS emits <obj code> + get_field(x)
-                // For `a[i] = expr`: LHS emits <obj code> + <idx code> + get_array_el
-                //
-                // We scan backwards from the current bytecode position to find
-                // the last GET opcode emitted by the LHS.
-                let lhsEnd = fd.byteCode.len
-                let (lastGetOp, lastGetPos) = findLastGetOpcode(from: lhsBcStart, to: lhsEnd)
-
-                if lastGetOp == .scope_get_private_field, let pos = lastGetPos {
-                    // obj.#x = expr: rewind the private read, leaving [obj].
-                    let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
-                    let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
-                    let scopeLevel = readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4)
-                    fd.byteCode.len = pos    // stack: [obj]
-                    parseAssignExpr()        // stack: [obj, val]
-                    emitOp(.dup)             // [obj, val, val]
-                    emitOp(.perm3)           // [val, obj, val]
-                    emitScopePutPrivateField(atom, scopeLevel: Int(scopeLevel))  // [val]
-                } else if lastGetOp == .scope_get_var, let pos = lastGetPos {
-                    let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
-                    let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
-                    let scopeLevel = readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4)
-                    fd.byteCode.len = pos  // rewind to remove scope_get_var
-                    parseAssignExpr()
-                    // Assignment expression must leave the value on the stack.
-                    // dup + put_var: dup keeps a copy, put_var stores and pops.
-                    emitOp(.dup)
-                    emitScopePutVar(atom, scopeLevel: Int(scopeLevel))
-                } else if lastGetOp == .get_field, let pos = lastGetPos {
-                    let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
-                    let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
-                    fd.byteCode.len = pos   // rewind; stack: [obj]
-                    parseAssignExpr()        // stack: [obj, val]
-                    // We need put_field(obj, val) AND leave val on stack.
-                    // Strategy: [obj, val] → swap → [val, obj] → over(val) → [val, obj, val]
-                    //           → put_field → [val]
-                    // But "over" doesn't exist. Use: dup val, insert obj above.
-                    // [obj, val] → dup → [obj, val, val] → perm3(2,0,1) → [val, obj, val]
-                    //           → put_field → [val]
-                    emitOp(.dup)             // [obj, val, val]
-                    emitOp(.perm3)           // [val, obj, val]  (rotate: TOS-2 goes to TOS)
-                    emitPutField(atom)       // pops [obj, val]; stack: [val]
-                } else if lastGetOp == .get_array_el, let pos = lastGetPos {
-                    fd.byteCode.len = pos   // rewind; stack: [obj, index]
-                    parseAssignExpr()        // stack: [obj, index, val]
-                    // Keep val: dup, then rotate so put_array_el gets [obj,index,val]
-                    emitOp(.dup)             // stack: [obj, index, val, val]
-                    emitOp(.perm4)           // stack: [val, obj, index, val]
-                    emitOp(.put_array_el)    // pops [obj,index,val]; stack: [val]
-                } else {
-                    // Fallback
-                    parseAssignExpr()
-                    emitOp(.nip)
-                }
-            } else if assignOp == .land || assignOp == .lor || assignOp == .nullishCoalescing {
-                // Logical assignment: x &&= y, x ||= y, x ??= y
-                //
-                // Semantics:
-                //   x ??= y  →  if (x == null || x == undefined) x = y; result = x
-                //   x ||= y  →  if (!x) x = y; result = x
-                //   x &&= y  →  if (x) x = y; result = x
-                //
-                // The LHS has already been emitted as a GET by parseTernaryExpr.
-                // We need to: check condition, if short-circuit keep old value,
-                // otherwise evaluate RHS, store back, and leave new value on stack.
-                let lhsOp = peekOpcodeAt(lhsBcStart)
-                let endLabel = newLabel()
-
-                let (logGetOp, logGetPos) = findLastGetOpcode(from: lhsBcStart, to: fd.byteCode.len)
-                if logGetOp == .scope_get_private_field, let pos = logGetPos {
-                    // obj.#x ??= y — rewind to just after the object.
-                    let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
-                    let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
-                    let scopeLevel = Int(readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4))
-                    let doneLabel = newLabel()
-                    fd.byteCode.len = pos                       // [obj]
-                    emitOp(.dup)                                // [obj, obj]
-                    emitScopeGetPrivateField(atom, scopeLevel: scopeLevel)  // [obj, old]
-                    emitOp(.dup)                                // [obj, old, old]
-                    switch assignOp {
-                    case .land:
-                        emitIfFalse(endLabel)
-                    case .lor:
-                        emitIfTrue(endLabel)
-                    case .nullishCoalescing:
-                        emitOp(.is_undefined_or_null)
-                        emitOp(.lnot)
-                        emitIfTrue(endLabel)
-                    default:
-                        break
-                    }
-                    emitOp(.drop)                               // [obj]
-                    parseAssignExpr()                           // [obj, val]
-                    emitOp(.dup)                                // [obj, val, val]
-                    emitOp(.perm3)                              // [val, obj, val]
-                    emitScopePutPrivateField(atom, scopeLevel: scopeLevel)  // [val]
-                    emitGoto(doneLabel)
-                    emitLabel(endLabel)                         // [obj, old]
-                    emitOp(.nip)                                // [old]
-                    emitLabel(doneLabel)
-                } else if lhsOp == .scope_get_var {
-                    // --- Variable LHS: x ??= y ---
-                    let opcodeSize = fd.byteCode.buf[lhsBcStart] == 0 ? 2 : 1
-                    let atom = readU32FromBuf(fd.byteCode.buf, lhsBcStart + opcodeSize)
-                    let scopeLevel = readU16FromBuf(fd.byteCode.buf, lhsBcStart + opcodeSize + 4)
-
-                    // Stack: [oldValue]
-                    emitOp(.dup)
-                    // Stack: [oldValue, oldValue]
-                    switch assignOp {
-                    case .land:
-                        emitIfFalse(endLabel) // if falsy, keep old value
-                    case .lor:
-                        emitIfTrue(endLabel)  // if truthy, keep old value
-                    case .nullishCoalescing:
-                        emitOp(.is_undefined_or_null)
-                        emitOp(.lnot)
-                        emitIfTrue(endLabel) // if NOT null/undefined, keep old value
-                    default:
-                        break
-                    }
-                    // Stack: [oldValue]  (condition says we should assign)
-                    emitOp(.drop) // drop old value
-                    parseAssignExpr() // evaluate RHS
-                    // Stack: [newValue]
-                    emitOp(.dup) // keep a copy for the expression result
-                    // Stack: [newValue, newValue]
-                    emitScopePutVar(atom, scopeLevel: Int(scopeLevel))
-                    // Stack: [newValue]
-                    emitLabel(endLabel)
-                    // Stack: [value]  (either old or new)
-                } else {
-                    // Fallback for non-variable LHS (field, array element, etc.)
-                    // Stack: [oldValue]
-                    emitOp(.dup)
-                    switch assignOp {
-                    case .land:
-                        emitIfFalse(endLabel)
-                    case .lor:
-                        emitIfTrue(endLabel)
-                    case .nullishCoalescing:
-                        emitOp(.is_undefined_or_null)
-                        emitOp(.lnot)
-                        emitIfTrue(endLabel)
-                    default:
-                        break
-                    }
-                    emitOp(.drop)
-                    parseAssignExpr()
-                    emitLabel(endLabel)
-                }
-            } else {
-                // Compound assignment: +=, -=, etc.
-                // LHS was already parsed and emitted a GET. We need to:
-                //   1. Read old value (the GET is already there)
-                //   2. Compute new value (RHS + binary op)
-                //   3. Store back to the same lvalue
-                // Check if the last emitted opcode is get_field (for obj.prop += rhs).
-                let fieldCheck = lastEmittedIsGetField()
-                if fieldCheck.isGetField {
-                    let fieldStart = fieldCheck.fieldStart
-                    let atom = fieldCheck.atom
-                    // Rewind past get_field, use get_field2 to keep obj on stack
-                    fd.byteCode.len = fieldStart             // rewind past get_field
-                    emitOp(.get_field2)                      // stack: [..., obj, oldValue]
-                    emitAtom(atom)
-                    parseAssignExpr()                        // stack: [..., obj, oldValue, rhs]
-                    emitBinaryOp(forAssignOp: assignOp)      // stack: [..., obj, newValue]
-                    emitOp(.dup)                             // stack: [..., obj, newValue, newValue]
-                    emitOp(.perm3)                           // stack: [..., newValue, obj, newValue]
-                    emitPutField(atom)                       // stack: [..., newValue]
-                } else {
-                    // Check for computed property access (obj[key] op= rhs)
-                    // MUST check get_array_el BEFORE scope_get_var — for expressions
-                    // like flags['lanes'] |= 1, the first opcode is scope_get_var
-                    // (for 'flags') but the last is get_array_el.
-                    let (compOp, compPos) = findLastGetOpcode(from: lhsBcStart, to: fd.byteCode.len)
-                    if compOp == .scope_get_private_field, let pos = compPos {
-                        // obj.#x += rhs
-                        let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
-                        let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
-                        let scopeLevel = Int(readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4))
-                        fd.byteCode.len = pos                        // [obj]
-                        emitOp(.dup)                                 // [obj, obj]
-                        emitScopeGetPrivateField(atom, scopeLevel: scopeLevel)  // [obj, old]
-                        parseAssignExpr()                            // [obj, old, rhs]
-                        emitBinaryOp(forAssignOp: assignOp)          // [obj, new]
-                        emitOp(.dup)                                 // [obj, new, new]
-                        emitOp(.perm3)                               // [new, obj, new]
-                        emitScopePutPrivateField(atom, scopeLevel: scopeLevel)  // [new]
-                    } else if compOp == .get_array_el, let pos = compPos {
-                        fd.byteCode.len = pos     // rewind past get_array_el; stack: [obj, key]
-                        emitOp(.dup2)              // [obj, key, obj, key]
-                        emitOp(.get_array_el)      // [obj, key, old_value]
-                        parseAssignExpr()          // [obj, key, old_value, rhs]
-                        emitBinaryOp(forAssignOp: assignOp) // [obj, key, new_value]
-                        emitOp(.dup)               // [obj, key, new, new]
-                        emitOp(.perm4)             // [new, obj, key, new]
-                        emitOp(.put_array_el)      // [new]
-                    } else if compOp == .scope_get_var, let pos = compPos {
-                        let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
-                        let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
-                        let scopeLevel = readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4)
-                        parseAssignExpr()
-                        emitBinaryOp(forAssignOp: assignOp)
-                        // Keep the expression value on the stack (matching the
-                        // field/array compound paths and plain assignment).
-                        // Without this dup, the statement-level `drop` pops one
-                        // entry too many; that is silently absorbed when the
-                        // stack is empty, but inside finally blocks it consumed
-                        // the gosub return address and `ret` then jumped to a
-                        // bogus pc (stack corruption, UAF crashes downstream).
-                        emitOp(.dup)
-                        emitScopePutVar(atom, scopeLevel: Int(scopeLevel))
-                    } else {
-                        // Fallback
-                        emitOp(.dup)
-                        parseAssignExpr()
-                        emitBinaryOp(forAssignOp: assignOp)
-                        emitOp(.nip)
-                    }
-                }
-            }
+            parseAssignmentOperator(assignOp, lhsBcStart: lhsBcStart, pattern: nil)
         }
-
         // Arrow functions are detected above (before parseTernaryExpr) for
         // IDENT => and (params) => patterns, and also in parsePrimaryExpr()
         // as a fallback for nested contexts (e.g., inside call arguments).
+    }
+
+    /// One-token lookahead for `=>`. Out of line: the lookahead saves and
+    /// restores a whole token, which would otherwise sit in the frame of
+    /// every recursive caller.
+    @inline(never)
+    private func nextTokenIsArrow() -> Bool {
+        return s.simpleNextToken() == JSTokenType.TOK_ARROW.rawValue
+    }
+
+    /// The current token is the identifier `async` (see nextTokenIsArrow).
+    @inline(never)
+    private func isAsyncIdent() -> Bool {
+        return isIdent("async")
+    }
+
+    /// Tokenizer state at the start of an LHS that began with `[` or `{`,
+    /// kept so the LHS can be re-parsed as a destructuring pattern. A class,
+    /// so the (token-sized) state lives on the heap rather than in the
+    /// frames that stay live while the LHS parses.
+    final class LhsPatternState {
+        let bufPtr: Int
+        let lineNum: Int
+        let token: JeffJSToken
+        let gotLF: Bool
+        let lastLineNum: Int
+        let lastPtr: Int
+        let templateNestLevel: Int
+        let lastTokenType: Int
+        let childCount: Int
+
+        init(bufPtr: Int, lineNum: Int, token: JeffJSToken, gotLF: Bool,
+             lastLineNum: Int, lastPtr: Int, templateNestLevel: Int,
+             lastTokenType: Int, childCount: Int) {
+            self.bufPtr = bufPtr
+            self.lineNum = lineNum
+            self.token = token
+            self.gotLF = gotLF
+            self.lastLineNum = lastLineNum
+            self.lastPtr = lastPtr
+            self.templateNestLevel = templateNestLevel
+            self.lastTokenType = lastTokenType
+            self.childCount = childCount
+        }
+    }
+
+    @inline(never)
+    private func capturePatternState() -> LhsPatternState {
+        return LhsPatternState(
+            bufPtr: s.bufPtr, lineNum: s.lineNum, token: s.token, gotLF: s.gotLF,
+            lastLineNum: s.lastLineNum, lastPtr: s.lastPtr,
+            templateNestLevel: s.templateNestLevel, lastTokenType: s.lastTokenType,
+            childCount: fd.childFunctions.count)
+    }
+
+    /// An AssignmentExpression starting with `[` or `{`: an array/object
+    /// literal operand, or the pattern of a destructuring assignment.
+    @inline(never)
+    private func parsePatternOrConditionalAssignExpr() {
+        // Save tokenizer state before LHS — needed to rewind if LHS turns out
+        // to be a destructuring assignment pattern ([a,b] = ... or {a,b} = ...).
+        let pattern = capturePatternState()
+        let lhsBcStart = fd.byteCode.len
+        parseTernaryExpr()
+        guard !shouldAbort else { return }
+        if let assignOp = getAssignOp(tok) {
+            parseAssignmentOperator(assignOp, lhsBcStart: lhsBcStart, pattern: pattern)
+        }
+    }
+
+    /// `async (...) =>` / `async x =>` at the start of an AssignmentExpression
+    /// (current token is the identifier `async`). Returns true when an arrow
+    /// function was parsed; otherwise the tokenizer is left where it was.
+    @inline(never)
+    private func parseAsyncArrowIfPresent() -> Bool {
+        let peekTok = s.simpleNextToken()
+        if peekTok == 0x28 { // '(' — could be async arrow
+            let savedBc = fd.byteCode.len
+            let savedBufPtr = s.bufPtr
+            let savedLineNum = s.lineNum
+            let savedToken = s.token
+            let savedGotLF = s.gotLF
+            let savedLastLineNum = s.lastLineNum
+            let savedLastPtr = s.lastPtr
+            let savedTemplateNest = s.templateNestLevel
+            let savedLastTokenType = s.lastTokenType
+
+            next() // consume 'async'
+            // [no LineTerminator here] between async and (
+            if !s.gotLF {
+                // async (pattern, ...) => — the ident-only scanner below
+                // does not accept patterns.
+                if let full = scanFullArrowFromParen(), full.contains(where: { $0.atom == 0 }) {
+                    next() // consume '('
+                    emitPatternArrowFunction(isAsync: true)
+                    return true
+                }
+                next() // consume '('
+                if tok == 0x29 { // ')' — async () =>
+                    next()
+                    if tok == JSTokenType.TOK_ARROW.rawValue {
+                        next()
+                        emitArrowFunction(paramAtoms: [], isAsync: true)
+                        return true
+                    }
+                } else if let arrowParams = scanParenArrowParams() {
+                    let (dflts, rst) = consumeParenArrowParams(arrowParams)
+                    emitArrowFunction(paramAtoms: arrowParams.map { $0.atom }, isAsync: true,
+                                      defaults: dflts, rest: rst)
+                    return true
+                }
+            }
+            // Not an async arrow — restore state fully
+            fd.byteCode.len = savedBc
+            s.bufPtr = savedBufPtr
+            s.lineNum = savedLineNum
+            s.token = savedToken
+            s.gotLF = savedGotLF
+            s.lastLineNum = savedLastLineNum
+            s.lastPtr = savedLastPtr
+            s.templateNestLevel = savedTemplateNest
+            s.lastTokenType = savedLastTokenType
+        } else if peekTok == JSTokenType.TOK_IDENT.rawValue {
+            // async x => ...
+            let savedBc = fd.byteCode.len
+            let savedBufPtr = s.bufPtr
+            let savedLineNum = s.lineNum
+            let savedToken = s.token
+            let savedGotLF = s.gotLF
+            let savedLastLineNum = s.lastLineNum
+            let savedLastPtr = s.lastPtr
+            let savedTemplateNest = s.templateNestLevel
+            let savedLastTokenType = s.lastTokenType
+
+            next() // consume 'async'
+            // [no LineTerminator here] between async and param
+            if !s.gotLF {
+                let paramAtom = s.token.identAtom
+                next() // consume param name
+                if tok == JSTokenType.TOK_ARROW.rawValue {
+                    next()
+                    emitArrowFunction(paramAtoms: [paramAtom], isAsync: true)
+                    return true
+                }
+            }
+            // Not arrow — restore state fully
+            fd.byteCode.len = savedBc
+            s.bufPtr = savedBufPtr
+            s.lineNum = savedLineNum
+            s.token = savedToken
+            s.gotLF = savedGotLF
+            s.lastLineNum = savedLastLineNum
+            s.lastPtr = savedLastPtr
+            s.templateNestLevel = savedTemplateNest
+            s.lastTokenType = savedLastTokenType
+        }
+        return false
+    }
+
+    /// `(params) =>` at the start of an AssignmentExpression (current token
+    /// is `(`). Returns true when an arrow function was parsed.
+    @inline(never)
+    private func parseParenArrowIfPresent() -> Bool {
+        let parenResult = scanFullArrowFromParen()
+        if let params = parenResult {
+            // Confirmed arrow: consume '(' then params then ')' then '=>'
+            let hasDestructuring = params.contains(where: { $0.atom == 0 })
+            next() // consume '('
+            if params.isEmpty {
+                // () => ...
+                expect(0x29) // ')'
+                expect(JSTokenType.TOK_ARROW.rawValue)
+                emitArrowFunction(paramAtoms: [], isAsync: false)
+            } else if hasDestructuring {
+                emitPatternArrowFunction(isAsync: false)
+            } else {
+                let (dflts, rst) = consumeParenArrowParams(params)
+                emitArrowFunction(paramAtoms: params.map { $0.atom }, isAsync: false,
+                                  defaults: dflts, rest: rst)
+            }
+            return true
+        }
+        return false
+    }
+
+    /// The part of an AssignmentExpression after `LHS AssignOp` (the operator
+    /// token is current and not yet consumed); the LHS's bytecode starts at
+    /// `lhsBcStart`. `pattern` is the tokenizer state at the LHS when it
+    /// started with `[` or `{` (a possible destructuring pattern).
+    ///
+    /// Kept out of line so parseAssignExpr's own frame, which is live across
+    /// every nested expression, stays small.
+    @inline(never)
+    func parseAssignmentOperator(_ assignOp: AssignOpKind, lhsBcStart: Int,
+                                 pattern: LhsPatternState?) {
+        next() // consume the operator
+
+        if assignOp == .plain {
+            // Check for destructuring assignment: [a, b] = expr or {a, b} = expr
+            // The LHS was parsed as an array/object literal. Detect this by
+            // checking if the first opcode is .object (array literal sentinel).
+            if let pattern = pattern,
+               peekOpcodeAt(lhsBcStart) == .object || peekOpcodeAt(lhsBcStart) == .dup {
+                parseDestructuringAssignment(lhsBcStart: lhsBcStart, pattern: pattern)
+                return
+            }
+            // Simple assignment: find the LAST get opcode emitted by the
+            // LHS and replace it with the corresponding put.
+            //
+            // For `a = expr`:   LHS emits scope_get_var(a)
+            // For `o.x = expr`: LHS emits <obj code> + get_field(x)
+            // For `a[i] = expr`: LHS emits <obj code> + <idx code> + get_array_el
+            //
+            // We scan backwards from the current bytecode position to find
+            // the last GET opcode emitted by the LHS.
+            let lhsEnd = fd.byteCode.len
+            let (lastGetOp, lastGetPos) = findLastGetOpcode(from: lhsBcStart, to: lhsEnd)
+
+            if lastGetOp == .scope_get_private_field, let pos = lastGetPos {
+                // obj.#x = expr: rewind the private read, leaving [obj].
+                let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
+                let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
+                let scopeLevel = readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4)
+                fd.byteCode.len = pos    // stack: [obj]
+                parseAssignExpr()        // stack: [obj, val]
+                emitOp(.dup)             // [obj, val, val]
+                emitOp(.perm3)           // [val, obj, val]
+                emitScopePutPrivateField(atom, scopeLevel: Int(scopeLevel))  // [val]
+            } else if lastGetOp == .scope_get_var, let pos = lastGetPos {
+                let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
+                let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
+                let scopeLevel = readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4)
+                fd.byteCode.len = pos  // rewind to remove scope_get_var
+                parseAssignExpr()
+                // Assignment expression must leave the value on the stack.
+                // dup + put_var: dup keeps a copy, put_var stores and pops.
+                emitOp(.dup)
+                emitScopePutVar(atom, scopeLevel: Int(scopeLevel))
+            } else if lastGetOp == .get_field, let pos = lastGetPos {
+                let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
+                let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
+                fd.byteCode.len = pos   // rewind; stack: [obj]
+                parseAssignExpr()        // stack: [obj, val]
+                // We need put_field(obj, val) AND leave val on stack.
+                // Strategy: [obj, val] → swap → [val, obj] → over(val) → [val, obj, val]
+                //           → put_field → [val]
+                // But "over" doesn't exist. Use: dup val, insert obj above.
+                // [obj, val] → dup → [obj, val, val] → perm3(2,0,1) → [val, obj, val]
+                //           → put_field → [val]
+                emitOp(.dup)             // [obj, val, val]
+                emitOp(.perm3)           // [val, obj, val]  (rotate: TOS-2 goes to TOS)
+                emitPutField(atom)       // pops [obj, val]; stack: [val]
+            } else if lastGetOp == .get_array_el, let pos = lastGetPos {
+                fd.byteCode.len = pos   // rewind; stack: [obj, index]
+                parseAssignExpr()        // stack: [obj, index, val]
+                // Keep val: dup, then rotate so put_array_el gets [obj,index,val]
+                emitOp(.dup)             // stack: [obj, index, val, val]
+                emitOp(.perm4)           // stack: [val, obj, index, val]
+                emitOp(.put_array_el)    // pops [obj,index,val]; stack: [val]
+            } else {
+                // Fallback
+                parseAssignExpr()
+                emitOp(.nip)
+            }
+        } else if assignOp == .land || assignOp == .lor || assignOp == .nullishCoalescing {
+            // Logical assignment: x &&= y, x ||= y, x ??= y
+            //
+            // Semantics:
+            //   x ??= y  →  if (x == null || x == undefined) x = y; result = x
+            //   x ||= y  →  if (!x) x = y; result = x
+            //   x &&= y  →  if (x) x = y; result = x
+            //
+            // The LHS has already been emitted as a GET by parseTernaryExpr.
+            // We need to: check condition, if short-circuit keep old value,
+            // otherwise evaluate RHS, store back, and leave new value on stack.
+            let lhsOp = peekOpcodeAt(lhsBcStart)
+            let endLabel = newLabel()
+
+            let (logGetOp, logGetPos) = findLastGetOpcode(from: lhsBcStart, to: fd.byteCode.len)
+            if logGetOp == .scope_get_private_field, let pos = logGetPos {
+                // obj.#x ??= y — rewind to just after the object.
+                let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
+                let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
+                let scopeLevel = Int(readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4))
+                let doneLabel = newLabel()
+                fd.byteCode.len = pos                       // [obj]
+                emitOp(.dup)                                // [obj, obj]
+                emitScopeGetPrivateField(atom, scopeLevel: scopeLevel)  // [obj, old]
+                emitOp(.dup)                                // [obj, old, old]
+                switch assignOp {
+                case .land:
+                    emitIfFalse(endLabel)
+                case .lor:
+                    emitIfTrue(endLabel)
+                case .nullishCoalescing:
+                    emitOp(.is_undefined_or_null)
+                    emitOp(.lnot)
+                    emitIfTrue(endLabel)
+                default:
+                    break
+                }
+                emitOp(.drop)                               // [obj]
+                parseAssignExpr()                           // [obj, val]
+                emitOp(.dup)                                // [obj, val, val]
+                emitOp(.perm3)                              // [val, obj, val]
+                emitScopePutPrivateField(atom, scopeLevel: scopeLevel)  // [val]
+                emitGoto(doneLabel)
+                emitLabel(endLabel)                         // [obj, old]
+                emitOp(.nip)                                // [old]
+                emitLabel(doneLabel)
+            } else if lhsOp == .scope_get_var {
+                // --- Variable LHS: x ??= y ---
+                let opcodeSize = fd.byteCode.buf[lhsBcStart] == 0 ? 2 : 1
+                let atom = readU32FromBuf(fd.byteCode.buf, lhsBcStart + opcodeSize)
+                let scopeLevel = readU16FromBuf(fd.byteCode.buf, lhsBcStart + opcodeSize + 4)
+
+                // Stack: [oldValue]
+                emitOp(.dup)
+                // Stack: [oldValue, oldValue]
+                switch assignOp {
+                case .land:
+                    emitIfFalse(endLabel) // if falsy, keep old value
+                case .lor:
+                    emitIfTrue(endLabel)  // if truthy, keep old value
+                case .nullishCoalescing:
+                    emitOp(.is_undefined_or_null)
+                    emitOp(.lnot)
+                    emitIfTrue(endLabel) // if NOT null/undefined, keep old value
+                default:
+                    break
+                }
+                // Stack: [oldValue]  (condition says we should assign)
+                emitOp(.drop) // drop old value
+                parseAssignExpr() // evaluate RHS
+                // Stack: [newValue]
+                emitOp(.dup) // keep a copy for the expression result
+                // Stack: [newValue, newValue]
+                emitScopePutVar(atom, scopeLevel: Int(scopeLevel))
+                // Stack: [newValue]
+                emitLabel(endLabel)
+                // Stack: [value]  (either old or new)
+            } else {
+                // Fallback for non-variable LHS (field, array element, etc.)
+                // Stack: [oldValue]
+                emitOp(.dup)
+                switch assignOp {
+                case .land:
+                    emitIfFalse(endLabel)
+                case .lor:
+                    emitIfTrue(endLabel)
+                case .nullishCoalescing:
+                    emitOp(.is_undefined_or_null)
+                    emitOp(.lnot)
+                    emitIfTrue(endLabel)
+                default:
+                    break
+                }
+                emitOp(.drop)
+                parseAssignExpr()
+                emitLabel(endLabel)
+            }
+        } else {
+            // Compound assignment: +=, -=, etc.
+            // LHS was already parsed and emitted a GET. We need to:
+            //   1. Read old value (the GET is already there)
+            //   2. Compute new value (RHS + binary op)
+            //   3. Store back to the same lvalue
+            // Check if the last emitted opcode is get_field (for obj.prop += rhs).
+            let fieldCheck = lastEmittedIsGetField()
+            if fieldCheck.isGetField {
+                let fieldStart = fieldCheck.fieldStart
+                let atom = fieldCheck.atom
+                // Rewind past get_field, use get_field2 to keep obj on stack
+                fd.byteCode.len = fieldStart             // rewind past get_field
+                emitOp(.get_field2)                      // stack: [..., obj, oldValue]
+                emitAtom(atom)
+                parseAssignExpr()                        // stack: [..., obj, oldValue, rhs]
+                emitBinaryOp(forAssignOp: assignOp)      // stack: [..., obj, newValue]
+                emitOp(.dup)                             // stack: [..., obj, newValue, newValue]
+                emitOp(.perm3)                           // stack: [..., newValue, obj, newValue]
+                emitPutField(atom)                       // stack: [..., newValue]
+            } else {
+                // Check for computed property access (obj[key] op= rhs)
+                // MUST check get_array_el BEFORE scope_get_var — for expressions
+                // like flags['lanes'] |= 1, the first opcode is scope_get_var
+                // (for 'flags') but the last is get_array_el.
+                let (compOp, compPos) = findLastGetOpcode(from: lhsBcStart, to: fd.byteCode.len)
+                if compOp == .scope_get_private_field, let pos = compPos {
+                    // obj.#x += rhs
+                    let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
+                    let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
+                    let scopeLevel = Int(readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4))
+                    fd.byteCode.len = pos                        // [obj]
+                    emitOp(.dup)                                 // [obj, obj]
+                    emitScopeGetPrivateField(atom, scopeLevel: scopeLevel)  // [obj, old]
+                    parseAssignExpr()                            // [obj, old, rhs]
+                    emitBinaryOp(forAssignOp: assignOp)          // [obj, new]
+                    emitOp(.dup)                                 // [obj, new, new]
+                    emitOp(.perm3)                               // [new, obj, new]
+                    emitScopePutPrivateField(atom, scopeLevel: scopeLevel)  // [new]
+                } else if compOp == .get_array_el, let pos = compPos {
+                    fd.byteCode.len = pos     // rewind past get_array_el; stack: [obj, key]
+                    emitOp(.dup2)              // [obj, key, obj, key]
+                    emitOp(.get_array_el)      // [obj, key, old_value]
+                    parseAssignExpr()          // [obj, key, old_value, rhs]
+                    emitBinaryOp(forAssignOp: assignOp) // [obj, key, new_value]
+                    emitOp(.dup)               // [obj, key, new, new]
+                    emitOp(.perm4)             // [new, obj, key, new]
+                    emitOp(.put_array_el)      // [new]
+                } else if compOp == .scope_get_var, let pos = compPos {
+                    let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
+                    let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
+                    let scopeLevel = readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4)
+                    parseAssignExpr()
+                    emitBinaryOp(forAssignOp: assignOp)
+                    // Keep the expression value on the stack (matching the
+                    // field/array compound paths and plain assignment).
+                    // Without this dup, the statement-level `drop` pops one
+                    // entry too many; that is silently absorbed when the
+                    // stack is empty, but inside finally blocks it consumed
+                    // the gosub return address and `ret` then jumped to a
+                    // bogus pc (stack corruption, UAF crashes downstream).
+                    emitOp(.dup)
+                    emitScopePutVar(atom, scopeLevel: Int(scopeLevel))
+                } else {
+                    // Fallback
+                    emitOp(.dup)
+                    parseAssignExpr()
+                    emitBinaryOp(forAssignOp: assignOp)
+                    emitOp(.nip)
+                }
+            }
+        }
+    }
+
+    /// `[a, b] = rhs` / `({a} = rhs)`: the LHS was parsed as an array/object
+    /// literal; drop that bytecode, parse the RHS, then re-parse the LHS
+    /// tokens as an assignment pattern.
+    @inline(never)
+    private func parseDestructuringAssignment(lhsBcStart: Int, pattern: LhsPatternState) {
+        // Rewind bytecode and tokenizer to re-parse as destructuring.
+        fd.byteCode.len = lhsBcStart
+        if fd.childFunctions.count > pattern.childCount {
+            fd.childFunctions.removeSubrange(pattern.childCount...)
+        }
+
+        // First parse the RHS (we need its value on the stack
+        // before the destructuring pattern consumes it).
+        parseAssignExpr()
+
+        // Save position after RHS
+        let afterRhsBufPtr = s.bufPtr
+        let afterRhsLineNum = s.lineNum
+        let afterRhsToken = s.token
+        let afterRhsGotLF = s.gotLF
+        let afterRhsLastLineNum = s.lastLineNum
+        let afterRhsLastPtr = s.lastPtr
+        let afterRhsTemplateNest = s.templateNestLevel
+        let afterRhsLastTokenType = s.lastTokenType
+
+        // Rewind to the LHS pattern
+        s.bufPtr = pattern.bufPtr
+        s.lineNum = pattern.lineNum
+        s.token = pattern.token
+        s.gotLF = pattern.gotLF
+        s.lastLineNum = pattern.lastLineNum
+        s.lastPtr = pattern.lastPtr
+        s.templateNestLevel = pattern.templateNestLevel
+        s.lastTokenType = pattern.lastTokenType
+
+        // Parse the destructuring pattern in assignment mode
+        // `({a} = o)` / `[a] = arr` are expressions whose
+        // value is the RHS: leave it on the stack.
+        parseDestructuringBinding(kind: .assignment, leaveSource: true)
+
+        // Restore to after RHS
+        s.bufPtr = afterRhsBufPtr
+        s.lineNum = afterRhsLineNum
+        s.token = afterRhsToken
+        s.gotLF = afterRhsGotLF
+        s.lastLineNum = afterRhsLastLineNum
+        s.lastPtr = afterRhsLastPtr
+        s.templateNestLevel = afterRhsTemplateNest
+        s.lastTokenType = afterRhsLastTokenType
     }
 
     /// Determine if a token is an assignment operator.
@@ -4806,16 +4935,21 @@ final class JeffJSParser {
 
     // MARK: Ternary (Conditional) Expression
 
-    /// Parse: LogicalORExpr ['?' AssignExpr ':' AssignExpr]
+    /// Parse: ShortCircuitExpr ['?' AssignExpr ':' AssignExpr]
+    ///
+    /// A right-nested chain `c1 ? v1 : c2 ? v2 : ... : vn` (minifiers emit
+    /// hundreds of links) is parsed in a loop, not by recursing through
+    /// parseAssignExpr for every `:` branch: every link's true branch jumps
+    /// to the same place (the end of the whole chain), so one end label
+    /// serves all of them.
     func parseTernaryExpr() {
-        parseNullishCoalescingExpr()
-        guard !shouldAbort else { return }
+        parseBinaryExpr(1)
+        guard !shouldAbort, tok == 0x3F else { return } // '?'
 
-        if tok == 0x3F { // '?'
+        let endLabel = newLabel()
+        while tok == 0x3F && !shouldAbort {
             next()
             let falseLabel = newLabel()
-            let endLabel = newLabel()
-
             emitIfFalse(falseLabel)
             // True branch uses [+In] per ECMAScript spec
             let savedInFlagTern = inFlag
@@ -4826,241 +4960,177 @@ final class JeffJSParser {
 
             expect(0x3A) // ':'
             emitLabel(falseLabel)
-            parseAssignExpr()
-            emitLabel(endLabel)
-        }
-    }
+            guard !shouldAbort else { break }
 
-    // MARK: Nullish Coalescing
-
-    /// Parse: LogicalORExpr ['??' LogicalORExpr]*
-    func parseNullishCoalescingExpr() {
-        parseLogicalOrExpr()
-
-        while tok == JSTokenType.TOK_DOUBLE_QUESTION_MARK.rawValue && !shouldAbort {
-            next()
-            let endLabel = newLabel()
-            emitOp(.dup)
-            emitOp(.is_undefined_or_null)
-            emitOp(.lnot)
-            emitIfTrue(endLabel) // if not null/undefined, skip
-            emitOp(.drop)
-            parseLogicalOrExpr()
-            emitLabel(endLabel)
-        }
-    }
-
-    // MARK: Logical OR
-
-    /// Parse: LogicalANDExpr ['||' LogicalANDExpr]*
-    func parseLogicalOrExpr() {
-        parseLogicalAndExpr()
-
-        while tok == JSTokenType.TOK_LOR.rawValue && !shouldAbort {
-            next()
-            let endLabel = newLabel()
-            emitOp(.dup)
-            emitIfTrue(endLabel) // short-circuit
-            emitOp(.drop)
-            parseLogicalAndExpr()
-            emitLabel(endLabel)
-        }
-    }
-
-    // MARK: Logical AND
-
-    /// Parse: BitwiseORExpr ['&&' BitwiseORExpr]*
-    func parseLogicalAndExpr() {
-        parseBitwiseOrExpr()
-
-        while tok == JSTokenType.TOK_LAND.rawValue && !shouldAbort {
-            next()
-            let endLabel = newLabel()
-            emitOp(.dup)
-            emitIfFalse(endLabel) // short-circuit
-            emitOp(.drop)
-            parseBitwiseOrExpr()
-            emitLabel(endLabel)
-        }
-    }
-
-    // MARK: Bitwise OR
-
-    /// Parse: BitwiseXORExpr ['|' BitwiseXORExpr]*
-    func parseBitwiseOrExpr() {
-        parseBitwiseXorExpr()
-
-        while tok == 0x7C && s.simpleNextToken() != 0x7C && !shouldAbort { // '|' but not '||'
-            next()
-            parseBitwiseXorExpr()
-            emitOp(.or)
-        }
-    }
-
-    // MARK: Bitwise XOR
-
-    /// Parse: BitwiseANDExpr ['^' BitwiseANDExpr]*
-    func parseBitwiseXorExpr() {
-        parseBitwiseAndExpr()
-
-        while tok == 0x5E && !shouldAbort { // '^'
-            next()
-            parseBitwiseAndExpr()
-            emitOp(.xor)
-        }
-    }
-
-    // MARK: Bitwise AND
-
-    /// Parse: EqualityExpr ['&' EqualityExpr]*
-    func parseBitwiseAndExpr() {
-        parseEqualityExpr()
-
-        while tok == 0x26 && s.simpleNextToken() != 0x26 && !shouldAbort { // '&' but not '&&'
-            next()
-            parseEqualityExpr()
-            emitOp(.and)
-        }
-    }
-
-    // MARK: Equality
-
-    /// Parse: RelationalExpr [('=='|'!='|'==='|'!==') RelationalExpr]*
-    func parseEqualityExpr() {
-        parseRelationalExpr()
-
-        while !shouldAbort {
-            switch tok {
-            case JSTokenType.TOK_EQ.rawValue:
-                next(); parseRelationalExpr(); emitOp(.eq)
-            case JSTokenType.TOK_NEQ.rawValue:
-                next(); parseRelationalExpr(); emitOp(.neq)
-            case JSTokenType.TOK_STRICT_EQ.rawValue:
-                next(); parseRelationalExpr(); emitOp(.strict_eq)
-            case JSTokenType.TOK_STRICT_NEQ.rawValue:
-                next(); parseRelationalExpr(); emitOp(.strict_neq)
-            default:
-                return
+            // The false branch is an AssignmentExpression. Anything that may
+            // be an arrow function, `yield` or a destructuring pattern takes
+            // the general path; a plain operand continues the chain here.
+            if !falseBranchIsPlainOperand() {
+                parseAssignExpr()
+                break
             }
+            exprStartPtr = s.token.ptr
+            let lhsBcStart = fd.byteCode.len
+            parseBinaryExpr(1)
+            guard !shouldAbort else { break }
+            if tok == 0x3F { continue } // next link: `: c2 ? v2 : ...`
+            if let assignOp = getAssignOp(tok) {
+                parseAssignmentOperator(assignOp, lhsBcStart: lhsBcStart, pattern: nil)
+            }
+            break
+        }
+        emitLabel(endLabel)
+    }
+
+    /// True when the current token cannot start an AssignmentExpression that
+    /// needs parseAssignExpr's own handling (arrow functions, `async`,
+    /// `yield`, `[`/`{` assignment patterns, a parenthesised arrow list).
+    @inline(__always)
+    private func falseBranchIsPlainOperand() -> Bool {
+        switch tok {
+        case JSTokenType.TOK_YIELD.rawValue, 0x28, 0x5B, 0x7B:
+            return false
+        case JSTokenType.TOK_IDENT.rawValue:
+            if !s.gotLF && nextTokenIsArrow() { return false }
+            return !isAsyncIdent()
+        default:
+            return true
         }
     }
 
-    // MARK: Relational
+    // MARK: Binary operators (precedence climbing)
 
-    /// Parse: ShiftExpr [('<'|'>'|'<='|'>='|'instanceof'|'in') ShiftExpr]*
-    func parseRelationalExpr() {
+    /// Precedence of `t` as a binary operator in the current context, 0 if it
+    /// is not one. Same levels as QuickJS's `js_parse_expr_binary` plus the
+    /// short-circuit operators; `**` (12) is the only right-associative one.
+    /// `??` binds loosest, so `a || b ?? c` is `(a || b) ?? c` and
+    /// `a ?? b || c` is `a ?? (b || c)`, as the old per-level parser did.
+    @inline(__always)
+    private func binaryPrecedence(_ t: Int) -> Int {
+        switch t {
+        case JSTokenType.TOK_DOUBLE_QUESTION_MARK.rawValue: return 1
+        case JSTokenType.TOK_LOR.rawValue: return 2
+        case JSTokenType.TOK_LAND.rawValue: return 3
+        case 0x7C: return 4 // '|'
+        case 0x5E: return 5 // '^'
+        case 0x26: return 6 // '&'
+        case JSTokenType.TOK_EQ.rawValue, JSTokenType.TOK_NEQ.rawValue,
+             JSTokenType.TOK_STRICT_EQ.rawValue, JSTokenType.TOK_STRICT_NEQ.rawValue:
+            return 7
+        case 0x3C, 0x3E, JSTokenType.TOK_LE.rawValue, JSTokenType.TOK_GE.rawValue,
+             JSTokenType.TOK_INSTANCEOF.rawValue:
+            return 8
+        case JSTokenType.TOK_IN.rawValue: return inFlag ? 8 : 0
+        case JSTokenType.TOK_SHL.rawValue, JSTokenType.TOK_SAR.rawValue,
+             JSTokenType.TOK_SHR.rawValue:
+            return 9
+        case 0x2B, 0x2D: return 10 // '+' '-'
+        case 0x2A: return s.peekByteAt(0) == 0x2A ? 0 : 11 // '*' ('**' is TOK_POW)
+        case 0x2F, 0x25: return 11 // '/' '%'
+        case JSTokenType.TOK_POW.rawValue: return 12
+        default: return 0
+        }
+    }
+
+    /// Parse a binary-operator expression whose operators all bind at least
+    /// as tightly as `minPrec` (1 = the whole ShortCircuitExpression).
+    ///
+    /// Operands are consumed left to right and each operator's bytecode is
+    /// emitted as soon as its right operand is complete, so a left-associative
+    /// chain of any length (`s + s + ... + s`, `a || b || ...`, the operands
+    /// of a comma list) runs in this loop: the recursion depth is bounded by
+    /// the number of precedence levels (12), not by the chain length. Only
+    /// right-associative `**` recurses per operand, as in QuickJS.
+    func parseBinaryExpr(_ minPrec: Int) {
         // `#x in obj`: a private name is only valid as the left operand of
-        // `in` (a brand check).
-        if tok == JSTokenType.TOK_PRIVATE_NAME.rawValue {
-            let nameAtom = s.token.identAtom
-            next()
-            if tok != JSTokenType.TOK_IN.rawValue || !inFlag {
-                syntaxError("invalid use of a private name")
-                return
-            }
-            next()
-            parseShiftExpr()
-            emitOp(.scope_in_private_field)
-            emitAtom(nameAtom)
-            emitU16(UInt16(fd.curScope))
+        // `in` (a brand check), i.e. where a RelationalExpression starts.
+        if tok == JSTokenType.TOK_PRIVATE_NAME.rawValue && minPrec <= 8 {
+            parsePrivateInExpr()
         } else {
-            parseShiftExpr()
+            parseUnaryExpr()
         }
 
         while !shouldAbort {
-            switch tok {
-            case 0x3C: // '<'
-                next(); parseShiftExpr(); emitOp(.lt)
-            case 0x3E: // '>'
-                next(); parseShiftExpr(); emitOp(.gt)
-            case JSTokenType.TOK_LE.rawValue:
-                next(); parseShiftExpr(); emitOp(.lte)
-            case JSTokenType.TOK_GE.rawValue:
-                next(); parseShiftExpr(); emitOp(.gte)
-            case JSTokenType.TOK_INSTANCEOF.rawValue:
-                next(); parseShiftExpr(); emitOp(.instanceof_)
-            case JSTokenType.TOK_IN.rawValue:
-                if inFlag {
-                    next(); parseShiftExpr(); emitOp(.in_)
-                } else {
-                    return
-                }
-            default:
-                return
-            }
-        }
-    }
-
-    // MARK: Shift
-
-    /// Parse: AdditiveExpr [('<<'|'>>'|'>>>') AdditiveExpr]*
-    func parseShiftExpr() {
-        parseAdditiveExpr()
-
-        while !shouldAbort {
-            switch tok {
-            case JSTokenType.TOK_SHL.rawValue:
-                next(); parseAdditiveExpr(); emitOp(.shl)
-            case JSTokenType.TOK_SAR.rawValue:
-                next(); parseAdditiveExpr(); emitOp(.sar)
-            case JSTokenType.TOK_SHR.rawValue:
-                next(); parseAdditiveExpr(); emitOp(.shr)
-            default:
-                return
-            }
-        }
-    }
-
-    // MARK: Additive
-
-    /// Parse: MultiplicativeExpr [('+'|'-') MultiplicativeExpr]*
-    func parseAdditiveExpr() {
-        parseMultiplicativeExpr()
-
-        while !shouldAbort {
-            switch tok {
-            case 0x2B: // '+'
-                next(); parseMultiplicativeExpr(); emitOp(.add)
-            case 0x2D: // '-'
-                next(); parseMultiplicativeExpr(); emitOp(.sub)
-            default:
-                return
-            }
-        }
-    }
-
-    // MARK: Multiplicative
-
-    /// Parse: ExponentiationExpr [('*'|'/'|'%') ExponentiationExpr]*
-    func parseMultiplicativeExpr() {
-        parseExponentiationExpr()
-
-        while !shouldAbort {
-            switch tok {
-            case 0x2A: // '*'
-                if s.peekByteAt(0) == 0x2A { return } // '**' is handled by exponentiation
-                next(); parseExponentiationExpr(); emitOp(.mul)
-            case 0x2F: // '/'
-                next(); parseExponentiationExpr(); emitOp(.div)
-            case 0x25: // '%'
-                next(); parseExponentiationExpr(); emitOp(.mod)
-            default:
-                return
-            }
-        }
-    }
-
-    // MARK: Exponentiation
-
-    /// Parse: UnaryExpr ['**' ExponentiationExpr]
-    /// Right-associative.
-    func parseExponentiationExpr() {
-        parseUnaryExpr()
-
-        if tok == JSTokenType.TOK_POW.rawValue {
+            let op = tok
+            let prec = binaryPrecedence(op)
+            if prec == 0 || prec < minPrec { return }
             next()
-            parseExponentiationExpr() // right-associative recursion
-            emitOp(.pow)
+            switch op {
+            case JSTokenType.TOK_DOUBLE_QUESTION_MARK.rawValue:
+                let endLabel = newLabel()
+                emitOp(.dup)
+                emitOp(.is_undefined_or_null)
+                emitOp(.lnot)
+                emitIfTrue(endLabel) // if not null/undefined, skip
+                emitOp(.drop)
+                parseBinaryExpr(2)
+                emitLabel(endLabel)
+            case JSTokenType.TOK_LOR.rawValue:
+                let endLabel = newLabel()
+                emitOp(.dup)
+                emitIfTrue(endLabel) // short-circuit
+                emitOp(.drop)
+                parseBinaryExpr(3)
+                emitLabel(endLabel)
+            case JSTokenType.TOK_LAND.rawValue:
+                let endLabel = newLabel()
+                emitOp(.dup)
+                emitIfFalse(endLabel) // short-circuit
+                emitOp(.drop)
+                parseBinaryExpr(4)
+                emitLabel(endLabel)
+            case JSTokenType.TOK_POW.rawValue:
+                parseBinaryExpr(12) // right-associative
+                emitOp(.pow)
+            default:
+                parseBinaryExpr(prec + 1)
+                emitBinaryOperator(op)
+            }
+        }
+    }
+
+    /// `#x in obj` (the left operand is the current PrivateName token).
+    @inline(never)
+    private func parsePrivateInExpr() {
+        let nameAtom = s.token.identAtom
+        next()
+        if tok != JSTokenType.TOK_IN.rawValue || !inFlag {
+            syntaxError("invalid use of a private name")
+            return
+        }
+        next()
+        parseBinaryExpr(9) // ShiftExpression
+        emitOp(.scope_in_private_field)
+        emitAtom(nameAtom)
+        emitU16(UInt16(fd.curScope))
+    }
+
+    /// The opcode for a non-short-circuit binary operator token.
+    @inline(__always)
+    private func emitBinaryOperator(_ op: Int) {
+        switch op {
+        case 0x7C: emitOp(.or)
+        case 0x5E: emitOp(.xor)
+        case 0x26: emitOp(.and)
+        case JSTokenType.TOK_EQ.rawValue: emitOp(.eq)
+        case JSTokenType.TOK_NEQ.rawValue: emitOp(.neq)
+        case JSTokenType.TOK_STRICT_EQ.rawValue: emitOp(.strict_eq)
+        case JSTokenType.TOK_STRICT_NEQ.rawValue: emitOp(.strict_neq)
+        case 0x3C: emitOp(.lt)
+        case 0x3E: emitOp(.gt)
+        case JSTokenType.TOK_LE.rawValue: emitOp(.lte)
+        case JSTokenType.TOK_GE.rawValue: emitOp(.gte)
+        case JSTokenType.TOK_INSTANCEOF.rawValue: emitOp(.instanceof_)
+        case JSTokenType.TOK_IN.rawValue: emitOp(.in_)
+        case JSTokenType.TOK_SHL.rawValue: emitOp(.shl)
+        case JSTokenType.TOK_SAR.rawValue: emitOp(.sar)
+        case JSTokenType.TOK_SHR.rawValue: emitOp(.shr)
+        case 0x2B: emitOp(.add)
+        case 0x2D: emitOp(.sub)
+        case 0x2A: emitOp(.mul)
+        case 0x2F: emitOp(.div)
+        case 0x25: emitOp(.mod)
+        default: break
         }
     }
 
@@ -5277,272 +5347,17 @@ final class JeffJSParser {
         while !shouldAbort {
             switch tok {
             case 0x28: // '(' -- function call
-                let isSuperCall = lastExprWasSuper
-                lastExprWasSuper = false
-                let isMethodCall = pendingMethodCall
-                pendingMethodCall = false
-                // Direct eval: the callee is exactly the identifier `eval`
-                // (ES §13.3.6.1); whether it is %eval% is decided at run time.
-                let isDirectEval = !isSuperCall && lastEvalCalleeFd === fd
-                    && lastEvalCalleeEnd == fd.byteCode.len
-                lastEvalCalleeEnd = -1
-                lastEvalCalleeFd = nil
-
-                if isSuperCall {
-                    // super(args) in a derived constructor: [[Construct]] the
-                    // parent with the current new.target (so builtin parents
-                    // allocate the right class and use new.target.prototype),
-                    // then bind the result as `this` (init_this below).
-                    //
-                    // Stack currently: ..., parentCtor  (from get_super)
-                    // call_constructor wants: ..., parentCtor, newTarget, args...
-                    emitOp(.special_object)
-                    emitU8(SpecialObjectType.newTarget.rawValue)
-                }
-
-                next()
-                var argc = 0
-                var hasSpread = false
-
-                // Re-enable `in` operator inside call arguments.
-                // It may have been disabled by a parent for-loop init.
-                let savedInFlagCall = inFlag
-                inFlag = true
-                while tok != 0x29 && tok != JSTokenType.TOK_EOF.rawValue && !shouldAbort {
-                    if tok == JSTokenType.TOK_ELLIPSIS.rawValue {
-                        if !hasSpread {
-                            // First spread: `.apply` wants a single args array, so pack
-                            // the plain arguments parsed so far into one (same
-                            // incremental strategy as array literals; `array_from`
-                            // only pops the sentinel object literals push, and the
-                            // value below the args here is the callee, so it's left alone).
-                            hasSpread = true
-                            emitOp(.array_from)
-                            emitU16(UInt16(argc))
-                            // Stack: [..., func, argsArray]
-                        }
-                        next()
-                        parseAssignExpr()
-                        // Stack: [..., func, argsArray, iterable]
-                        emitSpreadAppend()
-                        // Stack: [..., func, argsArray]
-                    } else {
-                        parseAssignExpr()
-                        if hasSpread {
-                            emitOp(.append)          // [..., func, argsArray]
-                        } else {
-                            argc += 1
-                        }
-                    }
-                    if tok == 0x2C { // ','
-                        next()
-                    }
-                }
-                inFlag = savedInFlagCall
-                expect(0x29) // ')'
-
-                if isSuperCall {
-                    // Stack: ..., parentCtor, newTarget, arg0, ..., argN
-                    if hasSpread {
-                        emitOp(.apply_constructor)   // [parentCtor, newTarget, argsArray] -> result
-                        emitU16(UInt16(argc))
-                    } else {
-                        emitCallConstructor(argc)
-                    }
-                    // Bind the constructed object as `this` and leave it as
-                    // the value of the `super(...)` expression (ES semantics).
-                    emitOp(.init_this)
-                    // A derived class initialises its instance fields as soon
-                    // as super() returns, before the rest of the body.
-                    emitClassFieldInit()
-                } else if isDirectEval {
-                    // `eval(...)`; in a `with` body the callee took the
-                    // two-slot form [receiver, func] (isMethodCall), flagged
-                    // in the top bit of the site operand.
-                    noteDirectEvalCall()
-                    let site = UInt16(fd.curScope)
-                    if hasSpread {
-                        if !isMethodCall {
-                            emitOp(.undefined)   // [func, argsArray, undefined]
-                            emitOp(.rot3r)       // [undefined, func, argsArray]
-                        }
-                        emitOp(.apply_eval)      // [this, func, argsArray] -> result
-                        emitU16(site)
-                    } else {
-                        emitOp(.eval)
-                        emitU16(UInt16(argc))
-                        emitU16(site | (isMethodCall ? 0x8000 : 0))
-                    }
-                } else if isMethodCall {
-                    // [receiver, func, args...]: obj[key](...) and super.m(...)
-                    if hasSpread {
-                        emitOp(.apply)       // [this, func, argsArray] -> result
-                        emitU16(UInt16(argc))
-                    } else {
-                        emitCallMethod(argc)
-                    }
-                } else if hasSpread {
-                    // The .apply opcode expects stack: [thisObj, funcVal, argsArray].
-                    // For plain function calls the parser only has [funcVal, argsArray]
-                    // on the stack (no thisObj), so we insert `undefined` below them.
-                    emitOp(.undefined)       // [func, argsArray, undefined]
-                    emitOp(.rot3r)           // [undefined, func, argsArray]
-                    emitOp(.apply)
-                    emitU16(UInt16(argc))
-                } else {
-                    emitCall(argc)
-                }
+                parseCallArguments()
 
             case 0x5B: // '[' -- computed member access
-                lastExprWasSuper = false
-                let superBase = lastExprWasSuperProp
-                lastExprWasSuperProp = false
-                next()
-                parseExpression()
-                expect(0x5D) // ']'
-                if superBase {
-                    // [homeProto, key] -> value; a following call gets `this`.
-                    emitOp(.get_array_el)
-                    if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
-                        emitOp(.push_this); emitOp(.swap); pendingMethodCall = true
-                    }
-                } else if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue
-                            || (tok == JSTokenType.TOK_OPTIONAL_CHAIN.rawValue
-                                && s.simpleNextToken() == 0x28) {
-                    // obj[key](...) / obj[key]`..` / obj[key]?.(): keep the receiver so
-                    // the call is a method call (QuickJS get_array_el2 +
-                    // call_method); a plain call passed `this` = undefined.
-                    emitOp(.get_array_el2)
-                    pendingMethodCall = true
-                } else {
-                    emitOp(.get_array_el)
-                }
+                parseComputedMemberSuffix()
 
             case 0x2E: // '.' -- member access
-                lastExprWasSuper = false
-                let superBase = lastExprWasSuperProp
-                lastExprWasSuperProp = false
-                next()
-                // After '.', accept identifiers AND keywords as property names.
-                // In JS, keywords are valid property names: obj.delete, Promise.finally,
-                // Symbol.for, etc.
-                var fieldAtomOpt: JSAtom? = nil
-                if tok == JSTokenType.TOK_IDENT.rawValue {
-                    fieldAtomOpt = s.token.identAtom
-                    next()
-                } else if isKeywordToken(tok) {
-                    // Keywords as property names: resolve to the canonical string
-                    // atom via getAtom(string). The keyword's identAtom is often 0
-                    // for keyword tokens, so we must get the string from the token type.
-                    let kwName = keywordTokenName(tok)
-                    fieldAtomOpt = getAtom(kwName)
-                    next()
-                }
-                if let fieldAtom = fieldAtomOpt {
-                    if superBase && (tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue) {
-                        // super.m(...): [homeProto] -> [this, homeProto] -> [this, m]
-                        emitOp(.push_this); emitOp(.swap)
-                        pendingMethodCall = true
-                        emitGetField(fieldAtom)
-                    } else if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue
-                                || (tok == JSTokenType.TOK_OPTIONAL_CHAIN.rawValue
-                                    && s.simpleNextToken() == 0x28) {
-                        // obj.m(...) / obj.m`..` / obj.m?.(): keep the receiver for
-                        // call_method right here. The later get_field+call rewrite
-                        // pass loses the receiver when the arguments contain
-                        // branches (`o.m(c ? a : b)`).
-                        emitOp(.get_field2)
-                        emitAtom(fieldAtom)
-                        pendingMethodCall = true
-                    } else {
-                        emitGetField(fieldAtom)
-                    }
-                } else if tok == JSTokenType.TOK_PRIVATE_NAME.rawValue {
-                    let fieldAtom = s.token.identAtom
-                    next()
-                    if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
-                        // obj.#m(...): keep the receiver for call_method. The
-                        // private-method form of scope_get_private_field
-                        // consumes the object it brand-checks.
-                        emitOp(.dup)
-                        pendingMethodCall = true
-                    }
-                    emitScopeGetPrivateField(fieldAtom)
-                } else {
-                    syntaxError("expected property name after '.'")
-                    return
-                }
+                parseDotMemberSuffix()
 
             case JSTokenType.TOK_OPTIONAL_CHAIN.rawValue: // '?.'
-                next()
-                lastExprWasSuper = false
-                lastExprWasSuperProp = false
-                // `o.m?.()` keeps o as the receiver (get_field2 emitted by the
-                // '.' case); the nullish branch then has one extra slot.
-                let optWasMethod = pendingMethodCall && tok == 0x28
-                pendingMethodCall = false
-                if optNullLabel < 0 {
-                    optNullLabel = newLabel()
-                    optEndLabel = newLabel()
-                }
-                var optNullTarget = optNullLabel
-                if optWasMethod {
-                    if optNull2Label < 0 { optNull2Label = newLabel() }
-                    optNullTarget = optNull2Label
-                }
-                emitOp(.dup)
-                emitOp(.is_undefined_or_null)
-                emitIfTrue(optNullTarget)
-
-                if tok == 0x28 { // '?.(args)'
-                    next()
-                    var argc = 0
-                    while tok != 0x29 && tok != JSTokenType.TOK_EOF.rawValue && !shouldAbort {
-                        parseAssignExpr()
-                        argc += 1
-                        if tok == 0x2C { next() }
-                    }
-                    expect(0x29)
-                    if optWasMethod { emitCallMethod(argc) } else { emitCall(argc) }
-                } else if tok == 0x5B { // '?.[expr]'
-                    next()
-                    parseExpression()
-                    expect(0x5D)
-                    if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
-                        emitOp(.get_array_el2)   // keep the receiver for the call
-                        pendingMethodCall = true
-                    } else {
-                        emitOp(.get_array_el)
-                    }
-                } else if tok == JSTokenType.TOK_IDENT.rawValue || isKeywordToken(tok) {
-                    let fieldAtom: JSAtom
-                    if tok == JSTokenType.TOK_IDENT.rawValue {
-                        fieldAtom = s.token.identAtom
-                    } else {
-                        fieldAtom = getAtom(keywordTokenName(tok))
-                    }
-                    next()
-                    if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
-                        emitOp(.get_field2)      // keep the receiver for the call
-                        emitAtom(fieldAtom)
-                        pendingMethodCall = true
-                    } else {
-                        emitGetField(fieldAtom)
-                    }
-                } else if tok == JSTokenType.TOK_PRIVATE_NAME.rawValue {
-                    // `o?.#x` / `o?.#m()`: the brand check only runs on the
-                    // non-nullish path, same shape as the '.' case above.
-                    let fieldAtom = s.token.identAtom
-                    next()
-                    if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
-                        emitOp(.dup)             // keep the receiver for the call
-                        pendingMethodCall = true
-                    }
-                    emitScopeGetPrivateField(fieldAtom)
-                } else {
-                    syntaxError("expected property name after '?.'")
-                    return
-                }
+                parseOptionalChainLink(nullLabel: &optNullLabel, null2Label: &optNull2Label,
+                                       endLabel: &optEndLabel)
 
             case JSTokenType.TOK_TEMPLATE.rawValue: // tagged template
                 // Inside a substitution the tokenizer never yields
@@ -5562,6 +5377,295 @@ final class JeffJSParser {
                 lastExprWasSuper = false
                 return
             }
+        }
+    }
+
+    // The suffixes of a call/member chain, out of line: parseCallExpr's frame
+    // is live across every nested expression, so it keeps only the
+    // optional-chain labels.
+
+    /// `callee(args)`: the current token is `(`.
+    @inline(never)
+    private func parseCallArguments() {
+        let isSuperCall = lastExprWasSuper
+        lastExprWasSuper = false
+        let isMethodCall = pendingMethodCall
+        pendingMethodCall = false
+        // Direct eval: the callee is exactly the identifier `eval`
+        // (ES §13.3.6.1); whether it is %eval% is decided at run time.
+        let isDirectEval = !isSuperCall && lastEvalCalleeFd === fd
+            && lastEvalCalleeEnd == fd.byteCode.len
+        lastEvalCalleeEnd = -1
+        lastEvalCalleeFd = nil
+
+        if isSuperCall {
+            // super(args) in a derived constructor: [[Construct]] the
+            // parent with the current new.target (so builtin parents
+            // allocate the right class and use new.target.prototype),
+            // then bind the result as `this` (init_this below).
+            //
+            // Stack currently: ..., parentCtor  (from get_super)
+            // call_constructor wants: ..., parentCtor, newTarget, args...
+            emitOp(.special_object)
+            emitU8(SpecialObjectType.newTarget.rawValue)
+        }
+
+        next()
+        var argc = 0
+        var hasSpread = false
+
+        // Re-enable `in` operator inside call arguments.
+        // It may have been disabled by a parent for-loop init.
+        let savedInFlagCall = inFlag
+        inFlag = true
+        while tok != 0x29 && tok != JSTokenType.TOK_EOF.rawValue && !shouldAbort {
+            if tok == JSTokenType.TOK_ELLIPSIS.rawValue {
+                if !hasSpread {
+                    // First spread: `.apply` wants a single args array, so pack
+                    // the plain arguments parsed so far into one (same
+                    // incremental strategy as array literals; `array_from`
+                    // only pops the sentinel object literals push, and the
+                    // value below the args here is the callee, so it's left alone).
+                    hasSpread = true
+                    emitOp(.array_from)
+                    emitU16(UInt16(argc))
+                    // Stack: [..., func, argsArray]
+                }
+                next()
+                parseAssignExpr()
+                // Stack: [..., func, argsArray, iterable]
+                emitSpreadAppend()
+                // Stack: [..., func, argsArray]
+            } else {
+                parseAssignExpr()
+                if hasSpread {
+                    emitOp(.append)          // [..., func, argsArray]
+                } else {
+                    argc += 1
+                    if argc > JeffJSParser.maxCallArguments { tooManyArguments(); return }
+                }
+            }
+            if tok == 0x2C { // ','
+                next()
+            }
+        }
+        inFlag = savedInFlagCall
+        expect(0x29) // ')'
+
+        if isSuperCall {
+            // Stack: ..., parentCtor, newTarget, arg0, ..., argN
+            if hasSpread {
+                emitOp(.apply_constructor)   // [parentCtor, newTarget, argsArray] -> result
+                emitU16(UInt16(argc))
+            } else {
+                emitCallConstructor(argc)
+            }
+            // Bind the constructed object as `this` and leave it as
+            // the value of the `super(...)` expression (ES semantics).
+            emitOp(.init_this)
+            // A derived class initialises its instance fields as soon
+            // as super() returns, before the rest of the body.
+            emitClassFieldInit()
+        } else if isDirectEval {
+            // `eval(...)`; in a `with` body the callee took the
+            // two-slot form [receiver, func] (isMethodCall), flagged
+            // in the top bit of the site operand.
+            noteDirectEvalCall()
+            let site = UInt16(fd.curScope)
+            if hasSpread {
+                if !isMethodCall {
+                    emitOp(.undefined)   // [func, argsArray, undefined]
+                    emitOp(.rot3r)       // [undefined, func, argsArray]
+                }
+                emitOp(.apply_eval)      // [this, func, argsArray] -> result
+                emitU16(site)
+            } else {
+                emitOp(.eval)
+                emitU16(UInt16(argc))
+                emitU16(site | (isMethodCall ? 0x8000 : 0))
+            }
+        } else if isMethodCall {
+            // [receiver, func, args...]: obj[key](...) and super.m(...)
+            if hasSpread {
+                emitOp(.apply)       // [this, func, argsArray] -> result
+                emitU16(UInt16(argc))
+            } else {
+                emitCallMethod(argc)
+            }
+        } else if hasSpread {
+            // The .apply opcode expects stack: [thisObj, funcVal, argsArray].
+            // For plain function calls the parser only has [funcVal, argsArray]
+            // on the stack (no thisObj), so we insert `undefined` below them.
+            emitOp(.undefined)       // [func, argsArray, undefined]
+            emitOp(.rot3r)           // [undefined, func, argsArray]
+            emitOp(.apply)
+            emitU16(UInt16(argc))
+        } else {
+            emitCall(argc)
+        }
+    }
+
+    /// `obj[key]`: the current token is `[`.
+    @inline(never)
+    private func parseComputedMemberSuffix() {
+        lastExprWasSuper = false
+        let superBase = lastExprWasSuperProp
+        lastExprWasSuperProp = false
+        next()
+        parseExpression()
+        expect(0x5D) // ']'
+        if superBase {
+            // [homeProto, key] -> value; a following call gets `this`.
+            emitOp(.get_array_el)
+            if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
+                emitOp(.push_this); emitOp(.swap); pendingMethodCall = true
+            }
+        } else if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue
+                    || (tok == JSTokenType.TOK_OPTIONAL_CHAIN.rawValue
+                        && s.simpleNextToken() == 0x28) {
+            // obj[key](...) / obj[key]`..` / obj[key]?.(): keep the receiver so
+            // the call is a method call (QuickJS get_array_el2 +
+            // call_method); a plain call passed `this` = undefined.
+            emitOp(.get_array_el2)
+            pendingMethodCall = true
+        } else {
+            emitOp(.get_array_el)
+        }
+    }
+
+    /// `obj.name` / `obj.#name`: the current token is `.`.
+    @inline(never)
+    private func parseDotMemberSuffix() {
+        lastExprWasSuper = false
+        let superBase = lastExprWasSuperProp
+        lastExprWasSuperProp = false
+        next()
+        // After '.', accept identifiers AND keywords as property names.
+        // In JS, keywords are valid property names: obj.delete, Promise.finally,
+        // Symbol.for, etc.
+        var fieldAtomOpt: JSAtom? = nil
+        if tok == JSTokenType.TOK_IDENT.rawValue {
+            fieldAtomOpt = s.token.identAtom
+            next()
+        } else if isKeywordToken(tok) {
+            // Keywords as property names: resolve to the canonical string
+            // atom via getAtom(string). The keyword's identAtom is often 0
+            // for keyword tokens, so we must get the string from the token type.
+            let kwName = keywordTokenName(tok)
+            fieldAtomOpt = getAtom(kwName)
+            next()
+        }
+        if let fieldAtom = fieldAtomOpt {
+            if superBase && (tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue) {
+                // super.m(...): [homeProto] -> [this, homeProto] -> [this, m]
+                emitOp(.push_this); emitOp(.swap)
+                pendingMethodCall = true
+                emitGetField(fieldAtom)
+            } else if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue
+                        || (tok == JSTokenType.TOK_OPTIONAL_CHAIN.rawValue
+                            && s.simpleNextToken() == 0x28) {
+                // obj.m(...) / obj.m`..` / obj.m?.(): keep the receiver for
+                // call_method right here. The later get_field+call rewrite
+                // pass loses the receiver when the arguments contain
+                // branches (`o.m(c ? a : b)`).
+                emitOp(.get_field2)
+                emitAtom(fieldAtom)
+                pendingMethodCall = true
+            } else {
+                emitGetField(fieldAtom)
+            }
+        } else if tok == JSTokenType.TOK_PRIVATE_NAME.rawValue {
+            let fieldAtom = s.token.identAtom
+            next()
+            if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
+                // obj.#m(...): keep the receiver for call_method. The
+                // private-method form of scope_get_private_field
+                // consumes the object it brand-checks.
+                emitOp(.dup)
+                pendingMethodCall = true
+            }
+            emitScopeGetPrivateField(fieldAtom)
+        } else {
+            syntaxError("expected property name after '.'")
+            return
+        }
+    }
+
+    /// One `?.` link (`?.(args)`, `?.[key]`, `?.name`, `?.#name`); the labels
+    /// are the chain's shared short-circuit targets, created on first use.
+    @inline(never)
+    private func parseOptionalChainLink(nullLabel optNullLabel: inout Int,
+                                        null2Label optNull2Label: inout Int,
+                                        endLabel optEndLabel: inout Int) {
+        next()
+        lastExprWasSuper = false
+        lastExprWasSuperProp = false
+        // `o.m?.()` keeps o as the receiver (get_field2 emitted by the
+        // '.' case); the nullish branch then has one extra slot.
+        let optWasMethod = pendingMethodCall && tok == 0x28
+        pendingMethodCall = false
+        if optNullLabel < 0 {
+            optNullLabel = newLabel()
+            optEndLabel = newLabel()
+        }
+        var optNullTarget = optNullLabel
+        if optWasMethod {
+            if optNull2Label < 0 { optNull2Label = newLabel() }
+            optNullTarget = optNull2Label
+        }
+        emitOp(.dup)
+        emitOp(.is_undefined_or_null)
+        emitIfTrue(optNullTarget)
+
+        if tok == 0x28 { // '?.(args)'
+            next()
+            var argc = 0
+            while tok != 0x29 && tok != JSTokenType.TOK_EOF.rawValue && !shouldAbort {
+                parseAssignExpr()
+                argc += 1
+                if argc > JeffJSParser.maxCallArguments { tooManyArguments(); return }
+                if tok == 0x2C { next() }
+            }
+            expect(0x29)
+            if optWasMethod { emitCallMethod(argc) } else { emitCall(argc) }
+        } else if tok == 0x5B { // '?.[expr]'
+            next()
+            parseExpression()
+            expect(0x5D)
+            if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
+                emitOp(.get_array_el2)   // keep the receiver for the call
+                pendingMethodCall = true
+            } else {
+                emitOp(.get_array_el)
+            }
+        } else if tok == JSTokenType.TOK_IDENT.rawValue || isKeywordToken(tok) {
+            let fieldAtom: JSAtom
+            if tok == JSTokenType.TOK_IDENT.rawValue {
+                fieldAtom = s.token.identAtom
+            } else {
+                fieldAtom = getAtom(keywordTokenName(tok))
+            }
+            next()
+            if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
+                emitOp(.get_field2)      // keep the receiver for the call
+                emitAtom(fieldAtom)
+                pendingMethodCall = true
+            } else {
+                emitGetField(fieldAtom)
+            }
+        } else if tok == JSTokenType.TOK_PRIVATE_NAME.rawValue {
+            // `o?.#x` / `o?.#m()`: the brand check only runs on the
+            // non-nullish path, same shape as the '.' case above.
+            let fieldAtom = s.token.identAtom
+            next()
+            if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
+                emitOp(.dup)             // keep the receiver for the call
+                pendingMethodCall = true
+            }
+            emitScopeGetPrivateField(fieldAtom)
+        } else {
+            syntaxError("expected property name after '?.'")
+            return
         }
     }
 
@@ -5640,6 +5744,7 @@ final class JeffJSParser {
                     } else {
                         parseAssignExpr()
                         if hasSpread { emitOp(.append) } else { argc += 1 }
+                        if argc > JeffJSParser.maxCallArguments { tooManyArguments(); return }
                     }
                     if tok == 0x2C { next() }
                 }
@@ -5666,6 +5771,20 @@ final class JeffJSParser {
     func emitArrowFunction(paramAtoms: [JSAtom], isAsync: Bool,
                            defaults: [JeffJSSavedDefaultParam] = [],
                            rest: JeffJSRestParamInfo? = nil) {
+        // Setup is out of line: this frame is live while the body parses.
+        let childFd = makeArrowFunctionDef(paramAtoms: paramAtoms, isAsync: isAsync,
+                                           defaults: defaults, rest: rest)
+        fd.childFunctions.append(childFd)
+        parseArrowFunctionBody(childFd: childFd, isAsync: isAsync,
+                               defaults: defaults, rest: rest)
+        let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
+        emitFClosure(cpoolIdx, anonymous: true)   // arrows are always anonymous
+    }
+
+    @inline(never)
+    private func makeArrowFunctionDef(paramAtoms: [JSAtom], isAsync: Bool,
+                                      defaults: [JeffJSSavedDefaultParam],
+                                      rest: JeffJSRestParamInfo?) -> JeffJSFunctionDefCompiler {
         let childFd = JeffJSFunctionDefCompiler()
         childFd.parent = fd
         childFd.definedScopeLevel = fd.curScope
@@ -5695,11 +5814,7 @@ final class JeffJSParser {
         childFd.argCount = paramAtoms.count
         childFd.functionLength = defaults.first?.argIndex ?? paramAtoms.count
 
-        fd.childFunctions.append(childFd)
-        parseArrowFunctionBody(childFd: childFd, isAsync: isAsync,
-                               defaults: defaults, rest: rest)
-        let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
-        emitFClosure(cpoolIdx, anonymous: true)   // arrows are always anonymous
+        return childFd
     }
 
     /// An arrow whose parameter list holds a pattern (`({a} = {}) => a`,
@@ -5733,8 +5848,44 @@ final class JeffJSParser {
     ///   '(' [params] ')' '=>'
     /// This is called BEFORE the '(' is consumed. It saves and restores
     /// the full tokenizer state and returns the param list, or nil.
+    /// `(` tokens (by source offset) known not to start an arrow parameter
+    /// list. Every `(` in an expression is looked ahead from (in
+    /// parseAssignExpr and again in parsePrimaryExpr), and the lookahead
+    /// skips a default value such as `(a = (b = (c = ...)))` to its closing
+    /// paren, so without this the nested parens of minified code
+    /// (recaptcha's `(Z=(A=(b=(...`) cost O(depth x length). A lookahead
+    /// records every inner paren it walks past whose `)` is not followed by
+    /// `=>`; those are then answered without scanning.
+    private var nonArrowParens = Set<Int>()
+    /// Source offsets of the `(` opened so far in the current lookahead.
+    private var scanOpenParens: [Int] = []
+
+    /// Advance the arrow lookahead by one token, noting parens that close
+    /// without a following `=>`.
+    @inline(__always)
+    private func scanAdvance() {
+        var closed = -1
+        switch s.token.type {
+        case 0x28: scanOpenParens.append(s.token.ptr)
+        case 0x29: closed = scanOpenParens.popLast() ?? -1
+        default: break
+        }
+        _ = s.nextToken()
+        if closed >= 0 && s.token.type != JSTokenType.TOK_ARROW.rawValue {
+            nonArrowParens.insert(closed)
+        }
+    }
+
     func scanFullArrowFromParen() -> [(atom: JSAtom, isRest: Bool)]? {
         guard tok == 0x28 else { return nil } // '('
+        let parenPtr = s.token.ptr
+        if nonArrowParens.contains(parenPtr) { return nil }
+        let result = scanFullArrowFromParenUncached()
+        if result == nil { nonArrowParens.insert(parenPtr) }
+        return result
+    }
+
+    private func scanFullArrowFromParenUncached() -> [(atom: JSAtom, isRest: Bool)]? {
         // Save full tokenizer state
         let savedBufPtr   = s.bufPtr
         let savedLineNum  = s.lineNum
@@ -5744,7 +5895,14 @@ final class JeffJSParser {
         let savedLastLine = s.lastLineNum
         let savedTmplNest = s.templateNestLevel
 
+        scanOpenParens.removeAll(keepingCapacity: true)
         defer {
+            // Parens still open when the scan stopped at the end of input
+            // never close: none of them starts an arrow parameter list.
+            if s.token.type == JSTokenType.TOK_EOF.rawValue {
+                for p in scanOpenParens { nonArrowParens.insert(p) }
+            }
+            scanOpenParens.removeAll(keepingCapacity: true)
             s.bufPtr              = savedBufPtr
             s.lineNum             = savedLineNum
             s.token               = savedToken
@@ -5754,11 +5912,11 @@ final class JeffJSParser {
             s.templateNestLevel   = savedTmplNest
         }
 
-        _ = s.nextToken() // consume '(' in the lookahead
+        scanAdvance() // consume '(' in the lookahead
 
         // Check for empty parens: () =>
         if s.token.type == 0x29 { // ')'
-            _ = s.nextToken()
+            scanAdvance()
             return s.token.type == JSTokenType.TOK_ARROW.rawValue ? [] : nil
         }
 
@@ -5774,43 +5932,43 @@ final class JeffJSParser {
             // Rest parameter: '...' IDENT, or '...' pattern (atom 0 routes the
             // arrow through parseFormalParameters, like any destructuring one)
             if curTok == JSTokenType.TOK_ELLIPSIS.rawValue {
-                _ = s.nextToken()
+                scanAdvance()
                 if s.token.type == 0x7B || s.token.type == 0x5B {
                     var depth = 1
-                    _ = s.nextToken()
+                    scanAdvance()
                     while depth > 0 && s.token.type != JSTokenType.TOK_EOF.rawValue {
                         let t = s.token.type
                         if t == 0x7B || t == 0x5B { depth += 1 }
                         if t == 0x7D || t == 0x5D { depth -= 1 }
-                        _ = s.nextToken()
+                        scanAdvance()
                     }
                     params.append((atom: 0, isRest: true))
                 } else {
                     if s.token.type != JSTokenType.TOK_IDENT.rawValue { return nil }
                     params.append((atom: s.token.identAtom, isRest: true))
-                    _ = s.nextToken()
+                    scanAdvance()
                 }
                 if s.token.type != 0x29 { return nil }
-                _ = s.nextToken()
+                scanAdvance()
                 return s.token.type == JSTokenType.TOK_ARROW.rawValue ? params : nil
             }
 
             // Destructuring parameter: skip balanced { } or [ ]
             if curTok == 0x7B || curTok == 0x5B {
                 var depth = 1
-                _ = s.nextToken()
+                scanAdvance()
                 while depth > 0 && s.token.type != JSTokenType.TOK_EOF.rawValue {
                     let t = s.token.type
                     if t == 0x7B || t == 0x5B { depth += 1 }
                     if t == 0x7D || t == 0x5D { depth -= 1 }
-                    _ = s.nextToken()
+                    scanAdvance()
                 }
                 // Use atom 0 as sentinel for destructuring param
                 params.append((atom: 0, isRest: false))
 
                 // Optional default value after pattern: skip balanced tokens
                 if s.token.type == 0x3D { // '='
-                    _ = s.nextToken()
+                    scanAdvance()
                     var dDepth = 0
                     while s.token.type != JSTokenType.TOK_EOF.rawValue {
                         let t = s.token.type
@@ -5820,14 +5978,14 @@ final class JeffJSParser {
                             dDepth -= 1
                         }
                         if dDepth == 0 && t == 0x2C { break }
-                        _ = s.nextToken()
+                        scanAdvance()
                     }
                 }
 
                 let afterParam = s.token.type
-                if afterParam == 0x2C { _ = s.nextToken(); continue }
+                if afterParam == 0x2C { scanAdvance(); continue }
                 if afterParam == 0x29 {
-                    _ = s.nextToken()
+                    scanAdvance()
                     return s.token.type == JSTokenType.TOK_ARROW.rawValue ? params : nil
                 }
                 return nil
@@ -5836,11 +5994,11 @@ final class JeffJSParser {
             // Regular parameter: must be IDENT
             if curTok != JSTokenType.TOK_IDENT.rawValue { return nil }
             params.append((atom: s.token.identAtom, isRest: false))
-            _ = s.nextToken()
+            scanAdvance()
 
             // Optional default value: skip balanced tokens until ',' or ')'
             if s.token.type == 0x3D { // '='
-                _ = s.nextToken()
+                scanAdvance()
                 var depth = 0
                 while s.token.type != JSTokenType.TOK_EOF.rawValue {
                     let t = s.token.type
@@ -5850,14 +6008,14 @@ final class JeffJSParser {
                         depth -= 1
                     }
                     if depth == 0 && t == 0x2C { break }
-                    _ = s.nextToken()
+                    scanAdvance()
                 }
             }
 
             let afterParam = s.token.type
-            if afterParam == 0x2C { _ = s.nextToken(); continue }
+            if afterParam == 0x2C { scanAdvance(); continue }
             if afterParam == 0x29 {
-                _ = s.nextToken()
+                scanAdvance()
                 return s.token.type == JSTokenType.TOK_ARROW.rawValue ? params : nil
             }
             return nil
@@ -5953,6 +6111,9 @@ final class JeffJSParser {
     /// The tokenizer state is always fully restored on return — this is a
     /// pure lookahead.
     func scanParenArrowParams() -> [(atom: JSAtom, isRest: Bool)]? {
+        // Called just after the `(` was consumed; a paren the full scan
+        // already rejected is not an ident-only arrow list either.
+        if nonArrowParens.contains(s.lastPtr - 1) { return nil }
         // Save full tokenizer state
         let savedBufPtr   = s.bufPtr
         let savedLineNum  = s.lineNum
@@ -6044,50 +6205,20 @@ final class JeffJSParser {
         guard enterRecursion() else { return }
         defer { leaveRecursion() }
         guard !shouldAbort else { return }
+        // Only dispatch here: this frame is live across every nested
+        // expression, so each case with locals of its own is out of line.
         switch tok {
-
         case JSTokenType.TOK_NUMBER.rawValue:
-            if let big = s.token.bigIntValue {
-                // BigInt literals always go through the constant pool: the
-                // value is a NaN-boxed BigInt, not a double.
-                let cpoolIdx = addConstPoolValue(JeffJSValue.newBigInt(big))
-                emitPushConst(cpoolIdx)
-                next()
-                break
-            }
-            let val = s.token.numValue
-            let intVal = Int32(exactly: val)
-            if let iv = intVal, Double(iv) == val {
-                emitPushI32(iv)
-            } else {
-                // Float constant -- add to constant pool with the actual double value
-                let cpoolIdx = addConstPoolValue(JeffJSValue.newFloat64(val))
-                emitPushConst(cpoolIdx)
-            }
-            next()
+            parseNumberLiteral()
 
         case JSTokenType.TOK_STRING.rawValue:
-            let str = s.token.strValue
-            let jsStr = JeffJSString(swiftString: str)
-            let cpoolIdx = addConstPoolValue(JeffJSValue.makeString(jsStr))
-            emitPushConst(cpoolIdx)
-            next()
+            parseStringLiteral()
 
         case JSTokenType.TOK_TEMPLATE.rawValue:
             parseTemplateLiteral(isTagged: false)
 
         case JSTokenType.TOK_REGEXP.rawValue:
-            // Push pattern and flags, then create regexp
-            let body = s.token.regexpBody
-            let flags = s.token.regexpFlags
-            let bodyAtom = getAtom(body)
-            let flagsAtom = getAtom(flags)
-            emitOp(.push_atom_value)
-            emitAtom(bodyAtom)
-            emitOp(.push_atom_value)
-            emitAtom(flagsAtom)
-            emitOp(.regexp)
-            next()
+            emitRegexpLiteral()
 
         case JSTokenType.TOK_NULL.rawValue:
             emitOp(.push_null)
@@ -6106,240 +6237,13 @@ final class JeffJSParser {
             next()
 
         case JSTokenType.TOK_SUPER.rawValue:
-            next()
-            if tok == 0x2E || tok == 0x5B {
-                // super.x / super[x]: the [[HomeObject]]'s prototype is the base
-                // (parent prototype in instance methods, parent class in static
-                // methods). The member access below adds `this` for calls.
-                emitOp(.special_object)
-                emitU8(SpecialObjectType.homeObjectProto.rawValue)
-                lastExprWasSuperProp = true
-            } else {
-                // super(...): push a dummy that get_super pops; the parent
-                // constructor is resolved from frame.curFunc.__proto__.
-                // (`this` is still uninitialised here, so not push_this.)
-                emitOp(.undefined)
-                emitOp(.get_super)
-                lastExprWasSuper = true
-            }
+            parseSuperPrimary()
 
         case JSTokenType.TOK_IDENT.rawValue:
-            // Check for 'async function' expression (e.g. var f = async function(){})
-            // [no LineTerminator here] is between async and function, so peek
-            // and check gotLF after consuming async.
-            if isIdent("async") &&
-               s.simpleNextToken() == JSTokenType.TOK_FUNCTION.rawValue {
-                let savedBc = fd.byteCode.len
-                let savedBufPtr = s.bufPtr
-                let savedLineNum = s.lineNum
-                let savedToken = s.token
-                let savedGotLF = s.gotLF
-                let savedLastLineNum = s.lastLineNum
-                let savedLastPtr = s.lastPtr
-                let savedTemplateNest = s.templateNestLevel
-                let savedLastTokenType = s.lastTokenType
-
-                next() // consume 'async'
-                let asyncThenLF = s.gotLF
-                // Backtrack in both cases: parseFunctionDef expects to see the
-                // 'async' token itself (that is what marks the function async).
-                fd.byteCode.len = savedBc
-                s.bufPtr = savedBufPtr
-                s.lineNum = savedLineNum
-                s.token = savedToken
-                s.gotLF = savedGotLF
-                s.lastLineNum = savedLastLineNum
-                s.lastPtr = savedLastPtr
-                s.templateNestLevel = savedTemplateNest
-                s.lastTokenType = savedLastTokenType
-                if !asyncThenLF {
-                    parseFunctionDef(isExpression: true, isArrow: false)
-                    return
-                }
-                // LF between async and function: not an async function expression
-            }
-
-            // Check for async arrow: async () =>, async (a,b) =>, async x =>
-            // [no LineTerminator here] between async and params — check after consuming async.
-            if isIdent("async") {
-                let peekTok = s.simpleNextToken()
-                if peekTok == 0x28 { // '(' — could be async arrow
-                    // Save full state for backtrack
-                    let savedBc = fd.byteCode.len
-                    let savedBufPtr = s.bufPtr
-                    let savedLineNum = s.lineNum
-                    let savedToken = s.token
-                    let savedGotLF = s.gotLF
-                    let savedLastLineNum = s.lastLineNum
-                    let savedLastPtr = s.lastPtr
-                    let savedTemplateNest = s.templateNestLevel
-                    let savedLastTokenType = s.lastTokenType
-
-                    next() // consume 'async'
-                    // [no LineTerminator here] between async and (
-                    if !s.gotLF {
-                        // async (pattern, ...) => — the ident-only scanner
-                        // below does not accept patterns.
-                        if let full = scanFullArrowFromParen(), full.contains(where: { $0.atom == 0 }) {
-                            next() // consume '('
-                            emitPatternArrowFunction(isAsync: true)
-                            return
-                        }
-                        next() // consume '('
-                        // Check for () => or (params) =>
-                        if tok == 0x29 { // ')'
-                            next()
-                            if tok == JSTokenType.TOK_ARROW.rawValue {
-                                next()
-                                emitArrowFunction(paramAtoms: [], isAsync: true)
-                                return
-                            }
-                        } else if let arrowParams = scanParenArrowParams() {
-                            let (dflts, rst) = consumeParenArrowParams(arrowParams)
-                            // consumeParenArrowParams already consumed ')' and '=>'
-                            emitArrowFunction(paramAtoms: arrowParams.map { $0.atom }, isAsync: true,
-                                              defaults: dflts, rest: rst)
-                            return
-                        }
-                    }
-                    // Not an async arrow — restore state fully
-                    fd.byteCode.len = savedBc
-                    s.bufPtr = savedBufPtr
-                    s.lineNum = savedLineNum
-                    s.token = savedToken
-                    s.gotLF = savedGotLF
-                    s.lastLineNum = savedLastLineNum
-                    s.lastPtr = savedLastPtr
-                    s.templateNestLevel = savedTemplateNest
-                    s.lastTokenType = savedLastTokenType
-                } else if peekTok == JSTokenType.TOK_IDENT.rawValue {
-                    // async x => ... (single param async arrow)
-                    let savedBc = fd.byteCode.len
-                    let savedBufPtr = s.bufPtr
-                    let savedLineNum = s.lineNum
-                    let savedToken = s.token
-                    let savedGotLF = s.gotLF
-                    let savedLastLineNum = s.lastLineNum
-                    let savedLastPtr = s.lastPtr
-                    let savedTemplateNest = s.templateNestLevel
-                    let savedLastTokenType = s.lastTokenType
-
-                    next() // consume 'async'
-                    if !s.gotLF {
-                        let paramAtom = s.token.identAtom
-                        next() // consume param name
-                        if tok == JSTokenType.TOK_ARROW.rawValue {
-                            next()
-                            emitArrowFunction(paramAtoms: [paramAtom], isAsync: true)
-                            return
-                        }
-                    }
-                    // Not arrow — restore state fully
-                    fd.byteCode.len = savedBc
-                    s.bufPtr = savedBufPtr
-                    s.lineNum = savedLineNum
-                    s.token = savedToken
-                    s.gotLF = savedGotLF
-                    s.lastLineNum = savedLastLineNum
-                    s.lastPtr = savedLastPtr
-                    s.templateNestLevel = savedTemplateNest
-                    s.lastTokenType = savedLastTokenType
-                }
-            }
-
-            let atom = s.token.identAtom
-            next()
-
-            // Check for arrow function: x =>
-            if tok == JSTokenType.TOK_ARROW.rawValue {
-                next() // consume '=>'
-                emitArrowFunction(paramAtoms: [atom], isAsync: false)
-                return
-            }
-
-            // Regular identifier -- emit scope variable access. Inside a
-            // `with` body a call needs the with object as its receiver, which
-            // takes the two-slot callee form.
-            if withCallFollows {
-                emitScopeGetVarCallee(atom, scopeLevel: fd.curScope)
-                pendingMethodCall = true
-            } else {
-                emitScopeGetVar(atom, scopeLevel: fd.curScope)
-            }
-            if atom == JSPredefinedAtom.eval_.rawValue {
-                lastEvalCalleeEnd = fd.byteCode.len
-                lastEvalCalleeFd = fd
-            }
+            parseIdentifierPrimary()
 
         case 0x28: // '(' -- grouping or arrow params
-            // Try full arrow scan first (handles destructuring patterns like ([e,t])=>...)
-            if let params = scanFullArrowFromParen() {
-                let hasDestructuring = params.contains(where: { $0.atom == 0 })
-                next() // consume '('
-                if params.isEmpty {
-                    expect(0x29) // ')'
-                    expect(JSTokenType.TOK_ARROW.rawValue)
-                    emitArrowFunction(paramAtoms: [], isAsync: false)
-                } else if hasDestructuring {
-                    emitPatternArrowFunction(isAsync: false)
-                } else {
-                    let (dflts, rst) = consumeParenArrowParams(params)
-                    emitArrowFunction(paramAtoms: params.map { $0.atom }, isAsync: false,
-                                      defaults: dflts, rest: rst)
-                }
-                return
-            }
-
-            next()
-
-            // Check for empty parens -> arrow: () =>
-            if tok == 0x29 { // ')'
-                next()
-                if tok == JSTokenType.TOK_ARROW.rawValue {
-                    next() // consume '=>'
-                    emitArrowFunction(paramAtoms: [], isAsync: false)
-                    return
-                }
-                // Empty parens without arrow -- error or undefined
-                emitOp(.undefined)
-                return
-            }
-
-            // Lookahead: check if this is a parenthesized arrow param list
-            // e.g. (a, b) => ..., (x) => ..., (a, b, ...rest) => ...
-            if let arrowParams = scanParenArrowParams() {
-                let (dflts, rst) = consumeParenArrowParams(arrowParams)
-                emitArrowFunction(paramAtoms: arrowParams.map { $0.atom }, isAsync: false,
-                                  defaults: dflts, rest: rst)
-                return
-            }
-
-            // Not an arrow — parse as normal parenthesized expression
-            let savedBcLen = fd.byteCode.len
-            let savedChildCount = fd.childFunctions.count
-            // Re-enable `in` inside parentheses
-            let savedInFlagGroup = inFlag
-            inFlag = true
-            parseExpression()
-            inFlag = savedInFlagGroup
-            expect(0x29) // ')'
-
-            // Fallback: check for arrow after parenthesized expression
-            // (handles complex cases the lookahead didn't match)
-            if tok == JSTokenType.TOK_ARROW.rawValue {
-                // Rewind bytecode emitted by the parenthesized expression
-                fd.byteCode.len = savedBcLen
-                // Remove any child functions that were added during
-                // the aborted expression parse
-                if fd.childFunctions.count > savedChildCount {
-                    fd.childFunctions.removeSubrange(savedChildCount...)
-                }
-                next() // consume '=>'
-                // We lost parameter info by parsing as an expression.
-                // Create a zero-arg arrow (best effort for unusual cases).
-                emitArrowFunction(paramAtoms: [], isAsync: false)
-                return
-            }
+            parseParenthesizedPrimary()
 
         case 0x5B: // '[' -- array literal
             parseArrayLiteral()
@@ -6355,62 +6259,371 @@ final class JeffJSParser {
 
         case 0x2F: // '/' -- regex literal
             s.reParseAsRegexp()
-            let body = s.token.regexpBody
-            let flags = s.token.regexpFlags
-            let bodyAtom = getAtom(body)
-            let flagsAtom = getAtom(flags)
-            emitOp(.push_atom_value)
-            emitAtom(bodyAtom)
-            emitOp(.push_atom_value)
-            emitAtom(flagsAtom)
-            emitOp(.regexp)
-            next()
+            emitRegexpLiteral()
 
         case JSTokenType.TOK_IMPORT.rawValue:
-            // import.meta or import()
-            next()
-            if tok == 0x2E { // '.'
-                next()
-                if isIdent("meta") {
-                    next()
-                    emitOp(.special_object)
-                    emitU8(3) // import.meta
-                } else {
-                    syntaxError("expected 'meta' after 'import.'")
-                }
-            } else if tok == 0x28 { // '(' dynamic import
-                next()
-                emitOp(.undefined) // this
-                parseAssignExpr()
-                expect(0x29)
-                emitOp(.import_)
-                emitU8(0)
-            }
+            parseImportPrimary()
 
         default:
-            // Keywords used as identifiers in expression context (common in minified JS).
-            // e.g., `of(e,t)` where `of` is a function named with the keyword.
-            if isKeywordToken(tok) {
-                let kwName = keywordTokenName(tok)
-                let atom = getAtom(kwName)
-                next()
-                // Check for arrow: keyword =>
-                if tok == JSTokenType.TOK_ARROW.rawValue {
-                    next()
-                    emitArrowFunction(paramAtoms: [atom], isAsync: false)
-                    return
-                }
-                if withCallFollows {
-                    emitScopeGetVarCallee(atom, scopeLevel: fd.curScope)
-                    pendingMethodCall = true
-                } else {
-                    emitScopeGetVar(atom, scopeLevel: fd.curScope)
-                }
-            } else {
-                syntaxError("unexpected token in expression: \(tokenName(tok))")
-                // Skip the token to avoid infinite loops
-                next()
+            parseKeywordPrimary()
+        }
+    }
+
+    @inline(never)
+    private func parseNumberLiteral() {
+        if let big = s.token.bigIntValue {
+            // BigInt literals always go through the constant pool: the
+            // value is a NaN-boxed BigInt, not a double.
+            let cpoolIdx = addConstPoolValue(JeffJSValue.newBigInt(big))
+            emitPushConst(cpoolIdx)
+            next()
+            return
+        }
+        let val = s.token.numValue
+        let intVal = Int32(exactly: val)
+        if let iv = intVal, Double(iv) == val {
+            emitPushI32(iv)
+        } else {
+            // Float constant -- add to constant pool with the actual double value
+            let cpoolIdx = addConstPoolValue(JeffJSValue.newFloat64(val))
+            emitPushConst(cpoolIdx)
+        }
+        next()
+    }
+
+    @inline(never)
+    private func parseStringLiteral() {
+        let str = s.token.strValue
+        let jsStr = JeffJSString(swiftString: str)
+        let cpoolIdx = addConstPoolValue(JeffJSValue.makeString(jsStr))
+        emitPushConst(cpoolIdx)
+        next()
+    }
+
+    /// The current token is a regexp literal: push pattern and flags, then
+    /// create the regexp.
+    @inline(never)
+    private func emitRegexpLiteral() {
+        let body = s.token.regexpBody
+        let flags = s.token.regexpFlags
+        let bodyAtom = getAtom(body)
+        let flagsAtom = getAtom(flags)
+        emitOp(.push_atom_value)
+        emitAtom(bodyAtom)
+        emitOp(.push_atom_value)
+        emitAtom(flagsAtom)
+        emitOp(.regexp)
+        next()
+    }
+
+    @inline(never)
+    private func parseSuperPrimary() {
+        next()
+        if tok == 0x2E || tok == 0x5B {
+            // super.x / super[x]: the [[HomeObject]]'s prototype is the base
+            // (parent prototype in instance methods, parent class in static
+            // methods). The member access below adds `this` for calls.
+            emitOp(.special_object)
+            emitU8(SpecialObjectType.homeObjectProto.rawValue)
+            lastExprWasSuperProp = true
+        } else {
+            // super(...): push a dummy that get_super pops; the parent
+            // constructor is resolved from frame.curFunc.__proto__.
+            // (`this` is still uninitialised here, so not push_this.)
+            emitOp(.undefined)
+            emitOp(.get_super)
+            lastExprWasSuper = true
+        }
+    }
+
+    /// `async function ...` / `async (...) =>` / `async x =>` in a primary
+    /// position (the current token is `async`). Returns true when parsed.
+    @inline(never)
+    private func parseAsyncPrimaryIfPresent() -> Bool {
+        // Check for 'async function' expression (e.g. var f = async function(){})
+        // [no LineTerminator here] is between async and function, so peek
+        // and check gotLF after consuming async.
+        if isIdent("async") &&
+           s.simpleNextToken() == JSTokenType.TOK_FUNCTION.rawValue {
+            let savedBc = fd.byteCode.len
+            let savedBufPtr = s.bufPtr
+            let savedLineNum = s.lineNum
+            let savedToken = s.token
+            let savedGotLF = s.gotLF
+            let savedLastLineNum = s.lastLineNum
+            let savedLastPtr = s.lastPtr
+            let savedTemplateNest = s.templateNestLevel
+            let savedLastTokenType = s.lastTokenType
+
+            next() // consume 'async'
+            let asyncThenLF = s.gotLF
+            // Backtrack in both cases: parseFunctionDef expects to see the
+            // 'async' token itself (that is what marks the function async).
+            fd.byteCode.len = savedBc
+            s.bufPtr = savedBufPtr
+            s.lineNum = savedLineNum
+            s.token = savedToken
+            s.gotLF = savedGotLF
+            s.lastLineNum = savedLastLineNum
+            s.lastPtr = savedLastPtr
+            s.templateNestLevel = savedTemplateNest
+            s.lastTokenType = savedLastTokenType
+            if !asyncThenLF {
+                parseFunctionDef(isExpression: true, isArrow: false)
+                return true
             }
+            // LF between async and function: not an async function expression
+        }
+
+        // Check for async arrow: async () =>, async (a,b) =>, async x =>
+        // [no LineTerminator here] between async and params — check after consuming async.
+        if isIdent("async") {
+            let peekTok = s.simpleNextToken()
+            if peekTok == 0x28 { // '(' — could be async arrow
+                // Save full state for backtrack
+                let savedBc = fd.byteCode.len
+                let savedBufPtr = s.bufPtr
+                let savedLineNum = s.lineNum
+                let savedToken = s.token
+                let savedGotLF = s.gotLF
+                let savedLastLineNum = s.lastLineNum
+                let savedLastPtr = s.lastPtr
+                let savedTemplateNest = s.templateNestLevel
+                let savedLastTokenType = s.lastTokenType
+
+                next() // consume 'async'
+                // [no LineTerminator here] between async and (
+                if !s.gotLF {
+                    // async (pattern, ...) => — the ident-only scanner
+                    // below does not accept patterns.
+                    if let full = scanFullArrowFromParen(), full.contains(where: { $0.atom == 0 }) {
+                        next() // consume '('
+                        emitPatternArrowFunction(isAsync: true)
+                        return true
+                    }
+                    next() // consume '('
+                    // Check for () => or (params) =>
+                    if tok == 0x29 { // ')'
+                        next()
+                        if tok == JSTokenType.TOK_ARROW.rawValue {
+                            next()
+                            emitArrowFunction(paramAtoms: [], isAsync: true)
+                            return true
+                        }
+                    } else if let arrowParams = scanParenArrowParams() {
+                        let (dflts, rst) = consumeParenArrowParams(arrowParams)
+                        // consumeParenArrowParams already consumed ')' and '=>'
+                        emitArrowFunction(paramAtoms: arrowParams.map { $0.atom }, isAsync: true,
+                                          defaults: dflts, rest: rst)
+                        return true
+                    }
+                }
+                // Not an async arrow — restore state fully
+                fd.byteCode.len = savedBc
+                s.bufPtr = savedBufPtr
+                s.lineNum = savedLineNum
+                s.token = savedToken
+                s.gotLF = savedGotLF
+                s.lastLineNum = savedLastLineNum
+                s.lastPtr = savedLastPtr
+                s.templateNestLevel = savedTemplateNest
+                s.lastTokenType = savedLastTokenType
+            } else if peekTok == JSTokenType.TOK_IDENT.rawValue {
+                // async x => ... (single param async arrow)
+                let savedBc = fd.byteCode.len
+                let savedBufPtr = s.bufPtr
+                let savedLineNum = s.lineNum
+                let savedToken = s.token
+                let savedGotLF = s.gotLF
+                let savedLastLineNum = s.lastLineNum
+                let savedLastPtr = s.lastPtr
+                let savedTemplateNest = s.templateNestLevel
+                let savedLastTokenType = s.lastTokenType
+
+                next() // consume 'async'
+                if !s.gotLF {
+                    let paramAtom = s.token.identAtom
+                    next() // consume param name
+                    if tok == JSTokenType.TOK_ARROW.rawValue {
+                        next()
+                        emitArrowFunction(paramAtoms: [paramAtom], isAsync: true)
+                        return true
+                    }
+                }
+                // Not arrow — restore state fully
+                fd.byteCode.len = savedBc
+                s.bufPtr = savedBufPtr
+                s.lineNum = savedLineNum
+                s.token = savedToken
+                s.gotLF = savedGotLF
+                s.lastLineNum = savedLastLineNum
+                s.lastPtr = savedLastPtr
+                s.templateNestLevel = savedTemplateNest
+                s.lastTokenType = savedLastTokenType
+            }
+        }
+        return false
+    }
+
+    @inline(never)
+    private func parseIdentifierPrimary() {
+        if isAsyncIdent() && parseAsyncPrimaryIfPresent() { return }
+
+        let atom = s.token.identAtom
+        next()
+
+        // Check for arrow function: x =>
+        if tok == JSTokenType.TOK_ARROW.rawValue {
+            next() // consume '=>'
+            emitArrowFunction(paramAtoms: [atom], isAsync: false)
+            return
+        }
+
+        // Regular identifier -- emit scope variable access. Inside a
+        // `with` body a call needs the with object as its receiver, which
+        // takes the two-slot callee form.
+        if withCallFollows {
+            emitScopeGetVarCallee(atom, scopeLevel: fd.curScope)
+            pendingMethodCall = true
+        } else {
+            emitScopeGetVar(atom, scopeLevel: fd.curScope)
+        }
+        if atom == JSPredefinedAtom.eval_.rawValue {
+            lastEvalCalleeEnd = fd.byteCode.len
+            lastEvalCalleeFd = fd
+        }
+    }
+
+    /// `( Expression )`, or an arrow function's parameter list.
+    @inline(never)
+    private func parseParenthesizedPrimary() {
+        if parseParenPrimaryArrowOrEmpty() { return }
+
+        // Not an arrow — parse as normal parenthesized expression
+        let savedBcLen = fd.byteCode.len
+        let savedChildCount = fd.childFunctions.count
+        // Re-enable `in` inside parentheses
+        let savedInFlagGroup = inFlag
+        inFlag = true
+        parseExpression()
+        inFlag = savedInFlagGroup
+        expect(0x29) // ')'
+
+        // Fallback: check for arrow after parenthesized expression
+        // (handles complex cases the lookahead didn't match)
+        if tok == JSTokenType.TOK_ARROW.rawValue {
+            // Rewind bytecode emitted by the parenthesized expression
+            fd.byteCode.len = savedBcLen
+            // Remove any child functions that were added during
+            // the aborted expression parse
+            if fd.childFunctions.count > savedChildCount {
+                fd.childFunctions.removeSubrange(savedChildCount...)
+            }
+            next() // consume '=>'
+            // We lost parameter info by parsing as an expression.
+            // Create a zero-arg arrow (best effort for unusual cases).
+            emitArrowFunction(paramAtoms: [], isAsync: false)
+            return
+        }
+    }
+
+    /// At `(` in a primary position: parse an arrow function (or the empty
+    /// `()` group) and return true, or consume the `(` of a parenthesised
+    /// expression and return false.
+    @inline(never)
+    private func parseParenPrimaryArrowOrEmpty() -> Bool {
+        // Try full arrow scan first (handles destructuring patterns like ([e,t])=>...)
+        if let params = scanFullArrowFromParen() {
+            let hasDestructuring = params.contains(where: { $0.atom == 0 })
+            next() // consume '('
+            if params.isEmpty {
+                expect(0x29) // ')'
+                expect(JSTokenType.TOK_ARROW.rawValue)
+                emitArrowFunction(paramAtoms: [], isAsync: false)
+            } else if hasDestructuring {
+                emitPatternArrowFunction(isAsync: false)
+            } else {
+                let (dflts, rst) = consumeParenArrowParams(params)
+                emitArrowFunction(paramAtoms: params.map { $0.atom }, isAsync: false,
+                                  defaults: dflts, rest: rst)
+            }
+            return true
+        }
+
+        next()
+
+        // Check for empty parens -> arrow: () =>
+        if tok == 0x29 { // ')'
+            next()
+            if tok == JSTokenType.TOK_ARROW.rawValue {
+                next() // consume '=>'
+                emitArrowFunction(paramAtoms: [], isAsync: false)
+                return true
+            }
+            // Empty parens without arrow -- error or undefined
+            emitOp(.undefined)
+            return true
+        }
+
+        // Lookahead: check if this is a parenthesized arrow param list
+        // e.g. (a, b) => ..., (x) => ..., (a, b, ...rest) => ...
+        if let arrowParams = scanParenArrowParams() {
+            let (dflts, rst) = consumeParenArrowParams(arrowParams)
+            emitArrowFunction(paramAtoms: arrowParams.map { $0.atom }, isAsync: false,
+                              defaults: dflts, rest: rst)
+            return true
+        }
+        return false
+    }
+
+    @inline(never)
+    private func parseImportPrimary() {
+        // import.meta or import()
+        next()
+        if tok == 0x2E { // '.'
+            next()
+            if isIdent("meta") {
+                next()
+                emitOp(.special_object)
+                emitU8(3) // import.meta
+            } else {
+                syntaxError("expected 'meta' after 'import.'")
+            }
+        } else if tok == 0x28 { // '(' dynamic import
+            next()
+            emitOp(.undefined) // this
+            parseAssignExpr()
+            expect(0x29)
+            emitOp(.import_)
+            emitU8(0)
+        }
+    }
+
+    /// Keywords used as identifiers in expression context, or an error.
+    @inline(never)
+    private func parseKeywordPrimary() {
+        // Keywords used as identifiers in expression context (common in minified JS).
+        // e.g., `of(e,t)` where `of` is a function named with the keyword.
+        if isKeywordToken(tok) {
+            let kwName = keywordTokenName(tok)
+            let atom = getAtom(kwName)
+            next()
+            // Check for arrow: keyword =>
+            if tok == JSTokenType.TOK_ARROW.rawValue {
+                next()
+                emitArrowFunction(paramAtoms: [atom], isAsync: false)
+                return
+            }
+            if withCallFollows {
+                emitScopeGetVarCallee(atom, scopeLevel: fd.curScope)
+                pendingMethodCall = true
+            } else {
+                emitScopeGetVar(atom, scopeLevel: fd.curScope)
+            }
+        } else {
+            syntaxError("unexpected token in expression: \(tokenName(tok))")
+            // Skip the token to avoid infinite loops
+            next()
         }
     }
 
@@ -6451,16 +6664,35 @@ final class JeffJSParser {
         // We start optimistically with the collect-then-array_from strategy.
         // If we hit a spread, we switch mid-stream.
 
+        // array_from takes a u16 count, and each collected element is an
+        // operand-stack slot: past a chunk, build the rest incrementally.
+        // Index of the next element while it is statically known (no spread
+        // yet), so elisions after a chunk flush still become holes.
+        var nextIndex: Int? = 0
+        func flushCollected() {
+            hasSpread = true
+            emitOp(.array_from)
+            emitU16(UInt16(count))
+            emitArrayHoles(holes)
+            holes.removeAll()
+            count = 0
+        }
+
         while tok != 0x5D && tok != JSTokenType.TOK_EOF.rawValue && !shouldAbort {
+            if !hasSpread && count >= JeffJSParser.arrayLiteralChunk { flushCollected() }
             if tok == 0x2C { // elision
                 if hasSpread {
                     emitOp(.undefined)
                     emitOp(.append)
+                    if let i = nextIndex {
+                        emitArrayHoles([i])
+                    }
                 } else {
                     emitOp(.undefined)
                     holes.append(count)
                     count += 1
                 }
+                if let i = nextIndex { nextIndex = i + 1 }
                 next()
                 continue
             }
@@ -6472,14 +6704,12 @@ final class JeffJSParser {
                     // the sentinel object.  Convert them: array_from(count)
                     // creates a proper Array from those values, consuming the
                     // sentinel.  Then append spread elements.
-                    hasSpread = true
-                    emitOp(.array_from)
-                    emitU16(UInt16(count))
+                    flushCollected()
                     // Stack: [array]  (proper Array)
-                    count = 0
                 }
 
                 // --- spread element: ...expr ---
+                nextIndex = nil
                 next()
                 parseAssignExpr()
                 // Stack: [array, iterable]
@@ -6488,6 +6718,7 @@ final class JeffJSParser {
             } else {
                 // --- normal element ---
                 parseAssignExpr()
+                if let i = nextIndex { nextIndex = i + 1 }
                 if hasSpread {
                     // Stack: [array, value]
                     emitOp(.append)
@@ -6507,17 +6738,32 @@ final class JeffJSParser {
             // No spread was found — use the fast array_from path.
             emitOp(.array_from)
             emitU16(UInt16(count))
-            // Turn the placeholder `undefined`s back into holes. Nothing is
-            // emitted for an array without elisions, which is all of them.
-            for h in holes {
-                emitOp(.dup)                 // [arr, arr]
-                emitPushI32(Int32(h))        // [arr, arr, i]
-                emitOp(.delete_)             // [arr, ok]
-                emitOp(.drop)                // [arr]
-            }
+            emitArrayHoles(holes)
         }
         // If hasSpread, the array was already built incrementally and is on
         // the stack as a proper Array.  Nothing more to emit.
+    }
+
+    /// Elements collected before array_from; past this the literal is built
+    /// incrementally (array_from's count is a u16).
+    static let arrayLiteralChunk = 16384
+    /// QuickJS's limit (call counts are u16 operands).
+    static let maxCallArguments = 65535
+
+    @inline(never)
+    func tooManyArguments() {
+        syntaxError("Too many call arguments")
+    }
+
+    /// Turn the placeholder `undefined`s of elisions back into holes.
+    /// Nothing is emitted for an array without elisions, which is all of them.
+    private func emitArrayHoles(_ holes: [Int]) {
+        for h in holes {
+            emitOp(.dup)                 // [arr, arr]
+            emitPushI32(Int32(h))        // [arr, arr, i]
+            emitOp(.delete_)             // [arr, ok]
+            emitOp(.drop)                // [arr]
+        }
     }
 
     /// Stack: [array, iterable] -> [array]. Iterates the iterable and appends
@@ -6580,6 +6826,43 @@ final class JeffJSParser {
     }
 
     /// Parse a single property definition in an object literal.
+    /// `async` before a method name in an object literal (the current token
+    /// is `async`): consumes it and returns true, or leaves it (a property
+    /// named `async`, or a line break after it). Out of line: the backtrack
+    /// state would otherwise sit in parsePropertyDefinition's frame, which
+    /// stays live across nested object literals.
+    @inline(never)
+    private func consumeAsyncMethodPrefix() -> Bool {
+        let nextTok = s.simpleNextToken()
+        if nextTok != 0x3A && nextTok != 0x2C && nextTok != 0x7D && // not :, ,, }
+           nextTok != 0x28 { // not ( (shorthand method)
+            let savedBufPtr = s.bufPtr
+            let savedLineNum = s.lineNum
+            let savedToken = s.token
+            let savedGotLF = s.gotLF
+            let savedLastLineNum = s.lastLineNum
+            let savedLastPtr = s.lastPtr
+            let savedTemplateNest = s.templateNestLevel
+            let savedLastTokenType = s.lastTokenType
+
+            next() // consume 'async'
+            if !s.gotLF {
+                return true
+            } else {
+                // LF between async and method name — backtrack
+                s.bufPtr = savedBufPtr
+                s.lineNum = savedLineNum
+                s.token = savedToken
+                s.gotLF = savedGotLF
+                s.lastLineNum = savedLastLineNum
+                s.lastPtr = savedLastPtr
+                s.templateNestLevel = savedTemplateNest
+                s.lastTokenType = savedLastTokenType
+            }
+        }
+        return false
+    }
+
     func parsePropertyDefinition() {
         // First byte of the property definition: a method / accessor's source
         // text starts at `async` / `*` / `get` / `set` / the property name.
@@ -6599,34 +6882,8 @@ final class JeffJSParser {
         var propKind: PropertyKind = .data
 
         // Check for 'async' — [no LineTerminator here] between async and method name
-        if isIdent("async") {
-            let nextTok = s.simpleNextToken()
-            if nextTok != 0x3A && nextTok != 0x2C && nextTok != 0x7D && // not :, ,, }
-               nextTok != 0x28 { // not ( (shorthand method)
-                let savedBufPtr = s.bufPtr
-                let savedLineNum = s.lineNum
-                let savedToken = s.token
-                let savedGotLF = s.gotLF
-                let savedLastLineNum = s.lastLineNum
-                let savedLastPtr = s.lastPtr
-                let savedTemplateNest = s.templateNestLevel
-                let savedLastTokenType = s.lastTokenType
-
-                next() // consume 'async'
-                if !s.gotLF {
-                    isAsync = true
-                } else {
-                    // LF between async and method name — backtrack
-                    s.bufPtr = savedBufPtr
-                    s.lineNum = savedLineNum
-                    s.token = savedToken
-                    s.gotLF = savedGotLF
-                    s.lastLineNum = savedLastLineNum
-                    s.lastPtr = savedLastPtr
-                    s.templateNestLevel = savedTemplateNest
-                    s.lastTokenType = savedLastTokenType
-                }
-            }
+        if isIdent("async") && consumeAsyncMethodPrefix() {
+            isAsync = true
         }
 
         // Check for generator '*'
@@ -7010,6 +7267,10 @@ final class JeffJSParser {
                                    isLexical: Bool = false,
                                    isConst: Bool = false,
                                    leaveSource: Bool = false) {
+        // Patterns nest (`[[[a]]]`, `{a: {b: ...}}`) without passing through
+        // the expression parsers' checks.
+        guard enterRecursion() else { return }
+        defer { leaveRecursion() }
         if leaveSource {
             // The source is stashed in a temporary and pushed again after the
             // pattern, rather than kept underneath it: that keeps the
@@ -7079,6 +7340,19 @@ final class JeffJSParser {
     /// state is restored.
     func tokenAfterBalancedGroup() -> Int {
         guard tok == 0x5B || tok == 0x7B || tok == 0x28 else { return -1 }
+        if let known = groupFollowers[s.token.ptr] { return known }
+        return tokenAfterBalancedGroupUncached()
+    }
+
+    /// Token type after the group opened at a source offset, for every
+    /// group a tokenAfterBalancedGroup scan walked through. Nested patterns
+    /// ask once per level (`[[[a] = x] = y] = z`), and each scan runs to the
+    /// end of its group, so this keeps them linear rather than O(depth x
+    /// length).
+    private var groupFollowers: [Int: Int] = [:]
+    private var groupScanOpen: [Int] = []
+
+    private func tokenAfterBalancedGroupUncached() -> Int {
         let savedBufPtr   = s.bufPtr
         let savedLineNum  = s.lineNum
         let savedToken    = s.token
@@ -7100,20 +7374,26 @@ final class JeffJSParser {
             s.lastErrorMessage    = savedErrorMsg
             JeffJSParseState.suppressErrorPrinting = savedSuppress
         }
+        groupScanOpen.removeAll(keepingCapacity: true)
         var depth = 0
         while true {
             let t = s.token.type
             if t == JSTokenType.TOK_EOF.rawValue { return -1 }
+            var closed = -1
             if t == 0x5B || t == 0x7B || t == 0x28 {
                 depth += 1
+                groupScanOpen.append(s.token.ptr)
             } else if t == 0x5D || t == 0x7D || t == 0x29 {
                 depth -= 1
+                closed = groupScanOpen.popLast() ?? -1
                 if depth <= 0 {
                     guard s.nextToken() else { return -1 }
+                    if closed >= 0 { groupFollowers[closed] = s.token.type }
                     return s.token.type
                 }
             }
             guard s.nextToken() else { return -1 }
+            if closed >= 0 { groupFollowers[closed] = s.token.type }
         }
     }
 

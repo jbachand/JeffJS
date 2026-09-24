@@ -2847,6 +2847,14 @@ struct JeffJSCompiler {
         // Compute stack size
         // ------------------------------------------------------------------
         fd.stackSize = computeStackSize(ctx: ctx, fd: fd, bc: bc)
+        // The frame's operand-stack size is a u16 (JS_STACK_SIZE_MAX); a call
+        // with 65,535 arguments or a literal array that long exceeds it.
+        // QuickJS: InternalError "stack overflow" from compute_stack_size.
+        if fd.stackSize > JS_STACK_SIZE_MAX {
+            _ = ctx.throwInternalError(
+                message: "stack overflow (operand stack \(fd.stackSize) > \(JS_STACK_SIZE_MAX))")
+            return false
+        }
 
         // Replace the bytecode buffer
         fd.byteCode = bc
@@ -3275,6 +3283,28 @@ struct JeffJSCompiler {
         // Track stack depth at each label
         var labelStacks = [Int](repeating: -1, count: fd.labels.count)
 
+        // Labels by address: `labelHead[addr]` is the lowest-numbered label
+        // at `addr` (-1: none), `labelNext[i]` the next one at the same
+        // address in ascending order. Scanning every label at every
+        // instruction was O(code x labels): a 100,000-operand `||` chain (one
+        // label per operand) took 19 s here.
+        let labelCount = fd.labels.count
+        var heads = [Int32](repeating: -1, count: len + 1)
+        var nexts = [Int32](repeating: -1, count: labelCount)
+        var li = labelCount - 1
+        while li >= 0 {
+            let a = fd.labels[li].addr
+            if a >= 0 && a <= len {
+                nexts[li] = heads[a]
+                heads[a] = Int32(li)
+            }
+            li -= 1
+        }
+        let labelHead = heads, labelNext = nexts
+        @inline(__always) func firstLabel(at addr: Int) -> Int {
+            return addr >= 0 && addr <= len ? Int(labelHead[addr]) : -1
+        }
+
         while pos < len {
             guard pos < buf.count else { break }
             guard let op = JeffJSOpcode(rawValue: UInt16(buf[pos])) else {
@@ -3285,14 +3315,14 @@ struct JeffJSCompiler {
             let instrSize = Int(info.size)
 
             // Check if this position is a label target
-            for i in 0 ..< fd.labels.count {
-                if fd.labels[i].addr == pos {
-                    if labelStacks[i] >= 0 {
-                        curStack = max(curStack, labelStacks[i])
-                    } else {
-                        labelStacks[i] = curStack
-                    }
+            var i = firstLabel(at: pos)
+            while i >= 0 {
+                if labelStacks[i] >= 0 {
+                    curStack = max(curStack, labelStacks[i])
+                } else {
+                    labelStacks[i] = curStack
                 }
+                i = Int(labelNext[i])
             }
 
             // Apply stack effect
@@ -3352,34 +3382,19 @@ struct JeffJSCompiler {
                         let relOffset = Int32(bitPattern: readU32(buf, pos + 1))
                         let targetAddr = pos + Int(info.size) + Int(relOffset)
                         // Find which label points to this address
-                        for i in 0 ..< fd.labels.count {
-                            if fd.labels[i].addr == targetAddr {
-                                targetLabel = i
-                                break
-                            }
-                        }
+                        targetLabel = firstLabel(at: targetAddr)
                     }
                 case .label8:
                     if pos + 1 < buf.count {
                         let offset = Int8(bitPattern: buf[pos + 1])
                         let targetAddr = pos + 2 + Int(offset)
-                        for i in 0 ..< fd.labels.count {
-                            if fd.labels[i].addr == targetAddr {
-                                targetLabel = i
-                                break
-                            }
-                        }
+                        targetLabel = firstLabel(at: targetAddr)
                     }
                 case .label16:
                     if pos + 2 < buf.count {
                         let offset = Int16(bitPattern: readU16(buf, pos + 1))
                         let targetAddr = pos + 3 + Int(offset)
-                        for i in 0 ..< fd.labels.count {
-                            if fd.labels[i].addr == targetAddr {
-                                targetLabel = i
-                                break
-                            }
-                        }
+                        targetLabel = firstLabel(at: targetAddr)
                     }
                 default:
                     break
@@ -4034,6 +4049,14 @@ struct JeffJSCompiler {
     ///   4. Produces the final JeffJSFunctionBytecode object
     static func createFunction(ctx: JeffJSContext,
                                 fd: JeffJSFunctionDefCompiler) -> JeffJSFunctionBytecodeCompiled? {
+        // Recurses once per level of function nesting. The parser bounds that
+        // nesting by its own stack check, but this pass may run with less
+        // stack left than the parser had: throw rather than overflow.
+        if ctx.rt.checkStackOverflow() {
+            ctx.throwStackOverflow()
+            return nil
+        }
+
         // 1. Variable resolution pass FIRST.
         //    This must run before compiling children because resolveVariables
         //    populates each child's closureVar list when it encounters

@@ -314,6 +314,7 @@ struct JeffJSTestRunner {
             ("ArrayIntegrity", { $0.testArrayIntegrity() }),
             ("DirectEval", { $0.testDirectEval() }),
             ("SelectorMatchingCache", { $0.testSelectorMatchingCache() }),
+            ("ParserNesting", { $0.testParserNesting() }),
         ]
     }
 
