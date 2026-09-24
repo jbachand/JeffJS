@@ -1136,15 +1136,6 @@ final class JeffJSStackFrame {
     var varCount: Int                 = 0
     var spBase: Int                   = 0
     var sp: Int                       = 0
-    /// Last receiver from a `get_field` opcode. Used as `this` fallback
-    /// when `call` is used instead of `call_method` (transformMethodCalls
-    /// can't handle ternary/complex args in method calls).
-    var lastGetFieldReceiver: JeffJSValue = .undefined
-    /// Bytecode pc of the get_field that stashed lastGetFieldReceiver.
-    /// The stash is only valid for a call opcode IMMEDIATELY following that
-    /// get_field — stale stashes (e.g. `throw obj.m` then a later `e()`)
-    /// must not leak `obj` in as `this`.
-    var lastGetFieldPC: Int = -1
 
     /// Contiguous unsafe buffer used by the interpreter's dispatch loop.
     /// Layout: [arg slots][var slots][value stack --->]

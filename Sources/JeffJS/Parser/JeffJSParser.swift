@@ -216,6 +216,22 @@ final class JeffJSParser {
     var lastEvalCalleeEnd: Int = -1
     var lastEvalCalleeFd: JeffJSFunctionDefCompiler? = nil
 
+    /// The last plain `obj.name` / `obj[key]` read (get_field / get_array_el):
+    /// its opcode position, the bytecode length just after it, and its
+    /// function. A parenthesised expression that ends exactly there is still
+    /// a property reference, so `(obj.m)()` calls with `this` = obj
+    /// (ES §13.2.9.1 / §13.3.6.1). A comma, `||`, `?:`, assignment... in the
+    /// parentheses emits code after the read (or clears it), so `(0, obj.m)()`
+    /// and `(a || obj.m)()` call with `this` = undefined.
+    var lastMemberGetPos: Int = -1
+    var lastMemberGetEnd: Int = -1
+    var lastMemberGetFd: JeffJSFunctionDefCompiler? = nil
+    /// Set by a `( ... )` group that is exactly such a reference; a call or
+    /// tagged template that immediately follows promotes it to a method call.
+    var parenMemberGetPos: Int = -1
+    var parenMemberGetEnd: Int = -1
+    var parenMemberGetFd: JeffJSFunctionDefCompiler? = nil
+
     /// Counter for the synthetic class-scope variables (computed field keys,
     /// deferred static initializers). Unique per compilation unit.
     var syntheticClassVarCounter: Int = 0
@@ -4340,7 +4356,8 @@ final class JeffJSParser {
         }
         // `(0, eval)(src)` ends in the same bytecode as `eval(src)` but is an
         // indirect eval: the comma operator yields a value, not a reference.
-        if hadComma { lastEvalCalleeEnd = -1 }
+        // Likewise `(0, obj.m)()` is a plain call (this = undefined).
+        if hadComma { lastEvalCalleeEnd = -1; lastMemberGetEnd = -1 }
     }
 
     /// Parse an assignment expression.
@@ -5347,6 +5364,7 @@ final class JeffJSParser {
         while !shouldAbort {
             switch tok {
             case 0x28: // '(' -- function call
+                promoteParenthesizedMemberCallee()
                 parseCallArguments()
 
             case 0x5B: // '[' -- computed member access
@@ -5356,6 +5374,7 @@ final class JeffJSParser {
                 parseDotMemberSuffix()
 
             case JSTokenType.TOK_OPTIONAL_CHAIN.rawValue: // '?.'
+                if s.simpleNextToken() == 0x28 { promoteParenthesizedMemberCallee() }
                 parseOptionalChainLink(nullLabel: &optNullLabel, null2Label: &optNull2Label,
                                        endLabel: &optEndLabel)
 
@@ -5368,6 +5387,7 @@ final class JeffJSParser {
                     lastExprWasSuper = false
                     return
                 }
+                promoteParenthesizedMemberCallee()
                 lastExprWasSuper = false
                 let isMethodCall = pendingMethodCall
                 pendingMethodCall = false
@@ -5529,8 +5549,41 @@ final class JeffJSParser {
             emitOp(.get_array_el2)
             pendingMethodCall = true
         } else {
+            let pos = fd.byteCode.len
             emitOp(.get_array_el)
+            noteMemberGet(at: pos)
         }
+    }
+
+    /// Record a plain property read that just ended the bytecode (see
+    /// `lastMemberGetPos`).
+    @inline(__always)
+    private func noteMemberGet(at pos: Int) {
+        lastMemberGetPos = pos
+        lastMemberGetEnd = fd.byteCode.len
+        lastMemberGetFd = fd
+    }
+
+    /// At the `(` or template of a call: when the callee is a parenthesised
+    /// property reference that ends the bytecode, `(obj.m)(...)`, keep the
+    /// receiver (get_field -> get_field2, get_array_el -> get_array_el2; same
+    /// sizes) and make the call a method call.
+    @inline(__always)
+    private func promoteParenthesizedMemberCallee() {
+        defer { parenMemberGetEnd = -1; parenMemberGetFd = nil }
+        guard !pendingMethodCall, !lastExprWasSuper,
+              parenMemberGetEnd >= 0, parenMemberGetEnd == fd.byteCode.len,
+              parenMemberGetFd === fd, parenMemberGetPos >= 0,
+              parenMemberGetPos < fd.byteCode.len else { return }
+        let raw = UInt16(fd.byteCode.buf[parenMemberGetPos])
+        if raw == JeffJSOpcode.get_field.rawValue {
+            fd.byteCode.buf[parenMemberGetPos] = UInt8(JeffJSOpcode.get_field2.rawValue)
+        } else if raw == JeffJSOpcode.get_array_el.rawValue {
+            fd.byteCode.buf[parenMemberGetPos] = UInt8(JeffJSOpcode.get_array_el2.rawValue)
+        } else {
+            return
+        }
+        pendingMethodCall = true
     }
 
     /// `obj.name` / `obj.#name`: the current token is `.`.
@@ -5572,7 +5625,9 @@ final class JeffJSParser {
                 emitAtom(fieldAtom)
                 pendingMethodCall = true
             } else {
+                let pos = fd.byteCode.len
                 emitGetField(fieldAtom)
+                noteMemberGet(at: pos)
             }
         } else if tok == JSTokenType.TOK_PRIVATE_NAME.rawValue {
             let fieldAtom = s.token.identAtom
@@ -6507,11 +6562,21 @@ final class JeffJSParser {
         inFlag = true
         parseExpression()
         inFlag = savedInFlagGroup
+        // `(obj.m)` is still a reference: remember it for a following call.
+        let isMemberRef = lastMemberGetFd === fd && lastMemberGetEnd >= 0
+            && lastMemberGetEnd == fd.byteCode.len
         expect(0x29) // ')'
+        if isMemberRef {
+            parenMemberGetPos = lastMemberGetPos
+            parenMemberGetEnd = fd.byteCode.len
+            parenMemberGetFd = fd
+        }
 
         // Fallback: check for arrow after parenthesized expression
         // (handles complex cases the lookahead didn't match)
         if tok == JSTokenType.TOK_ARROW.rawValue {
+            parenMemberGetEnd = -1
+            parenMemberGetFd = nil
             // Rewind bytecode emitted by the parenthesized expression
             fd.byteCode.len = savedBcLen
             // Remove any child functions that were added during

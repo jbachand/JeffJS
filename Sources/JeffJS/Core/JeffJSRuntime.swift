@@ -446,12 +446,6 @@ final class JeffJSRuntime {
         u._withUnsafeGuaranteedRef { frame in
             if !frame.newTarget.isUndefined { frame.newTarget = .undefined }
             frame.curPC = 0
-            if frame.lastGetFieldPC >= 0 {
-                // Drop any receiver stashed by get_field that no call consumed
-                frame.lastGetFieldReceiver.freeValue()
-                frame.lastGetFieldReceiver = .undefined
-                frame.lastGetFieldPC = -1
-            }
             frame.buf = nil
             // The arrays are materialised on demand; one flag instead of two
             // array-count loads per return.

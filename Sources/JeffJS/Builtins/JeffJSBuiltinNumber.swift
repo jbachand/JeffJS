@@ -87,15 +87,26 @@ extension JeffJSContext {
     }
 
     /// Convert a value to an integer JeffJSValue (ToInteger semantics).
+    /// ToIntegerOrInfinity: strings, booleans, null, undefined and objects go
+    /// through ToNumber (objects via valueOf/toString, which may throw), NaN is 0,
+    /// ±Infinity is kept. Returns an int or float64 value, or `.exception`.
     func toInteger(_ val: JeffJSValue) -> JeffJSValue {
         if val.isInt { return val }
+        let d: Double
         if val.isFloat64 {
-            let d = val.toFloat64()
-            if d.isNaN { return .newInt32(0) }
-            if d.isInfinite { return val }
-            return .newFloat64(d >= 0 ? Foundation.floor(d) : Foundation.ceil(d))
+            d = val.toFloat64()
+        } else {
+            if val.isBigInt { return throwTypeError(message: "Cannot convert a BigInt value to a number") }
+            if val.isSymbol { return throwTypeError(message: "Cannot convert a Symbol value to a number") }
+            let (n, ok) = JeffJSTypeConvert.toNumber(ctx: self, val: val)
+            if !ok { return .exception }
+            d = n
         }
-        return .newInt32(0)
+        if d.isNaN { return .newInt32(0) }
+        if d.isInfinite { return .newFloat64(d) }
+        let t = d >= 0 ? Foundation.floor(d) : Foundation.ceil(d)
+        if t >= -2147483648.0 && t <= 2147483647.0 { return .newInt32(Int32(t)) }
+        return .newFloat64(t)
     }
 
     /// Extract an Int from a JeffJSValue that is known to be a number.
@@ -501,238 +512,70 @@ struct JeffJSBuiltinNumber {
         return numVal
     }
 
-    /// `Number.prototype.toFixed(fractionDigits)`
+    /// ToIntegerOrInfinity on a builtin's argument, as a Double (±Infinity kept).
+    /// `nil` when the conversion threw.
+    private static func integerOrInfinityArg(ctx: JeffJSContext, _ args: [JeffJSValue], _ i: Int) -> Double? {
+        let v = ctx.toInteger(i < args.count ? args[i] : .undefined)
+        if v.isException { return nil }
+        return ctx.extractDouble(v)
+    }
+
+    /// `Number.prototype.toFixed(fractionDigits)` — ES2025 §21.1.3.3.
     static func toFixed(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let numVal = thisNumberValue(ctx: ctx, this: this)
         if numVal.isException {
             return ctx.throwTypeError("Number.prototype.toFixed requires that 'this' be a Number")
         }
-        let f: Int
-        if args.isEmpty {
-            f = 0
-        } else {
-            let n = ctx.toInteger(args[0])
-            if n.isException { return .exception }
-            f = ctx.extractInt(n)
-        }
-        if f < 0 || f > 100 {
+        let d = extractDouble(numVal)
+        // 2-4: f = ToIntegerOrInfinity(fractionDigits); RangeError before the finiteness check.
+        guard let f = integerOrInfinityArg(ctx: ctx, args, 0) else { return .exception }
+        if !f.isFinite || f < 0 || f > 100 {
             return ctx.throwRangeError("toFixed() digits argument must be between 0 and 100")
         }
-        let d = extractDouble(numVal)
-        if d.isNaN { return ctx.newStringValue("NaN") }
-        if d.isInfinite || Swift.abs(d) >= 1e21 {
+        // 5, 8: non-finite and |x| >= 1e21 use Number::toString.
+        if !d.isFinite || Swift.abs(d) >= 1e21 {
             return ctx.newStringValue(numberToStringBase10(d))
         }
-
-        // Use the spec-compliant fixed-point formatting
-        let result = toFixedInternal(d, f)
-        return ctx.newStringValue(result)
+        return ctx.newStringValue(jsNumberToFixed(d, fractionDigits: Int(f)))
     }
 
-    /// Internal toFixed implementation following the spec algorithm.
-    private static func toFixedInternal(_ x: Double, _ f: Int) -> String {
-        let negative = x < 0
-        let val = negative ? -x : x
-
-        var result: String
-        if val >= 1e21 {
-            result = numberToStringBase10(val)
-        } else {
-            // Use String(format:) for proper rounding
-            result = String(format: "%.\(f)f", val)
-        }
-        if negative && result != "0" && !result.allSatisfy({ $0 == "0" || $0 == "." }) {
-            result = "-" + result
-        }
-        return result
-    }
-
-    /// `Number.prototype.toExponential(fractionDigits)`
+    /// `Number.prototype.toExponential(fractionDigits)` — ES2025 §21.1.3.2.
     static func toExponential(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let numVal = thisNumberValue(ctx: ctx, this: this)
         if numVal.isException {
             return ctx.throwTypeError("Number.prototype.toExponential requires that 'this' be a Number")
         }
         let d = extractDouble(numVal)
-        if d.isNaN { return ctx.newStringValue("NaN") }
-        if d.isInfinite {
-            return ctx.newStringValue(d > 0 ? "Infinity" : "-Infinity")
+        // 2: f = ToIntegerOrInfinity(fractionDigits), before the finiteness check.
+        let undefinedDigits = args.isEmpty || args[0].isUndefined
+        guard let f = integerOrInfinityArg(ctx: ctx, args, 0) else { return .exception }
+        // 4: non-finite values stringify; 5: then the range check.
+        if !d.isFinite { return ctx.newStringValue(numberToStringBase10(d)) }
+        if !f.isFinite || f < 0 || f > 100 {
+            return ctx.throwRangeError("toExponential() argument must be between 0 and 100")
         }
-
-        let f: Int?
-        if args.isEmpty || args[0].isUndefined {
-            f = nil
-        } else {
-            let n = ctx.toInteger(args[0])
-            if n.isException { return .exception }
-            let fVal = ctx.extractInt(n)
-            if fVal < 0 || fVal > 100 {
-                return ctx.throwRangeError("toExponential() argument must be between 0 and 100")
-            }
-            f = fVal
-        }
-
-        let result = toExponentialInternal(d, f)
-        return ctx.newStringValue(result)
+        return ctx.newStringValue(jsNumberToExponential(d, fractionDigits: undefinedDigits ? nil : Int(f)))
     }
 
-    private static func toExponentialInternal(_ x: Double, _ fractionDigits: Int?) -> String {
-        let negative = x < 0
-        let val = negative ? -x : x
-
-        if val == 0 {
-            var result = "0"
-            if let f = fractionDigits, f > 0 {
-                result.append(".")
-                result.append(String(repeating: "0", count: f))
-            }
-            result.append("e+0")
-            if negative { result = "-" + result }
-            return result
-        }
-
-        var result: String
-        if let f = fractionDigits {
-            result = String(format: "%.\(f)e", val)
-        } else {
-            // Use the minimum number of digits needed
-            result = String(format: "%e", val)
-            // Remove trailing zeros in the mantissa
-            if let dotIdx = result.firstIndex(of: "."),
-               let eIdx = result.firstIndex(of: "e") {
-                var mantissa = String(result[dotIdx..<eIdx])
-                while mantissa.hasSuffix("0") {
-                    mantissa = String(mantissa.dropLast())
-                }
-                if mantissa == "." {
-                    mantissa = ""
-                }
-                let intPart = String(result[result.startIndex..<dotIdx])
-                let expPart = String(result[eIdx...])
-                result = intPart + mantissa + expPart
-            }
-        }
-
-        // Normalize the exponent format: remove leading zeros, ensure +/- sign
-        if let eIdx = result.firstIndex(of: "e") {
-            let expStr = String(result[result.index(after: eIdx)...])
-            let sign: String
-            var magnitude: String
-            if expStr.hasPrefix("-") {
-                sign = "-"
-                magnitude = String(expStr.dropFirst())
-            } else if expStr.hasPrefix("+") {
-                sign = "+"
-                magnitude = String(expStr.dropFirst())
-            } else {
-                sign = "+"
-                magnitude = expStr
-            }
-            // Remove leading zeros from magnitude
-            while magnitude.count > 1 && magnitude.hasPrefix("0") {
-                magnitude = String(magnitude.dropFirst())
-            }
-            let prefix = String(result[result.startIndex...eIdx])
-            result = prefix + sign + magnitude
-        }
-
-        if negative { result = "-" + result }
-        return result
-    }
-
-    /// `Number.prototype.toPrecision(precision)`
+    /// `Number.prototype.toPrecision(precision)` — ES2025 §21.1.3.5.
     static func toPrecision(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let numVal = thisNumberValue(ctx: ctx, this: this)
         if numVal.isException {
             return ctx.throwTypeError("Number.prototype.toPrecision requires that 'this' be a Number")
         }
         let d = extractDouble(numVal)
-
+        // 2: undefined precision is ToString(x).
         if args.isEmpty || args[0].isUndefined {
             return ctx.newStringValue(numberToStringBase10(d))
         }
-
-        if d.isNaN { return ctx.newStringValue("NaN") }
-        if d.isInfinite {
-            return ctx.newStringValue(d > 0 ? "Infinity" : "-Infinity")
-        }
-
-        let pVal = ctx.toInteger(args[0])
-        if pVal.isException { return .exception }
-        let p = ctx.extractInt(pVal)
-        if p < 1 || p > 100 {
+        // 3: p = ToIntegerOrInfinity(precision), before the finiteness check.
+        guard let p = integerOrInfinityArg(ctx: ctx, args, 0) else { return .exception }
+        // 4: non-finite values stringify; 5: then the range check.
+        if !d.isFinite { return ctx.newStringValue(numberToStringBase10(d)) }
+        if !p.isFinite || p < 1 || p > 100 {
             return ctx.throwRangeError("toPrecision() argument must be between 1 and 100")
         }
-
-        let result = toPrecisionInternal(d, p)
-        return ctx.newStringValue(result)
-    }
-
-    private static func toPrecisionInternal(_ x: Double, _ precision: Int) -> String {
-        let negative = x < 0
-        let val = negative ? -x : x
-
-        if val == 0 {
-            var result = "0"
-            if precision > 1 {
-                result.append(".")
-                result.append(String(repeating: "0", count: precision - 1))
-            }
-            if negative { result = "-" + result }
-            return result
-        }
-
-        // Compute the exponent (number of digits before/after decimal point)
-        let e = Int(Foundation.floor(Foundation.log10(val)))
-
-        var result: String
-        if e < -6 || e >= precision {
-            // Use exponential notation
-            result = String(format: "%.\(precision - 1)e", val)
-            // Normalize exponent
-            if let eIdx = result.firstIndex(of: "e") {
-                let expStr = String(result[result.index(after: eIdx)...])
-                let sign: String
-                var magnitude: String
-                if expStr.hasPrefix("-") {
-                    sign = "-"
-                    magnitude = String(expStr.dropFirst())
-                } else if expStr.hasPrefix("+") {
-                    sign = "+"
-                    magnitude = String(expStr.dropFirst())
-                } else {
-                    sign = "+"
-                    magnitude = expStr
-                }
-                while magnitude.count > 1 && magnitude.hasPrefix("0") {
-                    magnitude = String(magnitude.dropFirst())
-                }
-                let prefix = String(result[result.startIndex...eIdx])
-                result = prefix + sign + magnitude
-            }
-        } else {
-            // Use fixed notation
-            let fracDigits = precision - e - 1
-            if fracDigits >= 0 {
-                result = String(format: "%.\(fracDigits)f", val)
-            } else {
-                result = String(format: "%.0f", val)
-            }
-        }
-
-        // Remove trailing zeros after the decimal point (but keep the point
-        // if digits remain after it)
-        if result.contains(".") {
-            while result.hasSuffix("0") {
-                result = String(result.dropLast())
-            }
-            if result.hasSuffix(".") {
-                result = String(result.dropLast())
-            }
-        }
-
-        if negative { result = "-" + result }
-        return result
+        return ctx.newStringValue(jsNumberToPrecision(d, precision: Int(p)))
     }
 
     // MARK: - Global Number Functions

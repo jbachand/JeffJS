@@ -68,19 +68,19 @@ extension JeffJSContext {
         return 0
     }
 
-    /// ToLength conversion (clamp to 0...2^53-1).
+    /// ToLength (clamp to 0...2^53-1); non-numbers go through ToNumber (valueOf may run). Returns -1
+    /// when the conversion threw.
     func toLength2(_ val: JeffJSValue) -> Int {
         if val.isInt {
             let v = Int(val.toInt32())
             return max(0, v)
         }
-        if val.isFloat64 {
-            let d = val.toFloat64()
-            if d.isNaN || d <= 0 { return 0 }
-            if d >= 9007199254740991.0 { return Int.max }
-            return Int(d)
-        }
-        return 0
+        let n = toInteger(val)
+        if n.isException { return -1 }
+        let d = extractDouble(n)
+        if d.isNaN || d <= 0 { return 0 }
+        if d >= 9007199254740991.0 { return Int.max }
+        return Int(d)
     }
 
     /// ToUInt32 conversion.
@@ -607,7 +607,14 @@ struct JeffJSBuiltinString {
         var buf = [UInt16]()
         buf.reserveCapacity(args.count)
         for arg in args {
-            buf.append(ctx.toUInt16(arg))
+            if arg.isInt || arg.isFloat64 {
+                buf.append(ctx.toUInt16(arg))
+            } else {
+                // ToUint16(ToNumber(arg)): strings, booleans, objects.
+                let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: arg)
+                if !ok { return .exception }
+                buf.append(ctx.toUInt16(.newFloat64(d)))
+            }
         }
         return makeString(ctx: ctx, utf16: buf)
     }
@@ -1238,7 +1245,9 @@ struct JeffJSBuiltinString {
         if limitArg.isUndefined {
             lim = Int(UInt32.max)
         } else {
-            lim = Int(ctx.toUInt32(limitArg))
+            let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: limitArg)
+            if !ok { strVal.freeValue(); return .exception }
+            lim = Int(JeffJSTypeConvert.doubleToUInt32(d))
         }
         if lim == 0 {
             strVal.freeValue()

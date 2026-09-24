@@ -2761,25 +2761,6 @@ private func isStoreOpcode(_ bc: UnsafePointer<UInt8>, _ pos: Int, _ bcLen: Int)
     }
 }
 
-/// True if the instruction at `pos` is a plain call with NO arguments (call0,
-/// or call with argc 0). Only then is the value a directly-preceding get_field
-/// pushed the callee, i.e. `o.m()` left unfused, and its receiver the call's
-/// `this` (read from `frame.lastGetFieldReceiver`; the consumer checks
-/// pc == lastGetFieldPC + 5). With arguments, a get_field right before the call
-/// read the LAST ARGUMENT — `s(o.x)` must call `s` with `this` undefined, not
-/// `o` (MediaWiki's loader runs every module as `script($, $, require,
-/// registry[m].module)`, which gave each module `this` = its registry entry).
-/// `call_method`/`call_constructor` take their receiver from the stack and are
-/// excluded. The opcodes are < 256, so a single-byte compare is exact.
-@inline(__always)
-private func isZeroArgCallAt(_ bc: UnsafePointer<UInt8>, _ pos: Int, _ bcLen: Int) -> Bool {
-    guard pos < bcLen else { return false }
-    let b = bc[pos]
-    if b == UInt8(truncatingIfNeeded: JeffJSOpcode.call0.rawValue) { return true }
-    return b == UInt8(truncatingIfNeeded: JeffJSOpcode.call.rawValue)
-        && pos + 2 < bcLen && bc[pos + 1] == 0 && bc[pos + 2] == 0
-}
-
 // =============================================================================
 // MARK: - Fast Trace Mini-Interpreter
 // =============================================================================
@@ -2790,6 +2771,40 @@ private func isZeroArgCallAt(_ bc: UnsafePointer<UInt8>, _ pos: Int, _ bcLen: In
 ///   - On loop exit (condition became false): returns the branch target (after loop)
 ///   - On deopt (unsupported opcode or non-int type): returns the PC to resume at
 ///   - On interrupt/exception: returns -1 (caller should set retVal = .exception)
+/// The local slot written by the store instruction at `pos` (put_loc*,
+/// set_loc*, put_loc_check), or -1. String concatenation uses it to see that
+/// its result replaces the left operand's variable (`l = l + x`, `l += x`),
+/// which makes appending into the left operand's buffer safe.
+@inline(__always)
+func jeffJS_storedLocalIndex(_ bc: UnsafePointer<UInt8>, _ pos: Int, _ bcLen: Int) -> Int {
+    guard pos < bcLen else { return -1 }
+    let b = bc[pos]
+    @inline(__always) func op(_ o: JeffJSOpcode) -> UInt8 { UInt8(truncatingIfNeeded: o.rawValue) }
+    switch b {
+    case op(.put_loc), op(.set_loc), op(.put_loc_check):
+        return pos + 2 < bcLen ? Int(bc[pos + 1]) | (Int(bc[pos + 2]) << 8) : -1
+    case op(.put_loc8), op(.set_loc8):
+        return pos + 1 < bcLen ? Int(bc[pos + 1]) : -1
+    case op(.put_loc0), op(.set_loc0): return 0
+    case op(.put_loc1), op(.set_loc1): return 1
+    case op(.put_loc2), op(.set_loc2): return 2
+    case op(.put_loc3), op(.set_loc3): return 3
+    default: return -1
+    }
+}
+
+/// References to a string operand of `+` the caller owns: its operand slot
+/// (`stackRefs`, 0 when borrowed from a local) plus the local variable the
+/// next instruction overwrites with the result, if that local holds it.
+@inline(__always)
+func jeffJS_concatOwnedRefs(_ lhs: JeffJSValue, stackRefs: Int,
+                            _ bc: UnsafePointer<UInt8>, _ nextPC: Int, _ bcLen: Int,
+                            _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) -> Int {
+    let idx = jeffJS_storedLocalIndex(bc, nextPC, bcLen)
+    if idx >= 0 && buf[varBase + idx].bits == lhs.bits { return stackRefs + 1 }
+    return stackRefs
+}
+
 @inline(never)
 private func executeFastTrace(
     state: inout JeffJSInterpreter.HotState,
@@ -2925,7 +2940,9 @@ private func executeFastTrace(
             } else if a.isNumber && b.isNumber {
                 buf[sp] = jeffJS_arithNumeric(ar, jeffJS_traceNum(a), jeffJS_traceNum(b)); sp += 1
             } else if ar == 0 && a.isString && b.isString {
-                let r = jeffJS_concatStrings(s1: a, s2: b)
+                // a is borrowed from its local: in place only for `l = l + m`.
+                let r = jeffJS_concatStrings(s1: a, s2: b, ownedRefs:
+                    jeffJS_storedLocalIndex(bc, pc + 4, bcLen) == Int(bc[pc + 2]) ? 1 : 0)
                 if r.isException { resume = pc; break traceLoop }
                 buf[sp] = r; sp += 1
             } else { resume = pc; break traceLoop }
@@ -2962,7 +2979,8 @@ private func executeFastTrace(
                 buf[sp - 1] = jeffJS_arithNumeric(ar, jeffJS_traceNum(v), jeffJS_traceNum(c))
             } else if ar == 0 && v.isString && c.isString {
                 // `s += "lit"`: rope/buffer append, TOS is consumed
-                let r = jeffJS_concatStrings(s1: v, s2: c)
+                let r = jeffJS_concatStrings(s1: v, s2: c, ownedRefs:
+                    jeffJS_concatOwnedRefs(v, stackRefs: 1, bc, pc + 3, bcLen, buf, varBase))
                 if r.isException { resume = pc; break traceLoop }
                 v.freeValue()
                 buf[sp - 1] = r
@@ -3581,9 +3599,6 @@ private func executeFastTrace(
             pc += 3
 
         case .get_field:
-            // A directly-following plain call takes its `this` from a stash
-            // that only the main loop maintains: let it handle that pair.
-            if isZeroArgCallAt(bc, pc + 5, bcLen) { resume = pc; break traceLoop }
             guard let ents = fb.icEntries else { resume = pc; break traceLoop }
             let obj = buf[sp - 1]
             guard let jsObj = obj.obj else { resume = pc; break traceLoop }
@@ -3854,7 +3869,8 @@ private func executeFastTrace(
                 pc += 1
             } else if lhs.isString && rhs.isString {
                 // String concat stays in the trace (rope/buffer append).
-                let r = jeffJS_concatStrings(s1: lhs, s2: rhs)
+                let r = jeffJS_concatStrings(s1: lhs, s2: rhs, ownedRefs:
+                    jeffJS_concatOwnedRefs(lhs, stackRefs: 1, bc, pc + 1, bcLen, buf, varBase))
                 if r.isException { resume = pc; break traceLoop } // deopt: main loop rethrows
                 lhs.freeValue(); rhs.freeValue()
                 sp -= 1
@@ -4662,7 +4678,9 @@ private func executeFastTraceLean(
             } else if a.isNumber && b.isNumber {
                 buf[sp] = jeffJS_arithNumeric(ar, jeffJS_traceNum(a), jeffJS_traceNum(b)); sp += 1
             } else if ar == 0 && a.isString && b.isString {
-                let r = jeffJS_concatStrings(s1: a, s2: b)
+                // a is borrowed from its local: in place only for `l = l + m`.
+                let r = jeffJS_concatStrings(s1: a, s2: b, ownedRefs:
+                    jeffJS_storedLocalIndex(bc, pc + 4, bcLen) == Int(bc[pc + 2]) ? 1 : 0)
                 if r.isException { ctx.interruptCounter = interrupt; return pc }
                 buf[sp] = r; sp += 1
             } else { ctx.interruptCounter = interrupt; return pc }
@@ -4699,7 +4717,8 @@ private func executeFastTraceLean(
                 buf[sp - 1] = jeffJS_arithNumeric(ar, jeffJS_traceNum(v), jeffJS_traceNum(c))
             } else if ar == 0 && v.isString && c.isString {
                 // `s += "lit"`: rope/buffer append, TOS is consumed
-                let r = jeffJS_concatStrings(s1: v, s2: c)
+                let r = jeffJS_concatStrings(s1: v, s2: c, ownedRefs:
+                    jeffJS_concatOwnedRefs(v, stackRefs: 1, bc, pc + 3, bcLen, buf, varBase))
                 if r.isException { ctx.interruptCounter = interrupt; return pc }
                 v.freeValue()
                 buf[sp - 1] = r
@@ -5138,7 +5157,8 @@ private func executeFastTraceLean(
                 pc += 1
             } else if lhs.isString && rhs.isString {
                 // String concat stays in the trace (rope/buffer append).
-                let r = jeffJS_concatStrings(s1: lhs, s2: rhs)
+                let r = jeffJS_concatStrings(s1: lhs, s2: rhs, ownedRefs:
+                    jeffJS_concatOwnedRefs(lhs, stackRefs: 1, bc, pc + 1, bcLen, buf, varBase))
                 if r.isException { ctx.interruptCounter = interrupt; return pc } // deopt: main loop rethrows
                 lhs.freeValue(); rhs.freeValue()
                 sp -= 1
@@ -7660,17 +7680,9 @@ struct JeffJSInterpreter {
                         retVal = .exception
                         break dispatchLoop
                     }
-                    // `this`: a get_field receiver stash consumed only by the
-                    // directly-following call (arrow callees ignore it, so
-                    // leave the stash alone for them).
-                    var callThis: JeffJSValue = .undefined
-                    if !fastFb.isArrow, argc == 0,
-                       !frame.lastGetFieldReceiver.isUndefined,
-                       frame.lastGetFieldPC >= 0, pc == frame.lastGetFieldPC + 5 {
-                        callThis = frame.lastGetFieldReceiver   // move the stash's ref
-                        frame.lastGetFieldReceiver = .undefined
-                        frame.lastGetFieldPC = -1
-                    }
+                    // A plain call: `this` is undefined (method calls are
+                    // call_method; the parser decides which).
+                    let callThis: JeffJSValue = .undefined
                     do { // inline call (expanded; no nested-function capture of hot locals)
                         let e_fastFb = fastFb
                         let e_callObj = callObj
@@ -7812,11 +7824,7 @@ struct JeffJSInterpreter {
                         callArgs = tmp
                     }
                     let funcVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                    // Use lastGetFieldReceiver as `this` if available (method call
-                    // that transformMethodCalls couldn't convert to call_method).
-                    let stashValid = argc == 0 && !frame.lastGetFieldReceiver.isUndefined
-                        && frame.lastGetFieldPC >= 0 && pc == frame.lastGetFieldPC + 5
-                    let slowThis = stashValid ? frame.lastGetFieldReceiver : JeffJSValue.undefined
+                    let slowThis = JeffJSValue.undefined
                     let result: JeffJSValue
                     if let callObj = funcVal.obj,
                        let fastFb2 = callObj.fbFast, !fastFb2.isGenerator, !fastFb2.isAsyncFunc {
@@ -7829,10 +7837,6 @@ struct JeffJSInterpreter {
                     } else {
                         result = ctx.callFunction(funcVal, thisVal: slowThis, args: callArgs)
                     }
-                    // Drop the stash's reference (taken via dupValue in get_field)
-                    frame.lastGetFieldReceiver.freeValue()
-                    frame.lastGetFieldReceiver = .undefined  // clear after use
-                    frame.lastGetFieldPC = -1
                     // The call borrows: release the popped callee and the args
                     // (see "Ownership of call arguments").
                     funcVal.freeValue()
@@ -8715,17 +8719,8 @@ struct JeffJSInterpreter {
                 ctx.lastGetFieldAtom = atom
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 // The popped receiver owns one reference (from the get_var/get_loc
-                // that pushed it). It is disposed of exactly once at each exit below:
-                //  • a plain call directly follows — `call`/`call0…3` read the receiver
-                //    as `this` when pc == lastGetFieldPC + 5 (the transformMethodCalls
-                //    fallback for method calls it couldn't fuse into call_method):
-                //    MOVE the ref into the stash; the call consumes it.
-                //  • otherwise (the common plain property read): FREE it.
-                // Previously every get_field unconditionally stashed (a receiver
-                // dup + free on EVERY read) and leaked the popped ref. Gating on an
-                // actually-following call removes that churn from hot read loops and
-                // balances the reference.
-                let nextIsCall = isZeroArgCallAt(bc, pc + 5, bcLen)
+                // that pushed it), freed once at each exit below. A call that needs
+                // it as `this` was compiled to get_field2 + call_method instead.
                 // Property access on null/undefined. The location goes in the
                 // error's `stack` (built from the live frame chain), not in the
                 // message — the message must read like every other engine's.
@@ -8751,13 +8746,7 @@ struct JeffJSInterpreter {
                         if let hv = icHit {
                             do {
                                 buf[sp] = hv.dupValue(); sp += 1
-                                if nextIsCall {
-                                    frame.lastGetFieldReceiver.freeValue()
-                                    frame.lastGetFieldReceiver = obj   // move popped ref into stash
-                                    frame.lastGetFieldPC = pc
-                                } else {
-                                    obj.freeValue()
-                                }
+                                obj.freeValue()
                                 pc += 5
                                 continue dispatchLoop
                             }
@@ -8777,24 +8766,12 @@ struct JeffJSInterpreter {
                                                    holderShape: hs, propOffset: hIdx)
                         }
                     }
-                    if nextIsCall {
-                        frame.lastGetFieldReceiver.freeValue()
-                        frame.lastGetFieldReceiver = obj   // move popped ref into stash
-                        frame.lastGetFieldPC = pc
-                    } else {
-                        obj.freeValue()
-                    }
+                    obj.freeValue()
                 } else {
                     let val = ctx.getProperty(obj: obj, atom: atom)
                     if val.isException { obj.freeValue(); retVal = .exception; break dispatchLoop }
                     buf[sp] = val; sp += 1
-                    if nextIsCall {
-                        frame.lastGetFieldReceiver.freeValue()
-                        frame.lastGetFieldReceiver = obj   // move popped ref into stash
-                        frame.lastGetFieldPC = pc
-                    } else {
-                        obj.freeValue()
-                    }
+                    obj.freeValue()
                 }
                 pc += 5
 
@@ -11200,7 +11177,8 @@ struct JeffJSInterpreter {
                     buf[sp] = overflow ? .newFloat64(Double(a) + Double(b)) : .newInt32(r); sp += 1
                 } else if lhs.isString && rhs.isString {
                     // String+string fast path: rope-based O(1) concat, bypasses jsAdd
-                    let concatResult = jeffJS_concatStrings(s1: lhs, s2: rhs)
+                    let concatResult = jeffJS_concatStrings(s1: lhs, s2: rhs, ownedRefs:
+                        jeffJS_concatOwnedRefs(lhs, stackRefs: 1, bc, pc + 1, bcLen, buf, varBase))
                     lhs.freeValue(); rhs.freeValue()
                     buf[sp] = concatResult; sp += 1
                 } else {
