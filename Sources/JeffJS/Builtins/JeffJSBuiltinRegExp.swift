@@ -476,7 +476,9 @@ func js_regexp_test(
     if result.isException {
         return .exception
     }
-    return JeffJSValue.newBool(!result.isNull)
+    let matched = !result.isNull
+    result.freeValue()   // the match array is ours (it leaked on every successful test())
+    return JeffJSValue.newBool(matched)
 }
 
 // MARK: - RegExp.prototype.toString
@@ -793,7 +795,7 @@ func js_regexp_Symbol_match(
 
     if !isGlobal {
         // Non-global: single exec.
-        return js_regexp_exec(ctx: ctx, this: this, argv: [JeffJSValue.makeString(inputStr)])
+        return js_regexp_exec(ctx: ctx, this: this, argv: [JeffJSValue.borrowedString(inputStr)])
     }
 
     // Fast path: for standard RegExp with /g flag, bypass the full exec()
@@ -822,13 +824,16 @@ func js_regexp_Symbol_match(
 
     while safetyLimit > 0 {
         safetyLimit -= 1
-        let result = js_regexp_exec(ctx: ctx, this: this, argv: [JeffJSValue.makeString(inputStr.retain())])
+        // exec borrows its argument; the match array is ours.
+        let result = js_regexp_exec(ctx: ctx, this: this, argv: [JeffJSValue.borrowedString(inputStr)])
         if result.isException {
+            for m in matches { m.freeValue() }
             return .exception
         }
         if result.isNull {
             break
         }
+        defer { result.freeValue() }
 
         // Extract match[0].
         if let resObj = result.toObject() {
@@ -1121,7 +1126,9 @@ func js_regexp_Symbol_replace(
     while loopCount < maxLoops {
         loopCount += 1
 
-        let result = js_regexp_exec(ctx: ctx, this: this, argv: [JeffJSValue.makeString(inputStr.retain())])
+        // exec borrows its argument; the match array is ours (it leaked once
+        // per match: every regex String.prototype.replace grew the heap).
+        let result = js_regexp_exec(ctx: ctx, this: this, argv: [JeffJSValue.borrowedString(inputStr)])
         if result.isException {
             buf.free()
             return .exception
@@ -1129,6 +1136,7 @@ func js_regexp_Symbol_replace(
         if result.isNull {
             break
         }
+        defer { result.freeValue() }
 
         guard let resObj = result.toObject() else { break }
 
@@ -1158,8 +1166,11 @@ func js_regexp_Symbol_replace(
             // per ES spec §22.2.5.9 step 14.
             var callArgs: [JeffJSValue] = []
             // First arg: matched substring
+            // `ms` is result[0], a flat string exec created (it carries its own
+            // retain), so a dup is the owned reference; `makeString(ms.retain())`
+            // added a second Swift retain that nothing released.
             if let ms = matchedStr {
-                callArgs.append(JeffJSValue.makeString(ms.retain()))
+                callArgs.append(JeffJSValue.borrowedString(ms).dupValue())
             } else {
                 callArgs.append(ctx.newStringValue(""))
             }
@@ -1172,7 +1183,10 @@ func js_regexp_Symbol_replace(
             // Offset (position)
             callArgs.append(JeffJSValue.newInt32(Int32(matchStart)))
             // Full input string
-            callArgs.append(JeffJSValue.makeString(inputStr.retain()))
+            // The argument itself when it is a string value (a dup); a coerced or
+            // flattened copy has no owner of its own and keeps the retaining wrap.
+            callArgs.append(inputVal.isString ? inputVal.dupValue()
+                                              : JeffJSValue.makeString(inputStr.retain()))
             // Named groups (if present)
             let groupsAtom = ctx.rt.findAtom("groups")
             let groupsVal = resObj.getOwnPropertyValue(atom: groupsAtom)
@@ -1269,11 +1283,13 @@ func js_regexp_Symbol_search(
     }
 
     guard let resObj = result.toObject() else {
+        result.freeValue()
         return JeffJSValue.newInt32(-1)
     }
 
-    let indexVal = resObj.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_index.rawValue)
-    return indexVal.dupValue()
+    let indexVal = resObj.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_index.rawValue).dupValue()
+    result.freeValue()   // the match array is ours
+    return indexVal
 }
 
 /// `RegExp.prototype[@@split](string, limit)`
@@ -1454,6 +1470,15 @@ final class JSRegExpStringIteratorData {
         self.isUnicode = isUnicode
         self.done = done
     }
+
+    /// The copy of the regexp (created with a count of 1) and the retained
+    /// string die with the iterator; they leaked once per matchAll().
+    deinit {
+        if JeffJSGCObjectHeader.activeRuntime != nil {
+            JeffJSValue.makeObject(iteratingRegExp).freeValue()
+            JeffJSValue.borrowedString(iteratedString).freeValue()
+        }
+    }
 }
 
 /// `%RegExpStringIteratorPrototype%.next()`
@@ -1474,12 +1499,15 @@ func js_regexp_string_iterator_next(
         return js_createIteratorResult(ctx: ctx, value: .undefined, done: true)
     }
 
-    let regexpThisVal = JeffJSValue.makeObject(data.iteratingRegExp)
+    let regexpThisVal = JeffJSValue.borrowedObject(data.iteratingRegExp)
+    // exec borrows its argument; js_createIteratorResult dups the match array,
+    // so ours is released on the way out.
     let result = js_regexp_exec(
         ctx: ctx,
         this: regexpThisVal,
-        argv: [JeffJSValue.makeString(data.iteratedString.retain())]
+        argv: [JeffJSValue.borrowedString(data.iteratedString)]
     )
+    defer { result.freeValue() }
 
     if result.isException {
         return .exception

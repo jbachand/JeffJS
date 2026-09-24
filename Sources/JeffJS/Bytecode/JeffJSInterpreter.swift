@@ -9126,6 +9126,7 @@ struct JeffJSInterpreter {
                 let ok = ctx.setPropertyValue(obj: obj, prop: key, val: val,
                                               strict: fb.isStrictMode)
                 obj.freeValue()
+                key.freeValue()   // setPropertyValue borrows the key (a dynamic string key leaked per store)
                 if !ok {
                     retVal = .exception
                     break dispatchLoop
