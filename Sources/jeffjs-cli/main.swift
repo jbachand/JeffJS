@@ -15,6 +15,12 @@ guard !paths.isEmpty else {
     exit(2)
 }
 let showResult = args.contains("--result")
+// --parse-only: parse + compile each file without running it (no bytecode
+// cache), best of --repeat=N (default 5), times on stdout. --bc-hash also
+// prints an FNV-1a hash of the serialized bytecode (compiler identity check).
+let parseOnly = args.contains("--parse-only") || args.contains("--bc-hash")
+let bcHash = args.contains("--bc-hash")
+let repeatCount = args.first(where: { $0.hasPrefix("--repeat=") }).flatMap { Int($0.dropFirst(9)) } ?? (bcHash ? 1 : 5)
 
 // Several files are evaluated in order in ONE environment (shared globals),
 // which mirrors how the conformance runner feeds a group of snippets to a
@@ -29,6 +35,35 @@ let status: Int32 = MainActor.assumeIsolated {
         return "{\"runs\":\(s.runs),\"cyclesFreed\":\(s.cyclesFreed),\"liveObjects\":\(s.liveObjects),\"heapBytes\":\(s.heapBytes),\"threshold\":\(s.threshold)}"
     }
     var status: Int32 = 0
+    if parseOnly {
+        for path in paths {
+            guard let src = try? String(contentsOfFile: path, encoding: .utf8) else {
+                FileHandle.standardError.write("cannot read \(path)\n".data(using: .utf8)!)
+                return 2
+            }
+            var bestParse = Double.infinity, bestCompile = Double.infinity, bestTotal = Double.infinity
+            var hash: UInt64? = nil
+            for _ in 0..<max(1, repeatCount) {
+                let r = env.compileOnly(src, filename: path, hashBytecode: bcHash)
+                if let e = r.error {
+                    print("\(path)\tERROR\t\(e)")
+                    status = 1
+                    break
+                }
+                bestParse = min(bestParse, r.parseMs)
+                bestCompile = min(bestCompile, r.compileMs)
+                bestTotal = min(bestTotal, r.parseMs + r.compileMs)
+                hash = r.bytecodeHash
+            }
+            if bcHash {
+                print("\(path)\t\(hash.map { String($0, radix: 16) } ?? "-")")
+            } else if bestTotal.isFinite {
+                print(String(format: "%@\tparse %.1f ms\tcompile %.1f ms\ttotal %.1f ms",
+                             (path as NSString).lastPathComponent, bestParse, bestCompile, bestTotal))
+            }
+        }
+        return status
+    }
     for path in paths {
         guard let src = try? String(contentsOfFile: path, encoding: .utf8) else {
             FileHandle.standardError.write("cannot read \(path)\n".data(using: .utf8)!)

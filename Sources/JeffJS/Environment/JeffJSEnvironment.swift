@@ -334,6 +334,16 @@ public final class JeffJSEnvironment {
         }
     }
 
+    /// Parse and compile `source` as a global script without running it or
+    /// consulting the bytecode cache. For parser benchmarks (jeffjs-cli
+    /// --parse-only): times in ms, an FNV-1a hash of the serialized bytecode
+    /// when `hashBytecode` is set, and the SyntaxError text on failure.
+    public func compileOnly(_ source: String, filename: String = "<eval>", hashBytecode: Bool = false)
+        -> (parseMs: Double, compileMs: Double, bytecodeHash: UInt64?, error: String?)
+    {
+        return context.compileOnlyForBench(input: source, filename: filename, hash: hashBytecode)
+    }
+
     /// Evaluate JavaScript that may contain async operations (import, fetch).
     /// Waits up to `timeout` seconds for pending promises to settle.
     public func evalAsync(_ source: String, filename: String = "<eval>", timeout: TimeInterval = 10) async -> JeffJSEvalResult {

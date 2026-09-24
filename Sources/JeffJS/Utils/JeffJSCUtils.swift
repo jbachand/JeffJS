@@ -70,7 +70,28 @@ struct DynBuf {
     // MARK: Put primitives
 
     /// Append a single byte. Mirrors `dbuf_putc` in QuickJS.
+    /// Inlined fast path for the two common cases (overwriting a rewound
+    /// buffer, appending within the reserved capacity); the rest, including
+    /// growth and the size limit, is `putU8Slow` (the original logic).
+    @inline(__always)
     mutating func putU8(_ val: UInt8) {
+        if !error {
+            if len < buf.count {
+                buf[len] = val
+                len += 1
+                return
+            }
+            if len < size {
+                buf.append(val)
+                len += 1
+                return
+            }
+        }
+        putU8Slow(val)
+    }
+
+    @inline(never)
+    mutating func putU8Slow(_ val: UInt8) {
         guard !error else { return }
         if len >= buf.count {
             ensureSpace(1)
@@ -91,6 +112,7 @@ struct DynBuf {
     /// (the `invalid` opcode, which never appears in valid bytecode) followed
     /// by (rawValue - 256). The compiler's resolve passes know how to read
     /// this encoding back via `JeffJSCompiler.readOpcodeFromBuf`.
+    @inline(__always)
     mutating func putOpcode(_ rawValue: UInt16) {
         if rawValue <= 255 {
             putU8(UInt8(rawValue))
@@ -103,6 +125,7 @@ struct DynBuf {
 
     /// Append a UInt16 in little-endian byte order.
     /// Mirrors `dbuf_put_u16` in QuickJS.
+    @inline(__always)
     mutating func putU16(_ val: UInt16) {
         putU8(UInt8(val & 0xFF))
         putU8(UInt8((val >> 8) & 0xFF))
@@ -110,6 +133,7 @@ struct DynBuf {
 
     /// Append a UInt32 in little-endian byte order.
     /// Mirrors `dbuf_put_u32` in QuickJS.
+    @inline(__always)
     mutating func putU32(_ val: UInt32) {
         putU8(UInt8(val & 0xFF))
         putU8(UInt8((val >> 8) & 0xFF))

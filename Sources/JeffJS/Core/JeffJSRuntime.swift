@@ -1175,6 +1175,30 @@ final class JeffJSRuntime {
         return addAtom(str: str, hash: hash, atomType: .JS_ATOM_TYPE_STRING)
     }
 
+    /// `findAtom(_:)` for a UTF-8 spelling that is not a String yet (the
+    /// tokenizer's identifiers, straight from the source buffer). Same hash,
+    /// chain and refcount as the String version; the String is only built
+    /// when the atom is new.
+    func findAtom(utf8 bytes: UnsafeBufferPointer<UInt8>) -> UInt32 {
+        if let f = bytes.first, f >= 0x30 && f <= 0x39 {
+            return findAtom(String(decoding: bytes, as: UTF8.self))
+        }
+        guard atomHashSize > 0, !atomHash.isEmpty else { return 0 }
+        var h: UInt32 = 0
+        for b in bytes { h = h &* 31 &+ UInt32(b) }
+        let hash = h & JS_ATOM_HASH_MASK
+        var atomIdx = atomHash[Int(hash) & (atomHashSize - 1)]
+        while atomIdx != 0 {
+            guard let atom = atomArray[Int(atomIdx)] else { break }
+            if atom.hash == hash && jeffJS_utf8Equal(atom.str, bytes) {
+                atom.refCount += 1
+                return atomIdx
+            }
+            atomIdx = atom.hashNext
+        }
+        return addAtom(str: String(decoding: bytes, as: UTF8.self), hash: hash, atomType: .JS_ATOM_TYPE_STRING)
+    }
+
     /// Sequence used to make every private atom spelling unique.
     private var privateAtomSeq: UInt32 = 0
 
@@ -1660,6 +1684,18 @@ func jeffJS_utf8Equals(_ str: String, _ js: JeffJSString) -> Bool {
     return it.next() == nil
 }
 
+
+/// True when `str`'s UTF-8 is exactly `bytes`.
+@inline(__always)
+func jeffJS_utf8Equal(_ str: String, _ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+    let u = str.utf8
+    guard u.count == bytes.count else { return false }
+    if let r = u.withContiguousStorageIfAvailable({ s -> Bool in
+        guard let a = s.baseAddress, let b = bytes.baseAddress else { return s.count == 0 }
+        return memcmp(a, b, s.count) == 0
+    }) { return r }
+    return u.elementsEqual(bytes)
+}
 
 /// True decimal array index, i.e. the canonical string form of a value in
 /// 0...JS_ATOM_MAX_INT: no sign, no leading zero (except "0" itself), no

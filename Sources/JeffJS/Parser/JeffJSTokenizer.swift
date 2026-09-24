@@ -58,18 +58,20 @@ struct JeffJSToken {
         type = 0
         ptr = 0
         numValue = 0
-        bigIntValue = nil
-        strValue = ""
+        // Once per token: skip the stores (and the release of the old value)
+        // for payload fields the previous token did not set.
+        if bigIntValue != nil { bigIntValue = nil }
+        if !strValue.isEmpty { strValue = "" }
         strSeparator = "\0"
         templateRawStart = 0
         templateRawEnd = 0
-        templateEscapeError = nil
+        if templateEscapeError != nil { templateEscapeError = nil }
         templateEscapeErrorPos = 0
         identAtom = 0
         identHasEscape = false
         identIsReserved = false
-        regexpBody = ""
-        regexpFlags = ""
+        if !regexpBody.isEmpty { regexpBody = "" }
+        if !regexpFlags.isEmpty { regexpFlags = "" }
     }
 }
 
@@ -119,12 +121,19 @@ class JeffJSParseState {
     /// The first syntax error message captured during parsing (nil if no error).
     var lastErrorMessage: String?
 
+    /// The atom table identifiers are interned into, when the context is a
+    /// real JeffJSContext. Cached once: going through the weak `ctx` per
+    /// identifier cost a weak load plus side-table retain/release each time.
+    /// The context (and so its runtime) outlives every parse it starts.
+    unowned(unsafe) var atomRuntime: JeffJSRuntime? = nil
+
     init(source: String, filename: String = "<input>", ctx: JeffJSTokenizerContext? = nil) {
         self.filename = filename
         self.ctx = ctx
         let data = Array(source.utf8)
         self.buf = data
         self.bufLen = data.count
+        if let c = ctx as? JeffJSContext { self.atomRuntime = c.rt }
     }
 
     init(buf: [UInt8], filename: String = "<input>", ctx: JeffJSTokenizerContext? = nil) {
@@ -132,6 +141,7 @@ class JeffJSParseState {
         self.ctx = ctx
         self.buf = buf
         self.bufLen = buf.count
+        if let c = ctx as? JeffJSContext { self.atomRuntime = c.rt }
     }
 }
 
@@ -775,6 +785,227 @@ extension JeffJSParseState {
         return (ident, hasEscape)
     }
 
+    /// An identifier or keyword starting with an ASCII identifier character.
+    /// All-ASCII spellings (almost every identifier) are matched against the
+    /// keywords and interned straight from the source bytes; an escape or a
+    /// non-ASCII character takes the general `parseIdent` path. Same tokens,
+    /// atoms and flags as `parseIdent` + `updateTokenIdent`.
+    @inline(__always)
+    func lexIdentifier() -> Bool {
+        let start = bufPtr
+        let end = bufLen
+        let result: Int = buf.withUnsafeBufferPointer { b -> Int in
+            var p = start + 1
+            while p < end {
+                let c = b[p]
+                if (c >= 0x61 && c <= 0x7A) || (c >= 0x41 && c <= 0x5A) ||
+                   (c >= 0x30 && c <= 0x39) || c == 0x5F || c == 0x24 {
+                    p += 1
+                } else if c == 0x5C || c >= 0x80 {
+                    return -1   // escape or non-ASCII: general path
+                } else {
+                    break
+                }
+            }
+            let len = p - start
+            let kw = JeffJSParseState.keywordToken(b, start, len)
+            if kw != 0 {
+                token.type = kw
+            } else {
+                token.type = JSTokenType.TOK_IDENT.rawValue
+                // (identHasEscape / identIsReserved stay false from reset():
+                // every strict-mode reserved word is in the keyword table.)
+                if let rt = atomRuntime {
+                    token.identAtom = rt.findAtom(utf8: UnsafeBufferPointer(rebasing: b[start ..< p]))
+                } else {
+                    token.identAtom = ctx?.findAtom(String(decoding: UnsafeBufferPointer(rebasing: b[start ..< p]), as: UTF8.self)) ?? 0
+                }
+            }
+            return p
+        }
+        if result < 0 {
+            let (ident, hasEscape) = parseIdent()
+            updateTokenIdent(ident, hasEscape: hasEscape)
+            return true
+        }
+        bufPtr = result
+        return true
+    }
+
+    /// Keyword token for the ASCII identifier `b[start ..< start+len]`, or 0.
+    /// Same table as `keywordTable` (checked by byte length, then first byte).
+    @inline(__always)
+    static func keywordToken(_ b: UnsafeBufferPointer<UInt8>, _ s: Int, _ len: Int) -> Int {
+        switch len {
+        case 2:
+            switch b[s] {
+            case 0x64: // d
+                if b[s + 1] == 0x6F { return JSTokenType.TOK_DO.rawValue } // do
+                return 0
+            case 0x69: // i
+                if b[s + 1] == 0x66 { return JSTokenType.TOK_IF.rawValue } // if
+                if b[s + 1] == 0x6E { return JSTokenType.TOK_IN.rawValue } // in
+                return 0
+            case 0x6F: // o
+                if b[s + 1] == 0x66 { return JSTokenType.TOK_OF.rawValue } // of
+                return 0
+            default: return 0
+            }
+        case 3:
+            switch b[s] {
+            case 0x66: // f
+                if b[s + 1] == 0x6F && b[s + 2] == 0x72 { return JSTokenType.TOK_FOR.rawValue } // for
+                return 0
+            case 0x6C: // l
+                if b[s + 1] == 0x65 && b[s + 2] == 0x74 { return JSTokenType.TOK_LET.rawValue } // let
+                return 0
+            case 0x6E: // n
+                if b[s + 1] == 0x65 && b[s + 2] == 0x77 { return JSTokenType.TOK_NEW.rawValue } // new
+                return 0
+            case 0x74: // t
+                if b[s + 1] == 0x72 && b[s + 2] == 0x79 { return JSTokenType.TOK_TRY.rawValue } // try
+                return 0
+            case 0x76: // v
+                if b[s + 1] == 0x61 && b[s + 2] == 0x72 { return JSTokenType.TOK_VAR.rawValue } // var
+                return 0
+            default: return 0
+            }
+        case 4:
+            switch b[s] {
+            case 0x63: // c
+                if b[s + 1] == 0x61 && b[s + 2] == 0x73 && b[s + 3] == 0x65 { return JSTokenType.TOK_CASE.rawValue } // case
+                return 0
+            case 0x65: // e
+                if b[s + 1] == 0x6C && b[s + 2] == 0x73 && b[s + 3] == 0x65 { return JSTokenType.TOK_ELSE.rawValue } // else
+                if b[s + 1] == 0x6E && b[s + 2] == 0x75 && b[s + 3] == 0x6D { return JSTokenType.TOK_ENUM.rawValue } // enum
+                return 0
+            case 0x6E: // n
+                if b[s + 1] == 0x75 && b[s + 2] == 0x6C && b[s + 3] == 0x6C { return JSTokenType.TOK_NULL.rawValue } // null
+                return 0
+            case 0x74: // t
+                if b[s + 1] == 0x72 && b[s + 2] == 0x75 && b[s + 3] == 0x65 { return JSTokenType.TOK_TRUE.rawValue } // true
+                if b[s + 1] == 0x68 && b[s + 2] == 0x69 && b[s + 3] == 0x73 { return JSTokenType.TOK_THIS.rawValue } // this
+                return 0
+            case 0x76: // v
+                if b[s + 1] == 0x6F && b[s + 2] == 0x69 && b[s + 3] == 0x64 { return JSTokenType.TOK_VOID.rawValue } // void
+                return 0
+            case 0x77: // w
+                if b[s + 1] == 0x69 && b[s + 2] == 0x74 && b[s + 3] == 0x68 { return JSTokenType.TOK_WITH.rawValue } // with
+                return 0
+            default: return 0
+            }
+        case 5:
+            switch b[s] {
+            case 0x61: // a
+                if b[s + 1] == 0x77 && b[s + 2] == 0x61 && b[s + 3] == 0x69 && b[s + 4] == 0x74 { return JSTokenType.TOK_AWAIT.rawValue } // await
+                return 0
+            case 0x62: // b
+                if b[s + 1] == 0x72 && b[s + 2] == 0x65 && b[s + 3] == 0x61 && b[s + 4] == 0x6B { return JSTokenType.TOK_BREAK.rawValue } // break
+                return 0
+            case 0x63: // c
+                if b[s + 1] == 0x61 && b[s + 2] == 0x74 && b[s + 3] == 0x63 && b[s + 4] == 0x68 { return JSTokenType.TOK_CATCH.rawValue } // catch
+                if b[s + 1] == 0x6C && b[s + 2] == 0x61 && b[s + 3] == 0x73 && b[s + 4] == 0x73 { return JSTokenType.TOK_CLASS.rawValue } // class
+                if b[s + 1] == 0x6F && b[s + 2] == 0x6E && b[s + 3] == 0x73 && b[s + 4] == 0x74 { return JSTokenType.TOK_CONST.rawValue } // const
+                return 0
+            case 0x66: // f
+                if b[s + 1] == 0x61 && b[s + 2] == 0x6C && b[s + 3] == 0x73 && b[s + 4] == 0x65 { return JSTokenType.TOK_FALSE.rawValue } // false
+                return 0
+            case 0x73: // s
+                if b[s + 1] == 0x75 && b[s + 2] == 0x70 && b[s + 3] == 0x65 && b[s + 4] == 0x72 { return JSTokenType.TOK_SUPER.rawValue } // super
+                return 0
+            case 0x74: // t
+                if b[s + 1] == 0x68 && b[s + 2] == 0x72 && b[s + 3] == 0x6F && b[s + 4] == 0x77 { return JSTokenType.TOK_THROW.rawValue } // throw
+                return 0
+            case 0x77: // w
+                if b[s + 1] == 0x68 && b[s + 2] == 0x69 && b[s + 3] == 0x6C && b[s + 4] == 0x65 { return JSTokenType.TOK_WHILE.rawValue } // while
+                return 0
+            case 0x79: // y
+                if b[s + 1] == 0x69 && b[s + 2] == 0x65 && b[s + 3] == 0x6C && b[s + 4] == 0x64 { return JSTokenType.TOK_YIELD.rawValue } // yield
+                return 0
+            default: return 0
+            }
+        case 6:
+            switch b[s] {
+            case 0x64: // d
+                if b[s + 1] == 0x65 && b[s + 2] == 0x6C && b[s + 3] == 0x65 && b[s + 4] == 0x74 && b[s + 5] == 0x65 { return JSTokenType.TOK_DELETE.rawValue } // delete
+                return 0
+            case 0x65: // e
+                if b[s + 1] == 0x78 && b[s + 2] == 0x70 && b[s + 3] == 0x6F && b[s + 4] == 0x72 && b[s + 5] == 0x74 { return JSTokenType.TOK_EXPORT.rawValue } // export
+                return 0
+            case 0x69: // i
+                if b[s + 1] == 0x6D && b[s + 2] == 0x70 && b[s + 3] == 0x6F && b[s + 4] == 0x72 && b[s + 5] == 0x74 { return JSTokenType.TOK_IMPORT.rawValue } // import
+                return 0
+            case 0x70: // p
+                if b[s + 1] == 0x75 && b[s + 2] == 0x62 && b[s + 3] == 0x6C && b[s + 4] == 0x69 && b[s + 5] == 0x63 { return JSTokenType.TOK_PUBLIC.rawValue } // public
+                return 0
+            case 0x72: // r
+                if b[s + 1] == 0x65 && b[s + 2] == 0x74 && b[s + 3] == 0x75 && b[s + 4] == 0x72 && b[s + 5] == 0x6E { return JSTokenType.TOK_RETURN.rawValue } // return
+                return 0
+            case 0x73: // s
+                if b[s + 1] == 0x77 && b[s + 2] == 0x69 && b[s + 3] == 0x74 && b[s + 4] == 0x63 && b[s + 5] == 0x68 { return JSTokenType.TOK_SWITCH.rawValue } // switch
+                if b[s + 1] == 0x74 && b[s + 2] == 0x61 && b[s + 3] == 0x74 && b[s + 4] == 0x69 && b[s + 5] == 0x63 { return JSTokenType.TOK_STATIC.rawValue } // static
+                return 0
+            case 0x74: // t
+                if b[s + 1] == 0x79 && b[s + 2] == 0x70 && b[s + 3] == 0x65 && b[s + 4] == 0x6F && b[s + 5] == 0x66 { return JSTokenType.TOK_TYPEOF.rawValue } // typeof
+                return 0
+            default: return 0
+            }
+        case 7:
+            switch b[s] {
+            case 0x64: // d
+                if b[s + 1] == 0x65 && b[s + 2] == 0x66 && b[s + 3] == 0x61 && b[s + 4] == 0x75 && b[s + 5] == 0x6C && b[s + 6] == 0x74 { return JSTokenType.TOK_DEFAULT.rawValue } // default
+                return 0
+            case 0x65: // e
+                if b[s + 1] == 0x78 && b[s + 2] == 0x74 && b[s + 3] == 0x65 && b[s + 4] == 0x6E && b[s + 5] == 0x64 && b[s + 6] == 0x73 { return JSTokenType.TOK_EXTENDS.rawValue } // extends
+                return 0
+            case 0x66: // f
+                if b[s + 1] == 0x69 && b[s + 2] == 0x6E && b[s + 3] == 0x61 && b[s + 4] == 0x6C && b[s + 5] == 0x6C && b[s + 6] == 0x79 { return JSTokenType.TOK_FINALLY.rawValue } // finally
+                return 0
+            case 0x70: // p
+                if b[s + 1] == 0x61 && b[s + 2] == 0x63 && b[s + 3] == 0x6B && b[s + 4] == 0x61 && b[s + 5] == 0x67 && b[s + 6] == 0x65 { return JSTokenType.TOK_PACKAGE.rawValue } // package
+                if b[s + 1] == 0x72 && b[s + 2] == 0x69 && b[s + 3] == 0x76 && b[s + 4] == 0x61 && b[s + 5] == 0x74 && b[s + 6] == 0x65 { return JSTokenType.TOK_PRIVATE.rawValue } // private
+                return 0
+            default: return 0
+            }
+        case 8:
+            switch b[s] {
+            case 0x61: // a
+                if b[s + 1] == 0x63 && b[s + 2] == 0x63 && b[s + 3] == 0x65 && b[s + 4] == 0x73 && b[s + 5] == 0x73 && b[s + 6] == 0x6F && b[s + 7] == 0x72 { return JSTokenType.TOK_ACCESSOR.rawValue } // accessor
+                return 0
+            case 0x63: // c
+                if b[s + 1] == 0x6F && b[s + 2] == 0x6E && b[s + 3] == 0x74 && b[s + 4] == 0x69 && b[s + 5] == 0x6E && b[s + 6] == 0x75 && b[s + 7] == 0x65 { return JSTokenType.TOK_CONTINUE.rawValue } // continue
+                return 0
+            case 0x64: // d
+                if b[s + 1] == 0x65 && b[s + 2] == 0x62 && b[s + 3] == 0x75 && b[s + 4] == 0x67 && b[s + 5] == 0x67 && b[s + 6] == 0x65 && b[s + 7] == 0x72 { return JSTokenType.TOK_DEBUGGER.rawValue } // debugger
+                return 0
+            case 0x66: // f
+                if b[s + 1] == 0x75 && b[s + 2] == 0x6E && b[s + 3] == 0x63 && b[s + 4] == 0x74 && b[s + 5] == 0x69 && b[s + 6] == 0x6F && b[s + 7] == 0x6E { return JSTokenType.TOK_FUNCTION.rawValue } // function
+                return 0
+            default: return 0
+            }
+        case 9:
+            switch b[s] {
+            case 0x69: // i
+                if b[s + 1] == 0x6E && b[s + 2] == 0x74 && b[s + 3] == 0x65 && b[s + 4] == 0x72 && b[s + 5] == 0x66 && b[s + 6] == 0x61 && b[s + 7] == 0x63 && b[s + 8] == 0x65 { return JSTokenType.TOK_INTERFACE.rawValue } // interface
+                return 0
+            case 0x70: // p
+                if b[s + 1] == 0x72 && b[s + 2] == 0x6F && b[s + 3] == 0x74 && b[s + 4] == 0x65 && b[s + 5] == 0x63 && b[s + 6] == 0x74 && b[s + 7] == 0x65 && b[s + 8] == 0x64 { return JSTokenType.TOK_PROTECTED.rawValue } // protected
+                return 0
+            default: return 0
+            }
+        case 10:
+            switch b[s] {
+            case 0x69: // i
+                if b[s + 1] == 0x6E && b[s + 2] == 0x73 && b[s + 3] == 0x74 && b[s + 4] == 0x61 && b[s + 5] == 0x6E && b[s + 6] == 0x63 && b[s + 7] == 0x65 && b[s + 8] == 0x6F && b[s + 9] == 0x66 { return JSTokenType.TOK_INSTANCEOF.rawValue } // instanceof
+                if b[s + 1] == 0x6D && b[s + 2] == 0x70 && b[s + 3] == 0x6C && b[s + 4] == 0x65 && b[s + 5] == 0x6D && b[s + 6] == 0x65 && b[s + 7] == 0x6E && b[s + 8] == 0x74 && b[s + 9] == 0x73 { return JSTokenType.TOK_IMPLEMENTS.rawValue } // implements
+                return 0
+            default: return 0
+            }
+        default: return 0
+        }
+    }
+
+
     /// Parse a \uXXXX or \u{XXXXX} escape sequence. bufPtr should be positioned
     /// right after the 'u'. Returns the code point or UInt32.max on error.
     func parseUnicodeEscape() -> UInt32 {
@@ -865,8 +1096,29 @@ extension JeffJSParseState {
     /// `sep` is the opening quote character (0x22 for ", 0x27 for ').
     /// bufPtr should be positioned right after the opening quote.
     func parseString(_ sep: UInt8) -> Bool {
-        var result = [UInt8]()
         token.strSeparator = Character(Unicode.Scalar(sep))
+        // Fast path: an all-ASCII literal without escapes is its own value.
+        let start = bufPtr
+        let end = bufLen
+        let close: Int = buf.withUnsafeBufferPointer { b -> Int in
+            var p = start
+            while p < end {
+                let c = b[p]
+                if c == sep { return p }
+                if c == 0x5C || c == 0x0A || c == 0x0D || c >= 0x80 { return -1 }
+                p += 1
+            }
+            return -1
+        }
+        if close >= 0 {
+            token.strValue = buf.withUnsafeBufferPointer {
+                String(decoding: UnsafeBufferPointer(rebasing: $0[start ..< close]), as: UTF8.self)
+            }
+            bufPtr = close + 1
+            token.type = JSTokenType.TOK_STRING.rawValue
+            return true
+        }
+        var result = [UInt8]()
 
         while bufPtr < bufLen {
             let c = buf[bufPtr]
@@ -1414,6 +1666,22 @@ extension JeffJSParseState {
             }
         }
 
+        // Plain decimal integers of up to 15 digits are exact doubles: no
+        // String round trip.
+        if !isFloat && bufPtr - startPtr <= 15 {
+            var v: Int64 = 0
+            var plain = true
+            for i in startPtr ..< bufPtr {
+                let d = buf[i]
+                if d < 0x30 || d > 0x39 { plain = false; break }
+                v = v &* 10 &+ Int64(d &- 0x30)
+            }
+            if plain {
+                token.numValue = Double(v)
+                token.type = JSTokenType.TOK_NUMBER.rawValue
+                return true
+            }
+        }
         let numStr = extractNumberString(startPtr, bufPtr)
         token.numValue = Double(numStr) ?? 0
         token.type = JSTokenType.TOK_NUMBER.rawValue
@@ -1726,9 +1994,7 @@ extension JeffJSParseState {
 
         // MARK: Identifiers and keywords
         case 0x41...0x5A, 0x61...0x7A, 0x24, 0x5F: // A-Z, a-z, $, _
-            let (ident, hasEscape) = parseIdent()
-            updateTokenIdent(ident, hasEscape: hasEscape)
-            return true
+            return lexIdentifier()
 
         case 0x5C: // backslash — could be unicode-escaped identifier
             if bufPtr + 1 < bufLen && buf[bufPtr + 1] == 0x75 { // \u

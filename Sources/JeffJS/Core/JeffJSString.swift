@@ -1151,6 +1151,16 @@ extension JeffJSString {
     /// Create a `JeffJSString` from a Swift `String`.
     /// Uses 8-bit storage when all scalars fit in Latin-1, otherwise 16-bit.
     convenience init(swiftString: String) {
+        // ASCII (string literals, property names): the UTF-8 bytes are the
+        // Latin-1 code units; no scalar array.
+        if let ascii = swiftString.utf8.withContiguousStorageIfAvailable({ u -> [UInt8]? in
+            var acc: UInt8 = 0
+            for b in u { acc |= b }
+            return acc < 0x80 ? Array(u) : nil
+        }), let buf = ascii {
+            self.init(refCount: 1, len: buf.count, isWideChar: false, storage: .str8(buf))
+            return
+        }
         let scalars = Array(swiftString.unicodeScalars)
         let needsWide = scalars.contains { $0.value > 0xFF }
 

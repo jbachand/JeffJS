@@ -3109,6 +3109,46 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         return executeBytecode(fb)
     }
 
+    /// Parse + compile `input` as a global script without running it and
+    /// without touching the bytecode cache (jeffjs-cli --parse-only). Returns
+    /// the parse and compile times in ms, the FNV-1a hash of the serialized
+    /// bytecode when `hash` is set (an identity check for compiler changes),
+    /// and the SyntaxError text on failure.
+    func compileOnlyForBench(input: String, filename: String, hash: Bool)
+        -> (parseMs: Double, compileMs: Double, bytecodeHash: UInt64?, error: String?)
+    {
+        JeffJSGCObjectHeader.activeRuntime = rt
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let parseState = JeffJSParseState(source: input, filename: filename, ctx: self)
+        parseState.allowHTMLComments = true
+        let fd = JeffJSFunctionDefCompiler()
+        fd.filename = rt.findAtom(filename)
+        fd.source = input
+        fd.sourceText = JeffJSSourceText(bytes: parseState.buf)
+        fd.sourceStart = 0
+        fd.sourceEnd = parseState.buf.count
+        let parser = JeffJSParser(s: parseState, fd: fd)
+        parser.parseProgram()
+        let t1 = CFAbsoluteTimeGetCurrent()
+        if parser.hasError || fd.byteCode.error {
+            return ((t1 - t0) * 1000, 0, nil, parseState.lastErrorMessage ?? "parse error")
+        }
+        guard let fb = JeffJSCompiler.createFunction(ctx: self, fd: fd) else {
+            return ((t1 - t0) * 1000, 0, nil, "compile failed")
+        }
+        let t2 = CFAbsoluteTimeGetCurrent()
+        var h: UInt64? = nil
+        if hash {
+            var x: UInt64 = 0xcbf29ce484222325
+            for b in JeffJSBytecodeSerializer.serialize(fb, rt: rt) {
+                x = (x ^ UInt64(b)) &* 0x100000001b3
+            }
+            h = x
+        }
+        _ = fb   // bench only: the bytecode (and its cpool) is simply dropped
+        return ((t1 - t0) * 1000, (t2 - t1) * 1000, h, nil)
+    }
+
     /// Execute a compiled function bytecode on the global object.
     /// Recursively sums bytecodeLen across a function and all nested functions in its cpool.
     static func totalBytecodeLen(_ fb: JeffJSFunctionBytecode) -> Int {

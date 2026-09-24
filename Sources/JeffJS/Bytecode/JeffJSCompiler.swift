@@ -130,7 +130,32 @@ struct JeffJSBytecodeVarDef {
 /// Extended function definition used by the compiler.  The parser builds this,
 /// then the compiler resolves variables and labels to produce final bytecode.
 /// Mirrors `JSFunctionDef` in QuickJS.
+/// `op? == .x` / `op? != .x` for the peephole passes' look-ahead opcodes.
+/// The generic `Optional ==` was an out-of-line call per comparison (the
+/// peephole chain in resolveLabels runs dozens per instruction).
+@inline(__always)
+func == (lhs: JeffJSOpcode?, rhs: JeffJSOpcode) -> Bool {
+    guard let l = lhs else { return false }
+    return l.rawValue == rhs.rawValue
+}
+
+@inline(__always)
+func != (lhs: JeffJSOpcode?, rhs: JeffJSOpcode) -> Bool {
+    guard let l = lhs else { return true }
+    return l.rawValue != rhs.rawValue
+}
+
 class JeffJSFunctionDefCompiler {
+    // -- Name lookup index for JeffJSCompiler.findLocalVar (large functions) --
+    /// `vars.count` / `scopes.count` when the index was built (-1: never).
+    var varLookupVarCount: Int = -1
+    var varLookupScopeCount: Int = -1
+    /// (scope << 32 | name) -> the first var named `name` in that scope's
+    /// linked list, i.e. what the list walk would find.
+    var scopeVarLookup: [UInt64: Int32] = [:]
+    /// name -> the lowest-index non-lexical (function-scoped) var.
+    var functionVarLookup: [JSAtom: Int32] = [:]
+
     /// Local slots holding the object of each enclosing `with` statement in
     /// THIS function, outermost first. Non-empty only while a `with` body is
     /// being parsed; a nested function starts with an empty stack, so its
@@ -159,7 +184,12 @@ class JeffJSFunctionDefCompiler {
     var evalFuncDeclNames: [JSAtom] = []
 
     // -- Parent linkage --
-    weak var parent: JeffJSFunctionDefCompiler?
+    /// Unowned, not weak: a parent owns its children (`childFunctions`) and
+    /// outlives every use of this link (parse and compile of one tree). A
+    /// weak reference gave every function definition a refcount side table,
+    /// so each of the parser's and compiler's retains/releases of `fd` took
+    /// the slow path (~10% of bundle parse+compile time).
+    unowned var parent: JeffJSFunctionDefCompiler? = nil
     var childFunctions: [JeffJSFunctionDefCompiler] = []
     /// Byte ranges of hoisted function declarations (fclosure + scope_put_var_init).
     /// Stored as (startOffset, endOffset) in byteCode. These are moved to the
@@ -591,8 +621,10 @@ struct JeffJSCompiler {
         // name through a scope_* opcode (or uses eval). Keeping too many
         // close_locs is safe (it is the previous behaviour); dropping a
         // needed one is not, hence the over-approximation.
-        let (descendantNames, descendantsMayEval) = collectDescendantNameRefs(fd)
-        let keepAllCloseLoc = descendantsMayEval || fd.hasEval || fd.isDirectOrIndirectEval
+        // Computed on first use: it scans every descendant's bytecode, and a
+        // function without lexical bindings (all of ES5 code) never asks.
+        var descendantRefs: (names: Set<JSAtom>, mayEval: Bool)? = nil
+        let ownEval = fd.hasEval || fd.isDirectOrIndirectEval
 
         // TDZ elimination pre-pass: record where each lexical local is
         // initialised (scope_put_var_init). A direct get/put that sits after
@@ -820,10 +852,12 @@ struct JeffJSCompiler {
             // -----------------------------------------------------------------
             case .close_loc:
                 let clIdx = Int(readU16(fd.byteCode.buf, operandBase))
-                if !keepAllCloseLoc, clIdx < fd.vars.count,
-                   !fd.vars[clIdx].isCaptured,
-                   !descendantNames.contains(fd.vars[clIdx].varName) {
-                    nopOut(fd: fd, pos: pos, size: instrSize)
+                if !ownEval, clIdx < fd.vars.count, !fd.vars[clIdx].isCaptured {
+                    if descendantRefs == nil { descendantRefs = collectDescendantNameRefs(fd) }
+                    if !descendantRefs!.mayEval,
+                       !descendantRefs!.names.contains(fd.vars[clIdx].varName) {
+                        nopOut(fd: fd, pos: pos, size: instrSize)
+                    }
                 }
 
             // -----------------------------------------------------------------
@@ -904,9 +938,17 @@ struct JeffJSCompiler {
                         // Only lexical bindings get a fresh binding per block
                         // entry; a `var` declared in the block is function
                         // scoped and must keep one shared binding.
-                        if fd.vars[varIdx].isCaptured
-                            || (fd.vars[varIdx].isLexical
-                                && (keepAllCloseLoc || descendantNames.contains(fd.vars[varIdx].varName))) {
+                        var mayBeCaptured = fd.vars[varIdx].isCaptured
+                        if !mayBeCaptured && fd.vars[varIdx].isLexical {
+                            if ownEval {
+                                mayBeCaptured = true
+                            } else {
+                                if descendantRefs == nil { descendantRefs = collectDescendantNameRefs(fd) }
+                                mayBeCaptured = descendantRefs!.mayEval
+                                    || descendantRefs!.names.contains(fd.vars[varIdx].varName)
+                            }
+                        }
+                        if mayBeCaptured {
                             // Emit close_loc(varIdx): opcode(1 byte) + u16(2 bytes)
                             closeLocBytes.append(UInt8(truncatingIfNeeded: JeffJSOpcode.close_loc.rawValue))
                             closeLocBytes.append(UInt8(varIdx & 0xFF))
@@ -1722,6 +1764,12 @@ struct JeffJSCompiler {
     private static func findLocalVar(fd: JeffJSFunctionDefCompiler,
                                       name: JSAtom,
                                       scopeLevel: Int) -> (Int, JeffJSVarDef)? {
+        // Every free name is looked up in each enclosing function, and both
+        // walks below are linear in the function's var count: index large
+        // functions (webpack/closure-compiler module scopes have thousands).
+        if fd.vars.count >= 24 {
+            return findLocalVarIndexed(fd: fd, name: name, scopeLevel: scopeLevel)
+        }
         // Walk scope chain from innermost to outermost
         var scope = scopeLevel
         var reachedVarScope = false
@@ -1752,6 +1800,55 @@ struct JeffJSCompiler {
             }
         }
         return nil
+    }
+
+    /// `findLocalVar` through a per-function index with the same answers:
+    /// the first match of each scope's list walk, then the first
+    /// function-scoped var. Rebuilt when vars or scopes were added since
+    /// (the compiler only flips `isCaptured`, which is read live).
+    private static func findLocalVarIndexed(fd: JeffJSFunctionDefCompiler,
+                                            name: JSAtom,
+                                            scopeLevel: Int) -> (Int, JeffJSVarDef)? {
+        if fd.varLookupVarCount != fd.vars.count || fd.varLookupScopeCount != fd.scopes.count {
+            buildVarLookup(fd)
+        }
+        var scope = scopeLevel
+        var reachedVarScope = false
+        while scope >= 0 && scope < fd.scopes.count {
+            if scope == 0 { reachedVarScope = true }
+            if let i = fd.scopeVarLookup[UInt64(scope) << 32 | UInt64(name)] {
+                return (Int(i), fd.vars[Int(i)])
+            }
+            scope = fd.scopes[scope].parent
+        }
+        if !reachedVarScope && fd.paramScope >= 0 { return nil }
+        if let i = fd.functionVarLookup[name] {
+            return (Int(i), fd.vars[Int(i)])
+        }
+        return nil
+    }
+
+    private static func buildVarLookup(_ fd: JeffJSFunctionDefCompiler) {
+        let vars = fd.vars
+        var byScope = [UInt64: Int32](minimumCapacity: vars.count)
+        for scope in 0 ..< fd.scopes.count {
+            var varIdx = fd.scopes[scope].first
+            var steps = 0
+            while varIdx >= 0 && varIdx < vars.count && steps <= vars.count {
+                let key = UInt64(scope) << 32 | UInt64(vars[varIdx].varName)
+                if byScope[key] == nil { byScope[key] = Int32(varIdx) }
+                varIdx = vars[varIdx].scopeNext
+                steps += 1
+            }
+        }
+        var byName = [JSAtom: Int32](minimumCapacity: vars.count)
+        for i in 0 ..< vars.count where !vars[i].isLexical {
+            if byName[vars[i].varName] == nil { byName[vars[i].varName] = Int32(i) }
+        }
+        fd.scopeVarLookup = byScope
+        fd.functionVarLookup = byName
+        fd.varLookupVarCount = vars.count
+        fd.varLookupScopeCount = fd.scopes.count
     }
 
     /// True when a direct access to lexical local `localIdx` at the current
@@ -2057,20 +2154,27 @@ struct JeffJSCompiler {
         var srcBuf: [UInt8] = []
         srcBuf.reserveCapacity(fd.byteCode.len)
         do {
+            // Copied in runs between NOPs (one append per run, not per
+            // instruction); same bytes as copying each non-NOP instruction.
             let raw = fd.byteCode.buf
             let rawLen = min(fd.byteCode.len, raw.count)
             var p = 0
+            var runStart = 0
             while p < rawLen {
                 guard let (cop, cwidth) = readOpcodeFromBuf(raw, p) else {
-                    srcBuf.append(raw[p]); p += 1; continue
+                    p += 1; continue
                 }
                 let csize = max(Int(jeffJSGetOpcodeInfo(cop).size) + (cwidth - 1), 1)
-                if cop != .nop {
-                    let end = min(p + csize, rawLen)
-                    srcBuf.append(contentsOf: raw[p ..< end])
+                if cop == .nop {
+                    if runStart < p { srcBuf.append(contentsOf: raw[runStart ..< p]) }
+                    p += csize
+                    runStart = p
+                    continue
                 }
                 p += csize
             }
+            let runEnd = min(p, rawLen)
+            if runStart < runEnd { srcBuf.append(contentsOf: raw[runStart ..< runEnd]) }
         }
         let srcLen = srcBuf.count
         var bc = DynBuf()
@@ -2880,7 +2984,7 @@ struct JeffJSCompiler {
     /// Runs after `resolveVariables` (scope opcodes resolved) and before
     /// `resolveLabels` (labels still present, no short opcodes yet).
     static func transformMethodCalls(fd: JeffJSFunctionDefCompiler) {
-        var buf = fd.byteCode.buf
+        let buf = fd.byteCode.buf
         let bcLen = fd.byteCode.len
 
         // Collect (get_field_pos, call_pos) pairs to patch.
@@ -2907,15 +3011,15 @@ struct JeffJSCompiler {
             pos += instrSize
         }
 
-        // Apply all patches in-place.
+        // Apply all patches in place (no whole-buffer copy when there are none).
+        if patches.isEmpty { return }
+        _ = consume buf
         for (getFieldPos, callPos) in patches {
             // get_field -> get_field2 (both 5 bytes: opcode + u32 atom)
-            buf[getFieldPos] = UInt8(JeffJSOpcode.get_field2.rawValue & 0xFF)
+            fd.byteCode.buf[getFieldPos] = UInt8(JeffJSOpcode.get_field2.rawValue & 0xFF)
             // call -> call_method (both 3 bytes: opcode + u16 argc)
-            buf[callPos] = UInt8(JeffJSOpcode.call_method.rawValue & 0xFF)
+            fd.byteCode.buf[callPos] = UInt8(JeffJSOpcode.call_method.rawValue & 0xFF)
         }
-
-        fd.byteCode.buf = buf
     }
 
     /// Scans forward from `startPos` to find a `call(argc)` that consumes
@@ -3622,29 +3726,40 @@ struct JeffJSCompiler {
         let len = bc.len
         var newPos = [Int](repeating: -1, count: len + 1)
         var out = [UInt8]()
-        out.reserveCapacity(len)
-        let nopByte = UInt8(truncatingIfNeeded: JeffJSOpcode.nop.rawValue)
 
-        // Pass 1: copy non-NOP instructions, recording new positions.
+        // Pass 1: record the new position of every instruction, then copy
+        // the non-NOP instructions in runs (nothing is copied when there is
+        // no NOP). Same result as appending instruction by instruction.
         var pos = 0
+        var outCount = 0
+        var runs: [(Int, Int)] = []
+        var runStart = 0
         while pos < len {
-            newPos[pos] = out.count
+            newPos[pos] = outCount
             guard pos < src.count, let (op, width) = readOpcodeFromBuf(src, pos) else {
                 // Unknown byte: keep it verbatim (never expected).
-                out.append(src[pos]); pos += 1; continue
+                _ = src[pos]
+                outCount += 1; pos += 1; continue
             }
-            if op == .nop { pos += 1; continue }
+            if op == .nop {
+                if runStart < pos { runs.append((runStart, pos)) }
+                pos += 1
+                runStart = pos
+                continue
+            }
             let size = max(Int(jeffJSGetOpcodeInfo(op).size) + (width - 1), 1)
             let end = min(pos + size, len)
-            out.append(contentsOf: src[pos..<end])
+            outCount += end - pos
             pos = end
         }
-        newPos[len] = out.count
-        if out.count == len {
+        newPos[len] = outCount
+        if outCount == len {
             // Nothing removed: keep positions as they are.
             return newPos
         }
-        _ = nopByte
+        if runStart < len { runs.append((runStart, len)) }
+        out.reserveCapacity(outCount)
+        for (a, b) in runs { out.append(contentsOf: src[a ..< b]) }
 
         // Pass 2: rewrite relative jump operands in the compacted buffer.
         pos = 0
@@ -3709,11 +3824,20 @@ struct JeffJSCompiler {
         // Build a set of all label target addresses for fast lookup.
         // After label resolution, fd.labels[i].addr holds the byte offset
         // in the output buffer where each label points.
-        var labelAddresses = Set<Int>()
-        for label in fd.labels {
-            if label.addr >= 0 {
-                labelAddresses.insert(label.addr)
+        // Sorted, walked with a cursor as `pos` only grows (a Set built per
+        // function showed in parse profiles).
+        var labelAddresses: [Int] = []
+        labelAddresses.reserveCapacity(fd.labels.count)
+        for label in fd.labels where label.addr >= 0 {
+            labelAddresses.append(label.addr)
+        }
+        labelAddresses.sort()
+        var labelCursor = 0
+        @inline(__always) func isLabelAddress(_ p: Int) -> Bool {
+            while labelCursor < labelAddresses.count && labelAddresses[labelCursor] < p {
+                labelCursor += 1
             }
+            return labelCursor < labelAddresses.count && labelAddresses[labelCursor] == p
         }
 
         let len = bc.len
@@ -3730,7 +3854,7 @@ struct JeffJSCompiler {
 
             // A jump target at this position ends the dead code region,
             // since live code can branch here.
-            if isDeadCode && labelAddresses.contains(pos) {
+            if isDeadCode && isLabelAddress(pos) {
                 isDeadCode = false
             }
 
