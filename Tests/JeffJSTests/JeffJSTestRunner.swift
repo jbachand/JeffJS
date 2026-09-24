@@ -312,6 +312,7 @@ struct JeffJSTestRunner {
             ("GeneratorInstantiation", { $0.testGeneratorInstantiation() }),
             ("ArrayIntegrity", { $0.testArrayIntegrity() }),
             ("DirectEval", { $0.testDirectEval() }),
+            ("SelectorMatchingCache", { $0.testSelectorMatchingCache() }),
         ]
     }
 

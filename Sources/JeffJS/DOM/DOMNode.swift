@@ -6,7 +6,11 @@ import Foundation
 public final class DOMNode: @unchecked Sendable, Identifiable {
     public let id = UUID()
     public let nodeType: NodeType
-    public internal(set) weak var parent: DOMNode?
+    /// Any change invalidates every node's selector-matching cache (the
+    /// language and ancestor filter below are functions of the parent chain).
+    public internal(set) weak var parent: DOMNode? {
+        didSet { domSelectorEpochStorage.pointee &+= 1 }
+    }
 
     /// Lock protecting `_children` from concurrent read/write races.
     private let childrenLock = NSLock()
@@ -31,7 +35,12 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
 
     // Element-specific
     public let tagName: String?
-    public internal(set) var attributes: [String: String]
+    /// Every mutation invalidates the selector-matching caches (`id`, `class`,
+    /// `lang` / `xml:lang` feed them; the observer does not read `oldValue`, so
+    /// in-place edits stay in place).
+    public internal(set) var attributes: [String: String] {
+        didSet { domSelectorEpochStorage.pointee &+= 1 }
+    }
 
     /// The element's namespace. `nil` means the HTML namespace — the common
     /// case, kept nil so nothing pays for a string it never reads.
@@ -227,6 +236,19 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
     private var _cachedClassNames: [String]?
     /// Cached ASCII-lowercased tag name, for case-insensitive HTML type selectors.
     private var _cachedLowercasedTagName: String??
+
+    // Selector-matching cache (`DOMNode+SelectorCache.swift`): the resolved
+    // language and the ancestor Bloom filter, valid while
+    // `selectorCacheEpoch` equals the global selector epoch.
+    var selectorCacheEpoch: UInt64 = 0
+    var selectorLanguageID: UInt32 = 0
+    var selectorInclusiveFilter = DOMAncestorFilter()
+
+    deinit {
+        // A node's death zeroes its children's weak `parent` without running
+        // their observers, so it invalidates the caches too.
+        domSelectorEpochStorage.pointee &+= 1
+    }
 
     private init(nodeType: NodeType, tagName: String?, attributes: [String: String], textContent: String?) {
         self.nodeType = nodeType

@@ -137,8 +137,52 @@ public struct CSSHasSelector: Sendable {
 /// A compound selector — all components must match the same element.
 public struct CSSCompoundSelector: Sendable {
     public let components: [CSSSelectorComponent]
+    /// Hashes of the identifiers an element must carry to match this compound
+    /// (tag name, id, classes, the primary subtag of a `:lang()` range, and
+    /// what every alternative of an `:is()` / `:where()` requires). When the
+    /// compound sits left of a descendant or child combinator they are looked
+    /// up in the subject's ancestor filter (`DOMAncestorFilter`) before any
+    /// ancestor is walked.
+    public let ancestorKeyHashes: [UInt32]
+
     public init(components: [CSSSelectorComponent]) {
         self.components = components
+        self.ancestorKeyHashes = Self.requiredKeyHashes(components)
+    }
+
+    private static func requiredKeyHashes(_ components: [CSSSelectorComponent]) -> [UInt32] {
+        var keys: [UInt32] = []
+        for component in components {
+            switch component {
+            case .element(let tag):
+                keys.append(DOMSelectorKeyHash.hash(DOMSelectorKeyHash.tagKind, tag))
+            case .id(let id):
+                keys.append(DOMSelectorKeyHash.hash(DOMSelectorKeyHash.idKind, id))
+            case .className(let cls):
+                keys.append(DOMSelectorKeyHash.hash(DOMSelectorKeyHash.classKind, cls))
+            case .pseudoLang(let ranges):
+                // Extended filtering compares the primary subtag exactly unless
+                // it is `*`; a single primary subtag shared by every range is a
+                // key the matching element's language must have.
+                guard let first = ranges.first else { break }
+                let primary = DOMSelectorKeyHash.primarySubtag(first)
+                if primary != "*", ranges.allSatisfy({ DOMSelectorKeyHash.primarySubtag($0) == primary }) {
+                    keys.append(DOMSelectorKeyHash.hash(DOMSelectorKeyHash.langKind, primary))
+                }
+            case .pseudoMatchesAny(let alternatives), .pseudoWhere(let alternatives):
+                // Keys every alternative's subject compound requires.
+                var common: Set<UInt32>?
+                for alternative in alternatives {
+                    let subjectKeys = Set(alternative.parts.last?.selector.ancestorKeyHashes ?? [])
+                    common = common.map { $0.intersection(subjectKeys) } ?? subjectKeys
+                    if common?.isEmpty == true { break }
+                }
+                if let common { keys.append(contentsOf: common.sorted()) }
+            default:
+                break
+            }
+        }
+        return keys
     }
 }
 
@@ -311,8 +355,35 @@ public struct CSSSelectorMatcher: Sendable {
 
     /// Test whether a complex selector matches a DOM node within a scope.
     public static func matches(_ selector: CSSComplexSelector, node: DOMNode, context: CSSMatchContext) -> Bool {
-        guard !selector.parts.isEmpty else { return false }
-        return matchesChain(selector.parts, selector.parts.count - 1, node: node, context: context)
+        let parts = selector.parts
+        let last = parts.count - 1
+        guard last >= 0 else { return false }
+        guard matchesCompound(parts[last].selector, node: node, context: context) else { return false }
+        if last == 0 { return true }
+        // Fast reject: a compound left of a descendant / child combinator must
+        // match an ancestor, so its identifiers must be in the ancestor filter.
+        if ancestorFilterRejects(parts, node: node) { return false }
+        return matchesCombinator(parts, last, node: node, context: context)
+    }
+
+    /// True when some compound that has to match an ancestor of `node` needs
+    /// an identifier no ancestor carries. A compound left of a sibling
+    /// combinator matches a sibling, not an ancestor, and is skipped; the
+    /// compounds further left of it are ancestors again.
+    @inline(__always)
+    private static func ancestorFilterRejects(_ parts: [CSSComplexSelector.Part], node: DOMNode) -> Bool {
+        var filter: DOMAncestorFilter?
+        var index = parts.count - 1
+        while index > 0 {
+            let combinator = parts[index].combinator ?? .descendant
+            index -= 1
+            guard combinator == .descendant || combinator == .child else { continue }
+            let keys = parts[index].selector.ancestorKeyHashes
+            if keys.isEmpty { continue }
+            if filter == nil { filter = node.ancestorFilterForMatching() }
+            for key in keys where !filter.unsafelyUnwrapped.mayContain(key) { return true }
+        }
+        return false
     }
 
     /// Right-to-left match with backtracking over descendant / general-sibling
@@ -326,7 +397,17 @@ public struct CSSSelectorMatcher: Sendable {
     ) -> Bool {
         guard matchesCompound(parts[index].selector, node: node, context: context) else { return false }
         if index == 0 { return true }
+        return matchesCombinator(parts, index, node: node, context: context)
+    }
 
+    /// The rest of `matchesChain` once `parts[index]` matched `node`: find the
+    /// element the combinator before it points at.
+    private static func matchesCombinator(
+        _ parts: [CSSComplexSelector.Part],
+        _ index: Int,
+        node: DOMNode,
+        context: CSSMatchContext
+    ) -> Bool {
         switch parts[index].combinator ?? .descendant {
         case .child:
             guard let parent = node.parent else { return false }
@@ -892,24 +973,70 @@ public struct CSSSelectorMatcher: Sendable {
 
     // MARK: - Linguistic Pseudo-class Helpers
 
+    /// `:lang()` against the element's cached language (`DOMNode.language`,
+    /// resolved once per selector epoch). Ranges are lowercased by the parser.
+    /// An element without a language, or with an explicitly unknown one
+    /// (`lang=""`), matches no range.
     private static func matchesLang(_ node: DOMNode, ranges: [String]) -> Bool {
-        var language: String?
-        var cursor: DOMNode? = node
-        while let current = cursor {
-            if let value = current.attributes["lang"] ?? current.attributes["xml:lang"], !value.isEmpty {
-                language = value.lowercased()
-                break
-            }
-            cursor = current.parent
+        node.refreshSelectorCache(DOMNode.selectorEpoch)
+        let id = node.selectorLanguageID
+        let language: String
+        switch id {
+        case DOMLanguageTable.none, DOMLanguageTable.unknown:
+            return false
+        case DOMLanguageTable.uncached:
+            guard let resolved = node.uncachedLanguage(), !resolved.isEmpty else { return false }
+            language = resolved
+        default:
+            language = DOMLanguageTable.shared.tag(id)
         }
-        guard let language else { return false }
-        for range in ranges {
-            let candidate = range.lowercased()
-            if candidate == "*" { return true }
-            if language == candidate { return true }
-            if language.hasPrefix(candidate + "-") { return true }
-        }
+        for range in ranges where languageRange(range, matches: language) { return true }
         return false
+    }
+
+    /// RFC 4647 §3.3.2 extended filtering (Selectors 4 §7.2), both sides
+    /// lowercased: `en` matches `en` and `en-US`, `de-DE` matches `de-Latn-DE`,
+    /// `*-CH` matches `de-CH` and `fr-CH`, `*` matches any language.
+    static func languageRange(_ range: String, matches language: String) -> Bool {
+        if range == "*" { return true }
+        var range = range, language = language
+        return range.withUTF8 { r in language.withUTF8 { l in extendedFilter(r, l) } }
+    }
+
+    /// Extended filtering over UTF-8 bytes, without allocating: subtags are
+    /// `-`-separated runs, compared bytewise (both sides are lowercased).
+    private static func extendedFilter(_ r: UnsafeBufferPointer<UInt8>, _ l: UnsafeBufferPointer<UInt8>) -> Bool {
+        let dash = UInt8(ascii: "-"), star = UInt8(ascii: "*")
+        @inline(__always) func end(_ b: UnsafeBufferPointer<UInt8>, _ start: Int) -> Int {
+            var i = start
+            while i < b.count && b[i] != dash { i += 1 }
+            return i
+        }
+        @inline(__always) func same(_ rs: Int, _ re: Int, _ ls: Int, _ le: Int) -> Bool {
+            guard re - rs == le - ls else { return false }
+            var i = 0
+            while i < re - rs { if r[rs + i] != l[ls + i] { return false }; i += 1 }
+            return true
+        }
+        // First subtags: equal, or the range's is `*`.
+        let rEnd0 = end(r, 0), lEnd0 = end(l, 0)
+        let rangeStar0 = rEnd0 == 1 && r[0] == star
+        if !rangeStar0 && !same(0, rEnd0, 0, lEnd0) { return false }
+        var rs = rEnd0 + 1, ls = lEnd0 + 1     // start of the next subtag (> count: none)
+        while rs <= r.count {
+            let re = end(r, rs)
+            if re - rs == 1 && r[rs] == star { rs = re + 1; continue }
+            // The range subtag must occur later in the tag, stopping at a singleton.
+            while true {
+                guard ls <= l.count else { return false }
+                let le = end(l, ls)
+                if same(rs, re, ls, le) { ls = le + 1; break }
+                if le - ls == 1 { return false }
+                ls = le + 1
+            }
+            rs = re + 1
+        }
+        return true
     }
 
     /// `:dir()` — nearest `dir` attribute, defaulting to ltr. `dir=auto` is
@@ -1517,8 +1644,9 @@ public struct CSSSelectorParser: Sendable {
             let (a, b) = parseNthExpression(trimmedArg)
             return .pseudoNthLastOfType(a, b)
         case "lang":
+            // Language ranges compare case-insensitively: stored lowercased.
             let ranges = splitTopLevel(trimmedArg, separator: ",")
-                .map { unquote($0.trimmingCharacters(in: .whitespaces)) }
+                .map { unquote($0.trimmingCharacters(in: .whitespaces)).lowercased() }
                 .filter { !$0.isEmpty }
             guard !ranges.isEmpty else {
                 valid = false
