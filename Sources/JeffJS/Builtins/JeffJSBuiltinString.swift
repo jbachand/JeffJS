@@ -927,6 +927,30 @@ struct JeffJSBuiltinString {
 
     // MARK: - Regex-Delegating Methods
 
+    /// `fn.call(thisVal, ToString(this), ...extra)` for the @@match/@@replace/…
+    /// delegations. `fn` (from getProperty) and the string are owned here and
+    /// released after the call: callees borrow their arguments, so both used to
+    /// leak once per call (the string kept every input of a regex replace alive).
+    private static func delegate(_ ctx: JeffJSContext, _ fn: JeffJSValue, thisVal: JeffJSValue,
+                                 this: JeffJSValue, extra: [JeffJSValue] = []) -> JeffJSValue {
+        let str = ctx.toString(this)
+        if str.isException { fn.freeValue(); return .exception }
+        let r = ctx.callFunction(fn, thisVal: thisVal, args: [str] + extra)
+        str.freeValue()
+        fn.freeValue()
+        return r
+    }
+
+    /// `body(ToString(this))` for the direct RegExp fallbacks, releasing the string.
+    private static func withThisString(_ ctx: JeffJSContext, _ this: JeffJSValue,
+                                       _ body: (JeffJSValue) -> JeffJSValue) -> JeffJSValue {
+        let str = ctx.toString(this)
+        if str.isException { return .exception }
+        let r = body(str)
+        str.freeValue()
+        return r
+    }
+
     /// `String.prototype.match(regexp)`
     static func match(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         if this.isNull || this.isUndefined {
@@ -938,22 +962,23 @@ struct JeffJSBuiltinString {
             let matcher = ctx.getProperty(obj: regexp, atom: JeffJSAtomConstants.Symbol_match)
             if matcher.isException { return .exception }
             if !matcher.isNullOrUndefined {
-                return ctx.callFunction(matcher, thisVal: regexp, args: [ctx.toString(this)])
+                return delegate(ctx, matcher, thisVal: regexp, this: this)
             }
             // Direct fallback: if this is a RegExp, call [@@match] logic directly
             if let regexpObj = regexp.toObject(),
                regexpObj.classID == JeffJSClassID.regexp.rawValue {
-                return js_regexp_Symbol_match(ctx: ctx, this: regexp, argv: [ctx.toString(this)])
+                return withThisString(ctx, this) { js_regexp_Symbol_match(ctx: ctx, this: regexp, argv: [$0]) }
             }
         }
         // Create a RegExp from the argument and call its Symbol.match
         let rx = ctx.newRegExp(pattern: regexp, flags: ctx.newStringValue(""))
         if rx.isException { return .exception }
+        defer { rx.freeValue() }
         let matchFn = ctx.getProperty(obj: rx, atom: JeffJSAtomConstants.Symbol_match)
         if !matchFn.isException && !matchFn.isNullOrUndefined {
-            return ctx.callFunction(matchFn, thisVal: rx, args: [ctx.toString(this)])
+            return delegate(ctx, matchFn, thisVal: rx, this: this)
         }
-        return js_regexp_Symbol_match(ctx: ctx, this: rx, argv: [ctx.toString(this)])
+        return withThisString(ctx, this) { js_regexp_Symbol_match(ctx: ctx, this: rx, argv: [$0]) }
     }
 
     /// `String.prototype.matchAll(regexp)`
@@ -977,19 +1002,20 @@ struct JeffJSBuiltinString {
             let matcher = ctx.getProperty(obj: regexp, atom: JeffJSAtomConstants.Symbol_matchAll)
             if matcher.isException { return .exception }
             if !matcher.isNullOrUndefined {
-                return ctx.callFunction(matcher, thisVal: regexp, args: [ctx.toString(this)])
+                return delegate(ctx, matcher, thisVal: regexp, this: this)
             }
             // Direct fallback: if this is a RegExp, call [@@matchAll] logic directly
             if let regexpObj = regexp.toObject(),
                regexpObj.classID == JeffJSClassID.regexp.rawValue {
-                return js_regexp_Symbol_matchAll(ctx: ctx, this: regexp, argv: [ctx.toString(this)])
+                return withThisString(ctx, this) { js_regexp_Symbol_matchAll(ctx: ctx, this: regexp, argv: [$0]) }
             }
         }
         let rx = ctx.newRegExp(pattern: regexp, flags: ctx.newStringValue("g"))
         if rx.isException { return .exception }
+        defer { rx.freeValue() }
         let matchAllFn = ctx.getProperty(obj: rx, atom: JeffJSAtomConstants.Symbol_matchAll)
         if matchAllFn.isException { return .exception }
-        return ctx.callFunction(matchAllFn, thisVal: rx, args: [ctx.toString(this)])
+        return delegate(ctx, matchAllFn, thisVal: rx, this: this)
     }
 
     /// `String.prototype.search(regexp)`
@@ -1002,22 +1028,23 @@ struct JeffJSBuiltinString {
             let searcher = ctx.getProperty(obj: regexp, atom: JeffJSAtomConstants.Symbol_search)
             if searcher.isException { return .exception }
             if !searcher.isNullOrUndefined {
-                return ctx.callFunction(searcher, thisVal: regexp, args: [ctx.toString(this)])
+                return delegate(ctx, searcher, thisVal: regexp, this: this)
             }
             // Direct fallback: if this is a RegExp, call [@@search] logic directly
             if let regexpObj = regexp.toObject(),
                regexpObj.classID == JeffJSClassID.regexp.rawValue {
-                return js_regexp_Symbol_search(ctx: ctx, this: regexp, argv: [ctx.toString(this)])
+                return withThisString(ctx, this) { js_regexp_Symbol_search(ctx: ctx, this: regexp, argv: [$0]) }
             }
         }
         let rx = ctx.newRegExp(pattern: regexp, flags: ctx.newStringValue(""))
         if rx.isException { return .exception }
+        defer { rx.freeValue() }
         // Try Symbol.search, then fall back to direct call
         let searchFn = ctx.getProperty(obj: rx, atom: JeffJSAtomConstants.Symbol_search)
         if !searchFn.isException && !searchFn.isNullOrUndefined {
-            return ctx.callFunction(searchFn, thisVal: rx, args: [ctx.toString(this)])
+            return delegate(ctx, searchFn, thisVal: rx, this: this)
         }
-        return js_regexp_Symbol_search(ctx: ctx, this: rx, argv: [ctx.toString(this)])
+        return withThisString(ctx, this) { js_regexp_Symbol_search(ctx: ctx, this: rx, argv: [$0]) }
     }
 
     /// `String.prototype.replace(searchValue, replaceValue)`
@@ -1033,14 +1060,14 @@ struct JeffJSBuiltinString {
             let replacer = ctx.getProperty(obj: searchValue, atom: JeffJSAtomConstants.Symbol_replace)
             if replacer.isException { return .exception }
             if !replacer.isNullOrUndefined {
-                return ctx.callFunction(replacer, thisVal: searchValue,
-                                        args: [ctx.toString(this), replaceValue])
+                return delegate(ctx, replacer, thisVal: searchValue, this: this, extra: [replaceValue])
             }
             // Direct fallback: if this is a RegExp, call [@@replace] logic directly
             if let searchObj = searchValue.toObject(),
                searchObj.classID == JeffJSClassID.regexp.rawValue {
-                return js_regexp_Symbol_replace(ctx: ctx, this: searchValue,
-                                                argv: [ctx.toString(this), replaceValue])
+                return withThisString(ctx, this) {
+                    js_regexp_Symbol_replace(ctx: ctx, this: searchValue, argv: [$0, replaceValue])
+                }
             }
         }
 
@@ -1061,14 +1088,20 @@ struct JeffJSBuiltinString {
         let functionalReplace = ctx.isFunction(replaceValue)
         let replaceStr: [UInt16]
         if functionalReplace {
+            // The callee borrows its arguments: the matched string, the result
+            // and its ToString are ours to release.
+            let matchedVal = makeString(ctx: ctx, utf16: searchStr)
             let replResult = ctx.callFunction(replaceValue, thisVal: .undefined,
-                                              args: [makeString(ctx: ctx, utf16: searchStr),
+                                              args: [matchedVal,
                                                      JeffJSValue.newInt32(Int32(pos)),
                                                      strVal])
+            matchedVal.freeValue()
             if replResult.isException { return .exception }
             let rs = ctx.toString(replResult)
+            replResult.freeValue()
             if rs.isException { return .exception }
             replaceStr = ctx.toUTF16Array(rs)
+            rs.freeValue()
         } else {
             let rv = ctx.toString(replaceValue)
             if rv.isException { return .exception }
@@ -1110,14 +1143,14 @@ struct JeffJSBuiltinString {
             let replacer = ctx.getProperty(obj: searchValue, atom: JeffJSAtomConstants.Symbol_replace)
             if replacer.isException { return .exception }
             if !replacer.isNullOrUndefined {
-                return ctx.callFunction(replacer, thisVal: searchValue,
-                                        args: [ctx.toString(this), replaceValue])
+                return delegate(ctx, replacer, thisVal: searchValue, this: this, extra: [replaceValue])
             }
             // Direct fallback: if this is a RegExp, call [@@replace] logic directly
             if let searchObj = searchValue.toObject(),
                searchObj.classID == JeffJSClassID.regexp.rawValue {
-                return js_regexp_Symbol_replace(ctx: ctx, this: searchValue,
-                                                argv: [ctx.toString(this), replaceValue])
+                return withThisString(ctx, this) {
+                    js_regexp_Symbol_replace(ctx: ctx, this: searchValue, argv: [$0, replaceValue])
+                }
             }
         }
 
@@ -1150,14 +1183,18 @@ struct JeffJSBuiltinString {
             result.append(contentsOf: str[prevEnd..<pos])
 
             if functionalReplace {
+                let matchedVal = makeString(ctx: ctx, utf16: searchStr)
                 let replResult = ctx.callFunction(replaceValue, thisVal: .undefined,
-                                                  args: [makeString(ctx: ctx, utf16: searchStr),
+                                                  args: [matchedVal,
                                                          JeffJSValue.newInt32(Int32(pos)),
                                                          strVal])
+                matchedVal.freeValue()
                 if replResult.isException { return .exception }
                 let rs = ctx.toString(replResult)
+                replResult.freeValue()
                 if rs.isException { return .exception }
                 result.append(contentsOf: ctx.toUTF16Array(rs))
+                rs.freeValue()
             } else {
                 let sub = getSubstitution(ctx: ctx, matched: searchStr, str: str,
                                           position: pos, captures: [],
@@ -1184,13 +1221,13 @@ struct JeffJSBuiltinString {
             let splitter = ctx.getProperty(obj: separator, atom: JeffJSAtomConstants.Symbol_split)
             if splitter.isException { return .exception }
             if !splitter.isNullOrUndefined {
-                return ctx.callFunction(splitter, thisVal: separator,
-                                        args: [ctx.toString(this), limitArg])
+                return delegate(ctx, splitter, thisVal: separator, this: this, extra: [limitArg])
             }
             if let sepObj = separator.toObject(),
                sepObj.classID == JeffJSClassID.regexp.rawValue {
-                return js_regexp_Symbol_split(ctx: ctx, this: separator,
-                                              argv: [ctx.toString(this), limitArg])
+                return withThisString(ctx, this) {
+                    js_regexp_Symbol_split(ctx: ctx, this: separator, argv: [$0, limitArg])
+                }
             }
         }
         let strVal = ctx.toString(this)

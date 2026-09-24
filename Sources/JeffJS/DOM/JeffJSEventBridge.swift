@@ -690,7 +690,7 @@ final class JeffJSEventBridge {
         defer { global.freeValue() }
         let target = rawTarget.isObject ? rawTarget : global
 
-        let path = buildEventPath(ctx: ctx, from: target, global: global)
+        let path = buildEventPath(ctx: ctx, from: target, global: global, type: type)
         let frame = JeffJSEventDispatchFrame(event: event.dupValue(), path: path)
         dispatchStack.append(frame)
 
@@ -897,20 +897,29 @@ final class JeffJSEventBridge {
     /// ancestors; and for a node in the page document, `document` then
     /// `window`. `document`'s path is [document, window]; `window`'s and any
     /// non-node target's is just the target.
-    private func buildEventPath(ctx: JeffJSContext, from target: JeffJSValue, global: JeffJSValue) -> [JeffJSValue] {
+    ///
+    /// HTML §7.2.1 (Document's "get the parent"): a `load` event stops at the
+    /// document — a `<script>`/`<img>`/`<iframe>` load never reaches window's
+    /// capture listeners. It used to: web-vitals' `whenReady` (netflix.com)
+    /// re-registers a capturing window `load` listener every time one fires
+    /// before `readyState` is "complete", so each subresource load doubled
+    /// them — a 60 s+ main-thread hang and gigabytes of closures.
+    private func buildEventPath(ctx: JeffJSContext, from target: JeffJSValue, global: JeffJSValue,
+                                type: String = "") -> [JeffJSValue] {
         var path: [JeffJSValue] = [target.dupValue()]
         if target == global { return path }
+        let reachesWindow = type != "load"
 
         let docVal = documentValue(ctx: ctx, global: global)
         defer { docVal?.freeValue() }
         if let docVal, target == docVal {
-            path.append(global.dupValue())
+            if reachesWindow { path.append(global.dupValue()) }
             return path
         }
 
         guard let dom = domBridge, let node = dom.extractNode(from: target) else { return path }
         if node === dom.root {
-            path.append(global.dupValue())
+            if reachesWindow { path.append(global.dupValue()) }
             return path
         }
         var cursor = node.parent
@@ -918,7 +927,7 @@ final class JeffJSEventBridge {
             if ancestor === dom.root {
                 if let docVal {
                     path.append(docVal.dupValue())
-                    path.append(global.dupValue())
+                    if reachesWindow { path.append(global.dupValue()) }
                 }
                 break
             }
@@ -1040,16 +1049,21 @@ final class JeffJSEventBridge {
         if nodeID.isException { ctx.getException().freeValue() }
         nodeID.freeValue()
 
-        let existingKey = ctx.getPropertyStr(obj: value, name: "__nativeEventTargetKey")
-        if existingKey.isString, let key = ctx.toSwiftString(existingKey) {
-            existingKey.freeValue()
-            return key
+        // The key must be an *own* property: read through the prototype chain,
+        // every object inheriting from a keyed one (Closure/reCAPTCHA event
+        // targets, `Object.create(target)`) shared its listener list — dispatch
+        // on one ran them all, and handlers that re-register grew the list
+        // quadratically (netflix.com hung 60+ s).
+        let atom = ctx.rt.findAtom("__nativeEventTargetKey")
+        if let obj = value.toObject() {
+            let own = obj.getOwnPropertyValue(atom: atom)
+            if own.isString, let key = ctx.toSwiftString(own) {
+                ctx.rt.freeAtom(atom)
+                return key
+            }
         }
-        if existingKey.isException { ctx.getException().freeValue() }
-        existingKey.freeValue()
 
         let newKey = "object:\(UUID().uuidString)"
-        let atom = ctx.rt.findAtom("__nativeEventTargetKey")
         let keyVal = ctx.newStringValue(newKey)
         _ = ctx.definePropertyValue(obj: value, atom: atom, value: keyVal, flags: JS_PROP_CONFIGURABLE)
         keyVal.freeValue()   // borrowed by definePropertyValue
