@@ -3,12 +3,14 @@ import PackageDescription
 
 let package = Package(
     name: "JeffJS",
+    // iOS 18 / macOS 15 for the Synchronization module (`Atomic`, `Mutex`):
+    // the DOM's cross-thread state (DOMNode.swift threading contract).
     platforms: [
-        .iOS(.v16),
-        .macOS(.v13),
-        .watchOS(.v9),
-        .tvOS(.v16),
-        .visionOS(.v1),
+        .iOS("18.0"),
+        .macOS("15.0"),
+        .watchOS("11.0"),
+        .tvOS("18.0"),
+        .visionOS("2.0"),
     ],
     products: [
         .library(name: "JeffJS", targets: ["JeffJS"]),

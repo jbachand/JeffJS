@@ -1,45 +1,151 @@
 import Foundation
+import Synchronization
 
 // MARK: - DOM Node
+//
+// Threading contract
+// ------------------
+// One mutating thread; any number of reader threads may call the matching,
+// attribute, children, parent and text getters concurrently and observe a
+// consistent snapshot per call.
+//
+// * Everything a reader can observe that changes after a node is created lives
+//   in `state`, a `Mutex` (os_unfair_lock) per node: parent, children,
+//   attributes (with their order and aliases), text data, quirks mode, the
+//   cached `id`, the lazily built class tokens and the selector-matching cache
+//   entry (`DOMNode+SelectorCache.swift`). A getter takes the lock once, reads
+//   (or copies out a copy-on-write value: an array or dictionary snapshot the
+//   writer can no longer change) and releases it. Hot matching reads (`hasClass`,
+//   `idAttribute`, `attributeValue(_:)`) look up in place under the lock, so they
+//   neither allocate nor retain the collection. No getter holds two nodes' locks
+//   at once; the writer never does either, so there is no lock order to break.
+// * Lazily built caches (class tokens, selector-cache entries) are built into
+//   a local outside the lock and published under it only if their input has
+//   not changed since (class tokens: `classGeneration`; selector entries: the
+//   global selector epoch, an `Atomic` bumped with release ordering *after* the
+//   mutation it announces and loaded with acquire ordering by readers). A read
+//   racing a write therefore sees the state before or after it, never a mix
+//   within one call, and a stale cache entry is never trusted under a newer epoch.
+// * `nodeType`, `tagName`, `lowercasedTagName` and `id` are immutable;
+//   `namespaceURI` and `isDocumentType` are set by the factories before a node
+//   is inserted anywhere (insertion publishes them through the parent's lock).
+// * Script-only bookkeeping (`nodeDocument`, `scriptAlreadyStarted`,
+//   `scriptNonBlocking`) is touched by the mutating thread only.
 
 /// A node in the parsed HTML document tree.
 public final class DOMNode: @unchecked Sendable, Identifiable {
     public let id = UUID()
     public let nodeType: NodeType
-    /// Any change invalidates every node's selector-matching cache (the
-    /// language and ancestor filter below are functions of the parent chain).
-    public internal(set) weak var parent: DOMNode? {
-        didSet { domSelectorEpochStorage.pointee &+= 1 }
+
+    /// The reader-visible mutable state, guarded by one lock per node (see the
+    /// threading contract above).
+    struct State {
+        /// Any change invalidates every node's selector-matching cache (the
+        /// language and ancestor filter are functions of the parent chain).
+        weak var parent: DOMNode?
+        var children: [DOMNode] = []
+        var attributes: [String: String]
+        /// Attribute names in the order they were added (see `orderedAttributeNames`).
+        var attributeOrder: [String] = []
+        var aliasAttributeKeys: Set<String> = []
+        var textContent: String?
+        var quirksMode: QuirksMode = .noQuirks
+        /// `attributes["id"]`, kept in step with every attribute write so the
+        /// hot `#id` test does not hash a key.
+        var idValue: String?
+        /// Lazily built class tokens; nil until built after the last `class` change.
+        var classSet: Set<String>?
+        var classNames: [String]?
+        /// Bumped on every possible `class` change: a lazy token build publishes
+        /// its result only if this has not moved since it read the attribute.
+        var classGeneration: UInt64 = 0
+        /// Selector-matching cache (`DOMNode+SelectorCache.swift`).
+        var selectorCache = DOMSelectorCacheEntry()
+
+        init(attributes: [String: String], textContent: String?) {
+            self.attributes = attributes
+            self.textContent = textContent
+            self.idValue = attributes["id"]
+        }
+
+        @inline(__always)
+        mutating func invalidateClasses() {
+            classSet = nil
+            classNames = nil
+            classGeneration &+= 1
+        }
+
+        /// Keep the derived caches in step after `key` (lowercased) changed.
+        @inline(__always)
+        mutating func attributeDidChange(_ key: String) {
+            if key == "id" {
+                idValue = attributes["id"]
+            } else if key == "class" {
+                invalidateClasses()
+            }
+        }
+
+        /// After the whole dictionary was replaced or several keys changed.
+        mutating func attributesReplaced() {
+            idValue = attributes["id"]
+            invalidateClasses()
+        }
     }
 
-    /// Lock protecting `_children` from concurrent read/write races.
-    private let childrenLock = NSLock()
-    private var _children: [DOMNode] = []
+    let state: Mutex<State>
 
-    /// Thread-safe accessor for the children array.
-    /// Reading returns a snapshot; mutations must go through
-    /// `appendChild`, `removeChild`, or `clearChildren`.
-    public internal(set) var children: [DOMNode] {
-        get {
-            childrenLock.lock()
-            let snapshot = _children
-            childrenLock.unlock()
-            return snapshot
-        }
+    /// The selector-cache entry's epoch and language in one word, written
+    /// with the entry (under `state`'s lock) and read lock-free by `:lang()`
+    /// (`DOMNode+SelectorCache.swift`). 0 = no entry.
+    let selectorLanguageStamp = Atomic<UInt64>(0)
+
+    /// The parent node (weak). Any change bumps the selector epoch.
+    public internal(set) var parent: DOMNode? {
+        get { state.withLock { $0.parent } }
         set {
-            childrenLock.lock()
-            _children = newValue
-            childrenLock.unlock()
+            state.withLock { $0.parent = newValue }
+            DOMNode.bumpSelectorEpoch()
         }
+    }
+
+    /// A snapshot of the children. Mutations go through `appendChild`,
+    /// `removeChild`, `insertChild`, `replaceChild` or `clearChildren`.
+    public internal(set) var children: [DOMNode] {
+        get { state.withLock { $0.children } }
+        set { state.withLock { $0.children = newValue } }
     }
 
     // Element-specific
     public let tagName: String?
-    /// Every mutation invalidates the selector-matching caches (`id`, `class`,
-    /// `lang` / `xml:lang` feed them; the observer does not read `oldValue`, so
-    /// in-place edits stay in place).
+    /// ASCII-lowercased tag name, for case-insensitive HTML type selectors.
+    /// Elements created with `preserveCase` (SVG's `linearGradient`,
+    /// `clipPath`, ...) keep their authored spelling in `tagName`.
+    public let lowercasedTagName: String?
+
+    /// A snapshot of the attributes. Every mutation invalidates the
+    /// selector-matching caches (`id`, `class`, `lang` / `xml:lang` feed them).
+    /// Prefer `attributeValue(_:)` for a single lookup (no dictionary retain).
     public internal(set) var attributes: [String: String] {
-        didSet { domSelectorEpochStorage.pointee &+= 1 }
+        get { state.withLock { $0.attributes } }
+        set {
+            state.withLock {
+                $0.attributes = newValue
+                $0.attributesReplaced()
+            }
+            DOMNode.bumpSelectorEpoch()
+        }
+    }
+
+    /// One attribute's value, looked up under the node's lock.
+    @inline(__always)
+    public func attributeValue(_ name: String) -> String? {
+        state.withLock { $0.attributes[name] }
+    }
+
+    /// True when the element has the attribute `name`.
+    @inline(__always)
+    public func hasAttributeValue(_ name: String) -> Bool {
+        state.withLock { $0.attributes[name] != nil }
     }
 
     /// The element's namespace. `nil` means the HTML namespace — the common
@@ -51,34 +157,41 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
     /// every existing `attributes["viewbox"]` lookup keeps working, and are
     /// listed here so enumeration (`element.attributes`, `outerHTML`) can skip
     /// them.
-    public internal(set) var aliasAttributeKeys: Set<String> = []
+    public internal(set) var aliasAttributeKeys: Set<String> {
+        get { state.withLock { $0.aliasAttributeKeys } }
+        set { state.withLock { $0.aliasAttributeKeys = newValue } }
+    }
 
     /// `attributes` without the lowercase aliases — what the DOM exposes.
     public var enumerableAttributes: [String: String] {
-        guard !aliasAttributeKeys.isEmpty else { return attributes }
-        return attributes.filter { !aliasAttributeKeys.contains($0.key) }
+        let (attributes, aliases) = state.withLock { ($0.attributes, $0.aliasAttributeKeys) }
+        guard !aliases.isEmpty else { return attributes }
+        return attributes.filter { !aliases.contains($0.key) }
     }
 
     /// Attribute names in the order they were added (DOM §4.9: an element's
     /// attribute list is ordered — source order for parsed elements, append
     /// order for `setAttribute`). `attributes` is a dictionary, so the order
-    /// lives here; it may hold stale names (a host that mutates `attributes`
-    /// directly) and never lists aliases — read it through
-    /// `orderedAttributeNames`.
-    private var attributeOrder: [String] = []
-
+    /// lives in `State.attributeOrder`; it may hold stale names (a host that
+    /// replaces `attributes` directly) and never lists aliases.
+    ///
     /// The exposed attribute names in attribute-list order: the recorded
     /// order first, then any name the dictionary gained without going through
     /// the setters (sorted, so the result stays deterministic).
     public var orderedAttributeNames: [String] {
+        let (attributes, order, aliases) = state.withLock { ($0.attributes, $0.attributeOrder, $0.aliasAttributeKeys) }
+        return Self.orderedNames(attributes, order, aliases)
+    }
+
+    private static func orderedNames(_ attributes: [String: String], _ order: [String], _ aliases: Set<String>) -> [String] {
         var seen = Set<String>()
         var names: [String] = []
         names.reserveCapacity(attributes.count)
-        for name in attributeOrder where attributes[name] != nil && !aliasAttributeKeys.contains(name) {
+        for name in order where attributes[name] != nil && !aliases.contains(name) {
             if seen.insert(name).inserted { names.append(name) }
         }
-        if names.count < attributes.count - aliasAttributeKeys.count {
-            for name in attributes.keys.sorted() where !seen.contains(name) && !aliasAttributeKeys.contains(name) {
+        if names.count < attributes.count - aliases.count {
+            for name in attributes.keys.sorted() where !seen.contains(name) && !aliases.contains(name) {
                 names.append(name)
             }
         }
@@ -87,29 +200,34 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
 
     /// `(name, value)` pairs in attribute-list order (serialisation, cloning).
     public var orderedAttributes: [(name: String, value: String)] {
-        orderedAttributeNames.compactMap { name in attributes[name].map { (name, $0) } }
-    }
-
-    /// Records `name` at the end of the attribute list if it is new.
-    private func noteAttributeAdded(_ name: String, wasPresent: Bool) {
-        if !wasPresent { attributeOrder.append(name) }
+        let (attributes, order, aliases) = state.withLock { ($0.attributes, $0.attributeOrder, $0.aliasAttributeKeys) }
+        return Self.orderedNames(attributes, order, aliases).compactMap { name in attributes[name].map { (name, $0) } }
     }
 
     /// Appends an attribute the parser tokenised, keeping source order. The
     /// first occurrence of a duplicate name wins (HTML §13.2.5.33).
     func appendParsedAttribute(name: String, value: String) {
-        guard attributes[name] == nil else { return }
-        attributes[name] = value
-        attributeOrder.append(name)
+        let added: Bool = state.withLock {
+            guard $0.attributes[name] == nil else { return false }
+            $0.attributes[name] = value
+            $0.attributeOrder.append(name)
+            $0.attributeDidChange(name)
+            return true
+        }
+        if added { DOMNode.bumpSelectorEpoch() }
     }
 
     /// Copies `other`'s attribute list (values and order) — the cloning steps.
     func copyAttributes(from other: DOMNode) {
-        attributes = other.attributes
-        aliasAttributeKeys = other.aliasAttributeKeys
-        attributeOrder = other.orderedAttributeNames
-        _cachedClassList = nil
-        _cachedClassNames = nil
+        let (attributes, order, aliases) = other.state.withLock { ($0.attributes, $0.attributeOrder, $0.aliasAttributeKeys) }
+        let names = Self.orderedNames(attributes, order, aliases)
+        state.withLock {
+            $0.attributes = attributes
+            $0.aliasAttributeKeys = aliases
+            $0.attributeOrder = names
+            $0.attributesReplaced()
+        }
+        DOMNode.bumpSelectorEpoch()
     }
 
     /// The document this node belongs to while it is not in a document's tree
@@ -143,7 +261,10 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
         case limitedQuirks
     }
 
-    public internal(set) var quirksMode: QuirksMode = .noQuirks
+    public internal(set) var quirksMode: QuirksMode {
+        get { state.withLock { $0.quirksMode } }
+        set { state.withLock { $0.quirksMode = newValue } }
+    }
 
     /// `document.compatMode`: "BackCompat" in quirks mode, "CSS1Compat"
     /// otherwise (limited-quirks is a standards mode as far as this reports).
@@ -162,7 +283,17 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
     }
 
     // Text/comment content
-    public internal(set) var textContent: String?
+    public internal(set) var textContent: String? {
+        get { state.withLock { $0.textContent } }
+        set { state.withLock { $0.textContent = newValue } }
+    }
+
+    /// Appends to a text node's data in place (the parser's character runs).
+    func appendTextData(_ text: String) {
+        state.withLock {
+            if $0.textContent == nil { $0.textContent = text } else { $0.textContent!.append(text) }
+        }
+    }
 
     /// True for a `DocumentType` node (`<!DOCTYPE …>`, DOM §4.6).
     ///
@@ -230,42 +361,29 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
         return node
     }
 
-    /// Cached class list, invalidated when the `class` attribute changes.
-    private var _cachedClassList: Set<String>?
-    /// Cached ordered class tokens (document order, duplicates removed).
-    private var _cachedClassNames: [String]?
-    /// Cached ASCII-lowercased tag name, for case-insensitive HTML type selectors.
-    private var _cachedLowercasedTagName: String??
-
-    // Selector-matching cache (`DOMNode+SelectorCache.swift`): the resolved
-    // language and the ancestor Bloom filter, valid while
-    // `selectorCacheEpoch` equals the global selector epoch.
-    var selectorCacheEpoch: UInt64 = 0
-    var selectorLanguageID: UInt32 = 0
-    var selectorInclusiveFilter = DOMAncestorFilter()
-
     deinit {
         // A node's death zeroes its children's weak `parent` without running
         // their observers, so it invalidates the caches too.
-        domSelectorEpochStorage.pointee &+= 1
+        DOMNode.bumpSelectorEpoch()
     }
 
     private init(nodeType: NodeType, tagName: String?, attributes: [String: String], textContent: String?) {
         self.nodeType = nodeType
         self.tagName = tagName
-        self.attributes = attributes
-        self.textContent = textContent
+        self.lowercasedTagName = tagName.map(Self.asciiLowercased)
+        var initial = State(attributes: attributes, textContent: textContent)
         // A dictionary has no order; sort so a factory-built element at least
         // serialises deterministically.
-        if !attributes.isEmpty { self.attributeOrder = attributes.keys.sorted() }
+        if !attributes.isEmpty { initial.attributeOrder = attributes.keys.sorted() }
+        self.state = Mutex(initial)
     }
 
-    /// Invalidate cached classList when class attribute may have changed.
-    private func invalidateClassListIfNeeded(_ name: String) {
-        if name == "class" {
-            _cachedClassList = nil
-            _cachedClassNames = nil
-        }
+    /// `lowercased()` that hands back the same string (no copy) when there is
+    /// nothing to lower — the common case, as the parser lowercases HTML tags.
+    private static func asciiLowercased(_ string: String) -> String {
+        for byte in string.utf8 where byte >= 0x41 && byte <= 0x5A { return string.lowercased() }
+        for byte in string.utf8 where byte >= 0x80 { return string.lowercased() }
+        return string
     }
 
     // MARK: - ASCII Whitespace Token Splitting (HTML "space characters")
@@ -341,39 +459,44 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
     // MARK: - Computed Properties
 
     public var classList: Set<String> {
-        if let cached = _cachedClassList { return cached }
-        guard let cls = attributes["class"] else { return [] }
-        let result = Set(Self.splitASCIIWhitespace(cls))
-        _cachedClassList = result
-        return result
+        let (cached, source, generation) = state.withLock { s -> (Set<String>?, String?, UInt64) in
+            if let set = s.classSet { return (set, nil, 0) }
+            return (nil, s.attributes["class"], s.classGeneration)
+        }
+        if let cached { return cached }
+        let built: Set<String> = source.map { Set(Self.splitASCIIWhitespace($0)) } ?? []
+        state.withLock { if $0.classGeneration == generation { $0.classSet = built } }
+        return built
     }
 
     /// Ordered, de-duplicated class tokens — the order `classList.item(i)` and
     /// `classList[i]` must report.
     public var classNames: [String] {
-        if let cached = _cachedClassNames { return cached }
-        guard let cls = attributes["class"] else { return [] }
-        let result = Self.orderedTokenSet(cls)
-        _cachedClassNames = result
-        return result
+        let (cached, source, generation) = state.withLock { s -> ([String]?, String?, UInt64) in
+            if let names = s.classNames { return (names, nil, 0) }
+            return (nil, s.attributes["class"], s.classGeneration)
+        }
+        if let cached { return cached }
+        let built: [String] = source.map { Self.orderedTokenSet($0) } ?? []
+        state.withLock { if $0.classGeneration == generation { $0.classNames = built } }
+        return built
     }
 
-    /// ASCII-lowercased tag name, cached. HTML type selectors match
-    /// case-insensitively, but elements created with `preserveCase` (SVG's
-    /// `linearGradient`, `clipPath`, ...) keep their authored spelling.
-    public var lowercasedTagName: String? {
-        if let cached = _cachedLowercasedTagName { return cached }
-        let value = tagName?.lowercased()
-        _cachedLowercasedTagName = .some(value)
-        return value
+    /// `classList.contains(name)` without copying the set out (the `.class`
+    /// selector test).
+    @inline(__always)
+    public func hasClass(_ name: String) -> Bool {
+        let cached = state.withLock { $0.classSet?.contains(name) }
+        if let cached { return cached }
+        return classList.contains(name)
     }
 
     public var idAttribute: String? {
-        attributes["id"]
+        state.withLock { $0.idValue }
     }
 
     public var inlineStyle: String? {
-        attributes["style"]
+        attributeValue("style")
     }
 
     public var childElements: [DOMNode] {
@@ -424,30 +547,29 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
     /// hands back a snapshot, which turns "append this character to the
     /// trailing text node" into an O(n) copy per text token.
     var lastChildNode: DOMNode? {
-        childrenLock.lock()
-        defer { childrenLock.unlock() }
-        return _children.last
+        state.withLock { $0.children.last }
+    }
+
+    /// The first child, again without a snapshot.
+    var firstChildNode: DOMNode? {
+        state.withLock { $0.children.first }
     }
 
     /// The child immediately before `node`, again without a snapshot.
     func childBefore(_ node: DOMNode) -> DOMNode? {
-        childrenLock.lock()
-        defer { childrenLock.unlock() }
-        guard let index = _children.firstIndex(where: { $0 === node }), index > 0 else { return nil }
-        return _children[index - 1]
+        state.withLock {
+            guard let index = $0.children.firstIndex(where: { $0 === node }), index > 0 else { return nil }
+            return $0.children[index - 1]
+        }
     }
 
     func appendChild(_ child: DOMNode) {
         child.parent = self
-        childrenLock.lock()
-        _children.append(child)
-        childrenLock.unlock()
+        state.withLock { $0.children.append(child) }
     }
 
     func removeChild(_ child: DOMNode) {
-        childrenLock.lock()
-        _children.removeAll { $0 === child }
-        childrenLock.unlock()
+        state.withLock { $0.children.removeAll { $0 === child } }
         child.parent = nil
     }
 
@@ -455,52 +577,52 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
     /// Falls back to appending if `before` is not found.
     func insertChild(_ child: DOMNode, before: DOMNode) {
         child.parent = self
-        childrenLock.lock()
-        if let index = _children.firstIndex(where: { $0 === before }) {
-            _children.insert(child, at: index)
-        } else {
-            _children.append(child)
+        state.withLock {
+            if let index = $0.children.firstIndex(where: { $0 === before }) {
+                $0.children.insert(child, at: index)
+            } else {
+                $0.children.append(child)
+            }
         }
-        childrenLock.unlock()
     }
 
     /// Inserts `child` after `after` in the children array atomically.
     /// Falls back to appending if `after` is not found.
     func insertChild(_ child: DOMNode, after: DOMNode) {
         child.parent = self
-        childrenLock.lock()
-        if let index = _children.firstIndex(where: { $0 === after }) {
-            _children.insert(child, at: index + 1)
-        } else {
-            _children.append(child)
+        state.withLock {
+            if let index = $0.children.firstIndex(where: { $0 === after }) {
+                $0.children.insert(child, at: index + 1)
+            } else {
+                $0.children.append(child)
+            }
         }
-        childrenLock.unlock()
     }
 
     /// Inserts `child` at a specific index atomically.
     func insertChild(_ child: DOMNode, at index: Int) {
         child.parent = self
-        childrenLock.lock()
-        let clamped = min(index, _children.count)
-        _children.insert(child, at: clamped)
-        childrenLock.unlock()
+        state.withLock {
+            let clamped = min(index, $0.children.count)
+            $0.children.insert(child, at: clamped)
+        }
     }
 
     /// Atomically removes `old` and inserts `replacements` at its position.
     /// Returns the removed node, or nil if not found.
     @discardableResult
     func replaceChild(_ old: DOMNode, with replacements: [DOMNode]) -> DOMNode? {
-        childrenLock.lock()
-        guard let index = _children.firstIndex(where: { $0 === old }) else {
-            childrenLock.unlock()
-            return nil
+        let found = state.withLock { $0.children.contains { $0 === old } }
+        guard found else { return nil }
+        // Parents first (never under this node's lock: no two node locks are
+        // ever held at once), then one swap of the children array.
+        for replacement in replacements { replacement.parent = self }
+        let replaced: Bool = state.withLock {
+            guard let index = $0.children.firstIndex(where: { $0 === old }) else { return false }
+            $0.children.replaceSubrange(index...index, with: replacements)
+            return true
         }
-        _children.remove(at: index)
-        for (offset, replacement) in replacements.enumerated() {
-            replacement.parent = self
-            _children.insert(replacement, at: index + offset)
-        }
-        childrenLock.unlock()
+        guard replaced else { return nil }
         old.parent = nil
         return old
     }
@@ -511,18 +633,15 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
     /// `clearChildren()` would nil the new parents out from under them.
     @discardableResult
     func detachChildrenArray() -> [DOMNode] {
-        childrenLock.lock()
-        let old = _children
-        _children.removeAll()
-        childrenLock.unlock()
-        return old
+        state.withLock {
+            let old = $0.children
+            $0.children = []
+            return old
+        }
     }
 
     public func clearChildren() {
-        childrenLock.lock()
-        let old = _children
-        _children.removeAll()
-        childrenLock.unlock()
+        let old = detachChildrenArray()
         for child in old {
             child.parent = nil
         }
@@ -530,38 +649,48 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
 
     public func setAttribute(name: String, value: String) {
         let lower = name.lowercased()
-        noteAttributeAdded(lower, wasPresent: attributes[lower] != nil)
-        attributes[lower] = value
-        invalidateClassListIfNeeded(lower)
+        state.withLock {
+            if $0.attributes.updateValue(value, forKey: lower) == nil { $0.attributeOrder.append(lower) }
+            $0.attributeDidChange(lower)
+        }
+        DOMNode.bumpSelectorEpoch()
     }
 
     public func removeAttribute(name: String) {
         let lower = name.lowercased()
-        attributes.removeValue(forKey: lower)
-        if let index = attributeOrder.firstIndex(of: lower) { attributeOrder.remove(at: index) }
-        invalidateClassListIfNeeded(lower)
+        state.withLock {
+            $0.attributes.removeValue(forKey: lower)
+            if let index = $0.attributeOrder.firstIndex(of: lower) { $0.attributeOrder.remove(at: index) }
+            $0.attributeDidChange(lower)
+        }
+        DOMNode.bumpSelectorEpoch()
     }
 
     public func setAttributePreservingCase(name: String, value: String) {
-        noteAttributeAdded(name, wasPresent: attributes[name] != nil)
-        attributes[name] = value
         let lower = name.lowercased()
-        if lower != name {
-            attributes[lower] = value
-            aliasAttributeKeys.insert(lower)
+        state.withLock {
+            if $0.attributes.updateValue(value, forKey: name) == nil { $0.attributeOrder.append(name) }
+            if lower != name {
+                $0.attributes[lower] = value
+                $0.aliasAttributeKeys.insert(lower)
+            }
+            $0.attributeDidChange(lower)
         }
-        invalidateClassListIfNeeded(lower)
+        DOMNode.bumpSelectorEpoch()
     }
 
     public func removeAttributePreservingCase(name: String) {
-        attributes.removeValue(forKey: name)
-        if let index = attributeOrder.firstIndex(of: name) { attributeOrder.remove(at: index) }
         let lower = name.lowercased()
-        if lower != name || aliasAttributeKeys.contains(lower) {
-            attributes.removeValue(forKey: lower)
-            aliasAttributeKeys.remove(lower)
+        state.withLock {
+            $0.attributes.removeValue(forKey: name)
+            if let index = $0.attributeOrder.firstIndex(of: name) { $0.attributeOrder.remove(at: index) }
+            if lower != name || $0.aliasAttributeKeys.contains(lower) {
+                $0.attributes.removeValue(forKey: lower)
+                $0.aliasAttributeKeys.remove(lower)
+            }
+            $0.attributesReplaced()
         }
-        invalidateClassListIfNeeded("class")
+        DOMNode.bumpSelectorEpoch()
     }
 
     public func setTextContent(_ text: String?) {

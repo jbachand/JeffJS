@@ -385,14 +385,14 @@ final class HTMLTreeBuilder {
         let place = appropriateInsertionPlace()
         if let before = place.before {
             if let previous = place.parent.childBefore(before), previous.nodeType == .text {
-                previous.textContent = (previous.textContent ?? "") + text
+                previous.appendTextData(text)
                 return
             }
             place.parent.insertChild(DOMNode.text(text), before: before)
             return
         }
         if let last = place.parent.lastChildNode, last.nodeType == .text {
-            last.textContent = (last.textContent ?? "") + text
+            last.appendTextData(text)
             return
         }
         place.parent.appendChild(DOMNode.text(text))

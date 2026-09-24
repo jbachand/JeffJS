@@ -315,6 +315,7 @@ struct JeffJSTestRunner {
             ("DirectEval", { $0.testDirectEval() }),
             ("SelectorMatchingCache", { $0.testSelectorMatchingCache() }),
             ("ParserNesting", { $0.testParserNesting() }),
+            ("DOMThreadSafety", { $0.testDOMThreadSafety() }),
         ]
     }
 

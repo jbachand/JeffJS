@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 // MARK: - Selector-matching caches
 //
@@ -15,21 +16,38 @@ import Foundation
 //
 // Both are cached on the node and computed at most once per *selector epoch*.
 // The epoch is a global counter bumped by every change they depend on: a
-// `parent` assignment (insert / remove / move), any `attributes` mutation, and
+// `parent` assignment (insert / remove / move), any attribute mutation, and
 // any node's deallocation (which zeroes its children's weak `parent` without
 // running their observers). A style pass does not mutate the tree, so each
-// element computes its entry once per pass, from its parent's entry. A stale
-// read racing a mutation on another thread is caught by the epoch recorded
-// with the entry (it was read before the entry was computed).
+// element computes its entry once per pass, from its parent's entry.
+//
+// Threads (see the contract in `DOMNode.swift`): the epoch is an `Atomic`,
+// bumped with release ordering *after* the mutation (under the node's lock) it
+// announces, and loaded with acquire ordering — so a reader that sees epoch E
+// sees every mutation made before E was published. An entry is built into a
+// local from the node's state and its parent's entry (each read under that
+// node's own lock, never two at once) and published whole under the node's
+// lock, tagged with the epoch the reader loaded *before* it read any input. A
+// mutation racing the build bumps the epoch past that tag, so the entry is
+// never trusted by a later read; readers of different epochs may publish in
+// either order, and an older entry never replaces a newer one.
 
-/// The global selector epoch. A raw pointer rather than a static var so the
-/// hot reads are plain loads (no exclusivity bookkeeping, no lazy-init check)
-/// and so a `deinit` can bump it from any context.
-nonisolated(unsafe) let domSelectorEpochStorage: UnsafeMutablePointer<UInt64> = {
-    let pointer = UnsafeMutablePointer<UInt64>.allocate(capacity: 1)
-    pointer.initialize(to: 1)
-    return pointer
-}()
+/// The global selector epoch.
+let domSelectorEpoch = Atomic<UInt64>(1)
+
+/// One node's selector-matching cache entry: valid while `epoch` equals the
+/// global selector epoch.
+struct DOMSelectorCacheEntry {
+    var epoch: UInt64 = 0
+    /// Interned language (`DOMLanguageTable`).
+    var languageID: UInt32 = DOMLanguageTable.none
+    /// The identifiers of the node and every element ancestor.
+    var inclusiveFilter = DOMAncestorFilter()
+    /// The identifiers of every element ancestor (the parent's inclusive
+    /// filter), what a selector's left-hand compounds are tested against —
+    /// stored so the test needs neither the parent pointer nor its lock.
+    var ancestorFilter = DOMAncestorFilter()
+}
 
 /// A 512-bit Bloom filter of identifier hashes (tag names, ids, classes and
 /// primary language subtags), two bits per key. "May contain" can be a false
@@ -84,7 +102,7 @@ enum DOMSelectorKeyHash {
 }
 
 /// Interned lowercased language tags, so a node caches its language as an
-/// integer (a plain field write, safe to race with another reader).
+/// integer.
 /// IDs 0 and 1 are reserved: no language, and "unknown" (`lang=""`).
 final class DOMLanguageTable: @unchecked Sendable {
     static let shared = DOMLanguageTable()
@@ -98,7 +116,8 @@ final class DOMLanguageTable: @unchecked Sendable {
     private var ids: [String: UInt32] = [:]
     private let capacity = 1 << 14
     /// Written once per slot, under the lock, before its ID is handed out;
-    /// read without the lock afterwards.
+    /// read without the lock afterwards (a reader got the ID through the
+    /// lock, or through a node's lock taken after this one was released).
     private let tags: UnsafeMutablePointer<String>
     private let primaryHashes: UnsafeMutablePointer<UInt32>
     private var count: UInt32 = 2
@@ -134,13 +153,21 @@ final class DOMLanguageTable: @unchecked Sendable {
 extension DOMNode {
 
     /// The current selector epoch.
-    @inline(__always) static var selectorEpoch: UInt64 { domSelectorEpochStorage.pointee }
+    @inline(__always) static var selectorEpoch: UInt64 { domSelectorEpoch.load(ordering: .acquiring) }
+
+    /// Announces a mutation the selector caches depend on. Called after the
+    /// mutation is visible (the node's lock released).
+    @inline(__always) static func bumpSelectorEpoch() {
+        domSelectorEpoch.wrappingAdd(1, ordering: .releasing)
+    }
 
     /// The node's own `lang` / `xml:lang` value, if it declares one.
     @inline(__always)
     fileprivate var declaredLanguage: String? {
-        guard nodeType == .element, !attributes.isEmpty else { return nil }
-        return attributes["lang"] ?? attributes["xml:lang"]
+        guard nodeType == .element else { return nil }
+        return state.withLock { s in
+            s.attributes.isEmpty ? nil : (s.attributes["lang"] ?? s.attributes["xml:lang"])
+        }
     }
 
     /// The element's language (HTML §3.2.6.2): the nearest ancestor-or-self
@@ -148,8 +175,7 @@ extension DOMNode {
     /// empty (the language is explicitly unknown — it does not inherit past
     /// it); nil when no ancestor declares one.
     public var language: String? {
-        refreshSelectorCache(Self.selectorEpoch)
-        switch selectorLanguageID {
+        switch selectorLanguageID(Self.selectorEpoch) {
         case DOMLanguageTable.none: return nil
         case DOMLanguageTable.unknown: return ""
         case DOMLanguageTable.uncached: return uncachedLanguage()
@@ -170,48 +196,77 @@ extension DOMNode {
 
     /// The Bloom filter of every element ancestor's identifiers (not the
     /// node's own) — what a selector's left-hand compounds are tested against.
-    func ancestorFilterForMatching() -> DOMAncestorFilter {
-        guard let parent else { return DOMAncestorFilter() }
-        parent.refreshSelectorCache(Self.selectorEpoch)
-        return parent.selectorInclusiveFilter
-    }
-
-    /// Brings the node's cache entry (and any stale ancestor's) up to `epoch`.
     @inline(__always)
-    func refreshSelectorCache(_ epoch: UInt64) {
-        if selectorCacheEpoch == epoch { return }
-        refreshSelectorCacheSlow(epoch)
+    func ancestorFilterForMatching() -> DOMAncestorFilter {
+        let epoch = Self.selectorEpoch
+        let cached = state.withLock { $0.selectorCache.epoch == epoch ? $0.selectorCache.ancestorFilter : nil }
+        if let cached { return cached }
+        return refreshSelectorCacheSlow(epoch).ancestorFilter
     }
 
-    private func refreshSelectorCacheSlow(_ epoch: UInt64) {
-        guard let parent = self.parent else {
-            computeSelectorCache(parent: nil, epoch: epoch)
-            return
+    /// The node's interned language at `epoch`. Lock-free: `:lang()` is
+    /// tested once per rule per element, so the language rides in one atomic
+    /// word next to the entry (`selectorLanguageStamp`, see `languageStamp`).
+    @inline(__always)
+    func selectorLanguageID(_ epoch: UInt64) -> UInt32 {
+        let word = selectorLanguageStamp.load(ordering: .acquiring)
+        if word >> 16 == epoch & Self.languageStampEpochMask {
+            let id = UInt32(truncatingIfNeeded: word & 0xFFFF)
+            return id == 0xFFFF ? DOMLanguageTable.uncached : id
         }
-        if parent.selectorCacheEpoch == epoch {
-            computeSelectorCache(parent: parent, epoch: epoch)
-            return
+        return refreshSelectorCacheSlow(epoch).languageID
+    }
+
+    /// The low 48 bits of the epoch go in the stamp (a stale stamp would have
+    /// to be exactly a multiple of 2^48 mutations old to be mistaken for a
+    /// current one).
+    @inline(__always) static var languageStampEpochMask: UInt64 { (1 << 48) - 1 }
+
+    /// `(epoch & mask) << 16 | languageID` (`uncached` as 0xFFFF; the
+    /// language table holds 2^14 IDs).
+    @inline(__always)
+    static func languageStamp(epoch: UInt64, languageID: UInt32) -> UInt64 {
+        let id = languageID == DOMLanguageTable.uncached ? 0xFFFF : UInt64(languageID & 0xFFFF)
+        return (epoch & languageStampEpochMask) << 16 | id
+    }
+
+    /// Brings the node's entry (and any stale ancestor's) up to `epoch`
+    /// and returns it.
+    private func refreshSelectorCacheSlow(_ epoch: UInt64) -> DOMSelectorCacheEntry {
+        guard let parent = self.parent else {
+            return computeSelectorCache(parentEntry: nil, epoch: epoch)
+        }
+        let parentEntry = parent.state.withLock { $0.selectorCache }
+        if parentEntry.epoch == epoch {
+            return computeSelectorCache(parentEntry: parentEntry, epoch: epoch)
         }
         // Collect the stale part of the chain (strong references), then fill
         // it in from the top down.
         var chain: [DOMNode] = [self, parent]
+        var above: DOMSelectorCacheEntry?
         var cursor = parent.parent
-        while let node = cursor, node.selectorCacheEpoch != epoch {
+        while let node = cursor {
+            let entry = node.state.withLock { $0.selectorCache }
+            if entry.epoch == epoch { above = entry; break }
             chain.append(node)
             cursor = node.parent
         }
-        var above: DOMNode? = cursor
         for node in chain.reversed() {
-            node.computeSelectorCache(parent: above, epoch: epoch)
-            above = node
+            above = node.computeSelectorCache(parentEntry: above, epoch: epoch)
         }
+        return above.unsafelyUnwrapped
     }
 
-    private func computeSelectorCache(parent: DOMNode?, epoch: UInt64) {
-        var filter = parent?.selectorInclusiveFilter ?? DOMAncestorFilter()
-        var languageID = parent?.selectorLanguageID ?? DOMLanguageTable.none
+    private func computeSelectorCache(parentEntry: DOMSelectorCacheEntry?, epoch: UInt64) -> DOMSelectorCacheEntry {
+        let ancestorFilter = parentEntry?.inclusiveFilter ?? DOMAncestorFilter()
+        var filter = ancestorFilter
+        var languageID = parentEntry?.languageID ?? DOMLanguageTable.none
         if nodeType == .element {
-            if let declared = declaredLanguage {
+            let (declared, id, hasClass) = state.withLock { s -> (String?, String?, Bool) in
+                let declared = s.attributes.isEmpty ? nil : (s.attributes["lang"] ?? s.attributes["xml:lang"])
+                return (declared, s.idValue, s.attributes["class"] != nil)
+            }
+            if let declared {
                 languageID = declared.isEmpty
                     ? DOMLanguageTable.unknown
                     : DOMLanguageTable.shared.id(forLowercased: declared.lowercased())
@@ -219,10 +274,10 @@ extension DOMNode {
             if let tag = lowercasedTagName {
                 filter.insert(DOMSelectorKeyHash.hash(DOMSelectorKeyHash.tagKind, tag))
             }
-            if let id = idAttribute {
+            if let id {
                 filter.insert(DOMSelectorKeyHash.hash(DOMSelectorKeyHash.idKind, id))
             }
-            if attributes["class"] != nil {
+            if hasClass {
                 for cls in classList {
                     filter.insert(DOMSelectorKeyHash.hash(DOMSelectorKeyHash.classKind, cls))
                 }
@@ -234,8 +289,18 @@ extension DOMNode {
                                                       DOMSelectorKeyHash.primarySubtag(language)))
             }
         }
-        selectorInclusiveFilter = filter
-        selectorLanguageID = languageID
-        selectorCacheEpoch = epoch
+        let entry = DOMSelectorCacheEntry(epoch: epoch, languageID: languageID,
+                                          inclusiveFilter: filter, ancestorFilter: ancestorFilter)
+        // Published under the lock, so concurrent publishers are ordered and
+        // the stamp always matches the stored entry; release ordering makes
+        // the language table slot behind the ID visible with it.
+        let stamp = Self.languageStamp(epoch: epoch, languageID: languageID)
+        state.withLock {
+            if $0.selectorCache.epoch <= epoch {
+                $0.selectorCache = entry
+                selectorLanguageStamp.store(stamp, ordering: .releasing)
+            }
+        }
+        return entry
     }
 }

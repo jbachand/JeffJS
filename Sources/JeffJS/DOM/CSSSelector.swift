@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 // MARK: - Selector Components
 
@@ -447,7 +448,7 @@ public struct CSSSelectorMatcher: Sendable {
             case .element(let tag):
                 guard node.lowercasedTagName == tag else { return false }
             case .className(let cls):
-                guard node.classList.contains(cls) else { return false }
+                guard node.hasClass(cls) else { return false }
             case .id(let id):
                 guard node.idAttribute == id else { return false }
             case .attribute(let name, let op, let value, let caseSensitivity):
@@ -516,9 +517,9 @@ public struct CSSSelectorMatcher: Sendable {
             case .pseudoEnabled:
                 guard matchesEnabled(node) else { return false }
             case .pseudoRequired:
-                guard isRequirable(node), node.attributes["required"] != nil else { return false }
+                guard isRequirable(node), node.attributeValue("required") != nil else { return false }
             case .pseudoOptional:
-                guard isRequirable(node), node.attributes["required"] == nil else { return false }
+                guard isRequirable(node), node.attributeValue("required") == nil else { return false }
             case .pseudoPlaceholderShown:
                 guard matchesPlaceholderShown(node) else { return false }
             case .pseudoReadOnly:
@@ -550,36 +551,52 @@ public struct CSSSelectorMatcher: Sendable {
 
     /// Per-style-pass cache for `:has()`. Off by default: turn it on around a
     /// style pass with `beginMatchPass()` / `endMatchPass()` when the tree is
-    /// known not to change in between.
+    /// known not to change in between. The memo belongs to the thread that
+    /// began the pass: matching on any other thread (script's
+    /// `querySelectorAll` while a style pass runs elsewhere) neither reads nor
+    /// fills it, since it may see a newer tree than the pass.
     private struct HasCacheKey: Hashable {
         let node: ObjectIdentifier
         let selector: Int
     }
     nonisolated(unsafe) private static var hasCache: [HasCacheKey: Bool] = [:]
-    nonisolated(unsafe) private static var hasCacheEnabled = false
+    /// The selector epoch the memo's entries were computed at: a DOM mutation
+    /// during the pass (script running while the pass reads) empties it.
+    nonisolated(unsafe) private static var hasCacheEpoch: UInt64 = 0
+    /// The pass thread (`currentThreadToken`), 0 when no pass is running.
+    private static let hasCacheOwner = Atomic<UInt>(0)
     private static let hasCacheLock = NSLock()
 
-    /// Start a style pass: `:has()` results are memoised per element until
-    /// `endMatchPass()`. The DOM must not mutate in between.
+    @inline(__always)
+    private static var currentThreadToken: UInt { UInt(bitPattern: Int(bitPattern: UnsafeRawPointer(pthread_self()))) }
+
+    /// Start a style pass on the calling thread: `:has()` results are memoised
+    /// per element until `endMatchPass()`. The DOM must not mutate in between.
     public static func beginMatchPass() {
         hasCacheLock.lock()
         hasCache.removeAll(keepingCapacity: true)
-        hasCacheEnabled = true
         hasCacheLock.unlock()
+        hasCacheOwner.store(currentThreadToken, ordering: .releasing)
     }
 
     /// End a style pass and drop the `:has()` cache.
     public static func endMatchPass() {
+        hasCacheOwner.store(0, ordering: .releasing)
         hasCacheLock.lock()
         hasCache.removeAll()
-        hasCacheEnabled = false
         hasCacheLock.unlock()
     }
 
     private static func matchesHas(_ has: CSSHasSelector, anchor: DOMNode, context: CSSMatchContext) -> Bool {
         let key = HasCacheKey(node: ObjectIdentifier(anchor), selector: has.id)
-        if hasCacheEnabled {
+        let useCache = hasCacheOwner.load(ordering: .acquiring) == currentThreadToken
+        let epoch = DOMNode.selectorEpoch
+        if useCache {
             hasCacheLock.lock()
+            if hasCacheEpoch != epoch {
+                hasCache.removeAll(keepingCapacity: true)
+                hasCacheEpoch = epoch
+            }
             let cached = hasCache[key]
             hasCacheLock.unlock()
             if let cached { return cached }
@@ -611,9 +628,9 @@ public struct CSSSelectorMatcher: Sendable {
             if result { break }
         }
 
-        if hasCacheEnabled {
+        if useCache {
             hasCacheLock.lock()
-            hasCache[key] = result
+            if hasCacheEpoch == epoch { hasCache[key] = result }
             hasCacheLock.unlock()
         }
         return result
@@ -764,7 +781,7 @@ public struct CSSSelectorMatcher: Sendable {
 
     private static func isLink(_ node: DOMNode) -> Bool {
         guard let tag = node.lowercasedTagName, linkTags.contains(tag) else { return false }
-        return node.attributes["href"] != nil
+        return node.attributeValue("href") != nil
     }
 
     /// `:hover`, `:active` and `:focus-within` match the state-holding element
@@ -782,7 +799,7 @@ public struct CSSSelectorMatcher: Sendable {
         guard let fragment = DOMInteractionState.shared.targetFragment, !fragment.isEmpty else { return false }
         if node.idAttribute == fragment { return true }
         // Legacy: <a name="..."> is also a fragment target.
-        if node.lowercasedTagName == "a", node.attributes["name"] == fragment { return true }
+        if node.lowercasedTagName == "a", node.attributeValue("name") == fragment { return true }
         return false
     }
 
@@ -806,7 +823,7 @@ public struct CSSSelectorMatcher: Sendable {
     ]
 
     private static func inputType(_ node: DOMNode) -> String {
-        (node.attributes["type"] ?? "text").lowercased()
+        (node.attributeValue("type") ?? "text").lowercased()
     }
 
     private static func matchesChecked(_ node: DOMNode) -> Bool {
@@ -814,10 +831,10 @@ public struct CSSSelectorMatcher: Sendable {
         if tag == "input" {
             let type = inputType(node)
             guard type == "checkbox" || type == "radio" else { return false }
-            return node.attributes["checked"] != nil
+            return node.attributeValue("checked") != nil
         }
         if tag == "option" {
-            return node.attributes["selected"] != nil
+            return node.attributeValue("selected") != nil
         }
         return false
     }
@@ -826,12 +843,12 @@ public struct CSSSelectorMatcher: Sendable {
     /// (except through its first `<legend>`), which is what WebKit does.
     private static func matchesDisabled(_ node: DOMNode) -> Bool {
         guard let tag = node.lowercasedTagName, formDisableableTags.contains(tag) else { return false }
-        if node.attributes["disabled"] != nil { return true }
+        if node.attributeValue("disabled") != nil { return true }
         if tag == "fieldset" { return false }
         var child = node
         var cursor = node.parent
         while let ancestor = cursor {
-            if ancestor.lowercasedTagName == "fieldset", ancestor.attributes["disabled"] != nil {
+            if ancestor.lowercasedTagName == "fieldset", ancestor.attributeValue("disabled") != nil {
                 // Controls inside the fieldset's first <legend> stay enabled.
                 if let legend = ancestor.children.first(where: { $0.lowercasedTagName == "legend" }),
                    isSelfOrAncestor(legend, of: child) {
@@ -862,13 +879,13 @@ public struct CSSSelectorMatcher: Sendable {
 
     private static func matchesPlaceholderShown(_ node: DOMNode) -> Bool {
         guard let tag = node.lowercasedTagName else { return false }
-        guard node.attributes["placeholder"] != nil else { return false }
+        guard node.attributeValue("placeholder") != nil else { return false }
         if tag == "textarea" {
-            return node.textDescendants.isEmpty && (node.attributes["value"] ?? "").isEmpty
+            return node.textDescendants.isEmpty && (node.attributeValue("value") ?? "").isEmpty
         }
         guard tag == "input" else { return false }
         guard textualInputTypes.contains(inputType(node)) else { return false }
-        return (node.attributes["value"] ?? "").isEmpty
+        return (node.attributeValue("value") ?? "").isEmpty
     }
 
     /// `:read-write` — the element is user-editable. Everything else (including
@@ -877,12 +894,12 @@ public struct CSSSelectorMatcher: Sendable {
         guard let tag = node.lowercasedTagName else { return false }
         if tag == "input" || tag == "textarea" {
             if tag == "input", !textualInputTypes.contains(inputType(node)) { return false }
-            return node.attributes["readonly"] == nil && !matchesDisabled(node)
+            return node.attributeValue("readonly") == nil && !matchesDisabled(node)
         }
         // contenteditable (inherited)
         var cursor: DOMNode? = node
         while let current = cursor {
-            if let value = current.attributes["contenteditable"]?.lowercased() {
+            if let value = current.attributeValue("contenteditable")?.lowercased() {
                 if value == "false" { return false }
                 if value == "" || value == "true" || value == "plaintext-only" { return true }
             }
@@ -893,16 +910,16 @@ public struct CSSSelectorMatcher: Sendable {
 
     private static func matchesIndeterminate(_ node: DOMNode) -> Bool {
         guard let tag = node.lowercasedTagName else { return false }
-        if tag == "progress" { return node.attributes["value"] == nil }
+        if tag == "progress" { return node.attributeValue("value") == nil }
         guard tag == "input" else { return false }
         let type = inputType(node)
         if type == "checkbox" {
-            return node.attributes["indeterminate"] != nil
+            return node.attributeValue("indeterminate") != nil
         }
         if type == "radio" {
             // A radio group with nothing checked is indeterminate.
-            guard node.attributes["checked"] == nil else { return false }
-            let name = node.attributes["name"] ?? ""
+            guard node.attributeValue("checked") == nil else { return false }
+            let name = node.attributeValue("name") ?? ""
             guard !name.isEmpty else { return true }
             var root: DOMNode = node
             while let parent = root.parent { root = parent }
@@ -910,8 +927,8 @@ public struct CSSSelectorMatcher: Sendable {
             _ = anySubtreeElement(of: root, includeSelf: true) { candidate in
                 if candidate.lowercasedTagName == "input",
                    inputType(candidate) == "radio",
-                   candidate.attributes["name"] == name,
-                   candidate.attributes["checked"] != nil {
+                   candidate.attributeValue("name") == name,
+                   candidate.attributeValue("checked") != nil {
                     anyChecked = true
                     return true
                 }
@@ -926,15 +943,15 @@ public struct CSSSelectorMatcher: Sendable {
     /// default (first submit) button.
     private static func matchesDefault(_ node: DOMNode) -> Bool {
         guard let tag = node.lowercasedTagName else { return false }
-        if tag == "option" { return node.attributes["selected"] != nil }
+        if tag == "option" { return node.attributeValue("selected") != nil }
         if tag == "input" {
             let type = inputType(node)
-            if type == "checkbox" || type == "radio" { return node.attributes["checked"] != nil }
+            if type == "checkbox" || type == "radio" { return node.attributeValue("checked") != nil }
             if type == "submit" || type == "image" { return isDefaultSubmitButton(node) }
             return false
         }
         if tag == "button" {
-            let type = (node.attributes["type"] ?? "submit").lowercased()
+            let type = (node.attributeValue("type") ?? "submit").lowercased()
             guard type == "submit" else { return false }
             return isDefaultSubmitButton(node)
         }
@@ -953,7 +970,7 @@ public struct CSSSelectorMatcher: Sendable {
         _ = anySubtreeElement(of: form, includeSelf: false) { candidate in
             guard let tag = candidate.lowercasedTagName else { return false }
             if tag == "button" {
-                let type = (candidate.attributes["type"] ?? "submit").lowercased()
+                let type = (candidate.attributeValue("type") ?? "submit").lowercased()
                 if type == "submit" { first = candidate; return true }
             } else if tag == "input" {
                 let type = inputType(candidate)
@@ -978,8 +995,7 @@ public struct CSSSelectorMatcher: Sendable {
     /// An element without a language, or with an explicitly unknown one
     /// (`lang=""`), matches no range.
     private static func matchesLang(_ node: DOMNode, ranges: [String]) -> Bool {
-        node.refreshSelectorCache(DOMNode.selectorEpoch)
-        let id = node.selectorLanguageID
+        let id = node.selectorLanguageID(DOMNode.selectorEpoch)
         let language: String
         switch id {
         case DOMLanguageTable.none, DOMLanguageTable.unknown:
@@ -1044,7 +1060,7 @@ public struct CSSSelectorMatcher: Sendable {
     private static func resolvedDirection(_ node: DOMNode) -> String {
         var cursor: DOMNode? = node
         while let current = cursor {
-            if let value = current.attributes["dir"]?.lowercased() {
+            if let value = current.attributeValue("dir")?.lowercased() {
                 if value == "ltr" || value == "rtl" { return value }
                 if value == "auto" { return "ltr" }
             }
@@ -1105,7 +1121,7 @@ public struct CSSSelectorMatcher: Sendable {
         caseSensitivity: CSSAttributeCaseSensitivity
     ) -> Bool {
         let attrName = name.lowercased()
-        guard let rawAttrValue = node.attributes[attrName] else {
+        guard let rawAttrValue = node.attributeValue(attrName) else {
             return false
         }
         guard let op else { return true }
