@@ -4188,6 +4188,7 @@ struct JeffJSCompiler {
 
         // Trace block fusion: identify hot loop candidates for the fast mini-interpreter
         JeffJSCompiler.fuseBasicBlocks(fb)
+        JeffJSCompiler.computeArgSlotOwnership(fb)
 
         // Debug aid: JEFFJS_DUMP=1 prints the final bytecode of every
         // compiled function (after all passes) to stdout.
@@ -4689,6 +4690,52 @@ struct JeffJSCompiler {
 
     /// Analyze final bytecode for hot loop candidates and populate trace blocks.
     /// Called after resolveLabels when jump offsets are finalized.
+    /// Decide whether `fb`'s frames own their argument slots
+    /// (`argSlotsOwned` / `copiesArgs`; see "Ownership of call arguments" in
+    /// JeffJSInterpreter.swift). A parameter slot can be written by
+    /// put_arg/set_arg, through a mapped `arguments` object, an argument
+    /// reference (make_arg_ref), a closure that captured the parameter, or a
+    /// direct eval (whose code binds the caller's parameters as closure
+    /// variables). Any of those makes the slots owned; everything else keeps
+    /// borrowing the caller's references. Derived from the final bytecode and
+    /// the children's closure-variable lists, so the compiler and the
+    /// bytecode-cache loader (children are loaded first) agree.
+    static func computeArgSlotOwnership(_ fb: JeffJSFunctionBytecode) {
+        var owned = fb.evalSites != nil
+        if !owned {
+            for v in fb.cpool {
+                guard let child = v.toFunctionBytecode() else { continue }
+                if child.closureVarsList.contains(where: { $0.isLocal && $0.isArg }) { owned = true; break }
+            }
+        }
+        if !owned {
+            let bc = fb.bytecode
+            let len = min(fb.bytecodeLen, bc.count)
+            var pc = 0
+            scan: while pc < len {
+                guard let (op, opWidth) = readOpcodeFromBuf(bc, pc) else { pc += 1; continue }
+                switch op {
+                case .put_arg, .put_arg0, .put_arg1, .put_arg2, .put_arg3,
+                     .set_arg, .set_arg0, .set_arg1, .set_arg2, .set_arg3,
+                     .make_arg_ref, .eval, .apply_eval:
+                    owned = true
+                    break scan
+                case .special_object:
+                    if pc + opWidth < len,
+                       bc[pc + opWidth] == SpecialObjectType.mappedArguments.rawValue {
+                        owned = true
+                        break scan
+                    }
+                default:
+                    break
+                }
+                pc += max(Int(jeffJSGetOpcodeInfo(op).size) + (opWidth - 1), 1)
+            }
+        }
+        fb.argSlotsOwned = owned || fb.isGenerator || fb.isAsyncFunc
+        fb.copiesArgs = owned && !fb.isGenerator && !fb.isAsyncFunc
+    }
+
     static func fuseBasicBlocks(_ fb: JeffJSFunctionBytecode) {
         let bc = fb.bytecode
         let len = fb.bytecodeLen

@@ -319,6 +319,7 @@ struct JeffJSTestRunner {
             ("NumberFormatting", { $0.testNumberFormatting() }),
             ("CallThis", { $0.testCallThis() }),
             ("StringConcat", { $0.testStringConcat() }),
+            ("ParameterOwnership", { $0.testParameterOwnership() }),
         ]
     }
 

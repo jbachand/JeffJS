@@ -290,6 +290,23 @@ class JeffJSFunctionBytecode {
     /// Call-free function with at least one loop: run it in the lean trace
     /// variant from entry (set by the compiler's trace analysis).
     var traceLean: Bool = false
+    /// Argument-slot ownership (see "Ownership of call arguments" in
+    /// JeffJSInterpreter.swift). Set by `JeffJSCompiler.computeArgSlotOwnership`
+    /// from the final bytecode: true when something can store into one of
+    /// this function's parameter slots (put_arg/set_arg, a mapped
+    /// `arguments` object, a closure or direct eval capturing a parameter, an
+    /// argument reference). A store then releases the value it replaces, so
+    /// the slot must own it: plain frames of such a function take their own
+    /// references to the arguments on entry (`copiesArgs`) and release their
+    /// argument slots at exit; generator and async frames already own theirs
+    /// (callFunction hands them copies). Functions that never store into a
+    /// parameter keep borrowing the caller's references for free.
+    /// (Declared here, next to traceLean, so it fills existing padding and
+    /// leaves the hot fields' offsets alone.)
+    var argSlotsOwned: Bool = false
+    /// `argSlotsOwned` for a plain (non-generator, non-async) function: its
+    /// call paths dup the arguments into the frame and release them at exit.
+    var copiesArgs: Bool = false
     var cpool: [JeffJSValue] = []
     var isGenerator: Bool = false
     var isAsyncFunc: Bool = false
@@ -988,6 +1005,11 @@ final class JeffJSVarRef: JeffJSGCObjectHeader {
         }
     }
     var isArg: Bool
+    /// An argument var-ref over a frame that owns its argument slots
+    /// (`JeffJSFunctionBytecode.argSlotsOwned`): a store releases the value
+    /// it replaces, like a local. Otherwise the slot holds the caller's
+    /// borrowed reference and must not be released here.
+    var argOwned: Bool = false
     var varIdx: UInt16
 
     /// The parent stack frame whose slots we point into while live.
@@ -1010,15 +1032,16 @@ final class JeffJSVarRef: JeffJSGCObjectHeader {
     /// assignment to a captured variable leaked its previous value — React's
     /// `workInProgressHook = hook` alone leaked every hook of every render.
     ///
-    /// A live var-ref over a *parameter* is the exception: a plain frame's
-    /// argument slots hold the caller's borrowed references (see "Ownership
-    /// of call arguments" in JeffJSInterpreter.swift; `put_arg` does not free
-    /// either), so the value it replaces is not the slot's to release.
+    /// A live var-ref over a *parameter* releases the replaced value only
+    /// when its frame owns its argument slots (`argOwned`); otherwise the
+    /// slot holds the caller's borrowed reference (see "Ownership of call
+    /// arguments" in JeffJSInterpreter.swift). Every function whose parameter
+    /// can be captured owns its slots, so in practice this always releases.
     @inline(__always)
     func store(_ v: JeffJSValue) {
         if isDetached {
             let old = value; value = v; old.freeValue()
-        } else if isArg {
+        } else if isArg && !argOwned {
             pvalue = v
         } else {
             let old = pvalue; pvalue = v; old.freeValue()
@@ -1971,9 +1994,7 @@ extension JeffJSObject {
         let idx = jeffJS_findOwnPropertyIndex(obj: self, atom: atom)
         guard idx >= 0, idx < propValues.count else { return false }
         if let e = extra(at: idx), e.kind == .varRef, let vr = e.varRef {
-            let oldVal = vr.pvalue
-            vr.pvalue = value
-            oldVal.freeValue()
+            vr.store(value)   // releases the replaced value when the slot owns it
             return true
         }
         propValues[idx] = value; setExtraSlot(idx, nil)

@@ -564,8 +564,13 @@ extension JeffJSContext {
                 guard let cap = JeffJSBuiltinPromise.newPromiseCapability(ctx: self, ctor: .undefined) else {
                     return JeffJSBuiltinPromise.makeSettledPromise(ctx: self, value: result, fulfilled: true)
                 }
-                _ = call(cap.resolve, this: .undefined, args: [result])
+                call(cap.resolve, this: .undefined, args: [result]).freeValue()
                 result.freeValue()
+                // The capability's resolving functions are ours (Promise.resolve
+                // releases them the same way); keeping them leaked the promise,
+                // both functions and the value of every async call that
+                // returned an object.
+                cap.resolve.freeValue(); cap.reject.freeValue()
                 _ = rt.executePendingJobs()
                 return cap.promise
             }
@@ -670,6 +675,7 @@ extension JeffJSContext {
         // Generator / async frames re-acquire their buffer on resume, so they
         // keep the frame-based lookup (same rule as createClosure).
         let fb = frame.curFunc.toObject()?.fbFast
+        vr.argOwned = fb?.argSlotsOwned ?? false
         if let b = frame.buf, i < frame.bufVarBase,
            !(fb?.isGenerator ?? false), !(fb?.isAsyncFunc ?? false) {
             vr.slot = b + i
@@ -889,6 +895,9 @@ extension JeffJSContext {
                             varIdx: UInt16(cv.varIdx),
                             parentFrame: parentFrame
                         )
+                        // `fb` is the parent's: a parameter slot it lets a
+                        // closure capture is one it owns (argSlotsOwned).
+                        if cv.isArg { vr.argOwned = fb.argSlotsOwned }
                         // Direct slot pointer (see JeffJSVarRef.slot). Generator /
                         // async frames re-acquire their buffer on resume, so they
                         // keep the frame-based lookup.
@@ -1468,6 +1477,7 @@ extension JeffJSContext {
             }
             let vr = JeffJSVarRef(isDetached: false, isArg: cv.isArg,
                                   varIdx: UInt16(cv.varIdx), parentFrame: frame)
+            if cv.isArg { vr.argOwned = callerFB.argSlotsOwned }
             if !callerFB.isGenerator, !callerFB.isAsyncFunc, let b = frame.buf {
                 if cv.isArg {
                     if cv.varIdx < frame.bufVarBase { vr.slot = b + cv.varIdx }
@@ -2232,6 +2242,7 @@ extension JeffJSContext {
     func makeArgRef(frame: JeffJSStackFrame, idx: Int) -> JeffJSObject {
         let vr = JeffJSVarRef(isDetached: false, isArg: true, varIdx: UInt16(idx),
                               parentFrame: frame)
+        vr.argOwned = frame.curFunc.toObject()?.fbFast?.argSlotsOwned ?? false
         let obj = JeffJSObject()
         obj.payload = .opaque(vr)
         return obj
@@ -2718,6 +2729,51 @@ func jeffJS_isPlainBytecodeCallee(_ v: JeffJSValue) -> Bool {
 /// generator/async frame then released again — apple.com's globalnav
 /// `q.apply(this, [ev])` into an async-to-generator helper freed the menu
 /// event's argument object mid-dispatch.)
+
+///
+/// Argument slots. The frame's parameter slots hold the caller's references
+/// (borrowed) unless the function can store into a parameter
+/// (`fb.argSlotsOwned`, decided by the compiler from its bytecode). Such a
+/// store releases the value it replaces, so the slots must own their
+/// values, as in QuickJS (`JS_CallInternal` copies `argv` into the frame's
+/// `arg_buf` and frees it at exit):
+///   - callInternal and the uncarved inline-call path dup the arguments into
+///     the frame (`fb.copiesArgs`) and release every argument slot at exit;
+///   - an inline frame carved out of the caller's stack already owns slots
+///     [0, argc) — they are the caller's pushed arguments, which the caller
+///     releases by their *current* value after the return — so the callee
+///     only releases its padding slots [argc, argSlots) (a missing argument
+///     that was assigned);
+///   - generator and async frames receive their own copies from
+///     callFunction and release them at completion (or the saved state does).
+/// Before, a parameter store kept the old value without releasing it: every
+/// value but the last leaked (`e = e.next` list walks leaked each node), and
+/// on the native-call path the last one leaked as well.
+
+/// Store an owned value into argument slot `idx`, releasing the replaced one
+/// when the frame owns its argument slots.
+@inline(__always)
+func jeffJS_storeArg(_ buf: UnsafeMutablePointer<JeffJSValue>, _ idx: Int, _ val: JeffJSValue, _ owned: Bool) {
+    let old = buf[idx]
+    buf[idx] = val
+    if owned { old.freeValue() }
+}
+
+/// Frame exit for a function whose frames own their argument slots: release
+/// the slots this frame owns — all of them when it has its own buffer (args
+/// were dup'd in), only the padding past the caller's arguments when it was
+/// carved out of the caller's stack (the caller releases [0, argc)).
+/// Call sites test `fb.copiesArgs` first; this stays out of line so the
+/// interpreter loops (register-pressure sensitive) only carry the branch.
+/// Reads the slot layout off the frame (`buf`, `bufVarBase`, `argCount`,
+/// kept current by every call path) to keep the call sites small.
+@inline(never)
+func jeffJS_releaseOwnedArgSlots(_ frame: JeffJSStackFrame, bufOwned: Bool) {
+    guard let buf = frame.buf else { return }
+    let varBase = frame.bufVarBase
+    var i = bufOwned ? 0 : frame.argCount
+    while i < varBase { buf[i].freeValue(); buf[i] = .undefined; i += 1 }
+}
 
 /// Filled once at runtime bootstrap (jeffJS_computeStoreOpcodeMask): a
 /// stored global is a plain load, a lazily-initialised `let` costs a
@@ -3464,6 +3520,7 @@ private func executeFastTrace(
             // caller's stack, released below), like QuickJS frees var_buf at
             // function exit and the caller frees func/this/args after the call.
             do { var i = varBase; let n = state.spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
+            if fb.copiesArgs { jeffJS_releaseOwnedArgSlots(frame, bufOwned: state.bufOwned) }
             ctx.currentFrame = frame.prevFrame
             rt.releaseFrameU(Unmanaged.passUnretained(frame))
             if state.bufOwned { rt.releaseInterpBuf(buf, capacity: state.bufCapacity) }
@@ -6727,8 +6784,14 @@ struct JeffJSInterpreter {
         var varBase = argSlots
         var spBase = argSlots + varCount
 
-        // Copy args into buffer at offset 0
-        for i in 0..<args.count { buf[i] = args[i] }
+        // Copy args into buffer at offset 0: borrowed from the caller, or
+        // owned copies when the function can store into its parameters (see
+        // "Argument slots"; released in the epilogue).
+        if fb0.copiesArgs && resumeState == nil {
+            for i in 0..<args.count { buf[i] = args[i].dupValue() }
+        } else {
+            for i in 0..<args.count { buf[i] = args[i] }
+        }
         // Remaining arg slots (padding) are already .undefined from initialization
 
         var sp = spBase  // stack pointer (absolute index into buf)
@@ -7754,7 +7817,13 @@ struct JeffJSInterpreter {
                         } else {
                             (newBuf, newBufCap) = rt.acquireInterpBuf(size: newTotalSlots,
                                                                       initializedPrefix: newArgSlots + newVarCount)
-                            for i in 0..<e_argc { newBuf[i] = buf[argStart + i] }
+                            // Own buffer: borrow the caller's argument slots, or
+                            // take copies when the callee owns its slots.
+                            if e_fastFb.copiesArgs {
+                                for i in 0..<e_argc { newBuf[i] = buf[argStart + i].dupValue() }
+                            } else {
+                                for i in 0..<e_argc { newBuf[i] = buf[argStart + i] }
+                            }
                             bufOwned = true
                         }
                         frame = newFrame
@@ -8010,7 +8079,13 @@ struct JeffJSInterpreter {
                         } else {
                             (newBuf, newBufCap) = rt.acquireInterpBuf(size: newTotalSlots,
                                                                       initializedPrefix: newArgSlots + newVarCount)
-                            for i in 0..<e_argc { newBuf[i] = buf[argStart + i] }
+                            // Own buffer: borrow the caller's argument slots, or
+                            // take copies when the callee owns its slots.
+                            if e_fastFb.copiesArgs {
+                                for i in 0..<e_argc { newBuf[i] = buf[argStart + i].dupValue() }
+                            } else {
+                                for i in 0..<e_argc { newBuf[i] = buf[argStart + i] }
+                            }
                             bufOwned = true
                         }
                         frame = newFrame
@@ -8139,6 +8214,7 @@ struct JeffJSInterpreter {
                 // ended in `return f(...)` -- most visibly the `arguments`
                 // object, whose binding is a local slot.
                 do { var i = varBase; let n = spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
+                if fb.copiesArgs { jeffJS_releaseOwnedArgSlots(frame, bufOwned: bufOwned) }
                 ctx.currentFrame = frame.prevFrame
                 rt.releaseFrame(frame)
                 if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
@@ -8196,6 +8272,7 @@ struct JeffJSInterpreter {
                 // See tail_call: the frame's variable slots and the caller's
                 // callee/receiver/args slots are ours to release here.
                 do { var i = varBase; let n = spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
+                if fb.copiesArgs { jeffJS_releaseOwnedArgSlots(frame, bufOwned: bufOwned) }
                 ctx.currentFrame = frame.prevFrame
                 rt.releaseFrame(frame)
                 if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
@@ -8299,6 +8376,7 @@ struct JeffJSInterpreter {
                     // 1b. Release the callee's variable slots; the caller's
                     // func/this/args slots are released after the pop.
                     do { var i = varBase; let n = spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
+                    if fb.copiesArgs { jeffJS_releaseOwnedArgSlots(frame, bufOwned: bufOwned) }
                     ctx.currentFrame = frame.prevFrame
                     rt.releaseFrame(frame)
                     // 2b. Release callee's buf to pool
@@ -8341,6 +8419,7 @@ struct JeffJSInterpreter {
                         }
                     }
                     do { var i = varBase; let n = spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
+                    if fb.copiesArgs { jeffJS_releaseOwnedArgSlots(frame, bufOwned: bufOwned) }
                     ctx.currentFrame = frame.prevFrame
                     rt.releaseFrame(frame)
                     if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
@@ -9420,21 +9499,25 @@ struct JeffJSInterpreter {
                 }
                 pc += 3
 
+            // Parameter stores release the replaced value only when the frame
+            // owns its argument slots (fb.argSlotsOwned: the compiler sets it
+            // for every function that contains one of these, so in practice
+            // always; the check keeps a borrowed slot safe regardless).
             case .put_arg:
                 let idx = Int(readU16(bc, pc + 1))
+                let val: JeffJSValue
                 if isStoreOpcode(bc, pc + 3, bcLen) {
-                    let val = buf[sp - 1].dupValue()
-                    if idx < varBase { buf[idx] = val }
+                    val = buf[sp - 1].dupValue()
                 } else {
-                    let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                    if idx < varBase { buf[idx] = val }
+                    val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 }
+                if idx < varBase { jeffJS_storeArg(buf, idx, val, fb.argSlotsOwned) } else { val.freeValue() }
                 pc += 3
 
             case .set_arg:
                 let idx = Int(readU16(bc, pc + 1))
                 if idx < varBase {
-                    buf[idx] = buf[sp - 1].dupValue()
+                    jeffJS_storeArg(buf, idx, buf[sp - 1].dupValue(), fb.argSlotsOwned)
                 }
                 pc += 3
 
@@ -9443,39 +9526,21 @@ struct JeffJSInterpreter {
             case .get_arg2: buf[sp] = varBase > 2 ? buf[2].dupValue() : .undefined; sp += 1; pc += 1
             case .get_arg3: buf[sp] = varBase > 3 ? buf[3].dupValue() : .undefined; sp += 1; pc += 1
 
-            case .put_arg0:
+            case .put_arg0, .put_arg1, .put_arg2, .put_arg3:
+                let idx = Int(op.rawValue) &- Int(JeffJSOpcode.put_arg0.rawValue)
+                let val: JeffJSValue
                 if isStoreOpcode(bc, pc + 1, bcLen) {
-                    if varBase > 0 { buf[0] = buf[sp - 1].dupValue() }
+                    val = buf[sp - 1].dupValue()
                 } else {
-                    if varBase > 0 { buf[0] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
+                    val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 }
-                pc += 1
-            case .put_arg1:
-                if isStoreOpcode(bc, pc + 1, bcLen) {
-                    if varBase > 1 { buf[1] = buf[sp - 1].dupValue() }
-                } else {
-                    if varBase > 1 { buf[1] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
-                }
-                pc += 1
-            case .put_arg2:
-                if isStoreOpcode(bc, pc + 1, bcLen) {
-                    if varBase > 2 { buf[2] = buf[sp - 1].dupValue() }
-                } else {
-                    if varBase > 2 { buf[2] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
-                }
-                pc += 1
-            case .put_arg3:
-                if isStoreOpcode(bc, pc + 1, bcLen) {
-                    if varBase > 3 { buf[3] = buf[sp - 1].dupValue() }
-                } else {
-                    if varBase > 3 { buf[3] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
-                }
+                if idx < varBase { jeffJS_storeArg(buf, idx, val, fb.argSlotsOwned) } else { val.freeValue() }
                 pc += 1
 
-            case .set_arg0: if varBase > 0 { buf[0] = buf[sp - 1].dupValue() }; pc += 1
-            case .set_arg1: if varBase > 1 { buf[1] = buf[sp - 1].dupValue() }; pc += 1
-            case .set_arg2: if varBase > 2 { buf[2] = buf[sp - 1].dupValue() }; pc += 1
-            case .set_arg3: if varBase > 3 { buf[3] = buf[sp - 1].dupValue() }; pc += 1
+            case .set_arg0, .set_arg1, .set_arg2, .set_arg3:
+                let idx = Int(op.rawValue) &- Int(JeffJSOpcode.set_arg0.rawValue)
+                if idx < varBase { jeffJS_storeArg(buf, idx, buf[sp - 1].dupValue(), fb.argSlotsOwned) }
+                pc += 1
 
             // -----------------------------------------------------------------
             // Closure Variable Access
@@ -11930,7 +11995,13 @@ struct JeffJSInterpreter {
                         } else {
                             (newBuf, newBufCap) = rt.acquireInterpBuf(size: newTotalSlots,
                                                                       initializedPrefix: newArgSlots + newVarCount)
-                            for i in 0..<e_argc { newBuf[i] = buf[argStart + i] }
+                            // Own buffer: borrow the caller's argument slots, or
+                            // take copies when the callee owns its slots.
+                            if e_fastFb.copiesArgs {
+                                for i in 0..<e_argc { newBuf[i] = buf[argStart + i].dupValue() }
+                            } else {
+                                for i in 0..<e_argc { newBuf[i] = buf[argStart + i] }
+                            }
                             bufOwned = true
                         }
                         frame = newFrame
@@ -12110,6 +12181,7 @@ struct JeffJSInterpreter {
                     // an exception passed through leaked -- `arguments` most
                     // of all.
                     do { var i = varBase; let n = spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
+                    if fb.copiesArgs { jeffJS_releaseOwnedArgSlots(frame, bufOwned: bufOwned) }
                     ctx.currentFrame = frame.prevFrame
                     rt.releaseFrame(frame)
                     if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
@@ -12188,35 +12260,14 @@ struct JeffJSInterpreter {
             sp -= 1
             buf[sp].freeValue()
         }
-        // Release the variable slots (QuickJS frees var_buf at exit). Args are
-        // the caller's (borrowed). Generator/async frames keep their state
-        // while suspended; a generator that has completed (state still
-        // .executing after the loop, i.e. no yield suspended it) releases
-        // its locals and its arguments (generator args are owned by the
-        // generator: the call site hands them over at creation).
-        if !fb.isGenerator, !fb.isAsyncFunc, !frame.hasLiveVarRefs {
-            var i = varBase
-            while i < spBase { buf[i].freeValue(); i += 1 }
-        } else if fb.isGenerator, !fb.isAsyncFunc || resumeState == nil, !frame.hasLiveVarRefs,
-                  let genObj = generatorObject.toObject(),
-                  case .generatorData(let genData) = genObj.payload,
-                  genData.state == .executing {
-            var i = 0
-            while i < spBase { buf[i].freeValue(); i += 1 }
-        } else if fb.isAsyncFunc, !fb.isGenerator, !frame.hasLiveVarRefs,
-                  !asyncSuspendedHere {
-            // The async function ran to completion (either without ever
-            // suspending or on its last resumption): it owns its arguments
-            // (dup'd for it by callFunction) and its locals, and the saved state that
-            // handed them back on resume is gone.
-            var i = 0
-            while i < spBase { buf[i].freeValue(); i += 1 }
-        }
-
         // Detach any remaining live var-refs that still point at this frame.
         // This handles `var`-scoped captured variables whose lifetime equals
         // the entire function -- the compiler does not emit `close_loc` for
-        // them, so we must detach here before the frame goes away.
+        // them, so we must detach here before the frame goes away. The
+        // detached copy takes its own reference, so the slots are released
+        // below exactly as for a frame without captures (they used to be
+        // skipped whenever a closure had captured anything, which leaked
+        // every local and argument of such a frame on this path).
         // Skipped entirely for the common case (no captures): the sync loops
         // and detach walk cost real time at 250k calls/sec.
         if frame.hasLiveVarRefs {
@@ -12228,6 +12279,33 @@ struct JeffJSInterpreter {
                 vr.isDetached = true
                 vr.parentFrame = nil; vr.slot = nil
             }
+        }
+
+        // Release the variable slots (QuickJS frees var_buf at exit), and the
+        // argument slots when the frame owns them (see "Argument slots"; a
+        // plain function's are otherwise the caller's, borrowed).
+        // Generator/async frames keep their state while suspended; a
+        // generator that has completed (state still .executing after the
+        // loop, i.e. no yield suspended it) releases its locals and its
+        // arguments (generator args are owned by the generator: the call site
+        // hands them over at creation).
+        if !fb.isGenerator, !fb.isAsyncFunc {
+            var i = varBase
+            while i < spBase { buf[i].freeValue(); i += 1 }
+            if fb.copiesArgs { jeffJS_releaseOwnedArgSlots(frame, bufOwned: bufOwned) }
+        } else if fb.isGenerator, !fb.isAsyncFunc || resumeState == nil,
+                  let genObj = generatorObject.toObject(),
+                  case .generatorData(let genData) = genObj.payload,
+                  genData.state == .executing {
+            var i = 0
+            while i < spBase { buf[i].freeValue(); i += 1 }
+        } else if fb.isAsyncFunc, !fb.isGenerator, !asyncSuspendedHere {
+            // The async function ran to completion (either without ever
+            // suspending or on its last resumption): it owns its arguments
+            // (dup'd for it by callFunction) and its locals, and the saved state that
+            // handed them back on resume is gone.
+            var i = 0
+            while i < spBase { buf[i].freeValue(); i += 1 }
         }
 
         // Derived class constructor: `this` was bound by init_this (owned by

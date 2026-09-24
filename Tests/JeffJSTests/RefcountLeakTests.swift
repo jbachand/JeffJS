@@ -408,6 +408,52 @@ final class RefcountLeakTests: XCTestCase {
                    "var r=(function(){ var wip=null, fiber=null; function mount(){ var h={memoizedState:null,next:null}; if (wip===null) fiber.memoizedState = wip = h; else wip = wip.next = h; return wip } return function(){ fiber={}; wip=null; mount(); mount(); mount(); wip=null } })(); for (var i=0;i<$N;i++) r();")
     }
 
+    func testParameterStoresReleaseTheOldValue() {
+        // Argument slots held the caller's borrowed references, so a store
+        // into a parameter could not release what it replaced: every value
+        // but the last leaked (and the last one too when native code made
+        // the call). Minified React/scheduler code reassigns parameters
+        // constantly (`e = e.next`).
+        assertFlat("put_arg twice",
+                   "function g(a){ a={x:1}; a={y:2}; } for (var i=0;i<$N;i++) g(null);")
+        assertFlat("list walk via a parameter",
+                   "function w(e){ while (e) e = e.next; } for (var i=0;i<$N;i++) w({next:{next:{next:null}}});")
+        assertFlat("native caller",
+                   "function g(a){ a={x:1}; a={y:2}; } for (var i=0;i<$N;i++) { [{}].forEach(g); g.apply(null, [{}]); Reflect.apply(g, null, [{}]); }")
+        assertFlat("missing argument slot",
+                   "function g(a, b){ b={x:1}; b={y:2}; } for (var i=0;i<$N;i++) { g(1); g.call(null, 1); }")
+        assertFlat("mapped arguments",
+                   "function g(a){ arguments[0]={x:1}; a={y:2}; arguments[0]={z:3}; } for (var i=0;i<$N;i++) g({});")
+        assertFlat("closure writes a captured parameter",
+                   "function g(a){ var h=function(){ a={y:2}; }; h(); h(); a={z:3}; return a; } for (var i=0;i<$N;i++) g({});")
+        assertFlat("direct eval",
+                   "function g(a){ eval('a={e:1}'); a={f:1}; } for (var i=0;i<2000;i++) g({});")
+        assertFlat("throw through a frame",
+                   "function g(a){ a={x:1}; a={y:2}; throw a; } for (var i=0;i<$N;i++) { try { g({}); } catch (e) {} }")
+        assertFlat("generator",
+                   "function* g(a){ a={x:1}; yield a; a={y:2}; } for (var i=0;i<$N;i++) { var it=g({}); it.next(); if (i & 1) it.next(); }")
+        assertFlat("async function",
+                   "async function g(a){ a={x:1}; await null; a={y:2}; return 0; } for (var i=0;i<$N;i++) g({});")
+        assertFlat("deep recursion (the callee gets its own buffer)",
+                   "function d(n, a){ a={n:n}; return n > 0 ? d(n-1, a) : 0; } for (var i=0;i<$N/100;i++) d(150, null);")
+    }
+
+    func testCapturedFramesReleaseTheirSlots() {
+        // A frame called from native code that let a closure capture a
+        // variable skipped releasing its locals at exit (the detached copy is
+        // the closure's own reference).
+        assertFlat("captured local, native caller",
+                   "function g(){ var o={}; var h=function(){ return o; }; return 1; } for (var i=0;i<$N;i++) [1].forEach(g);")
+        assertFlat("captured local, async",
+                   "async function g(a){ var o={}; var h=()=>o; await null; return 1; } for (var i=0;i<$N;i++) g({});")
+        assertFlat("captured local, generator",
+                   "function* g(a){ var o={}; var h=()=>o; yield 1; } for (var i=0;i<$N;i++) { var it=g({}); it.next(); it.next(); }")
+        // An async function returning an object resolves through a promise
+        // capability whose resolving functions were never released.
+        assertFlat("async function returning an object",
+                   "async function g(){ return {y:2}; } for (var i=0;i<$N;i++) g();")
+    }
+
     func testFindLastReleasesUnmatchedElements() {
         assertFlat("findLast no match",  "for (var i=0;i<$N;i++){ [{a:1},{a:2}].findLast(function(){ return false }); }")
         assertFlat("findLast match",     "for (var i=0;i<$N;i++){ [{a:1},{a:2}].findLast(function(x){ return x.a === 1 }); }")

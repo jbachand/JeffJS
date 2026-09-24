@@ -878,6 +878,7 @@ struct JeffJSBytecodeDeserializer {
         // Trace regions are derived from the final bytecode (not stored):
         // recompute them so cached code runs with the same loop traces.
         JeffJSCompiler.fuseBasicBlocks(fb)
+        JeffJSCompiler.computeArgSlotOwnership(fb)
 
         return fb
     }

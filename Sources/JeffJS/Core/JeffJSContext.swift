@@ -1223,9 +1223,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                let e = jsObj.extra(at: idx), e.kind == .varRef, let vr = e.varRef {
                 if (flags & JS_PROP_TMASK) != JS_PROP_GETSET {
                     if (flags & JS_PROP_HAS_VALUE) != 0 {
-                        let oldVal = vr.pvalue
-                        vr.pvalue = value.dupValue()
-                        oldVal.freeValue()
+                        vr.store(value.dupValue())
                     }
                     if propFlags.contains(.writable) {
                         // Still mapped: keep the var-ref slot, refresh the
@@ -5024,9 +5022,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             if exFlags.isVarRef {
                 // Mapped arguments: write through to the live parameter slot.
                 if let e = jsObj.extra(at: exIdx), e.kind == .varRef, let vr = e.varRef {
-                    let oldVal = vr.pvalue
-                    vr.pvalue = value
-                    oldVal.freeValue()
+                    vr.store(value)   // releases the replaced value when the slot owns it
                     return 1
                 }
             }
