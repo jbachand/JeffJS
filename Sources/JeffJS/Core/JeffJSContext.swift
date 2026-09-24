@@ -682,6 +682,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // Safe point for GC — parsing and compilation are complete
         if rt.mallocState.mallocSize >= rt.mallocGCThreshold {
             runGC(rt)
+        } else if callDepth == 0 {
+            // A host-level eval is a task of its own (event dispatch strings).
+            jeffJS_idleGCTick(rt)
         }
         return result
     }

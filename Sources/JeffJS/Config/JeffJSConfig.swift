@@ -105,6 +105,11 @@ enum JeffJSConfig {
     static let gcMallocThreshold   = int("gc.mallocThreshold",        default: 256 * 1024)
     static let gcObjectCost        = int("gc.objectCost",              default: 256)
     static let gcMetalThreshold    = int("gc.metalThreshold",          default: 5000)
+    /// Idle collection (`jeffJS_idleGCTick`): collect between tasks once the
+    /// live heap grew by 1/2^shift since the last collection (0 = off) ...
+    static let gcIdleGrowthShift   = int("gc.idleGrowthShift",         default: 6)
+    /// ... and at least this long after it ended.
+    static let gcIdleIntervalMs    = int("gc.idleIntervalMs",          default: 1000)
     /// True when the crossover was named in the environment. `JEFFJS_GC_METAL=1`
     /// otherwise drops it to zero so "use the GPU collector" means every
     /// collection, not only the ones on a 5 000-object heap.

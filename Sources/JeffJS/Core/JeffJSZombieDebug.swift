@@ -39,6 +39,7 @@ func jeffJS_bootstrapDebugFlags() {
         || ProcessInfo.processInfo.environment["JEFFJS_TRACK_RC"] == "1"
     jeffJS_refDebugMode = JeffJSGCObjectHeader.trackRefcounts || jeffJSZombiesEnabled
     jeffJS_computeStoreOpcodeMask()
+    jeffJS_bootstrapHeapCensus()
     if JeffJSGCObjectHeader.trackRefcounts && !jeffJS_rcReportRegistered {
         jeffJS_rcReportRegistered = true
         atexit { FileHandle.standardError.write(JeffJSGCObjectHeader.refcountReport().data(using: .utf8)!) }

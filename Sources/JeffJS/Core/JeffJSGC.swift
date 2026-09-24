@@ -290,6 +290,13 @@ func _runGCImpl(_ rt: JeffJSRuntime) { runGC(rt) }
 ///   3. **Free cycles** — anything still at zero is unreachable; free it.
 func runGC(_ rt: JeffJSRuntime) {
     guard rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain, !jeffJS_gcDisable else { return }
+    let gcStart = CFAbsoluteTimeGetCurrent()
+    defer {
+        let end = CFAbsoluteTimeGetCurrent()
+        rt.gcLastEnd = end
+        rt.gcLastDuration = end - gcStart
+        rt.gcLiveAfterLast = rt.mallocState.mallocSize
+    }
 
     // Objects whose refcount hit zero while a free chain was unwinding must be
     // gone before trial deletion: a dead object still on the GC list would be
@@ -715,6 +722,54 @@ func gcFreeDeadObjects(_ rt: JeffJSRuntime, _ dead: [JeffJSGCObjectHeader]) {
 
 // MARK: - GC trigger
 
+/// Idle collection. The allocation trigger (`mallocGCThreshold`, quickjs's
+/// 1.5x-the-live-heap watermark) never fires on a page that only runs timers
+/// and animation frames: each tick leaves a few hundred bytes of *cyclic*
+/// garbage (a React commit's effect ring, a promise and its resolvers, a
+/// closure and the object it was stored on), so the live count creeps up for
+/// minutes before it crosses a watermark set at half again the page's whole
+/// heap (threes.day: +300 objects/s, 90 000 live, next collection at 135 000).
+///
+/// So a collection also runs between tasks — at the start of a top-level
+/// native -> JS call (timer, animation frame, event) — once the live heap has
+/// grown by 1/2^`gc.idleGrowthShift` (1/64) since the last one and at least
+/// `gc.idleIntervalMs` (1 s) has passed; the interval stretches to 50x the
+/// last collection's duration, which caps these collections at 2% of the
+/// thread. `gc.idleGrowthShift` 0 turns it off.
+nonisolated(unsafe) let jeffJS_idleGCShift = JeffJSConfig.gcIdleGrowthShift
+nonisolated(unsafe) let jeffJS_idleGCInterval = Double(JeffJSConfig.gcIdleIntervalMs) / 1000
+
+@inline(__always)
+func jeffJS_idleGCTick(_ rt: JeffJSRuntime) {
+    guard jeffJS_idleGCShift > 0 else { return }
+    let live = rt.mallocState.mallocSize
+    let base = rt.gcLiveAfterLast
+    guard live - base >= max(base >> jeffJS_idleGCShift, 64 * JeffJSConfig.gcObjectCost) else { return }
+    jeffJS_idleGCTickSlow(rt)
+}
+
+@inline(never)
+func jeffJS_idleGCTickSlow(_ rt: JeffJSRuntime) {
+    let now = CFAbsoluteTimeGetCurrent()
+    let interval = max(jeffJS_idleGCInterval, rt.gcLastDuration * 50) * Double(rt.gcIdleBackoff)
+    guard now - rt.gcLastEnd >= interval else { return }
+    guard rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain, rt.initComplete else { return }
+    rt.gcIdleRuns += 1
+    let grown = rt.mallocState.mallocSize - rt.gcLiveAfterLast
+    let freedBefore = rt.gcCyclesFreed
+    runGC(rt)
+    // A collection that got back less than half of what the heap grew by
+    // says the growth is live (or leaked, which no collection fixes): wait
+    // twice as long before the next idle one, up to 64x. One that did
+    // reclaim the growth resets the interval.
+    let reclaimed = (rt.gcCyclesFreed - freedBefore) * JeffJSConfig.gcObjectCost
+    if reclaimed * 2 < grown {
+        rt.gcIdleBackoff = min(rt.gcIdleBackoff * 2, 64)
+    } else {
+        rt.gcIdleBackoff = 1
+    }
+}
+
 /// Check if the allocation watermark has crossed the GC threshold.
 /// If so, run a full collection.
 func triggerGC(_ rt: JeffJSRuntime, size: Int) {
@@ -855,6 +910,12 @@ func markObject(_ rt: JeffJSRuntime,
         }
     }
 
+    // 3b. Weak-collection values keyed by this object: an ephemeron's value
+    // is reachable through its key, not through the WeakMap (see "Weak
+    // collections" in JeffJSBuiltinMap.swift). `weakrefCount` is zero for
+    // every object that is not a live WeakMap/WeakSet key.
+    if obj.weakrefCount != 0 { jeffJS_markWeakKeyValues(rt, obj, markFunc) }
+
     // 4. Payload — only the counted edges (see markChildren). A plain
     // object has none, and both `_fastArrayValues` and `payload` are
     // ARC-bearing reads (copying the payload enum retains its associated
@@ -904,6 +965,35 @@ func markObject(_ rt: JeffJSRuntime,
         // A proxy owns its target and handler (released by freeObject).
         if let c = pd.target.toGCObjectHeader() { markFunc(rt, c) }
         if let c = pd.handler.toGCObjectHeader() { markFunc(rt, c) }
+    case .mapState(let ms):
+        // A Map/Set owns a counted reference to every key and value
+        // (released by jeffJS_mapStateFree). Weak collections own only the
+        // values, which are marked from their keys (3b above).
+        if !ms.isWeak {
+            for rec in ms.records where !rec.empty {
+                if let c = rec.key.toGCObjectHeader() { markFunc(rt, c) }
+                if let c = rec.value.toGCObjectHeader() { markFunc(rt, c) }
+            }
+        }
+    case .promiseData(let pd):
+        // A promise owns its settled value and the handler and result promise
+        // of every queued reaction (released by jeffJS_promiseDataFree):
+        // `o.p = new Promise(...); o.p.then(() => o)` is a cycle.
+        if let c = pd.promiseResult.toGCObjectHeader() { markFunc(rt, c) }
+        for r in pd.promiseFulfillReactions {
+            if let c = r.handler.toGCObjectHeader() { markFunc(rt, c) }
+            if let c = r.resultPromise.toGCObjectHeader() { markFunc(rt, c) }
+        }
+        for r in pd.promiseRejectReactions {
+            if let c = r.handler.toGCObjectHeader() { markFunc(rt, c) }
+            if let c = r.resultPromise.toGCObjectHeader() { markFunc(rt, c) }
+        }
+    case .boundFunction(let bf):
+        // A bound function owns its target, `this` and arguments (released
+        // by freeObject): `obj.cb = obj.m.bind(obj)` is a cycle.
+        if let c = bf.funcObj.toGCObjectHeader() { markFunc(rt, c) }
+        if let c = bf.thisVal.toGCObjectHeader() { markFunc(rt, c) }
+        for a in bf.argv { if let c = a.toGCObjectHeader() { markFunc(rt, c) } }
     default:
         break
     }
@@ -1111,6 +1201,15 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
         freeValue(rt, pd.target)
         freeValue(rt, pd.handler)
     }
+    // A bound function owns its target, bound `this` and bound arguments
+    // (all dup'd by Function.prototype.bind). They were never released, so
+    // every `f.bind(...)` of a short-lived function leaked the function (and
+    // its closure) for good.
+    if case .boundFunction(let bf) = savedPayload {
+        freeValue(rt, bf.funcObj)
+        freeValue(rt, bf.thisVal)
+        for a in bf.argv { freeValue(rt, a) }
+    }
     if case .typedArray(let ta) = savedPayload, let buf = ta.buffer {
         ta.buffer = nil
         if buf.refCount > 0 {
@@ -1206,6 +1305,7 @@ func weakrefNew(_ rt: JeffJSRuntime, _ target: JeffJSObject) -> JeffJSWeakRef {
 func weakrefFree(_ rt: JeffJSRuntime, _ target: JeffJSObject) {
     let key = ObjectIdentifier(target)
     if let ref = rt.gcWeakRefMap.removeValue(forKey: key) { ref.cleared = true }
+    if target.weakrefCount != 0 { jeffJS_weakKeyDied(rt, target) }
 }
 
 /// Returns `true` if the weak reference's target is still alive.
@@ -1280,6 +1380,7 @@ func clearGCState(_ rt: JeffJSRuntime) {
     rt.gcZeroRefCountObjects.removeAll()
     rt.gcTmpObjects.removeAll()
     rt.gcWeakRefMap.removeAll()
+    rt.weakMapKeyRecords.removeAll()
 }
 
 /// Returns `true` if a value is eligible to be a WeakRef target.

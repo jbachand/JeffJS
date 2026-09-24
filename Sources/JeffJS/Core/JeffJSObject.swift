@@ -916,6 +916,11 @@ final class JeffJSMapRecord {
     var hashNext: Int = -1
     var link: ListNode = ListNode()
     var empty: Bool = false
+    /// WeakMap/WeakSet record whose key is held weakly: the record owns no
+    /// reference to `key`, which lists the record in the runtime's
+    /// `weakMapKeyRecords` instead (see "Weak collections" in
+    /// JeffJSBuiltinMap.swift).
+    var weakKey: Bool = false
 
     init() {}
 }
@@ -923,6 +928,9 @@ final class JeffJSMapRecord {
 /// Map / Set state.
 final class JeffJSMapState {
     var isWeak: Bool = false
+    /// Live iterators and running `forEach` loops, which address `records`
+    /// by index: the table is only compacted while this is zero.
+    var iterating: Int = 0
     var records: [JeffJSMapRecord] = []
     var count: Int = 0
     var hashSize: Int = 0
@@ -995,6 +1003,27 @@ final class JeffJSVarRef: JeffJSGCObjectHeader {
 
     /// Storage for the detached value (used after `close_loc`).
     var value: JeffJSValue
+
+    /// `put_var_ref` / `set_var_ref`: store an owned value into the binding
+    /// and release the one it replaces (quickjs `set_value`). The store
+    /// opcodes used to overwrite the slot without freeing it, so every
+    /// assignment to a captured variable leaked its previous value — React's
+    /// `workInProgressHook = hook` alone leaked every hook of every render.
+    ///
+    /// A live var-ref over a *parameter* is the exception: a plain frame's
+    /// argument slots hold the caller's borrowed references (see "Ownership
+    /// of call arguments" in JeffJSInterpreter.swift; `put_arg` does not free
+    /// either), so the value it replaces is not the slot's to release.
+    @inline(__always)
+    func store(_ v: JeffJSValue) {
+        if isDetached {
+            let old = value; value = v; old.freeValue()
+        } else if isArg {
+            pvalue = v
+        } else {
+            let old = pvalue; pvalue = v; old.freeValue()
+        }
+    }
 
     /// Computed live-slot accessor.  When not detached, reads/writes go
     /// through the parent frame's unsafe buffer (if available) or arrays;

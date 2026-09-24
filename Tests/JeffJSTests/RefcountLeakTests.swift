@@ -297,4 +297,143 @@ final class RefcountLeakTests: XCTestCase {
         assertFlat("sort comparator that throws",
                    "var a=[{},{},{}]; for (var i=0;i<$N/10;i++){ try { a.sort(function(){ throw 0 }) } catch(e){} }")
     }
+
+    // MARK: - Idle heap growth (timers / animation frames on a live page)
+
+    func testBoundFunctionsReleaseTheirTarget() {
+        // freeObject dropped the .boundFunction payload without releasing the
+        // target, bound `this` and bound arguments that bind() dup'd, so every
+        // `f.bind(...)` of a short-lived function leaked it and its closure.
+        assertFlat("bind a fresh closure", "for (var i=0;i<$N;i++){ var f=function(){ return i }; var g=f.bind(null); g(); }")
+        assertFlat("bound arguments",      "for (var i=0;i<$N;i++){ var f=function(a,b){ return a }; f.bind({}, {x:i}, [i])(); }")
+        assertFlat("bound method cycle",   "for (var i=0;i<$N;i++){ var o={ f:function(){ return this } }; o.g=o.f.bind(o); o=null; }")
+    }
+
+    func testCyclesThroughCollectionsAreCollected() {
+        // Map/Set entries, promise results/reactions and a resolver's promise
+        // are counted edges the collector did not follow, so any cycle through
+        // one of them was immortal.
+        assertFlat("Map cycle",  "for (var i=0;i<$N;i++){ var o={ m:new Map() }; o.m.set('self', o); o=null; }")
+        assertFlat("Map key cycle", "for (var i=0;i<$N;i++){ var o={ m:new Map() }; o.m.set(o, 1); o=null; }")
+        assertFlat("Set cycle",  "for (var i=0;i<$N;i++){ var o={ s:new Set() }; o.s.add(o); o=null; }")
+        assertFlat("pending promise cycle",
+                   "for (var i=0;i<$N;i++){ var o={}; o.p=new Promise(function(r){ o.r=r }); o.p.then(function(){ return o }); o=null; }")
+        assertFlat("settled promise cycle", "for (var i=0;i<$N;i++){ var o={}; o.p=Promise.resolve(o); o=null; }")
+    }
+
+    func testWeakCollectionsDoNotOwnTheirKeys() {
+        // WeakMap/WeakSet dup'd their keys like a Map, so a long-lived weak
+        // collection (a module cache, Babel's private-field WeakMap) kept
+        // every key it ever saw.
+        assertFlat("WeakMap cache",   "var wm=new WeakMap(); for (var i=0;i<$N;i++){ var k={}; wm.set(k, {v:i}); k=null; }")
+        assertFlat("WeakSet cache",   "var ws=new WeakSet(); for (var i=0;i<$N;i++){ var k={}; ws.add(k); k=null; }")
+        assertFlat("value refers to key (ephemeron)",
+                   "var wm=new WeakMap(); for (var i=0;i<$N;i++){ var k={}; wm.set(k, { k:k }); k=null; }")
+        assertFlat("private-field pattern",
+                   "var _p=new WeakMap(); function C(){ _p.set(this, { self:this, f:function(){} }) } for (var i=0;i<$N;i++){ new C(); }")
+        assertFlat("constructor entries", "for (var i=0;i<$N;i++){ var k={}; var w=new WeakMap([[k, {k:k}]]); w=null; k=null; }")
+    }
+
+    func testWeakCollectionSemantics() {
+        let rt = JeffJSRuntime()
+        let ctx = rt.newContext()
+        defer { ctx.free(); rt.free() }
+        let r = ctx.eval(input: """
+            var wm = new WeakMap(), ws = new WeakSet(), out = [];
+            var a = {}, b = {};
+            wm.set(a, 1).set(b, 2); ws.add(a);
+            out.push(wm.get(a), wm.get(b), wm.has(a), ws.has(a), ws.has(b));
+            wm.set(a, 3); out.push(wm.get(a));
+            out.push(wm.delete(a), wm.has(a), wm.delete(a), ws.delete(a), ws.has(a));
+            wm.set(a, 4); out.push(wm.get(a));
+            for (var i = 0; i < 1000; i++) wm.set({}, i);   // keys die at once
+            out.push(wm.get(b));
+            var threw = false; try { wm.set(1, 1) } catch (e) { threw = e instanceof TypeError }
+            out.push(threw);
+            out.join(',')
+            """, filename: "<weak-semantics>", evalFlags: 0)
+        XCTAssertEqual(ctx.toSwiftString(r), "1,2,true,true,false,3,true,false,false,true,false,4,2,true")
+        r.freeValue()
+        runGC(rt)
+        // Only a and b are still keyed; the 1 000 temporaries left no records.
+        XCTAssertEqual(rt.weakMapKeyRecords.count, 2)
+    }
+
+    func testMapChurnDoesNotGrowTheRecordTable() {
+        // Deleted records stayed in the table forever: a Map used as a queue
+        // grew by one record per insertion.
+        let rt = JeffJSRuntime()
+        let ctx = rt.newContext()
+        defer { ctx.free(); rt.free() }
+        let m = ctx.eval(input: """
+            var m = new Map(), seen = 0;
+            for (var i = 0; i < 100000; i++) { m.set(i, {v:i}); if (i >= 3) m.delete(i - 3); }
+            // Iteration that deletes as it goes still visits every entry once.
+            var it = m.keys(); m.set('x', 1);
+            for (var k of it) { seen++; m.delete(k); }
+            m.set('y', 2); m.forEach(function(v, k){ seen += 10; m.delete(k) });
+            m.set('z', 3);
+            m
+            """, filename: "<map-churn>", evalFlags: 0)
+        guard let obj = m.toObject(), case .mapState(let s) = obj.payload else {
+            XCTFail("not a Map"); m.freeValue(); return
+        }
+        XCTAssertLessThan(s.records.count, 64, "the record table kept \(s.records.count) records for \(s.count) entries")
+        XCTAssertEqual(s.count, 1)
+        m.freeValue()
+        let seen = ctx.eval(input: "seen", filename: "<seen>", evalFlags: 0)
+        XCTAssertEqual(seen.toInt32(), 4 + 10)
+    }
+
+    func testClosureVariableStoresReleaseTheOldValue() {
+        // put_var_ref / set_var_ref overwrote the captured binding without
+        // releasing what it held: every assignment to a closure variable
+        // leaked the previous value (React's module-level
+        // `workInProgressHook = hook` leaked every hook of every render).
+        assertFlat("plain store",
+                   "var f=(function(){ var v=null; return function(){ v={x:1}; } })(); for (var i=0;i<$N;i++) f();")
+        assertFlat("store in expression",
+                   "var f=(function(){ var v=null; return function(){ var y=(v={x:1}); } })(); for (var i=0;i<$N;i++) f();")
+        assertFlat("chained through a property",
+                   "var f=(function(){ var v={}; return function(){ v = v.next = {x:1}; } })(); for (var i=0;i<$N;i++) f();")
+        assertFlat("let binding",
+                   "var f=(function(){ let v=null; return function(){ v={x:1}; } })(); for (var i=0;i<$N;i++) f();")
+        // `y = (v = x)` on a `let` is `dup; put_var_ref_check; put_loc`: the
+        // trace's chained-store peek kept the dup'd reference too.
+        assertFlat("let binding in expression",
+                   "var f=(function(){ let v=null, w=null; return function(){ var y=(v={x:1}); w = v = {y:2}; } })(); for (var i=0;i<$N;i++) f();")
+        assertFlat("live (not yet closed) binding",
+                   "for (var i=0;i<$N;i++){ (function(){ var v={x:1}; var g=function(){ v={y:2}; v={z:3}; }; g(); })(); }")
+        assertFlat("hook list",
+                   "var r=(function(){ var wip=null, fiber=null; function mount(){ var h={memoizedState:null,next:null}; if (wip===null) fiber.memoizedState = wip = h; else wip = wip.next = h; return wip } return function(){ fiber={}; wip=null; mount(); mount(); mount(); wip=null } })(); for (var i=0;i<$N;i++) r();")
+    }
+
+    func testFindLastReleasesUnmatchedElements() {
+        assertFlat("findLast no match",  "for (var i=0;i<$N;i++){ [{a:1},{a:2}].findLast(function(){ return false }); }")
+        assertFlat("findLast match",     "for (var i=0;i<$N;i++){ [{a:1},{a:2}].findLast(function(x){ return x.a === 1 }); }")
+        assertFlat("findLastIndex",      "for (var i=0;i<$N;i++){ [{a:1},{a:2}].findLastIndex(function(x){ return x.a === 1 }); }")
+    }
+
+    func testIdleCollectionRunsBetweenTasks() {
+        // A page's timers leave cyclic garbage far below the allocation
+        // watermark; the idle trigger collects it at the next task boundary.
+        let rt = JeffJSRuntime()
+        let ctx = rt.newContext()
+        defer { ctx.free(); rt.free() }
+        let tick = ctx.eval(input: """
+            (function () { for (var i = 0; i < 300; i++) { var o = {}; o.self = o; o.f = function () { return o }; } })
+            """, filename: "<tick>", evalFlags: 0)
+        runGC(rt)
+        let before = rt.gcObjects.count
+        for _ in 0..<40 {
+            ctx.callFunction(tick, thisVal: .undefined, args: []).freeValue()
+            rt.gcLastEnd = 0   // pretend the last collection was long ago
+        }
+        let idleRuns = rt.gcIdleRuns
+        XCTAssertGreaterThan(idleRuns, 0, "no idle collection ran")
+        // 40 ticks x 300 cycles would be 12 000+ objects without a collection.
+        XCTAssertLessThan(rt.gcObjects.count - before, 2_000,
+                          "idle ticks left \(rt.gcObjects.count - before) objects behind (\(idleRuns) idle runs)")
+        tick.freeValue()
+    }
 }
