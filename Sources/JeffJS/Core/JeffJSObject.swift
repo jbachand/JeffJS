@@ -582,6 +582,7 @@ class JeffJSFunctionBytecode {
         cpool.withUnsafeBufferPointer { p.initialize(from: $0.baseAddress!, count: n) }
         _cpoolRaw = p
         cpoolRawCount = n
+    }
 
     /// Lazy compilation (JeffJSLazyFunctionInfo): set on a function whose
     /// body is compiled on its first call. While `lazyInfo.isPending` the
