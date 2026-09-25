@@ -182,6 +182,17 @@ func jeffJS_keyedAtom(_ key: JeffJSValue) -> UInt32 {
     return (a & JS_ATOM_TAG_INT) == 0 ? a : 0
 }
 
+/// Receivers whose string keys are not plain property names: a typed
+/// array treats every canonical numeric string ("-1", "1.5", "NaN") as an
+/// element index that never reaches the prototype (ES §10.4.5), and a
+/// module namespace is exotic. Their keyed sites are never cached.
+@inline(__always)
+func jeffJS_keyedCacheExcluded(_ o: JeffJSObj) -> Bool {
+    let c = o.classID
+    return (c >= JeffJSClassID.uint8cArray.rawValue && c <= JeffJSClassID.float64Array.rawValue)
+        || c == JeffJSClassID.moduleNamespace.rawValue
+}
+
 /// Keyed read cache hit (borrowed value), or nil.
 @inline(__always)
 func jeffJS_keyedICGet(_ ents: UnsafeMutablePointer<JeffJSICEntry>?, _ pc: Int, _ jsObj: JeffJSObj, _ atom: UInt32) -> JeffJSValue? {
@@ -202,7 +213,7 @@ func jeffJS_keyedGetMiss(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ p
                          _ obj: JeffJSValue, _ jsObj: JeffJSObj, _ atom: UInt32) -> JeffJSValue {
     let val = ctx.getProperty(obj: obj, atom: atom)
     if val.isException { return val }
-    if jsObj.shapeIdentity != nil, let shape = jsObj.shape {
+    if jsObj.shapeIdentity != nil, !jeffJS_keyedCacheExcluded(jsObj), let shape = jsObj.shape {
         if let propIdx = findShapeProperty(shape, atom) {
             fb.getIC().update(pc, shape: shape, propOffset: propIdx, atom: atom)
         } else if let holder = jsObj.proto, let hs = holder.shape,
@@ -306,7 +317,7 @@ func jeffJS_keyedPutMiss(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ p
     let ok = ctx.setPropertyChecked(obj: obj, atom: atom, value: val, strict: fb.isStrictMode)
     if ok < 0 { return false }
     // Never cache `arr.length = n` (the slot write would skip truncation).
-    if jsObj.shapeIdentity != nil, let curShape = jsObj.shape,
+    if jsObj.shapeIdentity != nil, !jeffJS_keyedCacheExcluded(jsObj), let curShape = jsObj.shape,
        let propIdx = findShapeProperty(curShape, atom),
        !(jsObj.classID == JeffJSClassID.array.rawValue && atom == JeffJSAtomID.JS_ATOM_length.rawValue) {
         fb.getIC().update(pc, shape: curShape, propOffset: propIdx, atom: atom)
