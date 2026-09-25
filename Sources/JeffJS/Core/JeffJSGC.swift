@@ -741,6 +741,9 @@ nonisolated(unsafe) let jeffJS_idleGCInterval = Double(JeffJSConfig.gcIdleInterv
 
 @inline(__always)
 func jeffJS_idleGCTick(_ rt: JeffJSRuntime) {
+    // Lazily compiled bodies waiting to be written to the bytecode cache.
+    if rt.lazyBodiesPending { rt.bytecodeCache.flushLazyBodiesIfDue() }
+    if rt.lazyDropAfterMs > 0 { rt.lazyReclaimTick() }
     guard jeffJS_idleGCShift > 0 else { return }
     let live = rt.mallocState.mallocSize
     let base = rt.gcLiveAfterLast

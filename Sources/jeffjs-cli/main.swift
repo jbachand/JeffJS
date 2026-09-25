@@ -69,6 +69,10 @@ let status: Int32 = MainActor.assumeIsolated {
         return "{\"runs\":\(s.runs),\"cyclesFreed\":\(s.cyclesFreed),\"liveObjects\":\(s.liveObjects),\"heapBytes\":\(s.heapBytes),\"threshold\":\(s.threshold)}"
     }
     var status: Int32 = 0
+    // --eager: compile every function body up front (lazy compilation off).
+    if args.contains("--eager") { env.lazyFunctions = false }
+    let lazyStats = args.contains("--lazy-stats")
+    defer { if lazyStats { FileHandle.standardError.write((env.lazyCompileSummary + "\n").data(using: .utf8)!) } }
     if parseOnly {
         for path in paths {
             guard let src = try? String(contentsOfFile: path, encoding: .utf8) else {
@@ -112,6 +116,7 @@ let status: Int32 = MainActor.assumeIsolated {
             status = 1
         }
     }
+    env.flushBytecodeCache()
     // --teardown exercises context/runtime free (the path the test suite runs
     // between groups); the CLI otherwise leaves it to process exit.
     if args.contains("--teardown") { env.teardown() }

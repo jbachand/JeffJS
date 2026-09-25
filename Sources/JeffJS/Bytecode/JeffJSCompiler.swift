@@ -264,6 +264,31 @@ class JeffJSFunctionDefCompiler {
         set { ownSourceText = newValue }
     }
 
+    // -- Lazy compilation (JeffJSCompiler.lazyStubOrEager / compileLazy) --
+    /// How to re-parse this function on its own, recorded by the parser at
+    /// the definition sites that support it (nil: always compiled eagerly).
+    var lazySeed: JeffJSLazySeed? = nil
+    /// The definition looks immediately invoked (`(function(){...})()`,
+    /// `!function(){...}()`, a parenthesized arrow): compile it eagerly.
+    var lazyEagerHint: Bool = false
+    /// The script being compiled, for its lazy functions. Set on the
+    /// top-level definition (or on the root of a lazy compile); nested
+    /// functions read it through the parent chain.
+    private var ownLazyScript: JeffJSLazyScript?
+    var lazyScript: JeffJSLazyScript? {
+        get { return ownLazyScript ?? parent?.lazyScript }
+        set { ownLazyScript = newValue }
+    }
+    /// Root of a lazy compile: its closure variables are fixed (the function
+    /// objects already hold their var_refs), so a free name resolves to the
+    /// preset closure variable of that name, or to a global.
+    var lazyClosureIndex: [JSAtom: Int]? = nil
+    /// The body was dropped right after it was parsed (lazyDropAtParseEnd):
+    /// only what it reads from enclosing scopes is left.
+    var lazyDropped: JeffJSCompiler.LazyScan? = nil
+    /// Dummy parent of a lazy re-parse: its child is never dropped.
+    var isLazyDummy = false
+
     // -- Bytecode under construction --
     var byteCode: DynBuf = DynBuf()
 
@@ -1170,6 +1195,18 @@ struct JeffJSCompiler {
             }
         }
 
+        // Root of a lazy compile: the enclosing bindings it captures are its
+        // preset closure variables (bound when its stub was made).
+        if let preset = curFd.lazyClosureIndex, let rootIdx = preset[name] {
+            let cv = curFd.closureVar[rootIdx]
+            let closureIdx = lazyRootClosureVar(ctx: ctx, s: fd, root: curFd, rootIdx: rootIdx)
+            let accessType = ScopeAccessType(rawValue: opType) ?? .get
+            return resolvedVarRefAccess(closureIdx: closureIdx,
+                                        isConst: cv.isConst,
+                                        isLexical: cv.isLexical,
+                                        accessType: accessType)
+        }
+
         // Not found in any local scope -- treat as global
         let accessType = ScopeAccessType(rawValue: opType) ?? .get
         return resolvedGlobalAccess(accessType: accessType)
@@ -1516,6 +1553,12 @@ struct JeffJSCompiler {
                $0.name == name && $0.varKind >= JSVarKindEnum.JS_VAR_PRIVATE_FIELD.rawValue }) {
             return (.get_var_ref, evalItemClosureVar(ctx: ctx, s: fd, root: curFd, itemIndex: i),
                     site.items[i].varKind)
+        }
+        // Root of a lazy compile: a private name of an enclosing class.
+        if let preset = curFd.lazyClosureIndex, let rootIdx = preset[name],
+           curFd.closureVar[rootIdx].varKind >= JSVarKindEnum.JS_VAR_PRIVATE_FIELD.rawValue {
+            return (.get_var_ref, lazyRootClosureVar(ctx: ctx, s: fd, root: curFd, rootIdx: rootIdx),
+                    curFd.closureVar[rootIdx].varKind)
         }
 
         // Not found: the parser rejects `this.#x` outside a class that
@@ -4008,8 +4051,24 @@ struct JeffJSCompiler {
         }
         for i in 0 ..< fd.childFunctions.count {
             let childFd = fd.childFunctions[i]
-            guard let childBc = createFunction(ctx: ctx, fd: childFd) else {
+            // A function whose body can wait for its first call becomes a
+            // stub here (lazyStubOrEager); the rest compile now.
+            let childBc: JeffJSFunctionBytecodeCompiled
+            switch lazyStubOrEager(ctx: ctx, parent: fd, child: childFd) {
+            case .stub(let stub):
+                childBc = stub
+            case .failed:
                 return nil
+            case .eagerReparsed(let fresh):
+                guard let c = createFunction(ctx: ctx, fd: fresh) else {
+                    return nil
+                }
+                childBc = c
+            case .eager:
+                guard let c = createFunction(ctx: ctx, fd: childFd) else {
+                    return nil
+                }
+                childBc = c
             }
             // Replace the placeholder in the constant pool at the correct index.
             if i < closureCpoolIndices.count {
@@ -4185,6 +4244,9 @@ struct JeffJSCompiler {
             fb.debugPc2colBuf = fd.pc2colBuf.toBytes()
             fb.debugPc2colLen = fd.pc2colBuf.len
         }
+
+        ctx.rt.lazyStats.functionsCompiled += 1
+        ctx.rt.lazyStats.bytecodeBytes += fb.bytecodeLen
 
         // Trace block fusion: identify hot loop candidates for the fast mini-interpreter
         JeffJSCompiler.fuseBasicBlocks(fb)
@@ -4625,6 +4687,13 @@ struct JeffJSCompiler {
         var mayEval = false
         var stack = fd.childFunctions
         while let child = stack.popLast() {
+            if let d = child.lazyDropped {
+                // A body dropped after parsing: only its free names can name
+                // our variables.
+                names.formUnion(d.names)
+                names.formUnion(d.privateNames)
+                continue
+            }
             stack.append(contentsOf: child.childFunctions)
             if child.hasEval || child.isDirectOrIndirectEval { mayEval = true }
             let buf = child.byteCode.buf
@@ -4946,3 +5015,794 @@ struct JeffJSCompiler {
 
 // putSLEB128 is defined in JeffJSCUtils.swift.
 // This file uses it from there to avoid duplicate declarations.
+
+// =============================================================================
+// MARK: - Lazy function compilation
+// =============================================================================
+//
+// A function body can wait for its first call (JavaScriptCore / V8 style):
+// code that never runs then costs neither the compile passes nor resident
+// bytecode, which dominated memory on script-heavy pages (lowes.com: 22.5 M
+// characters of script, ~7.6x that in eagerly compiled bytecode).
+//
+//  * Parse. The parser still parses every body (early errors are exact and
+//    reported at load, see "Early errors" below) and records at each
+//    definition site it supports how to re-parse the function on its own
+//    (`JeffJSFunctionDefCompiler.lazySeed`).
+//  * Stub. When its parent is compiled, an eligible child is not: its free
+//    names — the names its body (or anything nested in it) reads from
+//    enclosing scopes — are bound exactly as resolveVariables would bind them
+//    for an eager compile (closure variables, captured parent slots), and
+//    the child becomes a stub: a JeffJSFunctionBytecodeCompiled with those
+//    closure variables, its flags and source span, and no bytecode. The
+//    definition (vars, scopes, bytecode, nested definitions) is dropped.
+//  * Call. A closure made from a pending stub keeps `fbFast` nil, so every
+//    call path (the interpreter's inline paths all test fbFast) ends in
+//    callInternal's payload path, which calls compileLazy before running it:
+//    the function is re-parsed from the shared script text under a dummy
+//    parent, with its closure variables preset by name (a free name either
+//    matches one or is a global), compiled, and the result is moved into the
+//    stub object. Function objects and the parent's constant pool keep
+//    pointing at that object, so they all run the compiled body; the object
+//    that was called gets its fbFast back, the others on their first call.
+//  * Nested functions of a lazily compiled body are stubs again.
+//
+// Not lazy (compiled with the parent): class constructors, field
+// initializers and static blocks (no seed), a function containing a direct
+// eval anywhere inside (the eval code may name any enclosing binding), a
+// function inside a sloppy function with a direct eval or inside direct-eval
+// code (dynamic scopes), a function defined in a `with` body, module code,
+// arrows the parser reached through its fallback paths (no reliable start),
+// and definitions that look immediately invoked (`(function(){})()`).
+//
+// Early errors: the body was fully parsed at load. The only error the eager
+// compile adds later — a private name no enclosing class declares — is
+// checked when the stub binds its free names, so it is still a load-time
+// SyntaxError.
+
+/// Counters for the host's perf summary.
+struct JeffJSLazyStats {
+    var stubs = 0
+    var stubSourceBytes = 0
+    var compiled = 0
+    var compiledSourceBytes = 0
+    var compileMs: Double = 0
+    var bodyCacheHits = 0
+    /// Definitions that could re-parse on their own but compiled eagerly:
+    /// immediately invoked, or with a direct eval / dynamic scope around.
+    var eagerHinted = 0
+    var eagerOther = 0
+    /// Every function body compiled (eagerly or lazily) and its bytecode.
+    var functionsCompiled = 0
+    var bytecodeBytes = 0
+    /// Bodies reclaimed by the idle pass (compile.lazyDropAfterMs).
+    var dropped = 0
+    var droppedBytecodeBytes = 0
+
+    var description: String {
+        return "lazy stubs=\(stubs) (\(stubSourceBytes / 1024)KB src) compiled=\(compiled) (\(compiledSourceBytes / 1024)KB src, \(Int(compileMs.rounded()))ms) bodyHits=\(bodyCacheHits) eager: iife=\(eagerHinted) other=\(eagerOther) bodies=\(functionsCompiled) (\(bytecodeBytes / 1024)KB bytecode) dropped=\(dropped) (\(droppedBytecodeBytes / 1024)KB)"
+    }
+}
+
+extension JeffJSFunctionBytecodeCompiled {
+    /// Take over the body compiled for this lazy stub from `c` (a fresh
+    /// compile of the same function), so everything that already references
+    /// this object runs it. The closure variables are the stub's own (the
+    /// compile was bound to them).
+    func adoptLazyBody(from c: JeffJSFunctionBytecodeCompiled) {
+        bytecode = c.bytecode
+        bytecodeLen = c.bytecodeLen
+        resetBytecodeBuffer()
+        argCount = c.argCount
+        varCount = c.varCount
+        definedArgCount = c.definedArgCount
+        definedArgCountValue = c.definedArgCountValue
+        stackSize = c.stackSize
+        funcNameAtom = c.funcNameAtom
+        nameAtom = c.nameAtom
+        jsModeFlags = c.jsModeFlags
+        isStrictMode = c.isStrictMode
+        selfRefVarIdx = c.selfRefVarIdx
+        funcNameVarIdx = c.funcNameVarIdx
+        hasPrototype = c.hasPrototype
+        hasSimpleParameterList = c.hasSimpleParameterList
+        isDerivedClassConstructor = c.isDerivedClassConstructor
+        needHomeObject = c.needHomeObject
+        funcKindValue = c.funcKindValue
+        isArrow = c.isArrow
+        isGenerator = c.isGenerator
+        isAsyncFunc = c.isAsyncFunc
+        newTargetAllowedFlag = c.newTargetAllowedFlag
+        superCallAllowedFlag = c.superCallAllowedFlag
+        superAllowedFlag = c.superAllowedFlag
+        argumentsAllowedFlag = c.argumentsAllowedFlag
+        superCallAllowed = c.superCallAllowed
+        superAllowed = c.superAllowed
+        argumentsAllowed = c.argumentsAllowed
+        isDirectOrIndirectEval = c.isDirectOrIndirectEval
+        vardefs = c.vardefs
+        evalSites = c.evalSites
+        cpool = c.cpool
+        cpoolCountValue = c.cpoolCountValue
+        c.cpool = []
+        lineNum = c.lineNum
+        colNum = c.colNum
+        hasDebugInfo = c.hasDebugInfo
+        hasDebug = c.hasDebug
+        debugFilenameAtom = c.debugFilenameAtom
+        debugSourceStr = c.debugSourceStr
+        debugSourceLen = c.debugSourceLen
+        debugPc2lineBuf = c.debugPc2lineBuf
+        debugPc2lineLen = c.debugPc2lineLen
+        debugPc2colBuf = c.debugPc2colBuf
+        debugPc2colLen = c.debugPc2colLen
+        traceBlocks = c.traceBlocks
+        traceLean = c.traceLean
+        traceEntryEnabled = c.traceEntryEnabled
+        traceEntryDeopts = c.traceEntryDeopts
+        argSlotsOwned = c.argSlotsOwned
+        copiesArgs = c.copiesArgs
+        lazyInfo?.isPending = false
+    }
+}
+
+extension JeffJSCompiler {
+
+    enum LazyDecision {
+        case stub(JeffJSFunctionBytecodeCompiled)
+        case eager
+        /// A child dropped after parsing that must compile eagerly after all
+        /// (a sloppy direct eval in an enclosing function, found later):
+        /// re-parsed from the script text under its real parent.
+        case eagerReparsed(JeffJSFunctionDefCompiler)
+        /// An error was thrown (a private name no class declares).
+        case failed
+    }
+
+    /// Decide whether child definition `child` of `parent` (being compiled)
+    /// becomes a lazy stub, and make it. Called from createFunction after the
+    /// parent's resolveVariables, where an eager compile of the child runs.
+    static func lazyStubOrEager(ctx: JeffJSContext, parent: JeffJSFunctionDefCompiler,
+                                child: JeffJSFunctionDefCompiler) -> LazyDecision {
+        let rt = ctx.rt
+        let scan: LazyScan
+        if let dropped = child.lazyDropped {
+            guard enclosingScopesAreStatic(parent) else {
+                return reparseDropped(ctx: ctx, parent: parent, child: child)
+            }
+            scan = dropped
+        } else {
+            guard lazyCandidate(rt: rt, child) else {
+                if child.lazySeed != nil && rt.lazyFunctions {
+                    if child.lazyEagerHint { rt.lazyStats.eagerHinted += 1 } else { rt.lazyStats.eagerOther += 1 }
+                }
+                return .eager
+            }
+            // Dynamic scopes between the child and the globals (a sloppy
+            // direct eval's variable object, the caller scopes of direct-eval
+            // code) need the name-by-name checks an eager compile emits.
+            guard enclosingScopesAreStatic(parent), let s = lazyScan(root: child) else {
+                rt.lazyStats.eagerOther += 1
+                return .eager
+            }
+            scan = s
+        }
+        guard let seed = child.lazySeed, let script = child.lazyScript,
+              let source = child.sourceText else { return .eager }
+
+        // Bind the free names as the eager compile would: capture them from
+        // the enclosing definitions (closure-variable chain), else global.
+        for name in scan.names {
+            bindStubFreeName(ctx: ctx, s: child, name: name)
+        }
+        for name in scan.privateNames {
+            guard bindStubPrivateName(ctx: ctx, s: child, name: name) else {
+                _ = ctx.throwSyntaxError(
+                    message: "private name '\(ctx.atomToSwiftString(name))' is not declared in an enclosing class")
+                return .failed
+            }
+            // Accessors also read their <get:#x> / <set:#x> variables.
+            let base = ctx.atomToSwiftString(name)
+            for prefix in ["<get:", "<set:"] {
+                let accessor = ctx.findAtom(prefix + base + ">")
+                _ = bindStubPrivateName(ctx: ctx, s: child, name: accessor)
+                ctx.rt.freeAtom(accessor)
+            }
+        }
+
+        let fb = JeffJSFunctionBytecodeCompiled()
+        fb.funcNameAtom = child.funcName
+        fb.nameAtom = child.funcName
+        fb.argCount = UInt16(child.argCount)
+        fb.definedArgCountValue = UInt16(child.argCount)
+        fb.definedArgCount = UInt16(child.functionLength)
+        fb.jsModeFlags = UInt8(child.jsMode)
+        fb.isStrictMode = (child.jsMode & JS_MODE_STRICT) != 0
+        fb.hasPrototype = child.hasPrototype
+        fb.hasSimpleParameterList = child.hasSimpleParameterList
+        fb.isDerivedClassConstructor = child.isDerivedClassConstructor
+        fb.needHomeObject = child.needHomeObject
+        fb.funcKindValue = child.funcKind
+        fb.isArrow = child.isArrow
+        fb.newTargetAllowedFlag = child.newTargetAllowed
+        fb.superCallAllowedFlag = child.superCallAllowed
+        fb.superAllowedFlag = child.superAllowed
+        fb.argumentsAllowedFlag = child.argumentsAllowed
+        fb.isGenerator = (child.funcKind == JSFunctionKindEnum.JS_FUNC_GENERATOR.rawValue ||
+                          child.funcKind == JSFunctionKindEnum.JS_FUNC_ASYNC_GENERATOR.rawValue)
+        fb.isAsyncFunc = (child.funcKind == JSFunctionKindEnum.JS_FUNC_ASYNC.rawValue ||
+                          child.funcKind == JSFunctionKindEnum.JS_FUNC_ASYNC_GENERATOR.rawValue)
+        fb.closureVars = child.closureVar
+        fb.closureVarsList = child.closureVar
+        fb.closureVarCount = UInt16(child.closureVar.count)
+        fb.closureVarCountInt = child.closureVar.count
+        fb.varRefCountValue = UInt16(child.closureVar.count)
+        fb.lineNum = scan.firstLine
+        fb.colNum = scan.firstCol
+        fb.sourceText = source
+        fb.sourceStart = Int32(truncatingIfNeeded: child.sourceStart)
+        fb.sourceLen = Int32(truncatingIfNeeded: child.sourceEnd - child.sourceStart)
+        fb.hasDebugInfo = true
+        fb.hasDebug = true
+        fb.debugFilenameAtom = child.filename
+        fb.lazyInfo = JeffJSLazyFunctionInfo(seed: seed, script: script)
+        computeArgSlotOwnership(fb)
+
+        rt.lazyStats.stubs += 1
+        rt.lazyStats.stubSourceBytes += child.sourceEnd - child.sourceStart
+
+        // The definition is not needed any more: free its buffers now rather
+        // than when the whole tree is released.
+        child.byteCode = DynBuf()
+        child.childFunctions = []
+        child.vars = []
+        child.labels = []
+        child.relocs = []
+        child.cpool = []
+        child.pc2lineBuf = DynBuf()
+        child.pc2colBuf = DynBuf()
+        child.scopeVarLookup = [:]
+        child.functionVarLookup = [:]
+        return .stub(fb)
+    }
+
+    /// The checks on the definition itself (the enclosing ones are in
+    /// enclosingScopesAreStatic).
+    private static func lazyCandidate(rt: JeffJSRuntime, _ child: JeffJSFunctionDefCompiler) -> Bool {
+        guard rt.lazyFunctions, child.lazySeed != nil, !child.lazyEagerHint,
+              child.withVarStack.isEmpty,
+              child.sourceStart >= 0, child.sourceEnd > child.sourceStart,
+              child.sourceEnd - child.sourceStart >= rt.lazyMinSourceBytes,
+              let script = child.lazyScript, !script.isModule,
+              let source = child.sourceText, source === script.source
+        else { return false }
+        return true
+    }
+
+    /// No dynamic scope (with object, sloppy direct eval's variable object,
+    /// direct-eval caller scopes) from `parent` out to the globals.
+    private static func enclosingScopesAreStatic(_ parent: JeffJSFunctionDefCompiler) -> Bool {
+        var p: JeffJSFunctionDefCompiler? = parent
+        var top = parent
+        while let f = p {
+            if f.varObjIdx >= 0 || f.argVarObjIdx >= 0 || !f.withVarStack.isEmpty { return false }
+            top = f
+            p = f.parent
+        }
+        return top.evalSite == nil
+    }
+
+    /// Called by the parser when the body of `child` has been parsed: a
+    /// candidate for lazy compilation keeps only what it reads from enclosing
+    /// scopes (the names are bound when its parent compiles) and drops its
+    /// bytecode, variables and nested definitions right away, so a script's
+    /// definition tree never holds every body at once (the parse-time peak).
+    /// A sloppy direct eval found later in an enclosing function makes the
+    /// parent re-parse it (reparseDropped).
+    static func lazyDropAtParseEnd(rt: JeffJSRuntime, child: JeffJSFunctionDefCompiler) {
+        guard lazyCandidate(rt: rt, child), let parent = child.parent, !parent.isLazyDummy else { return }
+        var top = parent
+        while let p = top.parent { top = p }
+        if top.evalSite != nil { return }
+        guard let scan = lazyScan(root: child) else { return }
+        child.lazyDropped = scan
+        child.byteCode = DynBuf()
+        child.childFunctions = []
+        child.vars = []
+        child.args = []
+        child.scopes = [JeffJSScopeDef()]
+        child.labels = []
+        child.relocs = []
+        child.cpool = []
+        child.pc2lineBuf = DynBuf()
+        child.pc2colBuf = DynBuf()
+        child.scopeVarLookup = [:]
+        child.functionVarLookup = [:]
+        child.hoistedFuncDeclRanges = []
+        child.pc2Events = []
+        child.tdzInitPos = [:]
+    }
+
+    /// Re-parse dropped child `child` of `parent` from the script text so it
+    /// can compile eagerly under its real enclosing scopes.
+    private static func reparseDropped(ctx: JeffJSContext, parent: JeffJSFunctionDefCompiler,
+                                       child: JeffJSFunctionDefCompiler) -> LazyDecision {
+        guard let seed = child.lazySeed, let script = child.lazyScript,
+              let fresh = reparseLazyFunction(ctx: ctx, seed: seed, script: script,
+                                              spanStart: child.sourceStart, spanEnd: child.sourceEnd,
+                                              filenameAtom: child.filename, nameAtom: child.funcName)
+        else { return .failed }
+        fresh.parent = parent
+        fresh.definedScopeLevel = child.definedScopeLevel
+        fresh.lazyEagerHint = true
+        if let i = parent.childFunctions.firstIndex(where: { $0 === child }) {
+            parent.childFunctions[i] = fresh
+        }
+        return .eagerReparsed(fresh)
+    }
+
+    /// What a lazy candidate reads from outside itself.
+    struct LazyScan {
+        /// Free identifier names, in order of first reference.
+        var names: [JSAtom] = []
+        /// Free private names (`#x`).
+        var privateNames: [JSAtom] = []
+        /// The function's first source position (its first line_num).
+        var firstLine = 0
+        var firstCol = 0
+    }
+
+    /// Scan the definition tree rooted at `root` for scope accesses no binding
+    /// inside the tree resolves. nil when the tree cannot be compiled lazily
+    /// (a direct eval somewhere inside: the eval code may name any binding).
+    static func lazyScan(root: JeffJSFunctionDefCompiler) -> LazyScan? {
+        var scan = LazyScan()
+        var seen = Set<JSAtom>()
+        var seenPrivate = Set<JSAtom>()
+        let thisAtom = JSPredefinedAtom.this_.rawValue
+        var stack: [JeffJSFunctionDefCompiler] = [root]
+        while let f = stack.popLast() {
+            if f !== root, let d = f.lazyDropped, let fp = f.parent {
+                // Dropped at its own end of parse: its free names are free
+                // here unless a binding between it and `root` takes them.
+                for a in d.names where !seen.contains(a) {
+                    if !resolvesInside(fp, root: root, name: a, level: f.definedScopeLevel, isPrivate: false) {
+                        seen.insert(a)
+                        scan.names.append(a)
+                    }
+                }
+                for a in d.privateNames where !seenPrivate.contains(a) {
+                    if !resolvesInside(fp, root: root, name: a, level: f.definedScopeLevel, isPrivate: true) {
+                        seenPrivate.insert(a)
+                        scan.privateNames.append(a)
+                    }
+                }
+                continue
+            }
+            if f.hasEval || f.varObjIdx >= 0 || f.argVarObjIdx >= 0 || f.evalSite != nil { return nil }
+            stack.append(contentsOf: f.childFunctions)
+            let buf = f.byteCode.buf
+            let len = min(f.byteCode.len, buf.count)
+            var pos = 0
+            while pos < len {
+                guard let (op, w) = readOpcodeFromBuf(buf, pos) else { pos += 1; continue }
+                let size = max(Int(jeffJSGetOpcodeInfo(op).size) + (w - 1), 1)
+                let base = pos + w
+                switch op {
+                case .scope_get_var, .scope_put_var, .scope_put_var_init, .scope_delete_var,
+                     .scope_get_ref, .scope_make_ref:
+                    let levelAt = op == .scope_make_ref ? base + 8 : base + 4
+                    guard levelAt + 2 <= buf.count else { break }
+                    let a = readU32(buf, base)
+                    if a == thisAtom || seen.contains(a) { break }
+                    if !resolvesInside(f, root: root, name: a, level: Int(readU16(buf, levelAt)), isPrivate: false) {
+                        seen.insert(a)
+                        scan.names.append(a)
+                    }
+                case .scope_get_private_field, .scope_put_private_field, .scope_in_private_field:
+                    guard base + 6 <= buf.count else { break }
+                    let a = readU32(buf, base)
+                    if seenPrivate.contains(a) { break }
+                    if !resolvesInside(f, root: root, name: a, level: Int(readU16(buf, base + 4)), isPrivate: true) {
+                        seenPrivate.insert(a)
+                        scan.privateNames.append(a)
+                    }
+                case .eval, .apply_eval:
+                    return nil
+                case .line_num:
+                    if f === root && scan.firstLine == 0 && base + 8 <= buf.count {
+                        scan.firstLine = Int(readU32(buf, base))
+                        scan.firstCol = Int(readU32(buf, base + 4))
+                    }
+                default:
+                    break
+                }
+                pos += size
+            }
+        }
+        return scan
+    }
+
+    /// Does a reference to `name` at scope `level` of `f` (inside the tree
+    /// rooted at `root`) resolve to a binding of the tree? The same walk
+    /// resolveScopeVar / resolveScopePrivateField make, stopped at `root`.
+    private static func resolvesInside(_ f0: JeffJSFunctionDefCompiler, root: JeffJSFunctionDefCompiler,
+                                       name: JSAtom, level: Int, isPrivate: Bool) -> Bool {
+        var f = f0
+        var lvl = level
+        while true {
+            if isPrivate {
+                if findPrivateVar(fd: f, name: name, scopeLevel: lvl) != nil { return true }
+            } else {
+                if findLocalVar(fd: f, name: name, scopeLevel: lvl) != nil { return true }
+                for a in f.args where a.varName == name { return true }
+            }
+            if f === root { return false }
+            guard let p = f.parent else { return false }
+            lvl = f.definedScopeLevel
+            f = p
+        }
+    }
+
+    /// Bind free name `name` of stub `s` like resolveScopeVar does for an
+    /// eager compile of `s`: capture the nearest enclosing binding (closure
+    /// variable chain), else leave it global. The caller checked that no
+    /// dynamic scope (with / eval variable object) is on the way.
+    private static func bindStubFreeName(ctx: JeffJSContext, s: JeffJSFunctionDefCompiler, name: JSAtom) {
+        var parentFd = s.parent
+        var curFd = s
+        while let p = parentFd {
+            if let (i, vd) = findLocalVar(fd: p, name: name, scopeLevel: curFd.definedScopeLevel) {
+                p.vars[i].isCaptured = true
+                _ = getClosureVar(ctx: ctx, s: s, fd: p, isLocal: true, isArg: false,
+                                  varIdx: i, varName: name, isConst: vd.isConst,
+                                  isLexical: vd.isLexical, varKind: vd.varKind)
+                return
+            }
+            for i in 0 ..< p.args.count where p.args[i].varName == name {
+                p.args[i].isCaptured = true
+                _ = getClosureVar(ctx: ctx, s: s, fd: p, isLocal: true, isArg: true,
+                                  varIdx: i, varName: name, isConst: false, isLexical: false,
+                                  varKind: JSVarKindEnum.JS_VAR_NORMAL.rawValue)
+                return
+            }
+            curFd = p
+            parentFd = p.parent
+        }
+        if let preset = curFd.lazyClosureIndex, let rootIdx = preset[name] {
+            _ = lazyRootClosureVar(ctx: ctx, s: s, root: curFd, rootIdx: rootIdx)
+        }
+    }
+
+    /// Private-name counterpart of bindStubFreeName. false: no enclosing
+    /// class declares it.
+    private static func bindStubPrivateName(ctx: JeffJSContext, s: JeffJSFunctionDefCompiler, name: JSAtom) -> Bool {
+        var parentFd = s.parent
+        var curFd = s
+        while let p = parentFd {
+            if let (i, vd) = findPrivateVar(fd: p, name: name, scopeLevel: curFd.definedScopeLevel) {
+                p.vars[i].isCaptured = true
+                _ = getClosureVar(ctx: ctx, s: s, fd: p, isLocal: true, isArg: false,
+                                  varIdx: i, varName: name, isConst: vd.isConst,
+                                  isLexical: vd.isLexical, varKind: vd.varKind)
+                return true
+            }
+            curFd = p
+            parentFd = p.parent
+        }
+        if let preset = curFd.lazyClosureIndex, let rootIdx = preset[name],
+           curFd.closureVar[rootIdx].varKind >= JSVarKindEnum.JS_VAR_PRIVATE_FIELD.rawValue {
+            _ = lazyRootClosureVar(ctx: ctx, s: s, root: curFd, rootIdx: rootIdx)
+            return true
+        }
+        return false
+    }
+
+    /// Closure variable of `s` (the lazy-compile root `root` or a function
+    /// nested in it) for the root's preset closure variable `rootIdx`.
+    static func lazyRootClosureVar(ctx: JeffJSContext, s: JeffJSFunctionDefCompiler,
+                                   root: JeffJSFunctionDefCompiler, rootIdx: Int) -> Int {
+        if s === root { return rootIdx }
+        let cv = root.closureVar[rootIdx]
+        return getClosureVar(ctx: ctx, s: s, fd: root, isLocal: false, isArg: false,
+                             varIdx: rootIdx, varName: cv.varName, isConst: cv.isConst,
+                             isLexical: cv.isLexical, varKind: cv.varKind)
+    }
+
+    /// Compile the body of lazy stub `fb` into it (see the overview above).
+    /// Returns false with an exception pending on failure.
+    static func compileLazy(ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode) -> Bool {
+        guard let info = fb.lazyInfo, info.isPending else { return true }
+        guard let stub = fb as? JeffJSFunctionBytecodeCompiled else {
+            _ = ctx.throwInternalError(message: "lazy function without a compiled stub")
+            return false
+        }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let script = info.script
+        let seed = info.seed
+        let spanStart = Int(stub.sourceStart)
+        let spanEnd = spanStart + Int(stub.sourceLen)
+
+        // A body compiled by an earlier runtime (cached script): read it back.
+        let bodyStore: JeffJSLazyBodyStore? = script.cacheHash.flatMap {
+            ctx.rt.bytecodeCache.lazyBodyStore(for: $0)
+        }
+        let spanKey = JeffJSLazyBodyStore.spanKey(stub)
+        if let store = bodyStore, let blob = store.body(spanKey),
+           let loaded = JeffJSBytecodeDeserializer.deserialize(blob, rt: ctx.rt, ctx: ctx,
+                                                              lazyScript: script, cacheHash: script.cacheHash)
+                as? JeffJSFunctionBytecodeCompiled,
+           loaded.lazyInfo?.isPending == false,
+           loaded.sourceStart == stub.sourceStart, loaded.sourceLen == stub.sourceLen,
+           sameClosureVars(loaded.closureVarsList, stub.closureVarsList) {
+            stub.adoptLazyBody(from: loaded)
+            let rt = ctx.rt
+            rt.lazyStats.compiled += 1
+            rt.lazyStats.bodyCacheHits += 1
+            rt.lazyStats.compiledSourceBytes += Int(stub.sourceLen)
+            rt.lazyStats.compileMs += (CFAbsoluteTimeGetCurrent() - t0) * 1000
+            return true
+        }
+
+        guard let root = reparseLazyFunction(ctx: ctx, seed: seed, script: script,
+                                             spanStart: spanStart, spanEnd: spanEnd,
+                                             filenameAtom: stub.debugFilenameAtom, nameAtom: stub.nameAtom)
+        else { return false }
+
+        // The root stands alone: its enclosing bindings are the closure
+        // variables the stub was made with.
+        let preset = stub.closureVarsList
+        root.closureVar = preset
+        var index: [JSAtom: Int] = [:]
+        index.reserveCapacity(preset.count)
+        for (i, cv) in preset.enumerated() where index[cv.varName] == nil { index[cv.varName] = i }
+        root.lazyClosureIndex = index
+
+        guard let compiled = createFunction(ctx: ctx, fd: root) else {
+            if ctx.rt.currentException.isNull || ctx.rt.currentException.isUndefined {
+                _ = ctx.throwInternalError(message: "lazy compilation failed")
+            }
+            return false
+        }
+        guard compiled.closureVarsList.count == preset.count else {
+            _ = ctx.throwInternalError(
+                message: "lazy compilation of \(ctx.atomToSwiftString(stub.nameAtom)) bound \(compiled.closureVarsList.count) closure variables, the stub has \(preset.count)")
+            return false
+        }
+        stub.adoptLazyBody(from: compiled)
+        if let store = bodyStore {
+            store.add(spanKey, JeffJSBytecodeSerializer.serialize(stub, rt: ctx.rt, includeSource: false))
+        }
+        let rt = ctx.rt
+        rt.lazyStats.compiled += 1
+        rt.lazyStats.compiledSourceBytes += spanEnd - spanStart
+        rt.lazyStats.compileMs += (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        return true
+    }
+
+
+    /// Parse the function `seed` describes on its own, from the script text,
+    /// under a dummy parent (the parser treats a definition without a parent
+    /// as script code; arrows re-parse as the AssignmentExpression that
+    /// creates them). Returns the definition with no parent, or nil with a
+    /// SyntaxError / InternalError pending.
+    static func reparseLazyFunction(ctx: JeffJSContext, seed: JeffJSLazySeed, script: JeffJSLazyScript,
+                                    spanStart: Int, spanEnd: Int, filenameAtom fa: JSAtom,
+                                    nameAtom: JSAtom) -> JeffJSFunctionDefCompiler? {
+        let start = Int(seed.parseStart)
+        let line = Int(seed.parseLine)
+        let ps = JeffJSParseState(buf: script.source.bytes, filename: script.filename, ctx: ctx)
+        ps.isModule = script.isModule
+        ps.allowHTMLComments = !script.isModule
+        ps.bufPtr = start
+        ps.lineNum = line
+        ps.lastPtr = start
+        ps.lastLineNum = line
+        // Column numbers count from the start of the line; seed the
+        // tokenizer's incremental line/column cache at the function itself
+        // (no line break lies between the two), not at the line start: a
+        // minified bundle is one line of megabytes, and every column query
+        // of the re-parse would rescan it from there.
+        ps.lcCacheEnd = start
+        ps.lcCacheLine = line
+        ps.lcCacheLineStart = script.lineStart(containing: start)
+
+        let filenameAtom = fa != 0 ? fa : ctx.rt.findAtom(script.filename)
+        // Dummy parent: the parser treats a definition without a parent as
+        // script code (global var / function declarations), and arrows are
+        // re-parsed as the AssignmentExpression that creates them.
+        let dummy = JeffJSFunctionDefCompiler()
+        dummy.filename = filenameAtom
+        dummy.jsMode = Int(seed.jsMode)
+        dummy.sourceText = script.source
+        dummy.lazyScript = script
+        dummy.isLazyDummy = true
+        let parser = JeffJSParser(s: ps, fd: dummy)
+        parser.next()   // first token
+
+        let root: JeffJSFunctionDefCompiler
+        switch seed.kind {
+        case .arrow:
+            parser.inFlag = seed.has(JeffJSLazySeed.arrowInFlag)
+            parser.parseAssignExpr()
+            guard !parser.hasError, dummy.childFunctions.count == 1,
+                  dummy.childFunctions[0].isArrow,
+                  dummy.childFunctions[0].sourceStart == spanStart,
+                  dummy.childFunctions[0].sourceEnd == spanEnd else {
+                lazyParseFailed(ctx: ctx, ps: ps, parser: parser, name: nameAtom); return nil
+            }
+            root = dummy.childFunctions[0]
+        case .params:
+            let child = JeffJSFunctionDefCompiler()
+            child.parent = dummy
+            child.filename = filenameAtom
+            child.funcName = seed.funcName
+            child.funcKind = Int(seed.funcKind)
+            child.jsMode = Int(seed.jsMode)
+            child.argumentsAllowed = seed.has(JeffJSLazySeed.argumentsAllowed)
+            child.superAllowed = seed.has(JeffJSLazySeed.superAllowed)
+            child.superCallAllowed = seed.has(JeffJSLazySeed.superCallAllowed)
+            child.newTargetAllowed = seed.has(JeffJSLazySeed.newTargetAllowed)
+            child.needHomeObject = seed.has(JeffJSLazySeed.needHomeObject)
+            child.isDerivedClassConstructor = seed.has(JeffJSLazySeed.isDerivedClassConstructor)
+            child.emitFieldInitAtBodyStart = seed.has(JeffJSLazySeed.emitFieldInitAtBodyStart)
+            child.hasPrototype = seed.has(JeffJSLazySeed.hasPrototype)
+            if seed.has(JeffJSLazySeed.hasSelfBinding) {
+                // Named function expression (parseFunctionDef).
+                var vd = JeffJSVarDef()
+                vd.varName = seed.funcName
+                vd.scopeLevel = 0
+                vd.scopeNext = child.scopes[0].first
+                vd.isConst = true
+                vd.isLexical = false
+                child.vars.append(vd)
+                child.scopes[0].first = child.vars.count - 1
+                child.funcNameVarIdx = child.vars.count - 1
+            }
+            dummy.childFunctions.append(child)
+            parser.parseLazyFunctionTail(child, funcName: seed.funcName)
+            guard !parser.hasError, ps.lastPtr == spanEnd else {
+                lazyParseFailed(ctx: ctx, ps: ps, parser: parser, name: nameAtom); return nil
+            }
+            root = child
+        }
+
+        root.sourceText = script.source
+        root.lazyScript = script
+        root.parent = nil
+        root.definedScopeLevel = 0
+        root.sourceStart = spanStart
+        root.sourceEnd = spanEnd
+        return root
+    }
+
+    private static func sameClosureVars(_ a: [JeffJSClosureVar], _ b: [JeffJSClosureVar]) -> Bool {
+        guard a.count == b.count else { return false }
+        for i in 0 ..< a.count {
+            let x = a[i], y = b[i]
+            if x.varName != y.varName || x.isLocal != y.isLocal || x.isArg != y.isArg
+                || x.varIdx != y.varIdx || x.isConst != y.isConst || x.isLexical != y.isLexical
+                || x.varKind != y.varKind { return false }
+        }
+        return true
+    }
+
+    @inline(never)
+    private static func lazyParseFailed(ctx: JeffJSContext, ps: JeffJSParseState, parser: JeffJSParser,
+                                        name: JSAtom) {
+        if parser.hasError {
+            _ = ctx.throwSyntaxError(message: ps.lastErrorMessage ?? "lazy compilation: parse error")
+        } else {
+            _ = ctx.throwInternalError(
+                message: "lazy compilation: \(ctx.atomToSwiftString(name)) did not re-parse to its recorded span")
+        }
+    }
+}
+
+
+// MARK: - Idle reclaim of lazily compiled bodies
+
+extension JeffJSFunctionBytecodeCompiled {
+    /// Give back the compiled body of this lazy function: it becomes a stub
+    /// again (closure variables and seed kept) and compiles on its next call.
+    /// Returns the bytecode bytes released.
+    func dropLazyBody() -> Int {
+        let bytes = bytecodeLen
+        bytecode = []
+        bytecodeLen = 0
+        resetBytecodeBuffer()
+        cpool = []
+        cpoolCountValue = 0
+        vardefs = []
+        varCount = 0
+        stackSize = 0
+        debugPc2lineBuf = []
+        debugPc2lineLen = 0
+        debugPc2colBuf = []
+        debugPc2colLen = 0
+        pc2lineTable = nil
+        pc2colTable = nil
+        traceBlocks = nil
+        traceLean = false
+        traceEntryEnabled = true
+        traceEntryDeopts = 0
+        ic = nil
+        lazyInfo?.isPending = true
+        lazyInfo?.idleMarked = false
+        return bytes
+    }
+}
+
+extension JeffJSRuntime {
+    /// Idle tick (compile.lazyDropAfterMs > 0): one reclaim pass per interval.
+    func lazyReclaimTick() {
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lazyLastReclaim >= Double(lazyDropAfterMs) / 1000 else { return }
+        lazyLastReclaim = now
+        reclaimIdleLazyBodies()
+    }
+
+    /// One pass of the idle reclaim. Every lazily compiled function (not a
+    /// generator or async function, whose suspended activations hold a pc
+    /// into their bytecode) whose function objects all have `fbFast` nil —
+    /// no call and no new closure since the previous pass cleared it — and
+    /// that the previous pass marked, drops its body. The others are marked
+    /// and their function objects' `fbFast` cleared, so the next call goes
+    /// through callInternal's payload path (which sets it again). Runs only
+    /// with no JS on the stack; bodies holding tagged-template objects are
+    /// kept (their identity is observable). Returns (marked, dropped, bytes).
+    @discardableResult
+    func reclaimIdleLazyBodies() -> (marked: Int, dropped: Int, bytes: Int) {
+        guard inlineStackTop == 0 else { return (0, 0, 0) }
+        // The lazily compiled bodies of live function objects, and whether
+        // any of their objects ran (or was made) since the last pass.
+        func lazyFB(_ hdr: JeffJSGCObjectHeader) -> (JeffJSObject, JeffJSFunctionBytecodeCompiled)? {
+            guard hdr.gcObjType == .jsObject, hdr.refCount > 0 else { return nil }
+            let obj = unsafeBitCast(hdr, to: JeffJSObject.self)
+            guard obj.classID == JeffJSClassID.bytecodeFunction.rawValue,
+                  case .bytecodeFunc(let fbOpt, _, _) = obj.payload,
+                  let fb = fbOpt as? JeffJSFunctionBytecodeCompiled,
+                  let li = fb.lazyInfo, !li.isPending, !fb.isGenerator, !fb.isAsyncFunc
+            else { return nil }
+            return (obj, fb)
+        }
+        var used: [ObjectIdentifier: Bool] = [:]
+        var fbs: [JeffJSFunctionBytecodeCompiled] = []
+        for u in gcObjects {
+            guard let (obj, fb) = lazyFB(u.takeUnretainedValue()) else { continue }
+            let key = ObjectIdentifier(fb)
+            let ran = obj.fbFast != nil
+            if let seen = used[key] {
+                if ran && !seen { used[key] = true }
+            } else {
+                used[key] = ran
+                fbs.append(fb)
+            }
+        }
+        var marked = 0, dropped = 0, bytes = 0
+        var clear = Set<ObjectIdentifier>()
+        for fb in fbs {
+            guard let li = fb.lazyInfo else { continue }
+            // Tagged-template objects in the constant pool: their identity is
+            // observable, so the body stays.
+            if fb.cpool.contains(where: { $0.isObject }) { continue }
+            if li.idleMarked && used[ObjectIdentifier(fb)] == false {
+                bytes += fb.dropLazyBody()
+                dropped += 1
+            } else {
+                li.idleMarked = true
+                clear.insert(ObjectIdentifier(fb))
+                marked += 1
+            }
+        }
+        if !clear.isEmpty {
+            for u in gcObjects {
+                guard let (obj, fb) = lazyFB(u.takeUnretainedValue()) else { continue }
+                if clear.contains(ObjectIdentifier(fb)) { obj.fbFast = nil }
+            }
+        }
+        lazyStats.dropped += dropped
+        lazyStats.droppedBytecodeBytes += bytes
+        return (marked, dropped, bytes)
+    }
+}

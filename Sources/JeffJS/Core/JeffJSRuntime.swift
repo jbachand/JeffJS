@@ -583,6 +583,20 @@ final class JeffJSRuntime {
     /// so the cache must be scoped to the runtime that compiled them.
     let bytecodeCache = JeffJSBytecodeCache()
 
+    /// Lazy function compilation (`compile.lazyFunctions`): a function body
+    /// is compiled on its first call. Mutable so tests can compare both modes.
+    var lazyFunctions: Bool = JeffJSConfig.lazyFunctions
+    /// Bodies shorter than this many bytes of source are compiled eagerly.
+    var lazyMinSourceBytes: Int = JeffJSConfig.lazyMinSourceBytes
+    /// Counters for perf summaries (see JeffJSLazyStats).
+    var lazyStats = JeffJSLazyStats()
+    /// Some lazily compiled body waits to be written (JeffJSLazyBodyStore);
+    /// the idle tick flushes it.
+    var lazyBodiesPending = false
+    /// `compile.lazyDropAfterMs` (0 = off) and when the idle reclaim last ran.
+    var lazyDropAfterMs: Int = JeffJSConfig.lazyDropAfterMs
+    var lazyLastReclaim: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
+
     // MARK: - Stack Checking
 
     /// Maximum stack size in bytes.

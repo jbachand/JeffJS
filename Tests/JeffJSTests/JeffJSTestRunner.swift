@@ -321,6 +321,7 @@ struct JeffJSTestRunner {
             ("StringConcat", { $0.testStringConcat() }),
             ("ParameterOwnership", { $0.testParameterOwnership() }),
             ("IndexArguments", { $0.testIndexArguments() }),
+            ("LazyCompile", { $0.testLazyCompile() }),
         ]
     }
 

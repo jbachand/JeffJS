@@ -248,6 +248,18 @@ final class JeffJSParser {
     /// restored around every nested parseAssignExpr, so the innermost one wins.
     var exprStartPtr: Int = 0
 
+    /// Lazy compilation bookkeeping (see recordLazySeed / recordArrowSeed).
+    /// Source offset and line of an arrow function detected at the start of
+    /// an AssignmentExpression (the only arrows re-parsed on their own), -1
+    /// when none is pending.
+    var pendingArrowStart: Int = -1
+    var pendingArrowLine: Int = 1
+    /// First token after a `(` of a parenthesized expression or after a
+    /// unary `!`: a function starting here looks immediately invoked
+    /// (`(function(){...})()`, `!function(){...}()`, `(() => {...})()`), so
+    /// it is compiled eagerly (V8's PIFE heuristic).
+    var pifeStart: Int = -1
+
     // -- Error state --
     var hasError: Bool = false
 
@@ -3524,6 +3536,7 @@ final class JeffJSParser {
             parseArrowFunctionBody(childFd: childFd, isAsync: isAsync, srcStart: srcStart)
         } else {
             // Regular function
+            if tok == 0x28 { recordLazySeed(childFd, parenPtr: s.token.ptr, parenLine: s.token.line, srcStart: srcStart) }
             expect(0x28) // '('
             let (defaults, rest, dstructs) = parseFormalParameters(childFd: childFd)
             expect(0x29) // ')'
@@ -3548,6 +3561,7 @@ final class JeffJSParser {
             // `s->buf_ptr - ptr` before consuming it); `lastPtr` is the end of
             // the token `expect` just consumed.
             recordSource(childFd, from: srcStart)
+            finishLazyCandidate(childFd)
         }
 
         // Emit closure creation in parent
@@ -4032,6 +4046,7 @@ final class JeffJSParser {
         // The arrow's source starts at the first token of the enclosing
         // AssignmentExpression unless the caller knows better.
         let arrowStart = srcStart >= 0 ? srcStart : exprStartPtr
+        recordArrowSeed(childFd, arrowStart: arrowStart)
         let savedFd = fd
         let savedInFlagArrow = inFlag
         let savedFinallyScopesArrow = finallyScopes
@@ -4070,6 +4085,7 @@ final class JeffJSParser {
         }
 
         recordSource(childFd, from: arrowStart)
+        finishLazyCandidate(childFd)
 
         fd = savedFd
         inFlag = savedInFlagArrow
@@ -4084,6 +4100,80 @@ final class JeffJSParser {
         guard start >= 0, s.lastPtr > start, s.lastPtr <= s.bufLen else { return }
         child.sourceStart = start
         child.sourceEnd = s.lastPtr
+    }
+
+    /// Record how to re-parse `child` on its own — `(params) { body }` from
+    /// the '(' at `parenPtr` — so the compiler may compile it lazily
+    /// (JeffJSCompiler.lazyStubOrEager). Called with the definition fully set
+    /// up and the '(' as the current token. `srcStart` is the first byte of
+    /// the function's source text (the IIFE heuristic compares it).
+    @inline(never)
+    func recordLazySeed(_ child: JeffJSFunctionDefCompiler, parenPtr: Int, parenLine: Int, srcStart: Int) {
+        var seed = JeffJSLazySeed()
+        seed.kind = .params
+        seed.parseStart = Int32(truncatingIfNeeded: parenPtr)
+        seed.parseLine = Int32(truncatingIfNeeded: parenLine)
+        seed.funcName = child.funcName
+        seed.funcKind = UInt8(truncatingIfNeeded: child.funcKind)
+        seed.jsMode = UInt8(truncatingIfNeeded: child.jsMode)
+        var f: UInt16 = 0
+        if child.funcNameVarIdx >= 0 { f |= JeffJSLazySeed.hasSelfBinding }
+        if child.argumentsAllowed { f |= JeffJSLazySeed.argumentsAllowed }
+        if child.superAllowed { f |= JeffJSLazySeed.superAllowed }
+        if child.superCallAllowed { f |= JeffJSLazySeed.superCallAllowed }
+        if child.newTargetAllowed { f |= JeffJSLazySeed.newTargetAllowed }
+        if child.needHomeObject { f |= JeffJSLazySeed.needHomeObject }
+        if child.isDerivedClassConstructor { f |= JeffJSLazySeed.isDerivedClassConstructor }
+        if child.emitFieldInitAtBodyStart { f |= JeffJSLazySeed.emitFieldInitAtBodyStart }
+        if child.hasPrototype { f |= JeffJSLazySeed.hasPrototype }
+        seed.flags = f
+        child.lazySeed = seed
+        if srcStart >= 0 && srcStart == pifeStart { child.lazyEagerHint = true }
+    }
+
+    /// The body of `child` is parsed: a lazy candidate drops it now and keeps
+    /// only its free names (JeffJSCompiler.lazyDropAtParseEnd).
+    @inline(never)
+    func finishLazyCandidate(_ child: JeffJSFunctionDefCompiler) {
+        guard child.lazySeed != nil, !hasError, let rt = s.atomRuntime else { return }
+        JeffJSCompiler.lazyDropAtParseEnd(rt: rt, child: child)
+    }
+
+    /// Arrow counterpart of recordLazySeed: only an arrow that was detected
+    /// at the start of its AssignmentExpression (markArrowStart) can be
+    /// re-parsed from its first token.
+    @inline(never)
+    func recordArrowSeed(_ child: JeffJSFunctionDefCompiler, arrowStart: Int) {
+        defer { pendingArrowStart = -1 }
+        guard pendingArrowStart >= 0, pendingArrowStart == arrowStart else { return }
+        var seed = JeffJSLazySeed()
+        seed.kind = .arrow
+        seed.parseStart = Int32(truncatingIfNeeded: arrowStart)
+        seed.parseLine = Int32(truncatingIfNeeded: pendingArrowLine)
+        seed.funcKind = UInt8(truncatingIfNeeded: child.funcKind)
+        seed.jsMode = UInt8(truncatingIfNeeded: child.jsMode)
+        seed.flags = inFlag ? JeffJSLazySeed.arrowInFlag : 0
+        child.lazySeed = seed
+        if arrowStart == pifeStart { child.lazyEagerHint = true }
+    }
+
+    /// Parse the rest of a `.params` lazy function — `(params) { body }` —
+    /// into `child`, whose definition was rebuilt from its seed (see
+    /// JeffJSCompiler.compileLazy). Mirrors parseFunctionDef /
+    /// parsePropertyDefinition / parseClassBody from their '(' on.
+    func parseLazyFunctionTail(_ child: JeffJSFunctionDefCompiler, funcName: JSAtom) {
+        expect(0x28) // '('
+        let (defaults, rest, dstructs) = parseFormalParameters(childFd: child)
+        expect(0x29) // ')'
+        // Named function expression: a parameter of the same name shadows
+        // the self binding (see parseFunctionDef).
+        if child.funcNameVarIdx >= 0, child.args.contains(where: { $0.varName == funcName }) {
+            child.vars[child.funcNameVarIdx].varName = JeffJSAtomID.JS_ATOM_NULL.rawValue
+            child.funcNameVarIdx = -1
+        }
+        expect(0x7B) // '{'
+        parseFunctionBody(childFd: child, defaults: defaults, rest: rest, destructs: dstructs)
+        expect(0x7D) // '}'
     }
 
     /// Skip a destructuring pattern without emitting bytecode (for parameters).
@@ -4390,6 +4480,7 @@ final class JeffJSParser {
             // identifier is NOT emitted as a scope_get_var. This is the spec-
             // compliant location for ArrowFunction (AssignmentExpression).
             if !s.gotLF && nextTokenIsArrow() {
+                markArrowStart()
                 let atom = s.token.identAtom
                 next() // consume identifier
                 next() // consume '=>'
@@ -4397,10 +4488,13 @@ final class JeffJSParser {
                 return
             }
             // ---- Async arrow function early detection ----
-            if isAsyncIdent() && parseAsyncArrowIfPresent() { return }
+            if isAsyncIdent() && markArrowStart() && parseAsyncArrowIfPresent() { return }
+            pendingArrowStart = -1
 
         case 0x28: // '(' -- arrow parameter list?
+            markArrowStart()
             if parseParenArrowIfPresent() { return }
+            pendingArrowStart = -1
 
         case 0x5B, 0x7B: // '[' / '{' -- maybe a destructuring assignment
             parsePatternOrConditionalAssignExpr()
@@ -4421,6 +4515,17 @@ final class JeffJSParser {
         // Arrow functions are detected above (before parseTernaryExpr) for
         // IDENT => and (params) => patterns, and also in parsePrimaryExpr()
         // as a fallback for nested contexts (e.g., inside call arguments).
+    }
+
+    /// The current token (the first of the AssignmentExpression being
+    /// parsed) may start an arrow function: remember it, so the arrow can be
+    /// re-parsed from here when it is compiled lazily. Always true.
+    @inline(never)
+    @discardableResult
+    private func markArrowStart() -> Bool {
+        pendingArrowStart = s.token.ptr
+        pendingArrowLine = s.token.line
+        return true
     }
 
     /// One-token lookahead for `=>`. Out of line: the lookahead saves and
@@ -5177,6 +5282,7 @@ final class JeffJSParser {
 
         case 0x21: // '!' logical NOT
             next()
+            pifeStart = s.token.ptr
             parseUnaryExpr()
             emitOp(.lnot)
 
@@ -6555,6 +6661,7 @@ final class JeffJSParser {
         // Re-enable `in` inside parentheses
         let savedInFlagGroup = inFlag
         inFlag = true
+        pifeStart = s.token.ptr
         parseExpression()
         inFlag = savedInFlagGroup
         // `(obj.m)` is still a reference: remember it for a following call.
@@ -7045,6 +7152,7 @@ final class JeffJSParser {
             }
             fd.childFunctions.append(methodFd)
 
+            recordLazySeed(methodFd, parenPtr: s.token.ptr, parenLine: s.token.line, srcStart: memberStart)
             next() // consume '('
             let (omDefaults, omRest, omDstructs) = parseFormalParameters(childFd: methodFd)
             expect(0x29) // ')'
@@ -7052,6 +7160,7 @@ final class JeffJSParser {
             parseFunctionBody(childFd: methodFd, defaults: omDefaults, rest: omRest, destructs: omDstructs)
             expect(0x7D) // '}'
             recordSource(methodFd, from: memberStart)
+            finishLazyCandidate(methodFd)
 
             let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
             emitFClosure(cpoolIdx)
@@ -7081,6 +7190,7 @@ final class JeffJSParser {
             methodFd.funcName = accessorFuncName(propKind, propAtom, isComputed: isComputed)
             fd.childFunctions.append(methodFd)
 
+            if tok == 0x28 { recordLazySeed(methodFd, parenPtr: s.token.ptr, parenLine: s.token.line, srcStart: memberStart) }
             expect(0x28) // '('
             let (gsDefaults, gsRest, gsDstructs) = parseFormalParameters(childFd: methodFd)
             expect(0x29) // ')'
@@ -7088,6 +7198,7 @@ final class JeffJSParser {
             parseFunctionBody(childFd: methodFd, defaults: gsDefaults, rest: gsRest, destructs: gsDstructs)
             expect(0x7D) // '}'
             recordSource(methodFd, from: memberStart)
+            finishLazyCandidate(methodFd)
 
             let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
             emitFClosure(cpoolIdx)

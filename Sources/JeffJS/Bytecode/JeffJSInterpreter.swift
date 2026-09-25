@@ -1166,7 +1166,10 @@ extension JeffJSContext {
         }
 
         obj.payload = .bytecodeFunc(functionBytecode: innerFB, varRefs: childVarRefs, homeObject: nil)
-        obj.fbFast = innerFB
+        // A lazy function whose body is not compiled yet keeps fbFast nil:
+        // every call path then reaches callInternal's payload path, which
+        // compiles it (JeffJSCompiler.compileLazy) and sets fbFast.
+        if !innerFB.isLazyPending { obj.fbFast = innerFB }
         obj.varRefsFast = childVarRefs
 
         // Arrow functions capture the enclosing function's `this` value
@@ -1217,7 +1220,10 @@ extension JeffJSContext {
     /// `set_name`, `Object.defineProperty`) is left untouched.
     func materializeFunctionNameLength(_ funcObj: JeffJSObject) {
         funcObj.needsLazyNameLength = false
-        guard let fb = funcObj.fbFast else { return }
+        // fbFast is nil until a lazily compiled function's first call.
+        var payloadFB: JeffJSFunctionBytecode? = nil
+        if funcObj.fbFast == nil, case .bytecodeFunc(let f, _, _) = funcObj.payload { payloadFB = f }
+        guard let fb = funcObj.fbFast ?? payloadFB else { return }
         // Borrowed receiver: nothing here stores a reference to the function
         // itself (only two fresh primitives), so it must NOT be released --
         // and it must not be *retained* either (mkPtr takes an ARC retain that
@@ -7005,6 +7011,11 @@ struct JeffJSInterpreter {
                 _ = ctx.throwTypeError(message: "not a bytecode function")
                 return .exception
             }
+            // First call of a lazily compiled function: compile its body.
+            if fbFromPayload.isLazyPending,
+               !JeffJSCompiler.compileLazy(ctx: ctx, fbFromPayload) {
+                return .exception
+            }
             // Backfill the fast fields for the next call
             obj.fbFast = fbFromPayload
             obj.varRefsFast = varRefs
@@ -8487,7 +8498,9 @@ struct JeffJSInterpreter {
                 }
                 let tcFuncVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if rt.inlineStackTop == inlineBase {
-                    ctx.currentFrame = frame.prevFrame
+                    // The caller stays on the frame chain during the call
+                    // (Error stacks name it, as QuickJS does); the epilogue
+                    // after the loop unlinks it.
                     retVal = ctx.callFunction(tcFuncVal, thisVal: .undefined, args: tcArgs)
                     tcFuncVal.freeValue()
                     for a in tcArgs { a.freeValue() }
@@ -8551,7 +8564,7 @@ struct JeffJSInterpreter {
                 let tcmFuncVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let tcmThisObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if rt.inlineStackTop == inlineBase {
-                    ctx.currentFrame = frame.prevFrame
+                    // (The caller stays on the frame chain, see tail_call.)
                     retVal = ctx.callFunction(tcmFuncVal, thisVal: tcmThisObj, args: tcmArgs)
                     tcmFuncVal.freeValue(); tcmThisObj.freeValue()
                     for a in tcmArgs { a.freeValue() }

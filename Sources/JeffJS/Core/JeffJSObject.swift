@@ -234,6 +234,112 @@ final class JeffJSSourceText {
     }
 }
 
+/// How to re-parse one lazily compiled function (recorded by the parser
+/// when the function was first parsed, see JeffJSParser.recordLazySeed).
+struct JeffJSLazySeed {
+    enum Kind: UInt8 {
+        /// `(params) { body }` starting at the '(' token: function
+        /// declarations/expressions, object-literal and class methods,
+        /// getters and setters. The flags below rebuild the definition.
+        case params = 0
+        /// An arrow function: re-parsed as the AssignmentExpression that
+        /// starts at its first token.
+        case arrow = 1
+    }
+    var kind: Kind = .params
+    /// Byte offset of the first token to parse and its line.
+    var parseStart: Int32 = 0
+    var parseLine: Int32 = 1
+    var funcName: JSAtom = 0
+    var funcKind: UInt8 = 0
+    /// The mode the definition inherited (a body "use strict" is re-read).
+    var jsMode: UInt8 = 0
+    var flags: UInt16 = 0
+
+    static let hasSelfBinding: UInt16          = 1 << 0
+    static let argumentsAllowed: UInt16        = 1 << 1
+    static let superAllowed: UInt16            = 1 << 2
+    static let superCallAllowed: UInt16        = 1 << 3
+    static let newTargetAllowed: UInt16        = 1 << 4
+    static let needHomeObject: UInt16          = 1 << 5
+    /// The `in` operator was allowed where the (concise) arrow was written.
+    static let arrowInFlag: UInt16             = 1 << 6
+    static let isDerivedClassConstructor: UInt16 = 1 << 7
+    static let emitFieldInitAtBodyStart: UInt16 = 1 << 8
+    static let hasPrototype: UInt16            = 1 << 9
+
+    func has(_ f: UInt16) -> Bool { return flags & f != 0 }
+}
+
+/// The script a lazily compiled function comes from: the source text every
+/// function of it re-parses from, and a line index for column numbers.
+/// One per compiled (or cache-loaded) script, shared by all its functions.
+final class JeffJSLazyScript {
+    let source: JeffJSSourceText
+    let filename: String
+    let isModule: Bool
+    /// Hash of the bytecode-cache entry the script was stored under or
+    /// loaded from; compiled bodies persist next to it (JeffJSLazyBodyStore).
+    /// nil when the script is not cached.
+    var cacheHash: UInt64? = nil
+
+    init(source: JeffJSSourceText, filename: String, isModule: Bool) {
+        self.source = source
+        self.filename = filename
+        self.isModule = isModule
+    }
+
+    /// Byte offsets where lines start, by the rule JeffJSParseState.getLineCol
+    /// uses (\n, \r, \r\n). Built on the first lazy compile of the script.
+    private var lineStarts: [Int32]? = nil
+
+    /// Start of the line holding byte `offset`.
+    func lineStart(containing offset: Int) -> Int {
+        if lineStarts == nil {
+            var starts: [Int32] = [0]
+            let b = source.bytes
+            var i = 0
+            let n = b.count
+            while i < n {
+                let c = b[i]
+                if c == 0x0A {
+                    starts.append(Int32(truncatingIfNeeded: i + 1))
+                } else if c == 0x0D {
+                    if i + 1 < n && b[i + 1] == 0x0A { i += 1 }
+                    starts.append(Int32(truncatingIfNeeded: i + 1))
+                }
+                i += 1
+            }
+            lineStarts = starts
+        }
+        let starts = lineStarts!
+        var lo = 0, hi = starts.count - 1
+        let t = Int32(truncatingIfNeeded: offset)
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if starts[mid] <= t { lo = mid } else { hi = mid - 1 }
+        }
+        return Int(starts[lo])
+    }
+}
+
+/// Everything a lazily compiled function needs besides its (stub) bytecode
+/// object: where to re-parse it from and whether that happened yet.
+final class JeffJSLazyFunctionInfo {
+    let seed: JeffJSLazySeed
+    let script: JeffJSLazyScript
+    /// True until the body is compiled into the owning bytecode object.
+    var isPending: Bool = true
+    /// Idle reclaim: no call reached the body since the last reclaim pass
+    /// (JeffJSRuntime.reclaimIdleLazyBodies).
+    var idleMarked: Bool = false
+
+    init(seed: JeffJSLazySeed, script: JeffJSLazyScript) {
+        self.seed = seed
+        self.script = script
+    }
+}
+
 /// Forward reference for `JeffJSFunctionBytecode`.
 class JeffJSFunctionBytecode {
     var refCount: Int = 1
@@ -476,6 +582,23 @@ class JeffJSFunctionBytecode {
         cpool.withUnsafeBufferPointer { p.initialize(from: $0.baseAddress!, count: n) }
         _cpoolRaw = p
         cpoolRawCount = n
+
+    /// Lazy compilation (JeffJSLazyFunctionInfo): set on a function whose
+    /// body is compiled on its first call. While `lazyInfo.isPending` the
+    /// bytecode is empty and closure objects made from it keep `fbFast` nil,
+    /// so every call reaches callInternal's payload path, which compiles the
+    /// body into this object in place (JeffJSCompiler.compileLazy). Kept
+    /// after compiling (the recipe to recompile, and the body cache key).
+    var lazyInfo: JeffJSLazyFunctionInfo? = nil
+
+    /// A lazily compiled function whose body is not compiled yet.
+    @inline(__always) var isLazyPending: Bool { lazyInfo?.isPending ?? false }
+
+    /// Drop the raw copy of `bytecode` materialized by `bytecodePtr` (lazy
+    /// compilation replaced the bytecode of this object).
+    func resetBytecodeBuffer() {
+        _bcBuffer?.deallocate()
+        _bcBuffer = nil
     }
 
     /// The function's own source text, exactly as written (QuickJS
