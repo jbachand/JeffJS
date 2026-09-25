@@ -402,6 +402,14 @@ final class JeffJSRuntime {
     var protectedGlobals: Set<ObjectIdentifier> = []
     /// Recycled plain objects (JeffJSObjectPool.swift).
     var objectPool: [JeffJSObject] = []
+    /// Recycled arrays (JeffJSObjectPool.swift): empty, `length` 0, no
+    /// element storage, off the GC list.
+    var arrayPool: [JeffJSObject] = []
+    /// Element stores taken from recycled arrays: empty, capacity kept.
+    var arrayStoragePool: [JeffJSFastArrayStorage] = []
+    /// Spare argument array for native calls from the trace interpreter
+    /// (`jeffJS_nativeCallFromSlots`): empty, capacity kept.
+    var spareNativeArgs: [JeffJSValue] = []
     /// JS strings for atoms / small integer keys handed out by property
     /// enumeration (for-in, Object.keys): one string per atom instead of one
     /// per key per loop. Entries hold one JS reference (dropped in freeAtom).

@@ -454,13 +454,35 @@ struct JeffJSValue {
     /// of line so the inlined wrapper stays a single tag test.
     @inline(never)
     private func dupValueHeap() {
-        if (bits & Self._tagMask) == Self._objectTag,
+        let tag = bits & Self._tagMask
+        if _fastPath(tag == Self._objectTag),
            !JeffJSGCObjectHeader.trackRefcounts, !jeffJSZombiesEnabled,
            let ptr = _rawPtr {
             Unmanaged<JeffJSObject>.fromOpaque(ptr)._withUnsafeGuaranteedRef { $0.refCount += 1 }
             return
         }
+        // Strings (any representation; the count lives on the base class):
+        // same unretained bump. The generic path materialised a strong
+        // reference, a swift_retain/release pair per string push/pop.
+        if tag == Self._stringTag, !jeffJSZombiesEnabled, let ptr = _rawPtr {
+            Unmanaged<JeffJSStringBase>.fromOpaque(ptr)._withUnsafeGuaranteedRef { $0.refCount += 1 }
+            return
+        }
         dupValueSlow()
+    }
+
+    /// The property-key atom a flat string has cached (set by
+    /// `findAtom(jsString:)` the first time it is used as a key), read
+    /// without touching any refcount. 0 when the value is not a flat string
+    /// or has not been interned yet. The atom is owned by the string (or is
+    /// a tagged integer atom), so it is valid while the value is.
+    @inline(__always)
+    var cachedKeyAtom: UInt32 {
+        guard (bits & Self._tagMask) == Self._stringTag,
+              let p = UnsafeRawPointer(bitPattern: UInt(bits & Self._ptrMask)) else { return 0 }
+        return Unmanaged<JeffJSStringBase>.fromOpaque(p)._withUnsafeGuaranteedRef { sb -> UInt32 in
+            sb.kind == JeffJSStringBase.kindFlat ? unsafeDowncast(sb, to: JeffJSString.self).cachedAtom : 0
+        }
     }
 
     @inline(never)
@@ -522,6 +544,16 @@ struct JeffJSValue {
             }
             if stillAlive { return }
             if jeffJS_recycleObject(ptr) { return }
+        } else if (bits & Self._tagMask) == Self._stringTag, !jeffJSZombiesEnabled,
+                  let ptr = _rawPtr {
+            // A string that stays alive: drop the count through an unretained
+            // reference (see dupValueHeap). The last reference takes the
+            // generic path, which releases the Swift object.
+            let stillAlive = Unmanaged<JeffJSStringBase>.fromOpaque(ptr)._withUnsafeGuaranteedRef { s -> Bool in
+                if s.refCount > 1 { s.refCount -= 1; return true }
+                return false
+            }
+            if stillAlive { return }
         }
         freeValueSlow()
     }

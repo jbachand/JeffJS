@@ -163,6 +163,9 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// Borrowed value form of `arrayProtoPushObj` (owned by Array.prototype)
     /// for pushing `arr.push` onto the stack without an inline cache.
     var arrayProtoPushVal: JeffJSValue = .undefined
+    /// String.prototype (unretained; `classProto` owns it for the context's
+    /// lifetime), filled on first use by the string-receiver property cache.
+    var stringProtoRaw: UnsafeMutableRawPointer? = nil
     /// Where Array.prototype keeps `push`: the slot index, valid while
     /// Array.prototype is on the shape `arrayProtoPushShapeID` (-1: no own
     /// data property `push` on that shape).
@@ -744,6 +747,17 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     ///
     /// - Returns: A new JS array value, or JS_EXCEPTION on out-of-memory.
     func newArray() -> JeffJSValue {
+        // Recycled array (JeffJSObjectPool.swift): already an empty
+        // `.array` payload with its `length` slot at 0; it only needs the
+        // shared array shape (which fixes Array.prototype) and the GC list.
+        if let cached = arrayShape, cached.isHashed, let o = rt.arrayPool.popLast() {
+            o.refCount = 1
+            cached.refCount += 1
+            o.shape = cached
+            if o.storedProto !== cached.proto { o.storedProto = cached.proto }
+            addGCObject(rt, o)
+            return JeffJSValue.makeObjectRecycled(o)
+        }
         let obj = newObjectClass(classID: JSClassID.JS_CLASS_ARRAY.rawValue)
         if obj.isException { return obj }
 

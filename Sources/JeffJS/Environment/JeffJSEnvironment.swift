@@ -344,6 +344,39 @@ public final class JeffJSEnvironment {
         return context.compileOnlyForBench(input: source, filename: filename, hash: hashBytecode)
     }
 
+    /// Boot benchmark hook (jeffjs-cli --boot-bench): run a precompiled
+    /// polyfill bundle as the app ships it (8-byte little-endian compiler
+    /// version, then JFBC bytes). Returns nil on success, else the error.
+    public func evalPrecompiledBundle(_ data: [UInt8]) -> String? {
+        guard data.count > 8 else { return "bundle too short" }
+        var fileVersion: UInt64 = 0
+        for i in 0..<8 { fileVersion |= UInt64(data[i]) << (i * 8) }
+        guard fileVersion == JeffJSBytecodeCache.compilerVersion else {
+            return "stale bundle (v\(fileVersion), engine v\(JeffJSBytecodeCache.compilerVersion))"
+        }
+        let r = context.evalPrecompiled(Array(data.dropFirst(8)))
+        defer { r.freeValue() }
+        if r.isException {
+            let exc = context.getException()
+            defer { exc.freeValue() }
+            return context.toSwiftString(exc) ?? "exception"
+        }
+        return nil
+    }
+
+    /// Boot benchmark hook: time a bare `JeffJSRuntime()` and `newContext()`
+    /// (ms), then tear both down.
+    public static func measureRuntimeAndContextInit() -> (runtimeMs: Double, contextMs: Double) {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let rt = JeffJSRuntime()
+        let t1 = CFAbsoluteTimeGetCurrent()
+        let ctx = rt.newContext()
+        let t2 = CFAbsoluteTimeGetCurrent()
+        ctx.free()
+        rt.free()
+        return ((t1 - t0) * 1000, (t2 - t1) * 1000)
+    }
+
     /// Evaluate JavaScript that may contain async operations (import, fetch).
     /// Waits up to `timeout` seconds for pending promises to settle.
     public func evalAsync(_ source: String, filename: String = "<eval>", timeout: TimeInterval = 10) async -> JeffJSEvalResult {

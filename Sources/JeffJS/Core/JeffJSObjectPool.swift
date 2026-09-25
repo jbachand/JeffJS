@@ -19,6 +19,7 @@ let jeffJSObjectPoolCapacity = 4096
 @inline(never)
 func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
     return Unmanaged<JeffJSObject>.fromOpaque(ptr)._withUnsafeGuaranteedRef { o -> Bool in
+        if o.classID == JeffJSClassID.array.rawValue { return jeffJS_recycleArray(o) }
         guard !jeffJSObjectPoolDisabled, o.refCount == 1, o.isPoolable,
               let rt = o.ownerRuntime, rt.initComplete,
               rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain,
@@ -72,11 +73,66 @@ func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
     }
 }
 
+let jeffJSArrayPoolCapacity = 1024
+let jeffJSArrayStorageKeepCapacity = 64
+
+/// Array literals (`[a, b, c]`, `[]` in obfuscated predicates) die as fast
+/// as they are made. A dying ordinary array is reset to what `newArray()`
+/// returns — no element storage, `length` 0, the `.array` payload — and
+/// parked; its element store (capacity kept, when small) goes to a second
+/// pool that `newArrayFromSlots` fills. Anything else about the array
+/// (extra properties, accessors, frozen/sealed, weak refs, a subclass shape
+/// with more properties) takes the regular free path.
+@inline(never)
+func jeffJS_recycleArray(_ o: JeffJSObject) -> Bool {
+    guard !jeffJSObjectPoolDisabled, o.refCount == 1, o.isPoolableArray,
+          let rt = o.ownerRuntime, rt.initComplete,
+          rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain,
+          rt.arrayPool.count < jeffJSArrayPoolCapacity,
+          let st = o._fastArrayValues else { return false }
+    o.refCount = 0
+    removeGCObject(rt, o)
+    o._fastArrayValues = nil
+    // Release the elements; nested zero transitions are deferred and drained
+    // below (see jeffJS_recycleObject).
+    let n = min(Int(st.count), st.values.count)
+    rt.inFreeChain = true
+    var i = 0
+    while i < n { st.values[i].freeValue(); i += 1 }
+    rt.inFreeChain = false
+    if st.values.capacity <= jeffJSArrayStorageKeepCapacity,
+       rt.arrayStoragePool.count < jeffJSArrayPoolCapacity {
+        st.values.removeAll(keepingCapacity: true)
+        st.count = 0
+        rt.arrayStoragePool.append(st)
+    }
+    o.propValues[0] = .newInt32(0)     // `length` (a number: nothing to release)
+    if let shape = o.shape {           // hashed (isPoolableArray): never freed here
+        o.shape = nil
+        shape.refCount -= 1
+    }
+    o.payload = .array(size: 0, values: [], count: 0)
+    o.freeMark = false
+    o.tmpMark = false
+    o.mark = JeffJSGCMark.white
+    o.weakrefCount = 0
+    rt.arrayPool.append(o)
+    if !rt.gcZeroRefCountObjects.isEmpty {
+        while let d = rt.gcZeroRefCountObjects.popLast() {
+            if d.refCount == 0 { freeGCObjectAtZeroRefcount(rt, d) }
+        }
+    }
+    return true
+}
+
 extension JeffJSRuntime {
     /// Release the Swift references the pooled objects still carry (their
     /// original makeObject retain). Called from free().
     func drainObjectPool() {
         for o in objectPool { Unmanaged.passUnretained(o).release() }
         objectPool.removeAll()
+        for o in arrayPool { Unmanaged.passUnretained(o).release() }
+        arrayPool.removeAll()
+        arrayStoragePool.removeAll()
     }
 }

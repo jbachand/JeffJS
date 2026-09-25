@@ -42,6 +42,11 @@ struct JeffJSICEntry {
     /// Cached `.writable` flag of the slot (valid while the shape matches:
     /// flag changes copy the shape, so identity covers it).
     var writable: Bool = false
+    /// Property key of a computed-key site (`o[k]` with a string `k`):
+    /// the entry is valid only for this atom. 0 for named sites, whose
+    /// key is fixed by the pc. The retained shapes hold a reference to the
+    /// atom, so it cannot be freed and reused while the entry lives.
+    var atom: UInt32 = 0
     /// define_field transition target (retained): objects on `shapePtr` at
     /// this pc move to this shape when the field is added.
     var nextShapePtr: UnsafeRawPointer? = nil
@@ -127,7 +132,7 @@ final class JeffJSInlineCache {
     /// property on `holder` (their prototype) at `propOffset`.
     @inline(__always)
     func updateProto(_ pc: Int, receiverShape: JeffJSShape, holder: JeffJSObject,
-                     holderShape: JeffJSShape, propOffset: Int) {
+                     holderShape: JeffJSShape, propOffset: Int, atom: UInt32 = 0) {
         let idx = pc & Self.mask
         let rs = Unmanaged.passRetained(receiverShape).toOpaque()
         let hp = Unmanaged.passRetained(holder).toOpaque()
@@ -135,11 +140,12 @@ final class JeffJSInlineCache {
         releaseEntry(idx)
         entries[idx] = JeffJSICEntry(
             shapePtr: UnsafeRawPointer(rs), pc: pc, propOffset: propOffset, writable: false,
+            atom: atom,
             nextShapePtr: nil, holderPtr: UnsafeRawPointer(hp), holderShapePtr: UnsafeRawPointer(hs))
     }
 
     @inline(__always)
-    func update(_ pc: Int, shape: JeffJSShape, propOffset: Int) {
+    func update(_ pc: Int, shape: JeffJSShape, propOffset: Int, atom: UInt32 = 0) {
         let idx = pc & Self.mask
         // Retain the new shape before releasing the old one (handles re-caching
         // the same shape without a transient zero refcount).
@@ -151,7 +157,8 @@ final class JeffJSInlineCache {
             shapePtr: UnsafeRawPointer(newPtr),
             pc: pc,
             propOffset: propOffset,
-            writable: writable
+            writable: writable,
+            atom: atom
         )
     }
 
@@ -254,6 +261,7 @@ class JeffJSFunctionBytecode {
         if let b = _bcBuffer, let base = b.baseAddress {
             return UnsafePointer(base)
         }
+        materializeCpoolRaw()   // first execution: constants are final too
         let n = bytecode.count
         let buf = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: max(n, 1))
         if n > 0 {
@@ -267,6 +275,9 @@ class JeffJSFunctionBytecode {
 
     deinit {
         _bcBuffer?.deallocate()
+        _cpoolRaw?.deallocate()
+        _traceIndexPCs?.deallocate()
+        _traceIndexInfos?.deallocate()
     }
     var fileName: JeffJSString?
     var lineNum: Int = 0
@@ -307,7 +318,9 @@ class JeffJSFunctionBytecode {
     /// `argSlotsOwned` for a plain (non-generator, non-async) function: its
     /// call paths dup the arguments into the frame and release them at exit.
     var copiesArgs: Bool = false
-    var cpool: [JeffJSValue] = []
+    var cpool: [JeffJSValue] = [] {
+        didSet { if _cpoolRaw != nil { _dropCpoolRaw() } }
+    }
     var isGenerator: Bool = false
     var isAsyncFunc: Bool = false
     var isArrow: Bool = false
@@ -358,7 +371,9 @@ class JeffJSFunctionBytecode {
     /// Trace blocks for hot loop optimization. Maps backward-jump target PC → trace info.
     /// Populated by JeffJSCompiler.fuseBasicBlocks() after bytecode compilation.
     /// nil until fuseBasicBlocks runs (saves memory for functions with no loops).
-    var traceBlocks: [Int: TraceBlockInfo]?
+    var traceBlocks: [Int: TraceBlockInfo]? {
+        didSet { _dropTraceIndex() }
+    }
 
     // MARK: - Function source text (Function.prototype.toString)
     //
@@ -379,6 +394,84 @@ class JeffJSFunctionBytecode {
     /// Direct `eval` call sites of this function (see JeffJSEvalSite), nil
     /// when it has none. Indexed by the `eval`/`apply_eval` site operand.
     var evalSites: [JeffJSEvalSite]? = nil
+
+    /// Unretained copy of `cpool`'s element bits for the interpreters'
+    /// constant loads: reading `cpool[i]` through the class retained and
+    /// released the array buffer on every push_const8 (a hot opcode in
+    /// string-keyed code). The values stay owned by `cpool`; any mutation of
+    /// `cpool` drops the copy and the next load rebuilds it.
+    private var _cpoolRaw: UnsafeMutablePointer<JeffJSValue>? = nil
+    private(set) var cpoolRawCount: Int = 0
+
+    /// Constant `i` (borrowed), or undefined when out of range. No calls on
+    /// the hot path: a call here made the trace loops retain `fb` around
+    /// every constant load. The view is built with the bytecode pointer
+    /// (`bytecodePtr`); until then, or after a mutation, `cpool` is read.
+    @inline(__always) func constant(_ i: Int) -> JeffJSValue {
+        if let p = _cpoolRaw, i < cpoolRawCount { return p[i] }
+        return i < cpool.count ? cpool[i] : .undefined
+    }
+
+    /// Build the unretained constant view (idempotent).
+    func materializeCpoolRaw() {
+        guard _cpoolRaw == nil else { return }
+        let n = cpool.count
+        guard n > 0 else { return }
+        let p = UnsafeMutablePointer<JeffJSValue>.allocate(capacity: n)
+        cpool.withUnsafeBufferPointer { p.initialize(from: $0.baseAddress!, count: n) }
+        _cpoolRaw = p
+        cpoolRawCount = n
+    }
+
+    /// Loop-head lookup table mirroring `traceBlocks` (sorted pcs + unretained
+    /// infos; the dictionary keeps the infos alive). Every taken backward
+    /// branch asks for its trace block; a Swift dictionary probe (SipHash of
+    /// the pc) per iteration was ~4% of a call-heavy loop.
+    private var _traceIndexPCs: UnsafeMutablePointer<Int>? = nil
+    private var _traceIndexInfos: UnsafeMutablePointer<Unmanaged<TraceBlockInfo>>? = nil
+    private var _traceIndexCount: Int = -1   // -1: not built
+
+    /// Trace block whose loop head is `pc`, if any.
+    @inline(__always) func traceBlock(at pc: Int) -> TraceBlockInfo? {
+        let n = _traceIndexCount
+        if n == 0 { return nil }
+        if n < 0 { return _buildTraceIndex(pc) }
+        guard let pcs = _traceIndexPCs, let infos = _traceIndexInfos else { return nil }
+        var lo = 0, hi = n - 1
+        while lo <= hi {
+            let mid = (lo + hi) >> 1
+            let v = pcs[mid]
+            if v == pc { return infos[mid].takeUnretainedValue() }
+            if v < pc { lo = mid + 1 } else { hi = mid - 1 }
+        }
+        return nil
+    }
+
+    @inline(never) private func _buildTraceIndex(_ pc: Int) -> TraceBlockInfo? {
+        guard let blocks = traceBlocks, !blocks.isEmpty else { _traceIndexCount = 0; return nil }
+        let sorted = blocks.sorted { $0.key < $1.key }
+        let n = sorted.count
+        let pcs = UnsafeMutablePointer<Int>.allocate(capacity: n)
+        let infos = UnsafeMutablePointer<Unmanaged<TraceBlockInfo>>.allocate(capacity: n)
+        for (i, kv) in sorted.enumerated() {
+            (pcs + i).initialize(to: kv.key)
+            (infos + i).initialize(to: Unmanaged.passUnretained(kv.value))
+        }
+        _traceIndexPCs = pcs; _traceIndexInfos = infos; _traceIndexCount = n
+        return blocks[pc]
+    }
+
+    fileprivate func _dropTraceIndex() {
+        _traceIndexPCs?.deallocate(); _traceIndexPCs = nil
+        _traceIndexInfos?.deallocate(); _traceIndexInfos = nil
+        _traceIndexCount = -1
+    }
+
+    fileprivate func _dropCpoolRaw() {
+        _cpoolRaw?.deallocate()
+        _cpoolRaw = nil
+        cpoolRawCount = 0
+    }
 
     /// The function's own source text, exactly as written (QuickJS
     /// `js_function_toString`). nil when it was not recorded.
@@ -1598,6 +1691,22 @@ extension JeffJSObject {
     /// Recycle-pool eligibility (see JeffJSObjectPool.swift): a plain,
     /// non-exotic object holding only data slots, with no weak references,
     /// function payload or auxiliary storage. Cheap field tests only.
+    /// An ordinary array that can be parked in the runtime's array pool when
+    /// it dies: nothing but its elements (ref-type storage, default element
+    /// attributes, not frozen/sealed/non-extensible) and `length` on a shared
+    /// hashed shape. See JeffJSObjectPool.swift.
+    var isPoolableArray: Bool {
+        guard classID == JeffJSClassID.array.rawValue, fastArray, extensible, !isExotic,
+              !isProtectedGlobal, !hasImmutablePrototype, !isHTMLDDA, !isStdArrayPrototype,
+              !isConstructor, firstWeakRef == nil, propExtra.isEmpty,
+              storedPrimitiveValue.isUndefined, fbFast == nil, arrowThisVal == nil,
+              storedCFunction == nil, lazyFlags == 0,
+              let st = _fastArrayValues, !st.checked, st.attrs == nil,
+              let sh = shape, sh.isHashed, sh.propCount == 1, propValues.count == 1,
+              sh.prop[0].atom == JeffJSAtomID.JS_ATOM_length.rawValue else { return false }
+        return true
+    }
+
     @inline(__always) var isPoolable: Bool {
         classID == JeffJSClassID.object.rawValue && !isExotic && !fastArray && !isProtectedGlobal
             && !hasImmutablePrototype && !isHTMLDDA && !isStdArrayPrototype && !isConstructor
