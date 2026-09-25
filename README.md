@@ -428,7 +428,9 @@ All engine flags live in [`Sources/JeffJS/Resources/JeffJSConfig.plist`](Sources
 | `optimize.enabled` | `true` | Master switch for the bytecode optimizer. |
 | `optimize.shortOpcodes` | `true` | Use short-form opcodes where possible. |
 | `cache.bytecodeEnabled` | `false` | Persist compiled bytecode to disk. |
-| `cache.bytecodeMaxSize` | `1000000` | Maximum cached bytecode size (bytes). |
+| `cache.bytecodeMaxSize` | `0` | Largest serialized entry kept, in bytes (0 = no cap of its own; the budgets decide). |
+| `cache.bytecodeDiskBudgetBytes` | 200 MB (16 MB watchOS) | Total size of the disk tier (`Caches/JeffJSBytecodeCache/v5-cv<compilerVersion>-<engine identity>/`), kept by LRU eviction (file mtime, re-stamped on every hit). 0 = no disk tier. The directory is named after `compilerVersion` + `engineSourceHash` (`Scripts/update_bytecode_identity.sh`), never the host binary, so reinstalling an app keeps its cache. |
+| `cache.bytecodeMemoryBudgetBytes` | 16 MB (2 MB watchOS) | Serialized blobs each runtime keeps in memory (LRU); a blob over a quarter of it is disk-only. |
 | `stack.maxCallDepth` | `200` | JS call stack depth limit. |
 | `stack.defaultSize` | `1048576` | Per-context stack buffer size. |
 | `gc.mallocThreshold` | `262144` | Bytes allocated before a GC pass triggers. |

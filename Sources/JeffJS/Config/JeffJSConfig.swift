@@ -82,7 +82,28 @@ enum JeffJSConfig {
         string("cache.bytecodePrefixes", default: "")
             .split(separator: ",").map(String.init)
     }()
-    static let bytecodeMaxSize     = int("cache.bytecodeMaxSize",      default: 1_000_000)
+    /// Largest *serialized* entry the cache keeps, in bytes; 0 = no cap of
+    /// its own (the budgets below decide). It used to be the top-level
+    /// function's bytecode length with a 1 MB default, checked before
+    /// compiling, which skipped exactly the multi-MB bundles that are the
+    /// most expensive to recompile.
+    static let bytecodeMaxSize     = int("cache.bytecodeMaxSize",      default: 0)
+    /// Total bytes of the disk tier (`Caches/JeffJSBytecodeCache/<engine>`),
+    /// kept by LRU eviction (`JeffJSBytecodeDiskStore`); 0 = no disk tier.
+    /// Watch-sized by default on watchOS.
+    static let bytecodeDiskBudgetBytes = int("cache.bytecodeDiskBudgetBytes", default: platformBudget(iOS: 200, watch: 16))
+    /// Bytes of serialized blobs each runtime keeps in memory (LRU). A blob
+    /// over a quarter of it is disk-only.
+    static let bytecodeMemoryBudgetBytes = int("cache.bytecodeMemoryBudgetBytes", default: platformBudget(iOS: 16, watch: 2))
+
+    /// A default in MB for the platform the engine runs on, in bytes.
+    private static func platformBudget(iOS: Int, watch: Int) -> Int {
+        #if os(watchOS)
+        return watch * 1024 * 1024
+        #else
+        return iOS * 1024 * 1024
+        #endif
+    }
     /// One stderr line per bytecode-cache hit / miss / reject / store, with the
     /// full cache key and the reason a rejected entry was refused.
     /// `JEFFJS_CACHE_BYTECODEDEBUG=1` turns it on without touching the plist.

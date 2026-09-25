@@ -345,7 +345,11 @@ identical across compile and cache-hit evaluation; conformance 1706/0.
 | libvorbis (343 KB) | 132 ms | ~3 ms |
 
 Scripts whose bytecode exceeds `cache.bytecodeMaxSize` used to throw
-"Bytecode too large"; they now run uncached. Any config key can be overridden
+"Bytecode too large"; they later ran uncached. Since the byte-budget change
+the cap compares the *serialized* entry (default 0 = none) and the disk tier
+is bounded by `cache.bytecodeDiskBudgetBytes` with LRU eviction; a 3.7 MB
+production bundle (homedepot) compiles in 974 ms and loads from disk in 32 ms
+(8 MB entry). Any config key can be overridden
 from the environment (`JEFFJS_CACHE_BYTECODEENABLED=1`).
 
 ### Superinstruction tooling

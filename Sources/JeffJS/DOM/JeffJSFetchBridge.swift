@@ -182,19 +182,34 @@ final class JeffJSFetchBridge {
     /// Preflight (OPTIONS) results, keyed by origin|url|method|headers.
     private static var preflightCache: [String: Date] = [:]
 
-    /// Shared aggressive URLCache for all fetch requests.
-    /// 50 MB memory + 200 MB disk.
-    private static let sharedResourceCache: URLCache = URLCache(
-        memoryCapacity: 50 * 1024 * 1024,
-        diskCapacity: 200 * 1024 * 1024
-    )
+    /// The HTTP cache `fetch()` uses. A host sets this before the first
+    /// fetch to share its own (React Natively passes the renderer's, so a
+    /// script fetched by the page and by the renderer is one entry and one
+    /// budget); otherwise the bridge keeps a small one in
+    /// `Caches/JeffJSFetchCache` (16 MB memory / 64 MB disk; 2 / 8 on watchOS).
+    nonisolated(unsafe) static var hostURLCache: URLCache?
 
-    /// Cached session for JS-initiated fetches — uses the shared aggressive
-    /// resource cache so fetch() calls for scripts/CSS/assets get cached.
+    private static let sharedResourceCache: URLCache = {
+        if let host = hostURLCache { return host }
+        #if os(watchOS)
+        let memory = 2 * 1024 * 1024, disk = 8 * 1024 * 1024
+        #else
+        let memory = 16 * 1024 * 1024, disk = 64 * 1024 * 1024
+        #endif
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("JeffJSFetchCache", isDirectory: true)
+        return URLCache(memoryCapacity: memory, diskCapacity: disk, directory: dir)
+    }()
+
+    /// Session for JS-initiated GETs. HTTP semantics (`useProtocolCachePolicy`:
+    /// fresh from cache, stale revalidated, `no-store` never stored) unless the
+    /// request's `cache` mode says otherwise (`applyCachePolicy`). It used to
+    /// be `returnCacheDataElseLoad`: any stored GET — an API response too —
+    /// was replayed forever.
     private static let cachedSession: URLSession = {
         let config = URLSessionConfiguration.default
         config.urlCache = sharedResourceCache
-        config.requestCachePolicy = .returnCacheDataElseLoad
+        config.requestCachePolicy = .useProtocolCachePolicy
         return URLSession(configuration: config)
     }()
 

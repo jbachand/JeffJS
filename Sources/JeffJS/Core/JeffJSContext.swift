@@ -3047,6 +3047,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
 
         // ---- Cache MISS — full pipeline: Tokenize → Parse → Compile ----
         let isStrict = (evalFlags & JS_EVAL_FLAG_STRICT) != 0
+        let compileStart = CFAbsoluteTimeGetCurrent()
 
         // Step 1+2: Tokenize and parse
         let parseState = JeffJSParseState(
@@ -3082,8 +3083,6 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         if bcSize == 0 {
             return .JS_UNDEFINED
         }
-        // Scripts above the cache size limit still run; they are just not cached.
-        let tooLargeToCache = bcSize > JeffJSConfig.bytecodeMaxSize
 
         // Step 3: Compile (recursively compiles child functions, resolves
         // variables/labels, and produces final bytecode).
@@ -3100,11 +3099,14 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         lastBytecodeSize = compiledSize
         totalBytecodeSize += compiledSize
 
-        // Store serialized bytecode in cache for future evals of the same source
-        if let cacheKey, !tooLargeToCache {
+        rt.bytecodeCache.noteCompile(ms: (CFAbsoluteTimeGetCurrent() - compileStart) * 1000,
+                                     sourceBytes: input.utf8.count)
+
+        // Store serialized bytecode in cache for future evals of the same
+        // source. Size limits are the cache's business (serialized bytes
+        // against the tiers' budgets), not a pre-compile guess.
+        if let cacheKey {
             rt.bytecodeCache.store(cacheKey, bytecode: fb)
-        } else if cacheKey != nil {
-            rt.bytecodeCache.debugLog("skip store (bytecode \(bcSize) > cache.bytecodeMaxSize) file=\(filename)")
         }
 
         return executeBytecode(fb)

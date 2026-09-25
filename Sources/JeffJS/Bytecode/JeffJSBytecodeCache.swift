@@ -1027,6 +1027,8 @@ final class JeffJSBytecodeCache {
         let desc: String
         let sourceLength: Int
         let blob: [UInt8]
+        /// `useClock` at the last hit or store (LRU order).
+        var lastUse: UInt64 = 0
     }
 
     /// Serialized bytecode keyed by the cache key's hash.
@@ -1034,6 +1036,19 @@ final class JeffJSBytecodeCache {
 
     /// Maximum cached entries.
     private let maxEntries = 512
+
+    /// In-memory byte budget (`cache.bytecodeMemoryBudgetBytes`). The memory
+    /// tier is per runtime and the host usually makes one runtime per page, so
+    /// it only serves repeated evals inside one page: it is kept small, and a
+    /// blob larger than a quarter of it (a multi-MB bundle, which a page does
+    /// not eval twice) lives on disk only.
+    var memoryBudget = JeffJSConfig.bytecodeMemoryBudgetBytes
+    private var memoryBytes = 0
+    private var useClock: UInt64 = 0
+
+    /// The disk tier (nil = memory only). Shared by every runtime in the
+    /// process; tests swap in a store rooted in a temporary directory.
+    var diskStore: JeffJSBytecodeDiskStore? = JeffJSBytecodeDiskStore.shared
 
     /// Number of cache hits (in-memory).
     private(set) var hitCount: Int = 0
@@ -1051,6 +1066,35 @@ final class JeffJSBytecodeCache {
     /// Why the last rejection happened — surfaced for tests and for
     /// `cache.bytecodeDebug` logging.
     private(set) var lastRejectReason: String?
+
+    /// Blobs written (memory and/or disk) and why a compile was not cached.
+    private(set) var storeCount: Int = 0
+    private(set) var storeSkipCount: Int = 0
+
+    /// Time spent on each side of the cache, for the host's perf trace:
+    /// parse + compile on a miss (`noteCompile`), serialize on store,
+    /// read + deserialize on a hit. Milliseconds.
+    private(set) var compileMs: Double = 0
+    private(set) var compiledSourceBytes: Int = 0
+    private(set) var serializeMs: Double = 0
+    private(set) var deserializeMs: Double = 0
+    private(set) var diskReadBytes: Int = 0
+    private(set) var diskWriteBytes: Int = 0
+
+    /// Called by the eval pipeline after a parse + compile.
+    func noteCompile(ms: Double, sourceBytes: Int) {
+        compileMs += ms
+        compiledSourceBytes += sourceBytes
+    }
+
+    /// One line for a host's perf summary.
+    var perfDescription: String {
+        func f(_ v: Double) -> String { String(Int(v.rounded())) }
+        return "bc hits=\(hitCount) (disk \(diskHitCount)) misses=\(missCount) rejects=\(rejectCount) "
+            + "stores=\(storeCount) skipped=\(storeSkipCount) compile=\(f(compileMs))ms/\(compiledSourceBytes / 1024)KB "
+            + "deser=\(f(deserializeMs))ms ser=\(f(serializeMs))ms read=\(diskReadBytes / 1024)KB "
+            + "wrote=\(diskWriteBytes / 1024)KB mem=\(memoryBytes / 1024)KB"
+    }
 
     /// Runtime for atom remapping during deserialization.
     ///
@@ -1091,7 +1135,10 @@ final class JeffJSBytecodeCache {
     /// subdirectory, so old entries are simply never looked at again).
     /// 4 = entries carry a JBCK header (compiler version, key hash, source
     ///     length, canonical flags/config/filename string).
-    private static let diskVersion: UInt32 = 4
+    /// 5 = the directory is named after the engine identity (below) instead
+    ///     of being purged whenever the executable's modification date
+    ///     changed; entries themselves are unchanged.
+    static let diskVersion: UInt32 = 5
 
     /// Bump when parser or compiler logic changes (bug fixes, new opcodes, etc.).
     /// This is mixed into the cache key so cached bytecode from an older compiler
@@ -1127,39 +1174,51 @@ final class JeffJSBytecodeCache {
     //   wrong key atoms.
     static let compilerVersion: UInt64 = 15  // 2026-09-24: numeric property keys
 
-    /// Lazily-initialized disk cache directory.
-    /// Automatically clears cached .jfbc files when the app binary changes (new build).
-    private static let diskCacheDir: URL? = {
-        guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else { return nil }
-        let dir = caches.appendingPathComponent("JeffJSBytecodeCache/v\(diskVersion)", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    /// FNV-1a over the engine's bytecode-relevant sources: `Parser/*.swift`,
+    /// `Bytecode/JeffJSCompiler.swift`, `Bytecode/JeffJSOpcodes.swift` and
+    /// this file (minus this line). It is part of the disk directory's name,
+    /// so an engine whose parser, compiler or blob format changed never reads
+    /// blobs written by another one, even when nobody bumped
+    /// `compilerVersion`. `BytecodeCacheBudgetTests.testEngineSourceHashIsCurrent`
+    /// fails when it is stale; `Scripts/update_bytecode_identity.sh` rewrites it.
+    static let engineSourceHash: UInt64 = 0x18e0bc2c6a2b33e9 // bytecode-identity
 
-        // Detect new build by checking executable modification date
-        let stampFile = dir.appendingPathComponent(".build_stamp")
-        let currentStamp: String
-        if let execURL = Bundle.main.executableURL,
-           let attrs = try? FileManager.default.attributesOfItem(atPath: execURL.path),
-           let modDate = attrs[.modificationDate] as? Date {
-            currentStamp = String(Int(modDate.timeIntervalSince1970))
-        } else {
-            currentStamp = "unknown"
+    /// The engine build identity: `compilerVersion`, the blob and entry
+    /// layouts, `engineSourceHash`, and the opcode table the interpreter
+    /// decodes with. NOT the executable's modification date: reinstalling or
+    /// updating the app keeps the cache (it used to be purged whenever the
+    /// binary changed). Debug builds (`DEBUG`) also mix in the executable's
+    /// modification date, so a development build of an edited compiler never
+    /// runs blobs written by the build before it.
+    static let engineIdentity: UInt64 = {
+        var h: UInt64 = 0xcbf29ce484222325
+        func mix(_ s: String) {
+            for b in s.utf8 { h ^= UInt64(b); h &*= 0x100000001b3 }
+            h ^= 0; h &*= 0x100000001b3
         }
-        let savedStamp = (try? String(contentsOf: stampFile, encoding: .utf8)) ?? ""
-        if savedStamp != currentStamp {
-            // Build changed — purge all cached bytecode
-            if let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
-                for file in files where file.pathExtension == "jfbc" {
-                    try? FileManager.default.removeItem(at: file)
-                }
-            }
-            try? currentStamp.write(to: stampFile, atomically: true, encoding: .utf8)
+        mix("cv=\(compilerVersion);jfbc=\(JFBC_VERSION);jbck=\(JBCK_HEADER_VERSION);disk=\(diskVersion)")
+        mix(String(engineSourceHash, radix: 16))
+        for info in jeffJSOpcodeInfo {
+            mix("\(info.name):\(info.size):\(info.nPop):\(info.nPush):\(info.format)")
         }
-
-        return dir
+        #if DEBUG
+        if let exe = Bundle.main.executableURL,
+           let date = (try? FileManager.default.attributesOfItem(atPath: exe.path))?[.modificationDate] as? Date {
+            mix("debug-exe=\(Int(date.timeIntervalSince1970))")
+        }
+        #endif
+        return h
     }()
 
+    /// `v<diskVersion>-cv<compilerVersion>-<engineIdentity>`: the only
+    /// directory under the cache root this engine reads or keeps.
+    static var diskDirectoryName: String {
+        let hex = String(engineIdentity, radix: 16)
+        return "v\(diskVersion)-cv\(compilerVersion)-" + String(repeating: "0", count: max(0, 16 - hex.count)) + hex
+    }
+
     private func diskURL(for hash: UInt64) -> URL? {
-        Self.diskCacheDir?.appendingPathComponent("\(hash).jfbc")
+        diskStore?.url(for: hash)
     }
 
     /// The file a key maps to. Exposed for tests (header-rejection,
@@ -1262,6 +1321,11 @@ final class JeffJSBytecodeCache {
     /// Validate an entry against the key it was looked up with and return the
     /// JFBC blob, or the reason it was refused.
     static func openEntry(_ bytes: [UInt8], key: JeffJSBytecodeCacheKey) -> EntryResult {
+        bytes.withUnsafeBufferPointer { openEntry($0, key: key) }
+    }
+
+    /// Same, over a buffer (a memory-mapped file): the blob is the only copy.
+    static func openEntry(_ bytes: UnsafeBufferPointer<UInt8>, key: JeffJSBytecodeCacheKey) -> EntryResult {
         var p = 0
         func get32() -> UInt32? {
             guard p + 4 <= bytes.count else { return nil }
@@ -1285,10 +1349,10 @@ final class JeffJSBytecodeCache {
         guard Int(srcLen) == key.sourceLength else { return .refused("source length mismatch") }
         guard let descLen = get32() else { return .refused("truncated header") }
         guard p + Int(descLen) <= bytes.count else { return .refused("truncated desc") }
-        let desc = String(decoding: bytes[p..<(p + Int(descLen))], as: UTF8.self)
+        let desc = String(decoding: UnsafeBufferPointer(rebasing: bytes[p..<(p + Int(descLen))]), as: UTF8.self)
         p += Int(descLen)
         guard desc == key.desc else { return .refused("key mismatch") }
-        return .ok(Array(bytes[p...]))
+        return .ok(Array(UnsafeBufferPointer(rebasing: bytes[p...])))
     }
 
     // MARK: - Lookup
@@ -1301,80 +1365,324 @@ final class JeffJSBytecodeCache {
             guard entry.desc == key.desc, entry.sourceLength == key.sourceLength else {
                 // Same 64-bit hash, different compile. Never serve it.
                 reject("memory key mismatch", key)
-                cache.removeValue(forKey: key.hash)
+                removeMemoryEntry(key.hash)
                 return nil
             }
+            let t0 = CFAbsoluteTimeGetCurrent()
             guard let fb = JeffJSBytecodeDeserializer.deserialize(entry.blob, rt: rt, ctx: ctx) else {
                 reject("memory deserialize failed", key)
-                cache.removeValue(forKey: key.hash)
+                removeMemoryEntry(key.hash)
                 return nil
             }
+            deserializeMs += (CFAbsoluteTimeGetCurrent() - t0) * 1000
+            useClock &+= 1
+            cache[key.hash]?.lastUse = useClock
             hitCount += 1
             debugLog("hit memory key=\(key.desc) srcLen=\(key.sourceLength)")
             return fb
         }
-        // Disk fallback
-        guard let url = diskURL(for: key.hash),
-              let data = try? Data(contentsOf: url) else {
+        // Disk fallback. The file is memory-mapped and the blob is copied out
+        // of it once (it used to be copied three times: Data, [UInt8], blob).
+        let t0 = CFAbsoluteTimeGetCurrent()
+        guard let store = diskStore, let data = store.read(key.hash) else {
             missCount += 1
             debugLog("miss key=\(key.desc) srcLen=\(key.sourceLength)")
             return nil
         }
+        let opened: EntryResult = data.withUnsafeBytes { raw in
+            Self.openEntry(raw.bindMemory(to: UInt8.self), key: key)
+        }
         let blob: [UInt8]
-        switch Self.openEntry([UInt8](data), key: key) {
+        switch opened {
         case .refused(let reason):
             reject("disk \(reason)", key)
-            try? FileManager.default.removeItem(at: url)
+            store.remove(key.hash)
             return nil
         case .ok(let b):
             blob = b
         }
         guard let fb = JeffJSBytecodeDeserializer.deserialize(blob, rt: rt, ctx: ctx) else {
+            // A corrupt entry is deleted, so the next load recompiles and
+            // rewrites it instead of failing here forever.
             reject("disk deserialize failed", key)
-            try? FileManager.default.removeItem(at: url)
+            store.remove(key.hash)
             return nil
         }
-        // Promote to in-memory cache
-        cache[key.hash] = Entry(desc: key.desc, sourceLength: key.sourceLength, blob: blob)
+        let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        deserializeMs += ms
+        diskReadBytes += data.count
+        insertMemoryEntry(key.hash, Entry(desc: key.desc, sourceLength: key.sourceLength, blob: blob))
         hitCount += 1
         diskHitCount += 1
-        debugLog("hit disk key=\(key.desc) srcLen=\(key.sourceLength) bytes=\(blob.count)")
+        debugLog("hit disk key=\(key.desc) srcLen=\(key.sourceLength) bytes=\(blob.count) ms=\(Int(ms))")
         return fb
     }
+
+    // MARK: - Memory tier (byte budget, LRU)
+
+    private func insertMemoryEntry(_ hash: UInt64, _ entry: Entry) {
+        // A blob bigger than a quarter of the budget would flush the rest for
+        // a script the page is not going to eval again: disk only.
+        guard entry.blob.count <= memoryBudget / 4 else { return }
+        removeMemoryEntry(hash)
+        var e = entry
+        useClock &+= 1
+        e.lastUse = useClock
+        cache[hash] = e
+        memoryBytes += e.blob.count
+        while (memoryBytes > memoryBudget || cache.count > maxEntries),
+              let victim = cache.min(by: { $0.value.lastUse < $1.value.lastUse })?.key {
+            removeMemoryEntry(victim)
+        }
+    }
+
+    private func removeMemoryEntry(_ hash: UInt64) {
+        if let old = cache.removeValue(forKey: hash) { memoryBytes -= old.blob.count }
+    }
+
+    /// Bytes held by the in-memory tier (tests, perf summaries).
+    var memoryTierBytes: Int { memoryBytes }
 
     // MARK: - Store
 
     /// Store compiled bytecode in the cache (serializes with atom table).
     /// Also persists to disk for cross-launch caching.
+    ///
+    /// Size rules: `cache.bytecodeMaxSize` (serialized bytes, 0 = no cap of
+    /// its own) is the only per-entry limit; past that the tiers' budgets
+    /// decide (an entry over a quarter of a tier's budget skips that tier).
+    /// It used to compare the *top-level* function's bytecode length against
+    /// 1 MB before compiling, which skipped exactly the large bundles that
+    /// cost the most to recompile.
     func store(_ key: JeffJSBytecodeCacheKey, bytecode fb: JeffJSFunctionBytecode) {
-        guard cache.count < maxEntries else {
-            debugLog("store skipped (cache full) key=\(key.desc)")
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let serialized = JeffJSBytecodeSerializer.serialize(fb, rt: rt)
+        serializeMs += (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        let cap = JeffJSConfig.bytecodeMaxSize
+        if cap > 0, serialized.count > cap {
+            storeSkipCount += 1
+            debugLog("skip store (\(serialized.count) bytes > cache.bytecodeMaxSize \(cap)) key=\(key.desc)")
             return
         }
-        let serialized = JeffJSBytecodeSerializer.serialize(fb, rt: rt)
-        cache[key.hash] = Entry(desc: key.desc, sourceLength: key.sourceLength, blob: serialized)
-        // Persist to disk synchronously: a few hundred KB takes ~1 ms, and a
-        // queued write is lost when a short-lived host (the CLI) exits first.
-        // `.atomic` writes a sibling temp file and renames it, so a concurrent
-        // reader sees either the whole old entry or the whole new one — never
-        // a half-written blob.
-        if let url = diskURL(for: key.hash) {
-            do {
-                try Data(Self.makeEntry(key: key, blob: serialized)).write(to: url, options: .atomic)
-            } catch {
-                debugLog("store write failed key=\(key.desc): \(error)")
+        insertMemoryEntry(key.hash, Entry(desc: key.desc, sourceLength: key.sourceLength, blob: serialized))
+        // Persist to disk synchronously: a queued write is lost when a
+        // short-lived host (the CLI) exits first. The store writes a sibling
+        // temp file and renames it, so a concurrent reader sees either the
+        // whole old entry or the whole new one — never a half-written blob.
+        if let store = diskStore {
+            let entry = Self.makeEntry(key: key, blob: serialized)
+            if store.write(key.hash, entry) {
+                diskWriteBytes += entry.count
+            } else {
+                debugLog("store: disk write skipped or failed (\(entry.count) bytes, budget \(store.budgetBytes)) key=\(key.desc)")
             }
         }
+        storeCount += 1
         debugLog("store key=\(key.desc) srcLen=\(key.sourceLength) bytes=\(serialized.count)")
     }
 
     /// Clear all cached entries (in-memory and disk).
     func clear() {
         cache.removeAll()
+        memoryBytes = 0
         hitCount = 0
         diskHitCount = 0
         missCount = 0
         rejectCount = 0
         lastRejectReason = nil
+    }
+}
+
+// MARK: - Disk tier: one directory per engine identity, byte budget, LRU
+
+/// The on-disk half of the bytecode cache, shared by every runtime in the
+/// process.
+///
+/// * **Budget.** Entries are `<key hash>.jfbc` files in one directory whose
+///   total size (allocated bytes, as `du` counts them) is kept under
+///   `cache.bytecodeDiskBudgetBytes` (200 MB on iOS/macOS, 16 MB on watchOS).
+///   A write that takes the running total over the budget rescans the
+///   directory right away and deletes the least recently used entries (file
+///   modification date; every hit re-stamps its file) down to 90 % of the
+///   budget. The directory is also scanned once
+///   when the store opens, so a budget lowered by configuration applies at the
+///   next launch. An entry larger than a quarter of the budget is not written
+///   (one giant script must not flush everything else).
+/// * **Invalidation.** The directory is named `v<disk>-cv<compiler>-<engine
+///   identity>` (`JeffJSBytecodeCache.diskDirectoryName`). Every other entry
+///   under the root belongs to another engine build and is deleted when the
+///   store opens. Nothing depends on the app binary's modification date, so
+///   reinstalling or updating the app keeps the cache.
+/// * **Corruption.** A header or deserialize failure deletes the entry
+///   (`JeffJSBytecodeCache.lookup`).
+final class JeffJSBytecodeDiskStore: @unchecked Sendable {
+
+    let directory: URL
+    let budgetBytes: Int
+    private let lock = NSLock()
+    /// Running total of entry bytes; nil until the first scan finishes.
+    private var trackedBytes: Int?
+    private var scanScheduled = false
+    private(set) var evictedCount = 0
+
+    private static let maintenance = DispatchQueue(label: "jeffjs.bytecode-cache.disk", qos: .utility)
+
+    /// The process-wide store under `Caches/JeffJSBytecodeCache` (nil when
+    /// the disk budget is 0 or the directory cannot be created).
+    static let shared: JeffJSBytecodeDiskStore? = {
+        let budget = JeffJSConfig.bytecodeDiskBudgetBytes
+        guard budget > 0,
+              let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else { return nil }
+        let root = caches.appendingPathComponent("JeffJSBytecodeCache", isDirectory: true)
+        return JeffJSBytecodeDiskStore(root: root, name: JeffJSBytecodeCache.diskDirectoryName, budgetBytes: budget)
+    }()
+
+    /// Opens (creating) `root/name`. Removal of other engines' directories
+    /// and the initial budget scan run on the maintenance queue.
+    init?(root: URL, name: String, budgetBytes: Int) {
+        let dir = root.appendingPathComponent(name, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            return nil
+        }
+        self.directory = dir
+        self.budgetBytes = budgetBytes
+        scanScheduled = true
+        Self.maintenance.async { [self] in
+            Self.removeOtherEngines(root: root, keep: name)
+            lock.lock(); scanScheduled = false; lock.unlock()
+            enforceBudget()
+        }
+    }
+
+    /// Deletes everything under `root` except `keep`: directories of older
+    /// disk layouts / compiler versions / engine builds (the pre-v5 layout's
+    /// `v4/` with its `.build_stamp` included).
+    static func removeOtherEngines(root: URL, keep: String) {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { return }
+        for item in items where item.lastPathComponent != keep {
+            try? fm.removeItem(at: item)
+        }
+    }
+
+    func url(for hash: UInt64) -> URL {
+        directory.appendingPathComponent("\(hash).jfbc")
+    }
+
+    /// The largest entry this store writes.
+    var maxEntryBytes: Int { budgetBytes / 4 }
+
+    /// The entry's bytes (memory-mapped when the volume allows it); a hit
+    /// re-stamps the file as most recently used.
+    func read(_ hash: UInt64) -> Data? {
+        let u = url(for: hash)
+        guard let data = try? Data(contentsOf: u, options: .mappedIfSafe) else { return nil }
+        u.withUnsafeFileSystemRepresentation { path in
+            if let path { _ = utimes(path, nil) }
+        }
+        return data
+    }
+
+    /// Atomically writes an entry. False when it is over `maxEntryBytes` or
+    /// the write failed.
+    @discardableResult
+    func write(_ hash: UInt64, _ bytes: [UInt8]) -> Bool {
+        guard bytes.count <= maxEntryBytes else { return false }
+        do {
+            try Data(bytes).write(to: url(for: hash), options: .atomic)
+        } catch {
+            return false
+        }
+        // Accounted in allocated blocks, like `du`.
+        let allocated = (bytes.count + 4095) / 4096 * 4096
+        lock.lock()
+        let known = trackedBytes != nil
+        var over = false
+        if let t = trackedBytes {
+            trackedBytes = t + allocated
+            over = t + allocated > budgetBytes
+        }
+        lock.unlock()
+        if !known {
+            scheduleScan()          // the opening scan has not finished yet
+        } else if over {
+            enforceBudget()         // crossing the budget: evict now, so the
+                                    // directory never stays over it
+        }
+        return true
+    }
+
+    func remove(_ hash: UInt64) {
+        try? FileManager.default.removeItem(at: url(for: hash))
+    }
+
+    private func scheduleScan() {
+        lock.lock()
+        if scanScheduled { lock.unlock(); return }
+        scanScheduled = true
+        lock.unlock()
+        Self.maintenance.async { [self] in
+            lock.lock(); scanScheduled = false; lock.unlock()
+            enforceBudget()
+        }
+    }
+
+    /// Scans the directory and, when it is over budget, deletes the least
+    /// recently used entries down to 90 % of the budget. Returns the bytes
+    /// left and how many entries were evicted. Runs on the maintenance queue
+    /// (or directly from tests).
+    @discardableResult
+    func enforceBudget() -> (bytes: Int, evicted: Int) {
+        let fm = FileManager.default
+        let keys: Set<URLResourceKey> = [.fileSizeKey, .totalFileAllocatedSizeKey, .contentModificationDateKey]
+        guard let items = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: Array(keys)) else {
+            return (0, 0)
+        }
+        let now = Date()
+        var entries: [(url: URL, size: Int, used: Date)] = []
+        var total = 0
+        for item in items {
+            let values = try? item.resourceValues(forKeys: keys)
+            let size = values?.totalFileAllocatedSize ?? values?.fileSize ?? 0
+            let used = values?.contentModificationDate ?? .distantPast
+            guard item.pathExtension == "jfbc" else {
+                // The temp file of a write the process died in.
+                if now.timeIntervalSince(used) > 600 { try? fm.removeItem(at: item) }
+                continue
+            }
+            entries.append((item, size, used))
+            total += size
+        }
+        var evicted = 0
+        if total > budgetBytes {
+            let target = budgetBytes / 10 * 9
+            entries.sort { $0.used < $1.used }
+            for e in entries where total > target {
+                if (try? fm.removeItem(at: e.url)) != nil {
+                    total -= e.size
+                    evicted += 1
+                }
+            }
+        }
+        lock.lock()
+        trackedBytes = total
+        evictedCount += evicted
+        lock.unlock()
+        return (total, evicted)
+    }
+
+    /// Waits for queued maintenance (sibling removal, scans) to finish.
+    func synchronize() {
+        Self.maintenance.sync {}
+    }
+
+    /// Current total of entry bytes (scans when unknown).
+    var totalBytes: Int {
+        lock.lock()
+        let t = trackedBytes
+        lock.unlock()
+        return t ?? enforceBudget().bytes
     }
 }

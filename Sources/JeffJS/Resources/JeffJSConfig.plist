@@ -23,7 +23,7 @@
 	<key>cache.bytecodeExcludePrefixes</key>
 	<string>&lt;eval&gt;,&lt;onclick&gt;,&lt;diag&gt;</string>
 	<key>cache.bytecodeMaxSize</key>
-	<integer>1000000</integer>
+	<integer>0</integer>
 	<key>cache.bytecodeDebug</key>
 	<false/>
 	<key>trace.hitThreshold</key>
