@@ -319,7 +319,7 @@ class JeffJSFunctionBytecode {
     /// call paths dup the arguments into the frame and release them at exit.
     var copiesArgs: Bool = false
     var cpool: [JeffJSValue] = [] {
-        didSet { if _cpoolRaw != nil { _dropCpoolRaw() } }
+        didSet { if _cpoolWanted { _rebuildCpoolRaw() } }
     }
     var isGenerator: Bool = false
     var isAsyncFunc: Bool = false
@@ -398,29 +398,28 @@ class JeffJSFunctionBytecode {
     /// Unretained copy of `cpool`'s element bits for the interpreters'
     /// constant loads: reading `cpool[i]` through the class retained and
     /// released the array buffer on every push_const8 (a hot opcode in
-    /// string-keyed code). The values stay owned by `cpool`; any mutation of
-    /// `cpool` drops the copy and the next load rebuilds it.
-    private var _cpoolRaw: UnsafeMutablePointer<JeffJSValue>? = nil
+    /// string-keyed code). The values stay owned by `cpool`; once built, the
+    /// copy is rebuilt on every mutation of `cpool`.
+    private(set) var _cpoolRaw: UnsafeMutablePointer<JeffJSValue>? = nil
     private(set) var cpoolRawCount: Int = 0
+    private var _cpoolWanted = false
 
-    /// Constant `i` (borrowed), or undefined when out of range. No calls on
-    /// the hot path: a call here made the trace loops retain `fb` around
-    /// every constant load. The view is built with the bytecode pointer
-    /// (`bytecodePtr`); until then, or after a mutation, `cpool` is read.
+    /// Constant `i` (borrowed), or undefined when out of range, for the
+    /// interpreters. Field loads only: any call on this path (even a cold
+    /// fallback reading `cpool`) made the trace loops retain `fb` around
+    /// every constant load. Valid for every executing function: the view is
+    /// built with the bytecode pointer (`bytecodePtr`, which every execution
+    /// path takes first) and kept in sync with `cpool` from then on.
     @inline(__always) func constant(_ i: Int) -> JeffJSValue {
         if let p = _cpoolRaw, i < cpoolRawCount { return p[i] }
-        return i < cpool.count ? cpool[i] : .undefined
+        return .undefined
     }
 
-    /// Build the unretained constant view (idempotent).
+    /// Build the unretained constant view and keep it in sync from now on.
     func materializeCpoolRaw() {
-        guard _cpoolRaw == nil else { return }
-        let n = cpool.count
-        guard n > 0 else { return }
-        let p = UnsafeMutablePointer<JeffJSValue>.allocate(capacity: n)
-        cpool.withUnsafeBufferPointer { p.initialize(from: $0.baseAddress!, count: n) }
-        _cpoolRaw = p
-        cpoolRawCount = n
+        if _cpoolWanted { return }
+        _cpoolWanted = true
+        _rebuildCpoolRaw()
     }
 
     /// Loop-head lookup table mirroring `traceBlocks` (sorted pcs + unretained
@@ -467,10 +466,16 @@ class JeffJSFunctionBytecode {
         _traceIndexCount = -1
     }
 
-    fileprivate func _dropCpoolRaw() {
+    fileprivate func _rebuildCpoolRaw() {
         _cpoolRaw?.deallocate()
         _cpoolRaw = nil
         cpoolRawCount = 0
+        let n = cpool.count
+        guard n > 0 else { return }
+        let p = UnsafeMutablePointer<JeffJSValue>.allocate(capacity: n)
+        cpool.withUnsafeBufferPointer { p.initialize(from: $0.baseAddress!, count: n) }
+        _cpoolRaw = p
+        cpoolRawCount = n
     }
 
     /// The function's own source text, exactly as written (QuickJS

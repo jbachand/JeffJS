@@ -3189,7 +3189,16 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         let size = Self.totalBytecodeLen(fb)
         lastBytecodeSize = size
         totalBytecodeSize += size
+        // A precompiled bundle (the app's polyfills) builds the page's
+        // built-in surface: everything it allocates stays reachable, so the
+        // allocation-triggered collections it would set off (at 1K, 2K, 4K …
+        // objects under the doubling policy) walk a live heap for nothing —
+        // ~20% of the bundle's run time. Hold them off for its top-level run
+        // and set the next trigger as a fruitless collection would have.
+        let savedGCThreshold = rt.mallocGCThreshold
+        rt.mallocGCThreshold = Int.max
         let result = executeBytecode(fb)
+        rt.mallocGCThreshold = max(savedGCThreshold, jeffJS_nextGCThreshold(rt, reclaimed: 0))
         if jeffJSTimePrecompiled {
             let tEnd = CFAbsoluteTimeGetCurrent()
             FileHandle.standardError.write(String(format:

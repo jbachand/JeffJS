@@ -164,6 +164,16 @@ func jeffJS_pop(_ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: inout Int, _ spB
 // stored in the entry so a site whose key varies never false-hits.
 // Obfuscated code (Akamai, reCAPTCHA) reads nearly every property this way.
 
+/// Constant `i` of a function from its unretained view (see
+/// `JeffJSFunctionBytecode.constant`), taking the two fields as values: a
+/// method call on the call trace's `unowned(unsafe)` function reference
+/// retained and released it around every constant load.
+@inline(__always)
+func jeffJS_const(_ p: UnsafeMutablePointer<JeffJSValue>?, _ n: Int, _ i: Int) -> JeffJSValue {
+    if let p = p, i < n { return p[i] }
+    return .undefined
+}
+
 /// Atom of a string key usable for the keyed caches (a named, non-index
 /// atom), or 0.
 @inline(__always)
@@ -3245,7 +3255,7 @@ private func executeFastTrace(
         case .arith_const8:
             let ar = bc[pc + 1]
             let k = Int(bc[pc + 2])
-            let c = fb.constant(k)   // undefined when out of range: the generic arm below
+            let c = jeffJS_const(fb._cpoolRaw, fb.cpoolRawCount, k)   // undefined when out of range: the generic arm below
             let v = buf[sp - 1]
             if v.isInt && c.isInt {
                 buf[sp - 1] = jeffJS_arithInt(ar, v.toInt32(), c.toInt32())
@@ -3288,13 +3298,13 @@ private func executeFastTrace(
 
         case .push_const:
             let idx = Int(readU32(bc, pc + 1))
-            buf[sp] = fb.constant(idx).dupValue()
+            buf[sp] = jeffJS_const(fb._cpoolRaw, fb.cpoolRawCount, idx).dupValue()
             sp += 1
             pc += 5
 
         case .push_const8:
             let idx = Int(bc[pc + 1])
-            buf[sp] = fb.constant(idx).dupValue()
+            buf[sp] = jeffJS_const(fb._cpoolRaw, fb.cpoolRawCount, idx).dupValue()
             sp += 1
             pc += 2
 
@@ -3396,7 +3406,7 @@ private func executeFastTrace(
             if pc + 3 < bcLen,
                bc[pc + 1] == UInt8(truncatingIfNeeded: JeffJSOpcode.push_const8.rawValue),
                bc[pc + 3] == UInt8(truncatingIfNeeded: JeffJSOpcode.get_array_el.rawValue),
-               let hv = jeffJS_traceThisKeyedGet(fb.icEntries, pc + 3, thisV, fb.constant(Int(bc[pc + 2]))) {
+               let hv = jeffJS_traceThisKeyedGet(fb.icEntries, pc + 3, thisV, jeffJS_const(fb._cpoolRaw, fb.cpoolRawCount, Int(bc[pc + 2]))) {
                 buf[sp] = hv; sp += 1
                 pc += 4
                 continue traceLoop
