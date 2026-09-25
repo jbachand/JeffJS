@@ -581,6 +581,8 @@ extension JeffJSParser {
                                 propAtom == constructorAtom && propKind == .method
 
             // Parse method
+            let methodParenPtr = s.token.ptr
+            let methodParenLine = s.token.line
             expect(0x28) // '('
 
             let methodFd = JeffJSFunctionDefCompiler()
@@ -611,6 +613,8 @@ extension JeffJSParser {
             if isConstructor {
                 // The class span is stamped on it once the class body closes.
                 cf.ctorFd = methodFd
+            } else {
+                recordLazySeed(methodFd, parenPtr: methodParenPtr, parenLine: methodParenLine, srcStart: memberStart)
             }
 
             let (mDefaults, mRest, mDstructs) = parseFormalParameters(childFd: methodFd)
@@ -620,6 +624,7 @@ extension JeffJSParser {
             expect(0x7D) // '}'
             if !isConstructor {
                 recordSource(methodFd, from: memberStart)
+                finishLazyCandidate(methodFd)
             }
 
             let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))

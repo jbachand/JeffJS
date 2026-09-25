@@ -388,6 +388,25 @@ public final class JeffJSEnvironment {
          runtime.mallocState.mallocSize, runtime.mallocGCThreshold)
     }
 
+    /// Lazy function compilation (`compile.lazyFunctions`) for this
+    /// runtime: function bodies compile on their first call. Settable for
+    /// A/B measurements and tests.
+    public var lazyFunctions: Bool {
+        get { runtime.lazyFunctions }
+        set { runtime.lazyFunctions = newValue }
+    }
+
+    /// Lazy compilation counters, one line: stubs made at load and bodies
+    /// compiled on a first call (count, source KB, ms).
+    public var lazyCompileSummary: String { runtime.lazyStats.description }
+
+    /// Write the function bodies compiled lazily since the last flush to the
+    /// bytecode cache, so the next load of those scripts skips compiling
+    /// them (they are written in batches as they compile, and at teardown).
+    public func flushBytecodeCache() {
+        runtime.bytecodeCache.flushLazyBodies()
+    }
+
     // MARK: - Layout Geometry
 
     /// Pushes document-coordinate layout rects (keyed by `DOMNode.id`) and the

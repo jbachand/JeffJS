@@ -3067,6 +3067,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         fd.sourceText = JeffJSSourceText(bytes: parseState.buf)
         fd.sourceStart = 0
         fd.sourceEnd = parseState.buf.count
+        // Functions compiled lazily re-parse from this shared text.
+        let lazyScript = JeffJSLazyScript(source: fd.sourceText!, filename: filename, isModule: isModule)
+        lazyScript.cacheHash = cacheKey?.hash
+        fd.lazyScript = lazyScript
         if isStrict || isModule {
             fd.jsMode = JS_MODE_STRICT
         }
@@ -3130,6 +3134,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         fd.sourceText = JeffJSSourceText(bytes: parseState.buf)
         fd.sourceStart = 0
         fd.sourceEnd = parseState.buf.count
+        fd.lazyScript = JeffJSLazyScript(source: fd.sourceText!, filename: filename, isModule: false)
         let parser = JeffJSParser(s: parseState, fd: fd)
         parser.parseProgram()
         let t1 = CFAbsoluteTimeGetCurrent()

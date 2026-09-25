@@ -109,6 +109,18 @@ enum JeffJSConfig {
     /// `JEFFJS_CACHE_BYTECODEDEBUG=1` turns it on without touching the plist.
     static let bytecodeDebug       = bool("cache.bytecodeDebug",       default: false)
 
+    // MARK: - Compilation
+
+    /// Compile function bodies on their first call (JavaScriptCore / V8
+    /// style). The whole script is still parsed up front, so early errors are
+    /// reported at load; a function that never runs keeps only a small stub
+    /// (its closure variables and source span) instead of its bytecode.
+    /// `JEFFJS_COMPILE_LAZYFUNCTIONS=0` compiles everything eagerly.
+    static let lazyFunctions       = bool("compile.lazyFunctions",     default: true)
+    /// Functions whose source is shorter than this are compiled eagerly (a
+    /// tiny body costs about as much as its stub).
+    static let lazyMinSourceBytes  = int("compile.lazyMinSourceBytes", default: 0)
+
     // MARK: - Trace Blocks
 
     static let traceHitThreshold   = int("trace.hitThreshold",         default: 2)

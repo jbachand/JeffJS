@@ -19,7 +19,21 @@ private let JFBC_MAGIC: UInt32 = 0x4A46_4243
 /// 5: per-function source span + the script text (Function.prototype.toString)
 /// 6: atom-table entries are tagged (u8 kind: 0 = JS_ATOM_NULL, 1 = string),
 ///    so the null atom no longer collapses onto the empty-string atom.
-private let JFBC_VERSION: UInt8 = 6
+/// 7: lazy function compilation. Each function record has a u8 `ext` after
+///    its flags: bit 0 = a lazy seed follows the record (the function
+///    compiles from the script text on its first call), bit 1 = its body is
+///    not compiled yet (a stub: no bytecode, no constant pool), bit 2 = the
+///    pc->line / pc->column tables follow (stack traces of cached code).
+///    The trailer after the script text names the script (filename, module).
+private let JFBC_VERSION: UInt8 = 7
+
+/// Function record `ext` bits (v7).
+private let EXT_LAZY: UInt8 = 1
+private let EXT_LAZY_PENDING: UInt8 = 2
+private let EXT_DEBUG: UInt8 = 4
+/// Bytes of a lazy seed: kind, funcKind, jsMode, u16 flags, u32 start,
+/// u32 line, u32 name atom.
+private let LAZY_SEED_BYTES = 17
 
 /// Magic bytes for a *disk cache entry*: "JBCK" (JeffJS ByteCode Key).
 /// A disk entry is this header followed by the JFBC blob. The blob format is
@@ -297,6 +311,13 @@ struct JeffJSBytecodeSerializer {
     /// Serialize a compiled function bytecode to bytes.
     /// Requires the runtime to resolve atom IDs to strings.
     static func serialize(_ fb: JeffJSFunctionBytecode, rt: JeffJSRuntime? = nil) -> [UInt8] {
+        return serialize(fb, rt: rt, includeSource: true)
+    }
+
+    /// `includeSource: false` leaves the script text out: a lazily compiled
+    /// body stored next to its script's cache entry (JeffJSLazyBodyStore)
+    /// is read back with that script's text.
+    static func serialize(_ fb: JeffJSFunctionBytecode, rt: JeffJSRuntime?, includeSource: Bool) -> [UInt8] {
         var s = JeffJSBytecodeSerializer(atomTable: AtomTableBuilder())
         s.writeFunctionBytecode(fb, rt: rt)
 
@@ -315,16 +336,32 @@ struct JeffJSBytecodeSerializer {
         // The script text, once for the whole function tree. Every function's
         // (start, len) above indexes into it, so a cache hit reproduces the
         // exact same `toString()` output as a fresh compile.
-        if let src = fb.sourceText {
+        if includeSource, let src = fb.sourceText {
             s.writeU8(1)
             s.writeU32(UInt32(src.bytes.count))
             s.buf.append(contentsOf: src.bytes)
         } else {
             s.writeU8(0)
         }
+        // v7: the script's name (stack traces; lazy functions re-parse from
+        // the text above under it) and module flag.
+        var filename = s.lazyScript?.filename
+        if filename == nil, let rt, let c = fb as? JeffJSFunctionBytecodeCompiled, c.debugFilenameAtom != 0 {
+            filename = rt.atomToString(c.debugFilenameAtom)
+        }
+        if let filename {
+            s.writeU8(1)
+            s.writeString(filename)
+            s.writeU8(s.lazyScript?.isModule == true ? 1 : 0)
+        } else {
+            s.writeU8(0)
+        }
 
         return s.buf
     }
+
+    /// The script of the first lazy function written (they share one).
+    private var lazyScript: JeffJSLazyScript?
 
     // MARK: Primitives
 
@@ -365,6 +402,15 @@ struct JeffJSBytecodeSerializer {
         writeU32(JFBC_MAGIC)
         writeU8(JFBC_VERSION)
         writeU16(packFlags(fb))
+        let compiled = fb as? JeffJSFunctionBytecodeCompiled
+        var ext: UInt8 = 0
+        if let li = fb.lazyInfo {
+            ext |= EXT_LAZY
+            if li.isPending { ext |= EXT_LAZY_PENDING }
+            if lazyScript == nil { lazyScript = li.script }
+        }
+        if let c = compiled, c.debugPc2lineLen > 0 || c.debugPc2colLen > 0 { ext |= EXT_DEBUG }
+        writeU8(ext)
         writeU16(fb.argCount)
         writeU16(fb.varCount)
         writeU16(fb.definedArgCount)
@@ -448,6 +494,20 @@ struct JeffJSBytecodeSerializer {
                 }
             }
         }
+        if let li = fb.lazyInfo {
+            let seed = li.seed
+            writeU8(seed.kind.rawValue)
+            writeU8(seed.funcKind)
+            writeU8(seed.jsMode)
+            writeU16(seed.flags)
+            writeU32(UInt32(bitPattern: seed.parseStart))
+            writeU32(UInt32(bitPattern: seed.parseLine))
+            writeU32((rt != nil) ? atomTable.intern(seed.funcName, rt: rt!) : seed.funcName)
+        }
+        if ext & EXT_DEBUG != 0, let c = compiled {
+            writeBytes(Array(c.debugPc2lineBuf.prefix(c.debugPc2lineLen)))
+            writeBytes(Array(c.debugPc2colBuf.prefix(c.debugPc2colLen)))
+        }
     }
 
     // MARK: Constant Pool Entry
@@ -519,6 +579,15 @@ struct JeffJSBytecodeDeserializer {
     private var remapper: AtomRemapper?
     /// Script text shared by every function in this blob (trailer, v5+).
     private var sourceText: JeffJSSourceText?
+    /// Name / module flag of the script (trailer, v7).
+    private var scriptFilename: String?
+    private var scriptIsModule = false
+    /// The script lazy functions in this blob belong to: given by the caller
+    /// for a lazily compiled body, else made on the first lazy record.
+    private var lazyScript: JeffJSLazyScript?
+    private var lazyCacheHash: UInt64?
+    /// Filename atom for the debug info of every function in the blob.
+    private var debugFilenameAtom: JSAtom = 0
     /// Needed to rebuild tagged-template objects; without one, bytecode
     /// containing a tagged template fails to deserialize (cache miss).
     private var ctx: JeffJSContext?
@@ -527,6 +596,15 @@ struct JeffJSBytecodeDeserializer {
     /// If rt is provided, atoms are re-interned for cross-runtime portability.
     static func deserialize(_ data: [UInt8], rt: JeffJSRuntime? = nil,
                             ctx: JeffJSContext? = nil) -> JeffJSFunctionBytecode? {
+        return deserialize(data, rt: rt, ctx: ctx, lazyScript: nil, cacheHash: nil)
+    }
+
+    /// `lazyScript`: the blob is a lazily compiled body stored without the
+    /// script text (serialize(includeSource: false)); its functions belong to
+    /// that script. `cacheHash`: the cache entry the blob came from, for the
+    /// script its lazy functions get (their bodies persist next to it).
+    static func deserialize(_ data: [UInt8], rt: JeffJSRuntime?, ctx: JeffJSContext?,
+                            lazyScript: JeffJSLazyScript?, cacheHash: UInt64?) -> JeffJSFunctionBytecode? {
         var d = JeffJSBytecodeDeserializer(data: data)
         d.ctx = ctx
 
@@ -537,7 +615,16 @@ struct JeffJSBytecodeDeserializer {
         }
 
         // v5 trailer: the script text, shared by every function below.
-        d.sourceText = d.readTrailingSource()
+        d.readTrailer()
+        if let script = lazyScript {
+            d.lazyScript = script
+            d.sourceText = script.source
+            d.scriptFilename = script.filename
+        }
+        d.lazyCacheHash = cacheHash
+        if let rt, let name = d.scriptFilename {
+            d.debugFilenameAtom = rt.findAtom(name)
+        }
 
         d.pos = 0
         return d.readFunctionBytecode()
@@ -580,31 +667,46 @@ struct JeffJSBytecodeDeserializer {
         return AtomRemapper(indexToAtom: indexToAtom)
     }
 
-    /// Skip the function tree and the atom table to reach the shared script
-    /// text written by the serializer, and decode it.
-    private func readTrailingSource() -> JeffJSSourceText? {
+    /// Skip the function tree and the atom table to reach the trailer
+    /// written by the serializer: the shared script text (v5) and the
+    /// script's filename / module flag (v7).
+    private mutating func readTrailer() {
         var p = 0
-        guard skipFunctionBytecode(data: data, pos: &p) else { return nil }
-        guard p + 3 < data.count else { return nil }
+        guard skipFunctionBytecode(data: data, pos: &p) else { return }
+        guard p + 3 < data.count else { return }
         let atomCount = Int(readU32LE(data, p))
         p += 4
         for _ in 0..<atomCount {
-            guard p < data.count else { return nil }
+            guard p < data.count else { return }
             let kind = data[p]
             p += 1
             if kind == ATOM_ENTRY_NULL { continue }
-            guard p + 3 < data.count else { return nil }
+            guard p + 3 < data.count else { return }
             let strLen = Int(readU32LE(data, p))
             p += 4 + strLen
-            guard p <= data.count else { return nil }
+            guard p <= data.count else { return }
         }
-        guard p < data.count, data[p] == 1 else { return nil }
+        guard p < data.count else { return }
+        if data[p] == 1 {
+            p += 1
+            guard p + 3 < data.count else { return }
+            let srcLen = Int(readU32LE(data, p))
+            p += 4
+            guard p + srcLen <= data.count else { return }
+            sourceText = JeffJSSourceText(bytes: Array(data[p ..< (p + srcLen)]))
+            p += srcLen
+        } else {
+            p += 1
+        }
+        guard p < data.count, data[p] == 1 else { return }
         p += 1
-        guard p + 3 < data.count else { return nil }
-        let srcLen = Int(readU32LE(data, p))
+        guard p + 3 < data.count else { return }
+        let nameLen = Int(readU32LE(data, p))
         p += 4
-        guard p + srcLen <= data.count else { return nil }
-        return JeffJSSourceText(bytes: Array(data[p ..< (p + srcLen)]))
+        guard p + nameLen < data.count else { return }
+        scriptFilename = String(decoding: data[p ..< (p + nameLen)], as: UTF8.self)
+        p += nameLen
+        scriptIsModule = data[p] != 0
     }
 
     /// Read U32 at a specific position without advancing pos.
@@ -614,12 +716,13 @@ struct JeffJSBytecodeDeserializer {
 
     /// Skip past a serialized function bytecode (for finding atom table).
     private func skipFunctionBytecode(data: [UInt8], pos: inout Int) -> Bool {
-        // Magic(4) + Version(1) + Flags(2) + argCount(2) + varCount(2) +
+        // Magic(4) + Version(1) + Flags(2) + ext(1) + argCount(2) + varCount(2) +
         // definedArgCount(2) + nameAtom(4) + stackSize(2) + closureVarCount(2) +
         // lineNum(4) + colNum(4) + sourceStart(4) + sourceLen(4)
-        let headerSize = 4 + 1 + 2 + 2 + 2 + 2 + 4 + 2 + 2 + 4 + 4 + 4 + 4
+        let headerSize = 4 + 1 + 2 + 1 + 2 + 2 + 2 + 4 + 2 + 2 + 4 + 4 + 4 + 4
         guard pos + headerSize <= data.count else { return false }
         let flags = Int(data[pos + 5]) | (Int(data[pos + 6]) << 8)
+        let ext = data[pos + 7]
         pos += headerSize
 
         // Bytecode bytes: length(4) + data
@@ -659,6 +762,13 @@ struct JeffJSBytecodeDeserializer {
                 guard pos + 8 < data.count else { return false }
                 let items = Int(readU32LE(data, pos + 5))
                 pos += 9 + items * 11
+            }
+        }
+        if ext & EXT_LAZY != 0 { pos += LAZY_SEED_BYTES }
+        if ext & EXT_DEBUG != 0 {
+            for _ in 0 ..< 2 {
+                guard pos + 3 < data.count else { return false }
+                pos += 4 + Int(readU32LE(data, pos))
             }
         }
 
@@ -758,6 +868,7 @@ struct JeffJSBytecodeDeserializer {
         guard let magic = readU32(), magic == JFBC_MAGIC else { return nil }
         guard let version = readU8(), version == JFBC_VERSION else { return nil }   // older layouts lack the function source span / tagged atom table
         guard let flags = readU16() else { return nil }
+        guard let ext = readU8() else { return nil }
         guard let argCount = readU16() else { return nil }
         guard let varCount = readU16() else { return nil }
         guard let definedArgCount = readU16() else { return nil }
@@ -849,9 +960,44 @@ struct JeffJSBytecodeDeserializer {
             }
             evalSites = sites
         }
+        var lazyInfo: JeffJSLazyFunctionInfo? = nil
+        if ext & EXT_LAZY != 0 {
+            guard let kindRaw = readU8(), let kind = JeffJSLazySeed.Kind(rawValue: kindRaw),
+                  let funcKind = readU8(), let jsMode = readU8(), let seedFlags = readU16(),
+                  let start = readU32(), let line = readU32(), let nameRef = readU32(),
+                  let seedName = remapAtomRef(nameRef) else { return nil }
+            var seed = JeffJSLazySeed()
+            seed.kind = kind
+            seed.funcKind = funcKind
+            seed.jsMode = jsMode
+            seed.flags = seedFlags
+            seed.parseStart = Int32(bitPattern: start)
+            seed.parseLine = Int32(bitPattern: line)
+            seed.funcName = seedName
+            if lazyScript == nil {
+                // A lazy function re-parses from the script text.
+                guard let src = sourceText else { return nil }
+                let script = JeffJSLazyScript(source: src, filename: scriptFilename ?? "<input>",
+                                              isModule: scriptIsModule)
+                script.cacheHash = lazyCacheHash
+                lazyScript = script
+            }
+            let info = JeffJSLazyFunctionInfo(seed: seed, script: lazyScript!)
+            info.isPending = ext & EXT_LAZY_PENDING != 0
+            lazyInfo = info
+        }
+        var pc2line: [UInt8] = []
+        var pc2col: [UInt8] = []
+        if ext & EXT_DEBUG != 0 {
+            guard let l = readBytes(), let c = readBytes() else { return nil }
+            pc2line = l
+            pc2col = c
+        }
 
-        // Construct fresh JeffJSFunctionBytecode
-        let fb = JeffJSFunctionBytecode()
+        // Construct fresh function bytecode (the compiled class: it carries
+        // the debug tables, and a lazy function compiles into it in place).
+        let fbc = JeffJSFunctionBytecodeCompiled()
+        let fb: JeffJSFunctionBytecode = fbc
         fb.bytecode = bytecode
         fb.bytecodeLen = bytecode.count
         fb.argCount = argCount
@@ -875,6 +1021,31 @@ struct JeffJSBytecodeDeserializer {
         fb.closureVarsList = closureVars
         fb.selfRefVarIdx = Int(Int32(bitPattern: selfRefRaw))
         fb.evalSites = evalSites
+        fb.lazyInfo = lazyInfo
+        // Mirror the compiled-class fields the compiler fills in.
+        fbc.funcNameAtom = fb.nameAtom
+        fbc.funcNameVarIdx = fb.selfRefVarIdx
+        fbc.jsModeFlags = fb.isStrictMode ? UInt8(JS_MODE_STRICT) : 0
+        fbc.funcKindValue = fb.isGenerator
+            ? (fb.isAsyncFunc ? JSFunctionKindEnum.JS_FUNC_ASYNC_GENERATOR.rawValue : JSFunctionKindEnum.JS_FUNC_GENERATOR.rawValue)
+            : (fb.isAsyncFunc ? JSFunctionKindEnum.JS_FUNC_ASYNC.rawValue : JSFunctionKindEnum.JS_FUNC_NORMAL.rawValue)
+        fbc.superCallAllowedFlag = fb.superCallAllowed
+        fbc.superAllowedFlag = fb.superAllowed
+        fbc.argumentsAllowedFlag = fb.argumentsAllowed
+        fbc.isDirectOrIndirectEvalFlag = fb.isDirectOrIndirectEval
+        fbc.closureVars = closureVars
+        fbc.closureVarCountInt = closureVars.count
+        fbc.varRefCountValue = UInt16(closureVars.count)
+        fbc.definedArgCountValue = argCount
+        fbc.cpoolCountValue = cpool.count
+        fbc.debugFilenameAtom = debugFilenameAtom
+        if !pc2line.isEmpty || !pc2col.isEmpty || debugFilenameAtom != 0 {
+            fbc.hasDebugInfo = true
+            fbc.debugPc2lineBuf = pc2line
+            fbc.debugPc2lineLen = pc2line.count
+            fbc.debugPc2colBuf = pc2col
+            fbc.debugPc2colLen = pc2col.count
+        }
         // Trace regions are derived from the final bytecode (not stored):
         // recompute them so cached code runs with the same loop traces.
         JeffJSCompiler.fuseBasicBlocks(fb)
@@ -1172,7 +1343,11 @@ final class JeffJSBytecodeCache {
     //   destructuring read key "0.0", `{4294967296: v}` defined
     //   "4294967296.0", class `1.5(){}` was named "2"): cached blobs hold the
     //   wrong key atoms.
-    static let compilerVersion: UInt64 = 15  // 2026-09-24: numeric property keys
+    // 16 = lazy function compilation: blobs hold stubs (a seed, closure
+    //   variables and a source span, no body) for functions compiled on
+    //   their first call, JFBC v7 records (ext byte, seed, pc->line tables)
+    //   and trailer (script name); bodies persist in `<hash>-bodies.jfbc`.
+    static let compilerVersion: UInt64 = 16  // 2026-09-24: lazy function compilation
 
     /// FNV-1a over the engine's bytecode-relevant sources: `Parser/*.swift`,
     /// `Bytecode/JeffJSCompiler.swift`, `Bytecode/JeffJSOpcodes.swift` and
@@ -1181,7 +1356,7 @@ final class JeffJSBytecodeCache {
     /// blobs written by another one, even when nobody bumped
     /// `compilerVersion`. `BytecodeCacheBudgetTests.testEngineSourceHashIsCurrent`
     /// fails when it is stale; `Scripts/update_bytecode_identity.sh` rewrites it.
-    static let engineSourceHash: UInt64 = 0x18e0bc2c6a2b33e9 // bytecode-identity
+    static let engineSourceHash: UInt64 = 0x9c25e53c1860344d // bytecode-identity
 
     /// The engine build identity: `compilerVersion`, the blob and entry
     /// layouts, `engineSourceHash`, and the opcode table the interpreter
@@ -1369,7 +1544,8 @@ final class JeffJSBytecodeCache {
                 return nil
             }
             let t0 = CFAbsoluteTimeGetCurrent()
-            guard let fb = JeffJSBytecodeDeserializer.deserialize(entry.blob, rt: rt, ctx: ctx) else {
+            guard let fb = JeffJSBytecodeDeserializer.deserialize(entry.blob, rt: rt, ctx: ctx,
+                                                                  lazyScript: nil, cacheHash: key.hash) else {
                 reject("memory deserialize failed", key)
                 removeMemoryEntry(key.hash)
                 return nil
@@ -1401,7 +1577,8 @@ final class JeffJSBytecodeCache {
         case .ok(let b):
             blob = b
         }
-        guard let fb = JeffJSBytecodeDeserializer.deserialize(blob, rt: rt, ctx: ctx) else {
+        guard let fb = JeffJSBytecodeDeserializer.deserialize(blob, rt: rt, ctx: ctx,
+                                                              lazyScript: nil, cacheHash: key.hash) else {
             // A corrupt entry is deleted, so the next load recompiles and
             // rewrites it instead of failing here forever.
             reject("disk deserialize failed", key)
@@ -1481,8 +1658,43 @@ final class JeffJSBytecodeCache {
         debugLog("store key=\(key.desc) srcLen=\(key.sourceLength) bytes=\(serialized.count)")
     }
 
+    // MARK: - Lazily compiled bodies
+
+    /// Body stores of the cached scripts this runtime compiled or loaded.
+    private var bodyStores: [UInt64: JeffJSLazyBodyStore] = [:]
+
+    /// Where the lazily compiled bodies of the script cached under `hash`
+    /// persist (a sidecar file next to its entry), nil without a disk tier.
+    func lazyBodyStore(for hash: UInt64) -> JeffJSLazyBodyStore? {
+        if let s = bodyStores[hash] { return s }
+        guard let disk = diskStore else { return nil }
+        let s = JeffJSLazyBodyStore(hash: hash, disk: disk)
+        s.onPending = { [unowned(unsafe) self] in self.rt?.lazyBodiesPending = true }
+        bodyStores[hash] = s
+        return s
+    }
+
+    /// Write every lazily compiled body not on disk yet (runtime teardown,
+    /// or the host at a quiet moment).
+    func flushLazyBodies() {
+        for s in bodyStores.values { s.flush() }
+        rt?.lazyBodiesPending = false
+    }
+
+    /// From the idle tick: write pending bodies once the oldest waited 1 s.
+    func flushLazyBodiesIfDue() {
+        var pending = false
+        let now = CFAbsoluteTimeGetCurrent()
+        for s in bodyStores.values where s.hasPending {
+            if now - s.pendingSince >= 1 { s.flush() } else { pending = true }
+        }
+        rt?.lazyBodiesPending = pending
+    }
+
     /// Clear all cached entries (in-memory and disk).
     func clear() {
+        flushLazyBodies()
+        bodyStores.removeAll()
         cache.removeAll()
         memoryBytes = 0
         hitCount = 0
@@ -1616,6 +1828,55 @@ final class JeffJSBytecodeDiskStore: @unchecked Sendable {
 
     func remove(_ hash: UInt64) {
         try? FileManager.default.removeItem(at: url(for: hash))
+        try? FileManager.default.removeItem(at: sidecarURL(for: hash))
+    }
+
+    /// The lazily compiled bodies of the entry `hash` (JeffJSLazyBodyStore):
+    /// a separate `.jfbc` file, so the budget scan counts and evicts it like
+    /// any entry (losing it only costs recompiles).
+    func sidecarURL(for hash: UInt64) -> URL {
+        directory.appendingPathComponent("\(hash)-bodies.jfbc")
+    }
+
+    func readSidecar(_ hash: UInt64) -> Data? {
+        let u = sidecarURL(for: hash)
+        guard let data = try? Data(contentsOf: u, options: .mappedIfSafe) else { return nil }
+        u.withUnsafeFileSystemRepresentation { path in
+            if let path { _ = utimes(path, nil) }
+        }
+        return data
+    }
+
+    /// Append records to the sidecar, creating it with `header` first.
+    @discardableResult
+    func appendSidecar(_ hash: UInt64, header: [UInt8], _ bytes: [UInt8]) -> Bool {
+        let u = sidecarURL(for: hash)
+        let fm = FileManager.default
+        var existing = 0
+        if let size = (try? fm.attributesOfItem(atPath: u.path))?[.size] as? Int {
+            existing = size
+        } else {
+            guard (try? Data(header).write(to: u, options: .atomic)) != nil else { return false }
+            existing = header.count
+        }
+        guard existing + bytes.count <= maxEntryBytes,
+              let h = try? FileHandle(forWritingTo: u) else { return false }
+        defer { try? h.close() }
+        do {
+            try h.seekToEnd()
+            try h.write(contentsOf: Data(bytes))
+        } catch {
+            return false
+        }
+        lock.lock()
+        var over = false
+        if let t = trackedBytes {
+            trackedBytes = t + bytes.count
+            over = t + bytes.count > budgetBytes
+        }
+        lock.unlock()
+        if over { enforceBudget() }
+        return true
     }
 
     private func scheduleScan() {
@@ -1684,5 +1945,129 @@ final class JeffJSBytecodeDiskStore: @unchecked Sendable {
         let t = trackedBytes
         lock.unlock()
         return t ?? enforceBudget().bytes
+    }
+}
+
+// MARK: - Lazy function bodies
+
+/// The bodies of a cached script's lazily compiled functions, so a warm load
+/// (the script comes from the bytecode cache as stubs) does not compile
+/// again what ran before. A body compiled on a first call is serialized
+/// without the script text and appended to a sidecar file next to the
+/// script's cache entry (`<hash>-bodies.jfbc`); the next runtime that loads
+/// the script maps the file and reads a body back instead of compiling it.
+/// The sidecar is valid exactly as long as the entry: same key (source,
+/// flags, filename) and the same engine directory.
+///
+/// Sidecar: u32 magic "JLZB" | u32 version | u64 entry hash, then records
+/// u64 span key (source start << 32 | length) | u32 length | u64 FNV-1a of
+/// the blob | JFBC blob. A record whose checksum does not match is ignored
+/// (its function compiles from source), so a damaged file never runs.
+final class JeffJSLazyBodyStore {
+    static let magic: UInt32 = 0x4A4C_5A42
+    static let version: UInt32 = 1
+
+    let hash: UInt64
+    private let disk: JeffJSBytecodeDiskStore
+    private var mapped: Data? = nil
+    private var index: [UInt64: Range<Int>] = [:]
+    private var loaded = false
+    /// Bodies compiled here and not written yet.
+    private var pending: [(UInt64, [UInt8])] = []
+    private var pendingBytes = 0
+    private var firstPending: CFAbsoluteTime = 0
+    /// Spans already in the file or pending.
+    private var known = Set<UInt64>()
+    /// Called when the first body of a batch is added.
+    var onPending: (() -> Void)?
+    var hasPending: Bool { !pending.isEmpty }
+    var pendingSince: CFAbsoluteTime { firstPending }
+
+    init(hash: UInt64, disk: JeffJSBytecodeDiskStore) {
+        self.hash = hash
+        self.disk = disk
+    }
+
+    static func fnv(_ bytes: UnsafeRawBufferPointer) -> UInt64 {
+        var h: UInt64 = 0xcbf29ce484222325
+        for b in bytes { h ^= UInt64(b); h &*= 0x100000001b3 }
+        return h
+    }
+
+    static func spanKey(_ fb: JeffJSFunctionBytecode) -> UInt64 {
+        return UInt64(UInt32(bitPattern: fb.sourceStart)) << 32 | UInt64(UInt32(bitPattern: fb.sourceLen))
+    }
+
+    private var header: [UInt8] {
+        var h: [UInt8] = []
+        for v in [Self.magic, Self.version] { for i in 0 ..< 4 { h.append(UInt8((v >> (8 * UInt32(i))) & 0xFF)) } }
+        for i in 0 ..< 8 { h.append(UInt8((hash >> (8 * UInt64(i))) & 0xFF)) }
+        return h
+    }
+
+    private func load() {
+        loaded = true
+        guard let data = disk.readSidecar(hash) else { return }
+        let n = data.count
+        func u32(_ p: Int) -> UInt32 {
+            return UInt32(data[p]) | UInt32(data[p + 1]) << 8 | UInt32(data[p + 2]) << 16 | UInt32(data[p + 3]) << 24
+        }
+        func u64(_ p: Int) -> UInt64 { return UInt64(u32(p)) | UInt64(u32(p + 4)) << 32 }
+        guard n >= 16, u32(0) == Self.magic, u32(4) == Self.version, u64(8) == hash else { return }
+        var p = 16
+        while p + 20 <= n {
+            let key = u64(p)
+            let len = Int(u32(p + 8))
+            let sum = u64(p + 12)
+            p += 20
+            guard len >= 0, p + len <= n else { break }   // a record cut short by a crash
+            let checksum: UInt64 = data.withUnsafeBytes { raw in
+                Self.fnv(UnsafeRawBufferPointer(rebasing: raw[p ..< (p + len)]))
+            }
+            if checksum == sum {
+                if index[key] == nil { index[key] = p ..< (p + len) }
+                known.insert(key)
+            }
+            p += len
+        }
+        mapped = data
+    }
+
+    /// The stored body for the function spanning `key`, if any.
+    func body(_ key: UInt64) -> [UInt8]? {
+        if !loaded { load() }
+        guard let r = index[key], let m = mapped else { return nil }
+        return [UInt8](m[r])
+    }
+
+    /// Remember a body compiled in this runtime; written in batches.
+    func add(_ key: UInt64, _ blob: [UInt8]) {
+        if !loaded { load() }
+        guard known.insert(key).inserted else { return }
+        if pending.isEmpty { firstPending = CFAbsoluteTimeGetCurrent(); onPending?() }
+        pending.append((key, blob))
+        pendingBytes += blob.count
+        if pendingBytes >= 64 * 1024 || pending.count >= 64
+            || CFAbsoluteTimeGetCurrent() - firstPending >= 2 {
+            flush()
+        }
+    }
+
+    /// Append the pending bodies to the sidecar.
+    func flush() {
+        guard !pending.isEmpty else { return }
+        var out: [UInt8] = []
+        out.reserveCapacity(pendingBytes + pending.count * 20)
+        for (key, blob) in pending {
+            for i in 0 ..< 8 { out.append(UInt8((key >> (8 * UInt64(i))) & 0xFF)) }
+            let len = UInt32(blob.count)
+            for i in 0 ..< 4 { out.append(UInt8((len >> (8 * UInt32(i))) & 0xFF)) }
+            let sum = blob.withUnsafeBytes { Self.fnv($0) }
+            for i in 0 ..< 8 { out.append(UInt8((sum >> (8 * UInt64(i))) & 0xFF)) }
+            out.append(contentsOf: blob)
+        }
+        pending.removeAll()
+        pendingBytes = 0
+        disk.appendSidecar(hash, header: header, out)
     }
 }
