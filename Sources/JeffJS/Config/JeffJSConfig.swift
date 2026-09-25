@@ -120,6 +120,10 @@ enum JeffJSConfig {
     /// Functions whose source is shorter than this are compiled eagerly (a
     /// tiny body costs about as much as its stub).
     static let lazyMinSourceBytes  = int("compile.lazyMinSourceBytes", default: 0)
+    /// Reclaim the compiled body of a lazily compiled function that has not
+    /// run for this long (it compiles again on its next call); 0 = never.
+    /// Checked at idle points; generators and async functions are kept.
+    static let lazyDropAfterMs     = int("compile.lazyDropAfterMs",    default: 0)
 
     // MARK: - Trace Blocks
 

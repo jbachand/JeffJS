@@ -1265,6 +1265,7 @@ final class JeffJSBytecodeCache {
             + "stores=\(storeCount) skipped=\(storeSkipCount) compile=\(f(compileMs))ms/\(compiledSourceBytes / 1024)KB "
             + "deser=\(f(deserializeMs))ms ser=\(f(serializeMs))ms read=\(diskReadBytes / 1024)KB "
             + "wrote=\(diskWriteBytes / 1024)KB mem=\(memoryBytes / 1024)KB"
+            + (rt.map { " " + $0.lazyStats.description } ?? "")
     }
 
     /// Runtime for atom remapping during deserialization.
@@ -1356,7 +1357,7 @@ final class JeffJSBytecodeCache {
     /// blobs written by another one, even when nobody bumped
     /// `compilerVersion`. `BytecodeCacheBudgetTests.testEngineSourceHashIsCurrent`
     /// fails when it is stale; `Scripts/update_bytecode_identity.sh` rewrites it.
-    static let engineSourceHash: UInt64 = 0x9c25e53c1860344d // bytecode-identity
+    static let engineSourceHash: UInt64 = 0xe65d018f3113ff4b // bytecode-identity
 
     /// The engine build identity: `compilerVersion`, the blob and entry
     /// layouts, `engineSourceHash`, and the opcode table the interpreter

@@ -162,6 +162,49 @@ extension JeffJSTestRunner {
          "(function(){ function f(n){ var s = 0; outer: for (var i = 0; i < n; i++) { switch (i % 3) { case 0: continue outer; case 1: s += 1; break; default: try { if (i > 5) break outer; } finally { s += 10; } } } return s; } return f(10) === 33; })()"),
     ]
 
+    /// Idle reclaim (compile.lazyDropAfterMs): a lazily compiled body that
+    /// did not run between two passes is dropped and compiles again on its
+    /// next call; one that ran is kept.
+    mutating func testLazyReclaim() {
+        let group = "LazyCompile"
+        JeffJSStackDiag.currentLabel = "\(group): reclaim"
+        let (rt, ctx) = makeCtx()
+        func run(_ js: String) -> String {
+            let r = ctx.eval(input: js, filename: "<eval><\(group)-reclaim>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+            if r.isException {
+                let e = ctx.getException()
+                defer { e.freeValue() }
+                return "!" + (ctx.toSwiftString(e) ?? "?")
+            }
+            defer { r.freeValue() }
+            return ctx.toSwiftString(r) ?? "?"
+        }
+        let first = run("""
+            var __lcR = { f: function(a){ return a * 2 + 1; },
+                          g: function(s){ var t = 0; for (var i = 0; i < s; i++) t += i; return t; },
+                          h: (x) => x + 'h' };
+            __lcR.f(1) + __lcR.g(4) + __lcR.h(1)
+            """)
+        assert(first == "91h", "\(group): reclaim setup -> \(first)")
+        rt.reclaimIdleLazyBodies()                       // marks f, g, h
+        let d0 = rt.lazyStats.dropped
+        rt.reclaimIdleLazyBodies()                       // none ran: dropped
+        assert(rt.lazyStats.dropped - d0 >= 3, "\(group): reclaim dropped \(rt.lazyStats.dropped - d0)")
+        let c0 = rt.lazyStats.compiled
+        let second = run("__lcR.f(2) + __lcR.g(5) + __lcR.h(2) + (__lcR.f.toString() === 'function(a){ return a * 2 + 1; }')")
+        assert(second == "152htrue", "\(group): after reclaim -> \(second)")
+        assert(rt.lazyStats.compiled - c0 == 3, "\(group): recompiled \(rt.lazyStats.compiled - c0)")
+        rt.reclaimIdleLazyBodies()                       // marks again
+        let kept = run("__lcR.f(3)")                     // f runs between the passes
+        let d1 = rt.lazyStats.dropped
+        rt.reclaimIdleLazyBodies()
+        assert(kept == "7" && rt.lazyStats.dropped - d1 == 2,
+               "\(group): the function that ran is kept (\(kept), dropped \(rt.lazyStats.dropped - d1))")
+        let c1 = rt.lazyStats.compiled
+        let third = run("__lcR.f(4) + __lcR.g(3)")
+        assert(third == "12" && rt.lazyStats.compiled - c1 == 1, "\(group): f kept, g recompiled -> \(third)")
+    }
+
     mutating func testLazyCompile() {
         let group = "LazyCompile"
         var lazyStubs = 0
@@ -193,6 +236,7 @@ extension JeffJSTestRunner {
             }
         }
         makeCtx().0.lazyFunctions = JeffJSConfig.lazyFunctions
+        testLazyReclaim()
         // The cases exercise laziness only if the lazy runs made stubs and
         // compiled them on a call.
         assert(lazyStubs >= 40 && lazyCompiled >= 40, "\(group): only \(lazyCompiled) lazy compiles (stubs \(lazyStubs))")

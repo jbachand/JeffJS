@@ -323,6 +323,9 @@ final class JeffJSLazyFunctionInfo {
     let script: JeffJSLazyScript
     /// True until the body is compiled into the owning bytecode object.
     var isPending: Bool = true
+    /// Idle reclaim: no call reached the body since the last reclaim pass
+    /// (JeffJSRuntime.reclaimIdleLazyBodies).
+    var idleMarked: Bool = false
 
     init(seed: JeffJSLazySeed, script: JeffJSLazyScript) {
         self.seed = seed

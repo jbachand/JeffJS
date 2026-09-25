@@ -4245,6 +4245,9 @@ struct JeffJSCompiler {
             fb.debugPc2colLen = fd.pc2colBuf.len
         }
 
+        ctx.rt.lazyStats.functionsCompiled += 1
+        ctx.rt.lazyStats.bytecodeBytes += fb.bytecodeLen
+
         // Trace block fusion: identify hot loop candidates for the fast mini-interpreter
         JeffJSCompiler.fuseBasicBlocks(fb)
         JeffJSCompiler.computeArgSlotOwnership(fb)
@@ -5069,9 +5072,15 @@ struct JeffJSLazyStats {
     /// immediately invoked, or with a direct eval / dynamic scope around.
     var eagerHinted = 0
     var eagerOther = 0
+    /// Every function body compiled (eagerly or lazily) and its bytecode.
+    var functionsCompiled = 0
+    var bytecodeBytes = 0
+    /// Bodies reclaimed by the idle pass (compile.lazyDropAfterMs).
+    var dropped = 0
+    var droppedBytecodeBytes = 0
 
     var description: String {
-        return "lazy stubs=\(stubs) (\(stubSourceBytes / 1024)KB src) compiled=\(compiled) (\(compiledSourceBytes / 1024)KB src, \(Int(compileMs.rounded()))ms) bodyHits=\(bodyCacheHits) eager: iife=\(eagerHinted) other=\(eagerOther)"
+        return "lazy stubs=\(stubs) (\(stubSourceBytes / 1024)KB src) compiled=\(compiled) (\(compiledSourceBytes / 1024)KB src, \(Int(compileMs.rounded()))ms) bodyHits=\(bodyCacheHits) eager: iife=\(eagerHinted) other=\(eagerOther) bodies=\(functionsCompiled) (\(bytecodeBytes / 1024)KB bytecode) dropped=\(dropped) (\(droppedBytecodeBytes / 1024)KB)"
     }
 }
 
@@ -5589,10 +5598,14 @@ extension JeffJSCompiler {
         ps.lineNum = line
         ps.lastPtr = start
         ps.lastLineNum = line
-        let ls = script.lineStart(containing: start)
-        ps.lcCacheEnd = ls
+        // Column numbers count from the start of the line; seed the
+        // tokenizer's incremental line/column cache at the function itself
+        // (no line break lies between the two), not at the line start: a
+        // minified bundle is one line of megabytes, and every column query
+        // of the re-parse would rescan it from there.
+        ps.lcCacheEnd = start
         ps.lcCacheLine = line
-        ps.lcCacheLineStart = ls
+        ps.lcCacheLineStart = script.lineStart(containing: start)
 
         let filenameAtom = fa != 0 ? fa : ctx.rt.findAtom(script.filename)
         // Dummy parent: the parser treats a definition without a parent as
@@ -5683,5 +5696,113 @@ extension JeffJSCompiler {
             _ = ctx.throwInternalError(
                 message: "lazy compilation: \(ctx.atomToSwiftString(name)) did not re-parse to its recorded span")
         }
+    }
+}
+
+
+// MARK: - Idle reclaim of lazily compiled bodies
+
+extension JeffJSFunctionBytecodeCompiled {
+    /// Give back the compiled body of this lazy function: it becomes a stub
+    /// again (closure variables and seed kept) and compiles on its next call.
+    /// Returns the bytecode bytes released.
+    func dropLazyBody() -> Int {
+        let bytes = bytecodeLen
+        bytecode = []
+        bytecodeLen = 0
+        resetBytecodeBuffer()
+        cpool = []
+        cpoolCountValue = 0
+        vardefs = []
+        varCount = 0
+        stackSize = 0
+        debugPc2lineBuf = []
+        debugPc2lineLen = 0
+        debugPc2colBuf = []
+        debugPc2colLen = 0
+        pc2lineTable = nil
+        pc2colTable = nil
+        traceBlocks = nil
+        traceLean = false
+        traceEntryEnabled = true
+        traceEntryDeopts = 0
+        ic = nil
+        lazyInfo?.isPending = true
+        lazyInfo?.idleMarked = false
+        return bytes
+    }
+}
+
+extension JeffJSRuntime {
+    /// Idle tick (compile.lazyDropAfterMs > 0): one reclaim pass per interval.
+    func lazyReclaimTick() {
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lazyLastReclaim >= Double(lazyDropAfterMs) / 1000 else { return }
+        lazyLastReclaim = now
+        reclaimIdleLazyBodies()
+    }
+
+    /// One pass of the idle reclaim. Every lazily compiled function (not a
+    /// generator or async function, whose suspended activations hold a pc
+    /// into their bytecode) whose function objects all have `fbFast` nil —
+    /// no call and no new closure since the previous pass cleared it — and
+    /// that the previous pass marked, drops its body. The others are marked
+    /// and their function objects' `fbFast` cleared, so the next call goes
+    /// through callInternal's payload path (which sets it again). Runs only
+    /// with no JS on the stack; bodies holding tagged-template objects are
+    /// kept (their identity is observable). Returns (marked, dropped, bytes).
+    @discardableResult
+    func reclaimIdleLazyBodies() -> (marked: Int, dropped: Int, bytes: Int) {
+        guard inlineStackTop == 0 else { return (0, 0, 0) }
+        // The lazily compiled bodies of live function objects, and whether
+        // any of their objects ran (or was made) since the last pass.
+        func lazyFB(_ hdr: JeffJSGCObjectHeader) -> (JeffJSObject, JeffJSFunctionBytecodeCompiled)? {
+            guard hdr.gcObjType == .jsObject, hdr.refCount > 0 else { return nil }
+            let obj = unsafeBitCast(hdr, to: JeffJSObject.self)
+            guard obj.classID == JeffJSClassID.bytecodeFunction.rawValue,
+                  case .bytecodeFunc(let fbOpt, _, _) = obj.payload,
+                  let fb = fbOpt as? JeffJSFunctionBytecodeCompiled,
+                  let li = fb.lazyInfo, !li.isPending, !fb.isGenerator, !fb.isAsyncFunc
+            else { return nil }
+            return (obj, fb)
+        }
+        var used: [ObjectIdentifier: Bool] = [:]
+        var fbs: [JeffJSFunctionBytecodeCompiled] = []
+        for u in gcObjects {
+            guard let (obj, fb) = lazyFB(u.takeUnretainedValue()) else { continue }
+            let key = ObjectIdentifier(fb)
+            let ran = obj.fbFast != nil
+            if let seen = used[key] {
+                if ran && !seen { used[key] = true }
+            } else {
+                used[key] = ran
+                fbs.append(fb)
+            }
+        }
+        var marked = 0, dropped = 0, bytes = 0
+        var clear = Set<ObjectIdentifier>()
+        for fb in fbs {
+            guard let li = fb.lazyInfo else { continue }
+            // Tagged-template objects in the constant pool: their identity is
+            // observable, so the body stays.
+            if fb.cpool.contains(where: { $0.isObject }) { continue }
+            if li.idleMarked && used[ObjectIdentifier(fb)] == false {
+                bytes += fb.dropLazyBody()
+                dropped += 1
+            } else {
+                li.idleMarked = true
+                clear.insert(ObjectIdentifier(fb))
+                marked += 1
+            }
+        }
+        if !clear.isEmpty {
+            for u in gcObjects {
+                guard let (obj, fb) = lazyFB(u.takeUnretainedValue()) else { continue }
+                if clear.contains(ObjectIdentifier(fb)) { obj.fbFast = nil }
+            }
+        }
+        lazyStats.dropped += dropped
+        lazyStats.droppedBytecodeBytes += bytes
+        return (marked, dropped, bytes)
     }
 }
