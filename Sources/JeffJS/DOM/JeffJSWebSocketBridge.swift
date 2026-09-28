@@ -31,6 +31,9 @@ final class JeffJSWebSocketBridge {
     private let session: URLSession
 
     var activeCount: Int { activeSockets.count }
+    /// The browser's User-Agent for the opening handshake (the host's, so every
+    /// request path sends one UA); nil = URLSession's default.
+    var userAgent: String?
 
     // MARK: - Init
 
@@ -90,6 +93,7 @@ final class JeffJSWebSocketBridge {
         callbacks[id] = callback.dupValue()
 
         var request = URLRequest(url: wsURL)
+        if let userAgent { request.setValue(userAgent, forHTTPHeaderField: "User-Agent") }
         let protocolList = protocols.split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }

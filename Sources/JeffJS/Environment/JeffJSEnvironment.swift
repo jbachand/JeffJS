@@ -246,6 +246,7 @@ public final class JeffJSEnvironment {
 
         // 12. Register WebSocket bridge
         let wsBridge = JeffJSWebSocketBridge()
+        wsBridge.userAgent = configuration.userAgent
         wsBridge.register(on: ctx)
         self.webSocketBridge = wsBridge
 

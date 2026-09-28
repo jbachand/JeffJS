@@ -101,6 +101,8 @@ struct JeffJSFetchSpec {
     var signalID: String? = nil
     var responseType: String = "text"
     var cookieHeader: String? = nil           // from the bridge's cookie store
+    var referrer: String? = nil               // init.referrer: nil = about:client, "" = none, else a URL
+    var referrerPolicy: String = ""           // init.referrerPolicy ("" = the document's)
 }
 
 /// The network result, before it is turned into JS values.
@@ -215,6 +217,15 @@ final class JeffJSFetchBridge {
 
     /// Number of in-flight fetch requests.
     var activeCount: Int { activeTasks.count }
+
+    /// The document's referrer policy (`Referrer-Policy` header / `<meta
+    /// name="referrer">`, set by the host); `.empty` = strict-origin-when-cross-origin.
+    var referrerPolicy: JeffJSReferrerPolicy = .empty
+    /// The document URL (the default `Referer` and the request's origin for
+    /// `Sec-Fetch-Site`); defaults to `baseURL`.
+    var documentURL: URL?
+    /// Emit `Referer` / `Sec-Fetch-*` (`JeffJSRequestHeaders`); false = legacy (none).
+    var sendsRequestMetadata: Bool = true
 
     /// The document origin used for `Origin:` and CORS checks.
     var documentOrigin: String? {
@@ -511,6 +522,12 @@ final class JeffJSFetchBridge {
         if let r = str("redirect") { spec.redirect = r }
         if let s = str("signalId") ?? str("signalID") { spec.signalID = s }
         if let rt = str("responseType") { spec.responseType = rt }
+        if let rp = str("referrerPolicy") { spec.referrerPolicy = rp }
+        do {   // `referrer: ""` means no referrer, so it is not read through str()
+            let v = ctx.getPropertyStr(obj: opts, name: "referrer")
+            defer { v.freeValue() }
+            if !v.isUndefined && !v.isNull { spec.referrer = ctx.toSwiftString(v) ?? "" }
+        }
 
         // headers: plain object { name: value } or an array of [name, value].
         let headersVal = ctx.getPropertyStr(obj: opts, name: "headers")
@@ -578,6 +595,8 @@ final class JeffJSFetchBridge {
         if let v = obj["redirect"] as? String { spec.redirect = v }
         if let v = obj["responseType"] as? String { spec.responseType = v }
         if let v = obj["signalId"] { spec.signalID = String(describing: v) }
+        if let v = obj["referrer"] as? String { spec.referrer = v }
+        if let v = obj["referrerPolicy"] as? String { spec.referrerPolicy = v }
     }
 
     private func cookieHeaderForRequest(spec: JeffJSFetchSpec) -> String? {
@@ -707,6 +726,7 @@ final class JeffJSFetchBridge {
         request.httpMethod = method
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
+        applyRequestMetadata(spec: spec, to: &request)   // Referer + Sec-Fetch-* (JeffJSRequestHeaders.swift)
         if let body = spec.body {
             request.httpBody = Data(body)
             if let ct = spec.bodyContentType,
