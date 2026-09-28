@@ -51,6 +51,9 @@ public final class JeffJSEnvironment {
         public var additionalPolyfills: [String]
         /// JavaScript to evaluate after init (e.g. helper functions on window).
         public var startupScripts: [String]
+        /// The page's cookie jar (`document.cookie`, fetch/XHR, WebSocket). Nil
+        /// gives a fresh in-memory `JeffJSMemoryCookieJar` for the base URL's site.
+        public var cookieJar: (any JeffJSCookieJar)?
 
         public init(
             baseURL: URL = URL(string: "about:blank")!,
@@ -62,7 +65,8 @@ public final class JeffJSEnvironment {
             videoProvider: JeffJSVideoProvider? = nil,
             dynamicImportDelegate: JeffJSDynamicImportDelegate? = nil,
             additionalPolyfills: [String] = [],
-            startupScripts: [String] = []
+            startupScripts: [String] = [],
+            cookieJar: (any JeffJSCookieJar)? = nil
         ) {
             self.baseURL = baseURL
             self.userAgent = userAgent
@@ -74,6 +78,7 @@ public final class JeffJSEnvironment {
             self.dynamicImportDelegate = dynamicImportDelegate
             self.additionalPolyfills = additionalPolyfills
             self.startupScripts = startupScripts
+            self.cookieJar = cookieJar
         }
     }
 
@@ -92,6 +97,9 @@ public final class JeffJSEnvironment {
     private(set) var webAPIsBridge: JeffJSWebAPIsBridge?
     private(set) var dynamicImportBridge: JeffJSDynamicImportBridge?
     private(set) var quantumBridge: JeffJSQuantumBridge?
+    /// The page's cookie jar and the `document.cookie` accessor over it.
+    private(set) var cookieJar: (any JeffJSCookieJar)?
+    private(set) var cookieBridge: JeffJSCookieBridge?
 
     // MARK: - Callbacks
 
@@ -233,10 +241,18 @@ public final class JeffJSEnvironment {
         storageBridge.register(on: ctx)
         self.storageBridge = storageBridge
 
-        // 11. Register fetch bridge
+        // 11. Register the cookie jar (document.cookie) and the fetch bridge.
+        //     One jar: document.cookie, fetch/XHR and WebSocket share it.
+        let jar = configuration.cookieJar
+            ?? JeffJSMemoryCookieJar(site: JeffJSCookieParsing.site(of: configuration.baseURL))
+        self.cookieJar = jar
+        let baseURL = configuration.baseURL
+        let cookieBridge = JeffJSCookieBridge(jar: jar, documentURL: { baseURL })
+        cookieBridge.register(on: ctx)
+        self.cookieBridge = cookieBridge
         let fetchBridge = JeffJSFetchBridge(userAgent: configuration.userAgent)
         fetchBridge.baseURL = configuration.baseURL
-        // Cookie jar for credentials: "same-origin"/"include".
+        fetchBridge.cookieJar = jar
         fetchBridge.storageBridge = storageBridge
         fetchBridge.onConsoleLog = { [weak self] level, message in
             self?.onConsoleMessage?(level, message)
@@ -248,6 +264,8 @@ public final class JeffJSEnvironment {
         let wsBridge = JeffJSWebSocketBridge()
         wsBridge.register(on: ctx)
         self.webSocketBridge = wsBridge
+        wsBridge.cookieJar = jar                        // the handshake's cookies
+        wsBridge.documentURL = configuration.baseURL
 
         // 13. Register IndexedDB bridge
         let idbBridge = JeffJSIndexedDBBridge(scope: configuration.storageScope)

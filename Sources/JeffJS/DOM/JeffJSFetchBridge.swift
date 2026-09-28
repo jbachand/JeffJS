@@ -126,6 +126,11 @@ final class JeffJSRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked
     private(set) var blockedRedirect: HTTPURLResponse?
     private let lock = NSLock()
 
+    /// Cookie-jar mode: stores the redirect response's `Set-Cookie` and
+    /// returns the next request with its `Cookie:` header (set before `resume`).
+    var onRedirect: (@Sendable (HTTPURLResponse, URLRequest) -> URLRequest)?
+    private var finalFromCache = false
+
     init(mode: String) { self.mode = mode }
 
     func urlSession(_ session: URLSession, task: URLSessionTask,
@@ -136,7 +141,7 @@ final class JeffJSRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked
         if mode == "follow" {
             didRedirect = true
             lock.unlock()
-            completionHandler(request)
+            completionHandler(onRedirect?(response, request) ?? request)
         } else {
             blockedRedirect = response
             lock.unlock()
@@ -144,6 +149,14 @@ final class JeffJSRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked
         }
     }
 
+    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+        let cached = metrics.transactionMetrics.last?.resourceFetchType == .localCache
+        lock.lock(); finalFromCache = cached; lock.unlock()
+    }
+
+    /// The final response was replayed from the HTTP cache (its `Set-Cookie`,
+    /// if any, is not processed again).
+    var responseFromCache: Bool { lock.lock(); defer { lock.unlock() }; return finalFromCache }
     var redirected: Bool { lock.lock(); defer { lock.unlock() }; return didRedirect }
     var blocked: HTTPURLResponse? { lock.lock(); defer { lock.unlock() }; return blockedRedirect }
 }
@@ -176,6 +189,14 @@ final class JeffJSFetchBridge {
     var enforceCORS: Bool = true
     /// Explicit document origin ("scheme://host[:port]"); defaults to baseURL's.
     var originOverride: String?
+    /// The page's cookie jar (`JeffJSCookieJar.swift`). When set, every request
+    /// has `httpShouldHandleCookies = false` and carries exactly the jar's
+    /// cookies, and every response's `Set-Cookie` (redirects too) goes to the
+    /// jar; `credentials` decides both (omit: none; same-origin: same-origin
+    /// only; include: the target's cookies from this jar). Nil = legacy: the
+    /// `storageBridge` script cookies sent as an explicit `Cookie:` header on
+    /// top of URLSession's own storage (which that header replaces).
+    var cookieJar: (any JeffJSCookieJar)?
     /// Cookie jar used when the host app keeps cookies itself.
     weak var storageBridge: JeffJSStorageBridge?
 
@@ -581,6 +602,7 @@ final class JeffJSFetchBridge {
     }
 
     private func cookieHeaderForRequest(spec: JeffJSFetchSpec) -> String? {
+        guard cookieJar == nil else { return nil }   // the jar path computes it per request
         guard spec.credentials != "omit", let storageBridge else { return nil }
         // The bridge jar has no domain scoping: only send it same-origin, or
         // cross-origin when the caller explicitly asked to include credentials.
@@ -591,9 +613,68 @@ final class JeffJSFetchBridge {
         return cookies.isEmpty ? nil : cookies
     }
 
+    // MARK: - Cookie jar (credentials)
+
+    /// Whether a request to (or response from) `url` sends/stores cookies under
+    /// the `credentials` mode (Fetch §4.5 "include credentials").
+    nonisolated static func jarCredentialsApply(_ url: URL, credentials: String, documentOrigin: String?) -> Bool {
+        switch credentials {
+        case "omit": return false
+        case "include": return true
+        default:
+            guard let documentOrigin else { return true }
+            return origin(of: url) == documentOrigin
+        }
+    }
+
+    /// Sets the request's cookies from the jar (and nothing else: URLSession's
+    /// own cookie handling is off, a script-supplied `Cookie` is dropped).
+    private func applyJarCookies(_ jar: any JeffJSCookieJar, to request: inout URLRequest,
+                                 url: URL, credentials: String) {
+        request.httpShouldHandleCookies = false
+        request.setValue(nil, forHTTPHeaderField: "Cookie")
+        guard Self.jarCredentialsApply(url, credentials: credentials, documentOrigin: documentOrigin) else { return }
+        let docSite = baseURL.flatMap(JeffJSCookieParsing.site(of:))
+        let sameSite = docSite == nil || JeffJSCookieParsing.site(of: url) == docSite
+        if let header = jar.cookieHeader(for: url, sameSite: sameSite) {
+            request.setValue(header, forHTTPHeaderField: "Cookie")
+        }
+    }
+
+    /// Redirect hook for the jar: store the 3xx's cookies, attach the next hop's.
+    private func jarRedirectHandler(credentials: String) -> (@Sendable (HTTPURLResponse, URLRequest) -> URLRequest)? {
+        guard let jar = cookieJar else { return nil }
+        let docOrigin = documentOrigin
+        let docSite = baseURL.flatMap(JeffJSCookieParsing.site(of:))
+        return { response, next in
+            if let from = response.url,
+               Self.jarCredentialsApply(from, credentials: credentials, documentOrigin: docOrigin) {
+                jar.store(response: response, for: from)
+            }
+            var req = next
+            req.httpShouldHandleCookies = false
+            req.setValue(nil, forHTTPHeaderField: "Cookie")
+            if let to = req.url, Self.jarCredentialsApply(to, credentials: credentials, documentOrigin: docOrigin) {
+                let sameSite = docSite == nil || JeffJSCookieParsing.site(of: to) == docSite
+                if let header = jar.cookieHeader(for: to, sameSite: sameSite) {
+                    req.setValue(header, forHTTPHeaderField: "Cookie")
+                }
+            }
+            return req
+        }
+    }
+
+    /// Stores a final response's `Set-Cookie` in the jar (not for responses
+    /// replayed from the HTTP cache, nor when `credentials` excludes it).
+    private func storeJarCookies(from response: HTTPURLResponse?, url: URL, credentials: String, fromCache: Bool) {
+        guard let jar = cookieJar, let response, !fromCache,
+              Self.jarCredentialsApply(url, credentials: credentials, documentOrigin: documentOrigin) else { return }
+        jar.store(response: response, for: url)
+    }
+
     // MARK: - Origin helpers
 
-    static func origin(of url: URL) -> String {
+    nonisolated static func origin(of url: URL) -> String {
         guard let scheme = url.scheme?.lowercased(), let host = url.host else { return "null" }
         guard scheme == "http" || scheme == "https" else { return "null" }
         let defaultPort = (scheme == "https") ? 443 : 80
@@ -720,6 +801,9 @@ final class JeffJSFetchBridge {
             request.setValue(docOrigin, forHTTPHeaderField: "Origin")
         }
         // Credentials / cookies.
+        if let jar = cookieJar {
+            applyJarCookies(jar, to: &request, url: targetURL, credentials: spec.credentials)
+        } else {
         switch spec.credentials {
         case "omit":
             request.httpShouldHandleCookies = false
@@ -733,17 +817,21 @@ final class JeffJSFetchBridge {
                 request.setValue(cookie, forHTTPHeaderField: "Cookie")
             }
         }
+        }
         applyCachePolicy(spec.cache, to: &request)
 
         let startTime = CFAbsoluteTimeGetCurrent()
         let redirectMode = spec.redirect.isEmpty ? "follow" : spec.redirect
         let delegate = JeffJSRedirectDelegate(mode: redirectMode)
+        delegate.onRedirect = jarRedirectHandler(credentials: spec.credentials)
 
         do {
             let session = (method == "GET" && spec.cache != "no-store") ? Self.cachedSession : URLSession.shared
             let (data, response) = try await session.data(for: request, delegate: delegate)
             let durationMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
             let http = response as? HTTPURLResponse
+            storeJarCookies(from: http, url: http?.url ?? targetURL, credentials: spec.credentials,
+                            fromCache: delegate.responseFromCache)
 
             // Blocked redirect (redirect: manual | error).
             if let blocked = delegate.blocked {
@@ -770,6 +858,8 @@ final class JeffJSFetchBridge {
                 for (key, value) in http.allHeaderFields {
                     let k = String(describing: key).lowercased()
                     let v = String(describing: value)
+                    // Forbidden response header names (Fetch §2.2.2): the jar has them.
+                    if cookieJar != nil && (k == "set-cookie" || k == "set-cookie2") { continue }
                     if k == "set-cookie", let existing = headerMap[k] {
                         headerMap[k] = existing + "\n" + v   // set-cookie combined
                     } else {
@@ -874,7 +964,9 @@ final class JeffJSFetchBridge {
             req.setValue(headerNames.joined(separator: ","), forHTTPHeaderField: "Access-Control-Request-Headers")
         }
         req.cachePolicy = .reloadIgnoringLocalCacheData
-        req.httpShouldHandleCookies = credentials
+        // CORS-preflight requests never carry credentials (Fetch §4.8); the
+        // legacy path let URLSession add its stored cookies.
+        req.httpShouldHandleCookies = cookieJar == nil ? credentials : false
 
         do {
             let (_, response) = try await URLSession.shared.data(for: req)
