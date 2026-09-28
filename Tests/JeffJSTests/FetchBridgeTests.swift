@@ -225,6 +225,20 @@ final class TinyHTTPServer: @unchecked Sendable {
                 ("Access-Control-Allow-Credentials", "true")
             ], body: Array("cookie=\(req.headers["cookie"] ?? "")".utf8))
 
+        case "/setcookie":
+            // Sets an HttpOnly server cookie (and `c` when asked), echoes the Cookie header.
+            var headers: [(String, String)] = [
+                ("Content-Type", "text/plain"),
+                ("Set-Cookie", "srv=1; Path=/; HttpOnly")
+            ]
+            if let extra = req.query["c"] { headers.append(("Set-Cookie", extra)) }
+            return Response(headers: headers, body: Array("cookie=\(req.headers["cookie"] ?? "")".utf8))
+
+        case "/redirect-setcookie":
+            return Response(status: 302, reason: "Found",
+                            headers: [("Location", "/cookie"), ("Set-Cookie", "hop=1; Path=/")],
+                            body: [])
+
         case "/origin":
             return Response(headers: [
                 ("Content-Type", "text/plain"),
@@ -588,8 +602,9 @@ final class FetchBridgeTests: XCTestCase {
     func testCredentialsIncludeSendsCookiesCrossOrigin() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
+        // The target host's cookie, in this page's jar (partition).
+        env.cookieJar?.store(setCookieLines: ["sid=abc123; Path=/"], for: URL(string: crossOrigin + "/")!)
         let out = await runJS(env, """
-        __nativeStorage.set('cookies', 'sid', 'abc123');
         Promise.all([
           fetch('\(crossOrigin)/cookie', { credentials: 'include' }).then(function(r){ return r.text(); }),
           fetch('\(crossOrigin)/cookie?x=1', { credentials: 'omit' }).then(function(r){ return r.text(); })
@@ -600,6 +615,65 @@ final class FetchBridgeTests: XCTestCase {
         XCTAssertEqual(parts.count, 2, out)
         XCTAssertTrue(parts[0].contains("sid=abc123"), "credentials:include should send cookies — got \(parts[0])")
         XCTAssertFalse(parts[1].contains("sid=abc123"), "credentials:omit must not send cookies — got \(parts[1])")
+    }
+
+    /// One jar: a server HttpOnly cookie and a script cookie are both sent
+    /// (an explicit Cookie header used to replace URLSession's stored ones),
+    /// document.cookie sees only the script one, max-age=0 deletes it.
+    @MainActor
+    func testServerAndScriptCookiesShareOneJar() async throws {
+        try skipIfNoServer()
+        let env = makeEnvironment()
+        let out = await runJS(env, """
+        fetch('/setcookie').then(function(r){ return r.text(); }).then(function(first){
+          var headersSeen = '';
+          document.cookie = 'js=1';
+          var dc1 = document.cookie;
+          return fetch('/cookie').then(function(r){ return r.text(); }).then(function(second){
+            document.cookie = 'js=1; max-age=0';
+            var dc2 = document.cookie;
+            return fetch('/cookie').then(function(r){ return r.text(); }).then(function(third){
+              globalThis.__out = [first, dc1, second, dc2, third].join('||');
+            });
+          });
+        }).catch(function(e){ globalThis.__out = 'ERR ' + e; });
+        """)
+        let parts = out.components(separatedBy: "||")
+        XCTAssertEqual(parts.count, 5, out)
+        guard parts.count == 5 else { return }
+        XCTAssertEqual(parts[0], "cookie=")
+        XCTAssertEqual(parts[1], "js=1", "document.cookie must not show the HttpOnly srv cookie")
+        let sent = Set(parts[2].dropFirst("cookie=".count).components(separatedBy: "; "))
+        XCTAssertEqual(sent, ["srv=1", "js=1"], parts[2])
+        XCTAssertEqual(parts[3], "")
+        XCTAssertEqual(parts[4], "cookie=srv=1")
+    }
+
+    /// Set-Cookie on a followed redirect is stored and sent on the next hop;
+    /// the Set-Cookie header itself is not exposed to script.
+    @MainActor
+    func testRedirectSetCookieIsStoredAndSent() async throws {
+        try skipIfNoServer()
+        let env = makeEnvironment()
+        let out = await runJS(env, """
+        fetch('/redirect-setcookie').then(function(r){
+          return r.text().then(function(t){ globalThis.__out = t + '||' + r.headers.get('set-cookie') + '||' + document.cookie; });
+        }).catch(function(e){ globalThis.__out = 'ERR ' + e; });
+        """)
+        XCTAssertEqual(out, "cookie=hop=1||null||hop=1")
+    }
+
+    /// credentials: 'omit' neither sends nor stores cookies.
+    @MainActor
+    func testCredentialsOmitDoesNotStore() async throws {
+        try skipIfNoServer()
+        let env = makeEnvironment()
+        let out = await runJS(env, """
+        fetch('/setcookie?c=' + encodeURIComponent('vis=1; Path=/'), { credentials: 'omit' })
+          .then(function(){ globalThis.__out = 'dc=' + document.cookie; })
+          .catch(function(e){ globalThis.__out = 'ERR ' + e; });
+        """)
+        XCTAssertEqual(out, "dc=")
     }
 
     // MARK: abort

@@ -27,6 +27,11 @@ final class JeffJSWebSocketBridge {
     /// Stored callback JeffJSValues keyed by socket ID.
     /// These are JS functions that receive (type, data, code, reason) events.
     private var callbacks: [Int: JeffJSValue] = [:]
+    /// The page's cookie jar: the opening handshake carries its cookies for the
+    /// socket URL (and nothing from URLSession's shared storage). Nil = legacy.
+    var cookieJar: (any JeffJSCookieJar)?
+    /// The document URL (SameSite: a cross-site socket gets no Strict/Lax cookies).
+    var documentURL: URL?
     private weak var ctx: JeffJSContext?
     private let session: URLSession
 
@@ -98,6 +103,14 @@ final class JeffJSWebSocketBridge {
                             forHTTPHeaderField: "Sec-WebSocket-Protocol")
         }
 
+        if let jar = cookieJar {
+            request.httpShouldHandleCookies = false
+            let docSite = documentURL.flatMap(JeffJSCookieParsing.site(of:))
+            let sameSite = docSite == nil || JeffJSCookieParsing.site(of: wsURL) == docSite
+            if let header = jar.cookieHeader(for: wsURL, sameSite: sameSite) {
+                request.setValue(header, forHTTPHeaderField: "Cookie")
+            }
+        }
         let task = session.webSocketTask(with: request)
         activeSockets[id] = task
         task.resume()
