@@ -731,19 +731,57 @@ final class JeffJSEventBridge {
         return notCanceled
     }
 
-    /// DOM §2.9 "invoke" + "inner invoke" for one path entry and one pass.
+    /// DOM §2.9 legacy event types: a trusted event of one of these types that
+    /// finds no listener of its own type at a target is invoked there again
+    /// under the prefixed name (google.com's animation-sequence timers listen
+    /// for `webkitAnimationEnd` only and otherwise wait for a 1 s watchdog).
+    static let legacyEventTypes: [String: String] = [
+        "animationend": "webkitAnimationEnd",
+        "animationiteration": "webkitAnimationIteration",
+        "animationstart": "webkitAnimationStart",
+        "transitionend": "webkitTransitionEnd",
+    ]
+
+    /// DOM §2.9 "invoke" for one path entry and one pass: "inner invoke" with the
+    /// event's type, then — when that found no listener and the event is
+    /// trusted — with its legacy type, `event.type` set to it meanwhile.
     private func invoke(ctx: JeffJSContext, currentTarget: JeffJSValue, event: JeffJSValue, type: String,
                         capturing: Bool, frame: JeffJSEventDispatchFrame) {
         if readBool(ctx, event, "cancelBubble") { return }
         ctx.setPropertyStr(obj: event, name: "currentTarget", value: currentTarget.dupValue())
+        let legacy = Self.legacyEventTypes[type]
+        let found = innerInvoke(ctx: ctx, currentTarget: currentTarget, event: event, type: type,
+                                capturing: capturing, frame: frame, reportFound: legacy != nil)
+        guard !found, let legacy, readBool(ctx, event, "isTrusted") else { return }
+        ctx.setPropertyStr(obj: event, name: "type", value: ctx.newStringValue(legacy))
+        _ = innerInvoke(ctx: ctx, currentTarget: currentTarget, event: event, type: legacy,
+                        capturing: capturing, frame: frame, reportFound: false)
+        ctx.setPropertyStr(obj: event, name: "type", value: ctx.newStringValue(type))
+    }
 
+    /// DOM §2.9 "inner invoke": the listeners of `type` at the current target
+    /// for this pass. Returns `found` — whether the target has any listener of
+    /// `type` (either phase, or an `on<type>` handler); only computed when
+    /// `reportFound` (the caller has a legacy type to fall back to).
+    private func innerInvoke(ctx: JeffJSContext, currentTarget: JeffJSValue, event: JeffJSValue, type: String,
+                             capturing: Bool, frame: JeffJSEventDispatchFrame, reportFound: Bool) -> Bool {
         let targetKey = eventTargetKey(ctx: ctx, value: currentTarget)
         // Clone the list: listeners added from here on do not run for this target.
         let records = listenerStore.handlers(for: targetKey, type: type)
+        let handlerName = "on\(type.lowercased())"
+        var found = true
+        if reportFound {
+            found = records.contains { !$0.removed }
+            if !found {
+                let h = ctx.getPropertyStr(obj: currentTarget, name: handlerName)
+                found = h.isFunction
+                h.freeValue()
+            }
+        }
 
         // The `on<type>` event handler attribute acts as a non-capture listener.
         if !capturing {
-            let handler = ctx.getPropertyStr(obj: currentTarget, name: "on\(type)")
+            let handler = ctx.getPropertyStr(obj: currentTarget, name: handlerName)
             if handler.isFunction {
                 let r = ctx.call(handler, this: currentTarget, args: [event])
                 reportExceptionIfNeeded(r, ctx: ctx, label: "on\(type) handler")
@@ -763,7 +801,7 @@ final class JeffJSEventBridge {
                 reportExceptionIfNeeded(handler, ctx: ctx, label: "on\(type) handler")
             }
             handler.freeValue()
-            if readBool(ctx, event, "__immediateStopped") { return }
+            if readBool(ctx, event, "__immediateStopped") { return found }
         }
 
         for record in records {
@@ -816,8 +854,9 @@ final class JeffJSEventBridge {
                 }
             }
 
-            if readBool(ctx, event, "__immediateStopped") { return }
+            if readBool(ctx, event, "__immediateStopped") { return found }
         }
+        return found
     }
 
     // MARK: - Dispatch helpers
