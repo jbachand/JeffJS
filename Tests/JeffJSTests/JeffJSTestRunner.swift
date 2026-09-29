@@ -326,6 +326,7 @@ struct JeffJSTestRunner {
             ("ParameterOwnership", { $0.testParameterOwnership() }),
             ("IndexArguments", { $0.testIndexArguments() }),
             ("LazyCompile", { $0.testLazyCompile() }),
+            ("StringIterator", { $0.testStringIterator() }),
         ]
     }
 

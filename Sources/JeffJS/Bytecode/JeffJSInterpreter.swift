@@ -2716,14 +2716,9 @@ extension JeffJSContext {
             }
         }
 
-        // Built-in iterable fallbacks for types whose [Symbol.iterator] may
-        // have been registered under a string key (e.g. "[Symbol.iterator]")
-        // rather than the actual symbol atom, or not at all.
-
-        // String primitive: iterate over Unicode code points
-        if obj.isString, !isAsync {
-            return createStringIterator(obj: obj)
-        }
+        // Built-in iterable fallback for Arrays whose [Symbol.iterator] is
+        // missing. Strings have a real String.prototype[Symbol.iterator] (ES
+        // §22.1.3.35); a string whose method was deleted is not iterable.
 
         // Array / array-like: create an array values iterator
         if !isAsync, let jsObj = obj.toObject(),
@@ -2736,22 +2731,6 @@ extension JeffJSContext {
             ? "object is not async iterable"
             : "object is not iterable")
         return .exception
-    }
-
-    /// Creates a string character iterator.
-    /// Iterates over the Unicode code points of the string, returning
-    /// one character per call to .next().
-    func createStringIterator(obj: JeffJSValue) -> JeffJSValue {
-        guard let str = obj.stringValue?.toSwiftString() ?? toSwiftString(obj) else {
-            return createArrayIterator(obj: newArrayFrom([]), kind: 1)
-        }
-        // Build an array of single-character strings, then wrap in an array iterator
-        var chars = [JeffJSValue]()
-        for ch in str {
-            chars.append(newStringValue(String(ch)))
-        }
-        let charArr = newArrayFrom(chars)
-        return createArrayIterator(obj: charArr, kind: 1) // 1 = values
     }
 
     /// Gets the next value from a for-in iterator.

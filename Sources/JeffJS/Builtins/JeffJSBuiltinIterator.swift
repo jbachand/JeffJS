@@ -107,6 +107,7 @@ struct JeffJSBuiltinIterator {
         // them %IteratorPrototype% as [[Prototype]] so `[...arr.values()]`,
         // `Array.from(map.keys())` and `for...of` over an iterator work.
         for cid in [JSClassID.JS_CLASS_ARRAY_ITERATOR.rawValue,
+                    JSClassID.JS_CLASS_STRING_ITERATOR.rawValue,
                     JSClassID.JS_CLASS_MAP_ITERATOR.rawValue,
                     JSClassID.JS_CLASS_SET_ITERATOR.rawValue] where cid < ctx.classProto.count {
             let p = ctx.classProto[cid]
@@ -373,13 +374,18 @@ struct JeffJSBuiltinIterator {
             return nil
         }
 
-        guard let nextObj = nextMethod.toObject(), let cFunc = nextObj.cFunction else {
+        // Any callable `next` (IteratorNext, ES §7.4.4): this used to accept only
+        // native functions of one flavour, so `'ab'[Symbol.iterator]().toArray()`
+        // and every iterator whose `next` is a JS function failed.
+        guard ctx.isFunction(nextMethod) else {
+            nextMethod.freeValue()
             _ = ctx.throwTypeError(message: "iterator.next is not callable")
             return nil
         }
 
         let args = value.isUndefined ? [JeffJSValue]() : [value]
-        let result = cFunc(ctx, iterator, args)
+        let result = ctx.callFunction(func_: nextMethod, this: iterator, args: args)
+        nextMethod.freeValue()
         if result.isException { return nil }
         if !result.isObject {
             _ = ctx.throwTypeError(message: "iterator.next() must return an object")

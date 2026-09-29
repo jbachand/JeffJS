@@ -116,6 +116,22 @@ extension JeffJSContext {
     }
 }
 
+// MARK: - String Iterator state
+
+/// [[IteratedString]] / [[NextIndex]] of a String Iterator (ES2024 §22.1.5.3). The string
+/// is owned and released once the iterator is exhausted (the spec sets it to undefined).
+final class JeffJSStringIteratorData {
+    private(set) var string: JeffJSValue
+    var index = 0
+    init(string: JeffJSValue) { self.string = string }
+    func finish() {
+        if !string.isUndefined { string.freeValue(); string = .undefined }
+    }
+    deinit {
+        if JeffJSGCObjectHeader.activeRuntime != nil { string.freeValue() }
+    }
+}
+
 // MARK: - JeffJSBuiltinString
 
 struct JeffJSBuiltinString {
@@ -206,9 +222,13 @@ struct JeffJSBuiltinString {
         ctx.setPropertyFunc(obj: proto, name: "toString",     fn: toString,     length: 0)
         ctx.setPropertyFunc(obj: proto, name: "valueOf",      fn: valueOf,      length: 0)
 
-        // [Symbol.iterator]
-        ctx.setPropertyFuncSymbol(obj: proto, name: "[Symbol.iterator]",
-                                  fn: symbolIterator, length: 0)
+        // [Symbol.iterator] — keyed by the well-known symbol (§22.1.3.35)
+        let iterFn = ctx.newCFunction({ ctx, this, args in
+            symbolIterator(ctx: ctx, this: this, args: args)
+        }, name: "[Symbol.iterator]", length: 0)
+        _ = ctx.definePropertyValue(obj: proto, atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue,
+                                    value: iterFn, flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+        installStringIteratorPrototype(ctx: ctx)
 
         // Legacy HTML methods
         ctx.setPropertyFunc(obj: proto, name: "anchor",    fn: anchor,    length: 1)
@@ -1752,51 +1772,70 @@ struct JeffJSBuiltinString {
 
     // MARK: - Symbol.iterator
 
-    /// `String.prototype[Symbol.iterator]()`
-    /// Returns an iterator that yields code points (not code units).
+    /// `String.prototype[Symbol.iterator]()` (ES2024 §22.1.3.35): RequireObjectCoercible(this),
+    /// ToString, and a String Iterator (§22.1.5) over the result that yields code points —
+    /// a surrogate pair is one element, a lone surrogate is its own element.
+    ///
+    /// This used to be installed under the *string* key "[Symbol.iterator]", so
+    /// `'ab'[Symbol.iterator]` was undefined; `for-of`/spread got by through an
+    /// interpreter fallback for primitives, but `Array.from(str)` took the array-like
+    /// path (UTF-16 units) and page code calling the method threw.
     static func symbolIterator(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        guard let str = requireThisString(ctx: ctx, this: this, method: "[Symbol.iterator]") else {
-            return .exception
+        if this.isNull || this.isUndefined {
+            return ctx.throwTypeError("String.prototype[Symbol.iterator] requires that |this| not be null or undefined")
         }
-        // Create a string iterator object (class ID = stringIterator)
-        let iterObj = ctx.newObject(classID: JeffJSClassID.stringIterator.rawValue)
-        if iterObj.isException { return .exception }
-
-        // Store the string and the current index
-        ctx.setObjectData(iterObj, value: makeString(ctx: ctx, utf16: str))
-        ctx.setInternalIndex(iterObj, index: 0)
-
-        return iterObj
+        let sv = ctx.toString(this)
+        if sv.isException { return .exception }
+        let proto = ctx.classProto[JSClassID.JS_CLASS_STRING_ITERATOR.rawValue]
+        let iterObj = jeffJS_createObject(ctx: ctx, proto: proto.toObject(),
+                                          classID: UInt16(JSClassID.JS_CLASS_STRING_ITERATOR.rawValue))
+        iterObj.payload = .opaque(JeffJSStringIteratorData(string: sv))   // takes sv's reference
+        return JeffJSValue.makeObject(iterObj)
     }
 
-    /// The `next()` method for the string iterator.
-    /// Iterates by code points, emitting surrogate pairs as a single character.
+    /// `%StringIteratorPrototype%.next()` (ES2024 §22.1.5.1.1): CodePointAt([[IteratedString]],
+    /// [[NextIndex]]) and advance by its code-unit count.
     static func stringIteratorNext(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
-        let strVal = ctx.getObjectData(this)
-        if strVal.isUndefined {
+        guard let obj = this.toObject(), case .opaque(let opaque) = obj.payload,
+              let data = opaque as? JeffJSStringIteratorData else {
+            return ctx.throwTypeError("%StringIteratorPrototype%.next requires that |this| be a String Iterator instance")
+        }
+        guard let js = data.string.stringValue, data.index < js.len else {
+            data.finish()
             return ctx.createIterResult(value: .undefined, done: true)
         }
-        let str = ctx.toUTF16Array(strVal)
-        var index = ctx.getInternalIndex(this)
-
-        if index >= str.count {
-            // Mark as done
-            ctx.setObjectData(this, value: .undefined)
-            return ctx.createIterResult(value: .undefined, done: true)
-        }
-
-        let first = str[index]
-        var resultStr: [UInt16]
-        if isHiSurrogate(first) && index + 1 < str.count && isLoSurrogate(str[index + 1]) {
-            resultStr = [first, str[index + 1]]
-            index += 2
+        let cu = CodeUnits(js)
+        let i = data.index
+        let first = cu[i]
+        let result: JeffJSValue
+        if isHiSurrogate(first) && i + 1 < cu.count && isLoSurrogate(cu[i + 1]) {
+            result = cu.slice(i, i + 2)
+            data.index = i + 2
         } else {
-            resultStr = [first]
-            index += 1
+            result = oneCodeUnitString(UInt32(first))
+            data.index = i + 1
         }
-        ctx.setInternalIndex(this, index: index)
+        return ctx.createIterResult(value: result, done: false)
+    }
 
-        return ctx.createIterResult(value: makeString(ctx: ctx, utf16: resultStr), done: false)
+    /// %StringIteratorPrototype% (ES2024 §22.1.5.1): [[Prototype]] %IteratorPrototype%
+    /// (wired by JeffJSBuiltinIterator), `next`, @@toStringTag "String Iterator".
+    static func installStringIteratorPrototype(ctx: JeffJSContext) {
+        let idx = Int(JSClassID.JS_CLASS_STRING_ITERATOR.rawValue)
+        while ctx.classProto.count <= idx { ctx.classProto.append(.undefined) }
+        if !ctx.classProto[idx].isObject {
+            ctx.classProto[idx] = ctx.newObject()
+        }
+        let proto = ctx.classProto[idx]
+        let nextFn = ctx.newCFunction({ ctx, this, args in
+            stringIteratorNext(ctx: ctx, this: this, args: args)
+        }, name: "next", length: 0)
+        _ = ctx.definePropertyValue(obj: proto, atom: ctx.rt.findAtom("next"), value: nextFn,
+                                    flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+        _ = ctx.definePropertyValue(obj: proto,
+                                    atom: JeffJSAtomID.JS_ATOM_Symbol_toStringTag.rawValue,
+                                    value: ctx.newStringValue("String Iterator"),
+                                    flags: JS_PROP_CONFIGURABLE)
     }
 
     // MARK: - Legacy HTML Methods (Annex B)
