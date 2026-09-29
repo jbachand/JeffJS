@@ -328,6 +328,7 @@ struct JeffJSTestRunner {
             ("LazyCompile", { $0.testLazyCompile() }),
             ("StringIterator", { $0.testStringIterator() }),
             ("AggregateError", { $0.testAggregateError() }),
+            ("NamedEvaluation", { $0.testNamedEvaluation() }),
         ]
     }
 

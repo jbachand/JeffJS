@@ -170,8 +170,16 @@ final class JeffJSParser {
     var fd: JeffJSFunctionDefCompiler
 
     /// See emitFClosure / emitNamedEvaluation: bytecode offset just past the
-    /// most recently emitted anonymous closure, or -1.
+    /// most recently emitted anonymous function or class definition, or -1,
+    /// and the function definition it was emitted into (offsets of two
+    /// functions must never be compared).
     var lastAnonClosureEnd: Int = -1
+    var lastAnonClosureFd: ObjectIdentifier? = nil
+    /// For an anonymous class expression: where the atom operand of its
+    /// placeholder `set_name` sits (NamedEvaluation patches the name in, so
+    /// the class is named before its static elements run, ES §15.7.14), or -1
+    /// when the last anonymous definition was a function.
+    var lastAnonClassNameAtomPos: Int = -1
     /// The function whose formal parameters are being bound (pattern replay
     /// in emitParameterInitializers), or nil. A binding named `arguments`
     /// declared for it is a parameter name (ES §10.2.11 step 17).
@@ -1313,16 +1321,60 @@ final class JeffJSParser {
     func emitFClosure(_ cpoolIdx: Int, anonymous: Bool = false) {
         emitOp(.fclosure)
         emitU32(UInt32(cpoolIdx))
-        lastAnonClosureEnd = anonymous ? fd.byteCode.len : -1
+        if anonymous { markAnonymousDefinition(classNameAtomPos: -1) }
+        else { lastAnonClosureEnd = -1 }
     }
 
-    /// If the expression just parsed was exactly an anonymous closure, give it
-    /// `atom` as its `name`.
+    /// The expression that just ended is an anonymous function or class
+    /// definition (IsAnonymousFunctionDefinition, ES §8.4.3).
+    func markAnonymousDefinition(classNameAtomPos: Int) {
+        lastAnonClosureEnd = fd.byteCode.len
+        lastAnonClosureFd = ObjectIdentifier(fd)
+        lastAnonClassNameAtomPos = classNameAtomPos
+    }
+
+    /// True when the expression just parsed was exactly an anonymous function
+    /// or class definition (parentheses allowed, a comma expression not).
+    var lastExpressionIsAnonymousDefinition: Bool {
+        return lastAnonClosureEnd >= 0 && lastAnonClosureEnd == fd.byteCode.len
+            && lastAnonClosureFd == ObjectIdentifier(fd)
+    }
+
+    /// NamedEvaluation (ES §8.4.5) with a name known at compile time: if the
+    /// expression just parsed was exactly an anonymous function or class
+    /// definition, give it `atom` as its `name`. One rule for every
+    /// IsAnonymousFunctionDefinition position: variable / lexical
+    /// initializers, `=` and logical assignment to an identifier, default
+    /// parameters, destructuring defaults, property definitions, class fields.
     func emitNamedEvaluation(_ atom: JSAtom) {
-        guard atom != 0, lastAnonClosureEnd == fd.byteCode.len else { return }
-        emitOp(.set_name)
-        emitAtom(atom)
+        guard atom != 0, lastExpressionIsAnonymousDefinition else { return }
+        if lastAnonClassNameAtomPos >= 0 {
+            // A class: its placeholder `set_name ""` runs before the class
+            // elements; name it there (a static `name` member still wins).
+            let p = lastAnonClassNameAtomPos
+            fd.byteCode.buf[p] = UInt8(truncatingIfNeeded: atom)
+            fd.byteCode.buf[p + 1] = UInt8(truncatingIfNeeded: atom >> 8)
+            fd.byteCode.buf[p + 2] = UInt8(truncatingIfNeeded: atom >> 16)
+            fd.byteCode.buf[p + 3] = UInt8(truncatingIfNeeded: atom >> 24)
+        } else {
+            emitOp(.set_name)
+            emitAtom(atom)
+        }
         lastAnonClosureEnd = -1
+        lastAnonClassNameAtomPos = -1
+    }
+
+    /// NamedEvaluation with a computed key (`{[k]: function(){}}`, `[k] = class {}`):
+    /// the property key sits right under the value; names the value after it
+    /// at run time (a symbol gives "[description]"). Stack: [key, val] -> [key, val].
+    func emitNamedEvaluationComputed() {
+        guard lastExpressionIsAnonymousDefinition else { return }
+        emitOp(.swap)               // [val, key]
+        emitOp(.dup)                // [val, key, key]
+        emitOp(.rot3r)              // [key, val, key]
+        emitOp(.set_name_computed)  // [key, val]
+        lastAnonClosureEnd = -1
+        lastAnonClassNameAtomPos = -1
     }
 
     /// Emit a call opcode.
@@ -4471,7 +4523,7 @@ final class JeffJSParser {
         // `(0, eval)(src)` ends in the same bytecode as `eval(src)` but is an
         // indirect eval: the comma operator yields a value, not a reference.
         // Likewise `(0, obj.m)()` is a plain call (this = undefined).
-        if hadComma { lastEvalCalleeEnd = -1; lastMemberGetEnd = -1 }
+        if hadComma { lastEvalCalleeEnd = -1; lastMemberGetEnd = -1; lastAnonClosureEnd = -1 }
     }
 
     /// Parse an assignment expression.
@@ -4932,6 +4984,9 @@ final class JeffJSParser {
                 // Stack: [oldValue]  (condition says we should assign)
                 emitOp(.drop) // drop old value
                 parseAssignExpr() // evaluate RHS
+                // ES §13.15.2 steps 5.a/6.a/7.a: `x ??= function(){}` is a
+                // NamedEvaluation like `x = function(){}`.
+                emitNamedEvaluation(atom)
                 // Stack: [newValue]
                 emitOp(.dup) // keep a copy for the expression result
                 // Stack: [newValue, newValue]
@@ -7237,6 +7292,7 @@ final class JeffJSParser {
                 emitOp(.dup)     // [key, obj, obj]
                 emitOp(.rot3l)   // [obj, obj, key]
                 parseAssignExpr() // [obj, obj, key, value]
+                emitNamedEvaluationComputed()   // §13.2.5.5
                 emitOp(.put_array_el) // pops [obj, key, value] -> [obj]
             } else {
                 parseAssignExpr()
@@ -7978,6 +8034,7 @@ final class JeffJSParser {
                     emitOp(.drop)
                     next()
                     parseAssignExpr()
+                    emitNamedEvaluation(varName)   // §8.6.3 SingleNameBinding / §13.15.5.5
                     emitLabel(endLabel)
                 }
 
@@ -8183,6 +8240,7 @@ final class JeffJSParser {
                         emitOp(.drop)
                         next()
                         parseAssignExpr()
+                        emitNamedEvaluation(varName)
                         emitLabel(endLabel)
                     }
 
@@ -8218,6 +8276,7 @@ final class JeffJSParser {
                     emitOp(.drop)
                     next()
                     parseAssignExpr()
+                    emitNamedEvaluation(propAtom)
                     emitLabel(endLabel)
                 }
 

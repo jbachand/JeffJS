@@ -2167,6 +2167,11 @@ extension JeffJSContext {
         var base: String? = nil
         if key.isString, let str = key.stringValue {
             base = str.toSwiftString()
+        } else if key.isNumber {
+            // A numeric property key (`{[1]: function(){}}`) names "1".
+            let s = toString(key)
+            base = s.stringValue?.toSwiftString()
+            s.freeValue()
         } else if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
             // A symbol-keyed method is named "[description]" (ES §10.2.9); a
             // symbol with no description is anonymous.
@@ -2223,20 +2228,14 @@ extension JeffJSContext {
         }
         // Non-integer key (computed class field `[k] = v`): define an own
         // data property, like QuickJS's OP_define_array_el on a property key.
+        // A symbol key must resolve to the symbol's own atom: interning its
+        // description defined `static [Symbol('s')] = v` as the string key "s".
         let key = toPropertyKey(idx)
         if key.isException { return .exception }
-        let atom: UInt32
-        if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
-            atom = rt.findAtom(jsString: symStr)
-        } else if let str = key.stringValue {
-            atom = rt.findAtom(jsString: str)
-        } else {
-            key.freeValue()
-            return .newInt32(0)
-        }
-        key.freeValue()
+        defer { key.freeValue() }
+        guard let (atom, owned) = propertyKeyAtom(key) else { return .newInt32(0) }
         _ = definePropertyValue(obj: obj, atom: atom, value: val, flags: JS_PROP_C_W_E)
-        rt.freeAtom(atom)
+        if owned { rt.freeAtom(atom) }
         return .newInt32(0)
     }
 
@@ -9663,9 +9662,20 @@ struct JeffJSInterpreter {
                 pc += 5
 
             case .set_name_computed:
+                // NamedEvaluation with a computed key. The function was just
+                // created anonymous; a class that defined its own static
+                // `name` member (or field) keeps it (ES §15.7.14: the name is
+                // set before the class elements are defined).
                 let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let val = buf[sp - 1]
-                ctx.setFunctionNameComputed(val, key: key)
+                var keepsOwnName = false
+                if let fo = val.toObject(),
+                   jeffJS_findOwnPropertyIndex(obj: fo, atom: JeffJSAtomID.JS_ATOM_name.rawValue) >= 0 {
+                    let cur = fo.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_name.rawValue)
+                    keepsOwnName = !(cur.isString && cur.stringValue?.len == 0)
+                }
+                if !keepsOwnName { ctx.setFunctionNameComputed(val, key: key) }
+                key.freeValue()
                 pc += 1
 
             case .set_proto:
