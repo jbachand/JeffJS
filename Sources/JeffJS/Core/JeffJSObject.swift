@@ -3,6 +3,7 @@
 // Copyright 2026 Jeff Bachand. All rights reserved.
 
 import Foundation
+import Synchronization
 
 // MARK: - Forward references
 
@@ -76,18 +77,58 @@ func jeffJS_icProtoHit(_ entry: JeffJSICEntry) -> JeffJSValue? {
 /// entry lives. Without the pin, a dead shape's address can be recycled by a
 /// new shape allocation and the pointer-identity check false-hits, reading
 /// property slots through the wrong layout (observed as flaky engine crashes).
+///
+/// Sizing (IC table size fix, 2026-09-29): every site indexes the table with
+/// `pc & mask` (512 slots), and every site's `pc` is the offset of an
+/// instruction of the function that owns the table — the trace's inline calls
+/// switch `fb`/`bc`/`icEntries` together, and the fused `this[<const>]` read
+/// uses its `get_array_el`'s own pc (checked `< bcLen`). So a table only needs
+/// the slots `[0, bytecodeLen)`: it is `forBytecodeLength(len)` = the next power
+/// of two ≥ len (8 … 512) entries, not a fixed 512 × 56 B = 28 KB (a 12-byte
+/// arrow function kept 28 KB; 3 000 small functions = 83 MB). A function of
+/// ≤ 512 bytes maps every pc to its own slot exactly as before (no collision
+/// that the fixed table did not have); longer ones keep 512 slots. The hot
+/// path is unchanged (`pc & JeffJSInlineCache.mask`). Stores check the bound
+/// (`pc < capacity`; a miss path), so a future site that broke the invariant
+/// would lose its cache instead of writing past the table.
+/// `JEFFJS_INTERP_ICTABLEFIXED=1` (`interp.icTableFixed`) = fixed 512 slots (A/B).
 final class JeffJSInlineCache {
     static let size = 512
     static let mask = size - 1
+    static let minCapacity = 8
     var entries: UnsafeMutableBufferPointer<JeffJSICEntry>
+    /// Slots in `entries` (a power of two, ≤ `size`).
+    let capacity: Int
 
-    init() {
-        let ptr = UnsafeMutablePointer<JeffJSICEntry>.allocate(capacity: Self.size)
-        ptr.initialize(repeating: JeffJSICEntry(), count: Self.size)
-        entries = UnsafeMutableBufferPointer(start: ptr, count: Self.size)
+    /// Live tables / their bytes, process-wide (stats: `jeffjs-cli --settle`).
+    static let liveTables = Atomic<Int>(0)
+    static let liveBytes = Atomic<Int>(0)
+    static var liveStats: (tables: Int, bytes: Int) {
+        (liveTables.load(ordering: .relaxed), liveBytes.load(ordering: .relaxed))
+    }
+
+    /// Slots a table of a function with `len` bytes of bytecode needs.
+    @inline(__always)
+    static func capacity(forBytecodeLength len: Int) -> Int {
+        if JeffJSConfig.icTableFixed || len >= size { return size }
+        var c = minCapacity
+        while c < len { c <<= 1 }
+        return c
+    }
+
+    init(capacity requested: Int = JeffJSInlineCache.size) {
+        let cap = max(1, min(Self.size, requested))
+        capacity = cap
+        let ptr = UnsafeMutablePointer<JeffJSICEntry>.allocate(capacity: cap)
+        ptr.initialize(repeating: JeffJSICEntry(), count: cap)
+        entries = UnsafeMutableBufferPointer(start: ptr, count: cap)
+        Self.liveTables.wrappingAdd(1, ordering: .relaxed)
+        Self.liveBytes.wrappingAdd(cap * MemoryLayout<JeffJSICEntry>.stride, ordering: .relaxed)
     }
 
     deinit {
+        Self.liveTables.wrappingSubtract(1, ordering: .relaxed)
+        Self.liveBytes.wrappingSubtract(capacity * MemoryLayout<JeffJSICEntry>.stride, ordering: .relaxed)
         for entry in entries {
             if let old = entry.shapePtr {
                 Unmanaged<JeffJSShape>.fromOpaque(old).release()
@@ -102,13 +143,15 @@ final class JeffJSInlineCache {
                 Unmanaged<JeffJSShape>.fromOpaque(old).release()
             }
         }
-        entries.baseAddress?.deinitialize(count: Self.size)
+        entries.baseAddress?.deinitialize(count: capacity)
         entries.baseAddress?.deallocate()
     }
 
     @inline(__always)
     func lookup(_ pc: Int) -> JeffJSICEntry {
-        return entries[pc & Self.mask]
+        let idx = pc & Self.mask
+        guard idx < capacity else { return JeffJSICEntry() }
+        return entries[idx]
     }
 
     /// Release everything the entry at `idx` retains.
@@ -134,6 +177,7 @@ final class JeffJSInlineCache {
     func updateProto(_ pc: Int, receiverShape: JeffJSShape, holder: JeffJSObject,
                      holderShape: JeffJSShape, propOffset: Int, atom: UInt32 = 0) {
         let idx = pc & Self.mask
+        guard idx < capacity else { return }
         let rs = Unmanaged.passRetained(receiverShape).toOpaque()
         let hp = Unmanaged.passRetained(holder).toOpaque()
         let hs = Unmanaged.passRetained(holderShape).toOpaque()
@@ -147,6 +191,7 @@ final class JeffJSInlineCache {
     @inline(__always)
     func update(_ pc: Int, shape: JeffJSShape, propOffset: Int, atom: UInt32 = 0) {
         let idx = pc & Self.mask
+        guard idx < capacity else { return }
         // Retain the new shape before releasing the old one (handles re-caching
         // the same shape without a transient zero refcount).
         let newPtr = Unmanaged.passRetained(shape).toOpaque()
@@ -167,6 +212,7 @@ final class JeffJSInlineCache {
     @inline(__always)
     func updateTransition(_ pc: Int, from: JeffJSShape, to: JeffJSShape) {
         let idx = pc & Self.mask
+        guard idx < capacity else { return }
         let fromPtr = Unmanaged.passRetained(from).toOpaque()
         let toPtr = Unmanaged.passRetained(to).toOpaque()
         releaseEntry(idx)
@@ -480,7 +526,7 @@ class JeffJSFunctionBytecode {
     @inline(__always)
     func getIC() -> JeffJSInlineCache {
         if let ic = ic { return ic }
-        let newIC = JeffJSInlineCache()
+        let newIC = JeffJSInlineCache(capacity: JeffJSInlineCache.capacity(forBytecodeLength: bytecodeLen))
         ic = newIC
         return newIC
     }
