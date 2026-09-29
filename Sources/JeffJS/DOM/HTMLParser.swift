@@ -128,6 +128,27 @@ final class HTMLTreeBuilder {
     private var fragmentParsing = false
     private var contextElement: DOMNode?
 
+    /// WebKit's `maximumHTMLParserDOMTreeDepth` (`Settings::defaultMaximumHTMLParserDOMTreeDepth`
+    /// = 512; not in the HTML standard). `HTMLConstructionSite::attachLater`: when the stack
+    /// of open elements already holds 512 entries (`<html>` — or a fragment's root — is 1),
+    /// the node about to be attached makes the current node close (pop) and becomes its
+    /// *sibling*: the DOM a parse builds never nests deeper than 512, the rest of a deep
+    /// run lands flat at depth 512. Elements (void ones too) and comments go through it;
+    /// text and foster-parented nodes do not. Measured on the ladder's reference (iOS 26.2
+    /// WKWebView): 600 nested `<div>`s in a document, `DOMParser` and `innerHTML` alike.
+    static let maximumDOMTreeDepth = 512
+    /// Sticky, like WebKit's `m_hasReachedMaxDOMTreeDepth`: once the cap popped an element
+    /// the table insertion modes re-derive themselves from the stack (`resetInsertionModeAppropriately`),
+    /// since the popped element may have been the `table`/`tbody`/… the mode assumed.
+    private var reachedMaximumDOMTreeDepth = false
+    /// Elements attached while the current token is processed. WebKit queues every attach
+    /// (`attachLater`) and runs the queue after each token (`HTMLTreeBuilder::constructTree`),
+    /// and the cap only moves a node whose parent already has a `parentNode()`: a parent made
+    /// by the same token (an implied `tbody` before its `tr`, reconstructed formatting
+    /// elements) is not in the tree yet, so its child nests one level deeper. Measured on the
+    /// reference: `<table><tr>` at the cap gives tbody 512 > tr 513.
+    private var attachedThisToken: [DOMNode] = []
+
     init(html: String, scriptingEnabled: Bool) {
         self.tokenizer = HTMLTokenizer(html)
         self.scriptingEnabled = scriptingEnabled
@@ -180,6 +201,7 @@ final class HTMLTreeBuilder {
         while true {
             tokenizer.allowCDATA = shouldAllowCDATA()
             guard let token = tokenizer.nextToken() else { break }
+            attachedThisToken.removeAll(keepingCapacity: true)
             dispatch(token)
         }
         finishAtEOF()
@@ -332,7 +354,11 @@ final class HTMLTreeBuilder {
     }
 
     private func insert(_ node: DOMNode, overrideTarget: DOMNode? = nil) {
-        let place = appropriateInsertionPlace(overrideTarget: overrideTarget)
+        var place = appropriateInsertionPlace(overrideTarget: overrideTarget)
+        if place.before == nil, place.parent === (overrideTarget ?? currentNode ?? document) {
+            place.parent = depthCappedParent(place.parent)   // not foster-parented
+        }
+        if node.nodeType == .element { attachedThisToken.append(node) }
         if let before = place.before {
             place.parent.insertChild(node, before: before)
         } else {
@@ -398,10 +424,21 @@ final class HTMLTreeBuilder {
         place.parent.appendChild(DOMNode.text(text))
     }
 
+    /// `HTMLConstructionSite::attachLater`'s depth cap (`maximumDOMTreeDepth`): at 512 open
+    /// elements the current node is closed and `parent`'s parent takes the new node —
+    /// unless `parent` itself was attached by this token (`attachedThisToken`).
+    private func depthCappedParent(_ parent: DOMNode) -> DOMNode {
+        guard openElements.count >= Self.maximumDOMTreeDepth, let grandparent = parent.parent,
+              !attachedThisToken.contains(where: { $0 === parent }) else { return parent }
+        openElements.removeLast()
+        reachedMaximumDOMTreeDepth = true
+        return grandparent
+    }
+
     private func insertComment(_ data: String, target: DOMNode? = nil) {
         let comment = DOMNode.comment(data)
         if let target {
-            target.appendChild(comment)
+            depthCappedParent(target).appendChild(comment)
         } else {
             insert(comment)
         }
@@ -1021,6 +1058,7 @@ final class HTMLTreeBuilder {
             insertElement(tag: name, attributes: attributes)
             framesetOK = false
             mode = .inTable
+            if reachedMaximumDOMTreeDepth { resetInsertionModeAppropriately() }
 
         case "area", "br", "embed", "img", "keygen", "wbr":
             reconstructActiveFormatting()
@@ -1266,22 +1304,29 @@ final class HTMLTreeBuilder {
                 activeFormatting.append(.marker)
                 insertElement(tag: name, attributes: attributes)
                 mode = .inCaption
+                if reachedMaximumDOMTreeDepth { resetInsertionModeAppropriately() }
             case "colgroup":
                 clearStackBackToTableContext()
                 insertElement(tag: name, attributes: attributes)
                 mode = .inColumnGroup
+                if reachedMaximumDOMTreeDepth { resetInsertionModeAppropriately() }
             case "col":
                 clearStackBackToTableContext()
                 insertElement(tag: "colgroup", attributes: [])
-                reprocess(token, in: .inColumnGroup)
+                mode = .inColumnGroup
+                if reachedMaximumDOMTreeDepth { resetInsertionModeAppropriately() }
+                dispatch(token)
             case "tbody", "tfoot", "thead":
                 clearStackBackToTableContext()
                 insertElement(tag: name, attributes: attributes)
                 mode = .inTableBody
+                if reachedMaximumDOMTreeDepth { resetInsertionModeAppropriately() }
             case "td", "th", "tr":
                 clearStackBackToTableContext()
                 insertElement(tag: "tbody", attributes: [])
-                reprocess(token, in: .inTableBody)
+                mode = .inTableBody
+                if reachedMaximumDOMTreeDepth { resetInsertionModeAppropriately() }
+                dispatch(token)
             case "table":
                 guard hasInTableScope(["table"]) else { return }
                 popUntil("table")
