@@ -451,6 +451,10 @@ public final class JeffJSEnvironment {
     /// Lazy compilation counters, one line: stubs made at load and bodies
     /// compiled on a first call (count, source KB, ms).
     public var lazyCompileSummary: String { runtime.lazyStats.description }
+    /// Live inline-cache tables and their bytes, process-wide (all runtimes).
+    public static var inlineCacheStats: (tables: Int, bytes: Int) {
+        JeffJSInlineCache.liveStats
+    }
 
     /// Lazy compilation counters as numbers: bodies compiled (first calls and
     /// recompiles after an idle reclaim), their compile time, bodies dropped.

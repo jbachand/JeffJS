@@ -137,6 +137,13 @@ enum JeffJSConfig {
     /// (`JEFFJS_COMPILE_LAZYDROPSTRESS=1 swift test …`).
     static let lazyDropStress      = bool("compile.lazyDropStress",    default: false)
 
+    // MARK: - Interpreter
+
+    /// Inline-cache tables have a fixed 512 slots (28 KB) instead of the next
+    /// power of two ≥ the function's bytecode length (`JeffJSInlineCache`,
+    /// IC table size fix 2026-09-29). A/B: `JEFFJS_INTERP_ICTABLEFIXED=1`.
+    static let icTableFixed        = bool("interp.icTableFixed",       default: false)
+
     // MARK: - Trace Blocks
 
     static let traceHitThreshold   = int("trace.hitThreshold",         default: 2)

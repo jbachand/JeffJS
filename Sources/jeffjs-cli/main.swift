@@ -128,9 +128,10 @@ let status: Int32 = MainActor.assumeIsolated {
         let t0 = CFAbsoluteTimeGetCurrent()
         @MainActor func line(_ tag: String) {
             let g = env.gcStatistics, l = env.lazyCounters
-            print(String(format: "[settle] %@ t=%.0fs footprint=%.1fMB heap=%dKB objects=%d compiled=%d compileMs=%.0f dropped=%d reclaimMs=%.1f",
+            let ic = JeffJSEnvironment.inlineCacheStats
+            print(String(format: "[settle] %@ t=%.0fs footprint=%.1fMB heap=%dKB objects=%d compiled=%d compileMs=%.0f dropped=%d reclaimMs=%.1f icTables=%d icKB=%d",
                          tag, CFAbsoluteTimeGetCurrent() - t0, cliFootprintMB(), g.heapBytes / 1024, g.liveObjects,
-                         l.compiled, l.compileMs, l.dropped, l.reclaimMs))
+                         l.compiled, l.compileMs, l.dropped, l.reclaimMs, ic.tables, ic.bytes / 1024))
             fflush(stdout)
         }
         line("start")
