@@ -1394,7 +1394,7 @@ final class JeffJSBytecodeCache {
     /// blobs written by another one, even when nobody bumped
     /// `compilerVersion`. `BytecodeCacheBudgetTests.testEngineSourceHashIsCurrent`
     /// fails when it is stale; `Scripts/update_bytecode_identity.sh` rewrites it.
-    static let engineSourceHash: UInt64 = 0x3d18743879feb803 // bytecode-identity
+    static let engineSourceHash: UInt64 = 0xe974b3538168c1e3 // bytecode-identity
 
     /// The engine build identity: `compilerVersion`, the blob and entry
     /// layouts, `engineSourceHash`, and the opcode table the interpreter
@@ -1437,7 +1437,8 @@ final class JeffJSBytecodeCache {
     /// The file a key maps to. Exposed for tests (header-rejection,
     /// concurrent-writer) and for host-side cache inspection.
     func diskEntryURL(for key: JeffJSBytecodeCacheKey) -> URL? {
-        diskURL(for: key.hash)
+        Self.waitIfPending(key.hash)   // the entry's queued write lands first
+        return diskURL(for: key.hash)
     }
 
     // MARK: - Hashing

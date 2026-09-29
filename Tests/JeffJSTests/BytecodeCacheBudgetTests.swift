@@ -35,7 +35,8 @@ final class BytecodeCacheBudgetTests: XCTestCase {
     }
 
     private func entryExists(_ store: JeffJSBytecodeDiskStore, _ hash: UInt64) -> Bool {
-        FileManager.default.fileExists(atPath: store.url(for: hash).path)
+        JeffJSBytecodeCache.flushPendingDiskWrites()   // disk writes are queued (perf/memory-census)
+        return FileManager.default.fileExists(atPath: store.url(for: hash).path)
     }
 
     private func describe(_ ctx: JeffJSContext, _ v: JeffJSValue) -> String {
@@ -180,6 +181,7 @@ final class BytecodeCacheBudgetTests: XCTestCase {
         let k = JeffJSBytecodeCache.key(source: src, filename: file, evalFlags: 0)
         let (_, ctx) = runtime(with: store)
         XCTAssertEqual(describe(ctx, ctx.eval(input: src, filename: file, evalFlags: 0)), "42")
+        JeffJSBytecodeCache.flushPendingDiskWrites()   // disk writes are queued (perf/memory-census)
         let url = store.url(for: k.hash)
         var bytes = [UInt8](try Data(contentsOf: url))
         let headerLen = 29 + k.desc.utf8.count
@@ -195,6 +197,7 @@ final class BytecodeCacheBudgetTests: XCTestCase {
         let (rt3, ctx3) = runtime(with: store)
         XCTAssertEqual(describe(ctx3, ctx3.eval(input: src, filename: file, evalFlags: 0)), "42")
         XCTAssertEqual(rt3.bytecodeCache.storeCount, 1, "recompiled and rewritten")
+        JeffJSBytecodeCache.flushPendingDiskWrites()
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
     }
 
