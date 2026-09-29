@@ -255,11 +255,11 @@ extension JeffJSRuntime {
     /// if it was idle for the whole interval (or unconditionally in an
     /// aggressive cycle).
     private func lazyReclaimDecide(_ fb: JeffJSFunctionBytecodeCompiled, _ c: JeffJSLazyReclaimCycle) {
-        for v in fb.cpool {
-            guard let child = v.toFunctionBytecode() as? JeffJSFunctionBytecodeCompiled,
-                  let cli = child.lazyInfo, cli.seenCycle != c.phase else { continue }
+        for v in fb.cpool where v.isFunctionBytecode {
+            guard let child = v.toFunctionBytecode(), let cli = child.lazyInfo, cli.seenCycle != c.phase,
+                  let cc = child as? JeffJSFunctionBytecodeCompiled else { continue }
             cli.seenCycle = c.phase
-            c.fbs.append(child)
+            c.fbs.append(cc)
         }
         guard let li = fb.lazyInfo, !li.isPending, !fb.isGenerator, !fb.isAsyncFunc else { return }
         guard c.aggressive || li.touch < c.phase - 1 else { return }
