@@ -277,6 +277,10 @@ final class JeffJSParser {
 
     // -- Error state --
     var hasError: Bool = false
+    /// The parse failed: a parser error, or a tokenizer error the parser
+    /// did not turn into one (`\`${\`` ends inside a template the
+    /// substitution's tokenizer rejected, and parsing went on).
+    var failed: Bool { hasError || s.lastError != nil }
 
     // -- Safety limits to prevent OOM from parser bugs or adversarial input --
     //
@@ -405,7 +409,7 @@ final class JeffJSParser {
     func expectFailed(_ type: Int) {
         let expected = tokenName(type)
         let got = tokenName(tok)
-        syntaxError("expected '\(expected)' but got '\(got)'")
+        unexpectedTokenError("expected '\(expected)' but got '\(got)'")
     }
 
     /// Expect a semicolon: real ';', ASI via newline, '}', or EOF.
@@ -418,7 +422,7 @@ final class JeffJSParser {
         if s.gotLF || tok == 0x7D /* '}' */ || tok == JSTokenType.TOK_EOF.rawValue {
             return true
         }
-        syntaxError("expected ';'")
+        unexpectedTokenError("expected ';'")
         return false
     }
 
@@ -479,18 +483,112 @@ final class JeffJSParser {
     }
 
     /// Report a syntax error.
-    func syntaxError(_ msg: String) {
+    func syntaxError(_ msg: String, detail: String? = nil) {
         if !hasError {
-            s.syntaxError(msg)
+            s.syntaxError(msg, detail: detail)
             hasError = true
         }
     }
 
     /// Report a syntax error at a specific source offset.
-    func syntaxErrorAt(_ offset: Int, _ msg: String) {
+    func syntaxErrorAt(_ offset: Int, _ msg: String, detail: String? = nil) {
         if !hasError {
-            s.syntaxErrorAt(offset, msg)
+            s.syntaxErrorAt(offset, msg, detail: detail)
             hasError = true
+        }
+    }
+
+    // MARK: JavaScriptCore's wording
+
+    func atomText(_ atom: JSAtom) -> String {
+        return s.ctx?.atomName(atom) ?? "?"
+    }
+
+    /// JavaScriptCore's name for the current token in its "Unexpected …"
+    /// messages: `end of script`, `token '}'`, `identifier 'b'`, `keyword
+    /// 'class'`, `number '1.5e3'`, `string literal 'abc'`, `private name #x`.
+    func jscTokenDescription() -> String {
+        let t = tok
+        if t == JSTokenType.TOK_EOF.rawValue { return "end of script" }
+        var text = ""
+        let start = s.token.ptr, end = min(s.bufPtr, s.bufLen)
+        if start >= 0, end > start, end - start <= 256 {
+            text = String(decoding: s.buf[start ..< end], as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        switch t {
+        case JSTokenType.TOK_IDENT.rawValue:
+            return "identifier '\(text.isEmpty ? (s.ctx?.atomName(s.token.identAtom) ?? "") : text)'"
+        case JSTokenType.TOK_NUMBER.rawValue:
+            return s.token.bigIntValue != nil ? "token '\(text)'" : "number '\(text)'"
+        case JSTokenType.TOK_STRING.rawValue:
+            return "string literal \(text)"
+        case JSTokenType.TOK_TEMPLATE.rawValue:
+            return "template string"
+        case JSTokenType.TOK_PRIVATE_NAME.rawValue:
+            return "private name \(text)"
+        case JSTokenType.TOK_REGEXP.rawValue:
+            return "regular expression '\(text)'"
+        case JSTokenType.TOK_NULL.rawValue ... JSTokenType.TOK_SUPER.rawValue,
+             JSTokenType.TOK_LET.rawValue, JSTokenType.TOK_YIELD.rawValue:
+            return "keyword '\(keywordTokenName(t))'"
+        case JSTokenType.TOK_IMPLEMENTS.rawValue ... JSTokenType.TOK_ACCESSOR.rawValue:
+            return "identifier '\(keywordTokenName(t))'"
+        default:
+            return "token " + s.tokenTypeName(t)
+        }
+    }
+
+    /// "Unexpected <current token>" (JSC); `detail` is the engine's own
+    /// explanation, kept for its diagnostic line.
+    /// A list element not followed by ',' or the closing bracket (JSC:
+    /// "Unexpected identifier 'b'. Expected ')' to end an argument list.").
+    @inline(never)
+    func missingCommaError(_ expectation: String) {
+        syntaxErrorAt(tokenErrorOffset, "Unexpected \(jscTokenDescription()). \(expectation)")
+    }
+
+    @inline(never)
+    func unexpectedTokenError(_ detail: String? = nil) {
+        // A character no JS token starts with (the tokenizer hands it over
+        // as a one-character token): JSC reports the character itself.
+        if tok > 0x20 && tok < 0x7F, "@#\\".contains(Character(Unicode.Scalar(UInt8(tok)))) {
+            syntaxErrorAt(tokenErrorOffset, "Invalid character: '\(Character(Unicode.Scalar(UInt8(tok))))'", detail: detail)
+            return
+        }
+        syntaxErrorAt(tokenErrorOffset, "Unexpected " + jscTokenDescription(), detail: detail)
+    }
+
+    /// Where an "Unexpected <token>" error points: the token's first byte.
+    private var tokenErrorOffset: Int {
+        let p = s.token.ptr
+        return p >= 0 && p <= s.bufPtr ? p : s.bufPtr
+    }
+
+    /// A reserved word where a binding identifier is required: JSC's
+    /// "Cannot use the keyword 'class' as a variable name." (`what` is
+    /// "variable", "lexical variable", "parameter", "function",
+    /// "catch parameter", "class").
+    func isReservedBindingToken(_ t: Int) -> Bool {
+        if t >= JSTokenType.TOK_NULL.rawValue && t <= JSTokenType.TOK_SUPER.rawValue { return true }
+        if fd.jsMode & JS_MODE_STRICT != 0,
+           t >= JSTokenType.TOK_IMPLEMENTS.rawValue && t <= JSTokenType.TOK_STATIC.rawValue,
+           t != JSTokenType.TOK_LET.rawValue {
+            return true
+        }
+        return false
+    }
+
+    @inline(never)
+    func reservedBindingError(_ what: String) {
+        let t = tok
+        let name = keywordTokenName(t)
+        if t == JSTokenType.TOK_ENUM.rawValue {
+            syntaxError("Cannot use the reserved word '\(name)' as a \(what) name.")
+        } else if t >= JSTokenType.TOK_IMPLEMENTS.rawValue {
+            syntaxError("Cannot use the reserved word '\(name)' as a \(what) name in strict mode.")
+        } else {
+            syntaxError("Cannot use the keyword '\(name)' as a \(what) name.")
         }
     }
 
@@ -2572,10 +2670,12 @@ final class JeffJSParser {
         let mark = markTokenizer()
         let savedSuppress = JeffJSParseState.suppressErrorPrinting
         let savedErrorMsg = s.lastErrorMessage
+        let savedError = s.lastError
         JeffJSParseState.suppressErrorPrinting = true
         defer {
             resetTokenizer(to: mark)
             s.lastErrorMessage = savedErrorMsg
+            s.lastError = savedError
             JeffJSParseState.suppressErrorPrinting = savedSuppress
         }
         guard s.nextToken() else { return false }
@@ -3000,6 +3100,11 @@ final class JeffJSParser {
 
         // Check for finally
         let hasFinally = tok == JSTokenType.TOK_FINALLY.rawValue
+        if !hasFinally && tok != JSTokenType.TOK_CATCH.rawValue {
+            if tok == JSTokenType.TOK_EOF.rawValue { unexpectedTokenError("try without catch or finally") }
+            else { syntaxError("Unexpected \(jscTokenDescription()). Try statements must have at least a catch or finally block.") }
+            return
+        }
 
         emitGosub(finallyLabel) // always gosub (might be no-op if no finally)
         emitGoto(endLabel)
@@ -3043,8 +3148,10 @@ final class JeffJSParser {
                     // (`catch ({a} = {})`, applied when the thrown value is
                     // undefined); parseNestedDestructuringElement handles both.
                     parseNestedDestructuringElement(kind: .binding, isLexical: true, isConst: false)
+                } else if isReservedBindingToken(tok) {
+                    reservedBindingError("catch parameter")
                 } else {
-                    syntaxError("expected catch parameter")
+                    unexpectedTokenError("expected catch parameter")
                 }
                 expect(0x29) // ')'
             } else {
@@ -3109,7 +3216,7 @@ final class JeffJSParser {
         // Eval code is a Script: `return` outside a function is an early
         // error there (direct eval only; top-level scripts keep accepting it).
         if fd.parent == nil && fd.evalSite != nil {
-            syntaxError("'return' outside of function")
+            syntaxError("Return statements are only valid inside functions.")
             return
         }
         expect(JSTokenType.TOK_RETURN.rawValue)
@@ -3211,7 +3318,7 @@ final class JeffJSParser {
         expect(JSTokenType.TOK_THROW.rawValue)
 
         if s.gotLF {
-            syntaxError("no newline allowed after 'throw'")
+            syntaxError("Cannot have a newline after 'throw'.")
             return
         }
 
@@ -3235,9 +3342,9 @@ final class JeffJSParser {
         let label = findBreakLabel(labelName)
         if label < 0 {
             if labelName != 0 {
-                syntaxError("undefined label")
+                syntaxError("Cannot use the undeclared label '\(atomText(labelName))'.")
             } else {
-                syntaxError("break must be inside loop or switch")
+                syntaxError("'break' is only valid inside a switch or loop statement.")
             }
             return
         }
@@ -3262,10 +3369,11 @@ final class JeffJSParser {
         let label = findContinueLabel(labelName)
         if label < 0 {
             if labelName != 0 {
-                syntaxError(findBreakLabel(labelName) >= 0 ? "continue: label is not a loop"
-                                                          : "undefined label")
+                syntaxError(findBreakLabel(labelName) >= 0
+                            ? "Cannot continue to the label '\(atomText(labelName))' as it is not targeting a loop."
+                            : "Cannot use the undeclared label '\(atomText(labelName))'.")
             } else {
-                syntaxError("continue must be inside loop")
+                syntaxError("'continue' is only valid inside a loop statement.")
             }
             return
         }
@@ -3282,7 +3390,7 @@ final class JeffJSParser {
         expect(JSTokenType.TOK_WITH.rawValue)
 
         if fd.jsMode & JS_MODE_STRICT != 0 {
-            syntaxError("'with' is not allowed in strict mode")
+            syntaxError("'with' statements are not valid in strict mode.")
             return
         }
 
@@ -3449,11 +3557,16 @@ final class JeffJSParser {
         let varName: JSAtom
         if tok == JSTokenType.TOK_IDENT.rawValue {
             varName = s.token.identAtom
+        } else if isReservedBindingToken(tok) {
+            if isConst { reservedBindingError("lexical variable") }
+            else if isLexical { unexpectedTokenError("expected identifier in variable declaration") }
+            else { reservedBindingError("variable") }
+            return
         } else if isKeywordToken(tok) {
             let kwName = keywordTokenName(tok)
             varName = getAtom(kwName)
         } else {
-            syntaxError("expected identifier in variable declaration")
+            unexpectedTokenError("expected identifier in variable declaration")
             return
         }
         next() // consume identifier
@@ -3521,7 +3634,7 @@ final class JeffJSParser {
             } else {
                 // No initializer
                 if isConst {
-                    syntaxError("const declarations must be initialized")
+                    syntaxError("Unexpected \(jscTokenDescription()). const declared variable '\(atomText(varName))' must have an initializer.")
                     return
                 }
                 // For lexical variables (let), the TDZ is lifted at the
@@ -3584,12 +3697,16 @@ final class JeffJSParser {
         if tok == JSTokenType.TOK_IDENT.rawValue {
             funcName = s.token.identAtom
             next()
+        } else if isReservedBindingToken(tok) {
+            reservedBindingError("function")
+            return
         } else if isKeywordToken(tok) {
             let kwName = keywordTokenName(tok)
             funcName = getAtom(kwName)
             next()
         } else if !isExpression && !isArrow {
-            syntaxError("expected function name")
+            if tok == 0x28 { syntaxError("Function statements must have a name.") }
+            else { unexpectedTokenError("expected function name") }
             return
         }
 
@@ -3776,7 +3893,7 @@ final class JeffJSParser {
                     if skipDestructuringPattern() { childFd.hasParameterExpressions = true }
                     savedDestructs.append(saved)
                 } else {
-                    syntaxError("expected rest parameter name or pattern")
+                    unexpectedTokenError("expected rest parameter name or pattern")
                     return (savedDefaults, restParam, savedDestructs)
                 }
                 break // rest must be last
@@ -3869,13 +3986,17 @@ final class JeffJSParser {
                     savedDefaults.append(saved)
                 }
             } else {
-                syntaxError("expected parameter name")
+                if isReservedBindingToken(tok) { reservedBindingError("parameter") }
+                else { unexpectedTokenError("expected parameter name") }
                 return (savedDefaults, restParam, savedDestructs)
             }
 
             paramCount += 1
             if tok == 0x2C { // ','
                 next()
+            } else if tok != 0x29 {
+                missingCommaError("Expected a ')' or a ',' after a parameter declaration.")
+                return (savedDefaults, restParam, savedDestructs)
             }
         }
 
@@ -4397,10 +4518,10 @@ final class JeffJSParser {
                     let varIdx = defineVar(nsName, isConst: true, isLexical: true)
                     _ = varIdx
                 } else {
-                    syntaxError("expected identifier after 'as'")
+                    unexpectedTokenError("expected identifier after 'as'")
                 }
             } else {
-                syntaxError("expected 'as' after '*'")
+                unexpectedTokenError("expected 'as' after '*'")
             }
         } else if tok == 0x7B { // '{' named imports
             next()
@@ -4423,7 +4544,7 @@ final class JeffJSParser {
                     localName = importedName
                     next()
                 } else {
-                    syntaxError("expected import name")
+                    unexpectedTokenError("expected import name")
                     return
                 }
 
@@ -4433,7 +4554,7 @@ final class JeffJSParser {
                         localName = s.token.identAtom
                         next()
                     } else {
-                        syntaxError("expected identifier after 'as'")
+                        unexpectedTokenError("expected identifier after 'as'")
                         return
                     }
                 }
@@ -4459,7 +4580,7 @@ final class JeffJSParser {
                 _ = moduleSpecifier
                 next()
             } else {
-                syntaxError("expected module specifier string")
+                unexpectedTokenError("expected module specifier string")
             }
         }
 
@@ -4543,7 +4664,7 @@ final class JeffJSParser {
         } else if tok == JSTokenType.TOK_CLASS.rawValue {
             parseClassDeclaration()
         } else {
-            syntaxError("unexpected token in export")
+            unexpectedTokenError("unexpected token in export")
         }
     }
 
@@ -5770,6 +5891,9 @@ final class JeffJSParser {
             }
             if tok == 0x2C { // ','
                 next()
+            } else if tok != 0x29 {
+                missingCommaError("Expected ')' to end an argument list.")
+                break
             }
         }
         inFlag = savedInFlagCall
@@ -5951,7 +6075,7 @@ final class JeffJSParser {
             }
             emitScopeGetPrivateField(fieldAtom)
         } else {
-            syntaxError("expected property name after '.'")
+            unexpectedTokenError("expected property name after '.'")
             return
         }
     }
@@ -6024,7 +6148,7 @@ final class JeffJSParser {
             }
             emitScopeGetPrivateField(fieldAtom)
         } else {
-            syntaxError("expected property name after '?.'")
+            unexpectedTokenError("expected property name after '?.'")
             return
         }
     }
@@ -6048,7 +6172,7 @@ final class JeffJSParser {
                     emitU8(SpecialObjectType.newTarget.rawValue)
                     return
                 }
-                syntaxError("expected 'target' after 'new.'")
+                unexpectedTokenError("expected 'target' after 'new.'")
                 return
             }
 
@@ -6073,7 +6197,7 @@ final class JeffJSParser {
                         emitExprSpan(calleeStart, s.lastPtr)
                         emitGetField(fieldAtom)
                     } else {
-                        syntaxError("expected property name after '.'")
+                        unexpectedTokenError("expected property name after '.'")
                         return
                     }
                 } else { // '[' — computed member access
@@ -6111,7 +6235,7 @@ final class JeffJSParser {
                         if hasSpread { emitOp(.append) } else { argc += 1 }
                         if argc > JeffJSParser.maxCallArguments { tooManyArguments(); return }
                     }
-                    if tok == 0x2C { next() }
+                    if tok == 0x2C { next() } else if tok != 0x29 { missingCommaError("Expected ')' to end an argument list."); break }
                 }
                 expect(0x29)
                 emitExprSpan(newStart, s.lastPtr)
@@ -6964,7 +7088,7 @@ final class JeffJSParser {
                 emitOp(.special_object)
                 emitU8(3) // import.meta
             } else {
-                syntaxError("expected 'meta' after 'import.'")
+                unexpectedTokenError("expected 'meta' after 'import.'")
             }
         } else if tok == 0x28 { // '(' dynamic import
             next()
@@ -6998,7 +7122,7 @@ final class JeffJSParser {
                 emitScopeGetVar(atom, scopeLevel: fd.curScope)
             }
         } else {
-            syntaxError("unexpected token in expression: \(tokenName(tok))")
+            unexpectedTokenError("unexpected token in expression")
             // Skip the token to avoid infinite loops
             next()
         }
@@ -7105,7 +7229,7 @@ final class JeffJSParser {
                 }
             }
 
-            if tok == 0x2C { next() }
+            if tok == 0x2C { next() } else if tok != 0x5D { missingCommaError("Expected either a closing ']' or a ',' following an array element."); break }
         }
 
         inFlag = savedInFlagArr
@@ -7195,6 +7319,9 @@ final class JeffJSParser {
 
             if tok == 0x2C { // ','
                 next()
+            } else if tok != 0x7D {
+                missingCommaError("Expected '}' to end an object literal.")
+                break
             }
         }
 
@@ -7310,7 +7437,7 @@ final class JeffJSParser {
             propAtom = getAtom(kwName)
             next()
         } else {
-            syntaxError("expected property name")
+            unexpectedTokenError("expected property name")
             return
         }
 
@@ -7446,7 +7573,7 @@ final class JeffJSParser {
 
             emitDefineField(propAtom)
         } else {
-            syntaxError("unexpected token in property definition")
+            unexpectedTokenError("unexpected token in property definition")
         }
     }
 
@@ -7669,7 +7796,7 @@ final class JeffJSParser {
             parseObjectDestructuring(kind: kind, isLexical: isLexical, isConst: isConst,
                                      leaveSource: leaveSource)
         } else {
-            syntaxError("expected destructuring pattern")
+            unexpectedTokenError("expected destructuring pattern")
         }
     }
 
@@ -7738,8 +7865,10 @@ final class JeffJSParser {
         let savedTmplNest = s.templateNestLevel
         let savedSuppress = JeffJSParseState.suppressErrorPrinting
         let savedErrorMsg = s.lastErrorMessage
+        let savedError = s.lastError
         JeffJSParseState.suppressErrorPrinting = true
         defer {
+            s.lastError           = savedError
             s.bufPtr              = savedBufPtr
             s.lineNum             = savedLineNum
             s.token               = savedToken
@@ -8051,7 +8180,7 @@ final class JeffJSParser {
                 parseDestructuringDefault()
                 emitAssignTargetPut(ref)
                 idx += 1
-                if tok == 0x2C { next() }
+                if tok == 0x2C { next() } else if tok != 0x5D { missingCommaError("Expected either a closing ']' or a ',' following an element destructuring pattern."); break }
                 continue
             }
 
@@ -8095,12 +8224,14 @@ final class JeffJSParser {
                 }
             } else if tok == 0x5B || tok == 0x7B {
                 parseNestedDestructuringElement(kind: kind, isLexical: isLexical, isConst: isConst)
+            } else if isReservedBindingToken(tok) && kind != .assignment {
+                reservedBindingError(isConst ? "lexical variable" : "variable")
             } else {
-                syntaxError("expected identifier or pattern in destructuring")
+                unexpectedTokenError("expected identifier or pattern in destructuring")
             }
 
             idx += 1
-            if tok == 0x2C { next() }
+            if tok == 0x2C { next() } else if tok != 0x5D { missingCommaError("Expected either a closing ']' or a ',' following an element destructuring pattern."); break }
         }
 
         expect(0x5D) // ']'
@@ -8223,7 +8354,7 @@ final class JeffJSParser {
                 propAtom = getAtom(kwName)
                 next()
             } else {
-                syntaxError("expected property name in destructuring")
+                unexpectedTokenError("expected property name in destructuring")
                 return
             }
             if !isComputed { excludedAtoms.append(propAtom) }
@@ -8252,7 +8383,7 @@ final class JeffJSParser {
                 }
                 parseDestructuringDefault()
                 emitAssignTargetPut(ref) // Stack: [src]
-                if tok == 0x2C { next() }
+                if tok == 0x2C { next() } else if tok != 0x7D { missingCommaError("Expected either a closing '}' or an ',' after a property destructuring pattern."); break }
                 continue
             }
 
@@ -8301,7 +8432,11 @@ final class JeffJSParser {
                         }
                     }
                 } else {
-                    syntaxError("expected identifier or pattern")
+                    if isReservedBindingToken(tok) && kind != .assignment {
+                        reservedBindingError(isConst ? "lexical variable" : "variable")
+                    } else {
+                        unexpectedTokenError("expected identifier or pattern")
+                    }
                     return
                 }
             } else if isComputed {
@@ -8339,7 +8474,7 @@ final class JeffJSParser {
                 }
             }
 
-            if tok == 0x2C { next() }
+            if tok == 0x2C { next() } else if tok != 0x7D { missingCommaError("Expected either a closing '}' or an ',' after a property destructuring pattern."); break }
         }
 
         expect(0x7D) // '}'

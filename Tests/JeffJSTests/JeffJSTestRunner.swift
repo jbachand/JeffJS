@@ -335,6 +335,7 @@ struct JeffJSTestRunner {
             ("DOMParserInsertion", { $0.testDOMParserInsertion() }),
             ("LoneSurrogate", { $0.testLoneSurrogate() }),
             ("IteratorHelpers", { $0.testIteratorHelpers() }),
+            ("SyntaxErrorText", { $0.testSyntaxErrorText() }),
         ]
     }
 

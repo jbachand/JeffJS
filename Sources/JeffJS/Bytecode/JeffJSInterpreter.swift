@@ -1715,8 +1715,8 @@ extension JeffJSContext {
         if site.isStrict { fd.jsMode = JS_MODE_STRICT }
         let parser = JeffJSParser(s: parseState, fd: fd)
         parser.parseProgram()
-        if parser.hasError || fd.byteCode.error {
-            return throwSyntaxError(message: parseState.lastErrorMessage ?? "Parse error in eval code")
+        if parser.failed || fd.byteCode.error {
+            return throwParseSyntaxError(parseState, fallback: "Parse error in eval code")
         }
         if fd.byteCode.len == 0 { return .undefined }
         guard let fb = JeffJSCompiler.createFunction(ctx: self, fd: fd) else {
