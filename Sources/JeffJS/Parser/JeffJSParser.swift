@@ -4836,7 +4836,45 @@ final class JeffJSParser {
                 emitLabel(endLabel)                         // [obj, old]
                 emitOp(.nip)                                // [old]
                 emitLabel(doneLabel)
-            } else if lhsOp == .scope_get_var {
+            } else if logGetOp == .get_field, let pos = logGetPos {
+                // obj.x ??= y (ES2021 §13.15.2): obj is evaluated once, the property is
+                // read, and only a value that does not short-circuit is PutValue'd back.
+                // (This used to fall into the variable branch below whenever the LHS
+                // *started* with a variable — `_.nTa ||= v` assigned v to `_`.)
+                let opcodeSize = fd.byteCode.buf[pos] == 0 ? 2 : 1
+                let atom = readU32FromBuf(fd.byteCode.buf, pos + opcodeSize)
+                let doneLabel = newLabel()
+                fd.byteCode.len = pos                       // [obj]
+                emitOp(.get_field2)                         // [obj, old]
+                emitAtom(atom)
+                emitLogicalAssignShortCircuit(assignOp, to: endLabel)  // [obj, old] (jumps keep it)
+                emitOp(.drop)                               // [obj]
+                parseAssignExpr()                           // [obj, val]
+                emitOp(.dup)                                // [obj, val, val]
+                emitOp(.perm3)                              // [val, obj, val]
+                emitPutField(atom)                          // [val]
+                emitGoto(doneLabel)
+                emitLabel(endLabel)                         // [obj, old]
+                emitOp(.nip)                                // [old]
+                emitLabel(doneLabel)
+            } else if logGetOp == .get_array_el, let pos = logGetPos {
+                // obj[key] ??= y: obj and key evaluated once.
+                let doneLabel = newLabel()
+                fd.byteCode.len = pos                       // [obj, key]
+                emitOp(.dup2)                               // [obj, key, obj, key]
+                emitOp(.get_array_el)                       // [obj, key, old]
+                emitLogicalAssignShortCircuit(assignOp, to: endLabel)  // [obj, key, old]
+                emitOp(.drop)                               // [obj, key]
+                parseAssignExpr()                           // [obj, key, val]
+                emitOp(.dup)                                // [obj, key, val, val]
+                emitOp(.perm4)                              // [val, obj, key, val]
+                emitOp(.put_array_el)                       // [val]
+                emitGoto(doneLabel)
+                emitLabel(endLabel)                         // [obj, key, old]
+                emitOp(.nip)                                // [obj, old]
+                emitOp(.nip)                                // [old]
+                emitLabel(doneLabel)
+            } else if lhsOp == .scope_get_var, logGetOp == .scope_get_var, logGetPos == lhsBcStart {
                 // --- Variable LHS: x ??= y ---
                 let opcodeSize = fd.byteCode.buf[lhsBcStart] == 0 ? 2 : 1
                 let atom = readU32FromBuf(fd.byteCode.buf, lhsBcStart + opcodeSize)
@@ -5033,6 +5071,25 @@ final class JeffJSParser {
         case JSTokenType.TOK_LOR_ASSIGN.rawValue: return .lor
         case JSTokenType.TOK_DOUBLE_QUESTION_MARK_ASSIGN.rawValue: return .nullishCoalescing
         default: return nil
+        }
+    }
+
+    /// Logical assignment (`&&=` / `||=` / `??=`): with the old value on top,
+    /// dup it and jump to `label` (leaving the old value) when the operator
+    /// short-circuits; falls through with the old value still on the stack.
+    func emitLogicalAssignShortCircuit(_ op: AssignOpKind, to label: Int) {
+        emitOp(.dup)
+        switch op {
+        case .land:
+            emitIfFalse(label)
+        case .lor:
+            emitIfTrue(label)
+        case .nullishCoalescing:
+            emitOp(.is_undefined_or_null)
+            emitOp(.lnot)
+            emitIfTrue(label)
+        default:
+            break
         }
     }
 
