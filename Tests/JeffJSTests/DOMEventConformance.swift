@@ -14,6 +14,21 @@ extension JeffJSTestRunner {
 
     /// (name, JS expression that must evaluate to `true`).
     static let domEventCases: [(String, String)] = [
+        // DOM §2.9 invoke step 8: legacy event types (google.com's animation-sequence timers).
+        ("legacy types: a trusted animationend with no listener runs webkitAnimationEnd listeners", """
+            (function(){ var d = document.createElement('div'); document.body.appendChild(d); var log = [];
+              d.addEventListener('webkitAnimationEnd', function (e) { log.push('wk:' + e.type); });
+              var e = new Event('animationend', { bubbles: true }); e.isTrusted = true; d.dispatchEvent(e); log.push(e.type);
+              var u = new Event('animationend'); d.dispatchEvent(u);
+              var d2 = document.createElement('div'); document.body.appendChild(d2);
+              d2.addEventListener('animationend', function (e) { log.push('std'); });
+              d2.addEventListener('webkitAnimationEnd', function (e) { log.push('BAD'); });
+              var e2 = new Event('animationend'); e2.isTrusted = true; d2.dispatchEvent(e2);
+              var h = function (e) { log.push('up:' + e.type); }; document.body.addEventListener('webkitTransitionEnd', h);
+              var e3 = new Event('transitionend', { bubbles: true }); e3.isTrusted = true; d.dispatchEvent(e3);
+              document.body.removeEventListener('webkitTransitionEnd', h); d.remove(); d2.remove();
+              return log.join(' ') === 'wk:webkitAnimationEnd animationend std up:webkitTransitionEnd'; })()
+            """),
         // The spec-ladder defect: document had add/removeEventListener but no dispatchEvent.
         ("document.dispatchEvent (minimal repro)", """
             (function(){ var hit = 0; document.addEventListener('x', function(){ hit++; });
