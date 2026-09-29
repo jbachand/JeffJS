@@ -208,6 +208,13 @@ final class JeffJSParser {
     var lastExprWasSuperProp: Bool = false
     /// `obj[key]` was kept as [obj, value] because a call follows: emit call_method.
     var pendingMethodCall: Bool = false
+    /// Byte offset where the current LeftHandSideExpression chain starts
+    /// (`parseCallExpr` sets it and restores it on exit): the start of every
+    /// member access / call span in that chain.
+    var exprChainStart: Int = -1
+    /// Source offset of the left-hand side of the assignment being parsed
+    /// (read once by parseAssignmentOperator): `o.x = v` quotes all of it.
+    var assignLhsSrcStart: Int = -1
 
     /// Bytecode length just after the identifier `eval` was emitted as an
     /// expression (and the function it was emitted into). A call whose
@@ -1257,6 +1264,22 @@ final class JeffJSParser {
         }
     }
 
+    /// JSC-style expression info for the opcode emitted next: the source
+    /// range [start, end) (byte offsets into the script) of the member
+    /// access, call or `new` it performs. Runtime errors quote it —
+    /// "undefined is not an object (evaluating 'w.C[b]')", "o.f is not a
+    /// function. (In 'o.f()', 'o.f' is undefined)" — as JavaScriptCore does.
+    /// Carried as a tagged line_num (line = 0x8000_0000 | start, col = end)
+    /// that resolveLabels strips into the function's span table before any
+    /// peephole runs, so fusions never see it. Emitted *before* the opcode:
+    /// the parser's rewinds (assignment targets, `++`) look at the op itself.
+    func emitExprSpan(_ start: Int, _ end: Int) {
+        guard start >= 0, end > start, start < 0x7FFF_FFFF, end <= 0x7FFF_FFFF else { return }
+        emitOp(.line_num)
+        emitU32(UInt32(0x8000_0000) | UInt32(start))
+        emitU32(UInt32(end))
+    }
+
     /// Emit a get_field opcode.
     func emitGetField(_ atom: JSAtom) {
         emitOp(.get_field)
@@ -1742,6 +1765,7 @@ final class JeffJSParser {
         // matters that the mode is set *before* the real pass: strictness
         // changes tokenization — reserved words, legacy octal literals, `with`.
         scanProgramDirectivePrologue()
+        fd.isProgramCode = true
         next() // prime the first token
 
         // Parse source elements (statements and declarations)
@@ -4507,9 +4531,11 @@ final class JeffJSParser {
         // Save bytecode position before parsing LHS — we may need to rewrite
         // the last emitted GET into a PUT for assignment.
         let lhsBcStart = fd.byteCode.len
+        let lhsSrcStart = s.token.ptr
         parseTernaryExpr()
         guard !shouldAbort else { return }
         if let assignOp = getAssignOp(tok) {
+            assignLhsSrcStart = lhsSrcStart
             parseAssignmentOperator(assignOp, lhsBcStart: lhsBcStart, pattern: nil)
         }
         // Arrow functions are detected above (before parseTernaryExpr) for
@@ -4589,9 +4615,11 @@ final class JeffJSParser {
         // to be a destructuring assignment pattern ([a,b] = ... or {a,b} = ...).
         let pattern = capturePatternState()
         let lhsBcStart = fd.byteCode.len
+        let lhsSrcStart = s.token.ptr
         parseTernaryExpr()
         guard !shouldAbort else { return }
         if let assignOp = getAssignOp(tok) {
+            assignLhsSrcStart = lhsSrcStart
             parseAssignmentOperator(assignOp, lhsBcStart: lhsBcStart, pattern: pattern)
         }
     }
@@ -4721,6 +4749,7 @@ final class JeffJSParser {
     @inline(never)
     func parseAssignmentOperator(_ assignOp: AssignOpKind, lhsBcStart: Int,
                                  pattern: LhsPatternState?) {
+        let lhsSrcStart = assignLhsSrcStart
         next() // consume the operator
 
         if assignOp == .plain {
@@ -4760,6 +4789,9 @@ final class JeffJSParser {
                 let scopeLevel = readU16FromBuf(fd.byteCode.buf, pos + opcodeSize + 4)
                 fd.byteCode.len = pos  // rewind to remove scope_get_var
                 parseAssignExpr()
+                // ES §13.15.2 step 1.c: `x = function(){}` / `x = () => {}` names
+                // the function after the identifier (NamedEvaluation).
+                emitNamedEvaluation(atom)
                 // Assignment expression must leave the value on the stack.
                 // dup + put_var: dup keeps a copy, put_var stores and pops.
                 emitOp(.dup)
@@ -4777,6 +4809,7 @@ final class JeffJSParser {
                 //           → put_field → [val]
                 emitOp(.dup)             // [obj, val, val]
                 emitOp(.perm3)           // [val, obj, val]  (rotate: TOS-2 goes to TOS)
+                emitExprSpan(lhsSrcStart, s.lastPtr)
                 emitPutField(atom)       // pops [obj, val]; stack: [val]
             } else if lastGetOp == .get_array_el, let pos = lastGetPos {
                 fd.byteCode.len = pos   // rewind; stack: [obj, index]
@@ -4784,6 +4817,7 @@ final class JeffJSParser {
                 // Keep val: dup, then rotate so put_array_el gets [obj,index,val]
                 emitOp(.dup)             // stack: [obj, index, val, val]
                 emitOp(.perm4)           // stack: [val, obj, index, val]
+                emitExprSpan(lhsSrcStart, s.lastPtr)
                 emitOp(.put_array_el)    // pops [obj,index,val]; stack: [val]
             } else {
                 // Fallback
@@ -5149,11 +5183,13 @@ final class JeffJSParser {
                 break
             }
             exprStartPtr = s.token.ptr
+            let lhsSrcStart = s.token.ptr
             let lhsBcStart = fd.byteCode.len
             parseBinaryExpr(1)
             guard !shouldAbort else { break }
             if tok == 0x3F { continue } // next link: `: c2 ? v2 : ...`
             if let assignOp = getAssignOp(tok) {
+                assignLhsSrcStart = lhsSrcStart
                 parseAssignmentOperator(assignOp, lhsBcStart: lhsBcStart, pattern: nil)
             }
             break
@@ -5355,6 +5391,7 @@ final class JeffJSParser {
             emitOp(.undefined)
 
         case JSTokenType.TOK_DELETE.rawValue:
+            let deleteSrcStart = s.token.ptr
             next()
             // delete requires special handling: instead of evaluating the
             // operand to a value, we need to leave [obj, key] on the stack
@@ -5374,11 +5411,13 @@ final class JeffJSParser {
                 emitOp(.push_atom_value)
                 emitAtom(atom)
                 // Stack: [obj, key]
+                emitExprSpan(deleteSrcStart, s.lastPtr)
                 emitOp(.delete_)
             } else if lastOp == .get_array_el, let pos = lastPos {
                 // delete obj[key] -- rewind to remove get_array_el.
                 // Stack already has [obj, key] before get_array_el.
                 fd.byteCode.len = pos  // rewind: stack has [obj, key]
+                emitExprSpan(deleteSrcStart, s.lastPtr)
                 emitOp(.delete_)
             } else if lastOp == .scope_get_private_field {
                 // `delete obj.#x` is an early SyntaxError.
@@ -5501,6 +5540,9 @@ final class JeffJSParser {
 
     /// Parse: MemberExpr [Arguments | '[' Expression ']' | '.' Identifier | TemplateLiteral]*
     func parseCallExpr() {
+        let savedChainStart = exprChainStart
+        exprChainStart = s.token.ptr
+        defer { exprChainStart = savedChainStart }
         parseNewExpr()
 
         // Optional chaining short-circuits the WHOLE rest of the chain, not
@@ -5669,6 +5711,7 @@ final class JeffJSParser {
             }
         } else if isMethodCall {
             // [receiver, func, args...]: obj[key](...) and super.m(...)
+            emitExprSpan(exprChainStart, s.lastPtr)
             if hasSpread {
                 emitOp(.apply)       // [this, func, argsArray] -> result
                 emitU16(UInt16(argc))
@@ -5681,9 +5724,11 @@ final class JeffJSParser {
             // on the stack (no thisObj), so we insert `undefined` below them.
             emitOp(.undefined)       // [func, argsArray, undefined]
             emitOp(.rot3r)           // [undefined, func, argsArray]
+            emitExprSpan(exprChainStart, s.lastPtr)
             emitOp(.apply)
             emitU16(UInt16(argc))
         } else {
+            emitExprSpan(exprChainStart, s.lastPtr)
             emitCall(argc)
         }
     }
@@ -5709,9 +5754,11 @@ final class JeffJSParser {
             // obj[key](...) / obj[key]`..` / obj[key]?.(): keep the receiver so
             // the call is a method call (QuickJS get_array_el2 +
             // call_method); a plain call passed `this` = undefined.
+            emitExprSpan(exprChainStart, s.lastPtr)
             emitOp(.get_array_el2)
             pendingMethodCall = true
         } else {
+            emitExprSpan(exprChainStart, s.lastPtr)
             let pos = fd.byteCode.len
             emitOp(.get_array_el)
             noteMemberGet(at: pos)
@@ -5784,10 +5831,12 @@ final class JeffJSParser {
                 // call_method right here. The later get_field+call rewrite
                 // pass loses the receiver when the arguments contain
                 // branches (`o.m(c ? a : b)`).
+                emitExprSpan(exprChainStart, s.lastPtr)
                 emitOp(.get_field2)
                 emitAtom(fieldAtom)
                 pendingMethodCall = true
             } else {
+                emitExprSpan(exprChainStart, s.lastPtr)
                 let pos = fd.byteCode.len
                 emitGetField(fieldAtom)
                 noteMemberGet(at: pos)
@@ -5888,7 +5937,9 @@ final class JeffJSParser {
     ///      | MemberExpr
     func parseNewExpr() {
         if tok == JSTokenType.TOK_NEW.rawValue {
+            let newStart = s.token.ptr
             next() // consume 'new'
+            let calleeStart = s.token.ptr
 
             // Check for 'new.target'
             if tok == 0x2E { // '.'
@@ -5915,11 +5966,13 @@ final class JeffJSParser {
                     if tok == JSTokenType.TOK_IDENT.rawValue {
                         let fieldAtom = s.token.identAtom
                         next()
+                        emitExprSpan(calleeStart, s.lastPtr)
                         emitGetField(fieldAtom)
                     } else if isKeywordToken(tok) {
                         let kwName = keywordTokenName(tok)
                         let fieldAtom = getAtom(kwName)
                         next()
+                        emitExprSpan(calleeStart, s.lastPtr)
                         emitGetField(fieldAtom)
                     } else {
                         syntaxError("expected property name after '.'")
@@ -5929,6 +5982,7 @@ final class JeffJSParser {
                     next()
                     parseExpression()
                     expect(0x5D) // ']'
+                    emitExprSpan(calleeStart, s.lastPtr)
                     emitOp(.get_array_el)
                 }
             }
@@ -5962,6 +6016,7 @@ final class JeffJSParser {
                     if tok == 0x2C { next() }
                 }
                 expect(0x29)
+                emitExprSpan(newStart, s.lastPtr)
                 if hasSpread {
                     emitOp(.apply_constructor)
                     emitU16(UInt16(argc))
@@ -5969,6 +6024,7 @@ final class JeffJSParser {
                     emitCallConstructor(argc)
                 }
             } else {
+                emitExprSpan(newStart, s.lastPtr)
                 emitCallConstructor(0)
             }
         } else {
@@ -7184,6 +7240,8 @@ final class JeffJSParser {
                 emitOp(.put_array_el) // pops [obj, key, value] -> [obj]
             } else {
                 parseAssignExpr()
+                // ES §13.2.5.5: `{ m: function(){} }` names the function "m".
+                emitNamedEvaluation(propAtom)
                 emitDefineField(propAtom)
             }
         } else if tok == 0x28 { // '(' -- method shorthand

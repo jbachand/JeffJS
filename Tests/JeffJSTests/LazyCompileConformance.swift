@@ -275,7 +275,9 @@ extension JeffJSTestRunner {
                 let (_, ctx) = makeCtx()
                 ctx.rt.lazyFunctions = lazy
                 let before = ctx.rt.lazyStats
-                let result = ctx.eval(input: js, filename: "<eval><\(group)>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+                // (".js": a URL-like name, so stack frames print their line:column;
+                // the `<eval>` prefix still keeps the run out of the cache.)
+                let result = ctx.eval(input: js, filename: "<eval><\(group)>.js", evalFlags: JS_EVAL_TYPE_GLOBAL)
                 if result.isException {
                     let exc = ctx.getException()
                     assert(false, "\(group): \(label) threw \(ctx.toSwiftString(exc) ?? "?")")

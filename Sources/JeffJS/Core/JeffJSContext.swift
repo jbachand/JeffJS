@@ -59,6 +59,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// explicitly by free() and teardown().
     var rt: JeffJSRuntime
 
+    /// A TypeError waiting for the source text of the instruction that raised
+    /// it (JSC's source appender, see JeffJSErrorText.swift).
+    var pendingSourceAppender: JeffJSSourceAppender? = nil
+
     /// Lazily created private atom used as the hidden key for class private
     /// brands (see `privateBrandKeyAtom()`); 0 until first use.
     var privateBrandAtom: UInt32 = 0
@@ -2001,7 +2005,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             return result
         }
         if val.isSymbol {
-            return throwTypeError(message: "Cannot convert a Symbol value to a string")
+            return throwTypeError(message: "Cannot convert a symbol to a string")
         }
         if val.isBigInt {
             return newStringValue(JeffJSBigIntOps.toSwiftString(val))
@@ -2112,7 +2116,18 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             }
         }
 
-        return JeffJSValue.makeObject(obj)
+        // The builtins read a wrapper's primitive from [[ObjectData]] (the
+        // payload), as the constructors store it (`new String(s)` sets both
+        // slots to the same reference). Without it `Object('abc')` — and every
+        // boxed `this` of a sloppy call — failed String.prototype.toString /
+        // valueOf, Number.prototype.toFixed, ... with "requires that 'this'
+        // be a String".
+        obj.payload = .objectData(obj.primitiveValue)
+        let wrapper = JeffJSValue.makeObject(obj)
+        if val.isString, let str = val.stringValue {
+            _ = definePropertyValue(wrapper, name: "length", value: .newInt32(Int32(str.len)), flags: 0)
+        }
+        return wrapper
     }
 
     /// Converts a JS value to a Swift String.
@@ -3237,9 +3252,13 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // Without this freeValue, each eval leaks ~200B of bytecode + cpool.
         funcVal.freeValue()
 
-        // Drain microtask queue (promise reactions) after eval,
-        // matching browser/QuickJS behavior.
-        _ = rt.executePendingJobs()
+        // Drain the microtask queue after a host-level evaluation (a script
+        // is a task; HTML "perform a microtask checkpoint" once the JS stack
+        // is empty). Not after an eval called *from* JS — `(0, eval)(s)`,
+        // `new Function` bodies, direct-eval fallbacks: reactions must not
+        // run in the middle of the calling script (JSC/V8 run them after it
+        // returns; a stack captured inside one used to show the caller).
+        if callDepth == 0 { _ = rt.executePendingJobs() }
 
         return result
     }
@@ -4699,7 +4718,8 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 // The identifier that produced the undefined value belongs in
                 // the error's `stack`, not glued onto its message.
                 jeffJS_dumpLastOps(self)
-                return throwTypeError(message: "Cannot read properties of \(obj.isNull ? "null" : "undefined") (reading '\(atomStr)')")
+                _ = atomStr
+                return throwNotAnObject(obj)
             }
             return .JS_UNDEFINED
         }
@@ -4893,14 +4913,14 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             // mode too (ES §13.15.2 / PutValue step 5) — `o.m.n = 1` used to
             // fail silently and leave `e.message` undefined.
             if obj.isNullOrUndefined || (flags & JS_PROP_THROW) != 0 {
-                let propName = rt.atomToString(atom) ?? "?"
-                let desc: String
-                if obj.isUndefined { desc = "undefined" }
-                else if obj.isNull { desc = "null" }
-                else if obj.isInt { desc = "\(obj.toInt32())" }
-                else if obj.isBool { desc = obj.toBool() ? "true" : "false" }
-                else { desc = "\(obj.tag)" }
-                _ = throwTypeError(message: "Cannot set properties of \(desc) (setting '\(propName)')")
+                // JSC's wording: a nullish base "is not an object" (completed with
+                // the assignment's source when the interpreter has it), a
+                // strict-mode write to a primitive's property is a read-only one.
+                if obj.isNullOrUndefined {
+                    _ = throwNotAnObject(obj)
+                } else {
+                    _ = throwTypeError(message: "Attempted to assign to readonly property.")
+                }
             }
             value.freeValue()
             return -1
@@ -5181,7 +5201,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// Snapshot the live activation chain: (function bytecode, pc) per frame.
     /// This is all `stack` needs, and it costs one small array instead of
     /// formatting a multi-line string on every `new Error()`.
-    func captureStackFrames(maxDepth: Int = 16) -> [(fb: JeffJSFunctionBytecode, pc: Int)] {
+    func captureStackFrames(maxDepth: Int = 100) -> [(fb: JeffJSFunctionBytecode, pc: Int)] {
         var out: [(fb: JeffJSFunctionBytecode, pc: Int)] = []
         out.reserveCapacity(8)
         var frame = currentFrame
@@ -5216,45 +5236,70 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                                 flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
     }
 
-    /// Render captured frames as "Name: message" + one "    at fn (file:line:col)"
-    /// line per frame.
+    /// Render captured frames the way JavaScriptCore does (Safari, WKWebView):
+    /// no "Name: message" header, one `functionName@sourceURL:line:column` line
+    /// per frame, innermost first. Top-level code is `global code` / `eval
+    /// code`, an anonymous function the empty string, a function literal
+    /// named by its binding (`var U = function(){}`) that name. Code without a
+    /// source URL (eval, `new Function`, and the placeholder names this engine
+    /// gives unnamed sources — `<eval>`, `<input>`, `<inline>`, ...) prints
+    /// just `functionName@`. Scripts read and fingerprint this string (Google's
+    /// anti-abuse challenge folds `message + ":" + stack` of a provoked
+    /// TypeError into its token), so it must match JSC's, not V8's.
     func formatStackTrace(errorName: String, message: String,
                           frames: [(fb: JeffJSFunctionBytecode, pc: Int)]) -> String {
-        var lines: [String] = [message.isEmpty ? errorName : "\(errorName): \(message)"]
+        var lines: [String] = []
+        lines.reserveCapacity(frames.count)
         for (fbBase, rawPC) in frames {
             // A bytecode-cache hit hands back a plain JeffJSFunctionBytecode:
             // no pc2line/pc2col tables, but the function's own line, column,
-            // file and name atom survive the round trip, so the frame is
-            // still worth printing (skipping it left `stack` as a bare
-            // header whenever the cache was warm).
+            // file and name atom survive the round trip.
             let fbc = fbBase as? JeffJSFunctionBytecodeCompiled
             let pc = fbBase.bytecodeLen > 0 ? max(0, min(rawPC, fbBase.bytecodeLen - 1)) : 0
-            var lineNum = (fbc?.debugPc2lineBuf.isEmpty ?? true) ? 0 : fbc!.lineForPC(pc)
-            var colNum = (fbc?.debugPc2colBuf.isEmpty ?? true) ? 0 : fbc!.colForPC(pc)
-            if lineNum <= 0 { lineNum = fbBase.lineNum }
-            if colNum <= 0 { colNum = fbBase.colNum }
             let filename: String
             if let c = fbc?.cachedDebugFilename { filename = c }
             else {
                 filename = (fbc?.debugFilenameAtom ?? 0) != 0
-                    ? (rt.atomToString(fbc!.debugFilenameAtom) ?? "<unknown>")
-                    : (fbBase.fileName?.toSwiftString() ?? "<anonymous>")
+                    ? (rt.atomToString(fbc!.debugFilenameAtom) ?? "")
+                    : (fbBase.fileName?.toSwiftString() ?? "")
                 fbc?.cachedDebugFilename = filename
             }
-            let funcName: String
+            var funcName: String
             if let c = fbc?.cachedFuncName { funcName = c }
             else {
                 let nameAtom = (fbc?.funcNameAtom ?? 0) != 0 ? fbc!.funcNameAtom : fbBase.nameAtom
                 funcName = nameAtom != 0 ? (rt.atomToString(nameAtom) ?? "") : ""
                 fbc?.cachedFuncName = funcName
             }
-            let location: String
-            if lineNum > 0 && colNum > 0 { location = "\(filename):\(lineNum):\(colNum)" }
-            else if lineNum > 0 { location = "\(filename):\(lineNum)" }
-            else { location = filename }
-            lines.append("    at \(funcName.isEmpty ? "<anonymous>" : funcName) (\(location))")
+            if funcName.isEmpty {
+                if fbBase.isTopLevelCode {
+                    funcName = fbBase.isDirectOrIndirectEval ? "eval code" : "global code"
+                } else if let inferred = fbBase.inferredName {
+                    funcName = inferred
+                }
+            }
+            let sourceURL = JeffJSContext.stackSourceURL(filename)
+            if sourceURL.isEmpty {
+                lines.append("\(funcName)@")
+                continue
+            }
+            var lineNum = (fbc?.debugPc2lineBuf.isEmpty ?? true) ? 0 : fbc!.lineForPC(pc)
+            var colNum = (fbc?.debugPc2colBuf.isEmpty ?? true) ? 0 : fbc!.colForPC(pc)
+            if lineNum <= 0 { lineNum = fbBase.lineNum }
+            if colNum <= 0 { colNum = fbBase.colNum }
+            if lineNum > 0 && colNum > 0 { lines.append("\(funcName)@\(sourceURL):\(lineNum):\(colNum)") }
+            else { lines.append("\(funcName)@\(sourceURL)") }
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// The source URL a stack frame shows: the script's name, or "" for code
+    /// that has none (JSC prints `name@` then). This engine names unnamed
+    /// sources `<eval>`, `<input>`, `<inline>`, `<anonymous>`, ... — those are
+    /// placeholders, not URLs.
+    static func stackSourceURL(_ filename: String) -> String {
+        if filename.isEmpty || (filename.hasPrefix("<") && filename.hasSuffix(">")) { return "" }
+        return filename
     }
 
     func buildStackTrace(errorName: String, message: String,

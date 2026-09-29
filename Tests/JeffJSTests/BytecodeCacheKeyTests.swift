@@ -82,7 +82,9 @@ final class BytecodeCacheKeyTests: XCTestCase {
         [
             ("this", "(function () { return this === undefined ? 'undefined-this' : 'global-this'; })()"),
             ("delete-unqualified", "var r; try { r = delete Object; } catch (e) { r = 'threw'; } String(r)"),
-            ("implicit-global", "try { bccUndeclaredProbe = 1; 'assigned' } catch (e) { 'threw' }"),
+            // (Deletes the global it made: a strict run after a sloppy one in the
+            // same runtime would otherwise find the binding and assign legitimately.)
+            ("implicit-global", "try { bccUndeclaredProbe = 1; delete globalThis.bccUndeclaredProbe; 'assigned' } catch (e) { 'threw' }"),
         ]
     }
 
