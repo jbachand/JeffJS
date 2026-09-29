@@ -1394,7 +1394,7 @@ final class JeffJSBytecodeCache {
     /// blobs written by another one, even when nobody bumped
     /// `compilerVersion`. `BytecodeCacheBudgetTests.testEngineSourceHashIsCurrent`
     /// fails when it is stale; `Scripts/update_bytecode_identity.sh` rewrites it.
-    static let engineSourceHash: UInt64 = 0xe974b3538168c1e3 // bytecode-identity
+    static let engineSourceHash: UInt64 = 0xa4918e0837d7e352 // bytecode-identity
 
     /// The engine build identity: `compilerVersion`, the blob and entry
     /// layouts, `engineSourceHash`, and the opcode table the interpreter
@@ -1729,7 +1729,8 @@ final class JeffJSBytecodeCache {
     // JS (main) thread: the app's per-frame `<native-*>` glue evals cost 137 of
     // 304 ms of one apple.com scroll's JS time in parse + compile + disk write.
     // Now: (1) a source with a host pseudo-filename (`<...>`: glue, inline
-    // handlers, evals) is written only on its *second* sighting in the process
+    // handlers, evals — not `<inline…>` page scripts) is written only on its
+    // *second* sighting in the process
     // (keyed by the content hash, like a JIT's warm-up) — a one-shot text is not
     // worth a file; script URLs are still written on the first, so the next
     // launch hits as before; (2) the write runs on a serial background queue;
@@ -1758,7 +1759,10 @@ final class JeffJSBytecodeCache {
 
     private func diskWriteRefusal(key: JeffJSBytecodeCacheKey, filename: String?, bytes: Int) -> String? {
         if Self.writeSync { return nil }
-        if let filename, filename.hasPrefix("<") {
+        // Page content evaluated under a pseudo-name (the host's `<inline>` /
+        // `<inline-script>` for inline <script>s) is as stable across launches
+        // as a script URL: written on the first sighting like one.
+        if let filename, filename.hasPrefix("<"), !filename.hasPrefix("<inline") {
             Self.policyLock.lock()
             let seen = Self.sightings.contains(key.hash)
             if !seen {

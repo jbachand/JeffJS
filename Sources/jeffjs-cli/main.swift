@@ -164,6 +164,19 @@ let status: Int32 = MainActor.assumeIsolated {
             line("burst")
         }
     }
+    // --glue-evals=N: N distinct host-glue evals (filename <native-event>, the
+    // app's per-event dispatch text), timed on this thread.
+    if let g = args.first(where: { $0.hasPrefix("--glue-evals=") }).flatMap({ Int($0.dropFirst(13)) }) {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let salt = Int(t0 * 1000) % 1_000_000   // distinct texts per run
+        for i in 0..<g {
+            _ = env.eval("if (typeof globalThis.__nativeDispatchAnimationEvent === 'function') { globalThis.__nativeDispatchAnimationEvent(null, 'animationiteration', 'pulse\(salt)', \(i).25); } var __nativeEventTarget = null;",
+                         filename: "<native-event>")
+        }
+        print(String(format: "[glue] %d evals %.1f ms (%.3f ms each)", g, (CFAbsoluteTimeGetCurrent() - t0) * 1000,
+                     (CFAbsoluteTimeGetCurrent() - t0) * 1000 / Double(max(g, 1))))
+    }
+    if args.contains("--cache-stats") { print("[cache] " + env.bytecodeCacheDescription) }
     env.flushBytecodeCache()
     // --teardown exercises context/runtime free (the path the test suite runs
     // between groups); the CLI otherwise leaves it to process exit.
