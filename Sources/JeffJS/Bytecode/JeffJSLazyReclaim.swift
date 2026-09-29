@@ -96,18 +96,26 @@ enum JeffJSLazyPressureObserver {
         for name in ["UIApplicationDidReceiveMemoryWarningNotification",
                      "UIApplicationDidEnterBackgroundNotification"] {
             NotificationCenter.default.addObserver(forName: Notification.Name(name), object: nil,
-                                                   queue: nil) { _ in
-                jeffJS_lazyPressureGeneration.add(1, ordering: .relaxed)
-            }
+                                                   queue: nil) { _ in noteEvent(name) }
         }
         let src = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
-        src.setEventHandler { jeffJS_lazyPressureGeneration.add(1, ordering: .relaxed) }
+        src.setEventHandler { noteEvent("memory pressure source") }
         src.activate()
         source = src
+        if JeffJSConfig.lazyDropDebug {
+            FileHandle.standardError.write(Data("[jeffjs:reclaim] memory-warning / background / memory-pressure observers installed\n".utf8))
+        }
         return true
     }()
 
     static func installOnce() { _ = installed }
+
+    private static func noteEvent(_ what: String) {
+        jeffJS_lazyPressureGeneration.add(1, ordering: .relaxed)
+        if JeffJSConfig.lazyDropDebug {
+            FileHandle.standardError.write(Data("[jeffjs:reclaim] \(what): drop at the next idle tick\n".utf8))
+        }
+    }
 
     /// What a memory warning does, for hosts and tests: every runtime with
     /// `compile.lazyDropOnMemoryPressure` reclaims at its next idle tick.
