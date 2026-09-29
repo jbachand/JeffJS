@@ -1168,8 +1168,14 @@ extension JeffJSContext {
         obj.payload = .bytecodeFunc(functionBytecode: innerFB, varRefs: childVarRefs, homeObject: nil)
         // A lazy function whose body is not compiled yet keeps fbFast nil:
         // every call path then reaches callInternal's payload path, which
-        // compiles it (JeffJSCompiler.compileLazy) and sets fbFast.
-        if !innerFB.isLazyPending { obj.fbFast = innerFB }
+        // compiles it (JeffJSCompiler.compileLazy) and sets fbFast. A
+        // compiled one is stamped in use: the idle reclaim must not drop a
+        // body that a function object reaches through fbFast.
+        if let li = innerFB.lazyInfo {
+            if !li.isPending { obj.fbFast = innerFB; li.touch = rt.lazyReclaimPhase }
+        } else {
+            obj.fbFast = innerFB
+        }
         obj.varRefsFast = childVarRefs
 
         // Arrow functions capture the enclosing function's `this` value
@@ -7016,7 +7022,9 @@ struct JeffJSInterpreter {
                !JeffJSCompiler.compileLazy(ctx: ctx, fbFromPayload) {
                 return .exception
             }
-            // Backfill the fast fields for the next call
+            // Backfill the fast fields for the next call (a lazily compiled
+            // body is in use again: see JeffJSLazyReclaim.swift).
+            if let li = fbFromPayload.lazyInfo { li.touch = ctx.rt.lazyReclaimPhase }
             obj.fbFast = fbFromPayload
             obj.varRefsFast = varRefs
             fb0 = fbFromPayload

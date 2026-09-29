@@ -169,6 +169,14 @@ extension JeffJSTestRunner {
         let group = "LazyCompile"
         JeffJSStackDiag.currentLabel = "\(group): reclaim"
         let (rt, ctx) = makeCtx()
+        // Explicit cycles only (a JEFFJS_COMPILE_LAZYDROPAFTERMS run would
+        // start its own between the evals below). The runtime is shared by
+        // the whole suite: restore its settings, finish any cycle in flight.
+        let savedDrop = rt.lazyDropAfterMs, savedPressure = rt.lazyDropOnMemoryPressure
+        rt.lazyDropAfterMs = 0
+        rt.lazyDropOnMemoryPressure = false
+        defer { rt.lazyDropAfterMs = savedDrop; rt.lazyDropOnMemoryPressure = savedPressure }
+        if rt.lazyReclaimCycle != nil { rt.reclaimIdleLazyBodies() }
         func run(_ js: String) -> String {
             let r = ctx.eval(input: js, filename: "<eval><\(group)-reclaim>", evalFlags: JS_EVAL_TYPE_GLOBAL)
             if r.isException {
@@ -203,6 +211,57 @@ extension JeffJSTestRunner {
         let c1 = rt.lazyStats.compiled
         let third = run("__lcR.f(4) + __lcR.g(3)")
         assert(third == "12" && rt.lazyStats.compiled - c1 == 1, "\(group): f kept, g recompiled -> \(third)")
+
+        // A dropped body keeps its nested functions: closures made before the
+        // drop and after the recompile share one (compiled once).
+        let nested = run("""
+            var __lcN = function(k){ function inner(x){ return x + k; } return inner; };
+            var __lcN1 = __lcN(1); '' + __lcN1(1)
+            """)
+        assert(nested == "2", "\(group): nested setup -> \(nested)")
+        rt.reclaimIdleLazyBodies()
+        rt.reclaimIdleLazyBodies()
+        rt.reclaimIdleLazyBodies()                       // __lcN and inner dropped
+        let c2 = rt.lazyStats.compiled
+        let nestedAfter = run("var __lcN2 = __lcN(10); '' + __lcN1(2) + ',' + __lcN2(2) + ',' + __lcN1(3)")
+        assert(nestedAfter == "3,12,4" && rt.lazyStats.compiled - c2 == 2,
+               "\(group): nested function shared across a recompile (\(nestedAfter), compiled \(rt.lazyStats.compiled - c2))")
+
+        // Periodic reclaim in idle-tick slices: bodies idle for an interval
+        // are dropped, the one that keeps running is not, results unchanged.
+        _ = run("""
+            var __lcT = { a: function(x){ return x + 1; }, b: function(x){ return x * 3; },
+                          hot: function(x){ return x - 1; } };
+            __lcT.a(1) + __lcT.b(1) + __lcT.hot(1)
+            """)
+        rt.lazyDropAfterMs = 20
+        let d2 = rt.lazyStats.dropped, cy0 = rt.lazyStats.reclaimCycles
+        var hot = ""
+        for _ in 0 ..< 60 {
+            usleep(10_000)
+            hot = run("'' + __lcT.hot(5)")                // an idle tick, and a call
+        }
+        rt.lazyDropAfterMs = 0
+        assert(hot == "4" && rt.lazyStats.reclaimCycles - cy0 >= 3 && rt.lazyStats.dropped - d2 >= 2,
+               "\(group): sliced reclaim (\(hot), cycles \(rt.lazyStats.reclaimCycles - cy0), dropped \(rt.lazyStats.dropped - d2))")
+        let c3 = rt.lazyStats.compiled
+        let afterTicks = run("'' + __lcT.a(1) + __lcT.b(2) + __lcT.hot(3)")
+        assert(afterTicks == "262" && rt.lazyStats.compiled - c3 == 2,
+               "\(group): idle ones recompiled, hot one kept (\(afterTicks), compiled \(rt.lazyStats.compiled - c3))")
+
+        // Memory pressure (a UIKit memory warning, by name): the next idle
+        // tick drops every droppable body, hot ones included.
+        rt.lazyDropOnMemoryPressure = true
+        _ = run("0")                                     // installs the observers
+        let d3 = rt.lazyStats.dropped
+        NotificationCenter.default.post(name: Notification.Name("UIApplicationDidReceiveMemoryWarningNotification"),
+                                        object: nil)
+        _ = run("0")                                     // idle tick serves it
+        rt.lazyDropOnMemoryPressure = false
+        let c4 = rt.lazyStats.compiled
+        let afterPressure = run("'' + __lcT.hot(9)")
+        assert((rt.lazyStats.dropped - d3 >= 1 || JeffJSConfig.lazyDropStress) && afterPressure == "8" && rt.lazyStats.compiled - c4 == 1,
+               "\(group): memory pressure drops hot bodies (dropped \(rt.lazyStats.dropped - d3), \(afterPressure), compiled \(rt.lazyStats.compiled - c4))")
     }
 
     mutating func testLazyCompile() {

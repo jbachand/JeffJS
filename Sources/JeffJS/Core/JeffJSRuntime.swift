@@ -596,6 +596,19 @@ final class JeffJSRuntime {
     /// `compile.lazyDropAfterMs` (0 = off) and when the idle reclaim last ran.
     var lazyDropAfterMs: Int = JeffJSConfig.lazyDropAfterMs
     var lazyLastReclaim: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
+    /// `compile.lazyDropOnMemoryPressure`: a memory warning / backgrounding
+    /// drops every idle-droppable body at the next idle tick.
+    var lazyDropOnMemoryPressure: Bool = JeffJSConfig.lazyDropOnMemoryPressure || JeffJSConfig.lazyDropStress
+    /// Reclaim clock (JeffJSLazyReclaim.swift): odd while a cycle runs, even
+    /// between cycles; the cycle in progress; when its last slice ran; the
+    /// memory-pressure generation this runtime has served.
+    var lazyReclaimPhase: Int = 0
+    var lazyReclaimCycle: JeffJSLazyReclaimCycle? = nil
+    var lazyReclaimLastSlice: CFAbsoluteTime = 0
+    var lazyReclaimLastTick: CFAbsoluteTime = 0
+    /// lazyStats.compiled / compileMs at the previous cycle's end (debug line).
+    var lazyReclaimCompiledMark: (count: Int, ms: Double) = (0, 0)
+    var lazyPressureServed: Int = 0
 
     // MARK: - Stack Checking
 
