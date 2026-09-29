@@ -227,6 +227,9 @@ class JeffJSFunctionDefCompiler {
     /// A parameter (plain, rest or inside a pattern) is named `arguments`.
     var paramNamedArguments: Bool = false
     var isDerivedClassConstructor: Bool = false
+    /// A class constructor (base or derived): its body starts with
+    /// `check_ctor`, so [[Call]] without `new` throws (ES §10.2.1 step 2).
+    var isClassConstructor: Bool = false
     /// Base-class constructor: run the instance field initializers before the
     /// body (a derived constructor runs them right after `super()` returns).
     var emitFieldInitAtBodyStart: Bool = false

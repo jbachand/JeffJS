@@ -275,8 +275,10 @@ extension JeffJSParser {
             fd.childFunctions.append(defaultCtorFd)
             cf.ctorFd = defaultCtorFd
 
+            defaultCtorFd.isClassConstructor = true
             let savedFd = fd
             fd = defaultCtorFd
+            emitOp(.check_ctor)          // [[Call]] of a class constructor throws
             if hasExtends {
                 // constructor(...args) { super(...args); }
                 // `this` is uninitialised until super() returns (QuickJS
@@ -606,6 +608,7 @@ extension JeffJSParser {
             }
             if isConstructor {
                 methodFd.newTargetAllowed = true
+                methodFd.isClassConstructor = true
                 methodFd.funcName = className
                 if hasExtends {
                     methodFd.isDerivedClassConstructor = true

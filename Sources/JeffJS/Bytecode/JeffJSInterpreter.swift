@@ -8793,7 +8793,13 @@ struct JeffJSInterpreter {
 
             case .check_ctor:
                 if mFlags & JS_CALL_FLAG_CONSTRUCTOR == 0 {
-                    _ = ctx.throwTypeError(message: "class constructor cannot be called without 'new'")
+                    // JavaScriptCore's wording (the app presents a Safari UA):
+                    // the class's own name from its head, none for an anonymous
+                    // class even when NamedEvaluation named it.
+                    let nm = fb.nameAtom != 0 ? (ctx.rt.atomToString(fb.nameAtom) ?? "") : ""
+                    _ = ctx.throwTypeError(message: nm.isEmpty
+                        ? "Cannot call a class constructor without |new|"
+                        : "Cannot call a class constructor \(nm) without |new|")
                     retVal = .exception
                     break dispatchLoop
                 }

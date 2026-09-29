@@ -329,6 +329,7 @@ struct JeffJSTestRunner {
             ("StringIterator", { $0.testStringIterator() }),
             ("AggregateError", { $0.testAggregateError() }),
             ("NamedEvaluation", { $0.testNamedEvaluation() }),
+            ("ClassConstructorCall", { $0.testClassConstructorCall() }),
         ]
     }
 

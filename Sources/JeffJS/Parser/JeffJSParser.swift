@@ -3864,6 +3864,13 @@ final class JeffJSParser {
         inFlag = true // FunctionBody always uses [+In] per ECMAScript spec
         fd = childFd
 
+        // A class constructor called without `new` throws before anything
+        // else runs — parameter initializers and field initializers included
+        // (ES §10.2.1 [[Call]] step 2; QuickJS OP_check_ctor).
+        if fd.isClassConstructor {
+            emitOp(.check_ctor)
+        }
+
         // Check for "use strict" directive
         if tok == JSTokenType.TOK_STRING.rawValue && s.token.strValue == "use strict" {
             fd.jsMode |= JS_MODE_STRICT
