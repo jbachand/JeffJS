@@ -301,7 +301,7 @@ extension JeffJSContext {
             return JeffJSValue.newFloat64(d)
         }
         if v.isSymbol {
-            return throwTypeError(message: "Cannot convert a Symbol value to a number")
+            return throwTypeError(message: "Cannot convert a symbol to a number")
         }
         let (d, ok) = JeffJSTypeConvert.toNumber(ctx: self, val: v)
         if !ok { return .exception }

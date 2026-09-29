@@ -452,6 +452,11 @@ final class JeffJSRuntime {
         // enterInlineFrame set curFunc, thisVal, argCount, varCount and the
         // buf* fields on every use. This runs on every inline return.
         u._withUnsafeGuaranteedRef { frame in
+            if frame.ownsThis {
+                frame.thisVal.freeValue()
+                frame.thisVal = .undefined
+                frame.ownsThis = false
+            }
             if !frame.newTarget.isUndefined { frame.newTarget = .undefined }
             frame.curPC = 0
             frame.buf = nil

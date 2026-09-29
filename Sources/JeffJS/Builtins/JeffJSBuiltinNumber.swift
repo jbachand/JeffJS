@@ -97,7 +97,7 @@ extension JeffJSContext {
             d = val.toFloat64()
         } else {
             if val.isBigInt { return throwTypeError(message: "Cannot convert a BigInt value to a number") }
-            if val.isSymbol { return throwTypeError(message: "Cannot convert a Symbol value to a number") }
+            if val.isSymbol { return throwTypeError(message: "Cannot convert a symbol to a number") }
             let (n, ok) = JeffJSTypeConvert.toNumber(ctx: self, val: val)
             if !ok { return .exception }
             d = n

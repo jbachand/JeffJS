@@ -445,6 +445,15 @@ class JeffJSFunctionBytecode {
     var hasDebug: Bool = false
     var backtrace: Bool = false
     var readOnly: Bool = false
+    /// A script's (or eval's) top-level code: `Error.stack` names its frame
+    /// `global code` / `eval code`, as JavaScriptCore does.
+    var isTopLevelCode: Bool = false
+    /// The name an anonymous function literal got from its binding
+    /// (`var U = function(){}` → "U", ES SetFunctionName via `set_name`),
+    /// recorded the first time `set_name` runs on one of its closures.
+    /// `Error.stack` frames use it (JSC's ecmaName), never the bytecode's
+    /// own name, which would create a self-binding.
+    var inferredName: String? = nil
 
     // Call-path caches: callInternal used to discover these via
     // `as? JeffJSFunctionBytecodeCompiled` — two dynamic casts per call.
@@ -1377,6 +1386,11 @@ final class JeffJSStackFrame {
     var bufArraysLive: Bool = false
     var curFunc: JeffJSValue          = .undefined
     var thisVal: JeffJSValue          = .undefined
+    /// `thisVal` is a wrapper object this frame created (a sloppy-mode
+    /// function called with a primitive `this`, ES §10.2.1.2 step 6.b:
+    /// ToObject(thisArgument)); released with the frame. Callers pass
+    /// `this` borrowed, so only the boxed copy is owned.
+    var ownsThis: Bool                = false
     var newTarget: JeffJSValue        = .undefined
     var curPC: Int                    = 0
     var argBuf: [JeffJSValue]         = []

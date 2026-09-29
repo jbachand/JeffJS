@@ -94,7 +94,8 @@ final class BytecodeCacheLazyTests: XCTestCase {
 
             let rtW = JeffJSRuntime()
             let ctxW = JeffJSContext(rt: rtW)
-            guard let fb = compile(src, ctx: ctxW, filename: "<lazy-blob>") else {
+            // A URL-like name: `<...>` placeholders print no line:column in stacks (JSC format).
+            guard let fb = compile(src, ctx: ctxW, filename: "lazy-blob.js") else {
                 XCTFail("compile failed: \(src.prefix(80))")
                 continue
             }

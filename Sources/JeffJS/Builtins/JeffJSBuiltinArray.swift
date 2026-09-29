@@ -132,7 +132,7 @@ struct JeffJSBuiltinArray {
 
                 // If the uint32 value does not match the number value, it is not a valid length
                 if Double(lenVal) != dval {
-                    return ctx.throwRangeError(message: "Invalid array length")
+                    return ctx.throwRangeError(message: "Array length must be a positive integer of safe magnitude.")
                 }
 
                 ctx.setArrayLength(arr, Int64(lenVal))

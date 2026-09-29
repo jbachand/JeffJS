@@ -673,6 +673,7 @@ nonisolated public final class JeffJSMemoryCookieJar: JeffJSCookieJar, @unchecke
 /// `typeof document.cookie !== 'string'` then leaves it alone.
 @MainActor
 final class JeffJSCookieBridge {
+    nonisolated static let debug = ProcessInfo.processInfo.environment["JEFFJS_COOKIE_DEBUG"] == "1"
     let jar: any JeffJSCookieJar
     var documentURL: () -> URL?
 
@@ -694,7 +695,17 @@ final class JeffJSCookieBridge {
         let setter = ctx.newCFunction({ [weak self] ctx, _, args in
             guard let self, let url = self.documentURL() else { return JeffJSValue.undefined }
             let s = ctx.toSwiftString(args.first ?? .undefined) ?? ""
+            let before = JeffJSCookieBridge.debug ? self.jar.documentCookie(for: url).utf8.count : 0
             self.jar.setDocumentCookie(s, for: url)
+            if JeffJSCookieBridge.debug {
+                // JEFFJS_COOKIE_DEBUG=1: what a page's write did (Google's
+                // challenge only writes when document.cookie.length +
+                // the new cookie stays under 4093, then reads it back).
+                let name = s.split(separator: "=", maxSplits: 1).first.map(String.init) ?? ""
+                let after = self.jar.documentCookie(for: url)
+                let visible = after.split(separator: ";").contains { $0.trimmingCharacters(in: .whitespaces).hasPrefix(name + "=") }
+                print("[DocCookie] set \(name) len=\(s.utf8.count) url=\(url.absoluteString.prefix(80)) before=\(before) after=\(after.utf8.count) visible=\(visible)")
+            }
             return JeffJSValue.undefined
         }, name: "set cookie", length: 1)
         ctx.setPropertyGetSet(obj: doc, name: "cookie", getter: getter, setter: setter)

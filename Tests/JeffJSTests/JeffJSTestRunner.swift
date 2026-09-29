@@ -12944,47 +12944,98 @@ extension JeffJSTestRunner {
             d.x === 1 && d.y === 2 && d instanceof Base6 && Object.keys(Der6).length === 0
         """, expect: true)
 
-        // --- 8. Error stacks and error messages ----------------------------
-        // `stack` was just the header: rt.currentStackFrame, which
-        // buildBacktrace walked, is never assigned. It now walks the live
-        // interpreter chain (ctx.currentFrame).
-        // (Written without `.*` — the regexp engine mis-backtracks a greedy
-        // dot-star followed by a literal, which is a separate pre-existing bug.)
+        // --- 8. Error stacks and error messages (JavaScriptCore's format) ---
+        // `stack` is JSC's: no "Name: message" header, one `name@url:line:col`
+        // per frame (just `name@` for code without a URL — eval, the test
+        // harness's `<...>` placeholder names), `global code` for top-level
+        // code. Pages fingerprint this (Google's challenge VM folds
+        // `message + ":" + stack` into its token).
         evalCheckBool(ctx, """
             function inner8() { return new Error('boom').stack; }
             function outer8() { return inner8(); }
             var lines = outer8().split('\\n');
             function frameOK(line, name) {
-                return line.indexOf('    at ' + name + ' (') === 0 &&
-                       /:[0-9]+:[0-9]+\\)$/.test(line);
+                return line === name + '@' ||
+                       (line.indexOf(name + '@') === 0 && /:[0-9]+:[0-9]+$/.test(line));
             }
-            lines[0] === 'Error: boom' && lines.length >= 3 &&
-            frameOK(lines[1], 'inner8') && frameOK(lines[2], 'outer8')
+            lines.length >= 3 && frameOK(lines[0], 'inner8') &&
+            frameOK(lines[1], 'outer8') && frameOK(lines[2], 'global code')
         """, expect: true)
         // A thrown builtin error carries frames too.
         evalCheckBool(ctx, """
             function thrower8() { null.x; }
             var ok = false;
             try { thrower8(); } catch (e) {
-                var l = e.stack.split('\\n')[1];
-                ok = l.indexOf('    at thrower8 (') === 0 && /:[0-9]+:[0-9]+\\)$/.test(l);
+                var l = e.stack.split('\\n')[0];
+                ok = l === 'thrower8@' || l.indexOf('thrower8@') === 0;
             }
             ok
         """, expect: true)
-        // Messages name the property actually being read — the old heuristic
-        // appended the last unrelated get_field atom
-        // ("'navigator.x' is undefined") and a " at file:line" suffix.
+        // An anonymous function literal is named by its binding in stacks
+        // (JSC ecmaName), assignment and object-literal forms included.
+        evalCheckStr(ctx, """
+            var A8 = function() { throw new Error('a'); };
+            var B8; B8 = function() { return A8(); };
+            var o8n = { m: function() { return B8(); } };
+            var r8 = '';
+            try { o8n.m(); } catch (e) {
+                r8 = e.stack.split('\\n').slice(0, 3).map(function(l) { return l.split('@')[0]; }).join(',');
+            }
+            r8 + '|' + A8.name + B8.name + o8n.m.name
+        """, expect: "A8,B8,m|A8B8m")
+        // Messages quote the source of the failing access, as JSC's do.
         evalCheckStr(ctx, "var u8; try { u8.x; } catch (e) { e.message }",
-                     expect: "Cannot read properties of undefined (reading 'x')")
+                     expect: "undefined is not an object (evaluating 'u8.x')")
         evalCheckStr(ctx, "try { null.y; } catch (e) { e.message }",
-                     expect: "Cannot read properties of null (reading 'y')")
+                     expect: "null is not an object (evaluating 'null.y')")
         evalCheckStr(ctx, "var o8 = {}; try { o8.a.b; } catch (e) { e.message }",
-                     expect: "Cannot read properties of undefined (reading 'b')")
+                     expect: "undefined is not an object (evaluating 'o8.a.b')")
+        evalCheckStr(ctx, "var w8 = {}, b8 = 3; try { w8.C[b8]; } catch (e) { e.message }",
+                     expect: "undefined is not an object (evaluating 'w8.C[b8]')")
         // Writing through a null/undefined base throws in sloppy mode too.
         evalCheckStr(ctx, "var o8b = {}; try { o8b.m.n = 1; } catch (e) { e.message }",
-                     expect: "Cannot set properties of undefined (setting 'n')")
+                     expect: "undefined is not an object (evaluating 'o8b.m.n = 1')")
+        evalCheckStr(ctx, "var o8e = {}; try { o8e.a[1] = 2; } catch (e) { e.message }",
+                     expect: "undefined is not an object (evaluating 'o8e.a[1] = 2')")
         evalCheckStr(ctx, "var o8c = {}; try { o8c.nope(); } catch (e) { e.message }",
-                     expect: "undefined is not a function")
+                     expect: "o8c.nope is not a function. (In 'o8c.nope()', 'o8c.nope' is undefined)")
+        evalCheckStr(ctx, "var n8 = 5; try { n8(1, 2); } catch (e) { e.message }",
+                     expect: "n8 is not a function. (In 'n8(1, 2)', 'n8' is 5)")
+        evalCheckStr(ctx, "var s8 = 'q'; try { s8(); } catch (e) { e.message }",
+                     expect: "s8 is not a function. (In 's8()', 's8' is \"q\")")
+        evalCheckStr(ctx, "var ob8 = {}; try { ob8(); } catch (e) { e.message }",
+                     expect: "ob8 is not a function. (In 'ob8()', 'ob8' is an instance of Object)")
+        evalCheckStr(ctx, "var u8c; try { new u8c(); } catch (e) { e.message }",
+                     expect: "undefined is not a constructor (evaluating 'new u8c()')")
+        evalCheckStr(ctx, "try { missing8; } catch (e) { e.name + ': ' + e.message }",
+                     expect: "ReferenceError: Can't find variable: missing8")
+        // `delete` through a nullish base throws (ES §13.5.1.2, ToObject).
+        evalCheckStr(ctx, "var u8d; try { delete u8d.x; 'no throw' } catch (e) { e.message }",
+                     expect: "undefined is not an object (evaluating 'delete u8d.x')")
+        // Strict code: assigning an undeclared name is a ReferenceError.
+        evalCheckStr(ctx, "try { (function(){ 'use strict'; undeclared8 = 1; })(); 'no throw' } catch (e) { e.name + ': ' + e.message }",
+                     expect: "ReferenceError: Can't find variable: undeclared8")
+        // Symbols: a fresh symbol + a string literal threw after releasing
+        // the operand twice (crash); ToNumber(Symbol) is a TypeError.
+        evalCheckStr(ctx, "try { Symbol('d') + ''; 'no throw' } catch (e) { e.message }",
+                     expect: "Cannot convert a symbol to a string")
+        evalCheckStr(ctx, "try { Symbol('d') + 1; 'no throw' } catch (e) { e.message }",
+                     expect: "Cannot convert a symbol to a number")
+        // A sloppy function sees ToObject(this) (ES §10.2.1.2): the same
+        // wrapper for every read in one call.
+        evalCheckStr(ctx, """
+            function t8() { return typeof this + ':' + (this === this) + ':' + (this instanceof String); }
+            t8.call('x') + '|' + (function(){ 'use strict'; return typeof this; }).call('x') + '|' +
+            (function(){ return typeof this; }).call(5)
+        """, expect: "object:true:true|string|object")
+        // Promise reactions do not run inside an eval called from script.
+        evalCheckStr(ctx, """
+            var log8 = [];
+            Promise.resolve().then(function(){ log8.push('job'); });
+            (0, eval)('1');
+            log8.push('after');
+            log8.join(',')
+        """, expect: "after")
     }
 
     // =========================================================================

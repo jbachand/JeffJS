@@ -236,6 +236,12 @@ class JeffJSFunctionDefCompiler {
     var hasPrototype: Bool = false
     var needHomeObject: Bool = false
     var isDirectOrIndirectEval: Bool = false
+    /// Parsed by `parseProgram`: a script's or eval's top-level code.
+    var isProgramCode: Bool = false
+    /// Expression spans recorded during label resolution (pre-compaction
+    /// pcs): the source range of the member access / call / `new` whose
+    /// runtime error text quotes it (JSC's expression info).
+    var exprSpanEvents: [(pc: Int, start: Int32, end: Int32)] = []
     var newTargetAllowed: Bool = false
     var superCallAllowed: Bool = false
     var superAllowed: Bool = false
@@ -395,6 +401,11 @@ class JeffJSFunctionBytecodeCompiled: JeffJSFunctionBytecode {
     var debugPc2lineBuf: [UInt8] = []
     var debugPc2colLen: Int = 0
     var debugPc2colBuf: [UInt8] = []
+    /// Expression spans (JSC "expression info"): SLEB128 triples (pc delta,
+    /// start delta, length) giving, for a member access / call / `new`
+    /// instruction, the byte range of its source text in `sourceText`.
+    /// Decoded only when such an instruction throws (see `exprSpan(atPC:)`).
+    var debugExprSpans: [UInt8] = []
     /// Decoded pc->line / pc->column tables, built on first lookup.
     private var pc2lineTable: [(pc: Int32, value: Int32)]? = nil
     private var pc2colTable: [(pc: Int32, value: Int32)]? = nil
@@ -542,6 +553,45 @@ class JeffJSFunctionBytecodeCompiled: JeffJSFunctionBytecode {
             if pc > targetPC { break }
         }
         return max(1, col)
+    }
+
+    /// Encode expression spans (sorted by pc) into `debugExprSpans`.
+    static func encodeExprSpans(_ spans: [(pc: Int, start: Int32, end: Int32)]) -> [UInt8] {
+        guard !spans.isEmpty else { return [] }
+        var out = DynBuf()
+        var lastPC = 0
+        var lastStart: Int32 = 0
+        for s in spans.sorted(by: { $0.pc < $1.pc }) where s.end > s.start {
+            putSLEB128(&out, Int32(truncatingIfNeeded: s.pc - lastPC))
+            putSLEB128(&out, s.start &- lastStart)
+            putSLEB128(&out, s.end &- s.start)
+            lastPC = s.pc
+            lastStart = s.start
+        }
+        return out.toBytes()
+    }
+
+    /// The source text of the member access / call / `new` at `pc`, if the
+    /// compiler recorded one and the script text is still around.
+    func exprSpanText(atPC targetPC: Int) -> String? {
+        guard !debugExprSpans.isEmpty, let src = sourceText else { return nil }
+        var off = 0
+        var pc = 0
+        var start: Int32 = 0
+        let n = debugExprSpans.count
+        while off < n {
+            let (d, o1) = getSLEB128(debugExprSpans, off)
+            guard o1 < n else { break }
+            let (ds, o2) = getSLEB128(debugExprSpans, o1)
+            guard o2 < n || o2 == n else { break }
+            let (len, o3) = getSLEB128(debugExprSpans, o2)
+            off = o3
+            pc += Int(d)
+            start = start &+ ds
+            if pc == targetPC { return src.slice(start: Int(start), len: Int(len)) }
+            if pc > targetPC { break }
+        }
+        return nil
     }
 
     /// Extract source context around a given line (50 chars before/after the line start).
@@ -2196,6 +2246,11 @@ struct JeffJSCompiler {
         // Jumps are still label-based at this stage, so removing bytes is safe.
         var srcBuf: [UInt8] = []
         srcBuf.reserveCapacity(fd.byteCode.len)
+        // Expression spans (tagged line_num, see JeffJSParser.emitExprSpan) are
+        // stripped here with the NOPs, keyed by the srcBuf position of the
+        // instruction they describe, so the peephole window below never sees
+        // them between two ops it fuses.
+        var spanKeys: [(srcPos: Int, start: Int32, end: Int32)] = []
         do {
             // Copied in runs between NOPs (one append per run, not per
             // instruction); same bytes as copying each non-NOP instruction.
@@ -2210,6 +2265,16 @@ struct JeffJSCompiler {
                 let csize = max(Int(jeffJSGetOpcodeInfo(cop).size) + (cwidth - 1), 1)
                 if cop == .nop {
                     if runStart < p { srcBuf.append(contentsOf: raw[runStart ..< p]) }
+                    p += csize
+                    runStart = p
+                    continue
+                }
+                if cop == .line_num, p + cwidth + 8 <= rawLen,
+                   readU32(raw, p + cwidth) & 0x8000_0000 != 0 {
+                    if runStart < p { srcBuf.append(contentsOf: raw[runStart ..< p]) }
+                    let start = Int32(bitPattern: readU32(raw, p + cwidth) & 0x7FFF_FFFF)
+                    let end = Int32(bitPattern: readU32(raw, p + cwidth + 4))
+                    spanKeys.append((srcBuf.count, start, end))
                     p += csize
                     runStart = p
                     continue
@@ -2231,7 +2296,21 @@ struct JeffJSCompiler {
         // ------------------------------------------------------------------
         // Pass 1: Copy bytecode, apply peephole optimizations, resolve labels
         // ------------------------------------------------------------------
+        // Span attachment: every span keyed inside the source range an
+        // iteration consumed belongs to the instruction that iteration
+        // emitted (a fused op included), at the pc it started at.
+        var spanIdx = 0
+        var iterPC = 0
+        fd.exprSpanEvents.removeAll()
         while pos < srcLen {
+            if spanIdx < spanKeys.count, spanKeys[spanIdx].srcPos < pos {
+                while spanIdx < spanKeys.count, spanKeys[spanIdx].srcPos < pos {
+                    let k = spanKeys[spanIdx]
+                    fd.exprSpanEvents.append((pc: iterPC, start: k.start, end: k.end))
+                    spanIdx += 1
+                }
+            }
+            iterPC = bc.len
             guard pos < srcBuf.count else { break }
             guard let (op, opWidth) = readOpcodeFromBuf(srcBuf, pos) else {
                 bc.putU8(srcBuf[pos])
@@ -2972,7 +3051,26 @@ struct JeffJSCompiler {
         // conditional jumps). Remove them and remap every jump, the label
         // addresses and the line/column tables.
         // ------------------------------------------------------------------
+        while spanIdx < spanKeys.count {
+            let k = spanKeys[spanIdx]
+            fd.exprSpanEvents.append((pc: iterPC, start: k.start, end: k.end))
+            spanIdx += 1
+        }
         let pcMap = compactNops(fd: fd, bc: &bc)
+        // Expression spans follow their instructions to the compacted pcs; the
+        // last span recorded for a pc wins (a span left behind by a parser
+        // rewind precedes the op's own).
+        if !fd.exprSpanEvents.isEmpty {
+            var remapped: [(pc: Int, start: Int32, end: Int32)] = []
+            remapped.reserveCapacity(fd.exprSpanEvents.count)
+            for e in fd.exprSpanEvents {
+                let np = e.pc < pcMap.count ? pcMap[e.pc] : bc.len
+                if np < 0 { continue }   // the instruction was compacted away
+                if let last = remapped.last, last.pc == np { remapped[remapped.count - 1] = (np, e.start, e.end) }
+                else { remapped.append((np, e.start, e.end)) }
+            }
+            fd.exprSpanEvents = remapped
+        }
         // The pc2line delta encoder drops an entry whose delta is zero (the
         // common case for a one-line body), so remember the first position.
         if let first = fd.pc2Events.first {
@@ -4184,6 +4282,7 @@ struct JeffJSCompiler {
         fb.superAllowedFlag = fd.superAllowed
         fb.argumentsAllowedFlag = fd.argumentsAllowed
         fb.isDirectOrIndirectEval = fd.isDirectOrIndirectEval
+        fb.isTopLevelCode = fd.isProgramCode
         fb.funcNameVarIdx = fd.funcNameVarIdx
 
         // Generator/async flags
@@ -4244,6 +4343,8 @@ struct JeffJSCompiler {
             fb.debugPc2colBuf = fd.pc2colBuf.toBytes()
             fb.debugPc2colLen = fd.pc2colBuf.len
         }
+        fb.debugExprSpans = JeffJSFunctionBytecodeCompiled.encodeExprSpans(fd.exprSpanEvents)
+        fd.exprSpanEvents = []
 
         ctx.rt.lazyStats.functionsCompiled += 1
         ctx.rt.lazyStats.bytecodeBytes += fb.bytecodeLen
@@ -5143,6 +5244,7 @@ extension JeffJSFunctionBytecodeCompiled {
         debugPc2lineLen = c.debugPc2lineLen
         debugPc2colBuf = c.debugPc2colBuf
         debugPc2colLen = c.debugPc2colLen
+        debugExprSpans = c.debugExprSpans
         traceBlocks = c.traceBlocks
         traceLean = c.traceLean
         traceEntryEnabled = c.traceEntryEnabled
@@ -5417,7 +5519,9 @@ extension JeffJSCompiler {
                 case .eval, .apply_eval:
                     return nil
                 case .line_num:
-                    if f === root && scan.firstLine == 0 && base + 8 <= buf.count {
+                    // (An expression span is a tagged line_num, not a position.)
+                    if f === root && scan.firstLine == 0 && base + 8 <= buf.count
+                        && readU32(buf, base) & 0x8000_0000 == 0 {
                         scan.firstLine = Int(readU32(buf, base))
                         scan.firstCol = Int(readU32(buf, base + 4))
                     }
@@ -5735,6 +5839,7 @@ extension JeffJSFunctionBytecodeCompiled {
         debugPc2lineLen = 0
         debugPc2colBuf = []
         debugPc2colLen = 0
+        debugExprSpans = []
         pc2lineTable = nil
         pc2colTable = nil
         traceBlocks = nil

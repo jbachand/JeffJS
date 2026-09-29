@@ -616,7 +616,7 @@ extension JeffJSContext {
                 jeffJS_dumpLastOps(self)
                 return throwTypeError(message: "\(desc) is not a function\(hint)")
             }
-            return throwTypeError(message: "\(desc) is not a function")
+            return throwNotAFunction(funcVal)
         }
         // Hot path: plain bytecode function — skip the payload-enum matches
         // below (each one copies the payload, retaining FB + varRefs array).
@@ -802,8 +802,7 @@ extension JeffJSContext {
         // Regular bytecode function path — verify it IS a bytecode function
         guard case .bytecodeFunc = obj.payload else {
             // Not a callable type (plain object, array, etc.)
-            let desc = toSwiftString(funcVal) ?? "[object]"
-            return throwTypeError(message: "\(desc) is not a function")
+            return throwNotAFunction(funcVal)
         }
         return JeffJSInterpreter.callInternal(ctx: self, funcObj: funcVal,
                                                thisVal: thisVal, args: args, flags: 0)
@@ -987,7 +986,19 @@ extension JeffJSContext {
             }
             return argsObj
         case .thisVal:
-            return frame.thisVal.dupValue()
+            // Same binding push_this sees: a sloppy function's primitive `this`
+            // is boxed once per activation (ES §10.2.1.2 step 6.b).
+            let tv = frame.thisVal
+            if !tv.isObject && !tv.isNullOrUndefined && !tv.isUninitialized && !frame.ownsThis,
+               let fobj = frame.curFunc.toObject(), let ffb = fobj.fbFast,
+               !ffb.isStrictMode, !ffb.isGenerator, !ffb.isAsyncFunc {
+                let boxed = toObject(tv)
+                if boxed.isException { return boxed }
+                frame.thisVal = boxed
+                frame.ownsThis = true
+                return boxed.dupValue()
+            }
+            return tv.dupValue()
         case .newTarget:
             return frame.newTarget.dupValue()
         case .homeObject:
@@ -1356,7 +1367,7 @@ extension JeffJSContext {
     func callConstructor(_ funcVal: JeffJSValue, newTarget: JeffJSValue,
                          args: [JeffJSValue]) -> JeffJSValue {
         guard let obj = funcVal.toObject() else {
-            return throwTypeError(message: "not a constructor")
+            return throwNotAConstructor(funcVal)
         }
         // C function constructor path. Builtins allocate their own instance
         // with the class prototype; when constructed through a subclass or
@@ -1387,7 +1398,7 @@ extension JeffJSContext {
                 if r.isObject { newObj.freeValue(); result = r }
                 else { r.freeValue(); result = newObj }
             default:
-                return throwTypeError(message: "not a constructor")
+                return throwNotAConstructor(funcVal)
             }
             if result.isException { return .exception }
             if newTarget.isObject, newTarget.bits != funcVal.bits {
@@ -1411,7 +1422,7 @@ extension JeffJSContext {
         }
         // Bytecode function constructor path — verify it IS a bytecode function
         guard case .bytecodeFunc(let fbOpt, _, _) = obj.payload else {
-            return throwTypeError(message: "not a constructor")
+            return throwNotAConstructor(funcVal)
         }
         // Derived class constructor: `this` is uninitialised until super()
         // constructs it (see init_this); the activation epilogue returns it.
@@ -1841,7 +1852,7 @@ extension JeffJSContext {
         }
         if throwRefError {
             let name = atomToSwiftString(atom)
-            _ = throwReferenceError(message: "\(name) is not defined")
+            _ = throwReferenceError(message: "Can't find variable: \(name)")
             return .exception
         }
         return .JS_UNDEFINED
@@ -3423,6 +3434,8 @@ private func executeFastTrace(
         case .push_this:
             let thisV = frame.thisVal
             if thisV.isUninitialized { resume = pc; break traceLoop }   // deopt: derived ctor before super()
+            // deopt: a sloppy function's primitive `this` is boxed by the main loop.
+            if !thisV.isObject && !thisV.isNullOrUndefined && !fb.isStrictMode { resume = pc; break traceLoop }
             // `this["name"]` read (push_this, push_const8 k, get_array_el):
             // one dispatch through the get_array_el site's keyed cache
             // instead of three plus the receiver/key refcount traffic.
@@ -6212,6 +6225,11 @@ struct JeffJSTypeConvert {
             if prim.isException { return (Double.nan, false) }
             return toNumber(ctx: ctx, val: prim)
         }
+        if val.isSymbol {
+            // ES §7.1.4 ToNumber(Symbol): TypeError (`Symbol() + 1` was NaN).
+            _ = ctx.throwTypeError(message: "Cannot convert a symbol to a number")
+            return (Double.nan, false)
+        }
         return (Double.nan, true)
     }
 
@@ -6311,7 +6329,7 @@ struct JeffJSTypeConvert {
             return toString(ctx: ctx, val: prim)
         }
         if val.isSymbol {
-            _ = ctx.throwTypeError(message: "Cannot convert a Symbol value to a string")
+            _ = ctx.throwTypeError(message: "Cannot convert a symbol to a string")
             return .exception
         }
         if val.isBigInt {
@@ -6713,7 +6731,7 @@ struct JeffJSOperators {
     /// The instanceof operator.
     static func jsInstanceof(ctx: JeffJSContext, val: JeffJSValue, target: JeffJSValue) -> JeffJSValue {
         if !target.isObject {
-            _ = ctx.throwTypeError(message: "Right-hand side of instanceof is not an object")
+            _ = ctx.throwTypeError(message: "Right hand side of instanceof is not an object")
             return .exception
         }
         // Check [Symbol.hasInstance]
@@ -6971,7 +6989,8 @@ struct JeffJSInterpreter {
             else if funcObj.isInt { desc = String(funcObj.toInt32()) }
             else if funcObj.isBool { desc = funcObj.toBool() ? "true" : "false" }
             else { desc = ctx.toSwiftString(funcObj) ?? "\(funcObj.tag)" }
-            _ = ctx.throwTypeError(message: "\(desc) is not a function")
+            _ = desc
+            _ = ctx.throwNotAFunction(funcObj)
             return .exception
         }
 
@@ -7796,7 +7815,13 @@ struct JeffJSInterpreter {
                 } else if v.isNumber && c.isNumber {
                     buf[sp - 1] = jeffJS_arithNumeric(ar, jeffJS_traceNum(v), jeffJS_traceNum(c))
                 } else {
-                    guard let r = jeffJS_arithGeneric(ctx, ar, v, c.dupValue()) else { retVal = .exception; break dispatchLoop }
+                    // arithGeneric consumes TOS; on a throw (`Symbol() + ''`) the
+                    // slot must not keep the released value, or the unwinder
+                    // frees it a second time (a fresh symbol crashed here).
+                    guard let r = jeffJS_arithGeneric(ctx, ar, v, c.dupValue()) else {
+                        buf[sp - 1] = .undefined
+                        retVal = .exception; break dispatchLoop
+                    }
                     buf[sp - 1] = r
                 }
                 pc += 3
@@ -8845,7 +8870,7 @@ struct JeffJSInterpreter {
                 let atom = readU32(bc, pc + 1)
                 let errType = readU8(bc, pc + 5)
                 let msg = errType == ThrowErrorType.constAssign.rawValue
-                    ? "Assignment to constant variable."
+                    ? "Attempted to assign to readonly property."
                     : ctx.atomToSwiftString(atom)
                 ctx.throwErrorFromType(errType: Int(errType), msg: msg)
                 retVal = .exception
@@ -9014,6 +9039,15 @@ struct JeffJSInterpreter {
                         continue dispatchLoop
                     }
                 }
+                // Strict code: assigning an unresolvable reference is a
+                // ReferenceError (ES §6.2.5.6 PutValue step 3.a); sloppy code
+                // creates the global.
+                if fb.isStrictMode, !ctx.hasProperty(obj: ctx.globalObj, atom: atom) {
+                    val.freeValue()
+                    _ = ctx.throwReferenceError(message: "Can't find variable: \(ctx.rt.atomToString(atom) ?? "")")
+                    retVal = .exception
+                    break dispatchLoop
+                }
                 let ok = ctx.putGlobalVar(atom: atom, val: val, flags: 0)
                 if !ok {
                     retVal = .exception
@@ -9125,8 +9159,7 @@ struct JeffJSInterpreter {
                 // message — the message must read like every other engine's.
                 if obj.isNullOrUndefined {
                     frame.curPC = pc
-                    let propName = ctx.rt.atomToString(atom) ?? "?"
-                    _ = ctx.throwTypeError(message: "Cannot read properties of \(obj.isNull ? "null" : "undefined") (reading '\(propName)')")
+                    _ = ctx.throwNotAnObject(obj)
                     retVal = .exception; break dispatchLoop
                 }
                 // Inline cache fast path: shape-matched direct property read
@@ -9631,6 +9664,13 @@ struct JeffJSInterpreter {
                 let atom = readU32(bc, pc + 1)
                 let val = buf[sp - 1]
                 ctx.setFunctionName(val, atom: atom)
+                // The literal's binding name, for Error.stack frames (JSC ecmaName).
+                // (A lazy function's closure has no fbFast until it compiles; its
+                // payload holds the bytecode the compile fills in place.)
+                if let fo = val.obj, case .bytecodeFunc(let vfbOpt, _, _) = fo.payload,
+                   let vfb = vfbOpt, vfb.inferredName == nil {
+                    vfb.inferredName = rt.atomToString(atom) ?? ""
+                }
                 pc += 5
 
             case .set_name_computed:
@@ -11574,6 +11614,14 @@ struct JeffJSInterpreter {
             case .delete_:
                 let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                // ES §13.5.1.2 step 4.c: ToObject(base) — `delete u.x` with u
+                // nullish throws (sloppy mode too).
+                if obj.isNullOrUndefined {
+                    key.freeValue()
+                    _ = ctx.throwNotAnObject(obj)
+                    retVal = .exception
+                    break dispatchLoop
+                }
                 // Strict code: a refused delete (non-configurable property)
                 // is a TypeError (ES §13.5.1.2 step 5.e), thrown by
                 // [[Delete]] itself under JS_PROP_THROW.
@@ -11971,12 +12019,25 @@ struct JeffJSInterpreter {
                 pc += 1
 
             case .push_this:
-                let thisV = frame.thisVal
+                var thisV = frame.thisVal
                 if thisV.isUninitialized {
                     // Derived class constructor before super() returned.
                     _ = ctx.throwReferenceError(message: "must call super constructor before using 'this'")
                     retVal = .exception
                     break dispatchLoop
+                }
+                // OrdinaryCallBindThis (ES §10.2.1.2): a sloppy-mode function sees
+                // ToObject(this) — `(function(){ return typeof this }).call('x')`
+                // is "object" (nullish was already replaced by the global object
+                // at the call). Boxed once per activation; the frame owns the box
+                // so every read in the call sees the same object.
+                if !thisV.isObject && !thisV.isNullOrUndefined && !fb.isStrictMode
+                    && !fb.isGenerator && !fb.isAsyncFunc && !frame.ownsThis {
+                    let boxed = ctx.toObject(thisV)
+                    if boxed.isException { retVal = .exception; break dispatchLoop }
+                    frame.thisVal = boxed
+                    frame.ownsThis = true
+                    thisV = boxed
                 }
                 buf[sp] = thisV.dupValue(); sp += 1
                 pc += 1
@@ -12490,6 +12551,10 @@ struct JeffJSInterpreter {
         // caller frames.
         // -----------------------------------------------------------------
         if retVal.isException {
+            // JSC source appender: quote the instruction that raised it.
+            if ctx.pendingSourceAppender != nil {
+                ctx.applyPendingSourceAppender(fb: fb, bc: bc, bcLen: bcLen, pc: pc)
+            }
             var handlerFound = false
             // Interrupt-requested termination is uncatchable: unwind the whole
             // stack (freeing values) without entering any catch handler.
