@@ -2215,27 +2215,24 @@ extension JeffJSContext {
 
     /// Defines an array element and returns the next index.
     func defineArrayElement(obj: JeffJSValue, idx: JeffJSValue, val: JeffJSValue) -> JeffJSValue {
-        if idx.isInt {
-            let i = UInt32(bitPattern: idx.toInt32())
-            _ = setPropertyUint32(obj: obj, index: i, value: val)
-            let nextIdx = i + 1
-            // Keep .length in sync: if we wrote past current length, update it
-            let curLen = getArrayLength(obj)
-            if Int64(nextIdx) > curLen {
-                setArrayLength(obj, Int64(nextIdx))
-            }
-            return .newUInt32(nextIdx)
-        }
-        // Non-integer key (computed class field `[k] = v`): define an own
-        // data property, like QuickJS's OP_define_array_el on a property key.
-        // A symbol key must resolve to the symbol's own atom: interning its
-        // description defined `static [Symbol('s')] = v` as the string key "s".
+        // CreateDataPropertyOrThrow (ES §7.3.7): the computed key of an
+        // object literal (`{[k]: v}`, §13.2.5.5) or class field is *defined*,
+        // never [[Set]] — an Object.prototype setter, a `__proto__` key or a
+        // non-writable inherited property must not see it. Consumes `idx`
+        // and `val`; returns the next index (QuickJS: idx + 1 for an
+        // integer key) or an exception.
         let key = toPropertyKey(idx)
-        if key.isException { return .exception }
+        idx.freeValue()
+        if key.isException { val.freeValue(); return .exception }
         defer { key.freeValue() }
-        guard let (atom, owned) = propertyKeyAtom(key) else { return .newInt32(0) }
-        _ = definePropertyValue(obj: obj, atom: atom, value: val, flags: JS_PROP_C_W_E)
+        guard let (atom, owned) = propertyKeyAtom(key) else { val.freeValue(); return .exception }
+        let r = definePropertyValue(obj: obj, atom: atom, value: val,
+                                    flags: JS_PROP_C_W_E | JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_WRITABLE
+                                        | JS_PROP_HAS_ENUMERABLE | JS_PROP_THROW)
+        val.freeValue()
         if owned { rt.freeAtom(atom) }
+        if r < 0 { return .exception }
+        if key.isInt, key.toInt32() >= 0 { return .newUInt32(UInt32(key.toInt32()) &+ 1) }
         return .newInt32(0)
     }
 
@@ -2254,10 +2251,14 @@ extension JeffJSContext {
     /// Used by object spread (`{...source}`) and Object.assign-like operations.
     func copyDataProperties(target: JeffJSValue, source: JeffJSValue,
                             excludeList: JeffJSValue) -> Bool {
-        // If source is null or undefined, return success (no properties to copy)
+        // CopyDataProperties (ES §7.3.25) — `{...src}` and object rest
+        // (`{a, ...rest} = src`): every own enumerable key of ToObject(src),
+        // read with [[Get]] and *defined* on the target
+        // (CreateDataPropertyOrThrow), never [[Set]], so an Object.prototype
+        // setter or a `__proto__` key does not fire. Strings, arrays, typed
+        // arrays, proxies and other exotic sources go through
+        // [[OwnPropertyKeys]]; a plain object is one shape walk.
         if source.isNull || source.isUndefined { return true }
-        guard let srcObj = source.toObject() else { return true }
-        guard let shape = srcObj.shape else { return true }
 
         // Collect excluded property atoms
         var excludedAtoms = Set<UInt32>()
@@ -2268,42 +2269,70 @@ extension JeffJSContext {
                 }
             }
         }
+        let defineFlags = JS_PROP_C_W_E | JS_PROP_HAS_CONFIGURABLE | JS_PROP_HAS_WRITABLE
+            | JS_PROP_HAS_ENUMERABLE | JS_PROP_THROW
 
-        // Copy each enumerable own property from source to target.
-        // CopyDataProperties reads every key with [[Get]], so an accessor must
-        // be invoked (`({...{get a(){return 1}}}).a === 1`); a getter can also
-        // reshape the source, so the key list is snapshotted first and plain
-        // data slots are dup'd up front (the common path stays one shape walk).
-        var pending: [(atom: UInt32, value: JeffJSValue?)] = []
-        pending.reserveCapacity(shape.prop.count)
-        for (i, shapeProp) in shape.prop.enumerated() {
-            let atom = shapeProp.atom
-            if atom == 0 { continue } // skip empty slots
-            if excludedAtoms.contains(atom) { continue }
-            // Only copy enumerable properties
-            if !shapeProp.flags.contains(.enumerable) { continue }
-            guard i < srcObj.propCount else { continue }
-            switch srcObj.propEntry(at: i) {
-            case .value(let val): pending.append((atom, val.dupValue()))
-            case .varRef(let vr): pending.append((atom, vr.pvalue.dupValue()))
-            case .getset: pending.append((atom, nil))   // read with [[Get]] below
-            default: break
+        if let srcObj = source.toObject(), srcObj.classID == JSClassID.JS_CLASS_OBJECT.rawValue,
+           srcObj._fastArrayValues == nil, srcObj.lazyFlags == 0, let shape = srcObj.shape {
+            // A getter can reshape the source, so the key list is snapshotted
+            // first and plain data slots are dup'd up front.
+            var pending: [(atom: UInt32, value: JeffJSValue?)] = []
+            pending.reserveCapacity(shape.prop.count)
+            for (i, shapeProp) in shape.prop.enumerated() {
+                let atom = shapeProp.atom
+                if atom == 0 { continue } // skip empty slots
+                if excludedAtoms.contains(atom) { continue }
+                if !shapeProp.flags.contains(.enumerable) { continue }
+                guard i < srcObj.propCount else { continue }
+                switch srcObj.propEntry(at: i) {
+                case .value(let val): pending.append((atom, val.dupValue()))
+                case .varRef(let vr): pending.append((atom, vr.pvalue.dupValue()))
+                case .getset: pending.append((atom, nil))   // read with [[Get]] below
+                default: break
+                }
             }
-        }
-        for k in 0 ..< pending.count {
-            let (atom, owned) = pending[k]
-            var val = owned
-            if val == nil {
-                let got = getProperty(obj: source, atom: atom)   // runs the getter
-                if got.isException {
-                    // Release the still-unconsumed dups (earlier ones were
-                    // handed to setProperty).
+            for k in 0 ..< pending.count {
+                let (atom, owned) = pending[k]
+                var val = owned
+                if val == nil {
+                    let got = getProperty(obj: source, atom: atom)   // runs the getter
+                    if got.isException {
+                        for j in (k + 1) ..< pending.count { pending[j].value?.freeValue() }
+                        return false
+                    }
+                    val = got
+                }
+                let r = definePropertyValue(obj: target, atom: atom, value: val!, flags: defineFlags)
+                val!.freeValue()
+                if r < 0 {
                     for j in (k + 1) ..< pending.count { pending[j].value?.freeValue() }
                     return false
                 }
-                val = got
             }
-            _ = setProperty(obj: target, atom: atom, value: val!)   // takes the reference
+            return true
+        }
+
+        let from = toObject(source)
+        if from.isException { return false }
+        defer { from.freeValue() }
+        let keys = getOwnPropertyNames(from, flags: JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK | JS_GPN_ENUM_ONLY)
+        if keys.isException { return false }
+        defer { keys.freeValue() }
+        let len = getArrayLength(keys)
+        var j: Int64 = 0
+        while j < len {
+            let key = getPropertyByIndex(obj: keys, index: UInt32(j))
+            j += 1
+            if key.isException { return false }
+            defer { key.freeValue() }
+            guard let (atom, owned) = propertyKeyAtom(key) else { return false }
+            defer { if owned { rt.freeAtom(atom) } }
+            if excludedAtoms.contains(atom) { continue }
+            let val = getProperty(obj: from, atom: atom)
+            if val.isException { return false }
+            let r = definePropertyValue(obj: target, atom: atom, value: val, flags: defineFlags)
+            val.freeValue()
+            if r < 0 { return false }
         }
         return true
     }
@@ -9660,7 +9689,11 @@ struct JeffJSInterpreter {
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let idx = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = buf[sp - 1]
-                let nextIdx = ctx.defineArrayElement(obj: obj, idx: idx, val: val)
+                let nextIdx = ctx.defineArrayElement(obj: obj, idx: idx, val: val)   // consumes idx, val
+                if nextIdx.isException {
+                    retVal = .exception
+                    break dispatchLoop
+                }
                 buf[sp] = nextIdx; sp += 1
                 pc += 1
 

@@ -336,6 +336,7 @@ struct JeffJSTestRunner {
             ("LoneSurrogate", { $0.testLoneSurrogate() }),
             ("IteratorHelpers", { $0.testIteratorHelpers() }),
             ("SyntaxErrorText", { $0.testSyntaxErrorText() }),
+            ("ObjectLiteralDefine", { $0.testObjectLiteralDefine() }),
         ]
     }
 

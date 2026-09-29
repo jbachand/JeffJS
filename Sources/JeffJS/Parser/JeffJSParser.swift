@@ -7454,15 +7454,13 @@ final class JeffJSParser {
         if tok == 0x3A { // ':' -- data property
             next()
             if isComputed {
-                // Stack before: [obj, key]
-                // Rearrange to: [obj, obj_dup, key] so put_array_el can
-                // consume [obj_dup, key, value] and leave [obj] on stack.
-                emitOp(.swap)    // [key, obj]
-                emitOp(.dup)     // [key, obj, obj]
-                emitOp(.rot3l)   // [obj, obj, key]
-                parseAssignExpr() // [obj, obj, key, value]
-                emitNamedEvaluationComputed()   // §13.2.5.5
-                emitOp(.put_array_el) // pops [obj, key, value] -> [obj]
+                // §13.2.5.5 PropertyDefinitionEvaluation: CreateDataPropertyOrThrow,
+                // not [[Set]] (put_array_el ran Object.prototype setters and
+                // treated a computed "__proto__" key as the prototype).
+                parseAssignExpr()                 // [obj, key, value]
+                emitNamedEvaluationComputed()
+                emitOp(.define_array_el)          // [obj, nextIdx]
+                emitOp(.drop)                     // [obj]
             } else {
                 parseAssignExpr()
                 // ES §13.2.5.5: `{ m: function(){} }` names the function "m".
