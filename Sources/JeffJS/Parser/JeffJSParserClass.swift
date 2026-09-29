@@ -434,6 +434,7 @@ extension JeffJSParser {
         }
 
         if !isExpression && className != 0 {
+            checkLexicalDeclaration(className, kind: .classDecl)
             let varIdx = defineVar(className, isConst: true, isLexical: true)
             emitScopePutVarInit(className, scopeLevel: fd.curScope)
             _ = varIdx

@@ -1551,6 +1551,7 @@ final class JeffJSParser {
     /// of an enclosing block (B.3.4) and `with` objects.
     @discardableResult
     func declareVarBinding(_ name: JSAtom) -> Int {
+        checkVarDeclaration(name)
         if fd.parent == nil && programVarMode != .local {
             // Same rule as parseVarDeclaration's global `var`: parseProgram
             // hoists a define_var for it to the start of the script.
@@ -1585,6 +1586,141 @@ final class JeffJSParser {
         let idx = defineVar(name)
         fd.curScope = saved
         return idx
+    }
+
+    // MARK: Redeclaration early errors (ES §14.2.1, §14.12.1, §14.15.1, §15.2.1, §16.1.1, B.3.2-B.3.4)
+
+    enum LexicalDeclKind { case letDecl, constDecl, classDecl, functionDecl }
+
+    /// The vars of scope `sc` (its own linked list); `body` returns false to stop.
+    private func forEachVarInScope(_ sc: Int, _ body: (Int, JeffJSVarDef) -> Bool) {
+        guard sc >= 0, sc < fd.scopes.count else { return }
+        var i = fd.scopes[sc].first
+        var guardCount = 0
+        while i >= 0 && i < fd.vars.count && guardCount < 1_000_000 {
+            let v = fd.vars[i]
+            if !body(i, v) { return }
+            i = v.scopeNext
+            guardCount += 1
+        }
+    }
+
+    private func redeclAtomText(_ atom: JSAtom) -> String {
+        return s.ctx?.atomName(atom) ?? "?"
+    }
+
+    /// A lexical declaration (let / const / class, or a function declaration
+    /// in a block) of `name` in the current scope. It may not share the scope
+    /// with another declaration of the name, nor with a `var` declared in or
+    /// hoisted through it, nor (at a function's top level) with a parameter,
+    /// nor (in a catch block) with the catch parameter. Sloppy-mode duplicate
+    /// function declarations in a block are allowed (B.3.2.4). The messages
+    /// are JavaScriptCore's. Returns false after reporting the SyntaxError.
+    @discardableResult
+    func checkLexicalDeclaration(_ name: JSAtom, kind: LexicalDeclKind) -> Bool {
+        guard name != 0 else { return true }
+        let sc = fd.curScope
+        func fail() -> Bool {
+            let text = redeclAtomText(name)
+            switch kind {
+            case .letDecl: syntaxError("Cannot declare a let variable twice: '\(text)'.")
+            case .constDecl: syntaxError("Cannot declare a const variable twice: '\(text)'.")
+            case .classDecl: syntaxError("Cannot declare a class twice: '\(text)'.")
+            case .functionDecl: syntaxError("Cannot declare a function that shadows a let/const/class/function variable '\(text)'.")
+            }
+            return false
+        }
+        let sloppy = (fd.jsMode & JS_MODE_STRICT) == 0
+        let selfIdx = fd.funcNameVarIdx, argsIdx = fd.argumentsVarIdx
+        var conflict = false
+        forEachVarInScope(sc) { idx, v in
+            guard v.varName == name, idx != selfIdx, idx != argsIdx else { return true }
+            if sc == 0 {
+                // Top level: vars and function declarations are var-scoped;
+                // a lexical declaration conflicts with any of them.
+                if kind == .functionDecl && !v.isLexical { return true }
+                conflict = true
+            } else if kind == .functionDecl && sloppy && !v.isLexical
+                        && v.varKind == JSVarKindEnum.JS_VAR_FUNCTION_DECL.rawValue {
+                return true   // B.3.2.4: `{ function f(){} function f(){} }`
+            } else {
+                conflict = true
+            }
+            return !conflict
+        }
+        if conflict { return fail() }
+        // A script's block-level function declaration (bound by define_func).
+        if let fns = fd.blockFunctionNamesByScope[sc], fns.contains(name),
+           !(kind == .functionDecl && sloppy) {
+            return fail()
+        }
+        // A `var` of the name declared in (or hoisted through) this scope.
+        if !(kind == .functionDecl && sc == 0),
+           fd.varNamesThroughScope[sc]?.contains(name) == true {
+            return fail()
+        }
+        if sc == 0 && kind != .functionDecl {
+            // Script top level: its `var`s are hoisted by name.
+            if fd.parent == nil && fd.hoistedGlobalVarAtoms.contains(name) { return fail() }
+            // Function top level: a parameter of the same name.
+            if fd.parent != nil && fd.args.contains(where: { $0.varName == name }) { return fail() }
+        }
+        // The block of a catch clause: the catch parameter's names.
+        if sc > 0, sc < fd.scopes.count {
+            let p = fd.scopes[sc].parent
+            if p >= 0, p < fd.scopes.count, fd.scopes[p].isCatch {
+                var clash = false
+                forEachVarInScope(p) { _, v in
+                    if v.varName == name { clash = true }
+                    return !clash
+                }
+                if clash { return fail() }
+            }
+        }
+        return true
+    }
+
+    /// A `var` (or a top-level function declaration) of `name` in the current
+    /// scope hoists to the function's var scope: no scope it passes through,
+    /// the current one included, may hold a lexical declaration of the name
+    /// (a catch parameter excepted, B.3.4), and each records it so a later
+    /// lexical declaration there is rejected. Returns false after reporting
+    /// the SyntaxError.
+    @discardableResult
+    func checkVarDeclaration(_ name: JSAtom, isFunction: Bool = false) -> Bool {
+        guard name != 0 else { return true }
+        let selfIdx = fd.funcNameVarIdx, argsIdx = fd.argumentsVarIdx
+        var sc = fd.curScope
+        var steps = 0
+        while sc >= 0 && sc < fd.scopes.count && steps < 100_000 {
+            var conflict = false
+            let scope = sc
+            forEachVarInScope(scope) { idx, v in
+                guard v.varName == name, idx != selfIdx, idx != argsIdx else { return true }
+                if v.isLexical && v.varKind != JSVarKindEnum.JS_VAR_CATCH.rawValue {
+                    conflict = true
+                } else if scope != 0 && !isFunction
+                            && v.varKind == JSVarKindEnum.JS_VAR_FUNCTION_DECL.rawValue {
+                    conflict = true   // a function declared in a block is lexical there
+                }
+                return !conflict
+            }
+            if scope != 0, !isFunction, fd.blockFunctionNamesByScope[scope]?.contains(name) == true {
+                conflict = true
+            }
+            if conflict {
+                let text = redeclAtomText(name)
+                syntaxError(isFunction
+                    ? "Cannot declare a function that shadows a let/const/class/function variable '\(text)'."
+                    : "Cannot declare a var variable that shadows a let/const/class variable: '\(text)'.")
+                return false
+            }
+            fd.varNamesThroughScope[sc, default: []].insert(name)
+            if sc == 0 { break }
+            sc = fd.scopes[sc].parent
+            steps += 1
+        }
+        return true
     }
 
     /// Find a variable by name in the current scope chain.
@@ -2198,6 +2334,7 @@ final class JeffJSParser {
 
                 if tok == JSTokenType.TOK_IN.rawValue {
                     // for (var x in ...): a var head stores by name (-1)
+                    if isLexical { checkLexicalDeclaration(varName, kind: isConst ? .constDecl : .letDecl) }
                     let varIdx = isLexical ? defineVar(varName, isConst: isConst, isLexical: true)
                                            : { declareVarBinding(varName); return -1 }()
                     next() // consume 'in'
@@ -2209,6 +2346,7 @@ final class JeffJSParser {
                 } else if tok == JSTokenType.TOK_OF.rawValue ||
                           isIdent("of") {
                     // for (var x of ...): a var head stores by name (-1)
+                    if isLexical { checkLexicalDeclaration(varName, kind: isConst ? .constDecl : .letDecl) }
                     let varIdx = isLexical ? defineVar(varName, isConst: isConst, isLexical: true)
                                            : { declareVarBinding(varName); return -1 }()
                     next() // consume 'of'
@@ -2887,6 +3025,7 @@ final class JeffJSParser {
             next() // consume 'catch'
 
             let scopeIdx = pushScope()
+            if scopeIdx >= 0 && scopeIdx < fd.scopes.count { fd.scopes[scopeIdx].isCatch = true }
 
             if tok == 0x28 { // '(' -- catch parameter
                 next()
@@ -3323,6 +3462,7 @@ final class JeffJSParser {
         // is accessible from any scope (Promise reaction jobs, async callbacks,
         // other eval calls). `let`/`const` remain block-scoped.
         let isGlobalVar = !isLexical && fd.parent == nil && programVarMode != .local
+        if isGlobalVar { checkVarDeclaration(varName) }
 
         if isGlobalVar && fd.evalSite != nil {
             // Direct eval: parseProgram declares the name in the caller's
@@ -3361,6 +3501,7 @@ final class JeffJSParser {
             }
             // No initializer: variable is already undefined on global object
         } else {
+            if isLexical { checkLexicalDeclaration(varName, kind: isConst ? .constDecl : .letDecl) }
             let varIdx = isLexical ? defineVar(varName, isConst: isConst, isLexical: true)
                                    : declareVarBinding(varName)
 
@@ -3554,6 +3695,10 @@ final class JeffJSParser {
                 }
                 fd.hoistedFuncDeclRanges.append((fclosureStart, fd.byteCode.len))
             } else if fd.parent == nil && programVarMode == .global {
+                if fd.curScope == 0 { checkVarDeclaration(funcName, isFunction: true) }
+                else if checkLexicalDeclaration(funcName, kind: .functionDecl) {
+                    fd.blockFunctionNamesByScope[fd.curScope, default: []].insert(funcName)
+                }
                 if fd.evalSite != nil { fd.evalFuncDeclNames.append(funcName) }
                 // Top-level function declaration in global eval: hoist to global object
                 // via define_func so it's accessible from any scope (e.g., Promise
@@ -3571,6 +3716,8 @@ final class JeffJSParser {
                 // Function declaration inside a function: define as local variable.
                 // Mark byte range for hoisting (moved to body start before label resolution).
                 let hoistStart = fd.byteCode.len
+                if fd.curScope == 0 { checkVarDeclaration(funcName, isFunction: true) }
+                else { checkLexicalDeclaration(funcName, kind: .functionDecl) }
                 let varIdx = defineVar(funcName,
                                        varKind: JSVarKindEnum.JS_VAR_FUNCTION_DECL.rawValue)
                 emitScopePutVarInit(funcName, scopeLevel: fd.curScope)
@@ -7838,6 +7985,7 @@ final class JeffJSParser {
                     restVarIdx = defineVar(0, isConst: false, isLexical: false)
                     if restBindsVarByName { declareVarBinding(restVarName) }
                 } else {
+                    if isLexical { checkLexicalDeclaration(restVarName, kind: isConst ? .constDecl : .letDecl) }
                     restVarIdx = defineVar(restVarName, isConst: isConst, isLexical: isLexical)
                 }
 
@@ -7938,6 +8086,7 @@ final class JeffJSParser {
                     emitScopePutVar(varName, scopeLevel: fd.curScope)
                 } else {
                     if isLexical {
+                        checkLexicalDeclaration(varName, kind: isConst ? .constDecl : .letDecl)
                         let varIdx = defineVar(varName, isConst: isConst, isLexical: true)
                         emitOp(.put_loc_check_init)
                         emitU16(UInt16(varIdx))
@@ -8028,6 +8177,7 @@ final class JeffJSParser {
                     emitScopePutVar(varName, scopeLevel: fd.curScope)
                 } else {
                     if isLexical {
+                        checkLexicalDeclaration(varName, kind: isConst ? .constDecl : .letDecl)
                         let varIdx = defineVar(varName, isConst: isConst, isLexical: true)
                         emitOp(.put_loc_check_init)
                         emitU16(UInt16(varIdx))
@@ -8143,6 +8293,7 @@ final class JeffJSParser {
                         emitScopePutVar(varName, scopeLevel: fd.curScope)
                     } else {
                         if isLexical {
+                            checkLexicalDeclaration(varName, kind: isConst ? .constDecl : .letDecl)
                             let varIdx = defineVar(varName, isConst: isConst, isLexical: true)
                             emitOp(.put_loc_check_init)
                             emitU16(UInt16(varIdx))
@@ -8179,6 +8330,7 @@ final class JeffJSParser {
                     emitScopePutVar(propAtom, scopeLevel: fd.curScope)
                 } else {
                     if isLexical {
+                        checkLexicalDeclaration(propAtom, kind: isConst ? .constDecl : .letDecl)
                         let varIdx = defineVar(propAtom, isConst: isConst, isLexical: true)
                         emitOp(.put_loc_check_init)
                         emitU16(UInt16(varIdx))
