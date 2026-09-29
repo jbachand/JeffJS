@@ -6660,8 +6660,7 @@ final class JeffJSParser {
 
     @inline(never)
     private func parseStringLiteral() {
-        let str = s.token.strValue
-        let jsStr = JeffJSString(swiftString: str)
+        let jsStr = s.token.jsStringValue()
         let cpoolIdx = addConstPoolValue(JeffJSValue.makeString(jsStr))
         emitPushConst(cpoolIdx)
         next()
@@ -7500,8 +7499,7 @@ final class JeffJSParser {
                 syntaxErrorAt(s.token.templateEscapeErrorPos, err)
                 return
             }
-            let textStr = s.token.strValue
-            let jsStr = JeffJSString(swiftString: textStr)
+            let jsStr = s.token.jsStringValue()
             let cpoolIdx = addConstPoolValue(JeffJSValue.makeString(jsStr))
             emitPushConst(cpoolIdx)
             partCount += 1
@@ -7589,7 +7587,7 @@ final class JeffJSParser {
         while !shouldAbort {
             // ---- text segment ----
             if s.token.templateEscapeError == nil {
-                cooked.append(JeffJSValue.makeString(JeffJSString(swiftString: s.token.strValue)))
+                cooked.append(JeffJSValue.makeString(s.token.jsStringValue()))
             } else {
                 cooked.append(.undefined)
             }

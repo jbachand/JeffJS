@@ -32,6 +32,12 @@ struct JeffJSToken {
 
     // -- String / template literal data --
     var strValue: String = ""
+    /// The literal's UTF-16 code units when they are not well-formed UTF-16
+    /// (a lone surrogate from `\uD800`, `\u{DC00}`): a Swift `String` cannot
+    /// hold them, so `strValue` is then only a lossy spelling for diagnostics
+    /// and `jsStringValue()` builds the value from these units (ES §12.9.4.1:
+    /// a string literal's SV is a sequence of code units, §6.1.4).
+    var strUnits: [UInt16]? = nil
     var strSeparator: Character = "\0"
 
     // -- Template literal part data --
@@ -62,6 +68,7 @@ struct JeffJSToken {
         // for payload fields the previous token did not set.
         if bigIntValue != nil { bigIntValue = nil }
         if !strValue.isEmpty { strValue = "" }
+        if strUnits != nil { strUnits = nil }
         strSeparator = "\0"
         templateRawStart = 0
         templateRawEnd = 0
@@ -72,6 +79,14 @@ struct JeffJSToken {
         identIsReserved = false
         if !regexpBody.isEmpty { regexpBody = "" }
         if !regexpFlags.isEmpty { regexpFlags = "" }
+    }
+
+    /// The string / template-part value as a JS string, code units intact.
+    func jsStringValue() -> JeffJSString {
+        if let units = strUnits {
+            return JeffJSString(refCount: 1, len: units.count, isWideChar: true, storage: .str16(units))
+        }
+        return JeffJSString(swiftString: strValue)
     }
 }
 
@@ -1126,7 +1141,7 @@ extension JeffJSParseState {
 
             if c == sep {
                 bufPtr += 1 // consume closing quote
-                token.strValue = String(bytes: result, encoding: .utf8) ?? ""
+                setCookedString(result)
                 token.type = JSTokenType.TOK_STRING.rawValue
                 return true
             }
@@ -1253,6 +1268,44 @@ extension JeffJSParseState {
         return false
     }
 
+    /// Store a cooked string / template value built as generalized UTF-8
+    /// (WTF-8: escapes may add surrogate code points, which UTF-8 cannot
+    /// carry). Well-formed text becomes `strValue`; otherwise the code units
+    /// go to `strUnits` (and a lossy `strValue` for diagnostics), so
+    /// `"a\uD800b"` is three code units, not "" (ES §12.9.4.1, §6.1.4).
+    func setCookedString(_ bytes: [UInt8]) {
+        if let str = String(bytes: bytes, encoding: .utf8) {
+            token.strValue = str
+            token.strUnits = nil
+            return
+        }
+        var units = [UInt16]()
+        units.reserveCapacity(bytes.count)
+        var i = 0
+        let n = bytes.count
+        while i < n {
+            let b0 = UInt32(bytes[i])
+            var cp: UInt32
+            var len: Int
+            if b0 < 0x80 { cp = b0; len = 1 }
+            else if b0 < 0xE0 { cp = b0 & 0x1F; len = 2 }
+            else if b0 < 0xF0 { cp = b0 & 0x0F; len = 3 }
+            else { cp = b0 & 0x07; len = 4 }
+            if i + len > n { len = 1; cp = 0xFFFD }
+            else { for k in 1 ..< len { cp = (cp << 6) | (UInt32(bytes[i + k]) & 0x3F) } }
+            if cp >= 0x10000 {
+                let v = cp - 0x10000
+                units.append(UInt16(0xD800 | (v >> 10)))
+                units.append(UInt16(0xDC00 | (v & 0x3FF)))
+            } else {
+                units.append(UInt16(cp))
+            }
+            i += len
+        }
+        token.strUnits = units
+        token.strValue = String(decoding: units, as: UTF16.self)
+    }
+
     /// Parse a legacy octal escape sequence (\0nn, \1nn, etc.).
     /// `firstDigit` is the value of the first octal digit already consumed.
     func parseLegacyOctalEscape(firstDigit: UInt32) -> UInt32 {
@@ -1297,7 +1350,7 @@ extension JeffJSParseState {
             if c == 0x60 { // backtick — end of template
                 token.templateRawEnd = bufPtr
                 bufPtr += 1
-                token.strValue = String(bytes: result, encoding: .utf8) ?? ""
+                setCookedString(result)
                 return true
             }
 
@@ -1305,7 +1358,7 @@ extension JeffJSParseState {
                 token.templateRawEnd = bufPtr
                 bufPtr += 2
                 templateNestLevel += 1
-                token.strValue = String(bytes: result, encoding: .utf8) ?? ""
+                setCookedString(result)
                 return true
             }
 
@@ -2835,7 +2888,7 @@ extension JeffJSParseState {
             if c == sep {
                 bufPtr += 1
                 token.type = JSTokenType.TOK_STRING.rawValue
-                token.strValue = String(bytes: result, encoding: .utf8) ?? ""
+                setCookedString(result)
                 return true
             }
 

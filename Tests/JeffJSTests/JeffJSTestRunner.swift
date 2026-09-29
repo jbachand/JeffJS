@@ -333,6 +333,7 @@ struct JeffJSTestRunner {
             ("ProgramCompletion", { $0.testProgramCompletion() }),
             ("Redeclaration", { $0.testRedeclaration() }),
             ("DOMParserInsertion", { $0.testDOMParserInsertion() }),
+            ("LoneSurrogate", { $0.testLoneSurrogate() }),
         ]
     }
 
