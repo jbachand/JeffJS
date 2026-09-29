@@ -207,6 +207,8 @@ public enum JeffJSPolyfills {
     /// Navigator polyfill with userAgent, plugins, mimeTypes.
     public static func navigatorPolyfill(userAgent: String) -> String {
         let escapedUA = escapeJSString(userAgent)
+        // HTML §8.9.1.1: appVersion is the UA without its "Mozilla/" prefix.
+        let escapedAppVersion = escapeJSString(userAgent.hasPrefix("Mozilla/") ? String(userAgent.dropFirst(8)) : "4.0")
         return """
         (function() {
           if (typeof window.navigator === 'undefined') {
@@ -220,7 +222,7 @@ public enum JeffJSPolyfills {
           if (typeof window.navigator.maxTouchPoints === 'undefined') window.navigator.maxTouchPoints = 5;
           if (!window.navigator.product) window.navigator.product = 'Gecko';
           if (!window.navigator.appName) window.navigator.appName = 'Netscape';
-          if (!window.navigator.appVersion) window.navigator.appVersion = '5.0';
+          if (!window.navigator.appVersion) window.navigator.appVersion = '\(escapedAppVersion)';
           if (typeof window.navigator.plugins === 'undefined' || (Array.isArray(window.navigator.plugins) && window.navigator.plugins.length === 0)) {
             var __pdfPlugin = { name: 'PDF Viewer', description: 'Portable Document Format', filename: 'internal-pdf-viewer', length: 1 };
             var __pdfMime = { type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format', enabledPlugin: __pdfPlugin };
@@ -717,6 +719,11 @@ public enum JeffJSPolyfills {
       if (init.mode) opts.mode = String(init.mode);
       if (init.cache) opts.cache = String(init.cache);
       if (init.redirect) opts.redirect = String(init.redirect);
+      var ref = init.referrer !== undefined ? init.referrer
+        : ((typeof Request !== 'undefined' && input instanceof Request) ? input.referrer : undefined);
+      if (ref !== undefined && ref !== null) opts.referrer = String(ref);
+      var rpol = init.referrerPolicy || ((typeof Request !== 'undefined' && input instanceof Request) ? input.referrerPolicy : '');
+      if (rpol) opts.referrerPolicy = String(rpol);
 
       var signal = init.signal || null;
       if (signal) {
