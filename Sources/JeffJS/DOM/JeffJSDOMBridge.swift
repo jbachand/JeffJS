@@ -645,6 +645,19 @@ final class JeffJSDOMBridge {
             return .newBool(self.nodeArgument(args[0]) === self.root)
         }, length: 1)
 
+        ctx.setPropertyFunc(obj: doc, name: "isEqualNode", fn: { [weak self] _, _, args in
+            guard let self, !args.isEmpty, let other = self.nodeArgument(args[0]) else { return .newBool(false) }
+            return .newBool(self.nodesEqual(self.root, other))
+        }, length: 1)
+        ctx.setPropertyFunc(obj: doc, name: "getRootNode", fn: { _, thisVal, _ in
+            thisVal.dupValue()   // a document is its own root
+        }, length: 0)
+        ctx.setPropertyFunc(obj: doc, name: "normalize", fn: { [weak self] _, _, _ in
+            guard let self else { return .undefined }
+            if self.normalizeDescendants(of: self.root) { self.notifyMutation(for: self.root) }
+            return .undefined
+        }, length: 0)
+
         // importNode(node, deep) / adoptNode(node) — DOM §4.5: the clone /
         // the adopted node (removed from its old parent) belongs to this document.
         ctx.setPropertyFunc(obj: doc, name: "importNode", fn: { [weak self] ctx, _, args in
@@ -1648,6 +1661,14 @@ final class JeffJSDOMBridge {
             guard let otherNode = self.extractNode(from: args[0]) else { return .newBool(false) }
             return .newBool(self.nodeContains(targetNode, child: otherNode))
         }, length: 1)
+
+        // The rest of the Node interface (DOM §4.4), shared by every node
+        // wrapper (element, text, comment, doctype, fragment, detached
+        // document). These were app-polyfill stubs: normalize() did nothing,
+        // isEqualNode compared identity (JSC bridge) or was missing.
+        installNodeInterfaceMethods(on: el, ctx: ctx) { [weak self] thisVal in
+            self?.nodeFromValue(thisVal)
+        }
 
         // focus(options?) / blur() — HTML §6.6.6 focusing / unfocusing steps.
         ctx.setPropertyFunc(obj: el, name: "focus", fn: { [weak self] ctx, thisVal, _ in
@@ -3075,6 +3096,122 @@ final class JeffJSDOMBridge {
             noteParserInsertions(upTo: nil)
             queueTask { [weak self] in self?.runAutofocus() }
         }
+    }
+
+    // MARK: - Node interface (DOM §4.4)
+
+    /// hasChildNodes / isSameNode / isEqualNode / getRootNode / normalize on
+    /// a node object (`node(thisVal)` resolves the receiver).
+    func installNodeInterfaceMethods(on obj: JeffJSValue, ctx: JeffJSContext,
+                                     node: @escaping (JeffJSValue) -> DOMNode?) {
+        // hasChildNodes() — true if the node has children.
+        ctx.setPropertyFunc(obj: obj, name: "hasChildNodes", fn: { _, thisVal, _ in
+            guard let n = node(thisVal) else { return .newBool(false) }
+            return .newBool(!n.children.isEmpty)
+        }, length: 0)
+        // isSameNode(otherNode) — legacy alias of ===.
+        ctx.setPropertyFunc(obj: obj, name: "isSameNode", fn: { [weak self] _, thisVal, args in
+            guard let self, let n = node(thisVal), !args.isEmpty,
+                  let other = self.nodeArgument(args[0]) else { return .newBool(false) }
+            return .newBool(n === other)
+        }, length: 1)
+        // isEqualNode(otherNode) — the "equals" algorithm.
+        ctx.setPropertyFunc(obj: obj, name: "isEqualNode", fn: { [weak self] _, thisVal, args in
+            guard let self, let n = node(thisVal), !args.isEmpty,
+                  let other = self.nodeArgument(args[0]) else { return .newBool(false) }
+            return .newBool(self.nodesEqual(n, other))
+        }, length: 1)
+        // getRootNode(options) — the root: the topmost inclusive ancestor
+        // (shadow roots are the app's JS polyfill and are not in this tree).
+        ctx.setPropertyFunc(obj: obj, name: "getRootNode", fn: { [weak self] ctx, thisVal, _ in
+            guard let self, let n = node(thisVal) else { return thisVal.dupValue() }
+            var top = n
+            while let p = top.parent { top = p }
+            if top === n { return thisVal.dupValue() }
+            return self.jsValue(for: top, ctx: ctx)
+        }, length: 0)
+        // normalize() — merges adjacent Text nodes and removes empty ones
+        // in the subtree, with characterData / childList records.
+        ctx.setPropertyFunc(obj: obj, name: "normalize", fn: { [weak self] _, thisVal, _ in
+            guard let self, let n = node(thisVal) else { return .undefined }
+            if self.normalizeDescendants(of: n) { self.notifyMutation(for: n) }
+            return .undefined
+        }, length: 0)
+    }
+
+    /// DOM §4.4 "a node A equals a node B": same node type, the type's own
+    /// fields (doctype name / public ID / system ID; element namespace, local
+    /// name and attribute list — as a set of (name, value); text and comment
+    /// data), the same number of children and each child equal to the one at
+    /// the same index.
+    func nodesEqual(_ a: DOMNode, _ b: DOMNode) -> Bool {
+        if a === b { return true }
+        guard a.nodeType == b.nodeType, a.isDocumentType == b.isDocumentType else { return false }
+        switch a.nodeType {
+        case .element:
+            guard (a.namespaceURI ?? DOMNode.htmlNamespace) == (b.namespaceURI ?? DOMNode.htmlNamespace),
+                  a.tagName == b.tagName,
+                  a.enumerableAttributes == b.enumerableAttributes else { return false }
+        case .text:
+            if (a.textContent ?? "") != (b.textContent ?? "") { return false }
+        case .comment:
+            if a.isDocumentType {
+                if a.doctypeName != b.doctypeName || a.doctypePublicId != b.doctypePublicId
+                    || a.doctypeSystemId != b.doctypeSystemId { return false }
+            } else if (a.textContent ?? "") != (b.textContent ?? "") {
+                return false
+            }
+        case .document, .documentFragment:
+            break
+        }
+        let ac = a.children, bc = b.children
+        guard ac.count == bc.count else { return false }
+        for i in 0 ..< ac.count where !nodesEqual(ac[i], bc[i]) { return false }
+        return true
+    }
+
+    /// DOM §4.4 normalize() over `node`'s descendants in tree order: an empty
+    /// Text node is removed; otherwise each contiguous Text node after it is
+    /// appended to it ("replace data", a characterData record, unless empty)
+    /// and removed (a childList record), in WebKit's order. True when
+    /// anything changed.
+    @discardableResult
+    func normalizeDescendants(of node: DOMNode) -> Bool {
+        var changed = false
+        var i = 0
+        while true {
+            let kids = node.children
+            guard i < kids.count else { break }
+            let child = kids[i]
+            if child.nodeType == .text {
+                let data = child.textContent ?? ""
+                if data.utf16.isEmpty {
+                    removeNodeFromParent(child)
+                    changed = true
+                    continue            // the next node moved to index i
+                }
+                // Merge the following Text siblings one at a time, as WebKit
+                // does (Node::normalize): an empty one is just removed; a
+                // non-empty one is appended ("replace data" at the end, a
+                // characterData record) and then removed. The records come in
+                // that interleaved order (the spec's text appends them all in
+                // one step first); the resulting tree is the same.
+                var merged = data
+                while let next = nextSibling(of: child), next.nodeType == .text {
+                    let nextData = next.textContent ?? ""
+                    if !nextData.utf16.isEmpty {
+                        merged += nextData
+                        setCharacterData(child, merged)
+                    }
+                    removeNodeFromParent(next)
+                    changed = true
+                }
+            } else if !child.children.isEmpty {
+                if normalizeDescendants(of: child) { changed = true }
+            }
+            i += 1
+        }
+        return changed
     }
 
     // MARK: - Helpers
