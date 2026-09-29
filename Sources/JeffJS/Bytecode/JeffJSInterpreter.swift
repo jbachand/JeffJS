@@ -1165,7 +1165,17 @@ extension JeffJSContext {
             }
         }
 
-        obj.payload = .bytecodeFunc(functionBytecode: innerFB, varRefs: childVarRefs, homeObject: nil)
+        // ES2015 §14.2.16 / §12.3.5: an arrow function has no [[HomeObject]] of its
+        // own — `super.x` inside it is the enclosing method's (its
+        // GetThisEnvironment is the method's). Methods get theirs afterwards
+        // from `set_home_object`. (google.com's history store:
+        // `get(a){pMa(this,()=>c=super.get(a))}` threw "undefined is not a function".)
+        var inheritedHome: JeffJSObject? = nil
+        if innerFB.isArrow, let parentFn = parentFrame.curFunc.toObject(),
+           case .bytecodeFunc(_, _, let h) = parentFn.payload {
+            inheritedHome = h
+        }
+        obj.payload = .bytecodeFunc(functionBytecode: innerFB, varRefs: childVarRefs, homeObject: inheritedHome)
         // A lazy function whose body is not compiled yet keeps fbFast nil:
         // every call path then reaches callInternal's payload path, which
         // compiles it (JeffJSCompiler.compileLazy) and sets fbFast. A
