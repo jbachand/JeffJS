@@ -275,8 +275,10 @@ extension JeffJSParser {
             fd.childFunctions.append(defaultCtorFd)
             cf.ctorFd = defaultCtorFd
 
+            defaultCtorFd.isClassConstructor = true
             let savedFd = fd
             fd = defaultCtorFd
+            emitOp(.check_ctor)          // [[Call]] of a class constructor throws
             if hasExtends {
                 // constructor(...args) { super(...args); }
                 // `this` is uninitialised until super() returns (QuickJS
@@ -302,6 +304,16 @@ extension JeffJSParser {
             let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
             emitFClosure(cpoolIdx)
         }
+
+        // SetFunctionName(F, className) happens as soon as the constructor
+        // exists, before any class element is defined (ES §15.7.14): a static
+        // `name` member overrides it and a static initializer sees it. An
+        // anonymous class expression gets "" here; NamedEvaluation
+        // (emitNamedEvaluation) patches the binding's name into this operand.
+        var anonNameAtomPos = -1
+        emitOp(.set_name)
+        if className == 0 { anonNameAtomPos = fd.byteCode.len }
+        emitAtom(className != 0 ? className : getAtom(""))
 
         // Build prototype object.
         // For extends: stack has superclass; build proto with
@@ -379,14 +391,6 @@ extension JeffJSParser {
         emitU8(DefineMethodFlags.method.rawValue)    // ..., [sc,] ctorFunc, proto, proto
         emitOp(.drop)                                // ..., [sc,] ctorFunc, proto
 
-        // Set the constructor's name
-        if className != 0 {
-            emitOp(.swap)                            // ..., [sc,] proto, ctorFunc
-            emitOp(.set_name)
-            emitAtom(className)                      // ..., [sc,] proto, ctorFunc   (ctorFunc.name = className)
-            emitOp(.swap)                            // ..., [sc,] ctorFunc, proto
-        }
-
         // Drop proto, keep ctorFunc
         emitOp(.drop)                                // ..., [sc,] ctorFunc
 
@@ -430,9 +434,15 @@ extension JeffJSParser {
         }
 
         if !isExpression && className != 0 {
+            checkLexicalDeclaration(className, kind: .classDecl)
             let varIdx = defineVar(className, isConst: true, isLexical: true)
             emitScopePutVarInit(className, scopeLevel: fd.curScope)
             _ = varIdx
+        }
+        if isExpression && className == 0 {
+            markAnonymousDefinition(classNameAtomPos: anonNameAtomPos)
+        } else {
+            lastAnonClosureEnd = -1
         }
     }
 
@@ -599,6 +609,7 @@ extension JeffJSParser {
             }
             if isConstructor {
                 methodFd.newTargetAllowed = true
+                methodFd.isClassConstructor = true
                 methodFd.funcName = className
                 if hasExtends {
                     methodFd.isDerivedClassConstructor = true
@@ -794,6 +805,13 @@ extension JeffJSParser {
             }
             if hasInit {
                 parseAssignExpr()
+                // A field initializer is a NamedEvaluation with the field's
+                // name (ES §15.7.10 step 4): "x", "#x", or the computed key.
+                if isComputed {
+                    emitNamedEvaluationComputed()
+                } else {
+                    emitNamedEvaluation(propAtom)
+                }
             } else {
                 emitOp(.undefined)
             }

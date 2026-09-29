@@ -170,8 +170,16 @@ final class JeffJSParser {
     var fd: JeffJSFunctionDefCompiler
 
     /// See emitFClosure / emitNamedEvaluation: bytecode offset just past the
-    /// most recently emitted anonymous closure, or -1.
+    /// most recently emitted anonymous function or class definition, or -1,
+    /// and the function definition it was emitted into (offsets of two
+    /// functions must never be compared).
     var lastAnonClosureEnd: Int = -1
+    var lastAnonClosureFd: ObjectIdentifier? = nil
+    /// For an anonymous class expression: where the atom operand of its
+    /// placeholder `set_name` sits (NamedEvaluation patches the name in, so
+    /// the class is named before its static elements run, ES §15.7.14), or -1
+    /// when the last anonymous definition was a function.
+    var lastAnonClassNameAtomPos: Int = -1
     /// The function whose formal parameters are being bound (pattern replay
     /// in emitParameterInitializers), or nil. A binding named `arguments`
     /// declared for it is a parameter name (ES §10.2.11 step 17).
@@ -1313,16 +1321,60 @@ final class JeffJSParser {
     func emitFClosure(_ cpoolIdx: Int, anonymous: Bool = false) {
         emitOp(.fclosure)
         emitU32(UInt32(cpoolIdx))
-        lastAnonClosureEnd = anonymous ? fd.byteCode.len : -1
+        if anonymous { markAnonymousDefinition(classNameAtomPos: -1) }
+        else { lastAnonClosureEnd = -1 }
     }
 
-    /// If the expression just parsed was exactly an anonymous closure, give it
-    /// `atom` as its `name`.
+    /// The expression that just ended is an anonymous function or class
+    /// definition (IsAnonymousFunctionDefinition, ES §8.4.3).
+    func markAnonymousDefinition(classNameAtomPos: Int) {
+        lastAnonClosureEnd = fd.byteCode.len
+        lastAnonClosureFd = ObjectIdentifier(fd)
+        lastAnonClassNameAtomPos = classNameAtomPos
+    }
+
+    /// True when the expression just parsed was exactly an anonymous function
+    /// or class definition (parentheses allowed, a comma expression not).
+    var lastExpressionIsAnonymousDefinition: Bool {
+        return lastAnonClosureEnd >= 0 && lastAnonClosureEnd == fd.byteCode.len
+            && lastAnonClosureFd == ObjectIdentifier(fd)
+    }
+
+    /// NamedEvaluation (ES §8.4.5) with a name known at compile time: if the
+    /// expression just parsed was exactly an anonymous function or class
+    /// definition, give it `atom` as its `name`. One rule for every
+    /// IsAnonymousFunctionDefinition position: variable / lexical
+    /// initializers, `=` and logical assignment to an identifier, default
+    /// parameters, destructuring defaults, property definitions, class fields.
     func emitNamedEvaluation(_ atom: JSAtom) {
-        guard atom != 0, lastAnonClosureEnd == fd.byteCode.len else { return }
-        emitOp(.set_name)
-        emitAtom(atom)
+        guard atom != 0, lastExpressionIsAnonymousDefinition else { return }
+        if lastAnonClassNameAtomPos >= 0 {
+            // A class: its placeholder `set_name ""` runs before the class
+            // elements; name it there (a static `name` member still wins).
+            let p = lastAnonClassNameAtomPos
+            fd.byteCode.buf[p] = UInt8(truncatingIfNeeded: atom)
+            fd.byteCode.buf[p + 1] = UInt8(truncatingIfNeeded: atom >> 8)
+            fd.byteCode.buf[p + 2] = UInt8(truncatingIfNeeded: atom >> 16)
+            fd.byteCode.buf[p + 3] = UInt8(truncatingIfNeeded: atom >> 24)
+        } else {
+            emitOp(.set_name)
+            emitAtom(atom)
+        }
         lastAnonClosureEnd = -1
+        lastAnonClassNameAtomPos = -1
+    }
+
+    /// NamedEvaluation with a computed key (`{[k]: function(){}}`, `[k] = class {}`):
+    /// the property key sits right under the value; names the value after it
+    /// at run time (a symbol gives "[description]"). Stack: [key, val] -> [key, val].
+    func emitNamedEvaluationComputed() {
+        guard lastExpressionIsAnonymousDefinition else { return }
+        emitOp(.swap)               // [val, key]
+        emitOp(.dup)                // [val, key, key]
+        emitOp(.rot3r)              // [key, val, key]
+        emitOp(.set_name_computed)  // [key, val]
+        lastAnonClosureEnd = -1
+        lastAnonClassNameAtomPos = -1
     }
 
     /// Emit a call opcode.
@@ -1499,6 +1551,7 @@ final class JeffJSParser {
     /// of an enclosing block (B.3.4) and `with` objects.
     @discardableResult
     func declareVarBinding(_ name: JSAtom) -> Int {
+        checkVarDeclaration(name)
         if fd.parent == nil && programVarMode != .local {
             // Same rule as parseVarDeclaration's global `var`: parseProgram
             // hoists a define_var for it to the start of the script.
@@ -1533,6 +1586,141 @@ final class JeffJSParser {
         let idx = defineVar(name)
         fd.curScope = saved
         return idx
+    }
+
+    // MARK: Redeclaration early errors (ES §14.2.1, §14.12.1, §14.15.1, §15.2.1, §16.1.1, B.3.2-B.3.4)
+
+    enum LexicalDeclKind { case letDecl, constDecl, classDecl, functionDecl }
+
+    /// The vars of scope `sc` (its own linked list); `body` returns false to stop.
+    private func forEachVarInScope(_ sc: Int, _ body: (Int, JeffJSVarDef) -> Bool) {
+        guard sc >= 0, sc < fd.scopes.count else { return }
+        var i = fd.scopes[sc].first
+        var guardCount = 0
+        while i >= 0 && i < fd.vars.count && guardCount < 1_000_000 {
+            let v = fd.vars[i]
+            if !body(i, v) { return }
+            i = v.scopeNext
+            guardCount += 1
+        }
+    }
+
+    private func redeclAtomText(_ atom: JSAtom) -> String {
+        return s.ctx?.atomName(atom) ?? "?"
+    }
+
+    /// A lexical declaration (let / const / class, or a function declaration
+    /// in a block) of `name` in the current scope. It may not share the scope
+    /// with another declaration of the name, nor with a `var` declared in or
+    /// hoisted through it, nor (at a function's top level) with a parameter,
+    /// nor (in a catch block) with the catch parameter. Sloppy-mode duplicate
+    /// function declarations in a block are allowed (B.3.2.4). The messages
+    /// are JavaScriptCore's. Returns false after reporting the SyntaxError.
+    @discardableResult
+    func checkLexicalDeclaration(_ name: JSAtom, kind: LexicalDeclKind) -> Bool {
+        guard name != 0 else { return true }
+        let sc = fd.curScope
+        func fail() -> Bool {
+            let text = redeclAtomText(name)
+            switch kind {
+            case .letDecl: syntaxError("Cannot declare a let variable twice: '\(text)'.")
+            case .constDecl: syntaxError("Cannot declare a const variable twice: '\(text)'.")
+            case .classDecl: syntaxError("Cannot declare a class twice: '\(text)'.")
+            case .functionDecl: syntaxError("Cannot declare a function that shadows a let/const/class/function variable '\(text)'.")
+            }
+            return false
+        }
+        let sloppy = (fd.jsMode & JS_MODE_STRICT) == 0
+        let selfIdx = fd.funcNameVarIdx, argsIdx = fd.argumentsVarIdx
+        var conflict = false
+        forEachVarInScope(sc) { idx, v in
+            guard v.varName == name, idx != selfIdx, idx != argsIdx else { return true }
+            if sc == 0 {
+                // Top level: vars and function declarations are var-scoped;
+                // a lexical declaration conflicts with any of them.
+                if kind == .functionDecl && !v.isLexical { return true }
+                conflict = true
+            } else if kind == .functionDecl && sloppy && !v.isLexical
+                        && v.varKind == JSVarKindEnum.JS_VAR_FUNCTION_DECL.rawValue {
+                return true   // B.3.2.4: `{ function f(){} function f(){} }`
+            } else {
+                conflict = true
+            }
+            return !conflict
+        }
+        if conflict { return fail() }
+        // A script's block-level function declaration (bound by define_func).
+        if let fns = fd.blockFunctionNamesByScope[sc], fns.contains(name),
+           !(kind == .functionDecl && sloppy) {
+            return fail()
+        }
+        // A `var` of the name declared in (or hoisted through) this scope.
+        if !(kind == .functionDecl && sc == 0),
+           fd.varNamesThroughScope[sc]?.contains(name) == true {
+            return fail()
+        }
+        if sc == 0 && kind != .functionDecl {
+            // Script top level: its `var`s are hoisted by name.
+            if fd.parent == nil && fd.hoistedGlobalVarAtoms.contains(name) { return fail() }
+            // Function top level: a parameter of the same name.
+            if fd.parent != nil && fd.args.contains(where: { $0.varName == name }) { return fail() }
+        }
+        // The block of a catch clause: the catch parameter's names.
+        if sc > 0, sc < fd.scopes.count {
+            let p = fd.scopes[sc].parent
+            if p >= 0, p < fd.scopes.count, fd.scopes[p].isCatch {
+                var clash = false
+                forEachVarInScope(p) { _, v in
+                    if v.varName == name { clash = true }
+                    return !clash
+                }
+                if clash { return fail() }
+            }
+        }
+        return true
+    }
+
+    /// A `var` (or a top-level function declaration) of `name` in the current
+    /// scope hoists to the function's var scope: no scope it passes through,
+    /// the current one included, may hold a lexical declaration of the name
+    /// (a catch parameter excepted, B.3.4), and each records it so a later
+    /// lexical declaration there is rejected. Returns false after reporting
+    /// the SyntaxError.
+    @discardableResult
+    func checkVarDeclaration(_ name: JSAtom, isFunction: Bool = false) -> Bool {
+        guard name != 0 else { return true }
+        let selfIdx = fd.funcNameVarIdx, argsIdx = fd.argumentsVarIdx
+        var sc = fd.curScope
+        var steps = 0
+        while sc >= 0 && sc < fd.scopes.count && steps < 100_000 {
+            var conflict = false
+            let scope = sc
+            forEachVarInScope(scope) { idx, v in
+                guard v.varName == name, idx != selfIdx, idx != argsIdx else { return true }
+                if v.isLexical && v.varKind != JSVarKindEnum.JS_VAR_CATCH.rawValue {
+                    conflict = true
+                } else if scope != 0 && !isFunction
+                            && v.varKind == JSVarKindEnum.JS_VAR_FUNCTION_DECL.rawValue {
+                    conflict = true   // a function declared in a block is lexical there
+                }
+                return !conflict
+            }
+            if scope != 0, !isFunction, fd.blockFunctionNamesByScope[scope]?.contains(name) == true {
+                conflict = true
+            }
+            if conflict {
+                let text = redeclAtomText(name)
+                syntaxError(isFunction
+                    ? "Cannot declare a function that shadows a let/const/class/function variable '\(text)'."
+                    : "Cannot declare a var variable that shadows a let/const/class variable: '\(text)'.")
+                return false
+            }
+            fd.varNamesThroughScope[sc, default: []].insert(name)
+            if sc == 0 { break }
+            sc = fd.scopes[sc].parent
+            steps += 1
+        }
+        return true
     }
 
     /// Find a variable by name in the current scope chain.
@@ -1766,6 +1954,18 @@ final class JeffJSParser {
         // changes tokenization — reserved words, legacy octal literals, `with`.
         scanProgramDirectivePrologue()
         fd.isProgramCode = true
+        // The completion value (ES §16.1.6 ScriptEvaluation, §19.2.1.1
+        // PerformEval) lives in a hidden local, as in QuickJS: expression
+        // statements store into it and loops / if / switch / try / with reset
+        // it to undefined (UpdateEmpty(…, undefined)). It used to sit at the
+        // bottom of the operand stack, reached by rewriting "tail" drops into
+        // `nip` — which, inside a for-of / for-in body or a catch without a
+        // binding, overwrote the iterator record instead: `for (var c of l)
+        // f(c)` as the last statement of a script or eval called its value as
+        // `next` on the second iteration ("undefined is not a function"),
+        // `for (x of a) { try { throw 0 } catch {} }` did the same with the
+        // exception, and other shapes underflowed the stack ("op=nip").
+        fd.evalRetIdx = defineVar(0)
         next() // prime the first token
 
         // Parse source elements (statements and declarations)
@@ -1790,7 +1990,7 @@ final class JeffJSParser {
 
         // Hoist top-level `var` declarations: insert `define_var` instructions
         // at position 0 so variables exist (as undefined) from the start.
-        // This must happen before patchCompletionDrops because the bytecode
+        // This must happen before the final return is emitted because the bytecode
         // positions shift when we insert bytes at the front.
         if !fd.hoistedGlobalVarAtoms.isEmpty && programVarMode == .callerVarEnv,
            let site = fd.evalSite {
@@ -1840,174 +2040,20 @@ final class JeffJSParser {
             }
         }
 
-        // For eval: find the last `drop` opcode in tail position and replace
-        // it with `return_` so the expression value is returned. This handles
-        // not just simple expression statements but also drops inside if/else
-        // and try/catch branches.
-        //
-        // We scan backwards through the bytecode. Opcodes we can skip over
-        // (they don't affect the value on TOS): label_, goto_, nip_catch,
-        // leave_scope, gosub, ret (finally return), return_undef, nop.
-        // When we find a `drop`, replace it with `nop` and emit `return_`
-        // at the end. We replace ALL drops in tail position to handle both
-        // branches of if/else.
-        if patchCompletionDrops() {
-            // The patched drops became `nip`, which replaces the completion
-            // value sitting at the bottom of the operand stack. That slot is
-            // seeded with `undefined` here so a branch that never runs (or a
-            // loop body that runs zero times) still leaves exactly one value
-            // for `return_`: `if (false) { o.x = 1; }` used to reach the
-            // return with an empty stack.
-            let undefByte = UInt8(truncatingIfNeeded: JeffJSOpcode.undefined.rawValue)
-            fd.byteCode.buf.insert(undefByte, at: 0)
-            fd.byteCode.len += 1
-            fd.bodyBytecodeStart += 1
-            fd.hoistedFuncDeclRanges = fd.hoistedFuncDeclRanges.map { ($0.0 + 1, $0.1 + 1) }
-            emitOp(.return_)
-            return
-        }
-
-        // No expression statement at end — return undefined
-        emitOp(.return_undef)
+        // Return the completion value.
+        emitOp(.get_loc)
+        emitU16(UInt16(fd.evalRetIdx))
+        emitOp(.return_)
     }
 
-    /// Scan backwards through bytecode and replace `drop` opcodes in tail
-    /// position with `nop`. Returns true if at least one drop was replaced.
-    ///
-    /// Uses a work-list approach: starting from the last instruction, propagate
-    /// "tail" status to predecessors and jump targets until no more changes.
-    private func patchCompletionDrops() -> Bool {
-        let buf = fd.byteCode.buf
-        let bcLen = fd.byteCode.len
-        guard bcLen > 0 else { return false }
-
-        // Build an array of instruction positions and their opcodes.
-        var instructions: [(pos: Int, op: JeffJSOpcode, size: Int)] = []
-        var pos = 0
-        while pos < bcLen {
-            guard let op = peekOpcodeAt(pos) else { break }
-            let info = jeffJSGetOpcodeInfo(op)
-            let instrSize: Int
-            if buf[pos] == 0 && pos + 1 < bcLen {
-                instrSize = Int(info.size) + 1  // wide opcode
-            } else {
-                instrSize = Int(info.size)
-            }
-            if instrSize <= 0 { break }
-            instructions.append((pos: pos, op: op, size: instrSize))
-            pos += instrSize
-        }
-
-        guard !instructions.isEmpty else { return false }
-
-        // Build a reverse map: label index -> instruction index of the label_ opcode
-        var labelToInstrIdx: [Int: Int] = [:]
-        // Build: label index -> [instruction indices that jump TO this label]
-        var labelJumpSources: [Int: [Int]] = [:]
-
-        for (i, instr) in instructions.enumerated() {
-            if instr.op == .label_ {
-                let opcodeSize = buf[instr.pos] == 0 ? 2 : 1
-                let labelIdx = Int(readU32FromBuf(buf, instr.pos + opcodeSize))
-                labelToInstrIdx[labelIdx] = i
-            } else if instr.op == .goto_ || instr.op == .if_false || instr.op == .if_true
-                        || instr.op == .gosub {
-                let opcodeSize = buf[instr.pos] == 0 ? 2 : 1
-                let labelIdx = Int(readU32FromBuf(buf, instr.pos + opcodeSize))
-                labelJumpSources[labelIdx, default: []].append(i)
-            }
-        }
-
-        let dropOp = JeffJSOpcode.drop
-        let nipByte = UInt8(truncatingIfNeeded: JeffJSOpcode.nip.rawValue)
-        var found = false
-
-        // Work-list of instruction indices to process as "tail".
-        var tailIndices = Set<Int>()
-        var worklist = [instructions.count - 1]
-        tailIndices.insert(instructions.count - 1)
-
-        while !worklist.isEmpty {
-            let i = worklist.removeLast()
-            let (ipos, iop, _) = instructions[i]
-
-            if iop == dropOp {
-                // Replace this drop with `nip`: it overwrites the completion
-                // value below it instead of discarding the statement value,
-                // so the stack depth is the same on every path (and a tail
-                // drop inside a loop no longer grows the stack per iteration).
-                fd.byteCode.buf[ipos] = nipByte
-                found = true
-                // Predecessor is also in tail position
-                if i > 0 && !tailIndices.contains(i - 1) {
-                    tailIndices.insert(i - 1)
-                    worklist.append(i - 1)
-                }
-            } else if isTailTransparentOp(iop) {
-                // Predecessor is in tail position
-                if i > 0 && !tailIndices.contains(i - 1) {
-                    tailIndices.insert(i - 1)
-                    worklist.append(i - 1)
-                }
-
-                // For jump instructions, follow FORWARD jump targets
-                if iop == .goto_ || iop == .if_false || iop == .if_true {
-                    let opcodeSize = buf[ipos] == 0 ? 2 : 1
-                    let labelIdx = Int(readU32FromBuf(buf, ipos + opcodeSize))
-                    if let targetLabelInstrIdx = labelToInstrIdx[labelIdx] {
-                        let afterLabelIdx = targetLabelInstrIdx + 1
-                        if afterLabelIdx < instructions.count &&
-                           afterLabelIdx > i &&  // forward jump only
-                           !tailIndices.contains(afterLabelIdx) {
-                            tailIndices.insert(afterLabelIdx)
-                            worklist.append(afterLabelIdx)
-                        }
-                    }
-                }
-
-                // For label_ opcodes: if this label is a jump target and
-                // this label instruction is in tail position, then all
-                // instructions that jump HERE are also in tail position
-                // (because landing at this label means we're in tail context).
-                if iop == .label_ {
-                    let opcodeSize = buf[ipos] == 0 ? 2 : 1
-                    let labelIdx = Int(readU32FromBuf(buf, ipos + opcodeSize))
-                    if let sources = labelJumpSources[labelIdx] {
-                        for srcIdx in sources {
-                            if !tailIndices.contains(srcIdx) {
-                                tailIndices.insert(srcIdx)
-                                worklist.append(srcIdx)
-                            }
-                        }
-                    }
-                }
-            }
-            // Any other opcode: not transparent, stop propagating from here
-        }
-
-        return found
-    }
-
-    /// Returns true if an opcode is "transparent" for tail-position completion
-    /// value analysis -- i.e., it doesn't produce or consume the completion value.
-    ///
-    /// `.ret` is deliberately NOT transparent: walking backward through `ret`
-    /// enters a finally body, and a finally body's statement values are never
-    /// the script completion (the completion sits BELOW the gosub return
-    /// address). Patching a drop inside a finally leaves a stray value that
-    /// `ret` then pops as its return address — pc jumps to a bogus offset and
-    /// the gosub/ret cycle never terminates. The legitimate completion drop
-    /// before `gosub` is still reached via the end-label's jump-source walk.
-    private func isTailTransparentOp(_ op: JeffJSOpcode) -> Bool {
-        switch op {
-        case .label_, .goto_, .if_false, .if_true,
-             .nip_catch, .leave_scope, .enter_scope,
-             .gosub, .return_undef, .return_async, .nop,
-             .close_loc, .line_num:
-            return true
-        default:
-            return false
-        }
+    /// UpdateEmpty(…, undefined) for the statements that have it (if, loops,
+    /// switch, try, catch, with): in program code, reset the hidden
+    /// completion value (QuickJS set_eval_ret_undefined).
+    func emitSetEvalRetUndefined() {
+        guard fd.evalRetIdx >= 0 else { return }
+        emitOp(.undefined)
+        emitOp(.put_loc)
+        emitU16(UInt16(fd.evalRetIdx))
     }
 
     /// Parse a single source element (statement or declaration).
@@ -2152,6 +2198,7 @@ final class JeffJSParser {
     /// Parse: if '(' Expression ')' Statement [else Statement]
     func parseIfStatement() {
         expect(JSTokenType.TOK_IF.rawValue)
+        emitSetEvalRetUndefined()
         expect(0x28) // '('
         parseExpression()
         expect(0x29) // ')'
@@ -2178,6 +2225,7 @@ final class JeffJSParser {
     /// Parse: while '(' Expression ')' Statement
     func parseWhileStatement() {
         expect(JSTokenType.TOK_WHILE.rawValue)
+        emitSetEvalRetUndefined()
         expect(0x28) // '('
 
         let loopLabel = newLabel()
@@ -2213,6 +2261,7 @@ final class JeffJSParser {
     /// Parse: do Statement while '(' Expression ')' ';'
     func parseDoWhileStatement() {
         expect(JSTokenType.TOK_DO.rawValue)
+        emitSetEvalRetUndefined()
 
         let loopLabel = newLabel()
         let breakLabel = newLabel()
@@ -2243,6 +2292,7 @@ final class JeffJSParser {
     /// Handles: for, for-in, for-of
     func parseForStatement() {
         expect(JSTokenType.TOK_FOR.rawValue)
+        emitSetEvalRetUndefined()
 
         // Check for 'for await' (`await` is a keyword token, TOK_AWAIT)
         let isAwait = tok == JSTokenType.TOK_AWAIT.rawValue || isIdent("await")
@@ -2284,6 +2334,7 @@ final class JeffJSParser {
 
                 if tok == JSTokenType.TOK_IN.rawValue {
                     // for (var x in ...): a var head stores by name (-1)
+                    if isLexical { checkLexicalDeclaration(varName, kind: isConst ? .constDecl : .letDecl) }
                     let varIdx = isLexical ? defineVar(varName, isConst: isConst, isLexical: true)
                                            : { declareVarBinding(varName); return -1 }()
                     next() // consume 'in'
@@ -2295,6 +2346,7 @@ final class JeffJSParser {
                 } else if tok == JSTokenType.TOK_OF.rawValue ||
                           isIdent("of") {
                     // for (var x of ...): a var head stores by name (-1)
+                    if isLexical { checkLexicalDeclaration(varName, kind: isConst ? .constDecl : .letDecl) }
                     let varIdx = isLexical ? defineVar(varName, isConst: isConst, isLexical: true)
                                            : { declareVarBinding(varName); return -1 }()
                     next() // consume 'of'
@@ -2775,6 +2827,7 @@ final class JeffJSParser {
     func parseSwitchStatement() {
         fd.hasSwitch = true   // enables the compiler's switch fix-up pass for this function
         expect(JSTokenType.TOK_SWITCH.rawValue)
+        emitSetEvalRetUndefined()
         expect(0x28) // '('
         parseExpression()
         expect(0x29) // ')'
@@ -2917,6 +2970,7 @@ final class JeffJSParser {
     /// Parse: try Block [catch Block] [finally Block]
     func parseTryStatement() {
         expect(JSTokenType.TOK_TRY.rawValue)
+        emitSetEvalRetUndefined()
 
         let catchLabel = newLabel()
         let finallyLabel = newLabel()
@@ -2971,6 +3025,7 @@ final class JeffJSParser {
             next() // consume 'catch'
 
             let scopeIdx = pushScope()
+            if scopeIdx >= 0 && scopeIdx < fd.scopes.count { fd.scopes[scopeIdx].isCatch = true }
 
             if tok == 0x28 { // '(' -- catch parameter
                 next()
@@ -2999,6 +3054,10 @@ final class JeffJSParser {
                 emitOp(.drop)
             }
 
+            // The catch clause's completion is its block's (UpdateEmpty(C,
+            // undefined), ES §14.15.3), not what the try block stored.
+            emitSetEvalRetUndefined()
+
             // Push finally scope for catch body (no nip_catch needed —
             // catch handler already consumed by the catch dispatch)
             finallyScopes.append(FinallyScope(label: finallyLabel, needsNipCatch: false))
@@ -3014,7 +3073,21 @@ final class JeffJSParser {
         if tok == JSTokenType.TOK_FINALLY.rawValue {
             next() // consume 'finally'
             emitLabel(finallyLabel)
+            // A finally block that completes normally does not change the
+            // completion value (ES §14.15.3: the try / catch one stands):
+            // save it around the block (QuickJS does the same).
+            var savedRetIdx = -1
+            if fd.evalRetIdx >= 0 {
+                savedRetIdx = defineVar(0)
+                emitOp(.get_loc); emitU16(UInt16(fd.evalRetIdx))
+                emitOp(.put_loc); emitU16(UInt16(savedRetIdx))
+                emitSetEvalRetUndefined()
+            }
             parseBlockStatement()
+            if savedRetIdx >= 0 {
+                emitOp(.get_loc); emitU16(UInt16(savedRetIdx))
+                emitOp(.put_loc); emitU16(UInt16(fd.evalRetIdx))
+            }
             emitOp(.ret) // return from gosub
         } else {
             // No finally clause — emit a no-op finally so gosub has a target
@@ -3213,6 +3286,7 @@ final class JeffJSParser {
             return
         }
 
+        emitSetEvalRetUndefined()
         expect(0x28) // '('
         parseExpression()
         expect(0x29) // ')'
@@ -3275,7 +3349,13 @@ final class JeffJSParser {
     /// Parse: Expression ';'
     func parseExpressionStatement() {
         parseExpression()
-        emitOp(.drop)
+        if fd.evalRetIdx >= 0 {
+            // Program code: the statement's value is the completion value.
+            emitOp(.put_loc)
+            emitU16(UInt16(fd.evalRetIdx))
+        } else {
+            emitOp(.drop)
+        }
         expectSemicolon()
     }
 
@@ -3382,6 +3462,7 @@ final class JeffJSParser {
         // is accessible from any scope (Promise reaction jobs, async callbacks,
         // other eval calls). `let`/`const` remain block-scoped.
         let isGlobalVar = !isLexical && fd.parent == nil && programVarMode != .local
+        if isGlobalVar { checkVarDeclaration(varName) }
 
         if isGlobalVar && fd.evalSite != nil {
             // Direct eval: parseProgram declares the name in the caller's
@@ -3420,6 +3501,7 @@ final class JeffJSParser {
             }
             // No initializer: variable is already undefined on global object
         } else {
+            if isLexical { checkLexicalDeclaration(varName, kind: isConst ? .constDecl : .letDecl) }
             let varIdx = isLexical ? defineVar(varName, isConst: isConst, isLexical: true)
                                    : declareVarBinding(varName)
 
@@ -3613,6 +3695,10 @@ final class JeffJSParser {
                 }
                 fd.hoistedFuncDeclRanges.append((fclosureStart, fd.byteCode.len))
             } else if fd.parent == nil && programVarMode == .global {
+                if fd.curScope == 0 { checkVarDeclaration(funcName, isFunction: true) }
+                else if checkLexicalDeclaration(funcName, kind: .functionDecl) {
+                    fd.blockFunctionNamesByScope[fd.curScope, default: []].insert(funcName)
+                }
                 if fd.evalSite != nil { fd.evalFuncDeclNames.append(funcName) }
                 // Top-level function declaration in global eval: hoist to global object
                 // via define_func so it's accessible from any scope (e.g., Promise
@@ -3630,6 +3716,8 @@ final class JeffJSParser {
                 // Function declaration inside a function: define as local variable.
                 // Mark byte range for hoisting (moved to body start before label resolution).
                 let hoistStart = fd.byteCode.len
+                if fd.curScope == 0 { checkVarDeclaration(funcName, isFunction: true) }
+                else { checkLexicalDeclaration(funcName, kind: .functionDecl) }
                 let varIdx = defineVar(funcName,
                                        varKind: JSVarKindEnum.JS_VAR_FUNCTION_DECL.rawValue)
                 emitScopePutVarInit(funcName, scopeLevel: fd.curScope)
@@ -3811,6 +3899,13 @@ final class JeffJSParser {
         curBlockEnvIdx = -1  // nor the enclosing function's loops (break/continue/return unwinding)
         inFlag = true // FunctionBody always uses [+In] per ECMAScript spec
         fd = childFd
+
+        // A class constructor called without `new` throws before anything
+        // else runs — parameter initializers and field initializers included
+        // (ES §10.2.1 [[Call]] step 2; QuickJS OP_check_ctor).
+        if fd.isClassConstructor {
+            emitOp(.check_ctor)
+        }
 
         // Check for "use strict" directive
         if tok == JSTokenType.TOK_STRING.rawValue && s.token.strValue == "use strict" {
@@ -4471,7 +4566,7 @@ final class JeffJSParser {
         // `(0, eval)(src)` ends in the same bytecode as `eval(src)` but is an
         // indirect eval: the comma operator yields a value, not a reference.
         // Likewise `(0, obj.m)()` is a plain call (this = undefined).
-        if hadComma { lastEvalCalleeEnd = -1; lastMemberGetEnd = -1 }
+        if hadComma { lastEvalCalleeEnd = -1; lastMemberGetEnd = -1; lastAnonClosureEnd = -1 }
     }
 
     /// Parse an assignment expression.
@@ -4932,6 +5027,9 @@ final class JeffJSParser {
                 // Stack: [oldValue]  (condition says we should assign)
                 emitOp(.drop) // drop old value
                 parseAssignExpr() // evaluate RHS
+                // ES §13.15.2 steps 5.a/6.a/7.a: `x ??= function(){}` is a
+                // NamedEvaluation like `x = function(){}`.
+                emitNamedEvaluation(atom)
                 // Stack: [newValue]
                 emitOp(.dup) // keep a copy for the expression result
                 // Stack: [newValue, newValue]
@@ -7237,6 +7335,7 @@ final class JeffJSParser {
                 emitOp(.dup)     // [key, obj, obj]
                 emitOp(.rot3l)   // [obj, obj, key]
                 parseAssignExpr() // [obj, obj, key, value]
+                emitNamedEvaluationComputed()   // §13.2.5.5
                 emitOp(.put_array_el) // pops [obj, key, value] -> [obj]
             } else {
                 parseAssignExpr()
@@ -7553,10 +7652,9 @@ final class JeffJSParser {
         defer { leaveRecursion() }
         if leaveSource {
             // The source is stashed in a temporary and pushed again after the
-            // pattern, rather than kept underneath it: that keeps the
-            // pattern's last store from sitting directly in front of the
-            // consumer's store, which the chained-assignment lookahead in the
-            // interpreter (isStoreOpcode) would read as `a = b = v`.
+            // pattern, rather than kept underneath it (this also kept the
+            // pattern's last store away from the consumer's store while the
+            // interpreter read adjacent stores as `a = b = v`; it no longer does).
             let tmp = defineVar(0)
             emitOp(.dup)
             emitOp(.put_loc)
@@ -7887,6 +7985,7 @@ final class JeffJSParser {
                     restVarIdx = defineVar(0, isConst: false, isLexical: false)
                     if restBindsVarByName { declareVarBinding(restVarName) }
                 } else {
+                    if isLexical { checkLexicalDeclaration(restVarName, kind: isConst ? .constDecl : .letDecl) }
                     restVarIdx = defineVar(restVarName, isConst: isConst, isLexical: isLexical)
                 }
 
@@ -7978,6 +8077,7 @@ final class JeffJSParser {
                     emitOp(.drop)
                     next()
                     parseAssignExpr()
+                    emitNamedEvaluation(varName)   // §8.6.3 SingleNameBinding / §13.15.5.5
                     emitLabel(endLabel)
                 }
 
@@ -7986,6 +8086,7 @@ final class JeffJSParser {
                     emitScopePutVar(varName, scopeLevel: fd.curScope)
                 } else {
                     if isLexical {
+                        checkLexicalDeclaration(varName, kind: isConst ? .constDecl : .letDecl)
                         let varIdx = defineVar(varName, isConst: isConst, isLexical: true)
                         emitOp(.put_loc_check_init)
                         emitU16(UInt16(varIdx))
@@ -8076,6 +8177,7 @@ final class JeffJSParser {
                     emitScopePutVar(varName, scopeLevel: fd.curScope)
                 } else {
                     if isLexical {
+                        checkLexicalDeclaration(varName, kind: isConst ? .constDecl : .letDecl)
                         let varIdx = defineVar(varName, isConst: isConst, isLexical: true)
                         emitOp(.put_loc_check_init)
                         emitU16(UInt16(varIdx))
@@ -8183,6 +8285,7 @@ final class JeffJSParser {
                         emitOp(.drop)
                         next()
                         parseAssignExpr()
+                        emitNamedEvaluation(varName)
                         emitLabel(endLabel)
                     }
 
@@ -8190,6 +8293,7 @@ final class JeffJSParser {
                         emitScopePutVar(varName, scopeLevel: fd.curScope)
                     } else {
                         if isLexical {
+                            checkLexicalDeclaration(varName, kind: isConst ? .constDecl : .letDecl)
                             let varIdx = defineVar(varName, isConst: isConst, isLexical: true)
                             emitOp(.put_loc_check_init)
                             emitU16(UInt16(varIdx))
@@ -8218,6 +8322,7 @@ final class JeffJSParser {
                     emitOp(.drop)
                     next()
                     parseAssignExpr()
+                    emitNamedEvaluation(propAtom)
                     emitLabel(endLabel)
                 }
 
@@ -8225,6 +8330,7 @@ final class JeffJSParser {
                     emitScopePutVar(propAtom, scopeLevel: fd.curScope)
                 } else {
                     if isLexical {
+                        checkLexicalDeclaration(propAtom, kind: isConst ? .constDecl : .letDecl)
                         let varIdx = defineVar(propAtom, isConst: isConst, isLexical: true)
                         emitOp(.put_loc_check_init)
                         emitU16(UInt16(varIdx))

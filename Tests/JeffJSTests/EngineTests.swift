@@ -130,6 +130,7 @@ final class EngineTests: XCTestCase {
                 fn(&runner)
                 print("[suspect] \(name): +\(runner.passCount - p0) pass, +\(runner.failCount - f0) fail, +\(JeffJSStackDiag.overflowCount - o0) overflows")
             }
+            for e in runner.errors.prefix(60) { print("  \(e)") }
             done.fulfill()
         }
         thread.stackSize = 32 << 20

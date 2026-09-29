@@ -132,6 +132,11 @@ extension JeffJSContext {
         if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
             return true
         }
+        // A function's deferred `name` / `length` are own properties too
+        // (getOwnPropertyNames listed them while hasOwnProperty said false).
+        if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) {
+            materializeFunctionNameLength(jsObj)
+        }
         if let shape = jsObj.shape, findShapeProperty(shape, atom) != nil { return true }
         // The same three exotic index stores the `in` operator reads
         // (`hasPropertyEx`): array holes, typed-array elements and a String

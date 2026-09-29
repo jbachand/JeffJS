@@ -326,6 +326,13 @@ struct JeffJSTestRunner {
             ("ParameterOwnership", { $0.testParameterOwnership() }),
             ("IndexArguments", { $0.testIndexArguments() }),
             ("LazyCompile", { $0.testLazyCompile() }),
+            ("StringIterator", { $0.testStringIterator() }),
+            ("AggregateError", { $0.testAggregateError() }),
+            ("NamedEvaluation", { $0.testNamedEvaluation() }),
+            ("ClassConstructorCall", { $0.testClassConstructorCall() }),
+            ("ProgramCompletion", { $0.testProgramCompletion() }),
+            ("Redeclaration", { $0.testRedeclaration() }),
+            ("DOMParserInsertion", { $0.testDOMParserInsertion() }),
         ]
     }
 

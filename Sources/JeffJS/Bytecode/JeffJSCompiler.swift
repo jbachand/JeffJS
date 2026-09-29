@@ -109,6 +109,8 @@ struct JeffJSScopeDef {
     /// land after a `let` declaration without executing it, so lexical
     /// variables declared directly in this scope keep their TDZ checks.
     var isSwitch: Bool = false
+    /// The scope of a catch clause's parameter (its block is a child scope).
+    var isCatch: Bool = false
 }
 
 /// Bytecode variable definition in the final function bytecode.
@@ -227,6 +229,9 @@ class JeffJSFunctionDefCompiler {
     /// A parameter (plain, rest or inside a pattern) is named `arguments`.
     var paramNamedArguments: Bool = false
     var isDerivedClassConstructor: Bool = false
+    /// A class constructor (base or derived): its body starts with
+    /// `check_ctor`, so [[Call]] without `new` throws (ES §10.2.1 step 2).
+    var isClassConstructor: Bool = false
     /// Base-class constructor: run the instance field initializers before the
     /// body (a derived constructor runs them right after `super()` returns).
     var emitFieldInitAtBodyStart: Bool = false
@@ -238,6 +243,17 @@ class JeffJSFunctionDefCompiler {
     var isDirectOrIndirectEval: Bool = false
     /// Parsed by `parseProgram`: a script's or eval's top-level code.
     var isProgramCode: Bool = false
+    /// Early redeclaration errors: the `var` (and top-level function) names
+    /// declared in or hoisted through each scope, so a later `let` / `const` /
+    /// `class` of the same name in that scope is rejected (`{ var d; let d; }`).
+    var varNamesThroughScope: [Int: Set<JSAtom>] = [:]
+    /// Script code: function declarations in blocks, which bind as globals
+    /// (define_func) rather than block locals, by block scope.
+    var blockFunctionNamesByScope: [Int: Set<JSAtom>] = [:]
+    /// Program (script / eval) code: local slot of the hidden completion-value
+    /// variable (QuickJS `eval_ret_idx`), or -1. Expression statements store
+    /// into it; the program returns it.
+    var evalRetIdx: Int = -1
     /// Expression spans recorded during label resolution (pre-compaction
     /// pcs): the source range of the member access / call / `new` whose
     /// runtime error text quotes it (JSC's expression info).

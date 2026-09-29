@@ -599,6 +599,71 @@ extension JeffJSDOMBridge {
         }
     }
 
+    /// The HTML parser's insertions as MutationObserver sees them (HTML §13.2.6.1
+    /// "insert an element at the adjusted insertion location" -> DOM "insert",
+    /// which queues a childList record per node). The host parses the whole
+    /// document before it runs the parser-inserted scripts, so the nodes that
+    /// follow a script in document order are already in the tree when it runs;
+    /// in WebKit's streaming parser they are inserted after it. Called right
+    /// before each parser-inserted script runs (`boundary` = that script
+    /// element; `setCurrentScriptNode` does it, so hosts need no change: a
+    /// script the parser did not insert is ignored) and once when parsing
+    /// finishes (`nil`; `setReadyState("interactive")` does it, before
+    /// `DOMContentLoaded`): every node after the previous boundary, through
+    /// `boundary` and its contents, is reported to the observers registered
+    /// now, one record per node (target = its parent, previousSibling = its
+    /// previous sibling, nextSibling = null, as the parser appends), and the
+    /// records are delivered in a microtask checkpoint before the script runs.
+    /// Page-called appendChild & co. queue their own records as usual.
+    public func noteParserInsertions(upTo boundary: DOMNode?) {
+        guard !parserInsertionsDone else { return }
+        if !parserInsertionsStarted && boundary == nil {
+            parserInsertionsDone = true   // no parser script ever ran: nothing to replay
+            return
+        }
+        if !parserInsertionsStarted {
+            // The parser's output, before any script could move it.
+            parserInsertionsStarted = true
+            var stack: [(DOMNode, Int)] = [(root, 0)]
+            while let (n, d) = stack.popLast() {
+                parserOrder.append((n, d))
+                for c in n.children.reversed() { stack.append((c, d + 1)) }
+            }
+        }
+        // Everything through `boundary`'s subtree (the script's text was
+        // inserted before it ran); through the end when parsing finished.
+        var end = parserOrder.count - 1
+        if let b = boundary {
+            guard let bi = parserOrder.indices.first(where: { $0 > parserInsertedThrough && parserOrder[$0].node === b }) else {
+                return   // not a node the parser inserted (or already passed)
+            }
+            end = bi
+            let depth = parserOrder[bi].depth
+            while end + 1 < parserOrder.count && parserOrder[end + 1].depth > depth { end += 1 }
+        }
+        let start = parserInsertedThrough + 1
+        parserInsertedThrough = max(parserInsertedThrough, end)
+        if boundary == nil { parserInsertionsDone = true }
+        defer { if parserInsertionsDone { parserOrder = [] } }
+        guard start <= end, !moRegistrations.isEmpty, let ctx = jsContext else { return }
+
+        var queued = false
+        for k in start ... end {
+            let node = parserOrder[k].node
+            // Still where the parser put it (a script may have moved or
+            // removed it since; then there is nothing to insert any more).
+            guard node !== root, let parent = node.parent, isConnected(node) else { continue }
+            let siblings = parent.children
+            var previous: DOMNode? = nil
+            if let i = siblings.firstIndex(where: { $0 === node }), i > 0 { previous = siblings[i - 1] }
+            queueChildListRecord(target: parent, added: [node], removed: [], previous: previous, next: nil)
+            queued = true
+        }
+        // A microtask checkpoint before the script runs (the parser's
+        // "clean up after running script" / HTML §13.2.6.3 script handling).
+        if queued { _ = ctx.rt.executePendingJobs() }
+    }
+
     func queueAttributeRecord(target: DOMNode, name: String, oldValue: String?) {
         guard !moRegistrations.isEmpty, let ctx = jsContext else { return }
         let interested = interestedObservers(target: target, kind: .attributes, attributeName: name)

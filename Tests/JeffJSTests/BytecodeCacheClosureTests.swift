@@ -102,6 +102,32 @@ final class BytecodeCacheClosuresTests: XCTestCase {
         XCTAssertEqual(twice, once, "\(name): blob is not stable across a cache round trip", file: file, line: line)
     }
 
+    // MARK: - JSC error text and Error.stack across a cache hit
+
+    /// The expression-span table (JSC's "(evaluating '…')" / "(In '…', …)"
+    /// completions) and the top-level flag (`global code` frames) must come
+    /// back from a cache entry: a merge had dropped both from the record, so a
+    /// warm cache produced different error text (Google's challenge token).
+    func testErrorTextAndStackSurviveCacheRoundTrip() {
+        let src = """
+        var out = [];
+        try { var u; u.x; } catch (e) { out.push(e.message); }
+        try { var o = {}; o.m.n = 1; } catch (e) { out.push(e.message); }
+        try { var n5 = 5; n5(1, 2); } catch (e) { out.push(e.message); }
+        try { var w = {}, b = 3; w.C[b]; } catch (e) { out.push(e.message); }
+        function inner() { return new Error('b').stack.split('\\n').map(function (l) { return l.split('@')[0]; }).join(','); }
+        function outer() { return inner(); }
+        out.push(outer());
+        (function () { try { null.q; } catch (e) { out.push(e.message); } })();
+        out.join('|');
+        """
+        let text = runText(src)
+        XCTAssertTrue(text.contains("(evaluating 'u.x')") && text.contains("inner,outer,global code"),
+                      "text path lacks JSC spans/frames: \(text)")
+        check("jsc-error-text", src)
+        checkStable("jsc-error-text", src)
+    }
+
     // MARK: - (a) self-recursive function declaration + (b) sibling caller
 
     func testSelfRecursiveDeclarationVisibleToSiblings() {
