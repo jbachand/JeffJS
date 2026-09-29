@@ -318,6 +318,8 @@ struct JeffJSTestRunner {
             ("DOMThreadSafety", { $0.testDOMThreadSafety() }),
             ("NumberFormatting", { $0.testNumberFormatting() }),
             ("CallThis", { $0.testCallThis() }),
+            ("LogicalAssignment", { $0.testLogicalAssignment() }),
+            ("SuperInArrow", { $0.testSuperInArrow() }),
             ("StringConcat", { $0.testStringConcat() }),
             ("ParameterOwnership", { $0.testParameterOwnership() }),
             ("IndexArguments", { $0.testIndexArguments() }),
