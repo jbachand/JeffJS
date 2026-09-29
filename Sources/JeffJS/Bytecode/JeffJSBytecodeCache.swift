@@ -31,6 +31,10 @@ private let JFBC_VERSION: UInt8 = 7
 private let EXT_LAZY: UInt8 = 1
 private let EXT_LAZY_PENDING: UInt8 = 2
 private let EXT_DEBUG: UInt8 = 4
+/// Expression-span table (length-prefixed bytes after the debug tables).
+private let EXT_SPANS: UInt8 = 8
+/// The function is a script's / eval's top-level code (no payload).
+private let EXT_TOPLEVEL: UInt8 = 16
 /// Bytes of a lazy seed: kind, funcKind, jsMode, u16 flags, u32 start,
 /// u32 line, u32 name atom.
 private let LAZY_SEED_BYTES = 17
@@ -410,6 +414,8 @@ struct JeffJSBytecodeSerializer {
             if lazyScript == nil { lazyScript = li.script }
         }
         if let c = compiled, c.debugPc2lineLen > 0 || c.debugPc2colLen > 0 { ext |= EXT_DEBUG }
+        if let c = compiled, !c.debugExprSpans.isEmpty { ext |= EXT_SPANS }
+        if fb.isTopLevelCode { ext |= EXT_TOPLEVEL }
         writeU8(ext)
         writeU16(fb.argCount)
         writeU16(fb.varCount)
@@ -507,6 +513,9 @@ struct JeffJSBytecodeSerializer {
         if ext & EXT_DEBUG != 0, let c = compiled {
             writeBytes(Array(c.debugPc2lineBuf.prefix(c.debugPc2lineLen)))
             writeBytes(Array(c.debugPc2colBuf.prefix(c.debugPc2colLen)))
+        }
+        if ext & EXT_SPANS != 0, let c = compiled {
+            writeBytes(c.debugExprSpans)
         }
     }
 
@@ -771,6 +780,10 @@ struct JeffJSBytecodeDeserializer {
                 pos += 4 + Int(readU32LE(data, pos))
             }
         }
+        if ext & EXT_SPANS != 0 {
+            guard pos + 3 < data.count else { return false }
+            pos += 4 + Int(readU32LE(data, pos))
+        }
 
         return pos <= data.count
     }
@@ -993,6 +1006,11 @@ struct JeffJSBytecodeDeserializer {
             pc2line = l
             pc2col = c
         }
+        var exprSpans: [UInt8] = []
+        if ext & EXT_SPANS != 0 {
+            guard let b = readBytes() else { return nil }
+            exprSpans = b
+        }
 
         // Construct fresh function bytecode (the compiled class: it carries
         // the debug tables, and a lazy function compiles into it in place).
@@ -1046,6 +1064,8 @@ struct JeffJSBytecodeDeserializer {
             fbc.debugPc2colBuf = pc2col
             fbc.debugPc2colLen = pc2col.count
         }
+        fbc.debugExprSpans = exprSpans
+        fbc.isTopLevelCode = ext & EXT_TOPLEVEL != 0
         // Trace regions are derived from the final bytecode (not stored):
         // recompute them so cached code runs with the same loop traces.
         JeffJSCompiler.fuseBasicBlocks(fb)
@@ -1348,7 +1368,12 @@ final class JeffJSBytecodeCache {
     //   variables and a source span, no body) for functions compiled on
     //   their first call, JFBC v7 records (ext byte, seed, pc->line tables)
     //   and trailer (script name); bodies persist in `<hash>-bodies.jfbc`.
-    static let compilerVersion: UInt64 = 16  // 2026-09-24: lazy function compilation
+    // 17 = the expression-span table (JSC error text, `EXT_SPANS`) and the
+    //   top-level flag (`EXT_TOPLEVEL`) are in the record again (a merge had
+    //   dropped them: a cache hit lost "(evaluating '…')" and the `global code`
+    //   frame name); program completion values in a hidden local, class
+    //   constructors start with check_ctor, NamedEvaluation for classes.
+    static let compilerVersion: UInt64 = 17  // 2026-09-29: spans + top-level flag restored
 
     /// FNV-1a over the engine's bytecode-relevant sources: `Parser/*.swift`,
     /// `Bytecode/JeffJSCompiler.swift`, `Bytecode/JeffJSOpcodes.swift` and
