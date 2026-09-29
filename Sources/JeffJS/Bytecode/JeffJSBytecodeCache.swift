@@ -582,6 +582,8 @@ struct JeffJSBytecodeSerializer {
 /// Deserializes bytes into a fresh JeffJSFunctionBytecode with new cpool values.
 /// If a runtime is provided, atom table indices are remapped to the runtime's atom IDs.
 struct JeffJSBytecodeDeserializer {
+    /// The last file name read (shared by the functions of one blob).
+    private var fileNameMemo: (text: String, string: JeffJSString)? = nil
 
     private let data: [UInt8]
     private var pos: Int = 0
@@ -906,7 +908,16 @@ struct JeffJSBytecodeDeserializer {
         var fileName: JeffJSString? = nil
         if hasFilename == 1 {
             guard let fnStr = readString() else { return nil }
-            fileName = JeffJSString(swiftString: fnStr)
+            // perf/memory-census: every function of a script carries the same
+            // file name; one string per blob instead of one per function
+            // (homedepot: ~30 000 strings, ~5 MB).
+            if let memo = fileNameMemo, memo.text == fnStr {
+                fileName = memo.string
+            } else {
+                let str = JeffJSString(swiftString: fnStr)
+                fileNameMemo = (fnStr, str)
+                fileName = str
+            }
         }
 
         // Constant pool
@@ -1285,6 +1296,7 @@ final class JeffJSBytecodeCache {
             + "stores=\(storeCount) skipped=\(storeSkipCount) compile=\(f(compileMs))ms/\(compiledSourceBytes / 1024)KB "
             + "deser=\(f(deserializeMs))ms ser=\(f(serializeMs))ms read=\(diskReadBytes / 1024)KB "
             + "wrote=\(diskWriteBytes / 1024)KB mem=\(memoryBytes / 1024)KB"
+            + " writeMs=\(f(diskWriteMs)) oneShot=\(diskOneShotSkips) capped=\(diskCapSkips)"
             + (rt.map { " " + $0.lazyStats.description } ?? "")
     }
 
@@ -1382,7 +1394,7 @@ final class JeffJSBytecodeCache {
     /// blobs written by another one, even when nobody bumped
     /// `compilerVersion`. `BytecodeCacheBudgetTests.testEngineSourceHashIsCurrent`
     /// fails when it is stale; `Scripts/update_bytecode_identity.sh` rewrites it.
-    static let engineSourceHash: UInt64 = 0x09836f322c77568d // bytecode-identity
+    static let engineSourceHash: UInt64 = 0x4d782897f77affd0 // bytecode-identity
 
     /// The engine build identity: `compilerVersion`, the blob and entry
     /// layouts, `engineSourceHash`, and the opcode table the interpreter
@@ -1425,7 +1437,8 @@ final class JeffJSBytecodeCache {
     /// The file a key maps to. Exposed for tests (header-rejection,
     /// concurrent-writer) and for host-side cache inspection.
     func diskEntryURL(for key: JeffJSBytecodeCacheKey) -> URL? {
-        diskURL(for: key.hash)
+        Self.waitIfPending(key.hash)   // the entry's queued write lands first
+        return diskURL(for: key.hash)
     }
 
     // MARK: - Hashing
@@ -1586,6 +1599,7 @@ final class JeffJSBytecodeCache {
         // Disk fallback. The file is memory-mapped and the blob is copied out
         // of it once (it used to be copied three times: Data, [UInt8], blob).
         let t0 = CFAbsoluteTimeGetCurrent()
+        if diskStore != nil { Self.waitIfPending(key.hash) }   // its queued write lands first
         guard let store = diskStore, let data = store.read(key.hash) else {
             missCount += 1
             debugLog("miss key=\(key.desc) srcLen=\(key.sourceLength)")
@@ -1657,7 +1671,7 @@ final class JeffJSBytecodeCache {
     /// It used to compare the *top-level* function's bytecode length against
     /// 1 MB before compiling, which skipped exactly the large bundles that
     /// cost the most to recompile.
-    func store(_ key: JeffJSBytecodeCacheKey, bytecode fb: JeffJSFunctionBytecode) {
+    func store(_ key: JeffJSBytecodeCacheKey, bytecode fb: JeffJSFunctionBytecode, filename: String? = nil) {
         let t0 = CFAbsoluteTimeGetCurrent()
         let serialized = JeffJSBytecodeSerializer.serialize(fb, rt: rt)
         serializeMs += (CFAbsoluteTimeGetCurrent() - t0) * 1000
@@ -1668,20 +1682,115 @@ final class JeffJSBytecodeCache {
             return
         }
         insertMemoryEntry(key.hash, Entry(desc: key.desc, sourceLength: key.sourceLength, blob: serialized))
-        // Persist to disk synchronously: a queued write is lost when a
-        // short-lived host (the CLI) exits first. The store writes a sibling
-        // temp file and renames it, so a concurrent reader sees either the
-        // whole old entry or the whole new one — never a half-written blob.
         if let store = diskStore {
             let entry = Self.makeEntry(key: key, blob: serialized)
-            if store.write(key.hash, entry) {
-                diskWriteBytes += entry.count
+            if let why = diskWriteRefusal(key: key, filename: filename, bytes: entry.count) {
+                diskSkipped.insert(key.hash)
+                debugLog("store: memory only (\(why)) key=\(key.desc)")
+            } else if Self.writeSync {
+                // Legacy (JEFFJS_CACHE_BYTECODEWRITESYNC=1): write on the calling thread.
+                let w0 = CFAbsoluteTimeGetCurrent()
+                if store.write(key.hash, entry) {
+                    diskWriteBytes += entry.count
+                } else {
+                    debugLog("store: disk write skipped or failed (\(entry.count) bytes, budget \(store.budgetBytes)) key=\(key.desc)")
+                }
+                diskWriteMs += (CFAbsoluteTimeGetCurrent() - w0) * 1000
+                diskWritesThisRuntime += 1
             } else {
-                debugLog("store: disk write skipped or failed (\(entry.count) bytes, budget \(store.budgetBytes)) key=\(key.desc)")
+                // The write happens on a serial background queue: the memory
+                // tier already has the entry, a lookup of a hash still being
+                // written waits for it (`waitIfPending`), and teardown / the CLI
+                // drain the queue (`flushPendingDiskWrites`), so a short-lived
+                // host does not lose it. The store writes a sibling temp file
+                // and renames it: readers see the whole old or new entry.
+                let w0 = CFAbsoluteTimeGetCurrent()
+                let hash = key.hash
+                Self.notePending(hash)
+                Self.pendingWrites.enter()
+                Self.writeQueue.async {
+                    _ = store.write(hash, entry)
+                    Self.donePending(hash)
+                    Self.pendingWrites.leave()
+                }
+                diskWriteBytes += entry.count
+                diskWriteMs += (CFAbsoluteTimeGetCurrent() - w0) * 1000
+                diskWritesThisRuntime += 1
             }
+            diskBytesThisRuntime += entry.count
         }
         storeCount += 1
         debugLog("store key=\(key.desc) srcLen=\(key.sourceLength) bytes=\(serialized.count)")
+    }
+
+    // MARK: - Disk write policy (perf/memory-census)
+    //
+    // Every distinct eval text used to be written to disk synchronously on the
+    // JS (main) thread: the app's per-frame `<native-*>` glue evals cost 137 of
+    // 304 ms of one apple.com scroll's JS time in parse + compile + disk write.
+    // Now: (1) a source with a host pseudo-filename (`<...>`: glue, inline
+    // handlers, evals — not `<inline…>` page scripts) is written only on its
+    // *second* sighting in the process
+    // (keyed by the content hash, like a JIT's warm-up) — a one-shot text is not
+    // worth a file; script URLs are still written on the first, so the next
+    // launch hits as before; (2) the write runs on a serial background queue;
+    // (3) one runtime (≈ one page) writes at most 256 entries / 48 MB per
+    // session, so a page generating unique eval texts cannot churn the budget.
+    // `JEFFJS_CACHE_BYTECODEWRITESYNC=1` = the old behaviour (every store, on
+    // the calling thread).
+
+    static let writeSync = ProcessInfo.processInfo.environment["JEFFJS_CACHE_BYTECODEWRITESYNC"] == "1"
+    static let maxDiskWritesPerRuntime = 256
+    static let maxDiskBytesPerRuntime = 48 * 1024 * 1024
+    private static let writeQueue = DispatchQueue(label: "jeffjs.bytecode-cache.write", qos: .utility)
+    private static let pendingWrites = DispatchGroup()
+    private static let policyLock = NSLock()
+    nonisolated(unsafe) private static var pendingHashes: Set<UInt64> = []
+    nonisolated(unsafe) private static var sightings: Set<UInt64> = []
+
+    private var diskWritesThisRuntime = 0
+    private var diskBytesThisRuntime = 0
+    /// Entries kept in memory only (their lazy bodies are not persisted either).
+    private var diskSkipped: Set<UInt64> = []
+    /// Disk-write time spent on the calling thread (ms) and entries refused.
+    private(set) var diskWriteMs: Double = 0
+    private(set) var diskOneShotSkips = 0
+    private(set) var diskCapSkips = 0
+
+    private func diskWriteRefusal(key: JeffJSBytecodeCacheKey, filename: String?, bytes: Int) -> String? {
+        if Self.writeSync { return nil }
+        // Page content evaluated under a pseudo-name (the host's `<inline>` /
+        // `<inline-script>` for inline <script>s) is as stable across launches
+        // as a script URL: written on the first sighting like one.
+        if let filename, filename.hasPrefix("<"), !filename.hasPrefix("<inline") {
+            Self.policyLock.lock()
+            let seen = Self.sightings.contains(key.hash)
+            if !seen {
+                if Self.sightings.count >= 16384 { Self.sightings.removeAll(keepingCapacity: true) }
+                Self.sightings.insert(key.hash)
+            }
+            Self.policyLock.unlock()
+            if !seen { diskOneShotSkips += 1; return "first sighting of \(filename)" }
+        }
+        if diskWritesThisRuntime >= Self.maxDiskWritesPerRuntime || diskBytesThisRuntime + bytes > Self.maxDiskBytesPerRuntime {
+            diskCapSkips += 1
+            return "per-runtime write cap (\(diskWritesThisRuntime) entries, \(diskBytesThisRuntime / 1024) KB)"
+        }
+        return nil
+    }
+
+    private static func notePending(_ h: UInt64) { policyLock.lock(); pendingHashes.insert(h); policyLock.unlock() }
+    private static func donePending(_ h: UInt64) { policyLock.lock(); pendingHashes.remove(h); policyLock.unlock() }
+
+    /// A disk lookup of an entry whose write is still queued waits for it.
+    static func waitIfPending(_ h: UInt64) {
+        policyLock.lock(); let pending = pendingHashes.contains(h); policyLock.unlock()
+        if pending { writeQueue.sync {} }
+    }
+
+    /// Blocks until every queued disk write has landed (runtime teardown, CLI exit).
+    static func flushPendingDiskWrites() {
+        pendingWrites.wait()
     }
 
     // MARK: - Lazily compiled bodies
@@ -1693,7 +1802,7 @@ final class JeffJSBytecodeCache {
     /// persist (a sidecar file next to its entry), nil without a disk tier.
     func lazyBodyStore(for hash: UInt64) -> JeffJSLazyBodyStore? {
         if let s = bodyStores[hash] { return s }
-        guard let disk = diskStore else { return nil }
+        guard let disk = diskStore, !diskSkipped.contains(hash) else { return nil }
         let s = JeffJSLazyBodyStore(hash: hash, disk: disk)
         s.onPending = { [unowned(unsafe) self] in self.rt?.lazyBodiesPending = true }
         bodyStores[hash] = s
@@ -1703,6 +1812,7 @@ final class JeffJSBytecodeCache {
     /// Write every lazily compiled body not on disk yet (runtime teardown,
     /// or the host at a quiet moment).
     func flushLazyBodies() {
+        Self.flushPendingDiskWrites()
         for s in bodyStores.values { s.flush() }
         rt?.lazyBodiesPending = false
     }

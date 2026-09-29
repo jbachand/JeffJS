@@ -555,6 +555,12 @@ class JeffJSFunctionBytecode {
     var sourceStart: Int32 = 0
     /// Byte length of the span; -1 when no span was recorded.
     var sourceLen: Int32 = -1
+    /// Function objects whose payload runs this bytecode (counted where such a
+    /// payload is made — createClosure, the class/method closure path,
+    /// executeBytecode — and uncounted in freeObject). 0 + a refCount of 1 (its parent's constant
+    /// pool) after the parent script finished = nothing can run it again
+    /// (JeffJSContext.releaseTopLevelConstants).
+    var liveClosures: Int32 = 0
 
     /// Direct `eval` call sites of this function (see JeffJSEvalSite), nil
     /// when it has none. Indexed by the `eval`/`apply_eval` site operand.

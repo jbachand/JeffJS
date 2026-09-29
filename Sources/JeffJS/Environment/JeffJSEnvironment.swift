@@ -487,6 +487,10 @@ public final class JeffJSEnvironment {
         runtime.bytecodeCache.flushLazyBodies()
     }
 
+    /// The bytecode cache's counters (hits, stores, compile / serialize / disk
+    /// write ms, one-shot and capped disk skips) as one line.
+    public var bytecodeCacheDescription: String { runtime.bytecodeCache.perfDescription }
+
     // MARK: - Layout Geometry
 
     /// Pushes document-coordinate layout rects (keyed by `DOMNode.id`) and the
