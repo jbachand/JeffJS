@@ -582,6 +582,8 @@ struct JeffJSBytecodeSerializer {
 /// Deserializes bytes into a fresh JeffJSFunctionBytecode with new cpool values.
 /// If a runtime is provided, atom table indices are remapped to the runtime's atom IDs.
 struct JeffJSBytecodeDeserializer {
+    /// The last file name read (shared by the functions of one blob).
+    private var fileNameMemo: (text: String, string: JeffJSString)? = nil
 
     private let data: [UInt8]
     private var pos: Int = 0
@@ -906,7 +908,16 @@ struct JeffJSBytecodeDeserializer {
         var fileName: JeffJSString? = nil
         if hasFilename == 1 {
             guard let fnStr = readString() else { return nil }
-            fileName = JeffJSString(swiftString: fnStr)
+            // perf/memory-census: every function of a script carries the same
+            // file name; one string per blob instead of one per function
+            // (homedepot: ~30 000 strings, ~5 MB).
+            if let memo = fileNameMemo, memo.text == fnStr {
+                fileName = memo.string
+            } else {
+                let str = JeffJSString(swiftString: fnStr)
+                fileNameMemo = (fnStr, str)
+                fileName = str
+            }
         }
 
         // Constant pool
@@ -1382,7 +1393,7 @@ final class JeffJSBytecodeCache {
     /// blobs written by another one, even when nobody bumped
     /// `compilerVersion`. `BytecodeCacheBudgetTests.testEngineSourceHashIsCurrent`
     /// fails when it is stale; `Scripts/update_bytecode_identity.sh` rewrites it.
-    static let engineSourceHash: UInt64 = 0x9359f685ffbffd75 // bytecode-identity
+    static let engineSourceHash: UInt64 = 0x858bb9c89d825ad8 // bytecode-identity
 
     /// The engine build identity: `compilerVersion`, the blob and entry
     /// layouts, `engineSourceHash`, and the opcode table the interpreter

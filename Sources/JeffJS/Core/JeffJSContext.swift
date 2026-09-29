@@ -8,6 +8,14 @@
 // QuickJS source reference: quickjs.c — struct JSContext and all JS_* context functions.
 
 import Foundation
+
+/// JEFFJS_EVAL_KEEPTOPLEVELCONSTANTS=1: keep (leak) the constant pool of a
+/// script's top-level function after it ran — the behaviour before
+/// perf/memory-census (A/B).
+let jeffJSKeepTopLevelConstants = ProcessInfo.processInfo.environment["JEFFJS_EVAL_KEEPTOPLEVELCONSTANTS"] == "1"
+/// JEFFJS_EVAL_KEEPNESTEDBODIES=1: release only the non-function constants
+/// (keep every nested function body of a finished script) (A/B).
+let jeffJSKeepNestedBodies = ProcessInfo.processInfo.environment["JEFFJS_EVAL_KEEPNESTEDBODIES"] == "1"
 #if canImport(CoreFoundation)
 import CoreFoundation
 #endif
@@ -3186,6 +3194,39 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         return ((t1 - t0) * 1000, (t2 - t1) * 1000, h, nil)
     }
 
+    /// Frees the constants of a top-level function that has run (see
+    /// executeBytecode): every non-function constant, and every nested function
+    /// bytecode that nothing can run any more (no function object runs it —
+    /// `liveClosures == 0` — and no other constant pool shares it), recursively.
+    /// A nested body that a live closure still runs is kept with its whole pool.
+    private func releaseTopLevelConstants(_ fb: JeffJSFunctionBytecode, depth: Int = 0) {
+        var released = false
+        var pool = fb.cpool
+        for i in 0..<pool.count {
+            let v = pool[i]
+            if v.isFunctionBytecode {
+                guard !jeffJSKeepNestedBodies, depth < 64, let child = v.toFunctionBytecode(),
+                      child.refCount == 1, child.liveClosures == 0 else { continue }
+                releaseTopLevelConstants(child, depth: depth + 1)
+                // What is left in the child's pool are nested bodies still in
+                // use: they keep the child's reference (never released).
+                child.cpool = []
+                v.freeValue()   // refCount 1 -> 0: frees the (now empty) pool, drops the retain
+                pool[i] = .undefined
+                released = true
+                continue
+            }
+            if v.hasRefCount {
+                v.freeValue()
+                pool[i] = .undefined
+                released = true
+            }
+        }
+        if released {
+            fb.cpool = pool
+        }
+    }
+
     /// Execute a compiled function bytecode on the global object.
     /// Recursively sums bytecodeLen across a function and all nested functions in its cpool.
     static func totalBytecodeLen(_ fb: JeffJSFunctionBytecode) -> Int {
@@ -3251,6 +3292,20 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // own references to the bytecode through varRefs, independent of this wrapper.
         // Without this freeValue, each eval leaks ~200B of bytecode + cpool.
         funcVal.freeValue()
+
+        // perf/memory-census: the top-level function of a script/eval runs once
+        // and nothing refers to it afterwards (its wrapper is gone; closures made
+        // by the script hold their *own* bytecode objects, which are cpool
+        // entries of this one). ARC then frees `fb`, but its constant pool holds
+        // manually counted references that its deinit never releases: every
+        // string/number/template constant of every host eval leaked (the app's
+        // per-event `<native-event>` evals: ~3 strings per animation event, +240
+        // strings/s on homedepot at idle). Release the non-function constants
+        // now; nested function bytecode stays (closures still run it).
+        // JEFFJS_EVAL_KEEPTOPLEVELCONSTANTS=1 = the old behaviour (A/B).
+        if !jeffJSKeepTopLevelConstants, fb.refCount <= 1, !fb.isGenerator, !fb.isAsyncFunc {
+            releaseTopLevelConstants(fb)
+        }
 
         // Drain the microtask queue after a host-level evaluation (a script
         // is a task; HTML "perform a microtask checkpoint" once the JS stack

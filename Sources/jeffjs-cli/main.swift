@@ -141,6 +141,9 @@ let status: Int32 = MainActor.assumeIsolated {
             if CFAbsoluteTimeGetCurrent() - t0 >= next { line("sample"); next += sample }
         }
         line("settled")
+        // --mem-census: malloc census by class (MallocCensus.swift, the app's copy).
+        if args.contains("--mem-census") { print(MallocCensus.report(label: "settled", top: 30)) }
+        if let rc = args.first(where: { $0.hasPrefix("--refs=") }) { print(referrerReport(className: String(rc.dropFirst(7)))) }
         let cycles = args.first(where: { $0.hasPrefix("--reclaim-cycles=") }).flatMap { Int($0.dropFirst(17)) } ?? 0
         for i in 0..<cycles {
             let c0 = CFAbsoluteTimeGetCurrent()
