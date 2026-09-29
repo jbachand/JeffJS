@@ -3395,6 +3395,83 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         _ = setPropertyStr(obj: proto, name: "@@hasInstance", value: hasInstanceFunc)
     }
 
+    /// The shared steps of the Error / NativeError / AggregateError constructors
+    /// (ES §20.5.1.1 steps 3-4): a non-undefined `message` becomes a non-enumerable
+    /// own "message" (ToString), and InstallErrorCause (§20.5.8.1) copies
+    /// `options.cause` when `options` is an object that has one (own or inherited).
+    /// Returns the message text for the stack header, nil when a conversion threw.
+    func initErrorObject(_ errObj: JeffJSValue, message: JeffJSValue, options: JeffJSValue) -> String? {
+        var msgStr = ""
+        if !message.isUndefined {
+            let m = toString(message)
+            if m.isException { return nil }
+            msgStr = toSwiftString(m) ?? ""
+            _ = definePropertyValue(obj: errObj, atom: JeffJSAtomID.JS_ATOM_message.rawValue,
+                                    value: m, flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+        }
+        if options.isObject {
+            let causeAtom = JeffJSAtomID.JS_ATOM_cause.rawValue
+            let has = hasPropertyEx(obj: options, atom: causeAtom)
+            if has < 0 { return nil }
+            if has > 0 {
+                let cause = getProperty(obj: options, atom: causeAtom)
+                if cause.isException { return nil }
+                _ = definePropertyValue(obj: errObj, atom: causeAtom, value: cause,
+                                        flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+            }
+        }
+        return msgStr
+    }
+
+    /// IterableToList (ES §7.4.12): GetIterator(sync) + IteratorStepValue until done.
+    /// The values are owned by the caller; nil when an abrupt completion is pending.
+    func iterableToList(_ items: JeffJSValue) -> [JeffJSValue]? {
+        let iter = getIterator(obj: items, isAsync: false)
+        if iter.isException { return nil }
+        defer { iter.freeValue() }
+        let next = getProperty(obj: iter, atom: iterNextAtom)
+        if next.isException { return nil }
+        defer { next.freeValue() }
+        guard isFunction(next) else {
+            _ = throwTypeError(message: "iterator.next is not a function")
+            return nil
+        }
+        var out: [JeffJSValue] = []
+        while true {
+            let r = callFunction(next, thisVal: iter, args: [])
+            if r.isException { for v in out { v.freeValue() }; return nil }
+            guard r.isObject else {
+                r.freeValue()
+                for v in out { v.freeValue() }
+                _ = throwTypeError(message: "iterator result is not an object")
+                return nil
+            }
+            let done = getProperty(obj: r, atom: JeffJSAtomID.JS_ATOM_done.rawValue)
+            if done.isException { r.freeValue(); for v in out { v.freeValue() }; return nil }
+            if toBoolFree(done) { r.freeValue(); return out }
+            let v = getProperty(obj: r, atom: JeffJSAtomID.JS_ATOM_value.rawValue)
+            r.freeValue()
+            if v.isException { for v in out { v.freeValue() }; return nil }
+            out.append(v)
+        }
+    }
+
+    /// A new AggregateError whose "errors" is an array of `errors` (borrowed; each is
+    /// dup'd) — what Promise.any rejects with (ES §27.2.4.3.1 step 8.b, §27.2.4.3.2
+    /// step 9.b): no own "message", like JavaScriptCore.
+    func newAggregateError(errors: [JeffJSValue]) -> JeffJSValue {
+        let errObj = newObjectClass(classID: JSClassID.JS_CLASS_ERROR.rawValue)
+        let idx = JSErrorEnum.JS_AGGREGATE_ERROR.rawValue
+        if idx < nativeErrorProto.count, let o = errObj.toObject(), let p = nativeErrorProto[idx].toObject() {
+            o.proto = p
+        }
+        _ = definePropertyValue(obj: errObj, atom: JeffJSAtomID.JS_ATOM_errors.rawValue,
+                                value: newArrayFrom(errors.map { $0.dupValue() }),
+                                flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+        attachPendingStack(errObj, errorName: "AggregateError", message: "")
+        return errObj
+    }
+
     /// Adds Error and NativeError constructors.
     private func addErrorConstructors() {
         // Error prototype
@@ -3432,10 +3509,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         let errorCtor = newCFunction({ [weak self] ctx, thisVal, args in
             guard let self = self else { return .exception }
             let errObj = self.newObjectClass(classID: JSClassID.JS_CLASS_ERROR.rawValue)
-            var msgStr = ""
-            if !args.isEmpty && !args[0].isUndefined {
-                msgStr = self.toSwiftString(args[0]) ?? ""
-                _ = self.setPropertyStr(obj: errObj, name: "message", value: self.newStringValue(msgStr))
+            guard let msgStr = self.initErrorObject(errObj, message: args.count > 0 ? args[0] : .undefined,
+                                                    options: args.count > 1 ? args[1] : .undefined) else {
+                errObj.freeValue()
+                return .exception
             }
             // `stack` carries the call site: header + one "at fn (file:line:col)"
             // line per live interpreter frame. The frames are captured now and
@@ -3472,6 +3549,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
 
             let capturedName = name
             let capturedProto = nativeProto
+            let isAggregate = errorEnum == .JS_AGGREGATE_ERROR
             let ctor = newCFunction({ [weak self] ctx, thisVal, args in
                 guard let self = self else { return .exception }
                 let errObj = self.newObjectClass(classID: JSClassID.JS_CLASS_ERROR.rawValue)
@@ -3480,14 +3558,33 @@ public final class JeffJSContext: JeffJSTokenizerContext {
                 if let errJSObj = errObj.toObject(), let nativeProtoObj = capturedProto.toObject() {
                     errJSObj.proto = nativeProtoObj
                 }
-                var msgStr = ""
-                if !args.isEmpty && !args[0].isUndefined {
-                    msgStr = self.toSwiftString(args[0]) ?? ""
-                    _ = self.setPropertyStr(obj: errObj, name: "message", value: self.newStringValue(msgStr))
+                // NativeError(message, options) (ES §20.5.6.1.1);
+                // AggregateError(errors, message, options) (§20.5.7.1.1).
+                let base = isAggregate ? 1 : 0
+                guard let msgStr = self.initErrorObject(errObj,
+                                                        message: args.count > base ? args[base] : .undefined,
+                                                        options: args.count > base + 1 ? args[base + 1] : .undefined) else {
+                    errObj.freeValue()
+                    return .exception
+                }
+                if isAggregate {
+                    // errorsList = IterableToList(errors); "errors" is a
+                    // non-enumerable own data property (step 5-6).
+                    guard let list = self.iterableToList(args.count > 0 ? args[0] : .undefined) else {
+                        errObj.freeValue()
+                        return .exception
+                    }
+                    _ = self.definePropertyValue(obj: errObj, atom: JeffJSAtomID.JS_ATOM_errors.rawValue,
+                                                 value: self.newArrayFrom(list),
+                                                 flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
                 }
                 self.attachPendingStack(errObj, errorName: capturedName, message: msgStr)
                 return errObj
-            }, name: name, length: 1)
+            }, name: name, length: isAggregate ? 2 : 1)
+            // Every NativeError constructor's [[Prototype]] is %Error% (§20.5.6.2, §20.5.7.2).
+            if let ctorObj = ctor.toObject(), let errorCtorObj = errorCtor.toObject() {
+                ctorObj.proto = errorCtorObj
+            }
             // Set NativeError.prototype on constructor and NativeError.prototype.constructor = NativeError
             _ = setPropertyStr(obj: ctor, name: "prototype", value: nativeProto.dupValue())
             _ = setPropertyStr(obj: nativeProto, name: "constructor", value: ctor.dupValue())
@@ -5369,40 +5466,25 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             "TypeError", "URIError", "InternalError", "AggregateError"
         ]
         let nameStr = errorType.rawValue < errorNames.count ? errorNames[errorType.rawValue] : "Error"
-        _ = setPropertyStr(obj: errObj, name: "name", value: newStringValue(nameStr))
-
-        // Set the message
-        _ = setPropertyStr(obj: errObj, name: "message", value: newStringValue(message))
+        // `name` is inherited from NativeError.prototype and `message` is a
+        // non-enumerable own property, as for `new TypeError(msg)` (ES
+        // §20.5.6.1.1). Both used to be enumerable own properties, so
+        // `JSON.stringify(e)` / `Object.keys(e)` of an engine error showed
+        // them (JavaScriptCore: `{}` / `[]`).
+        _ = definePropertyValue(obj: errObj, atom: JeffJSAtomID.JS_ATOM_message.rawValue,
+                                value: newStringValue(message),
+                                flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
 
         // Set stack property with source location from call frames
         // Guard against re-entrant / deeply nested errors that may corrupt frame state
         attachPendingStack(errObj, errorName: nameStr, message: message)
 
-        // Set prototype to the appropriate NativeError.prototype.
-        // Look up the constructor from the global object and get its .prototype
-        // property, so we always use the same prototype that instanceof checks.
-        // This handles the case where JeffJSBuiltinError.addIntrinsic creates
-        // new constructor/prototype pairs that differ from nativeErrorProto[].
-        if let errJSObj = errObj.toObject() {
-            let ctorVal = getPropertyStr(obj: globalObj, name: nameStr)
-            if ctorVal.isObject {
-                let protoVal = getProperty(obj: ctorVal, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue)
-                if protoVal.isObject {
-                    errJSObj.proto = protoVal.toObject()
-                } else if errorType.rawValue < nativeErrorProto.count {
-                    // Fallback to nativeErrorProto if constructor lookup fails
-                    let proto = nativeErrorProto[errorType.rawValue]
-                    if proto.isObject {
-                        errJSObj.proto = proto.toObject()
-                    }
-                }
-            } else if errorType.rawValue < nativeErrorProto.count {
-                // Fallback to nativeErrorProto if constructor not on global
-                let proto = nativeErrorProto[errorType.rawValue]
-                if proto.isObject {
-                    errJSObj.proto = proto.toObject()
-                }
-            }
+        // [[Prototype]] is the intrinsic %NativeError.prototype% — never
+        // whatever the page left in `globalThis.TypeError` (the lookup through
+        // the global object also leaked the constructor and prototype values).
+        if let errJSObj = errObj.toObject(), errorType.rawValue < nativeErrorProto.count,
+           let proto = nativeErrorProto[errorType.rawValue].toObject() {
+            errJSObj.proto = proto
         }
 
         return throwValue(errObj)

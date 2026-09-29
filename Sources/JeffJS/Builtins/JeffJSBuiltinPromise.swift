@@ -343,9 +343,11 @@ struct JeffJSBuiltinPromise {
 
         var index = 0
         allData.remainingElements = 1 // Will be decremented after loop
-        let maxIterations = 10_000 // safety limit
 
-        while index < maxIterations {
+        // No element cap: PerformPromiseAll runs until the iterator is done
+        // (ES §27.2.4.1.2). A 10 000-element "safety limit" used to stop the
+        // loop silently, so Promise.all of a larger list never settled.
+        while true {
             let next = iteratorNext(ctx: ctx, iterator: iterResult)
             if next.isException {
                 let _ = ctx.callFunction(func_: cap.reject, this: .undefined,
@@ -608,13 +610,10 @@ struct JeffJSBuiltinPromise {
 
         allData.remainingElements -= 1
         if allData.remainingElements == 0 {
-            // All rejected -- create AggregateError
-            let errorsArray = createArrayFromValues(ctx: ctx, values: allData.errors)
-            let aggError = createAggregateError(ctx: ctx, errors: errorsArray,
-                                                 message: "All promises were rejected")
+            // All rejected (or none given) -- reject with an AggregateError
+            let aggError = ctx.newAggregateError(errors: allData.errors)
             let _ = ctx.callFunction(func_: allData.rejectFunc, this: .undefined,
                                      args: [aggError])
-            ctx.freeValue(errorsArray)
             ctx.freeValue(aggError)
         }
 
@@ -1437,12 +1436,9 @@ struct JeffJSBuiltinPromise {
 
             allData.remainingElements -= 1
             if allData.remainingElements == 0 {
-                let errorsArray = createArrayFromValues(ctx: c, values: allData.errors)
-                let aggError = createAggregateError(ctx: c, errors: errorsArray,
-                                                     message: "All promises were rejected")
+                let aggError = c.newAggregateError(errors: allData.errors)
                 let _ = c.callFunction(func_: allData.rejectFunc, this: .undefined,
                                        args: [aggError])
-                c.freeValue(errorsArray)
                 c.freeValue(aggError)
             }
 
@@ -1529,20 +1525,6 @@ struct JeffJSBuiltinPromise {
         return arr
     }
 
-    // MARK: - Helper: AggregateError
-
-    /// Create an AggregateError object with the given errors array and message.
-    private static func createAggregateError(ctx: JeffJSContext,
-                                              errors: JeffJSValue,
-                                              message: String) -> JeffJSValue {
-        let errObj = ctx.newPlainObject()
-        ctx.setPropertyStr(obj: errObj, name: "name",
-                           value: ctx.newStringValue("AggregateError"))
-        ctx.setPropertyStr(obj: errObj, name: "message",
-                           value: ctx.newStringValue(message))
-        ctx.setPropertyStr(obj: errObj, name: "errors", value: errors.dupValue())
-        return errObj
-    }
 }
 
 // MARK: - Context Extension for Exception Handling
