@@ -1187,6 +1187,7 @@ extension JeffJSContext {
             inheritedHome = h
         }
         obj.payload = .bytecodeFunc(functionBytecode: innerFB, varRefs: childVarRefs, homeObject: inheritedHome)
+        innerFB.liveClosures &+= 1   // perf/memory-census (uncounted in freeObject)
         // A lazy function whose body is not compiled yet keeps fbFast nil:
         // every call path then reaches callInternal's payload path, which
         // compiles it (JeffJSCompiler.compileLazy) and sets fbFast. A
@@ -1763,6 +1764,7 @@ extension JeffJSContext {
             refs.append(vr)
         }
         obj.payload = .bytecodeFunc(functionBytecode: fb, varRefs: refs, homeObject: home)
+        fb.liveClosures &+= 1   // perf/memory-census (uncounted in freeObject)
         obj.fbFast = fb
         obj.varRefsFast = refs
         let proto = functionProto.toObject()

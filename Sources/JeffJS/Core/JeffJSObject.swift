@@ -555,8 +555,9 @@ class JeffJSFunctionBytecode {
     var sourceStart: Int32 = 0
     /// Byte length of the span; -1 when no span was recorded.
     var sourceLen: Int32 = -1
-    /// Function objects whose payload runs this bytecode (kept by the payload
-    /// setter of JeffJSObject). 0 + a refCount of 1 (its parent's constant
+    /// Function objects whose payload runs this bytecode (counted where such a
+    /// payload is made — createClosure, the class/method closure path,
+    /// executeBytecode — and uncounted in freeObject). 0 + a refCount of 1 (its parent's constant
     /// pool) after the parent script finished = nothing can run it again
     /// (JeffJSContext.releaseTopLevelConstants).
     var liveClosures: Int32 = 0
@@ -1732,11 +1733,6 @@ final class JeffJSObject: JeffJSGCObjectHeader {
         didSet {
             if case .cFunc(_, let cf, _, _, let magic) = payload { cFuncFast = cf; cMagicFast = Int(magic) }
             else if cFuncFast != nil { cFuncFast = nil }
-            // perf/memory-census: count the function objects that run each
-            // bytecode (JeffJSFunctionBytecode.liveClosures), so a finished
-            // script can release the nested bodies nothing can call any more.
-            if case .bytecodeFunc(let fb, _, _) = payload, let fb { fb.liveClosures &+= 1 }
-            if case .bytecodeFunc(let ofb, _, _) = oldValue, let ofb { ofb.liveClosures &-= 1 }
         }
     }
 

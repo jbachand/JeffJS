@@ -1101,6 +1101,8 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     } else {
         savedPayload = obj.payload
         obj.payload = .opaque(nil)
+        // perf/memory-census: one function object fewer runs this bytecode.
+        if case .bytecodeFunc(let fb, _, _) = savedPayload, let fb { fb.liveClosures &-= 1 }
         obj.fbFast = nil
         if !obj.varRefsFast.isEmpty { obj.varRefsFast = [] }
     }

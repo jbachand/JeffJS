@@ -3277,6 +3277,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             varRefs: [],
             homeObject: nil
         )
+        fb.liveClosures &+= 1   // perf/memory-census (uncounted in freeObject)
         funcObj.fbFast = fb
         funcObj.varRefsFast = []
         let funcVal = JeffJSValue.makeObject(funcObj)
