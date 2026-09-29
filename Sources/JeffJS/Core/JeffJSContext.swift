@@ -3147,7 +3147,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // source. Size limits are the cache's business (serialized bytes
         // against the tiers' budgets), not a pre-compile guess.
         if let cacheKey {
-            rt.bytecodeCache.store(cacheKey, bytecode: fb)
+            rt.bytecodeCache.store(cacheKey, bytecode: fb, filename: filename)
         }
 
         return executeBytecode(fb)
