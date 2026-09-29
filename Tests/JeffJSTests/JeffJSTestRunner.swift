@@ -333,6 +333,11 @@ struct JeffJSTestRunner {
             ("ProgramCompletion", { $0.testProgramCompletion() }),
             ("Redeclaration", { $0.testRedeclaration() }),
             ("DOMParserInsertion", { $0.testDOMParserInsertion() }),
+            ("LoneSurrogate", { $0.testLoneSurrogate() }),
+            ("IteratorHelpers", { $0.testIteratorHelpers() }),
+            ("SyntaxErrorText", { $0.testSyntaxErrorText() }),
+            ("ObjectLiteralDefine", { $0.testObjectLiteralDefine() }),
+            ("DOMNodeInterface", { $0.testDOMNodeInterface() }),
         ]
     }
 

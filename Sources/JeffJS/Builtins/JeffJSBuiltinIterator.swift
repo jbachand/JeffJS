@@ -46,25 +46,54 @@ final class JeffJSAsyncGeneratorRequest {
 
 // MARK: - Iterator Helper Data
 
-/// Internal data stored on iterator helper wrapper objects.
-/// Used by map, filter, take, drop, flatMap to track state.
-///
-/// Mirrors QuickJS `JSIteratorHelperData`.
-private final class JeffJSIteratorHelperData {
-    /// The underlying iterator being wrapped
-    var underlying: JeffJSValue = .undefined
-    /// The callback function (mapper, predicate, etc.)
-    var callback: JeffJSValue = .undefined
-    /// Counter for take/drop
-    var remaining: Int64 = 0
-    /// Is the helper exhausted?
-    var done: Bool = false
-    /// For flatMap: the inner iterator currently being consumed
-    var innerIterator: JeffJSValue = .undefined
-    /// For flatMap: is the inner iterator active?
-    var innerActive: Bool = false
+/// The state of an Iterator Helper object (ES2025 §27.1.2.1: what the
+/// helper's abstract closure captures, plus the generator state
+/// CreateIteratorFromClosure gives it) or of a %WrapForValidIteratorPrototype%
+/// object (`kind == .wrap`: just [[Iterated]]). Lives in the object's payload;
+/// the object has no own properties. Every JeffJSValue here is owned.
+final class JeffJSIteratorHelperData {
+    enum Kind { case map, filter, take, drop, flatMap, concat, wrap }
+    enum State { case suspendedStart, suspendedYield, executing, completed }
 
-    init() {}
+    let kind: Kind
+    var state: State = .suspendedStart
+    /// [[UnderlyingIterator]] (map … flatMap) / [[Iterated]] (wrap).
+    var iterator: JeffJSValue = .undefined
+    var nextMethod: JeffJSValue = .undefined
+    /// mapper / predicate.
+    var fn: JeffJSValue = .undefined
+    var counter: Double = 0
+    /// take / drop: the remaining limit (+∞ allowed).
+    var remaining: Double = 0
+    /// flatMap / concat: the inner iterator being drained.
+    var inner: JeffJSValue = .undefined
+    var innerNext: JeffJSValue = .undefined
+    var innerAlive = false
+    /// concat: [openMethod₀, iterable₀, openMethod₁, iterable₁, …].
+    var items: [JeffJSValue] = []
+    var itemIndex = 0
+
+    init(kind: Kind) { self.kind = kind }
+
+    func clearInner() {
+        inner.freeValue(); inner = .undefined
+        innerNext.freeValue(); innerNext = .undefined
+        innerAlive = false
+    }
+
+    /// Drops every reference (a completed helper keeps nothing alive).
+    func release() {
+        clearInner()
+        iterator.freeValue(); iterator = .undefined
+        nextMethod.freeValue(); nextMethod = .undefined
+        fn.freeValue(); fn = .undefined
+        for v in items { v.freeValue() }
+        items = []
+    }
+
+    deinit {
+        if JeffJSGCObjectHeader.activeRuntime != nil { release() }
+    }
 }
 
 // MARK: - JeffJSBuiltinIterator
@@ -89,7 +118,6 @@ struct JeffJSBuiltinIterator {
     /// - Generator.prototype: next, return, throw
     /// - AsyncGenerator.prototype: next, return, throw
     static func addIntrinsic(ctx: JeffJSContext) {
-        let rt = ctx.rt
 
         // ---------------------------------------------------------------
         // 1. Iterator.prototype (%IteratorPrototype%)
@@ -116,49 +144,84 @@ struct JeffJSBuiltinIterator {
             }
         }
 
-        // Iterator.prototype[Symbol.toStringTag] = "Iterator"
-        // (this used to define the *string* key "toStringTag", which
-        // Object.prototype.toString never reads).
-        _ = ctx.definePropertyValue(
-            obj: iterProto,
-            atom: JeffJSAtomID.JS_ATOM_Symbol_toStringTag.rawValue,
-            value: ctx.newStringValue("Iterator"),
-            flags: JS_PROP_CONFIGURABLE)
-
-        // Iterator.prototype helper methods (ES2025)
-        addProtoFunc(ctx, iterProto, "map",     iteratorMap,     1)
-        addProtoFunc(ctx, iterProto, "filter",  iteratorFilter,  1)
-        addProtoFunc(ctx, iterProto, "take",    iteratorTake,    1)
-        addProtoFunc(ctx, iterProto, "drop",    iteratorDrop,    1)
-        addProtoFunc(ctx, iterProto, "flatMap", iteratorFlatMap, 1)
-        addProtoFunc(ctx, iterProto, "reduce",  iteratorReduce,  1)
-        addProtoFunc(ctx, iterProto, "toArray", iteratorToArray, 0)
-        addProtoFunc(ctx, iterProto, "forEach", iteratorForEach, 1)
-        addProtoFunc(ctx, iterProto, "some",    iteratorSome,    1)
-        addProtoFunc(ctx, iterProto, "every",   iteratorEvery,   1)
-        addProtoFunc(ctx, iterProto, "find",    iteratorFind,    1)
+        // Iterator.prototype helper methods (ES2025 §27.1.4), non-enumerable.
+        ctx.setPropertyFunc(obj: iterProto, name: "map",     fn: iteratorMap,     length: 1)
+        ctx.setPropertyFunc(obj: iterProto, name: "filter",  fn: iteratorFilter,  length: 1)
+        ctx.setPropertyFunc(obj: iterProto, name: "take",    fn: iteratorTake,    length: 1)
+        ctx.setPropertyFunc(obj: iterProto, name: "drop",    fn: iteratorDrop,    length: 1)
+        ctx.setPropertyFunc(obj: iterProto, name: "flatMap", fn: iteratorFlatMap, length: 1)
+        ctx.setPropertyFunc(obj: iterProto, name: "reduce",  fn: iteratorReduce,  length: 1)
+        ctx.setPropertyFunc(obj: iterProto, name: "toArray", fn: iteratorToArray, length: 0)
+        ctx.setPropertyFunc(obj: iterProto, name: "forEach", fn: iteratorForEach, length: 1)
+        ctx.setPropertyFunc(obj: iterProto, name: "some",    fn: iteratorSome,    length: 1)
+        ctx.setPropertyFunc(obj: iterProto, name: "every",   fn: iteratorEvery,   length: 1)
+        ctx.setPropertyFunc(obj: iterProto, name: "find",    fn: iteratorFind,    length: 1)
 
         // ---------------------------------------------------------------
-        // 2. Iterator constructor
+        // 2. Iterator constructor (§27.1.3.1): abstract; `super()` from a
+        //    subclass creates the instance.
         // ---------------------------------------------------------------
-        let iterCtor = ctx.newCFunction({ ctx, this, args in
-            return iteratorConstructor(ctx: ctx, newTarget: this, this: this, args: args)
-        }, name: "Iterator", length: 0)
-
-        // Iterator.from()
-        let iterFromFunc = ctx.newCFunction(iteratorFrom, name: "from", length: 1)
-        ctx.setPropertyStr(obj: iterCtor, name: "from", value: iterFromFunc)
-
-        // Iterator.concat() -- ES2025
-        let iterConcatFunc = ctx.newCFunction(iteratorConcat, name: "concat", length: 0)
-        ctx.setPropertyStr(obj: iterCtor, name: "concat", value: iterConcatFunc)
-
-        // Link Iterator.prototype to Iterator constructor
-        ctx.setPropertyStr(obj: iterCtor, name: "prototype", value: iterProto.dupValue())
-        ctx.setPropertyStr(obj: iterProto, name: "constructor", value: iterCtor.dupValue())
-
-        // Store Iterator constructor on ctx
+        let iterCtor = ctx.newCFunction({ ctx, this, args in .undefined }, name: "Iterator", length: 0)
+        if let o = iterCtor.toObject() {
+            o.payload = .cFunc(
+                realm: ctx,
+                cFunction: .constructorOrFunc({ ctx, newTarget, args, isNew in
+                    iteratorConstructor(ctx: ctx, newTarget: newTarget, isNew: isNew)
+                }),
+                length: 0,
+                cproto: UInt8(JS_CFUNC_CONSTRUCTOR_OR_FUNC),
+                magic: 0)
+            o.isConstructor = true
+        }
+        ctx.setPropertyFunc(obj: iterCtor, name: "from", fn: iteratorFrom, length: 1)
+        ctx.setPropertyFunc(obj: iterCtor, name: "concat", fn: iteratorConcat, length: 0)
+        // Iterator.prototype: { [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: false }
+        _ = ctx.definePropertyValue(obj: iterCtor, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
+                                    value: iterProto, flags: 0)
         ctx.iteratorCtor = iterCtor.dupValue()
+
+        // Iterator.prototype[@@toStringTag] and .constructor are accessors
+        // (§27.1.4.1, §27.1.4.14): the getter answers "Iterator" / %Iterator%,
+        // the setter is SetterThatIgnoresPrototypeProperties — assigning on
+        // an iterator creates an own property instead of failing on the
+        // inherited accessor.
+        func defineIgnoringAccessor(_ atom: UInt32, _ label: String, value: @escaping (JeffJSContext) -> JeffJSValue) {
+            let getter = ctx.newCFunction({ ctx, this, args in value(ctx) }, name: "get \(label)", length: 0)
+            let setter = ctx.newCFunction({ ctx, this, args in
+                setterThatIgnoresPrototypeProperties(ctx: ctx, this: this, atom: atom,
+                                                     value: args.isEmpty ? .undefined : args[0])
+            }, name: "set \(label)", length: 1)
+            _ = ctx.defineProperty(obj: iterProto, atom: atom, value: .undefined,
+                                   getter: getter, setter: setter,
+                                   flags: JS_PROP_HAS_GET | JS_PROP_HAS_SET | JS_PROP_HAS_CONFIGURABLE |
+                                          JS_PROP_CONFIGURABLE | JS_PROP_HAS_ENUMERABLE | JS_PROP_GETSET)
+            getter.freeValue()
+            setter.freeValue()
+        }
+        defineIgnoringAccessor(JeffJSAtomID.JS_ATOM_Symbol_toStringTag.rawValue, "[Symbol.toStringTag]") { ctx in
+            ctx.newStringValue("Iterator")
+        }
+        defineIgnoringAccessor(JeffJSAtomID.JS_ATOM_constructor.rawValue, "constructor") { ctx in
+            ctx.iteratorCtor.dupValue()
+        }
+
+        // %IteratorHelperPrototype% (§27.1.2.1) and %WrapForValidIteratorPrototype%
+        // (§27.1.3.2.1.1), both inheriting %Iterator.prototype%.
+        let helperClass = JSClassID.JS_CLASS_ITERATOR_HELPER.rawValue
+        let wrapClass = JSClassID.JS_CLASS_ITERATOR_WRAP.rawValue
+        while ctx.classProto.count <= max(helperClass, wrapClass) { ctx.classProto.append(.undefined) }
+        let helperProto = ctx.newObjectProto(proto: iterProto)
+        ctx.setPropertyFunc(obj: helperProto, name: "next", fn: helperNext, length: 0)
+        ctx.setPropertyFunc(obj: helperProto, name: "return", fn: helperReturn, length: 0)
+        _ = ctx.definePropertyValue(obj: helperProto,
+                                    atom: JeffJSAtomID.JS_ATOM_Symbol_toStringTag.rawValue,
+                                    value: ctx.newStringValue("Iterator Helper"),
+                                    flags: JS_PROP_CONFIGURABLE)
+        ctx.classProto[helperClass] = helperProto
+        let wrapProto = ctx.newObjectProto(proto: iterProto)
+        ctx.setPropertyFunc(obj: wrapProto, name: "next", fn: wrapNext, length: 0)
+        ctx.setPropertyFunc(obj: wrapProto, name: "return", fn: wrapReturn, length: 0)
+        ctx.classProto[wrapClass] = wrapProto
 
         // Register Iterator on the global object
         ctx.setPropertyStr(obj: ctx.globalObj, name: "Iterator", value: iterCtor)
@@ -360,940 +423,660 @@ struct JeffJSBuiltinIterator {
         return result
     }
 
-    // MARK: - Call Iterator .next()
+    // MARK: - Iterator records (ES2025 §7.4)
 
-    /// Calls iterator.next(value) and returns the result object.
-    ///
-    /// Mirrors `JS_IteratorNext` in QuickJS.
-    private static func iteratorNext(ctx: JeffJSContext, iterator: JeffJSValue,
-                                      value: JeffJSValue = .undefined) -> JeffJSValue? {
-        let nextMethod = ctx.getPropertyStr(obj: iterator, name: "next")
-        if nextMethod.isException { return nil }
-        if nextMethod.isUndefined || nextMethod.isNull {
-            _ = ctx.throwTypeError(message: "iterator.next is not a function")
+    /// One IteratorStep / IteratorStepValue outcome. `.value` is owned.
+    enum StepOutcome { case value(JeffJSValue), done, error }
+
+    /// IteratorStepValue (ES2025 §7.4.8), or IteratorStep when `readValue` is
+    /// false (`.value(.undefined)` then). `iterator` / `next` are borrowed.
+    static func stepIterator(_ ctx: JeffJSContext, _ iterator: JeffJSValue, _ next: JeffJSValue,
+                             readValue: Bool = true) -> StepOutcome {
+        guard ctx.isCallable(next) else {
+            _ = ctx.throwTypeError(message: "\(ctx.jscValueDescription(next)) is not a function")
+            return .error
+        }
+        let r = ctx.callFunction(next, thisVal: iterator, args: [])
+        if r.isException { return .error }
+        guard r.isObject else {
+            r.freeValue()
+            _ = ctx.throwTypeError(message: "Iterator result interface is not an object.")
+            return .error
+        }
+        let d = ctx.getProperty(obj: r, atom: JeffJSAtomID.JS_ATOM_done.rawValue)
+        if d.isException { r.freeValue(); return .error }
+        if ctx.toBoolFree(d) { r.freeValue(); return .done }
+        if !readValue { r.freeValue(); return .value(.undefined) }
+        let v = ctx.getProperty(obj: r, atom: JeffJSAtomID.JS_ATOM_value.rawValue)
+        r.freeValue()
+        if v.isException { return .error }
+        return .value(v)
+    }
+
+    /// IteratorClose(iterator, NormalCompletion / ReturnCompletion) (§7.4.11):
+    /// calls `return` if there is one; its errors and a non-object result
+    /// throw. Returns false with the exception pending.
+    static func closeIterator(_ ctx: JeffJSContext, _ iterator: JeffJSValue) -> Bool {
+        let ret = ctx.getProperty(obj: iterator, atom: ctx.iterReturnAtom)
+        if ret.isException { return false }
+        if ret.isUndefined || ret.isNull { return true }
+        guard ctx.isCallable(ret) else {
+            _ = ctx.throwTypeError(message: "\(ctx.jscValueDescription(ret)) is not a function")
+            ret.freeValue()
+            return false
+        }
+        let r = ctx.callFunction(ret, thisVal: iterator, args: [])
+        ret.freeValue()
+        if r.isException { return false }
+        let isObj = r.isObject
+        r.freeValue()
+        if !isObj {
+            _ = ctx.throwTypeError(message: "Iterator result interface is not an object.")
+            return false
+        }
+        return true
+    }
+
+    /// IteratorClose(iterator, ThrowCompletion) with the exception pending on
+    /// `ctx`: `return` is called, whatever it does is ignored, and the
+    /// original exception stays the pending one.
+    static func closeIteratorOnThrow(_ ctx: JeffJSContext, _ iterator: JeffJSValue) {
+        if ctx.rt.currentExceptionIsUncatchable || !iterator.isObject { return }
+        let exc = ctx.getException()
+        let ret = ctx.getProperty(obj: iterator, atom: ctx.iterReturnAtom)
+        if ret.isException {
+            ctx.getException().freeValue()
+        } else if ctx.isCallable(ret) {
+            let r = ctx.callFunction(ret, thisVal: iterator, args: [])
+            if r.isException { ctx.getException().freeValue() } else { r.freeValue() }
+        }
+        ret.freeValue()
+        _ = ctx.throwValue(exc)
+    }
+
+    /// GetIteratorFlattenable(obj, primitiveHandling) (§7.4.13): the iterator
+    /// and its `next` (both owned), or nil with the exception pending.
+    static func getIteratorFlattenable(_ ctx: JeffJSContext, _ obj: JeffJSValue,
+                                       allowStrings: Bool) -> (JeffJSValue, JeffJSValue)? {
+        if !obj.isObject && !(allowStrings && obj.isString) {
+            _ = ctx.throwTypeError(message: allowStrings
+                ? "GetIteratorFlattenable expects its first argument to be an object or a string"
+                : "GetIteratorFlattenable expects its first argument to be an object")
             return nil
         }
-
-        // Any callable `next` (IteratorNext, ES §7.4.4): this used to accept only
-        // native functions of one flavour, so `'ab'[Symbol.iterator]().toArray()`
-        // and every iterator whose `next` is a JS function failed.
-        guard ctx.isFunction(nextMethod) else {
-            nextMethod.freeValue()
-            _ = ctx.throwTypeError(message: "iterator.next is not callable")
+        let method = ctx.getProperty(obj: obj, atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue)
+        if method.isException { return nil }
+        let iterator: JeffJSValue
+        if method.isUndefined || method.isNull {
+            iterator = obj.dupValue()
+        } else {
+            guard ctx.isCallable(method) else {
+                _ = ctx.throwTypeError(message: "\(ctx.jscValueDescription(method)) is not a function")
+                method.freeValue()
+                return nil
+            }
+            iterator = ctx.callFunction(method, thisVal: obj, args: [])
+            method.freeValue()
+            if iterator.isException { return nil }
+        }
+        guard iterator.isObject else {
+            iterator.freeValue()
+            _ = ctx.throwTypeError(message: "Iterator result interface is not an object.")
             return nil
         }
+        let next = ctx.getProperty(obj: iterator, atom: ctx.iterNextAtom)
+        if next.isException { iterator.freeValue(); return nil }
+        return (iterator, next)
+    }
 
-        let args = value.isUndefined ? [JeffJSValue]() : [value]
-        let result = ctx.callFunction(func_: nextMethod, this: iterator, args: args)
-        nextMethod.freeValue()
-        if result.isException { return nil }
-        if !result.isObject {
-            _ = ctx.throwTypeError(message: "iterator.next() must return an object")
-            return nil
+    /// A counter / index as a JS number.
+    @inline(__always)
+    static func numberValue(_ d: Double) -> JeffJSValue {
+        if d <= Double(Int32.max) { return .newInt32(Int32(d)) }
+        return .newFloat64(d)
+    }
+
+    // MARK: - Iterator constructor (ES2025 §27.1.3.1)
+
+    /// `Iterator()`: abstract — `new Iterator()` and a plain call throw; a
+    /// subclass's `super()` gets OrdinaryCreateFromConstructor(NewTarget,
+    /// %Iterator.prototype%).
+    static func iteratorConstructor(ctx: JeffJSContext, newTarget: JeffJSValue,
+                                    isNew: Bool) -> JeffJSValue {
+        if !isNew || newTarget.isUndefined {
+            return ctx.throwTypeError(message: "calling Iterator constructor without new is invalid")
         }
+        if newTarget.bits == ctx.iteratorCtor.bits {
+            return ctx.throwTypeError(message: "Iterator cannot be constructed directly")
+        }
+        let protoVal = ctx.getProperty(obj: newTarget, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue)
+        if protoVal.isException { return .exception }
+        let result = ctx.newObjectProto(proto: protoVal.isObject ? protoVal : ctx.iteratorProto)
+        protoVal.freeValue()
         return result
     }
 
-    /// Check if an iterator result is done.
-    private static func iterResultDone(ctx: JeffJSContext,
-                                        iterResult: JeffJSValue) -> Bool {
-        let doneVal = ctx.getPropertyStr(obj: iterResult, name: "done")
-        return ctx.toBool(doneVal)
-    }
-
-    /// Get the value from an iterator result.
-    private static func iterResultValue(ctx: JeffJSContext,
-                                         iterResult: JeffJSValue) -> JeffJSValue {
-        return ctx.getPropertyStr(obj: iterResult, name: "value")
-    }
-
-    /// Close an iterator by calling iterator.return() if it exists.
-    ///
-    /// Mirrors `JS_IteratorClose` in QuickJS.
-    private static func iteratorClose(ctx: JeffJSContext,
-                                       iterator: JeffJSValue,
-                                       completion: JeffJSValue = .undefined) {
-        let returnMethod = ctx.getPropertyStr(obj: iterator, name: "return")
-        if returnMethod.isException || returnMethod.isUndefined || returnMethod.isNull {
-            return
+    /// SetterThatIgnoresPrototypeProperties(this, %Iterator.prototype%, p, v)
+    /// (ES2025 §27.1.4.14.1 / §10.4.? ): a TypeError on a primitive receiver
+    /// or on the prototype itself; otherwise define an own data property if
+    /// there is none, else Set.
+    static func setterThatIgnoresPrototypeProperties(ctx: JeffJSContext, this: JeffJSValue,
+                                                     atom: UInt32, value: JeffJSValue) -> JeffJSValue {
+        guard let o = this.toObject() else {
+            return ctx.throwTypeError(message: "SetterThatIgnoresPrototypeProperties expected |this| to be an object.")
         }
-        guard let retObj = returnMethod.toObject(), let cFunc = retObj.cFunction else {
-            return
+        if let home = ctx.iteratorProto.toObject(), o === home {
+            return ctx.throwTypeError(message: "SetterThatIgnoresPrototypeProperties was called on a home object.")
         }
-        let args = completion.isUndefined ? [JeffJSValue]() : [completion]
-        _ = cFunc(ctx, iterator, args)
-    }
-
-    // MARK: - Iterator Constructor
-
-    /// `new Iterator()` -- abstract constructor.
-    ///
-    /// The Iterator constructor is not meant to be called directly. It serves
-    /// as the base class for iterator helpers.
-    ///
-    /// Mirrors `js_iterator_constructor` in QuickJS.
-    static func iteratorConstructor(ctx: JeffJSContext, newTarget: JeffJSValue,
-                                     this: JeffJSValue,
-                                     args: [JeffJSValue]) -> JeffJSValue {
-        // Per spec, Iterator is an abstract class
-        if newTarget.isUndefined {
-            return ctx.throwTypeError(message: "Iterator is not a constructor")
-        }
-        // If called with new via a subclass, return a plain object
-        return ctx.newObject()
-    }
-
-    // MARK: - Iterator.from(value)
-
-    /// `Iterator.from(value)` -- wraps any iterable or iterator-like into an Iterator.
-    ///
-    /// If value has a [Symbol.iterator] method, calls it and wraps the result.
-    /// If value already has a `.next()` method, wraps it directly.
-    ///
-    /// Mirrors `js_iterator_from` in QuickJS.
-    static func iteratorFrom(ctx: JeffJSContext, this: JeffJSValue,
-                              args: [JeffJSValue]) -> JeffJSValue {
-        let value = args.isEmpty ? JeffJSValue.undefined : args[0]
-
-        // Step 1: Try to get [Symbol.iterator]
-        let symIterAtom = JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue
-        let iterMethod = ctx.getProperty(obj: value, atom: symIterAtom)
-
-        if !iterMethod.isUndefined && !iterMethod.isNull && !iterMethod.isException {
-            // Call the iterator method
-            guard let iter = callIteratorMethod(ctx: ctx, method: iterMethod, obj: value) else {
+        let desc = ctx.getOwnProperty(obj: this, atom: atom)
+        if desc == nil {
+            if ctx.defineProperty(obj: this, atom: atom, value: value,
+                                  flags: JS_PROP_HAS_VALUE | JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE |
+                                         JS_PROP_HAS_ENUMERABLE | JS_PROP_ENUMERABLE |
+                                         JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE | JS_PROP_THROW) < 0 {
                 return .exception
             }
-            // If iter already has Iterator.prototype in its chain, return as-is
-            // Otherwise wrap it in a WrapForValidIteratorPrototype
-            return wrapIterator(ctx: ctx, iterator: iter)
-        }
-
-        // Step 2: Check if value itself has a .next() method (iterator protocol)
-        let nextMethod = ctx.getPropertyStr(obj: value, name: "next")
-        if !nextMethod.isUndefined && !nextMethod.isNull && !nextMethod.isException {
-            return wrapIterator(ctx: ctx, iterator: value)
-        }
-
-        return ctx.throwTypeError(message: "Iterator.from: argument is not iterable")
-    }
-
-    /// Wrap an iterator object so it has Iterator.prototype helper methods.
-    private static func wrapIterator(ctx: JeffJSContext,
-                                      iterator: JeffJSValue) -> JeffJSValue {
-        // Create a wrapper object that delegates .next/.return/.throw to the
-        // underlying iterator but inherits from Iterator.prototype.
-        let wrapper = ctx.newObject()
-        if wrapper.isException { return .exception }
-
-        // Store the underlying iterator
-        ctx.setPropertyStr(obj: wrapper, name: "__underlying", value: iterator.dupValue())
-
-        // Install a .next() that delegates
-        let nextFn = ctx.newCFunction({ ctx, this, args in
-            let underlying = ctx.getPropertyStr(obj: this, name: "__underlying")
-            if underlying.isUndefined {
-                return createIterResult(ctx: ctx, val: .undefined, done: true)
-            }
-            guard let result = iteratorNext(ctx: ctx, iterator: underlying,
-                                             value: args.isEmpty ? .undefined : args[0].dupValue()) else {
-                return .exception
-            }
-            return result
-        }, name: "next", length: 1)
-        ctx.setPropertyStr(obj: wrapper, name: "next", value: nextFn)
-
-        // Install a .return() that delegates
-        let returnFn = ctx.newCFunction({ ctx, this, args in
-            let underlying = ctx.getPropertyStr(obj: this, name: "__underlying")
-            if underlying.isUndefined || underlying.isNull {
-                let val = args.isEmpty ? JeffJSValue.undefined : args[0]
-                return createIterResult(ctx: ctx, val: val, done: true)
-            }
-            let returnMethod = ctx.getPropertyStr(obj: underlying, name: "return")
-            if returnMethod.isUndefined || returnMethod.isNull {
-                let val = args.isEmpty ? JeffJSValue.undefined : args[0]
-                return createIterResult(ctx: ctx, val: val, done: true)
-            }
-            guard let retObj = returnMethod.toObject(), let cFunc = retObj.cFunction else {
-                return ctx.throwTypeError(message: "iterator.return is not callable")
-            }
-            return cFunc(ctx, underlying, args)
-        }, name: "return", length: 1)
-        ctx.setPropertyStr(obj: wrapper, name: "return", value: returnFn)
-
-        // Install [Symbol.iterator] returning this
-        let selfIterFn = ctx.newCFunction({ ctx, this, args in
-            return this.dupValue()
-        }, name: "[Symbol.iterator]", length: 0)
-        let symAtom = JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue
-        ctx.setProperty(obj: wrapper, atom: symAtom, value: selfIterFn)
-
-        return wrapper
-    }
-
-    // MARK: - Iterator.prototype.map(mapperFn)
-
-    /// `Iterator.prototype.map(mapperFn)` -- lazy map.
-    ///
-    /// Returns a new iterator that yields mapperFn(value, counter) for each
-    /// value from the underlying iterator.
-    ///
-    /// Mirrors `js_iterator_proto_map` in QuickJS.
-    static func iteratorMap(ctx: JeffJSContext, this: JeffJSValue,
-                             args: [JeffJSValue]) -> JeffJSValue {
-        let mapper = args.isEmpty ? JeffJSValue.undefined : args[0]
-        if !mapper.isObject {
-            return ctx.throwTypeError(message: "Iterator.prototype.map: callback is not a function")
-        }
-
-        var counter: Int64 = 0
-        let underlying = this
-
-        let wrapper = ctx.newObject()
-        if wrapper.isException { return .exception }
-
-        // Store state on the wrapper via closures
-        ctx.setPropertyStr(obj: wrapper, name: "__underlying", value: underlying.dupValue())
-        ctx.setPropertyStr(obj: wrapper, name: "__mapper", value: mapper.dupValue())
-        ctx.setPropertyStr(obj: wrapper, name: "__counter", value: .newInt32(0))
-        ctx.setPropertyStr(obj: wrapper, name: "__done", value: .JS_FALSE)
-
-        let nextFn = ctx.newCFunction({ ctx, this, args in
-            let doneVal = ctx.getPropertyStr(obj: this, name: "__done")
-            if ctx.toBool(doneVal) {
-                return createIterResult(ctx: ctx, val: .undefined, done: true)
-            }
-
-            let underlying = ctx.getPropertyStr(obj: this, name: "__underlying")
-            let mapper = ctx.getPropertyStr(obj: this, name: "__mapper")
-            let counterVal = ctx.getPropertyStr(obj: this, name: "__counter")
-            let currentCounter = counterVal.isInt ? Int64(counterVal.toInt32()) : 0
-
-            guard let iterResult = iteratorNext(ctx: ctx, iterator: underlying) else {
-                ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                return .exception
-            }
-
-            if iterResultDone(ctx: ctx, iterResult: iterResult) {
-                ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                return createIterResult(ctx: ctx, val: .undefined, done: true)
-            }
-
-            let value = iterResultValue(ctx: ctx, iterResult: iterResult)
-
-            // Call mapper(value, counter)
-            guard let mapperObj = mapper.toObject(), let cFunc = mapperObj.cFunction else {
-                iteratorClose(ctx: ctx, iterator: underlying)
-                ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                return ctx.throwTypeError(message: "Iterator.prototype.map: mapper is not callable")
-            }
-
-            let mapped = cFunc(ctx, .undefined, [value, .newInt64(currentCounter)])
-            if mapped.isException {
-                iteratorClose(ctx: ctx, iterator: underlying)
-                ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                return .exception
-            }
-
-            ctx.setPropertyStr(obj: this, name: "__counter",
-                               value: .newInt64(currentCounter + 1))
-
-            return createIterResult(ctx: ctx, val: mapped, done: false)
-        }, name: "next", length: 0)
-        ctx.setPropertyStr(obj: wrapper, name: "next", value: nextFn)
-
-        installIteratorReturn(ctx: ctx, wrapper: wrapper)
-        installSymbolIterator(ctx: ctx, wrapper: wrapper)
-
-        return wrapper
-    }
-
-    // MARK: - Iterator.prototype.filter(predicate)
-
-    /// `Iterator.prototype.filter(predicate)` -- lazy filter.
-    ///
-    /// Returns a new iterator that yields only values where predicate(value, counter)
-    /// is truthy.
-    ///
-    /// Mirrors `js_iterator_proto_filter` in QuickJS.
-    static func iteratorFilter(ctx: JeffJSContext, this: JeffJSValue,
-                                args: [JeffJSValue]) -> JeffJSValue {
-        let predicate = args.isEmpty ? JeffJSValue.undefined : args[0]
-        if !predicate.isObject {
-            return ctx.throwTypeError(message: "Iterator.prototype.filter: callback is not a function")
-        }
-
-        let wrapper = ctx.newObject()
-        if wrapper.isException { return .exception }
-
-        ctx.setPropertyStr(obj: wrapper, name: "__underlying", value: this.dupValue())
-        ctx.setPropertyStr(obj: wrapper, name: "__predicate", value: predicate.dupValue())
-        ctx.setPropertyStr(obj: wrapper, name: "__counter", value: .newInt32(0))
-        ctx.setPropertyStr(obj: wrapper, name: "__done", value: .JS_FALSE)
-
-        let nextFn = ctx.newCFunction({ ctx, this, args in
-            let doneVal = ctx.getPropertyStr(obj: this, name: "__done")
-            if ctx.toBool(doneVal) {
-                return createIterResult(ctx: ctx, val: .undefined, done: true)
-            }
-
-            let underlying = ctx.getPropertyStr(obj: this, name: "__underlying")
-            let predicate = ctx.getPropertyStr(obj: this, name: "__predicate")
-            var counterVal = ctx.getPropertyStr(obj: this, name: "__counter")
-            var currentCounter = counterVal.isInt ? Int64(counterVal.toInt32()) : 0
-
-            guard let predObj = predicate.toObject(), let cFunc = predObj.cFunction else {
-                ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                return ctx.throwTypeError(message: "filter predicate is not callable")
-            }
-
-            // Keep calling next until we find a matching element or exhaust the iterator
-            while true {
-                guard let iterResult = iteratorNext(ctx: ctx, iterator: underlying) else {
-                    ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                    return .exception
-                }
-
-                if iterResultDone(ctx: ctx, iterResult: iterResult) {
-                    ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                    return createIterResult(ctx: ctx, val: .undefined, done: true)
-                }
-
-                let value = iterResultValue(ctx: ctx, iterResult: iterResult)
-                let selected = cFunc(ctx, .undefined, [value, .newInt64(currentCounter)])
-                currentCounter += 1
-
-                if selected.isException {
-                    iteratorClose(ctx: ctx, iterator: underlying)
-                    ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                    return .exception
-                }
-
-                if ctx.toBool(selected) {
-                    ctx.setPropertyStr(obj: this, name: "__counter",
-                                       value: .newInt64(currentCounter))
-                    return createIterResult(ctx: ctx, val: value, done: false)
-                }
-            }
-        }, name: "next", length: 0)
-        ctx.setPropertyStr(obj: wrapper, name: "next", value: nextFn)
-
-        installIteratorReturn(ctx: ctx, wrapper: wrapper)
-        installSymbolIterator(ctx: ctx, wrapper: wrapper)
-
-        return wrapper
-    }
-
-    // MARK: - Iterator.prototype.take(limit)
-
-    /// `Iterator.prototype.take(limit)` -- lazy take.
-    ///
-    /// Returns a new iterator that yields at most `limit` values.
-    ///
-    /// Mirrors `js_iterator_proto_take` in QuickJS.
-    static func iteratorTake(ctx: JeffJSContext, this: JeffJSValue,
-                              args: [JeffJSValue]) -> JeffJSValue {
-        let limitVal = args.isEmpty ? JeffJSValue.undefined : args[0]
-        guard let limitNum = ctx.toFloat64(limitVal) else {
+        } else if ctx.setProperty(obj: this, atom: atom, value: value.dupValue()) < 0 {
             return .exception
         }
-
-        if limitNum.isNaN || limitNum < 0 {
-            return ctx.throwRangeError(message: "Iterator.prototype.take: limit must be a non-negative number")
-        }
-
-        let limit = limitNum.isInfinite ? Int64.max : Int64(limitNum)
-
-        let wrapper = ctx.newObject()
-        if wrapper.isException { return .exception }
-
-        ctx.setPropertyStr(obj: wrapper, name: "__underlying", value: this.dupValue())
-        ctx.setPropertyStr(obj: wrapper, name: "__remaining", value: .newInt64(limit))
-        ctx.setPropertyStr(obj: wrapper, name: "__done", value: .JS_FALSE)
-
-        let nextFn = ctx.newCFunction({ ctx, this, args in
-            let doneVal = ctx.getPropertyStr(obj: this, name: "__done")
-            if ctx.toBool(doneVal) {
-                return createIterResult(ctx: ctx, val: .undefined, done: true)
-            }
-
-            let remainingVal = ctx.getPropertyStr(obj: this, name: "__remaining")
-            var remaining: Int64 = 0
-            if remainingVal.isInt {
-                remaining = Int64(remainingVal.toInt32())
-            } else if remainingVal.isFloat64 {
-                let d = remainingVal.toFloat64()
-                remaining = d.isNaN ? 0 : (d.isInfinite || abs(d) > Double(Int64.max) ? (d > 0 ? Int64.max : 0) : Int64(d))
-            }
-
-            if remaining <= 0 {
-                let underlying = ctx.getPropertyStr(obj: this, name: "__underlying")
-                iteratorClose(ctx: ctx, iterator: underlying)
-                ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                return createIterResult(ctx: ctx, val: .undefined, done: true)
-            }
-
-            let underlying = ctx.getPropertyStr(obj: this, name: "__underlying")
-            guard let iterResult = iteratorNext(ctx: ctx, iterator: underlying) else {
-                ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                return .exception
-            }
-
-            if iterResultDone(ctx: ctx, iterResult: iterResult) {
-                ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                return createIterResult(ctx: ctx, val: .undefined, done: true)
-            }
-
-            ctx.setPropertyStr(obj: this, name: "__remaining",
-                               value: .newInt64(remaining - 1))
-
-            return iterResult
-        }, name: "next", length: 0)
-        ctx.setPropertyStr(obj: wrapper, name: "next", value: nextFn)
-
-        installIteratorReturn(ctx: ctx, wrapper: wrapper)
-        installSymbolIterator(ctx: ctx, wrapper: wrapper)
-
-        return wrapper
-    }
-
-    // MARK: - Iterator.prototype.drop(limit)
-
-    /// `Iterator.prototype.drop(limit)` -- lazy drop.
-    ///
-    /// Returns a new iterator that skips the first `limit` values, then yields
-    /// the rest.
-    ///
-    /// Mirrors `js_iterator_proto_drop` in QuickJS.
-    static func iteratorDrop(ctx: JeffJSContext, this: JeffJSValue,
-                              args: [JeffJSValue]) -> JeffJSValue {
-        let limitVal = args.isEmpty ? JeffJSValue.undefined : args[0]
-        guard let limitNum = ctx.toFloat64(limitVal) else {
-            return .exception
-        }
-
-        if limitNum.isNaN || limitNum < 0 {
-            return ctx.throwRangeError(message: "Iterator.prototype.drop: limit must be a non-negative number")
-        }
-
-        let limit = limitNum.isInfinite ? Int64.max : Int64(limitNum)
-
-        let wrapper = ctx.newObject()
-        if wrapper.isException { return .exception }
-
-        ctx.setPropertyStr(obj: wrapper, name: "__underlying", value: this.dupValue())
-        ctx.setPropertyStr(obj: wrapper, name: "__toDrop", value: .newInt64(limit))
-        ctx.setPropertyStr(obj: wrapper, name: "__done", value: .JS_FALSE)
-
-        let nextFn = ctx.newCFunction({ ctx, this, args in
-            let doneVal = ctx.getPropertyStr(obj: this, name: "__done")
-            if ctx.toBool(doneVal) {
-                return createIterResult(ctx: ctx, val: .undefined, done: true)
-            }
-
-            let underlying = ctx.getPropertyStr(obj: this, name: "__underlying")
-            let toDropVal = ctx.getPropertyStr(obj: this, name: "__toDrop")
-            var toDrop: Int64 = 0
-            if toDropVal.isInt {
-                toDrop = Int64(toDropVal.toInt32())
-            } else if toDropVal.isFloat64 {
-                let d = toDropVal.toFloat64()
-                toDrop = d.isNaN ? 0 : (d.isInfinite || abs(d) > Double(Int64.max) ? (d > 0 ? Int64.max : 0) : Int64(d))
-            }
-
-            // Skip elements
-            while toDrop > 0 {
-                guard let iterResult = iteratorNext(ctx: ctx, iterator: underlying) else {
-                    ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                    return .exception
-                }
-                if iterResultDone(ctx: ctx, iterResult: iterResult) {
-                    ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                    return createIterResult(ctx: ctx, val: .undefined, done: true)
-                }
-                toDrop -= 1
-            }
-            ctx.setPropertyStr(obj: this, name: "__toDrop", value: .newInt32(0))
-
-            // Now yield the next element
-            guard let iterResult = iteratorNext(ctx: ctx, iterator: underlying) else {
-                ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                return .exception
-            }
-
-            if iterResultDone(ctx: ctx, iterResult: iterResult) {
-                ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                return createIterResult(ctx: ctx, val: .undefined, done: true)
-            }
-
-            return iterResult
-        }, name: "next", length: 0)
-        ctx.setPropertyStr(obj: wrapper, name: "next", value: nextFn)
-
-        installIteratorReturn(ctx: ctx, wrapper: wrapper)
-        installSymbolIterator(ctx: ctx, wrapper: wrapper)
-
-        return wrapper
-    }
-
-    // MARK: - Iterator.prototype.flatMap(mapperFn)
-
-    /// `Iterator.prototype.flatMap(mapperFn)` -- lazy flatMap.
-    ///
-    /// For each value, calls mapperFn(value, counter) which must return an iterable.
-    /// Yields all values from each returned iterable in sequence.
-    ///
-    /// Mirrors `js_iterator_proto_flatMap` in QuickJS.
-    static func iteratorFlatMap(ctx: JeffJSContext, this: JeffJSValue,
-                                 args: [JeffJSValue]) -> JeffJSValue {
-        let mapper = args.isEmpty ? JeffJSValue.undefined : args[0]
-        if !mapper.isObject {
-            return ctx.throwTypeError(message: "Iterator.prototype.flatMap: callback is not a function")
-        }
-
-        let wrapper = ctx.newObject()
-        if wrapper.isException { return .exception }
-
-        ctx.setPropertyStr(obj: wrapper, name: "__underlying", value: this.dupValue())
-        ctx.setPropertyStr(obj: wrapper, name: "__mapper", value: mapper.dupValue())
-        ctx.setPropertyStr(obj: wrapper, name: "__counter", value: .newInt32(0))
-        ctx.setPropertyStr(obj: wrapper, name: "__done", value: .JS_FALSE)
-        ctx.setPropertyStr(obj: wrapper, name: "__innerIter", value: .undefined)
-        ctx.setPropertyStr(obj: wrapper, name: "__innerActive", value: .JS_FALSE)
-
-        let nextFn = ctx.newCFunction({ ctx, this, args in
-            let doneVal = ctx.getPropertyStr(obj: this, name: "__done")
-            if ctx.toBool(doneVal) {
-                return createIterResult(ctx: ctx, val: .undefined, done: true)
-            }
-
-            let underlying = ctx.getPropertyStr(obj: this, name: "__underlying")
-            let mapper = ctx.getPropertyStr(obj: this, name: "__mapper")
-            var counterVal = ctx.getPropertyStr(obj: this, name: "__counter")
-            var currentCounter = counterVal.isInt ? Int64(counterVal.toInt32()) : 0
-
-            guard let mapperObj = mapper.toObject(), let mapFn = mapperObj.cFunction else {
-                ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                return ctx.throwTypeError(message: "flatMap mapper is not callable")
-            }
-
-            while true {
-                // If we have an active inner iterator, try to get next from it
-                let innerActive = ctx.toBool(ctx.getPropertyStr(obj: this, name: "__innerActive"))
-                if innerActive {
-                    let innerIter = ctx.getPropertyStr(obj: this, name: "__innerIter")
-                    if let innerResult = iteratorNext(ctx: ctx, iterator: innerIter) {
-                        if !iterResultDone(ctx: ctx, iterResult: innerResult) {
-                            return innerResult
-                        }
-                    }
-                    // Inner iterator exhausted
-                    ctx.setPropertyStr(obj: this, name: "__innerActive", value: .JS_FALSE)
-                    ctx.setPropertyStr(obj: this, name: "__innerIter", value: .undefined)
-                }
-
-                // Get next from outer iterator
-                guard let outerResult = iteratorNext(ctx: ctx, iterator: underlying) else {
-                    ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                    return .exception
-                }
-
-                if iterResultDone(ctx: ctx, iterResult: outerResult) {
-                    ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                    return createIterResult(ctx: ctx, val: .undefined, done: true)
-                }
-
-                let value = iterResultValue(ctx: ctx, iterResult: outerResult)
-
-                // Call mapper(value, counter)
-                let mapped = mapFn(ctx, .undefined, [value, .newInt64(currentCounter)])
-                currentCounter += 1
-                ctx.setPropertyStr(obj: this, name: "__counter",
-                                   value: .newInt64(currentCounter))
-
-                if mapped.isException {
-                    iteratorClose(ctx: ctx, iterator: underlying)
-                    ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                    return .exception
-                }
-
-                // Get an iterator from the mapped value
-                guard let innerIter = getIterator(ctx: ctx, obj: mapped) else {
-                    iteratorClose(ctx: ctx, iterator: underlying)
-                    ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                    return .exception
-                }
-
-                ctx.setPropertyStr(obj: this, name: "__innerIter", value: innerIter.dupValue())
-                ctx.setPropertyStr(obj: this, name: "__innerActive", value: .JS_TRUE)
-                // Loop back to try getting from inner iterator
-            }
-        }, name: "next", length: 0)
-        ctx.setPropertyStr(obj: wrapper, name: "next", value: nextFn)
-
-        installIteratorReturn(ctx: ctx, wrapper: wrapper)
-        installSymbolIterator(ctx: ctx, wrapper: wrapper)
-
-        return wrapper
-    }
-
-    // MARK: - Iterator.prototype.reduce(reducer [, initialValue])
-
-    /// `Iterator.prototype.reduce(reducer [, initialValue])` -- eager reduce.
-    ///
-    /// Consumes the entire iterator, reducing to a single value.
-    /// If no initialValue is provided, uses the first yielded value.
-    ///
-    /// Mirrors `js_iterator_proto_reduce` in QuickJS.
-    static func iteratorReduce(ctx: JeffJSContext, this: JeffJSValue,
-                                args: [JeffJSValue]) -> JeffJSValue {
-        let reducer = args.isEmpty ? JeffJSValue.undefined : args[0]
-        if !reducer.isObject {
-            return ctx.throwTypeError(message: "Iterator.prototype.reduce: callback is not a function")
-        }
-
-        guard let reducerObj = reducer.toObject(), let reduceFn = reducerObj.cFunction else {
-            return ctx.throwTypeError(message: "Iterator.prototype.reduce: callback is not callable")
-        }
-
-        var accumulator: JeffJSValue
-        var counter: Int64 = 0
-        let hasInitialValue = args.count >= 2
-
-        if hasInitialValue {
-            accumulator = args[1]
-        } else {
-            // Use first element as initial value
-            guard let first = iteratorNext(ctx: ctx, iterator: this) else {
-                return .exception
-            }
-            if iterResultDone(ctx: ctx, iterResult: first) {
-                return ctx.throwTypeError(message: "Iterator.prototype.reduce: reduce of empty iterator with no initial value")
-            }
-            accumulator = iterResultValue(ctx: ctx, iterResult: first)
-            counter = 1
-        }
-
-        // Consume the rest
-        while true {
-            guard let iterResult = iteratorNext(ctx: ctx, iterator: this) else {
-                return .exception
-            }
-            if iterResultDone(ctx: ctx, iterResult: iterResult) {
-                break
-            }
-
-            let value = iterResultValue(ctx: ctx, iterResult: iterResult)
-            let result = reduceFn(ctx, .undefined, [accumulator, value, .newInt64(counter)])
-            if result.isException {
-                iteratorClose(ctx: ctx, iterator: this)
-                return .exception
-            }
-            accumulator = result
-            counter += 1
-        }
-
-        return accumulator
-    }
-
-    // MARK: - Iterator.prototype.toArray()
-
-    /// `Iterator.prototype.toArray()` -- eagerly collects all values into an array.
-    ///
-    /// Mirrors `js_iterator_proto_toArray` in QuickJS.
-    static func iteratorToArray(ctx: JeffJSContext, this: JeffJSValue,
-                                 args: [JeffJSValue]) -> JeffJSValue {
-        return iteratorToArrayInternal(ctx: ctx, iterator: this)
-    }
-
-    /// Internal helper: consume an iterator and collect results into a JS array.
-    ///
-    /// Mirrors `js_iterator_to_array` in QuickJS.
-    static func iteratorToArrayInternal(ctx: JeffJSContext,
-                                         iterator: JeffJSValue) -> JeffJSValue {
-        let arr = ctx.newArray()
-        if arr.isException { return .exception }
-
-        var index: UInt32 = 0
-
-        while true {
-            guard let iterResult = iteratorNext(ctx: ctx, iterator: iterator) else {
-                return .exception
-            }
-            if iterResultDone(ctx: ctx, iterResult: iterResult) {
-                break
-            }
-
-            let value = iterResultValue(ctx: ctx, iterResult: iterResult)
-            ctx.setPropertyUint32(obj: arr, index: index, value: value.dupValue())
-            index += 1
-        }
-
-        // Set array length
-        ctx.setPropertyStr(obj: arr, name: "length", value: .newUInt32(index))
-
-        return arr
-    }
-
-    // MARK: - Iterator.prototype.forEach(fn)
-
-    /// `Iterator.prototype.forEach(fn)` -- eagerly calls fn(value, counter) for each value.
-    ///
-    /// Returns undefined. Consumes the entire iterator.
-    ///
-    /// Mirrors `js_iterator_proto_forEach` in QuickJS.
-    static func iteratorForEach(ctx: JeffJSContext, this: JeffJSValue,
-                                 args: [JeffJSValue]) -> JeffJSValue {
-        let fn = args.isEmpty ? JeffJSValue.undefined : args[0]
-        if !fn.isObject {
-            return ctx.throwTypeError(message: "Iterator.prototype.forEach: callback is not a function")
-        }
-
-        guard let fnObj = fn.toObject(), let cFunc = fnObj.cFunction else {
-            return ctx.throwTypeError(message: "Iterator.prototype.forEach: callback is not callable")
-        }
-
-        var counter: Int64 = 0
-        while true {
-            guard let iterResult = iteratorNext(ctx: ctx, iterator: this) else {
-                return .exception
-            }
-            if iterResultDone(ctx: ctx, iterResult: iterResult) {
-                break
-            }
-
-            let value = iterResultValue(ctx: ctx, iterResult: iterResult)
-            let result = cFunc(ctx, .undefined, [value, .newInt64(counter)])
-            if result.isException {
-                iteratorClose(ctx: ctx, iterator: this)
-                return .exception
-            }
-            counter += 1
-        }
-
         return .undefined
     }
 
-    // MARK: - Iterator.prototype.some(predicate)
+    // MARK: - Iterator.from (ES2025 §27.1.3.2.1) and %WrapForValidIteratorPrototype%
 
-    /// `Iterator.prototype.some(predicate)` -- eagerly tests if any value matches.
-    ///
-    /// Returns true if predicate(value, counter) is truthy for at least one value.
-    /// Short-circuits on the first truthy result. Consumes the iterator.
-    ///
-    /// Mirrors `js_iterator_proto_some` in QuickJS.
-    static func iteratorSome(ctx: JeffJSContext, this: JeffJSValue,
-                              args: [JeffJSValue]) -> JeffJSValue {
-        let predicate = args.isEmpty ? JeffJSValue.undefined : args[0]
-        if !predicate.isObject {
-            return ctx.throwTypeError(message: "Iterator.prototype.some: callback is not a function")
+    static func iteratorFrom(ctx: JeffJSContext, this: JeffJSValue,
+                             args: [JeffJSValue]) -> JeffJSValue {
+        let value = args.isEmpty ? JeffJSValue.undefined : args[0]
+        guard let (iterator, next) = getIteratorFlattenable(ctx, value, allowStrings: true) else {
+            return .exception
         }
-
-        guard let predObj = predicate.toObject(), let cFunc = predObj.cFunction else {
-            return ctx.throwTypeError(message: "Iterator.prototype.some: callback is not callable")
+        if JeffJSBuiltinFunction.ordinaryIsInstanceOf(ctx: ctx, val: iterator, obj: ctx.iteratorCtor) {
+            next.freeValue()
+            return iterator
         }
+        let data = JeffJSIteratorHelperData(kind: .wrap)
+        data.iterator = iterator
+        data.nextMethod = next
+        return makeHelperObject(ctx, data, classID: JSClassID.JS_CLASS_ITERATOR_WRAP.rawValue)
+    }
 
-        var counter: Int64 = 0
-        while true {
-            guard let iterResult = iteratorNext(ctx: ctx, iterator: this) else {
-                return .exception
-            }
-            if iterResultDone(ctx: ctx, iterResult: iterResult) {
-                return .JS_FALSE
-            }
+    private static func wrapData(_ this: JeffJSValue) -> JeffJSIteratorHelperData? {
+        guard let obj = this.toObject(), obj.classID == JSClassID.JS_CLASS_ITERATOR_WRAP.rawValue,
+              case .opaque(let o) = obj.payload, let d = o as? JeffJSIteratorHelperData else { return nil }
+        return d
+    }
 
-            let value = iterResultValue(ctx: ctx, iterResult: iterResult)
-            let result = cFunc(ctx, .undefined, [value, .newInt64(counter)])
-            if result.isException {
-                iteratorClose(ctx: ctx, iterator: this)
-                return .exception
-            }
+    /// %WrapForValidIteratorPrototype%.next() (§27.1.3.2.1.1.1).
+    static func wrapNext(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        guard let d = wrapData(this) else {
+            return ctx.throwTypeError(message: "%WrapForValidIteratorPrototype%.next requires that |this| be a WrapForValidIteratorPrototype object")
+        }
+        guard ctx.isCallable(d.nextMethod) else {
+            return ctx.throwTypeError(message: "\(ctx.jscValueDescription(d.nextMethod)) is not a function")
+        }
+        return ctx.callRetained(d.nextMethod, this: d.iterator, args: [])
+    }
 
-            if ctx.toBool(result) {
-                iteratorClose(ctx: ctx, iterator: this)
-                return .JS_TRUE
-            }
-            counter += 1
+    /// %WrapForValidIteratorPrototype%.return() (§27.1.3.2.1.1.2).
+    static func wrapReturn(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        guard let d = wrapData(this) else {
+            return ctx.throwTypeError(message: "%WrapForValidIteratorPrototype%.return requires that |this| be a WrapForValidIteratorPrototype object")
+        }
+        let iterator = d.iterator.dupValue()
+        defer { iterator.freeValue() }
+        let ret = ctx.getProperty(obj: iterator, atom: ctx.iterReturnAtom)
+        if ret.isException { return .exception }
+        if ret.isUndefined || ret.isNull {
+            return ctx.makeIterResult(value: .undefined, done: true)
+        }
+        guard ctx.isCallable(ret) else {
+            _ = ctx.throwTypeError(message: "\(ctx.jscValueDescription(ret)) is not a function")
+            ret.freeValue()
+            return .exception
+        }
+        let r = ctx.callFunction(ret, thisVal: iterator, args: [])
+        ret.freeValue()
+        return r
+    }
+
+    // MARK: - %IteratorHelperPrototype% (ES2025 §27.1.2.1)
+
+    static func makeHelperObject(_ ctx: JeffJSContext, _ data: JeffJSIteratorHelperData,
+                                 classID: Int) -> JeffJSValue {
+        let proto = classID < ctx.classProto.count ? ctx.classProto[classID].toObject() : nil
+        let obj = jeffJS_createObject(ctx: ctx, proto: proto, classID: UInt16(classID))
+        obj.payload = .opaque(data)
+        return JeffJSValue.makeObject(obj)
+    }
+
+    private static func helperData(_ this: JeffJSValue) -> JeffJSIteratorHelperData? {
+        guard let obj = this.toObject(), obj.classID == JSClassID.JS_CLASS_ITERATOR_HELPER.rawValue,
+              case .opaque(let o) = obj.payload, let d = o as? JeffJSIteratorHelperData else { return nil }
+        return d
+    }
+
+    /// %IteratorHelperPrototype%.next() (§27.1.2.1.1): GeneratorResume of the
+    /// helper's closure.
+    static func helperNext(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        guard let data = helperData(this) else {
+            return ctx.throwTypeError(message: "|this| should be an iterator helper")
+        }
+        switch data.state {
+        case .executing: return ctx.throwTypeError(message: "Generator is executing")
+        case .completed: return ctx.makeIterResult(value: .undefined, done: true)
+        case .suspendedStart, .suspendedYield: break
+        }
+        let atStart = data.state == .suspendedStart
+        data.state = .executing
+        switch helperStep(ctx, data, atStart: atStart) {
+        case .value(let v):
+            data.state = .suspendedYield
+            return ctx.makeIterResult(value: v, done: false)
+        case .done:
+            data.state = .completed
+            data.release()
+            return ctx.makeIterResult(value: .undefined, done: true)
+        case .error:
+            data.state = .completed
+            data.release()
+            return .exception
         }
     }
 
-    // MARK: - Iterator.prototype.every(predicate)
-
-    /// `Iterator.prototype.every(predicate)` -- eagerly tests if all values match.
-    ///
-    /// Returns true if predicate(value, counter) is truthy for every value.
-    /// Short-circuits on the first falsy result. Consumes the iterator.
-    ///
-    /// Mirrors `js_iterator_proto_every` in QuickJS.
-    static func iteratorEvery(ctx: JeffJSContext, this: JeffJSValue,
-                               args: [JeffJSValue]) -> JeffJSValue {
-        let predicate = args.isEmpty ? JeffJSValue.undefined : args[0]
-        if !predicate.isObject {
-            return ctx.throwTypeError(message: "Iterator.prototype.every: callback is not a function")
+    /// %IteratorHelperPrototype%.return() (§27.1.2.1.2): closes the underlying
+    /// iterator(s) — GeneratorResumeAbrupt with a return completion.
+    static func helperReturn(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        guard let data = helperData(this) else {
+            return ctx.throwTypeError(message: "|this| should be an iterator helper")
         }
-
-        guard let predObj = predicate.toObject(), let cFunc = predObj.cFunction else {
-            return ctx.throwTypeError(message: "Iterator.prototype.every: callback is not callable")
+        var ok = true
+        switch data.state {
+        case .executing:
+            return ctx.throwTypeError(message: "Generator is executing")
+        case .completed:
+            return ctx.makeIterResult(value: .undefined, done: true)
+        case .suspendedStart:
+            data.state = .completed
+            if data.kind != .concat { ok = closeIterator(ctx, data.iterator) }
+        case .suspendedYield:
+            data.state = .executing
+            switch data.kind {
+            case .flatMap where data.innerAlive:
+                // Yield's abrupt completion: close the inner iterator, then
+                // the outer one (with the inner's error if it threw).
+                if closeIterator(ctx, data.inner) {
+                    ok = closeIterator(ctx, data.iterator)
+                } else {
+                    closeIteratorOnThrow(ctx, data.iterator)
+                    ok = false
+                }
+            case .concat:
+                if data.innerAlive { ok = closeIterator(ctx, data.inner) }
+            default:
+                ok = closeIterator(ctx, data.iterator)
+            }
+            data.state = .completed
         }
-
-        var counter: Int64 = 0
-        while true {
-            guard let iterResult = iteratorNext(ctx: ctx, iterator: this) else {
-                return .exception
-            }
-            if iterResultDone(ctx: ctx, iterResult: iterResult) {
-                return .JS_TRUE
-            }
-
-            let value = iterResultValue(ctx: ctx, iterResult: iterResult)
-            let result = cFunc(ctx, .undefined, [value, .newInt64(counter)])
-            if result.isException {
-                iteratorClose(ctx: ctx, iterator: this)
-                return .exception
-            }
-
-            if !ctx.toBool(result) {
-                iteratorClose(ctx: ctx, iterator: this)
-                return .JS_FALSE
-            }
-            counter += 1
-        }
+        data.release()
+        return ok ? ctx.makeIterResult(value: .undefined, done: true) : .exception
     }
 
-    // MARK: - Iterator.prototype.find(predicate)
-
-    /// `Iterator.prototype.find(predicate)` -- eagerly finds the first matching value.
-    ///
-    /// Returns the first value for which predicate(value, counter) is truthy,
-    /// or undefined if none match. Consumes the iterator.
-    ///
-    /// Mirrors `js_iterator_proto_find` in QuickJS.
-    static func iteratorFind(ctx: JeffJSContext, this: JeffJSValue,
-                              args: [JeffJSValue]) -> JeffJSValue {
-        let predicate = args.isEmpty ? JeffJSValue.undefined : args[0]
-        if !predicate.isObject {
-            return ctx.throwTypeError(message: "Iterator.prototype.find: callback is not a function")
-        }
-
-        guard let predObj = predicate.toObject(), let cFunc = predObj.cFunction else {
-            return ctx.throwTypeError(message: "Iterator.prototype.find: callback is not callable")
-        }
-
-        var counter: Int64 = 0
-        while true {
-            guard let iterResult = iteratorNext(ctx: ctx, iterator: this) else {
-                return .exception
-            }
-            if iterResultDone(ctx: ctx, iterResult: iterResult) {
-                return .undefined
+    /// Runs the helper's closure from where it is suspended to its next
+    /// Yield (`.value`, owned), its return (`.done`) or a throw (`.error`).
+    private static func helperStep(_ ctx: JeffJSContext, _ data: JeffJSIteratorHelperData,
+                                   atStart: Bool) -> StepOutcome {
+        switch data.kind {
+        case .map:
+            switch stepIterator(ctx, data.iterator, data.nextMethod) {
+            case .error: return .error
+            case .done: return .done
+            case .value(let v):
+                let mapped = ctx.callFunction(data.fn, thisVal: .undefined, args: [v, numberValue(data.counter)])
+                v.freeValue()
+                if mapped.isException { closeIteratorOnThrow(ctx, data.iterator); return .error }
+                data.counter += 1
+                return .value(mapped)
             }
 
-            let value = iterResultValue(ctx: ctx, iterResult: iterResult)
-            let result = cFunc(ctx, .undefined, [value, .newInt64(counter)])
-            if result.isException {
-                iteratorClose(ctx: ctx, iterator: this)
-                return .exception
-            }
-
-            if ctx.toBool(result) {
-                iteratorClose(ctx: ctx, iterator: this)
-                return value
-            }
-            counter += 1
-        }
-    }
-
-    // MARK: - Iterator.concat(...iterables)
-
-    /// `Iterator.concat(...iterables)` -- concatenates multiple iterables.
-    ///
-    /// Returns a new iterator that yields all values from each iterable in sequence.
-    /// Each argument must be iterable; a TypeError is thrown otherwise.
-    ///
-    /// This is a static method on Iterator, not a prototype method (ES2025).
-    ///
-    /// Mirrors the Iterator.concat proposal.
-    static func iteratorConcat(ctx: JeffJSContext, this: JeffJSValue,
-                                args: [JeffJSValue]) -> JeffJSValue {
-        // Validate all arguments are iterable before creating the iterator
-        let symIterAtom = JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue
-        for (i, arg) in args.enumerated() {
-            let method = ctx.getProperty(obj: arg, atom: symIterAtom)
-            if method.isUndefined || method.isNull {
-                return ctx.throwTypeError(message: "Iterator.concat: argument \(i) is not iterable")
-            }
-        }
-
-        let wrapper = ctx.newObject()
-        if wrapper.isException { return .exception }
-
-        // Store the iterables as an array
-        let iterablesArr = ctx.newArray()
-        for (i, arg) in args.enumerated() {
-            ctx.setPropertyUint32(obj: iterablesArr, index: UInt32(i), value: arg.dupValue())
-        }
-        ctx.setPropertyStr(obj: iterablesArr, name: "length",
-                           value: .newInt32(Int32(args.count)))
-
-        ctx.setPropertyStr(obj: wrapper, name: "__iterables", value: iterablesArr)
-        ctx.setPropertyStr(obj: wrapper, name: "__outerIndex", value: .newInt32(0))
-        ctx.setPropertyStr(obj: wrapper, name: "__innerIter", value: .undefined)
-        ctx.setPropertyStr(obj: wrapper, name: "__done", value: .JS_FALSE)
-        ctx.setPropertyStr(obj: wrapper, name: "__count", value: .newInt32(Int32(args.count)))
-
-        let nextFn = ctx.newCFunction({ ctx, this, args in
-            let doneVal = ctx.getPropertyStr(obj: this, name: "__done")
-            if ctx.toBool(doneVal) {
-                return createIterResult(ctx: ctx, val: .undefined, done: true)
-            }
-
-            let iterables = ctx.getPropertyStr(obj: this, name: "__iterables")
-            let countVal = ctx.getPropertyStr(obj: this, name: "__count")
-            let count = countVal.isInt ? Int(countVal.toInt32()) : 0
-
+        case .filter:
             while true {
-                // Try to get from current inner iterator
-                let innerIter = ctx.getPropertyStr(obj: this, name: "__innerIter")
-                if !innerIter.isUndefined && !innerIter.isNull {
-                    if let iterResult = iteratorNext(ctx: ctx, iterator: innerIter) {
-                        if !iterResultDone(ctx: ctx, iterResult: iterResult) {
-                            return iterResult
-                        }
-                    }
-                    // Inner exhausted, move to next
-                    ctx.setPropertyStr(obj: this, name: "__innerIter", value: .undefined)
+                switch stepIterator(ctx, data.iterator, data.nextMethod) {
+                case .error: return .error
+                case .done: return .done
+                case .value(let v):
+                    let sel = ctx.callFunction(data.fn, thisVal: .undefined, args: [v, numberValue(data.counter)])
+                    if sel.isException { v.freeValue(); closeIteratorOnThrow(ctx, data.iterator); return .error }
+                    data.counter += 1
+                    if ctx.toBoolFree(sel) { return .value(v) }
+                    v.freeValue()
                 }
-
-                // Get next iterable
-                let outerIndexVal = ctx.getPropertyStr(obj: this, name: "__outerIndex")
-                let outerIndex = outerIndexVal.isInt ? Int(outerIndexVal.toInt32()) : 0
-
-                if outerIndex >= count {
-                    ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                    return createIterResult(ctx: ctx, val: .undefined, done: true)
-                }
-
-                let nextIterable = ctx.getPropertyUint32(obj: iterables, index: UInt32(outerIndex))
-                ctx.setPropertyStr(obj: this, name: "__outerIndex",
-                                   value: .newInt32(Int32(outerIndex + 1)))
-
-                // Get iterator from the iterable
-                guard let newInner = getIterator(ctx: ctx, obj: nextIterable) else {
-                    ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-                    return .exception
-                }
-
-                ctx.setPropertyStr(obj: this, name: "__innerIter", value: newInner.dupValue())
-                // Loop back to try getting from the new inner iterator
             }
-        }, name: "next", length: 0)
-        ctx.setPropertyStr(obj: wrapper, name: "next", value: nextFn)
 
-        installIteratorReturn(ctx: ctx, wrapper: wrapper)
-        installSymbolIterator(ctx: ctx, wrapper: wrapper)
+        case .take:
+            if data.remaining == 0 {
+                return closeIterator(ctx, data.iterator) ? .done : .error
+            }
+            if data.remaining != .infinity { data.remaining -= 1 }
+            return stepIterator(ctx, data.iterator, data.nextMethod)
 
-        return wrapper
+        case .drop:
+            if atStart {
+                while data.remaining > 0 {
+                    if data.remaining != .infinity { data.remaining -= 1 }
+                    switch stepIterator(ctx, data.iterator, data.nextMethod, readValue: false) {
+                    case .error: return .error
+                    case .done: return .done
+                    case .value: break
+                    }
+                }
+            }
+            return stepIterator(ctx, data.iterator, data.nextMethod)
+
+        case .flatMap:
+            while true {
+                if data.innerAlive {
+                    switch stepIterator(ctx, data.inner, data.innerNext) {
+                    case .error: closeIteratorOnThrow(ctx, data.iterator); return .error
+                    case .done: data.clearInner(); data.counter += 1; continue
+                    case .value(let v): return .value(v)
+                    }
+                }
+                switch stepIterator(ctx, data.iterator, data.nextMethod) {
+                case .error: return .error
+                case .done: return .done
+                case .value(let v):
+                    let mapped = ctx.callFunction(data.fn, thisVal: .undefined, args: [v, numberValue(data.counter)])
+                    v.freeValue()
+                    if mapped.isException { closeIteratorOnThrow(ctx, data.iterator); return .error }
+                    let inner = getIteratorFlattenable(ctx, mapped, allowStrings: false)
+                    mapped.freeValue()
+                    guard let (it, next) = inner else { closeIteratorOnThrow(ctx, data.iterator); return .error }
+                    data.inner = it
+                    data.innerNext = next
+                    data.innerAlive = true
+                }
+            }
+
+        case .concat:
+            while true {
+                if data.innerAlive {
+                    switch stepIterator(ctx, data.inner, data.innerNext) {
+                    case .error: return .error
+                    case .done: data.clearInner(); continue
+                    case .value(let v): return .value(v)
+                    }
+                }
+                if data.itemIndex * 2 >= data.items.count { return .done }
+                let method = data.items[data.itemIndex * 2], iterable = data.items[data.itemIndex * 2 + 1]
+                data.itemIndex += 1
+                let it = ctx.callFunction(method, thisVal: iterable, args: [])
+                if it.isException { return .error }
+                guard it.isObject else {
+                    it.freeValue()
+                    _ = ctx.throwTypeError(message: "Iterator result interface is not an object.")
+                    return .error
+                }
+                let next = ctx.getProperty(obj: it, atom: ctx.iterNextAtom)
+                if next.isException { it.freeValue(); return .error }
+                data.inner = it
+                data.innerNext = next
+                data.innerAlive = true
+            }
+
+        case .wrap:
+            return .done
+        }
+    }
+
+    // MARK: - Iterator.prototype methods (ES2025 §27.1.4)
+
+    /// Steps 1-2 of every Iterator.prototype method: `this` must be an Object.
+    @inline(__always)
+    private static func requireObjectThis(_ ctx: JeffJSContext, _ this: JeffJSValue, _ method: String) -> Bool {
+        if this.isObject { return true }
+        _ = ctx.throwTypeError(message: "Iterator.prototype.\(method) requires that |this| be an Object.")
+        return false
+    }
+
+    /// An argument check that fails after `this` is known to be an iterator:
+    /// the error closes it (IteratorClose(iterated, error)).
+    private static func throwAndClose(_ ctx: JeffJSContext, _ this: JeffJSValue,
+                                      range: Bool = false, _ message: String) -> JeffJSValue {
+        if range { _ = ctx.throwRangeError(message: message) } else { _ = ctx.throwTypeError(message: message) }
+        closeIteratorOnThrow(ctx, this)
+        return .exception
+    }
+
+    /// map / filter / flatMap: validate the callback, GetIteratorDirect, and
+    /// build the helper.
+    private static func makeCallbackHelper(_ ctx: JeffJSContext, _ this: JeffJSValue, _ args: [JeffJSValue],
+                                           kind: JeffJSIteratorHelperData.Kind, method: String) -> JeffJSValue {
+        guard requireObjectThis(ctx, this, method) else { return .exception }
+        let fn = args.isEmpty ? JeffJSValue.undefined : args[0]
+        guard ctx.isCallable(fn) else {
+            return throwAndClose(ctx, this, "Iterator.prototype.\(method) callback must be a function.")
+        }
+        let next = ctx.getProperty(obj: this, atom: ctx.iterNextAtom)
+        if next.isException { return .exception }
+        let data = JeffJSIteratorHelperData(kind: kind)
+        data.iterator = this.dupValue()
+        data.nextMethod = next
+        data.fn = fn.dupValue()
+        return makeHelperObject(ctx, data, classID: JSClassID.JS_CLASS_ITERATOR_HELPER.rawValue)
+    }
+
+    static func iteratorMap(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        makeCallbackHelper(ctx, this, args, kind: .map, method: "map")
+    }
+
+    static func iteratorFilter(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        makeCallbackHelper(ctx, this, args, kind: .filter, method: "filter")
+    }
+
+    static func iteratorFlatMap(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        makeCallbackHelper(ctx, this, args, kind: .flatMap, method: "flatMap")
+    }
+
+    /// take / drop (§27.1.4.12, §27.1.4.3): ToNumber(limit), NaN and negative
+    /// limits are RangeErrors (each closing the iterator), then the helper.
+    private static func makeLimitHelper(_ ctx: JeffJSContext, _ this: JeffJSValue, _ args: [JeffJSValue],
+                                        kind: JeffJSIteratorHelperData.Kind, method: String) -> JeffJSValue {
+        guard requireObjectThis(ctx, this, method) else { return .exception }
+        let (num, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: args.isEmpty ? .undefined : args[0])
+        if !ok { closeIteratorOnThrow(ctx, this); return .exception }
+        if num.isNaN {
+            return throwAndClose(ctx, this, range: true, "Iterator.prototype.\(method) argument must not be NaN.")
+        }
+        let limit = num.isInfinite ? num : num.rounded(.towardZero)
+        if limit < 0 {
+            return throwAndClose(ctx, this, range: true, "Iterator.prototype.\(method) argument must be non-negative.")
+        }
+        let next = ctx.getProperty(obj: this, atom: ctx.iterNextAtom)
+        if next.isException { return .exception }
+        let data = JeffJSIteratorHelperData(kind: kind)
+        data.iterator = this.dupValue()
+        data.nextMethod = next
+        data.remaining = limit
+        return makeHelperObject(ctx, data, classID: JSClassID.JS_CLASS_ITERATOR_HELPER.rawValue)
+    }
+
+    static func iteratorTake(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        makeLimitHelper(ctx, this, args, kind: .take, method: "take")
+    }
+
+    static func iteratorDrop(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        makeLimitHelper(ctx, this, args, kind: .drop, method: "drop")
+    }
+
+    /// The eager methods: `this` checked, `fn` validated (closing on failure),
+    /// then the iterator record (owned `next`).
+    private static func eagerRecord(_ ctx: JeffJSContext, _ this: JeffJSValue, _ args: [JeffJSValue],
+                                    method: String, notCallable: String?) -> JeffJSValue? {
+        guard requireObjectThis(ctx, this, method) else { return nil }
+        if let message = notCallable, !ctx.isCallable(args.isEmpty ? .undefined : args[0]) {
+            _ = throwAndClose(ctx, this, message)
+            return nil
+        }
+        let next = ctx.getProperty(obj: this, atom: ctx.iterNextAtom)
+        if next.isException { return nil }
+        return next
+    }
+
+    /// Iterator.prototype.reduce(reducer [, initialValue]) (§27.1.4.9).
+    static func iteratorReduce(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        guard let next = eagerRecord(ctx, this, args, method: "reduce",
+                                     notCallable: "Iterator.prototype.reduce reducer argument must be a function.") else {
+            return .exception
+        }
+        defer { next.freeValue() }
+        let reducer = args[0]
+        var acc: JeffJSValue
+        var counter: Double
+        if args.count < 2 {
+            switch stepIterator(ctx, this, next) {
+            case .error: return .exception
+            case .done:
+                return ctx.throwTypeError(message: "Iterator.prototype.reduce requires an initial value or an iterator that is not done.")
+            case .value(let v): acc = v
+            }
+            counter = 1
+        } else {
+            acc = args[1].dupValue()
+            counter = 0
+        }
+        while true {
+            switch stepIterator(ctx, this, next) {
+            case .error: acc.freeValue(); return .exception
+            case .done: return acc
+            case .value(let v):
+                let r = ctx.callFunction(reducer, thisVal: .undefined, args: [acc, v, numberValue(counter)])
+                v.freeValue()
+                acc.freeValue()
+                if r.isException { closeIteratorOnThrow(ctx, this); return .exception }
+                acc = r
+                counter += 1
+            }
+        }
+    }
+
+    /// Iterator.prototype.toArray() (§27.1.4.13).
+    static func iteratorToArray(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        guard let next = eagerRecord(ctx, this, args, method: "toArray", notCallable: nil) else {
+            return .exception
+        }
+        defer { next.freeValue() }
+        var items: [JeffJSValue] = []
+        while true {
+            switch stepIterator(ctx, this, next) {
+            case .error: for v in items { v.freeValue() }; return .exception
+            case .done: return ctx.newArrayFrom(items)
+            case .value(let v): items.append(v)
+            }
+        }
+    }
+
+    /// Iterator.prototype.forEach(fn) (§27.1.4.5).
+    static func iteratorForEach(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        guard let next = eagerRecord(ctx, this, args, method: "forEach",
+                                     notCallable: "Iterator.prototype.forEach requires the callback argument to be callable.") else {
+            return .exception
+        }
+        defer { next.freeValue() }
+        let fn = args[0]
+        var counter: Double = 0
+        while true {
+            switch stepIterator(ctx, this, next) {
+            case .error: return .exception
+            case .done: return .undefined
+            case .value(let v):
+                let r = ctx.callFunction(fn, thisVal: .undefined, args: [v, numberValue(counter)])
+                v.freeValue()
+                if r.isException { closeIteratorOnThrow(ctx, this); return .exception }
+                r.freeValue()
+                counter += 1
+            }
+        }
+    }
+
+    /// some / every / find (§27.1.4.11, §27.1.4.4, §27.1.4.6): the first
+    /// deciding result closes the iterator (IteratorClose with a normal
+    /// completion) and is returned.
+    private enum ShortCircuit { case some, every, find }
+
+    private static func shortCircuit(_ ctx: JeffJSContext, _ this: JeffJSValue, _ args: [JeffJSValue],
+                                     _ mode: ShortCircuit, method: String) -> JeffJSValue {
+        guard let next = eagerRecord(ctx, this, args, method: method,
+                                     notCallable: "Iterator.prototype.\(method) callback must be a function.") else {
+            return .exception
+        }
+        defer { next.freeValue() }
+        let predicate = args[0]
+        var counter: Double = 0
+        while true {
+            switch stepIterator(ctx, this, next) {
+            case .error: return .exception
+            case .done:
+                switch mode {
+                case .some: return .JS_FALSE
+                case .every: return .JS_TRUE
+                case .find: return .undefined
+                }
+            case .value(let v):
+                let r = ctx.callFunction(predicate, thisVal: .undefined, args: [v, numberValue(counter)])
+                if r.isException { v.freeValue(); closeIteratorOnThrow(ctx, this); return .exception }
+                let truthy = ctx.toBoolFree(r)
+                let decided = mode == .every ? !truthy : truthy
+                if decided {
+                    guard closeIterator(ctx, this) else { v.freeValue(); return .exception }
+                    switch mode {
+                    case .some: v.freeValue(); return .JS_TRUE
+                    case .every: v.freeValue(); return .JS_FALSE
+                    case .find: return v
+                    }
+                }
+                v.freeValue()
+                counter += 1
+            }
+        }
+    }
+
+    static func iteratorSome(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        shortCircuit(ctx, this, args, .some, method: "some")
+    }
+
+    static func iteratorEvery(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        shortCircuit(ctx, this, args, .every, method: "every")
+    }
+
+    static func iteratorFind(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        shortCircuit(ctx, this, args, .find, method: "find")
+    }
+
+    // MARK: - Iterator.concat(...items) (ES2026 §27.1.3.2.2)
+
+    static func iteratorConcat(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+        var items: [JeffJSValue] = []
+        func fail(_ message: String?) -> JeffJSValue {
+            for v in items { v.freeValue() }
+            if let m = message { _ = ctx.throwTypeError(message: m) }
+            return .exception
+        }
+        for item in args {
+            guard item.isObject else { return fail("Iterator.concat expects all arguments to be objects") }
+            let method = ctx.getProperty(obj: item, atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue)
+            if method.isException { return fail(nil) }
+            if method.isUndefined || method.isNull { return fail("Iterator.concat expects all arguments to be iterable") }
+            guard ctx.isCallable(method) else {
+                let m = "\(ctx.jscValueDescription(method)) is not a function"
+                method.freeValue()
+                return fail(m)
+            }
+            items.append(method)
+            items.append(item.dupValue())
+        }
+        let data = JeffJSIteratorHelperData(kind: .concat)
+        data.items = items
+        return makeHelperObject(ctx, data, classID: JSClassID.JS_CLASS_ITERATOR_HELPER.rawValue)
     }
 
     // MARK: - Generator.prototype.next(value)
@@ -1625,44 +1408,5 @@ struct JeffJSBuiltinIterator {
                 asyncGeneratorDrain(ctx: ctx, genObj: held, genData: genData)
                 held.freeValue()
             })
-    }
-
-    // MARK: - Private Helpers
-
-    /// Install a .return() method that delegates to the underlying iterator's .return().
-    private static func installIteratorReturn(ctx: JeffJSContext, wrapper: JeffJSValue) {
-        let returnFn = ctx.newCFunction({ ctx, this, args in
-            let underlying = ctx.getPropertyStr(obj: this, name: "__underlying")
-            ctx.setPropertyStr(obj: this, name: "__done", value: .JS_TRUE)
-
-            if underlying.isUndefined || underlying.isNull {
-                let val = args.isEmpty ? JeffJSValue.undefined : args[0]
-                return createIterResult(ctx: ctx, val: val, done: true)
-            }
-
-            // Try to call underlying.return()
-            let returnMethod = ctx.getPropertyStr(obj: underlying, name: "return")
-            if returnMethod.isUndefined || returnMethod.isNull {
-                let val = args.isEmpty ? JeffJSValue.undefined : args[0]
-                return createIterResult(ctx: ctx, val: val, done: true)
-            }
-
-            if let retObj = returnMethod.toObject(), let cFunc = retObj.cFunction {
-                return cFunc(ctx, underlying, args)
-            }
-
-            let val = args.isEmpty ? JeffJSValue.undefined : args[0]
-            return createIterResult(ctx: ctx, val: val, done: true)
-        }, name: "return", length: 1)
-        ctx.setPropertyStr(obj: wrapper, name: "return", value: returnFn)
-    }
-
-    /// Install [Symbol.iterator] that returns `this` on a wrapper object.
-    private static func installSymbolIterator(ctx: JeffJSContext, wrapper: JeffJSValue) {
-        let selfIterFn = ctx.newCFunction({ ctx, this, args in
-            return this.dupValue()
-        }, name: "[Symbol.iterator]", length: 0)
-        let symAtom = JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue
-        ctx.setProperty(obj: wrapper, atom: symAtom, value: selfIterFn)
     }
 }

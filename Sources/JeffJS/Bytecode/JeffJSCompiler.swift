@@ -5758,7 +5758,7 @@ extension JeffJSCompiler {
         case .arrow:
             parser.inFlag = seed.has(JeffJSLazySeed.arrowInFlag)
             parser.parseAssignExpr()
-            guard !parser.hasError, dummy.childFunctions.count == 1,
+            guard !parser.failed, dummy.childFunctions.count == 1,
                   dummy.childFunctions[0].isArrow,
                   dummy.childFunctions[0].sourceStart == spanStart,
                   dummy.childFunctions[0].sourceEnd == spanEnd else {
@@ -5794,7 +5794,7 @@ extension JeffJSCompiler {
             }
             dummy.childFunctions.append(child)
             parser.parseLazyFunctionTail(child, funcName: seed.funcName)
-            guard !parser.hasError, ps.lastPtr == spanEnd else {
+            guard !parser.failed, ps.lastPtr == spanEnd else {
                 lazyParseFailed(ctx: ctx, ps: ps, parser: parser, name: nameAtom); return nil
             }
             root = child
@@ -5823,8 +5823,8 @@ extension JeffJSCompiler {
     @inline(never)
     private static func lazyParseFailed(ctx: JeffJSContext, ps: JeffJSParseState, parser: JeffJSParser,
                                         name: JSAtom) {
-        if parser.hasError {
-            _ = ctx.throwSyntaxError(message: ps.lastErrorMessage ?? "lazy compilation: parse error")
+        if parser.failed {
+            _ = ctx.throwParseSyntaxError(ps, fallback: "lazy compilation: parse error")
         } else {
             _ = ctx.throwInternalError(
                 message: "lazy compilation: \(ctx.atomToSwiftString(name)) did not re-parse to its recorded span")

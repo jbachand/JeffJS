@@ -1739,6 +1739,34 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         return throwErrorInternal(errorType: .JS_SYNTAX_ERROR, message: message)
     }
 
+    /// Throws the SyntaxError of a failed parse the way JavaScriptCore reports
+    /// it: `message` is the bare text ("Unexpected token '}'"), the location
+    /// is in `line` / `column` and — for a script (no frame on the stack, a
+    /// real source URL) — in `stack` as `global code@url:line:col`. The
+    /// engine's own diagnostic (`ps.lastErrorMessage`, printed when the error
+    /// was recorded) keeps the "file:line:col:" prefix and the source line.
+    @discardableResult
+    func throwParseSyntaxError(_ ps: JeffJSParseState, fallback: String) -> JeffJSValue {
+        guard let info = ps.lastError else {
+            return throwSyntaxError(message: ps.lastErrorMessage ?? fallback)
+        }
+        let r = throwErrorInternal(errorType: .JS_SYNTAX_ERROR, message: info.text)
+        let err = rt.currentException
+        guard let obj = err.toObject() else { return r }
+        _ = definePropertyValue(obj: err, atom: rt.findAtom("line"), value: .newInt32(Int32(clamping: info.line)),
+                                flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+        _ = definePropertyValue(obj: err, atom: rt.findAtom("column"), value: .newInt32(Int32(clamping: info.column)),
+                                flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+        if let pending = obj.pendingStack, pending.frames.isEmpty,
+           !info.filename.isEmpty, !info.filename.hasPrefix("<") {
+            obj.setPendingStack(nil)
+            _ = definePropertyValue(obj: err, atom: JeffJSAtomID.JS_ATOM_stack.rawValue,
+                                    value: newStringValue("global code@\(info.filename):\(info.line):\(info.column)"),
+                                    flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+        }
+        return r
+    }
+
     /// Throws a URIError with the given message.
     @discardableResult
     func throwURIError(message: String) -> JeffJSValue {
@@ -3107,9 +3135,8 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         let parser = JeffJSParser(s: parseState, fd: fd)
         parser.parseProgram()
 
-        if parser.hasError || fd.byteCode.error {
-            let detail = parseState.lastErrorMessage ?? "Parse error in \(filename)"
-            return throwSyntaxError(message: detail)
+        if parser.failed || fd.byteCode.error {
+            return throwParseSyntaxError(parseState, fallback: "Parse error in \(filename)")
         }
 
         let bcSize = fd.byteCode.len
@@ -3167,7 +3194,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         let parser = JeffJSParser(s: parseState, fd: fd)
         parser.parseProgram()
         let t1 = CFAbsoluteTimeGetCurrent()
-        if parser.hasError || fd.byteCode.error {
+        if parser.failed || fd.byteCode.error {
             return ((t1 - t0) * 1000, 0, nil, parseState.lastErrorMessage ?? "parse error")
         }
         guard let fb = JeffJSCompiler.createFunction(ctx: self, fd: fd) else {

@@ -226,8 +226,12 @@ extension JeffJSParser {
         if tok == JSTokenType.TOK_IDENT.rawValue {
             className = s.token.identAtom
             next()
+        } else if tok >= JSTokenType.TOK_NULL.rawValue && tok <= JSTokenType.TOK_SUPER.rawValue
+                    && tok != JSTokenType.TOK_EXTENDS.rawValue {
+            reservedBindingError("class")
+            return
         } else if !isExpression {
-            syntaxError("expected class name")
+            unexpectedTokenError("expected class name")
             return
         }
 
@@ -575,7 +579,7 @@ extension JeffJSParser {
                 propAtom = getAtom(kwName)
                 next()
             } else {
-                syntaxError("expected property name")
+                unexpectedTokenError("expected property name")
                 return ctorFound
             }
 
@@ -633,7 +637,7 @@ extension JeffJSParser {
             var replacedDefaultCtor = false
             if isConstructor {
                 if ctorFound {
-                    syntaxError("a class may only have one constructor")
+                    syntaxError("Cannot declare multiple constructors in a single class.")
                     return ctorFound
                 }
                 if let defaultCtor = cf.ctorFd,

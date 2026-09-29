@@ -428,14 +428,14 @@ struct JeffJSBuiltinGlobal {
         let inputVal = args.isEmpty ? JeffJSValue.undefined : args[0]
         let inputStr = ctx.toString(inputVal)
         if inputStr.isException { return .exception }
-        guard let str = ctx.toSwiftString(inputStr) else {
-            return .exception
-        }
+        // The string's own code units: a Swift String round trip would turn
+        // a lone surrogate into U+FFFD and encode it instead of throwing
+        // (ES §19.2.6.5 Encode step 3.c.ii → URIError).
+        let utf16 = ctx.toUTF16Array(inputStr)
+        inputStr.freeValue()
 
         var result = ""
-        result.reserveCapacity(str.count)
-
-        let utf16 = Array(str.utf16)
+        result.reserveCapacity(utf16.count)
         var i = 0
 
         while i < utf16.count {
@@ -460,17 +460,17 @@ struct JeffJSBuiltinGlobal {
             if c >= 0xD800 && c <= 0xDBFF {
                 // High surrogate -- must be followed by a low surrogate
                 if i + 1 >= utf16.count {
-                    return ctx.throwURIError(message: "\(funcName): lone high surrogate")
+                    return ctx.throwURIError(message: "String contained an illegal UTF-16 sequence.")
                 }
                 let low = utf16[i + 1]
                 if low < 0xDC00 || low > 0xDFFF {
-                    return ctx.throwURIError(message: "\(funcName): lone high surrogate")
+                    return ctx.throwURIError(message: "String contained an illegal UTF-16 sequence.")
                 }
                 codePoint = 0x10000 + (UInt32(c - 0xD800) << 10) + UInt32(low - 0xDC00)
                 i += 2
             } else if c >= 0xDC00 && c <= 0xDFFF {
                 // Lone low surrogate
-                return ctx.throwURIError(message: "\(funcName): lone low surrogate")
+                return ctx.throwURIError(message: "String contained an illegal UTF-16 sequence.")
             } else {
                 codePoint = UInt32(c)
                 i += 1
@@ -558,113 +558,77 @@ struct JeffJSBuiltinGlobal {
         let inputVal = args.isEmpty ? JeffJSValue.undefined : args[0]
         let inputStr = ctx.toString(inputVal)
         if inputStr.isException { return .exception }
-        guard let str = ctx.toSwiftString(inputStr) else {
-            return .exception
+        // ES §19.2.6.6 Decode works on code units: anything that is not a
+        // `%XX` sequence (a lone surrogate included) is copied unchanged.
+        let units = ctx.toUTF16Array(inputStr)
+        inputStr.freeValue()
+
+        @inline(__always) func hex(_ u: UInt16) -> UInt8? {
+            if u >= 0x30 && u <= 0x39 { return UInt8(u - 0x30) }
+            if u >= 0x41 && u <= 0x46 { return UInt8(u - 0x41 + 10) }
+            if u >= 0x61 && u <= 0x66 { return UInt8(u - 0x61 + 10) }
+            return nil
+        }
+        /// The byte of the `%XX` at `p`, or nil when there is none.
+        func percentByte(at p: Int) -> UInt8? {
+            guard p + 2 < units.count, units[p] == 0x25,
+                  let h1 = hex(units[p + 1]), let h2 = hex(units[p + 2]) else { return nil }
+            return h1 << 4 | h2
         }
 
-        var result = ""
-        result.reserveCapacity(str.count)
-
-        let chars = Array(str)
+        var result = [UInt16]()
+        result.reserveCapacity(units.count)
         var pos = 0
-
-        while pos < chars.count {
-            let c = chars[pos]
-
-            if c != "%" {
+        while pos < units.count {
+            let c = units[pos]
+            if c != 0x25 {                           // not '%'
                 result.append(c)
                 pos += 1
                 continue
             }
-
-            // We have a '%' -- need at least 2 hex digits after it
-            if pos + 2 >= chars.count {
-                return ctx.throwURIError(message: "\(funcName): incomplete percent-encoding")
+            guard let byte = percentByte(at: pos) else {
+                return ctx.throwURIError(message: "URI error")
             }
-
-            guard let h1 = hexCharValue(chars[pos + 1]),
-                  let h2 = hexCharValue(chars[pos + 2]) else {
-                return ctx.throwURIError(message: "\(funcName): invalid hex digits in percent-encoding")
-            }
-
-            let byte = UInt8(h1 << 4 | h2)
-
-            // If the byte is ASCII (<0x80), check if it's in the reserved set
             if byte < 0x80 {
                 if reservedSet.contains(byte) {
-                    // Leave it encoded
-                    result.append(contentsOf: chars[pos...pos+2])
-                    pos += 3
+                    result.append(contentsOf: units[pos ..< pos + 3])   // leave it encoded
                 } else {
-                    result.append(Character(Unicode.Scalar(byte)))
-                    pos += 3
+                    result.append(UInt16(byte))
                 }
+                pos += 3
                 continue
             }
-
             // Multi-byte UTF-8 sequence
             let expectedLen = utf8SequenceLength(byte)
             if expectedLen < 2 || expectedLen > 4 {
-                return ctx.throwURIError(message: "\(funcName): invalid UTF-8 start byte")
+                return ctx.throwURIError(message: "URI error")
             }
-
             var utf8Bytes = [byte]
             pos += 3
-
-            for _ in 1..<expectedLen {
-                if pos >= chars.count || chars[pos] != "%" {
-                    return ctx.throwURIError(message: "\(funcName): incomplete UTF-8 sequence")
-                }
-                if pos + 2 >= chars.count {
-                    return ctx.throwURIError(message: "\(funcName): incomplete percent-encoding in UTF-8 sequence")
-                }
-                guard let ch1 = hexCharValue(chars[pos + 1]),
-                      let ch2 = hexCharValue(chars[pos + 2]) else {
-                    return ctx.throwURIError(message: "\(funcName): invalid hex digits in UTF-8 continuation")
-                }
-                let contByte = UInt8(ch1 << 4 | ch2)
-                // Validate continuation byte: must be 10xxxxxx
-                if contByte & 0xC0 != 0x80 {
-                    return ctx.throwURIError(message: "\(funcName): invalid UTF-8 continuation byte")
+            for _ in 1 ..< expectedLen {
+                guard let contByte = percentByte(at: pos), contByte & 0xC0 == 0x80 else {
+                    return ctx.throwURIError(message: "URI error")
                 }
                 utf8Bytes.append(contByte)
                 pos += 3
             }
-
-            // Decode the UTF-8 sequence to a Unicode code point
             guard let codePoint = decodeUTF8Sequence(utf8Bytes) else {
-                return ctx.throwURIError(message: "\(funcName): invalid UTF-8 sequence")
+                return ctx.throwURIError(message: "URI error")
             }
-
-            // Validate: no surrogates (U+D800..U+DFFF) or overlong encodings
-            if codePoint >= 0xD800 && codePoint <= 0xDFFF {
-                return ctx.throwURIError(message: "\(funcName): UTF-8 encodes surrogate")
+            // No surrogates, nothing past U+10FFFF, no overlong encodings.
+            let minCodePoint: UInt32 = expectedLen == 2 ? 0x80 : expectedLen == 3 ? 0x800 : 0x10000
+            if (codePoint >= 0xD800 && codePoint <= 0xDFFF) || codePoint > 0x10FFFF || codePoint < minCodePoint {
+                return ctx.throwURIError(message: "URI error")
             }
-            if codePoint > 0x10FFFF {
-                return ctx.throwURIError(message: "\(funcName): UTF-8 code point out of range")
-            }
-
-            // Validate no overlong encoding
-            let minCodePoint: UInt32
-            switch expectedLen {
-            case 2: minCodePoint = 0x80
-            case 3: minCodePoint = 0x800
-            case 4: minCodePoint = 0x10000
-            default: minCodePoint = 0
-            }
-            if codePoint < minCodePoint {
-                return ctx.throwURIError(message: "\(funcName): overlong UTF-8 encoding")
-            }
-
-            // Append the decoded character
-            if let scalar = Unicode.Scalar(codePoint) {
-                result.append(Character(scalar))
+            if codePoint >= 0x10000 {
+                let v = codePoint - 0x10000
+                result.append(UInt16(0xD800 | (v >> 10)))
+                result.append(UInt16(0xDC00 | (v & 0x3FF)))
             } else {
-                return ctx.throwURIError(message: "\(funcName): invalid Unicode scalar")
+                result.append(UInt16(codePoint))
             }
         }
-
-        return ctx.newStringValue(result)
+        return JeffJSBuiltinString.makeString(ctx: ctx, utf16: result)
     }
 
     /// Get the hex value of a Character, or nil if not a valid hex digit.

@@ -233,7 +233,12 @@ enum JSClassID: Int {
     case JS_CLASS_WEAKREF = 54
     case JS_CLASS_FINALIZATION_REGISTRY = 55
     case JS_CLASS_CALL_SITE = 56
-    case JS_CLASS_INIT_COUNT = 57
+    /// Iterator Helper objects (ES2025 §27.1.2.1) and Iterator.from wrappers
+    /// (§27.1.3.2.1.1); state in the payload (JeffJSIteratorHelperData).
+    /// (57 is JeffJSClassID.globalObject.)
+    case JS_CLASS_ITERATOR_HELPER = 58
+    case JS_CLASS_ITERATOR_WRAP = 59
+    case JS_CLASS_INIT_COUNT = 60
 }
 
 /// First and last typed array class IDs for range checks.

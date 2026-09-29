@@ -1970,8 +1970,10 @@ enum JeffJSClassID: Int {
     case finalizationRegistry = 55
     case callSite        = 56     // JS_CLASS_CALL_SITE
     case globalObject    = 57
+    case iteratorHelper  = 58     // JS_CLASS_ITERATOR_HELPER
+    case iteratorWrap    = 59     // JS_CLASS_ITERATOR_WRAP
 
-    static let initialCount: UInt16 = 58
+    static let initialCount: UInt16 = 60
 }
 
 // MARK: - Object operations

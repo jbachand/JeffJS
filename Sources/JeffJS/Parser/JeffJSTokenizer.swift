@@ -32,6 +32,12 @@ struct JeffJSToken {
 
     // -- String / template literal data --
     var strValue: String = ""
+    /// The literal's UTF-16 code units when they are not well-formed UTF-16
+    /// (a lone surrogate from `\uD800`, `\u{DC00}`): a Swift `String` cannot
+    /// hold them, so `strValue` is then only a lossy spelling for diagnostics
+    /// and `jsStringValue()` builds the value from these units (ES §12.9.4.1:
+    /// a string literal's SV is a sequence of code units, §6.1.4).
+    var strUnits: [UInt16]? = nil
     var strSeparator: Character = "\0"
 
     // -- Template literal part data --
@@ -62,6 +68,7 @@ struct JeffJSToken {
         // for payload fields the previous token did not set.
         if bigIntValue != nil { bigIntValue = nil }
         if !strValue.isEmpty { strValue = "" }
+        if strUnits != nil { strUnits = nil }
         strSeparator = "\0"
         templateRawStart = 0
         templateRawEnd = 0
@@ -72,6 +79,14 @@ struct JeffJSToken {
         identIsReserved = false
         if !regexpBody.isEmpty { regexpBody = "" }
         if !regexpFlags.isEmpty { regexpFlags = "" }
+    }
+
+    /// The string / template-part value as a JS string, code units intact.
+    func jsStringValue() -> JeffJSString {
+        if let units = strUnits {
+            return JeffJSString(refCount: 1, len: units.count, isWideChar: true, storage: .str16(units))
+        }
+        return JeffJSString(swiftString: strValue)
     }
 }
 
@@ -118,8 +133,13 @@ class JeffJSParseState {
     var lastTokenType: Int = 0
 
     // -- Error state --
-    /// The first syntax error message captured during parsing (nil if no error).
+    /// The first syntax error captured during parsing, as the engine's own
+    /// diagnostic ("file:line:col: text" + the source line and a caret; nil
+    /// if no error).
     var lastErrorMessage: String?
+    /// The same error as a SyntaxError carries it (JSC): `text` is the bare
+    /// message, the location goes to `line` / `column` / the stack.
+    var lastError: JeffJSSyntaxErrorInfo?
 
     /// The atom table identifiers are interned into, when the context is a
     /// real JeffJSContext. Cached once: going through the weak `ctx` per
@@ -479,27 +499,35 @@ extension JeffJSParseState {
     /// Global flag to suppress syntax error console output (e.g., during test262 runs).
     static var suppressErrorPrinting = JeffJSConfig.suppressErrorPrinting
 
-    /// Report a syntax error at the current position.
-    func syntaxError(_ msg: String) {
-        let (line, col) = getLineCol(bufPtr)
-        var full = "\(filename):\(line):\(col): \(msg)"
-        if let (srcSnippet, caretCol) = getSourceSnippet(at: bufPtr) {
-            full += "\n  \(srcSnippet)\n  \(String(repeating: " ", count: max(0, caretCol - 1)))^"
-        }
-        if lastErrorMessage == nil { lastErrorMessage = full }
-        if !JeffJSParseState.suppressErrorPrinting { print("SyntaxError: \(full)") }
+    /// Report a syntax error at the current position. `msg` is the message
+    /// the SyntaxError gets (JavaScriptCore's wording, no location);
+    /// `detail`, when given, is appended to the engine's diagnostic only.
+    func syntaxError(_ msg: String, detail: String? = nil) {
+        syntaxErrorAt(bufPtr, msg, detail: detail)
     }
 
     /// Report a syntax error at a specific offset.
-    func syntaxErrorAt(_ offset: Int, _ msg: String) {
+    func syntaxErrorAt(_ offset: Int, _ msg: String, detail: String? = nil) {
         let (line, col) = getLineCol(offset)
         var full = "\(filename):\(line):\(col): \(msg)"
+        if let d = detail { full += " [\(d)]" }
         if let (srcSnippet, caretCol) = getSourceSnippet(at: offset) {
             full += "\n  \(srcSnippet)\n  \(String(repeating: " ", count: max(0, caretCol - 1)))^"
         }
-        if lastErrorMessage == nil { lastErrorMessage = full }
+        if lastErrorMessage == nil {
+            lastErrorMessage = full
+            lastError = JeffJSSyntaxErrorInfo(text: msg, filename: filename, line: line, column: col)
+        }
         if !JeffJSParseState.suppressErrorPrinting { print("SyntaxError: \(full)") }
     }
+}
+
+/// A parse error as the SyntaxError object reports it.
+struct JeffJSSyntaxErrorInfo {
+    let text: String
+    let filename: String
+    let line: Int
+    let column: Int
 }
 
 // MARK: - Line / Column Tracking
@@ -694,7 +722,7 @@ extension JeffJSParseState {
                 bufPtr += 1
             }
         }
-        syntaxError("unterminated block comment")
+        syntaxError("Multiline comment was not closed properly")
         return false
     }
 
@@ -1126,7 +1154,7 @@ extension JeffJSParseState {
 
             if c == sep {
                 bufPtr += 1 // consume closing quote
-                token.strValue = String(bytes: result, encoding: .utf8) ?? ""
+                setCookedString(result)
                 token.type = JSTokenType.TOK_STRING.rawValue
                 return true
             }
@@ -1134,7 +1162,7 @@ extension JeffJSParseState {
             if c == 0x5C { // backslash
                 bufPtr += 1
                 guard bufPtr < bufLen else {
-                    syntaxError("unexpected end of string")
+                    syntaxError("Unexpected EOF", detail: "unexpected end of string")
                     return false
                 }
                 let esc = buf[bufPtr]
@@ -1229,7 +1257,7 @@ extension JeffJSParseState {
                 }
 
             } else if c == 0x0A || c == 0x0D {
-                syntaxError("unterminated string literal")
+                syntaxError("Unexpected EOF", detail: "unterminated string literal")
                 return false
             } else if c >= 0x80 {
                 let (cp, len) = decodeUTF8()
@@ -1249,8 +1277,46 @@ extension JeffJSParseState {
             }
         }
 
-        syntaxError("unterminated string literal")
+        syntaxError("Unexpected EOF", detail: "unterminated string literal")
         return false
+    }
+
+    /// Store a cooked string / template value built as generalized UTF-8
+    /// (WTF-8: escapes may add surrogate code points, which UTF-8 cannot
+    /// carry). Well-formed text becomes `strValue`; otherwise the code units
+    /// go to `strUnits` (and a lossy `strValue` for diagnostics), so
+    /// `"a\uD800b"` is three code units, not "" (ES §12.9.4.1, §6.1.4).
+    func setCookedString(_ bytes: [UInt8]) {
+        if let str = String(bytes: bytes, encoding: .utf8) {
+            token.strValue = str
+            token.strUnits = nil
+            return
+        }
+        var units = [UInt16]()
+        units.reserveCapacity(bytes.count)
+        var i = 0
+        let n = bytes.count
+        while i < n {
+            let b0 = UInt32(bytes[i])
+            var cp: UInt32
+            var len: Int
+            if b0 < 0x80 { cp = b0; len = 1 }
+            else if b0 < 0xE0 { cp = b0 & 0x1F; len = 2 }
+            else if b0 < 0xF0 { cp = b0 & 0x0F; len = 3 }
+            else { cp = b0 & 0x07; len = 4 }
+            if i + len > n { len = 1; cp = 0xFFFD }
+            else { for k in 1 ..< len { cp = (cp << 6) | (UInt32(bytes[i + k]) & 0x3F) } }
+            if cp >= 0x10000 {
+                let v = cp - 0x10000
+                units.append(UInt16(0xD800 | (v >> 10)))
+                units.append(UInt16(0xDC00 | (v & 0x3FF)))
+            } else {
+                units.append(UInt16(cp))
+            }
+            i += len
+        }
+        token.strUnits = units
+        token.strValue = String(decoding: units, as: UTF16.self)
     }
 
     /// Parse a legacy octal escape sequence (\0nn, \1nn, etc.).
@@ -1297,7 +1363,7 @@ extension JeffJSParseState {
             if c == 0x60 { // backtick — end of template
                 token.templateRawEnd = bufPtr
                 bufPtr += 1
-                token.strValue = String(bytes: result, encoding: .utf8) ?? ""
+                setCookedString(result)
                 return true
             }
 
@@ -1305,7 +1371,7 @@ extension JeffJSParseState {
                 token.templateRawEnd = bufPtr
                 bufPtr += 2
                 templateNestLevel += 1
-                token.strValue = String(bytes: result, encoding: .utf8) ?? ""
+                setCookedString(result)
                 return true
             }
 
@@ -1313,7 +1379,7 @@ extension JeffJSParseState {
                 let escPos = bufPtr
                 bufPtr += 1
                 guard bufPtr < bufLen else {
-                    syntaxError("unexpected end of template literal")
+                    syntaxError("Unexpected EOF", detail: "unexpected end of template literal")
                     return false
                 }
                 let esc = buf[bufPtr]
@@ -1405,7 +1471,7 @@ extension JeffJSParseState {
             }
         }
 
-        syntaxError("unterminated template literal")
+        syntaxError("Unexpected EOF", detail: "unterminated template literal")
         return false
     }
 
@@ -1447,19 +1513,20 @@ extension JeffJSParseState {
     func parseRegexp() -> Bool {
         var body = [UInt8]()
         var inClass = false
+        var closed = false
 
         while bufPtr < bufLen {
             let c = buf[bufPtr]
 
             if c == 0x0A || c == 0x0D {
-                syntaxError("unterminated regular expression")
+                syntaxError("Unterminated regular expression literal '/\(String(decoding: body, as: UTF8.self))'")
                 return false
             }
 
             if c >= 0x80 {
                 let (cp, len) = decodeUTF8()
                 if cp == 0x2028 || cp == 0x2029 {
-                    syntaxError("unterminated regular expression")
+                    syntaxError("Unterminated regular expression literal '/\(String(decoding: body, as: UTF8.self))'")
                     return false
                 }
                 for i in 0..<len {
@@ -1473,12 +1540,12 @@ extension JeffJSParseState {
                 body.append(c)
                 bufPtr += 1
                 guard bufPtr < bufLen else {
-                    syntaxError("unterminated regular expression")
+                    syntaxError("Unterminated regular expression literal '/\(String(decoding: body, as: UTF8.self))'")
                     return false
                 }
                 let escaped = buf[bufPtr]
                 if escaped == 0x0A || escaped == 0x0D {
-                    syntaxError("unterminated regular expression")
+                    syntaxError("Unterminated regular expression literal '/\(String(decoding: body, as: UTF8.self))'")
                     return false
                 }
                 if escaped >= 0x80 {
@@ -1496,6 +1563,7 @@ extension JeffJSParseState {
 
             if c == 0x2F && !inClass { // '/' ends the regex (unless in char class)
                 bufPtr += 1
+                closed = true
                 break
             }
 
@@ -1507,6 +1575,11 @@ extension JeffJSParseState {
 
             body.append(c)
             bufPtr += 1
+        }
+
+        if !closed {   // end of input before the closing '/'
+            syntaxError("Unterminated regular expression literal '/\(String(decoding: body, as: UTF8.self))'")
+            return false
         }
 
         // Parse flags
@@ -1623,7 +1696,7 @@ extension JeffJSParseState {
                 bufPtr += 1
             }
             if bufPtr >= bufLen || !(buf[bufPtr] >= 0x30 && buf[bufPtr] <= 0x39) {
-                syntaxError("missing exponent")
+                syntaxError("Non-number found after exponent indicator")
                 return false
             }
             guard skipDecimalDigits() else { return false }
@@ -1648,7 +1721,7 @@ extension JeffJSParseState {
             if bufPtr < bufLen {
                 let (nextCP, _) = decodeUTF8()
                 if jeffJS_isIdentFirst(nextCP) {
-                    syntaxError("identifier starts immediately after numeric literal")
+                    syntaxError("No identifiers allowed directly after numeric literal")
                     return false
                 }
             }
@@ -1662,7 +1735,7 @@ extension JeffJSParseState {
         if bufPtr < bufLen {
             let (nextCP, _) = decodeUTF8()
             if jeffJS_isIdentFirst(nextCP) {
-                syntaxError("identifier starts immediately after numeric literal")
+                syntaxError("No identifiers allowed directly after numeric literal")
                 return false
             }
         }
@@ -1695,7 +1768,7 @@ extension JeffJSParseState {
         skipHexDigits()
 
         if bufPtr == digitStart {
-            syntaxError("expected hex digit after 0x")
+            syntaxError("No hexadecimal digits after '0x'")
             return false
         }
 
@@ -1711,7 +1784,7 @@ extension JeffJSParseState {
         if bufPtr < bufLen {
             let (nextCP, _) = decodeUTF8()
             if jeffJS_isIdentFirst(nextCP) {
-                syntaxError("identifier starts immediately after numeric literal")
+                syntaxError("No identifiers allowed directly after numeric literal")
                 return false
             }
         }
@@ -1754,7 +1827,7 @@ extension JeffJSParseState {
         }
 
         if bufPtr == digitStart {
-            syntaxError("expected octal digit after 0o")
+            syntaxError("No octal digits after '0o'")
             return false
         }
 
@@ -1766,7 +1839,7 @@ extension JeffJSParseState {
         if bufPtr < bufLen {
             let (nextCP, _) = decodeUTF8()
             if jeffJS_isIdentFirst(nextCP) {
-                syntaxError("identifier starts immediately after numeric literal")
+                syntaxError("No identifiers allowed directly after numeric literal")
                 return false
             }
         }
@@ -1808,7 +1881,7 @@ extension JeffJSParseState {
         }
 
         if bufPtr == digitStart {
-            syntaxError("expected binary digit after 0b")
+            syntaxError("No binary digits after '0b'")
             return false
         }
 
@@ -1820,7 +1893,7 @@ extension JeffJSParseState {
         if bufPtr < bufLen {
             let (nextCP, _) = decodeUTF8()
             if jeffJS_isIdentFirst(nextCP) {
-                syntaxError("identifier starts immediately after numeric literal")
+                syntaxError("No identifiers allowed directly after numeric literal")
                 return false
             }
         }
@@ -2379,11 +2452,11 @@ extension JeffJSParseState {
                     return true
                 }
                 // Unicode whitespace was already handled — this is an error
-                syntaxError("unexpected character U+\(String(format: "%04X", cp))")
+                syntaxError("Invalid character '\\u\(String(format: "%04x", cp))'")
                 return false
             }
 
-            syntaxError("unexpected character '\(Character(Unicode.Scalar(c)))'")
+            syntaxError("Invalid character: '\(Character(Unicode.Scalar(c)))'")
             return false
         }
     }
@@ -2835,7 +2908,7 @@ extension JeffJSParseState {
             if c == sep {
                 bufPtr += 1
                 token.type = JSTokenType.TOK_STRING.rawValue
-                token.strValue = String(bytes: result, encoding: .utf8) ?? ""
+                setCookedString(result)
                 return true
             }
 
