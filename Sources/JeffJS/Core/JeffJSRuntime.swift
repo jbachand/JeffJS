@@ -1682,6 +1682,8 @@ final class JeffJSRuntime {
         registerBuiltinClass(.JS_CLASS_WEAKREF, name: JeffJSAtomID.JS_ATOM_WeakRef.rawValue)
         registerBuiltinClass(.JS_CLASS_FINALIZATION_REGISTRY, name: JeffJSAtomID.JS_ATOM_FinalizationRegistry.rawValue)
         registerBuiltinClass(.JS_CLASS_CALL_SITE, name: JeffJSAtomID.JS_ATOM_Object.rawValue)
+        registerBuiltinClass(.JS_CLASS_ITERATOR_HELPER, name: JeffJSAtomID.JS_ATOM_Iterator.rawValue)
+        registerBuiltinClass(.JS_CLASS_ITERATOR_WRAP, name: JeffJSAtomID.JS_ATOM_Iterator.rawValue)
     }
 
     /// Registers a single built-in class with its name atom.

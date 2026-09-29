@@ -334,6 +334,7 @@ struct JeffJSTestRunner {
             ("Redeclaration", { $0.testRedeclaration() }),
             ("DOMParserInsertion", { $0.testDOMParserInsertion() }),
             ("LoneSurrogate", { $0.testLoneSurrogate() }),
+            ("IteratorHelpers", { $0.testIteratorHelpers() }),
         ]
     }
 
