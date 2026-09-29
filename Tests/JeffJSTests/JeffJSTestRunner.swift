@@ -330,6 +330,7 @@ struct JeffJSTestRunner {
             ("AggregateError", { $0.testAggregateError() }),
             ("NamedEvaluation", { $0.testNamedEvaluation() }),
             ("ClassConstructorCall", { $0.testClassConstructorCall() }),
+            ("ProgramCompletion", { $0.testProgramCompletion() }),
         ]
     }
 

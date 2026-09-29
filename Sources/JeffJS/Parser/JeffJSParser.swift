@@ -1818,6 +1818,18 @@ final class JeffJSParser {
         // changes tokenization — reserved words, legacy octal literals, `with`.
         scanProgramDirectivePrologue()
         fd.isProgramCode = true
+        // The completion value (ES §16.1.6 ScriptEvaluation, §19.2.1.1
+        // PerformEval) lives in a hidden local, as in QuickJS: expression
+        // statements store into it and loops / if / switch / try / with reset
+        // it to undefined (UpdateEmpty(…, undefined)). It used to sit at the
+        // bottom of the operand stack, reached by rewriting "tail" drops into
+        // `nip` — which, inside a for-of / for-in body or a catch without a
+        // binding, overwrote the iterator record instead: `for (var c of l)
+        // f(c)` as the last statement of a script or eval called its value as
+        // `next` on the second iteration ("undefined is not a function"),
+        // `for (x of a) { try { throw 0 } catch {} }` did the same with the
+        // exception, and other shapes underflowed the stack ("op=nip").
+        fd.evalRetIdx = defineVar(0)
         next() // prime the first token
 
         // Parse source elements (statements and declarations)
@@ -1842,7 +1854,7 @@ final class JeffJSParser {
 
         // Hoist top-level `var` declarations: insert `define_var` instructions
         // at position 0 so variables exist (as undefined) from the start.
-        // This must happen before patchCompletionDrops because the bytecode
+        // This must happen before the final return is emitted because the bytecode
         // positions shift when we insert bytes at the front.
         if !fd.hoistedGlobalVarAtoms.isEmpty && programVarMode == .callerVarEnv,
            let site = fd.evalSite {
@@ -1892,174 +1904,20 @@ final class JeffJSParser {
             }
         }
 
-        // For eval: find the last `drop` opcode in tail position and replace
-        // it with `return_` so the expression value is returned. This handles
-        // not just simple expression statements but also drops inside if/else
-        // and try/catch branches.
-        //
-        // We scan backwards through the bytecode. Opcodes we can skip over
-        // (they don't affect the value on TOS): label_, goto_, nip_catch,
-        // leave_scope, gosub, ret (finally return), return_undef, nop.
-        // When we find a `drop`, replace it with `nop` and emit `return_`
-        // at the end. We replace ALL drops in tail position to handle both
-        // branches of if/else.
-        if patchCompletionDrops() {
-            // The patched drops became `nip`, which replaces the completion
-            // value sitting at the bottom of the operand stack. That slot is
-            // seeded with `undefined` here so a branch that never runs (or a
-            // loop body that runs zero times) still leaves exactly one value
-            // for `return_`: `if (false) { o.x = 1; }` used to reach the
-            // return with an empty stack.
-            let undefByte = UInt8(truncatingIfNeeded: JeffJSOpcode.undefined.rawValue)
-            fd.byteCode.buf.insert(undefByte, at: 0)
-            fd.byteCode.len += 1
-            fd.bodyBytecodeStart += 1
-            fd.hoistedFuncDeclRanges = fd.hoistedFuncDeclRanges.map { ($0.0 + 1, $0.1 + 1) }
-            emitOp(.return_)
-            return
-        }
-
-        // No expression statement at end — return undefined
-        emitOp(.return_undef)
+        // Return the completion value.
+        emitOp(.get_loc)
+        emitU16(UInt16(fd.evalRetIdx))
+        emitOp(.return_)
     }
 
-    /// Scan backwards through bytecode and replace `drop` opcodes in tail
-    /// position with `nop`. Returns true if at least one drop was replaced.
-    ///
-    /// Uses a work-list approach: starting from the last instruction, propagate
-    /// "tail" status to predecessors and jump targets until no more changes.
-    private func patchCompletionDrops() -> Bool {
-        let buf = fd.byteCode.buf
-        let bcLen = fd.byteCode.len
-        guard bcLen > 0 else { return false }
-
-        // Build an array of instruction positions and their opcodes.
-        var instructions: [(pos: Int, op: JeffJSOpcode, size: Int)] = []
-        var pos = 0
-        while pos < bcLen {
-            guard let op = peekOpcodeAt(pos) else { break }
-            let info = jeffJSGetOpcodeInfo(op)
-            let instrSize: Int
-            if buf[pos] == 0 && pos + 1 < bcLen {
-                instrSize = Int(info.size) + 1  // wide opcode
-            } else {
-                instrSize = Int(info.size)
-            }
-            if instrSize <= 0 { break }
-            instructions.append((pos: pos, op: op, size: instrSize))
-            pos += instrSize
-        }
-
-        guard !instructions.isEmpty else { return false }
-
-        // Build a reverse map: label index -> instruction index of the label_ opcode
-        var labelToInstrIdx: [Int: Int] = [:]
-        // Build: label index -> [instruction indices that jump TO this label]
-        var labelJumpSources: [Int: [Int]] = [:]
-
-        for (i, instr) in instructions.enumerated() {
-            if instr.op == .label_ {
-                let opcodeSize = buf[instr.pos] == 0 ? 2 : 1
-                let labelIdx = Int(readU32FromBuf(buf, instr.pos + opcodeSize))
-                labelToInstrIdx[labelIdx] = i
-            } else if instr.op == .goto_ || instr.op == .if_false || instr.op == .if_true
-                        || instr.op == .gosub {
-                let opcodeSize = buf[instr.pos] == 0 ? 2 : 1
-                let labelIdx = Int(readU32FromBuf(buf, instr.pos + opcodeSize))
-                labelJumpSources[labelIdx, default: []].append(i)
-            }
-        }
-
-        let dropOp = JeffJSOpcode.drop
-        let nipByte = UInt8(truncatingIfNeeded: JeffJSOpcode.nip.rawValue)
-        var found = false
-
-        // Work-list of instruction indices to process as "tail".
-        var tailIndices = Set<Int>()
-        var worklist = [instructions.count - 1]
-        tailIndices.insert(instructions.count - 1)
-
-        while !worklist.isEmpty {
-            let i = worklist.removeLast()
-            let (ipos, iop, _) = instructions[i]
-
-            if iop == dropOp {
-                // Replace this drop with `nip`: it overwrites the completion
-                // value below it instead of discarding the statement value,
-                // so the stack depth is the same on every path (and a tail
-                // drop inside a loop no longer grows the stack per iteration).
-                fd.byteCode.buf[ipos] = nipByte
-                found = true
-                // Predecessor is also in tail position
-                if i > 0 && !tailIndices.contains(i - 1) {
-                    tailIndices.insert(i - 1)
-                    worklist.append(i - 1)
-                }
-            } else if isTailTransparentOp(iop) {
-                // Predecessor is in tail position
-                if i > 0 && !tailIndices.contains(i - 1) {
-                    tailIndices.insert(i - 1)
-                    worklist.append(i - 1)
-                }
-
-                // For jump instructions, follow FORWARD jump targets
-                if iop == .goto_ || iop == .if_false || iop == .if_true {
-                    let opcodeSize = buf[ipos] == 0 ? 2 : 1
-                    let labelIdx = Int(readU32FromBuf(buf, ipos + opcodeSize))
-                    if let targetLabelInstrIdx = labelToInstrIdx[labelIdx] {
-                        let afterLabelIdx = targetLabelInstrIdx + 1
-                        if afterLabelIdx < instructions.count &&
-                           afterLabelIdx > i &&  // forward jump only
-                           !tailIndices.contains(afterLabelIdx) {
-                            tailIndices.insert(afterLabelIdx)
-                            worklist.append(afterLabelIdx)
-                        }
-                    }
-                }
-
-                // For label_ opcodes: if this label is a jump target and
-                // this label instruction is in tail position, then all
-                // instructions that jump HERE are also in tail position
-                // (because landing at this label means we're in tail context).
-                if iop == .label_ {
-                    let opcodeSize = buf[ipos] == 0 ? 2 : 1
-                    let labelIdx = Int(readU32FromBuf(buf, ipos + opcodeSize))
-                    if let sources = labelJumpSources[labelIdx] {
-                        for srcIdx in sources {
-                            if !tailIndices.contains(srcIdx) {
-                                tailIndices.insert(srcIdx)
-                                worklist.append(srcIdx)
-                            }
-                        }
-                    }
-                }
-            }
-            // Any other opcode: not transparent, stop propagating from here
-        }
-
-        return found
-    }
-
-    /// Returns true if an opcode is "transparent" for tail-position completion
-    /// value analysis -- i.e., it doesn't produce or consume the completion value.
-    ///
-    /// `.ret` is deliberately NOT transparent: walking backward through `ret`
-    /// enters a finally body, and a finally body's statement values are never
-    /// the script completion (the completion sits BELOW the gosub return
-    /// address). Patching a drop inside a finally leaves a stray value that
-    /// `ret` then pops as its return address — pc jumps to a bogus offset and
-    /// the gosub/ret cycle never terminates. The legitimate completion drop
-    /// before `gosub` is still reached via the end-label's jump-source walk.
-    private func isTailTransparentOp(_ op: JeffJSOpcode) -> Bool {
-        switch op {
-        case .label_, .goto_, .if_false, .if_true,
-             .nip_catch, .leave_scope, .enter_scope,
-             .gosub, .return_undef, .return_async, .nop,
-             .close_loc, .line_num:
-            return true
-        default:
-            return false
-        }
+    /// UpdateEmpty(…, undefined) for the statements that have it (if, loops,
+    /// switch, try, catch, with): in program code, reset the hidden
+    /// completion value (QuickJS set_eval_ret_undefined).
+    func emitSetEvalRetUndefined() {
+        guard fd.evalRetIdx >= 0 else { return }
+        emitOp(.undefined)
+        emitOp(.put_loc)
+        emitU16(UInt16(fd.evalRetIdx))
     }
 
     /// Parse a single source element (statement or declaration).
@@ -2204,6 +2062,7 @@ final class JeffJSParser {
     /// Parse: if '(' Expression ')' Statement [else Statement]
     func parseIfStatement() {
         expect(JSTokenType.TOK_IF.rawValue)
+        emitSetEvalRetUndefined()
         expect(0x28) // '('
         parseExpression()
         expect(0x29) // ')'
@@ -2230,6 +2089,7 @@ final class JeffJSParser {
     /// Parse: while '(' Expression ')' Statement
     func parseWhileStatement() {
         expect(JSTokenType.TOK_WHILE.rawValue)
+        emitSetEvalRetUndefined()
         expect(0x28) // '('
 
         let loopLabel = newLabel()
@@ -2265,6 +2125,7 @@ final class JeffJSParser {
     /// Parse: do Statement while '(' Expression ')' ';'
     func parseDoWhileStatement() {
         expect(JSTokenType.TOK_DO.rawValue)
+        emitSetEvalRetUndefined()
 
         let loopLabel = newLabel()
         let breakLabel = newLabel()
@@ -2295,6 +2156,7 @@ final class JeffJSParser {
     /// Handles: for, for-in, for-of
     func parseForStatement() {
         expect(JSTokenType.TOK_FOR.rawValue)
+        emitSetEvalRetUndefined()
 
         // Check for 'for await' (`await` is a keyword token, TOK_AWAIT)
         let isAwait = tok == JSTokenType.TOK_AWAIT.rawValue || isIdent("await")
@@ -2827,6 +2689,7 @@ final class JeffJSParser {
     func parseSwitchStatement() {
         fd.hasSwitch = true   // enables the compiler's switch fix-up pass for this function
         expect(JSTokenType.TOK_SWITCH.rawValue)
+        emitSetEvalRetUndefined()
         expect(0x28) // '('
         parseExpression()
         expect(0x29) // ')'
@@ -2969,6 +2832,7 @@ final class JeffJSParser {
     /// Parse: try Block [catch Block] [finally Block]
     func parseTryStatement() {
         expect(JSTokenType.TOK_TRY.rawValue)
+        emitSetEvalRetUndefined()
 
         let catchLabel = newLabel()
         let finallyLabel = newLabel()
@@ -3051,6 +2915,10 @@ final class JeffJSParser {
                 emitOp(.drop)
             }
 
+            // The catch clause's completion is its block's (UpdateEmpty(C,
+            // undefined), ES §14.15.3), not what the try block stored.
+            emitSetEvalRetUndefined()
+
             // Push finally scope for catch body (no nip_catch needed —
             // catch handler already consumed by the catch dispatch)
             finallyScopes.append(FinallyScope(label: finallyLabel, needsNipCatch: false))
@@ -3066,7 +2934,21 @@ final class JeffJSParser {
         if tok == JSTokenType.TOK_FINALLY.rawValue {
             next() // consume 'finally'
             emitLabel(finallyLabel)
+            // A finally block that completes normally does not change the
+            // completion value (ES §14.15.3: the try / catch one stands):
+            // save it around the block (QuickJS does the same).
+            var savedRetIdx = -1
+            if fd.evalRetIdx >= 0 {
+                savedRetIdx = defineVar(0)
+                emitOp(.get_loc); emitU16(UInt16(fd.evalRetIdx))
+                emitOp(.put_loc); emitU16(UInt16(savedRetIdx))
+                emitSetEvalRetUndefined()
+            }
             parseBlockStatement()
+            if savedRetIdx >= 0 {
+                emitOp(.get_loc); emitU16(UInt16(savedRetIdx))
+                emitOp(.put_loc); emitU16(UInt16(fd.evalRetIdx))
+            }
             emitOp(.ret) // return from gosub
         } else {
             // No finally clause — emit a no-op finally so gosub has a target
@@ -3265,6 +3147,7 @@ final class JeffJSParser {
             return
         }
 
+        emitSetEvalRetUndefined()
         expect(0x28) // '('
         parseExpression()
         expect(0x29) // ')'
@@ -3327,7 +3210,13 @@ final class JeffJSParser {
     /// Parse: Expression ';'
     func parseExpressionStatement() {
         parseExpression()
-        emitOp(.drop)
+        if fd.evalRetIdx >= 0 {
+            // Program code: the statement's value is the completion value.
+            emitOp(.put_loc)
+            emitU16(UInt16(fd.evalRetIdx))
+        } else {
+            emitOp(.drop)
+        }
         expectSemicolon()
     }
 
@@ -7616,10 +7505,9 @@ final class JeffJSParser {
         defer { leaveRecursion() }
         if leaveSource {
             // The source is stashed in a temporary and pushed again after the
-            // pattern, rather than kept underneath it: that keeps the
-            // pattern's last store from sitting directly in front of the
-            // consumer's store, which the chained-assignment lookahead in the
-            // interpreter (isStoreOpcode) would read as `a = b = v`.
+            // pattern, rather than kept underneath it (this also kept the
+            // pattern's last store away from the consumer's store while the
+            // interpreter read adjacent stores as `a = b = v`; it no longer does).
             let tmp = defineVar(0)
             emitOp(.dup)
             emitOp(.put_loc)

@@ -2951,13 +2951,6 @@ private func readI32(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> Int32 {
     return Int32(bitPattern: readU32(bc, pos))
 }
 
-/// Check if the opcode byte at `pos` in the bytecode is a "store variable"
-/// opcode that pops a value from the stack.  Used to detect chained
-/// assignment patterns (e.g., `a = b = c = 5`) where intermediate stores
-/// must keep the value on the stack for the next store.
-/// 256-bit store-opcode membership mask, indexed by raw opcode byte.
-/// `isStoreOpcode` runs on EVERY put_loc/put_var execution (chained-assignment
-/// lookahead), so it must be a couple of bit ops — not an enum init + switch.
 /// True for a plain bytecode function: its frame borrows the caller's
 /// argument references only for the duration of the call, so the caller
 /// may release them afterwards. Generators and async functions keep their
@@ -3026,47 +3019,15 @@ func jeffJS_releaseOwnedArgSlots(_ frame: JeffJSStackFrame, bufOwned: Bool) {
     while i < varBase { buf[i].freeValue(); buf[i] = .undefined; i += 1 }
 }
 
-/// Filled once at runtime bootstrap (jeffJS_computeStoreOpcodeMask): a
-/// stored global is a plain load, a lazily-initialised `let` costs a
-/// swift_once-guarded addressor call on every isStoreOpcode.
-nonisolated(unsafe) var jeffJS_storeOpcodeMask: (UInt64, UInt64, UInt64, UInt64) = (0, 0, 0, 0)
-
-func jeffJS_computeStoreOpcodeMask() {
-    var m: (UInt64, UInt64, UInt64, UInt64) = (0, 0, 0, 0)
-    let ops: [JeffJSOpcode] = [
-        .put_loc, .put_loc0, .put_loc1, .put_loc2, .put_loc3, .put_loc8,
-        .put_var,
-        .put_arg, .put_arg0, .put_arg1, .put_arg2, .put_arg3,
-        .put_var_ref,
-        .put_field, .put_array_el,
-    ]
-    for op in ops {
-        let v = Int(op.rawValue)
-        guard v < 256 else { continue }
-        let bit = UInt64(1) << UInt64(v & 63)
-        switch v >> 6 {
-        case 0: m.0 |= bit
-        case 1: m.1 |= bit
-        case 2: m.2 |= bit
-        default: m.3 |= bit
-        }
-    }
-    jeffJS_storeOpcodeMask = m
-}
-
-@inline(__always)
-private func isStoreOpcode(_ bc: UnsafePointer<UInt8>, _ pos: Int, _ bcLen: Int) -> Bool {
-    guard pos < bcLen else { return false }
-    let b = bc[pos]
-    let m = jeffJS_storeOpcodeMask
-    let bit = UInt64(b & 63)
-    switch b >> 6 {
-    case 0: return (m.0 >> bit) & 1 != 0
-    case 1: return (m.1 >> bit) & 1 != 0
-    case 2: return (m.2 >> bit) & 1 != 0
-    default: return (m.3 >> bit) & 1 != 0
-    }
-}
+/// Stores (put_loc / put_var / put_arg / put_var_ref / put_field …) always
+/// consume their operand, as in QuickJS; the compiler emits `dup` when the
+/// value is used (`a = b = v` is `dup; put b; dup; put a`). A lookahead used
+/// to keep the value whenever the *next* opcode was also a store, reading
+/// any two adjacent stores as a chained assignment: a store followed by an
+/// unrelated one (a program's completion-value store after `n += x`, the last
+/// store of a destructuring pattern before its consumer's) left a stray value
+/// on the stack, which inside a for-of / for-in loop shifted the iterator
+/// record under it.
 
 // =============================================================================
 // MARK: - Fast Trace Mini-Interpreter
@@ -3846,7 +3807,7 @@ private func executeFastTrace(
             let idx = Int(readU16(bc, pc + 1))
             guard idx < varRefsRawCount, let u = varRefsRaw![idx] else { resume = pc; break traceLoop }
             let v: JeffJSValue
-            if isStoreOpcode(bc, pc + 3, bcLen) { v = buf[sp - 1].dupValue() } else { sp -= 1; v = buf[sp] }
+            sp -= 1; v = buf[sp]
             u._withUnsafeGuaranteedRef { vr in vr.store(v) }
             pc += 3
 
@@ -3854,10 +3815,7 @@ private func executeFastTrace(
             let idx = Int(readU16(bc, pc + 1))
             guard idx < varRefsRawCount, let u = varRefsRaw![idx] else { resume = pc; break traceLoop }
             if u._withUnsafeGuaranteedRef({ $0.isDetached ? $0.value : $0.pvalue }).isUninitialized { resume = pc; break traceLoop }
-            // Always consumes its operand, like the main loop's: the compiler
-            // emits `dup` before it when the value is used (`y = (v = x)` is
-            // `dup; put_var_ref_check; put_loc`), so the chained-store peek
-            // (`isStoreOpcode`) kept an extra reference on every such store.
+            // Always consumes its operand, like every store.
             sp -= 1; let v = buf[sp]
             u._withUnsafeGuaranteedRef { vr in vr.store(v) }
             pc += 3
@@ -4071,9 +4029,7 @@ private func executeFastTrace(
                gShape.prop[entry.propOffset].flags.contains(.writable),
                gShape.prop[entry.propOffset].flags.isPlainData,
                gObj.extra(at: entry.propOffset) == nil {
-                let chained = isStoreOpcode(bc, pc + 5, bcLen)
-                let val: JeffJSValue
-                if chained { val = buf[sp - 1].dupValue() } else { sp -= 1; val = buf[sp] }
+                sp -= 1; let val = buf[sp]
                 let old = gObj.dataValue(at: entry.propOffset)
                 gObj.asClass.propValues[entry.propOffset] = val
                 old.freeValue()
@@ -5379,9 +5335,7 @@ private func executeFastTraceLean(
                gShape.prop[entry.propOffset].flags.contains(.writable),
                gShape.prop[entry.propOffset].flags.isPlainData,
                gObj.extra(at: entry.propOffset) == nil {
-                let chained = isStoreOpcode(bc, pc + 5, bcLen)
-                let val: JeffJSValue
-                if chained { val = buf[sp - 1].dupValue() } else { sp -= 1; val = buf[sp] }
+                sp -= 1; let val = buf[sp]
                 let old = gObj.dataValue(at: entry.propOffset)
                 gObj.asClass.propValues[entry.propOffset] = val
                 old.freeValue()
@@ -9012,10 +8966,7 @@ struct JeffJSInterpreter {
 
             case .put_var:
                 let atom = readU32(bc, pc + 1)
-                // Chained assignment: if next opcode is also a store, keep value on stack
-                let chainedPutVar = isStoreOpcode(bc, pc + 5, bcLen)
-                let val: JeffJSValue
-                if chainedPutVar { val = buf[sp - 1].dupValue() } else { val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 // Global-var inline cache: shape-matched writable data slot
                 if let gObj = ctx.globalObj.obj, let gShape = gObj.shape, let ic = fb.ic {
                     let entry = ic.lookup(pc)
@@ -9833,12 +9784,7 @@ struct JeffJSInterpreter {
             case .put_loc:
                 let idx = Int(readU16(bc, pc + 1))
                 let oldPutLoc = buf[varBase + idx]
-                // Chained assignment: if next opcode is also a store, keep value on stack
-                if isStoreOpcode(bc, pc + 3, bcLen) {
-                    buf[varBase + idx] = buf[sp - 1].dupValue()
-                } else {
-                    buf[varBase + idx] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                }
+                buf[varBase + idx] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 oldPutLoc.freeValue()
                 pc += 3
 
@@ -9858,11 +9804,7 @@ struct JeffJSInterpreter {
             case .put_loc8:
                 let idx = Int(readU8(bc, pc + 1))
                 let oldPutLoc8 = buf[varBase + idx]
-                if isStoreOpcode(bc, pc + 2, bcLen) {
-                    buf[varBase + idx] = buf[sp - 1].dupValue()
-                } else {
-                    buf[varBase + idx] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                }
+                buf[varBase + idx] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 oldPutLoc8.freeValue()
                 pc += 2
 
@@ -9879,16 +9821,16 @@ struct JeffJSInterpreter {
             case .get_loc3: buf[sp] = buf[varBase + 3].dupValue(); sp += 1; pc += 1
 
             case .put_loc0:
-                do { let old = buf[varBase]; if isStoreOpcode(bc, pc + 1, bcLen) { buf[varBase] = buf[sp - 1].dupValue() } else { buf[varBase] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; old.freeValue() }
+                do { let old = buf[varBase]; buf[varBase] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); old.freeValue() }
                 pc += 1
             case .put_loc1:
-                do { let old = buf[varBase + 1]; if isStoreOpcode(bc, pc + 1, bcLen) { buf[varBase + 1] = buf[sp - 1].dupValue() } else { buf[varBase + 1] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; old.freeValue() }
+                do { let old = buf[varBase + 1]; buf[varBase + 1] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); old.freeValue() }
                 pc += 1
             case .put_loc2:
-                do { let old = buf[varBase + 2]; if isStoreOpcode(bc, pc + 1, bcLen) { buf[varBase + 2] = buf[sp - 1].dupValue() } else { buf[varBase + 2] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; old.freeValue() }
+                do { let old = buf[varBase + 2]; buf[varBase + 2] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); old.freeValue() }
                 pc += 1
             case .put_loc3:
-                do { let old = buf[varBase + 3]; if isStoreOpcode(bc, pc + 1, bcLen) { buf[varBase + 3] = buf[sp - 1].dupValue() } else { buf[varBase + 3] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; old.freeValue() }
+                do { let old = buf[varBase + 3]; buf[varBase + 3] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); old.freeValue() }
                 pc += 1
 
             case .set_loc0: do { let old = buf[varBase]; buf[varBase] = buf[sp - 1].dupValue(); old.freeValue() }; pc += 1
@@ -9915,12 +9857,7 @@ struct JeffJSInterpreter {
             // always; the check keeps a borrowed slot safe regardless).
             case .put_arg:
                 let idx = Int(readU16(bc, pc + 1))
-                let val: JeffJSValue
-                if isStoreOpcode(bc, pc + 3, bcLen) {
-                    val = buf[sp - 1].dupValue()
-                } else {
-                    val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                }
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if idx < varBase { jeffJS_storeArg(buf, idx, val, fb.argSlotsOwned) } else { val.freeValue() }
                 pc += 3
 
@@ -9938,12 +9875,7 @@ struct JeffJSInterpreter {
 
             case .put_arg0, .put_arg1, .put_arg2, .put_arg3:
                 let idx = Int(op.rawValue) &- Int(JeffJSOpcode.put_arg0.rawValue)
-                let val: JeffJSValue
-                if isStoreOpcode(bc, pc + 1, bcLen) {
-                    val = buf[sp - 1].dupValue()
-                } else {
-                    val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                }
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if idx < varBase { jeffJS_storeArg(buf, idx, val, fb.argSlotsOwned) } else { val.freeValue() }
                 pc += 1
 
@@ -9974,16 +9906,9 @@ struct JeffJSInterpreter {
 
             case .put_var_ref:
                 let idx = Int(readU16(bc, pc + 1))
-                if isStoreOpcode(bc, pc + 3, bcLen) {
-                    let val = buf[sp - 1].dupValue()
-                    if idx < varRefs.count, let vr = varRefs[idx] {
-                        vr.store(val)
-                    }
-                } else {
-                    let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                    if idx < varRefs.count, let vr = varRefs[idx] {
-                        vr.store(val)
-                    }
+                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                if idx < varRefs.count, let vr = varRefs[idx] {
+                    vr.store(val)
                 }
                 pc += 3
 

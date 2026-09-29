@@ -241,6 +241,10 @@ class JeffJSFunctionDefCompiler {
     var isDirectOrIndirectEval: Bool = false
     /// Parsed by `parseProgram`: a script's or eval's top-level code.
     var isProgramCode: Bool = false
+    /// Program (script / eval) code: local slot of the hidden completion-value
+    /// variable (QuickJS `eval_ret_idx`), or -1. Expression statements store
+    /// into it; the program returns it.
+    var evalRetIdx: Int = -1
     /// Expression spans recorded during label resolution (pre-compaction
     /// pcs): the source range of the member access / call / `new` whose
     /// runtime error text quotes it (JSC's expression info).
