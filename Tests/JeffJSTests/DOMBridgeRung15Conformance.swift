@@ -33,6 +33,25 @@ extension JeffJSTestRunner {
 
     /// (name, JS expression that must evaluate to `true`).
     static let rung15SyncCases: [(String, String)] = [
+        // ---- DOM §4.4 Document is a Node (google.com Wiz: el.ownerDocument.compareDocumentPosition(el) & 16)
+        ("document implements Node: compareDocumentPosition both ways, tree accessors, getRootNode", """
+            (function(){ var d = fx('<i></i>'), e = d.firstChild, D = document;
+              return D.compareDocumentPosition(e) === 20 && e.compareDocumentPosition(D) === 10 &&
+                D.compareDocumentPosition(D) === 0 && (D.compareDocumentPosition(D.createElement('p')) & 1) === 1 &&
+                D.hasChildNodes() && D.isSameNode(D) && !D.isSameNode(e) && D.getRootNode() === D &&
+                D.childNodes.length >= 1 && D.lastChild === D.documentElement && D.documentElement.parentNode === D &&
+                D.parentNode === null && D.nextSibling === null && D.textContent === null && D.isConnected === true &&
+                D.contains(D) && !e.contains(D); })()
+            """),
+        // ---- HTML §3.1.5 document.getElementsByName (google.com's cdos init: getElementsByName("biw"))
+        ("document.getElementsByName: HTML elements with that exact name, tree order; not on Element", """
+            (function(){ var d = fx('<input name="gebn1"><p><meta name="gebn1"></p><span name="GEBN1"></span>');
+              var l = document.getElementsByName('gebn1');
+              var b = document.createElement('b'); b.setAttribute('name', 'null'); d.appendChild(b);
+              return l.length === 2 && l[0].nodeName === 'INPUT' && l[1].nodeName === 'META' &&
+                document.getElementsByName('none').length === 0 && document.getElementsByName(null).length === 1 &&
+                typeof d.getElementsByName === 'undefined'; })()
+            """),
         // ---- 15-11 EventTarget
         ("passive listener: preventDefault is a no-op inside and after", """
             (function(){ var d = fx('<i></i>').firstChild, inside = 'none';

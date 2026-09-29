@@ -537,6 +537,22 @@ final class JeffJSDOMBridge {
             return self.wrapElementArray(nodes, ctx: ctx)
         }, length: 1)
 
+        // getElementsByName(elementName) — HTML §3.1.5 (DOM tree accessors):
+        // every HTML element in the document whose `name` attribute is exactly
+        // the argument, in tree order. It was missing: google.com's `cdos`
+        // module init (`document.getElementsByName("biw")`) threw.
+        ctx.setPropertyFunc(obj: doc, name: "getElementsByName", fn: { [weak self] ctx, thisVal, args in
+            guard let self else { return JeffJSValue.null }
+            // DOMString conversion: null -> "null", undefined -> "undefined".
+            let arg = args.first ?? .undefined
+            let elementName = arg.isNull ? "null" : arg.isUndefined ? "undefined"
+                : (ctx.toSwiftString(arg) ?? "")
+            let nodes = self.allElementDescendants(of: self.root).filter {
+                $0.isHTMLNamespace && $0.attributes["name"] == elementName
+            }
+            return self.wrapElementArray(nodes, ctx: ctx)
+        }, length: 1)
+
         // createElement
         ctx.setPropertyFunc(obj: doc, name: "createElement", fn: { [weak self] ctx, thisVal, args in
             guard let self, let tag = self.extractString(ctx: ctx, args: args, index: 0) else {
@@ -589,10 +605,30 @@ final class JeffJSDOMBridge {
 
         // contains(node) -> bool (jQuery.contains and focus-trap libraries call it)
         ctx.setPropertyFunc(obj: doc, name: "contains", fn: { [weak self] ctx, _, args in
-            guard let self, !args.isEmpty, let other = self.extractNode(from: args[0]) else {
+            guard let self, !args.isEmpty, let other = self.nodeArgument(args[0]) else {
                 return .newBool(false)
             }
             return .newBool(self.nodeContains(self.root, child: other) || other === self.root)
+        }, length: 1)
+
+        // The rest of the Node interface on the document (DOM §4.4: Document is
+        // a Node). The document object is not a node wrapper, so none of the
+        // element prototype's Node methods reached it: Wiz's "element is in the
+        // document" check, `el.ownerDocument.compareDocumentPosition(el) & 16`,
+        // threw and google.com's search box controller never got its
+        // dependencies (no trending searches).
+        ctx.setPropertyFunc(obj: doc, name: "compareDocumentPosition", fn: { [weak self] ctx, _, args in
+            guard let self, !args.isEmpty, let other = self.nodeArgument(args[0]) else {
+                return .newInt32(0x21)   // not a node: DISCONNECTED | IMPLEMENTATION_SPECIFIC
+            }
+            return .newInt32(self.documentPosition(of: self.root, relativeTo: other))
+        }, length: 1)
+        ctx.setPropertyFunc(obj: doc, name: "hasChildNodes", fn: { [weak self] _, _, _ in
+            .newBool(!(self?.root.children.isEmpty ?? true))
+        }, length: 0)
+        ctx.setPropertyFunc(obj: doc, name: "isSameNode", fn: { [weak self] _, _, args in
+            guard let self, !args.isEmpty else { return .newBool(false) }
+            return .newBool(self.nodeArgument(args[0]) === self.root)
         }, length: 1)
 
         // importNode(node, deep) / adoptNode(node) — DOM §4.5: the clone /
@@ -935,6 +971,20 @@ final class JeffJSDOMBridge {
             return self.wrapElement(html, ctx: ctx)
         }, length: 0)
 
+        // childNodes / firstChild / lastChild of the document (doctype, comments, <html>)
+        ctx.setPropertyFunc(obj: doc, name: "__get_childNodes", fn: { [weak self] ctx, _, _ in
+            guard let self else { return ctx.newArray() }
+            return self.wrapElementArray(self.root.children, ctx: ctx)
+        }, length: 0)
+        ctx.setPropertyFunc(obj: doc, name: "__get_firstChild", fn: { [weak self] ctx, _, _ in
+            guard let self, let first = self.root.children.first else { return JeffJSValue.null }
+            return self.wrapElement(first, ctx: ctx)
+        }, length: 0)
+        ctx.setPropertyFunc(obj: doc, name: "__get_lastChild", fn: { [weak self] ctx, _, _ in
+            guard let self, let last = self.root.children.last else { return JeffJSValue.null }
+            return self.wrapElement(last, ctx: ctx)
+        }, length: 0)
+
         // Install getter properties via a small eval shim.
         // Uses literal property names (no forEach+closure) to avoid JeffJS var_ref issues.
         let shim = """
@@ -963,6 +1013,24 @@ final class JeffJSDOMBridge {
                     get: function() { return this.__get_documentElement(); }
                 });
             }
+            // Node tree members of the document (DOM §4.4): no parent, no
+            // siblings, null nodeValue/textContent, always connected, its own root.
+            if (typeof d.__get_childNodes === 'function') {
+                Object.defineProperty(d, 'childNodes', { configurable: true, enumerable: true,
+                    get: function() { return this.__get_childNodes(); } });
+                Object.defineProperty(d, 'firstChild', { configurable: true, enumerable: true,
+                    get: function() { return this.__get_firstChild(); } });
+                Object.defineProperty(d, 'lastChild', { configurable: true, enumerable: true,
+                    get: function() { return this.__get_lastChild(); } });
+            }
+            if (!('parentNode' in d)) d.parentNode = null;
+            if (!('parentElement' in d)) d.parentElement = null;
+            if (!('previousSibling' in d)) d.previousSibling = null;
+            if (!('nextSibling' in d)) d.nextSibling = null;
+            if (!('nodeValue' in d)) d.nodeValue = null;
+            if (!('textContent' in d)) d.textContent = null;
+            if (!('isConnected' in d)) d.isConnected = true;
+            if (!('getRootNode' in d)) d.getRootNode = function getRootNode() { return this; };
             // Fallback for engines where defineProperty getter behavior is incomplete
             // during early bootstrap: eagerly materialize missing/null values.
             if ((typeof d.documentElement === 'undefined' || d.documentElement == null) &&
@@ -1490,7 +1558,7 @@ final class JeffJSDOMBridge {
         ctx.setPropertyFunc(obj: el, name: "compareDocumentPosition", fn: { [weak self] ctx, thisVal, args in
             guard let self, !args.isEmpty,
                   let a = self.extractNode(from: thisVal),
-                  let b = self.extractNode(from: args[0]) else { return .newInt32(1) }
+                  let b = self.nodeArgument(args[0]) else { return .newInt32(1) }
             return .newInt32(self.documentPosition(of: a, relativeTo: b))
         }, length: 1)
 
@@ -2997,6 +3065,16 @@ final class JeffJSDOMBridge {
         // Primary: check opaque payload
         if let obj = val.toObject(), case .opaque(let any) = obj.payload, let node = any as? DOMNode {
             return node
+        }
+        return nil
+    }
+
+    /// A Node argument: a node wrapper, or the document object itself (which
+    /// carries no node payload) as the document's root node.
+    func nodeArgument(_ val: JeffJSValue) -> DOMNode? {
+        if let node = extractNode(from: val) { return node }
+        if let docVal = documentJSValue, let a = val.toObject(), let b = docVal.toObject(), a === b {
+            return root
         }
         return nil
     }
