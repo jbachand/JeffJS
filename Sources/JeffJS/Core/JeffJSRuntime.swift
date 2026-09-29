@@ -605,6 +605,9 @@ final class JeffJSRuntime {
     var lazyReclaimPhase: Int = 0
     var lazyReclaimCycle: JeffJSLazyReclaimCycle? = nil
     var lazyReclaimLastSlice: CFAbsoluteTime = 0
+    var lazyReclaimLastTick: CFAbsoluteTime = 0
+    /// lazyStats.compiled / compileMs at the previous cycle's end (debug line).
+    var lazyReclaimCompiledMark: (count: Int, ms: Double) = (0, 0)
     var lazyPressureServed: Int = 0
 
     // MARK: - Stack Checking

@@ -32,9 +32,10 @@
 // new objects are appended behind the cursor — those were made by
 // createClosure, which stamps), then a decide pass over the bodies it listed,
 // which also walks their constant pools (nested bodies whose closures are all
-// gone are only reachable there). Both run in slices of ≤ 1 ms, at most one
-// slice per 8 ms of idle ticks, so a page with a large heap never parks the
-// thread for a whole pass.
+// gone are only reachable there). Both run in slices of ≤ 1 ms (≤ 4 ms after
+// 100 ms without a tick: nothing is running then), at most one slice per 8 ms
+// of idle ticks, so a page with a large heap never parks the thread for a
+// whole pass.
 //
 // Memory pressure: a memory warning, the app going to the background, or a
 // kernel memory-pressure event bumps a process-wide generation; each runtime
@@ -115,8 +116,14 @@ enum JeffJSLazyPressureObserver {
 
 extension JeffJSRuntime {
     /// Longest slice, and the least time between two slices, in seconds.
+    /// After a quiet stretch (no idle tick for `lazyReclaimQuietGap`: the
+    /// page is not running script) a slice may take `lazyReclaimQuietBudget`
+    /// instead — a quiet page ticks rarely, and a cycle that only moves 1 ms
+    /// per tick would take minutes to finish exactly when reclaiming matters.
     static let lazyReclaimSliceBudget: Double = 0.001
     static let lazyReclaimSliceGap: Double = 0.008
+    static let lazyReclaimQuietGap: Double = 0.1
+    static let lazyReclaimQuietBudget: Double = 0.004
 
     /// Idle tick (no JS on the stack): serve a memory-pressure request, start
     /// a cycle once per `lazyDropAfterMs`, and run one slice of it.
@@ -137,9 +144,12 @@ extension JeffJSRuntime {
             guard now - lazyLastReclaim >= Double(lazyDropAfterMs) / 1000 else { return }
             startLazyReclaimCycle(aggressive: false)
         }
+        let sinceTick = now - lazyReclaimLastTick
+        lazyReclaimLastTick = now
         guard now - lazyReclaimLastSlice >= Self.lazyReclaimSliceGap else { return }
         lazyReclaimLastSlice = now
-        runLazyReclaimSlice(deadline: now + Self.lazyReclaimSliceBudget)
+        let budget = sinceTick >= Self.lazyReclaimQuietGap ? Self.lazyReclaimQuietBudget : Self.lazyReclaimSliceBudget
+        runLazyReclaimSlice(deadline: now + budget)
     }
 
     /// One complete cycle now: finishes the cycle in progress, or runs a new
@@ -270,11 +280,16 @@ extension JeffJSRuntime {
         lazyStats.droppedBytecodeBytes += c.droppedBytes
         lazyStats.droppedICTables += c.droppedICs
         if JeffJSConfig.lazyDropDebug {
+            // Bodies compiled since the previous cycle ended: first calls
+            // plus recompiles of dropped bodies (the reclaim's cost).
+            let mark = lazyReclaimCompiledMark
             FileHandle.standardError.write(Data(String(
-                format: "[jeffjs:reclaim] cycle %d%@: objects=%d bodies=%d dropped=%d (%dKB bytecode, %d IC tables) slices=%d %.1fms (max slice %.2fms)\n",
+                format: "[jeffjs:reclaim] cycle %d%@: objects=%d bodies=%d dropped=%d (%dKB bytecode, %d IC tables) slices=%d %.1fms (max slice %.2fms) | compiled since last cycle %d in %.1fms, dropped total %d\n",
                 lazyStats.reclaimCycles, c.aggressive ? " (memory pressure)" : "", c.scanned, c.fbs.count,
-                c.dropped, c.droppedBytes / 1024, c.droppedICs, c.slices, c.ms, c.maxSliceMs).utf8))
+                c.dropped, c.droppedBytes / 1024, c.droppedICs, c.slices, c.ms, c.maxSliceMs,
+                lazyStats.compiled - mark.count, lazyStats.compileMs - mark.ms, lazyStats.dropped).utf8))
         }
+        lazyReclaimCompiledMark = (lazyStats.compiled, lazyStats.compileMs)
     }
 }
 
