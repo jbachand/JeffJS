@@ -305,9 +305,11 @@ func js_regexp_exec(
     }
 
     let inputVal = argv.count >= 1 ? argv[0] : JeffJSValue.undefined
-    guard let inputStr = js_regexp_coerceToString(ctx: ctx, val: inputVal) else {
+    guard let input = js_regexp_coerceInput(ctx: ctx, val: inputVal) else {
         return .exception
     }
+    defer { input.value.freeValue() }
+    let inputStr = input.str
 
     let flags = js_regexp_getFlags(obj)
     let isGlobal = (flags & LRE_FLAG_GLOBAL) != 0
@@ -419,7 +421,7 @@ func js_regexp_exec(
     // the first result, four slot appends instead of four transition lookups.
     let lengthVal = JeffJSValue.newInt32(Int32(arrayValues.count))
     let indexVal = JeffJSValue.newInt32(Int32(matchStart))
-    let inputStrVal = JeffJSValue.makeString(inputStr.retain())
+    let inputStrVal = input.value.dupValue()   // the subject: its own counted reference
     if let shape = ctx.regexpMatchShape, shape.isHashed, shape.propCount == 4,
        resultArray.propValues.count == 0, let old = resultArray.shape {
         shape.refCount += 1
@@ -786,16 +788,18 @@ func js_regexp_Symbol_match(
     }
 
     let inputVal = argv.count >= 1 ? argv[0] : JeffJSValue.undefined
-    guard let inputStr = js_regexp_coerceToString(ctx: ctx, val: inputVal) else {
+    guard let input = js_regexp_coerceInput(ctx: ctx, val: inputVal) else {
         return .exception
     }
+    defer { input.value.freeValue() }
+    let inputStr = input.str
 
     let flags = js_regexp_getFlags(obj)
     let isGlobal = (flags & LRE_FLAG_GLOBAL) != 0
 
     if !isGlobal {
         // Non-global: single exec.
-        return js_regexp_exec(ctx: ctx, this: this, argv: [JeffJSValue.borrowedString(inputStr)])
+        return js_regexp_exec(ctx: ctx, this: this, argv: [input.value])
     }
 
     // Fast path: for standard RegExp with /g flag, bypass the full exec()
@@ -825,7 +829,7 @@ func js_regexp_Symbol_match(
     while safetyLimit > 0 {
         safetyLimit -= 1
         // exec borrows its argument; the match array is ours.
-        let result = js_regexp_exec(ctx: ctx, this: this, argv: [JeffJSValue.borrowedString(inputStr)])
+        let result = js_regexp_exec(ctx: ctx, this: this, argv: [input.value])
         if result.isException {
             for m in matches { m.freeValue() }
             return .exception
@@ -1025,9 +1029,11 @@ func js_regexp_Symbol_matchAll(
     }
 
     let inputVal = argv.count >= 1 ? argv[0] : JeffJSValue.undefined
-    guard let inputStr = js_regexp_coerceToString(ctx: ctx, val: inputVal) else {
+    guard let input = js_regexp_coerceInput(ctx: ctx, val: inputVal) else {
         return .exception
     }
+    defer { input.value.freeValue() }
+    let inputStr = input.str
 
     // Create a copy of the regexp (to preserve the original's lastIndex).
     let flags = js_regexp_getFlags(obj)
@@ -1056,7 +1062,8 @@ func js_regexp_Symbol_matchAll(
     // Create the iterator object.
     let iterData = JSRegExpStringIteratorData(
         iteratingRegExp: regexpCopy,
-        iteratedString: inputStr.retain(),
+        iteratedString: inputStr,
+        iteratedValue: input.value.dupValue(),
         isGlobal: isGlobal,
         isUnicode: isUnicode,
         done: false
@@ -1092,9 +1099,11 @@ func js_regexp_Symbol_replace(
     let inputVal = argv.count >= 1 ? argv[0] : JeffJSValue.undefined
     let replaceVal = argv.count >= 2 ? argv[1] : JeffJSValue.undefined
 
-    guard let inputStr = js_regexp_coerceToString(ctx: ctx, val: inputVal) else {
+    guard let input = js_regexp_coerceInput(ctx: ctx, val: inputVal) else {
         return .exception
     }
+    defer { input.value.freeValue() }
+    let inputStr = input.str
 
     let flags = js_regexp_getFlags(obj)
     let isGlobal = (flags & LRE_FLAG_GLOBAL) != 0
@@ -1130,7 +1139,7 @@ func js_regexp_Symbol_replace(
 
         // exec borrows its argument; the match array is ours (it leaked once
         // per match: every regex String.prototype.replace grew the heap).
-        let result = js_regexp_exec(ctx: ctx, this: this, argv: [JeffJSValue.borrowedString(inputStr)])
+        let result = js_regexp_exec(ctx: ctx, this: this, argv: [input.value])
         if result.isException {
             buf.free()
             return .exception
@@ -1184,11 +1193,8 @@ func js_regexp_Symbol_replace(
             }
             // Offset (position)
             callArgs.append(JeffJSValue.newInt32(Int32(matchStart)))
-            // Full input string
-            // The argument itself when it is a string value (a dup); a coerced or
-            // flattened copy has no owner of its own and keeps the retaining wrap.
-            callArgs.append(inputVal.isString ? inputVal.dupValue()
-                                              : JeffJSValue.makeString(inputStr.retain()))
+            // Full input string: the subject value, a counted reference.
+            callArgs.append(input.value.dupValue())
             // Named groups (if present)
             let groupsAtom = ctx.rt.findAtom("groups")
             let groupsVal = resObj.getOwnPropertyValue(atom: groupsAtom)
@@ -1309,9 +1315,11 @@ func js_regexp_Symbol_split(
     let inputVal = argv.count >= 1 ? argv[0] : JeffJSValue.undefined
     let limitVal = argv.count >= 2 ? argv[1] : JeffJSValue.undefined
 
-    guard let inputStr = js_regexp_coerceToString(ctx: ctx, val: inputVal) else {
+    guard let input = js_regexp_coerceInput(ctx: ctx, val: inputVal) else {
         return .exception
     }
+    defer { input.value.freeValue() }
+    let inputStr = input.str
 
     // Compute limit.
     let limit: UInt32
@@ -1354,7 +1362,7 @@ func js_regexp_Symbol_split(
                                            captureCount: captureCount)
         let arrVal = ctx.newArray()
         if probe == nil || probe!.isEmpty, limit > 0 {
-            _ = ctx.setPropertyStr(obj: arrVal, name: "0", value: .makeString(inputStr))
+            _ = ctx.setPropertyStr(obj: arrVal, name: "0", value: input.value.dupValue())
             _ = ctx.setPropertyStr(obj: arrVal, name: "length", value: .newInt32(1))
         }
         return arrVal
@@ -1456,18 +1464,23 @@ func js_regexp_get_species(
 /// Mirrors QuickJS `JSRegExpStringIteratorData`.
 final class JSRegExpStringIteratorData {
     var iteratingRegExp: JeffJSObject
+    /// Flat view of `iteratedValue` (kept alive by it).
     var iteratedString: JeffJSString
+    /// The subject string, owned (see js_regexp_coerceInput).
+    let iteratedValue: JeffJSValue
     var isGlobal: Bool
     var isUnicode: Bool
     var done: Bool
 
     init(iteratingRegExp: JeffJSObject,
          iteratedString: JeffJSString,
+         iteratedValue: JeffJSValue,
          isGlobal: Bool,
          isUnicode: Bool,
          done: Bool) {
         self.iteratingRegExp = iteratingRegExp
         self.iteratedString = iteratedString
+        self.iteratedValue = iteratedValue
         self.isGlobal = isGlobal
         self.isUnicode = isUnicode
         self.done = done
@@ -1478,7 +1491,7 @@ final class JSRegExpStringIteratorData {
     deinit {
         if JeffJSGCObjectHeader.activeRuntime != nil {
             JeffJSValue.makeObject(iteratingRegExp).freeValue()
-            JeffJSValue.borrowedString(iteratedString).freeValue()
+            iteratedValue.freeValue()
         }
     }
 }
@@ -1507,7 +1520,7 @@ func js_regexp_string_iterator_next(
     let result = js_regexp_exec(
         ctx: ctx,
         this: regexpThisVal,
-        argv: [JeffJSValue.borrowedString(data.iteratedString)]
+        argv: [data.iteratedValue]
     )
     defer { result.freeValue() }
 
@@ -1675,34 +1688,36 @@ private func js_regexp_advanceIndex(
     return index + 1
 }
 
-/// Coerce a value to a JeffJSString (for use as input to regex operations).
+/// ToString(input) for the RegExp builtins, held as ONE owned reference for
+/// the whole call (mirrors QuickJS `str = JS_ToString(ctx, argv[0])` ...
+/// `JS_FreeValue(ctx, str)`). `value` is the caller's to release (a `defer`
+/// right after the call); `str` is its flat view, valid while `value` is.
 ///
-/// Mirrors QuickJS `JS_ToString`.
-private func js_regexp_coerceToString(
+/// Ownership rule for the subject string: every value these builtins hand
+/// out that *is* the subject — a match array's `input`, the one-element
+/// result of splitting an empty string, the replacer callback's `string`
+/// argument, the iterator's subject — is `value.dupValue()`, a counted
+/// reference of its own. The subject used to be a bare borrowed
+/// `JeffJSString` (the argument's own string, a rope's flattened cache, or an
+/// unowned coerced copy) that each site wrapped differently: `"".split(/\s+/)`
+/// wrapped it with `makeString` and no count, so the array freed the
+/// caller's string (google.com's `a.trim().split(ZOa)` freed the shared ""
+/// literal and a later array recycle crashed on it), and the
+/// `makeString(s.retain())` wraps took an ARC retain that nothing released.
+/// Internal exec calls pass `value` (never a borrowed flat string, which has
+/// no JS owner of its own once its rope is gone).
+private func js_regexp_coerceInput(
     ctx: JeffJSContext,
     val: JeffJSValue
-) -> JeffJSString? {
-    if let s = val.stringValue {
-        return s
+) -> (value: JeffJSValue, str: JeffJSString)? {
+    let v = val.isString ? val.dupValue() : ctx.toString(val)
+    if v.isException { return nil }
+    guard let s = v.stringValue else {
+        v.freeValue()
+        _ = ctx.throwTypeError("cannot convert to string")
+        return nil
     }
-    if val.isUndefined {
-        return JeffJSString(swiftString: "undefined")
-    }
-    if val.isNull {
-        return JeffJSString(swiftString: "null")
-    }
-    if val.isBool {
-        return JeffJSString(swiftString: val.toBool() ? "true" : "false")
-    }
-    if val.isInt {
-        return JeffJSString(swiftString: "\(val.toInt32())")
-    }
-    if val.isFloat64 {
-        return JeffJSString(swiftString: "\(val.toFloat64())")
-    }
-    // In a full build we would call JS_ToString which handles objects via
-    // ToPrimitive.  For now, return "".
-    return JeffJSString(swiftString: "")
+    return (v, s)
 }
 
 /// Capture group result from the regex engine.

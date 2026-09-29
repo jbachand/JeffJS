@@ -376,7 +376,9 @@ struct JeffJSBuiltinFunction {
 
         if case .bytecodeFunc(let bc, _, _) = obj.payload {
             if let bc = bc, let fn = bc.fileName {
-                return JeffJSValue.makeString(fn)
+                // A fresh string: `makeString(fn)` wrapped the bytecode's own
+                // file name without a count, so the value's release freed it.
+                return ctx.newStringValue(fn.toSwiftString())
             }
         }
         return .null

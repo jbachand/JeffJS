@@ -113,6 +113,35 @@ extension JeffJSTestRunner {
             ev.detail.target.id === 1
             """)
 
+        // RegExp subject-string ownership (js_regexp_coerceInput): a value
+        // handed out that is the subject string itself takes a count of its
+        // own. `"".split(/\s+/)` wrapped the caller's "" without one, so the
+        // result array released the caller's string (google.com m=… script,
+        // `a.trim().split(ZOa).filter(b=>b.length>0)`: the shared "" literal
+        // was freed and a recycled array later crashed on it).
+        evalNoFreedTouches(ctx, "split of an empty subject returns the subject", """
+            var ok = true;
+            for (var i = 0; i < 20; i++) {
+                var p = ("" || "").trim().split(/\\s+/).filter(function (b) { return b.length > 0; });
+                var q = "".split(/x/);
+                ok = ok && p.length === 0 && q.length === 1 && q[0] === "" && "".split(/(?:)/).length === 0;
+            }
+            var lit = ""; ok && lit.length === 0 && "".split(/,/)[0] === lit
+            """)
+        evalNoFreedTouches(ctx, "exec input, replacer string, matchAll subject", """
+            var ok = true, keep = [];
+            for (var i = 0; i < 20; i++) {
+                var r = "k" + i; r = r + "ab".repeat(300);          // a rope subject
+                var m = /b/.exec(r); keep.push(m.input); r = null;
+                var s = ("x" + i).replace(/x/, function (mm, off, str) { return str; });
+                var all = [...("q" + i + "q").matchAll(/q/g)];
+                ok = ok && m.input.length === 601 + String(i).length && s === "x" + i + i &&
+                     all.length === 2 && all[1].input === "q" + i + "q";
+            }
+            ok && keep.every(function (x) { return x.charCodeAt(0) === 107; }) &&
+                /1/.exec(12).input === "12" && /a/.exec({ toString() { return "zaz"; } }).index === 1
+            """)
+
         _ = rt
         testDeadPrototypeShapes()
     }
