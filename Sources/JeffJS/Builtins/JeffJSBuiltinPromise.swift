@@ -1468,84 +1468,52 @@ struct JeffJSBuiltinPromise {
 
     // MARK: - Helper: Iterator Protocol
 
-    /// Get an iterator from an iterable.
-    /// Simplified: treats arrays directly as iterables.
+    /// GetIterator(iterable, sync) (ECMA-262 §7.4.3), as used by PerformPromiseAll /
+    /// AllSettled / Race / Any (§27.2.4.1-5): method = GetMethod(iterable, @@iterator),
+    /// iterator = Call(method, iterable), which must be an object.
+    ///
+    /// The method is looked up by the well-known symbol. This used to read the *string*
+    /// key "@@iterator", which never exists, so every combinator rejected a Set, Map,
+    /// generator or array iterator with "object is not iterable" and only real Arrays
+    /// got through an array-only fallback (google.com's module loader awaits
+    /// `Promise.all(new Set(...))` between script chunks: the chain stopped after the
+    /// first chunk).
     private static func getIterator(ctx: JeffJSContext,
                                      iterable: JeffJSValue) -> JeffJSValue {
-        // Check for Symbol.iterator method
-        let iterMethod = ctx.getPropertyStr(obj: iterable, name: "@@iterator")
-
-        if ctx.isFunction(iterMethod) {
-            let iterator = ctx.callFunction(func_: iterMethod, this: iterable, args: [])
+        let iterMethod = ctx.getProperty(obj: iterable,
+                                         atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue)
+        if iterMethod.isException { return iterMethod }
+        guard ctx.isFunction(iterMethod) else {
             ctx.freeValue(iterMethod)
-            return iterator
+            return ctx.throwTypeError("object is not iterable")
         }
+        let iterator = ctx.callFunction(func_: iterMethod, this: iterable, args: [])
         ctx.freeValue(iterMethod)
-
-        // Fallback: if it's an array, create a simple array iterator
-        if ctx.isArray(iterable) {
-            return createArrayIterator(ctx: ctx, array: iterable)
+        if iterator.isException { return iterator }
+        guard iterator.isObject else {
+            ctx.freeValue(iterator)
+            return ctx.throwTypeError("iterator must return an object")
         }
-
-        return ctx.throwTypeError("object is not iterable")
+        return iterator
     }
 
-    /// Get the next value from an iterator.
+    /// IteratorStep's IteratorNext (§7.4.4): Call(iterator.next, iterator); the result
+    /// must be an object.
     private static func iteratorNext(ctx: JeffJSContext,
                                       iterator: JeffJSValue) -> JeffJSValue {
         let nextMethod = ctx.getPropertyStr(obj: iterator, name: "next")
-        if !ctx.isFunction(nextMethod) {
+        if nextMethod.isException { return nextMethod }
+        guard ctx.isFunction(nextMethod) else {
             ctx.freeValue(nextMethod)
-            // Check if this is our simple array iterator
-            return simpleArrayIteratorNext(ctx: ctx, iterator: iterator)
+            return ctx.throwTypeError("iterator.next is not a function")
         }
-
         let result = ctx.callFunction(func_: nextMethod, this: iterator, args: [])
         ctx.freeValue(nextMethod)
-        return result
-    }
-
-    /// Create a simple array iterator object.
-    private static func createArrayIterator(ctx: JeffJSContext,
-                                             array: JeffJSValue) -> JeffJSValue {
-        let iterObj = ctx.newPlainObject()
-        ctx.setPropertyStr(obj: iterObj, name: "__array__", value: array.dupValue())
-        ctx.setPropertyStr(obj: iterObj, name: "__index__", value: JeffJSValue.newInt32(0))
-        return iterObj
-    }
-
-    /// Advance a simple array iterator.
-    private static func simpleArrayIteratorNext(ctx: JeffJSContext,
-                                                 iterator: JeffJSValue) -> JeffJSValue {
-        let array = ctx.getPropertyStr(obj: iterator, name: "__array__")
-        let indexVal = ctx.getPropertyStr(obj: iterator, name: "__index__")
-
-        if array.isUndefined || indexVal.isUndefined {
-            let result = ctx.newPlainObject()
-            ctx.setPropertyStr(obj: result, name: "done", value: JeffJSValue.JS_TRUE)
-            ctx.setPropertyStr(obj: result, name: "value", value: .undefined)
-            return result
+        if result.isException { return result }
+        guard result.isObject else {
+            ctx.freeValue(result)
+            return ctx.throwTypeError("iterator result is not an object")
         }
-
-        let index = indexVal.isInt ? Int(indexVal.toInt32()) : 0
-        let length = ctx.getPropertyLength(array)
-
-        if index >= length {
-            let result = ctx.newPlainObject()
-            ctx.setPropertyStr(obj: result, name: "done", value: JeffJSValue.JS_TRUE)
-            ctx.setPropertyStr(obj: result, name: "value", value: .undefined)
-            return result
-        }
-
-        let value = ctx.getPropertyUInt32(obj: array, index: UInt32(index))
-
-        // Update the index
-        ctx.setPropertyStr(obj: iterator, name: "__index__",
-                           value: JeffJSValue.newInt32(Int32(index + 1)))
-
-        let result = ctx.newPlainObject()
-        ctx.setPropertyStr(obj: result, name: "done", value: JeffJSValue.JS_FALSE)
-        ctx.setPropertyStr(obj: result, name: "value", value: value)
         return result
     }
 

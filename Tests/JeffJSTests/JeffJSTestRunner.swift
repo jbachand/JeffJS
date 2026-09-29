@@ -320,6 +320,8 @@ struct JeffJSTestRunner {
             ("CallThis", { $0.testCallThis() }),
             ("LogicalAssignment", { $0.testLogicalAssignment() }),
             ("SuperInArrow", { $0.testSuperInArrow() }),
+            ("ClassStaticElements", { $0.testClassStaticElements() }),
+            ("PromiseIterables", { $0.testPromiseIterables() }),
             ("StringConcat", { $0.testStringConcat() }),
             ("ParameterOwnership", { $0.testParameterOwnership() }),
             ("IndexArguments", { $0.testIndexArguments() }),

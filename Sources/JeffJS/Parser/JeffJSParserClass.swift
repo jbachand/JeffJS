@@ -609,7 +609,32 @@ extension JeffJSParser {
                     methodFd.emitFieldInitAtBodyStart = true
                 }
             }
-            fd.childFunctions.append(methodFd)
+            // The explicit constructor takes the default constructor's place
+            // (QuickJS patches the constructor's cpool slot after the body):
+            // the closure made at the class head -- on which every static
+            // method, accessor and static private brand parsed so far has
+            // already been defined -- *is* this function. Child functions bind
+            // to fclosure slots positionally, so it replaces the default in
+            // `childFunctions` and emits no fclosure of its own. Pushing a
+            // second closure and swapping it in dropped every static member
+            // written before `constructor(){}` (`class { static Ta(){} constructor(){} }`,
+            // google.com's Wiz controllers).
+            var replacedDefaultCtor = false
+            if isConstructor {
+                if ctorFound {
+                    syntaxError("a class may only have one constructor")
+                    return ctorFound
+                }
+                if let defaultCtor = cf.ctorFd,
+                   let slot = fd.childFunctions.firstIndex(where: { $0 === defaultCtor }) {
+                    fd.childFunctions[slot] = methodFd
+                    replacedDefaultCtor = true
+                } else {
+                    fd.childFunctions.append(methodFd)
+                }
+            } else {
+                fd.childFunctions.append(methodFd)
+            }
             if isConstructor {
                 // The class span is stamped on it once the class body closes.
                 cf.ctorFd = methodFd
@@ -627,12 +652,18 @@ extension JeffJSParser {
                 finishLazyCandidate(methodFd)
             }
 
+            if replacedDefaultCtor {
+                // Stack unchanged: ..., ctorFunc (now this constructor), proto
+                ctorFound = true
+                continue
+            }
+
             let cpoolIdx = addConstPoolValue(.mkVal(tag: .undefined, val: 0))
             emitFClosure(cpoolIdx)
 
             if isConstructor {
-                // Replace the current ctorFunc (default or previous) with
-                // the explicit constructor.
+                // Fallback (no default constructor slot found): replace the
+                // current ctorFunc on the stack with the explicit constructor.
                 // Stack: ..., ctorFunc, proto, newCtorFunc
                 emitOp(.rot3l)   // ..., proto, newCtorFunc, ctorFunc
                 emitOp(.drop)    // ..., proto, newCtorFunc
@@ -645,14 +676,17 @@ extension JeffJSParser {
                 // Regular method -- define it on proto (or ctor for static).
                 if isStatic {
                     // For static methods, define on the constructor.
-                    // Stack: ..., ctorFunc, proto, methodFunc
-                    // Rearrange so ctorFunc is below methodFunc for define_method.
-                    emitOp(.rot3l)   // ..., proto, methodFunc, ctorFunc
-                    emitOp(.swap)    // ..., proto, ctorFunc, methodFunc
                     if isComputed {
+                        // Stack: ..., ctorFunc, proto, key, methodFunc
+                        emitOp(.rot4l)   // ..., proto, key, methodFunc, ctorFunc
+                        emitOp(.rot3r)   // ..., proto, ctorFunc, key, methodFunc
                         emitOp(.define_method_computed)
                         emitU8(classMethodFlags(propKind))
                     } else {
+                        // Stack: ..., ctorFunc, proto, methodFunc
+                        // Rearrange so ctorFunc is below methodFunc for define_method.
+                        emitOp(.rot3l)   // ..., proto, methodFunc, ctorFunc
+                        emitOp(.swap)    // ..., proto, ctorFunc, methodFunc
                         emitOp(.define_method)
                         emitAtom(propAtom)
                         emitU8(classMethodFlags(propKind))
