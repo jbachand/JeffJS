@@ -120,10 +120,22 @@ enum JeffJSConfig {
     /// Functions whose source is shorter than this are compiled eagerly (a
     /// tiny body costs about as much as its stub).
     static let lazyMinSourceBytes  = int("compile.lazyMinSourceBytes", default: 0)
-    /// Reclaim the compiled body of a lazily compiled function that has not
-    /// run for this long (it compiles again on its next call); 0 = never.
-    /// Checked at idle points; generators and async functions are kept.
+    /// Reclaim the compiled body (bytecode, inline caches, trace data) of a
+    /// lazily compiled function that has not run for between one and two of
+    /// these intervals (it compiles again on its next call); 0 = never. The
+    /// scan runs in ≤ 1 ms slices at idle points; generators and async
+    /// functions are kept.
     static let lazyDropAfterMs     = int("compile.lazyDropAfterMs",    default: 0)
+    /// On a memory warning or when the app goes to the background, drop
+    /// every lazily compiled body at the next idle point (they compile
+    /// again on their next call). Independent of `lazyDropAfterMs`.
+    static let lazyDropOnMemoryPressure = bool("compile.lazyDropOnMemoryPressure", default: false)
+    /// One stderr line per completed reclaim cycle (`[jeffjs:reclaim] …`).
+    static let lazyDropDebug       = bool("compile.lazyDropDebug",     default: false)
+    /// Engine testing: every idle tick runs a memory-pressure reclaim, so
+    /// every lazily compiled body is dropped and recompiled between tasks
+    /// (`JEFFJS_COMPILE_LAZYDROPSTRESS=1 swift test …`).
+    static let lazyDropStress      = bool("compile.lazyDropStress",    default: false)
 
     // MARK: - Trace Blocks
 

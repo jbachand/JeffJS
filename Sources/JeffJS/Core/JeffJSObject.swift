@@ -330,9 +330,13 @@ final class JeffJSLazyFunctionInfo {
     let script: JeffJSLazyScript
     /// True until the body is compiled into the owning bytecode object.
     var isPending: Bool = true
-    /// Idle reclaim: no call reached the body since the last reclaim pass
-    /// (JeffJSRuntime.reclaimIdleLazyBodies).
-    var idleMarked: Bool = false
+    /// Idle reclaim (JeffJSLazyReclaim.swift): the runtime's reclaim phase
+    /// when the body was last seen in use — a call that had to go through
+    /// callInternal's payload path, a new closure made from it, or a reclaim
+    /// scan finding one of its function objects with `fbFast` set.
+    var touch: Int = 0
+    /// The reclaim cycle that last listed this function (dedup, no set).
+    var seenCycle: Int = 0
 
     init(seed: JeffJSLazySeed, script: JeffJSLazyScript) {
         self.seed = seed

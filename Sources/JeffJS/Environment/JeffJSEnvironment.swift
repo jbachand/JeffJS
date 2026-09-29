@@ -433,6 +433,30 @@ public final class JeffJSEnvironment {
     /// compiled on a first call (count, source KB, ms).
     public var lazyCompileSummary: String { runtime.lazyStats.description }
 
+    /// Lazy compilation counters as numbers: bodies compiled (first calls and
+    /// recompiles after an idle reclaim), their compile time, bodies dropped.
+    public var lazyCounters: (compiled: Int, compileMs: Double, dropped: Int, reclaimMs: Double) {
+        let s = runtime.lazyStats
+        return (s.compiled, s.compileMs, s.dropped, s.reclaimMs)
+    }
+
+    /// One complete idle-reclaim cycle now (`compile.lazyDropAfterMs`
+    /// semantics, JeffJSRuntime.reclaimIdleLazyBodies): bodies that have not
+    /// run since the previous cycle are dropped. Call with no JS running.
+    @discardableResult
+    public func reclaimIdleLazyBodies() -> (marked: Int, dropped: Int, bytes: Int) {
+        runtime.reclaimIdleLazyBodies()
+    }
+
+    /// What `compile.lazyDropOnMemoryPressure` does on a memory warning, now:
+    /// drop every lazily compiled body that can be dropped (`aggressive`) or
+    /// only the idle ones. Call with no JS running (e.g. from a host's own
+    /// memory-pressure handler on the JS thread).
+    @discardableResult
+    public func reclaimLazyBodiesNow(aggressive: Bool = true) -> (marked: Int, dropped: Int, bytes: Int) {
+        runtime.reclaimLazyBodiesNow(aggressive: aggressive)
+    }
+
     /// Write the function bodies compiled lazily since the last flush to the
     /// bytecode cache, so the next load of those scripts skips compiling
     /// them (they are written in batches as they compile, and at teardown).
