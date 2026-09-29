@@ -16,6 +16,9 @@ let jeffJSKeepTopLevelConstants = ProcessInfo.processInfo.environment["JEFFJS_EV
 /// JEFFJS_EVAL_KEEPNESTEDBODIES=1: release only the non-function constants
 /// (keep every nested function body of a finished script) (A/B).
 let jeffJSKeepNestedBodies = ProcessInfo.processInfo.environment["JEFFJS_EVAL_KEEPNESTEDBODIES"] == "1"
+/// JEFFJS_ERROR_KEEPMESSAGEREF=1: engine-thrown errors keep the extra
+/// reference to their message string (the leak before perf/memory-census, A/B).
+let jeffJSKeepErrorMessageRef = ProcessInfo.processInfo.environment["JEFFJS_ERROR_KEEPMESSAGEREF"] == "1"
 #if canImport(CoreFoundation)
 import CoreFoundation
 #endif
@@ -5527,9 +5530,13 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         // §20.5.6.1.1). Both used to be enumerable own properties, so
         // `JSON.stringify(e)` / `Object.keys(e)` of an engine error showed
         // them (JavaScriptCore: `{}` / `[]`).
+        // defineProperty dups the value: release the creation reference (every
+        // engine-thrown error leaked its message string; perf/memory-census).
+        let messageVal = newStringValue(message)
         _ = definePropertyValue(obj: errObj, atom: JeffJSAtomID.JS_ATOM_message.rawValue,
-                                value: newStringValue(message),
+                                value: messageVal,
                                 flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+        if !jeffJSKeepErrorMessageRef { messageVal.freeValue() }
 
         // Set stack property with source location from call frames
         // Guard against re-entrant / deeply nested errors that may corrupt frame state
