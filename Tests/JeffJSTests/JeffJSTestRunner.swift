@@ -332,6 +332,7 @@ struct JeffJSTestRunner {
             ("ClassConstructorCall", { $0.testClassConstructorCall() }),
             ("ProgramCompletion", { $0.testProgramCompletion() }),
             ("Redeclaration", { $0.testRedeclaration() }),
+            ("DOMParserInsertion", { $0.testDOMParserInsertion() }),
         ]
     }
 

@@ -166,6 +166,13 @@ final class JeffJSDOMBridge {
     var moObservers: [Int: JeffJSMutationObserverEntry] = [:]
     var moRegistrations: [UUID: [JeffJSMutationRegistration]] = [:]
     var moDeliveryScheduled = false
+    /// Parser-insertion emulation (see `noteParserInsertions(upTo:)`): the
+    /// parser's output in document order (with depths), taken before the first
+    /// script ran, and the index of the last node already "inserted".
+    var parserOrder: [(node: DOMNode, depth: Int)] = []
+    var parserInsertedThrough = -1
+    var parserInsertionsStarted = false
+    var parserInsertionsDone = false
 
     /// The focused element (HTML "focused area"); nil = the viewport/body.
     weak var focusedElement: DOMNode?
@@ -238,6 +245,10 @@ final class JeffJSDOMBridge {
 
         elementPrototype?.freeValue()
         elementPrototype = nil
+        parserOrder = []
+        parserInsertedThrough = -1
+        parserInsertionsStarted = false
+        parserInsertionsDone = false
 
         domRectPrototype?.freeValue()
         domRectPrototype = nil
@@ -343,6 +354,9 @@ final class JeffJSDOMBridge {
     /// Pass `nil` when evaluation finishes.
     func setCurrentScriptNode(_ node: DOMNode?) {
         currentScriptNode = node
+        // A parser-inserted script is about to run: the parser's insertions
+        // since the previous one reach the MutationObservers first.
+        if let node, !parserInsertionsDone { noteParserInsertions(upTo: node) }
     }
 
     /// Elements whose `src` IDL attribute reflects as a URL.
@@ -713,6 +727,10 @@ final class JeffJSDOMBridge {
             }
             self.currentScriptNode = self.nodeRegistry[uuid]
                 ?? self.findElement(in: self.root, where: { $0.id == uuid })
+            // The host's way of starting a script (see setCurrentScriptNode).
+            if let n = self.currentScriptNode, !self.parserInsertionsDone {
+                self.noteParserInsertions(upTo: n)
+            }
             return JeffJSValue.undefined
         }, length: 1)
     }
@@ -3053,6 +3071,8 @@ final class JeffJSDOMBridge {
         // HTML §6.6.5: autofocus candidates are flushed at the next rendering
         // update after parsing — a queued task here.
         if value == "interactive" {
+            // Parsing finished: the rest of the parser's insertions.
+            noteParserInsertions(upTo: nil)
             queueTask { [weak self] in self?.runAutofocus() }
         }
     }
