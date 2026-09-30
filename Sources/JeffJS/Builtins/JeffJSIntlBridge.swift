@@ -1314,6 +1314,13 @@ extension JeffJSIntlBridge {
 
     func installHooks(ctx: JeffJSContext, n: JeffJSValue) {
 
+        // The shim's functions are shaped like natives (JeffJSContext.markPlatformFunction).
+        ctx.setPropertyFunc(obj: n, name: "markNative", fn: { ctx, _, args in
+            guard let f = args.first else { return .undefined }
+            ctx.markPlatformFunction(f, isConstructor: args.count > 1 && args[1].isBool && args[1].toBool())
+            return .undefined
+        }, length: 2)
+
         // ---- NumberFormat ----
 
         ctx.setPropertyFunc(obj: n, name: "resolveNumber", fn: { [weak self] ctx, _, args in
@@ -1620,7 +1627,18 @@ extension JeffJSIntlBridge {
       // record rather than over the instance: `fn.bind(this)` stored on the
       // instance would be a reference cycle, and cycles are never collected
       // during a run.
-      function ownMethod(o, name, fn) { hide(o, name, fn); }
+      function ownMethod(o, name, fn) { st(o)['$' + name] = fn; }
+      // Internal slots (ECMA-402 [[InitializedDateTimeFormat]] …) live in a
+      // WeakMap, not in own `_r` / `format` properties: an Intl object has no own
+      // properties in WebKit (`Object.getOwnPropertyNames(new Intl.DateTimeFormat())`
+      // is []), and its bound `format` / `compare` come from prototype getters.
+      var SLOTS = (typeof WeakMap === 'function') ? new WeakMap() : null;
+      function st(o) { var r = SLOTS.get(o); if (!r) { r = {}; SLOTS.set(o, r); } return r; }
+      function sl(o) {
+        var r = (o !== null && (typeof o === 'object' || typeof o === 'function')) ? SLOTS.get(o) : undefined;
+        if (!r) { throw new TypeError('Receiver is not an Intl object'); }
+        return r;
+      }
       function pub(r) {
         var out = {};
         var keys = (r && r._pub) || [];
@@ -1637,83 +1655,83 @@ extension JeffJSIntlBridge {
       function NumberFormat(locales, options) {
         if (!(this instanceof NumberFormat)) { return new NumberFormat(locales, options); }
         var r = N.resolveNumber(locales, options);
-        hide(this, '_r', r);
+        st(this)._r = r;
         ownMethod(this, 'format', function format(value) {
           return N.formatNumber(r, value === undefined ? NaN : Number(value));
         });
       }
       NumberFormat.prototype.format = function (value) {
-        return N.formatNumber(this._r, value === undefined ? NaN : Number(value));
+        return N.formatNumber(sl(this)._r, value === undefined ? NaN : Number(value));
       };
       NumberFormat.prototype.formatToParts = function (value) {
-        return N.formatNumberParts(this._r, value === undefined ? NaN : Number(value));
+        return N.formatNumberParts(sl(this)._r, value === undefined ? NaN : Number(value));
       };
       NumberFormat.prototype.formatRange = function (a, b) {
         var x = this.format(a), y = this.format(b);
         return x === y ? x : (x + '–' + y);
       };
-      NumberFormat.prototype.resolvedOptions = function () { return pub(this._r); };
+      NumberFormat.prototype.resolvedOptions = function () { return pub(sl(this)._r); };
 
       // ---------------- Intl.DateTimeFormat ----------------
       function DateTimeFormat(locales, options) {
         if (!(this instanceof DateTimeFormat)) { return new DateTimeFormat(locales, options); }
         var r = N.resolveDate(locales, options);
-        hide(this, '_r', r);
+        st(this)._r = r;
         ownMethod(this, 'format', function format(date) {
           return N.formatDate(r, toTime(date));
         });
       }
       DateTimeFormat.prototype.format = function (date) {
-        return N.formatDate(this._r, toTime(date));
+        return N.formatDate(sl(this)._r, toTime(date));
       };
       DateTimeFormat.prototype.formatToParts = function (date) {
-        return N.formatDateParts(this._r, toTime(date));
+        return N.formatDateParts(sl(this)._r, toTime(date));
       };
       DateTimeFormat.prototype.formatRange = function (start, end) {
-        var a = N.formatDate(this._r, toTime(start));
-        var b = N.formatDate(this._r, toTime(end));
+        var a = N.formatDate(sl(this)._r, toTime(start));
+        var b = N.formatDate(sl(this)._r, toTime(end));
         return a === b ? a : (a + ' – ' + b);
       };
       DateTimeFormat.prototype.formatRangeToParts = function (start, end) {
-        var a = N.formatDateParts(this._r, toTime(start));
-        var b = N.formatDateParts(this._r, toTime(end));
+        var a = N.formatDateParts(sl(this)._r, toTime(start));
+        var b = N.formatDateParts(sl(this)._r, toTime(end));
         var out = [], i;
         for (i = 0; i < a.length; i++) { a[i].source = 'startRange'; out.push(a[i]); }
         out.push({ type: 'literal', value: ' – ', source: 'shared' });
         for (i = 0; i < b.length; i++) { b[i].source = 'endRange'; out.push(b[i]); }
         return out;
       };
-      DateTimeFormat.prototype.resolvedOptions = function () { return pub(this._r); };
+      DateTimeFormat.prototype.resolvedOptions = function () { return pub(sl(this)._r); };
 
       // ---------------- Intl.Collator ----------------
       function Collator(locales, options) {
         if (!(this instanceof Collator)) { return new Collator(locales, options); }
         var r = N.resolveCollator(locales, options);
-        hide(this, '_r', r);
+        st(this)._r = r;
         ownMethod(this, 'compare', function compare(a, b) {
           return N.compare(r, String(a), String(b));
         });
       }
       Collator.prototype.compare = function (a, b) {
-        return N.compare(this._r, String(a), String(b));
+        return N.compare(sl(this)._r, String(a), String(b));
       };
-      Collator.prototype.resolvedOptions = function () { return pub(this._r); };
+      Collator.prototype.resolvedOptions = function () { return pub(sl(this)._r); };
 
       // ---------------- Intl.PluralRules ----------------
       function PluralRules(locales, options) {
         if (!(this instanceof PluralRules)) { return new PluralRules(locales, options); }
         var r = N.resolvePlural(locales, options);
-        hide(this, '_r', r);
+        st(this)._r = r;
         ownMethod(this, 'select', function select(value) {
           return N.plural(r, Number(value));
         });
       }
-      PluralRules.prototype.select = function (value) { return N.plural(this._r, Number(value)); };
+      PluralRules.prototype.select = function (value) { return N.plural(sl(this)._r, Number(value)); };
       PluralRules.prototype.selectRange = function (a, b) {
-        var x = N.plural(this._r, Number(a)), y = N.plural(this._r, Number(b));
+        var x = N.plural(sl(this)._r, Number(a)), y = N.plural(sl(this)._r, Number(b));
         return x === y ? x : 'other';
       };
-      PluralRules.prototype.resolvedOptions = function () { return pub(this._r); };
+      PluralRules.prototype.resolvedOptions = function () { return pub(sl(this)._r); };
 
       // ---------------- Intl.RelativeTimeFormat ----------------
       function RelativeTimeFormat(locales, options) {
@@ -1728,22 +1746,22 @@ extension JeffJSIntlBridge {
           throw new RangeError('Value ' + style + ' out of range for Intl.RelativeTimeFormat options property style');
         }
         var loc = N.canonical(locales)[0] || N.defaultLocale();
-        hide(this, '_locale', loc);
-        hide(this, '_numeric', numeric);
-        hide(this, '_style', style);
+        st(this)._locale = loc;
+        st(this)._numeric = numeric;
+        st(this)._style = style;
         ownMethod(this, 'format', function format(value, unit) {
           return N.relative(loc, numeric, Number(value), String(unit), style);
         });
       }
       RelativeTimeFormat.prototype.format = function (value, unit) {
-        return N.relative(this._locale, this._numeric, Number(value), String(unit), this._style);
+        return N.relative(sl(this)._locale, sl(this)._numeric, Number(value), String(unit), sl(this)._style);
       };
       // ECMA-402 §17.5.3 PartitionRelativeTimePattern: the number's parts
       // (tagged with the singular unit) between the pattern's literals.
       RelativeTimeFormat.prototype.formatToParts = function (value, unit) {
         var text = this.format(value, unit);
         var u = String(unit).replace(/s$/, '');
-        var nf = new NumberFormat(this._locale);
+        var nf = new NumberFormat(sl(this)._locale);
         var num = nf.format(Math.abs(Number(value)));
         var i = text.indexOf(num);
         if (i < 0) return [{ type: 'literal', value: text }];
@@ -1755,7 +1773,7 @@ extension JeffJSIntlBridge {
         return out;
       };
       RelativeTimeFormat.prototype.resolvedOptions = function () {
-        return { locale: this._locale, style: this._style, numeric: this._numeric,
+        return { locale: sl(this)._locale, style: sl(this)._style, numeric: sl(this)._numeric,
                  numberingSystem: 'latn' };
       };
 
@@ -1769,9 +1787,9 @@ extension JeffJSIntlBridge {
         }
         var style = o.style === undefined ? 'long' : String(o.style);
         var loc = N.canonical(locales)[0] || N.defaultLocale();
-        hide(this, '_locale', loc);
-        hide(this, '_type', type);
-        hide(this, '_style', style);
+        st(this)._locale = loc;
+        st(this)._type = type;
+        st(this)._style = style;
         ownMethod(this, 'format', function format(list) {
           return N.list(loc, type, listToArray(list));
         });
@@ -1787,13 +1805,13 @@ extension JeffJSIntlBridge {
         return out;
       };
       ListFormat.prototype.format = function (list) {
-        return N.list(this._locale, this._type, listToArray(list));
+        return N.list(sl(this)._locale, sl(this)._type, listToArray(list));
       };
       ListFormat.prototype.formatToParts = function (list) {
         return [{ type: 'literal', value: this.format(list) }];
       };
       ListFormat.prototype.resolvedOptions = function () {
-        return { locale: this._locale, type: this._type, style: this._style };
+        return { locale: sl(this)._locale, type: sl(this)._type, style: sl(this)._style };
       };
 
       // ---------------- Intl.DisplayNames ----------------
@@ -1806,10 +1824,10 @@ extension JeffJSIntlBridge {
         if (type === undefined) { throw new TypeError('type must be provided'); }
         var loc = N.canonical(locales)[0] || N.defaultLocale();
         var fallback = o.fallback === undefined ? 'code' : String(o.fallback);
-        hide(this, '_locale', loc);
-        hide(this, '_type', type);
-        hide(this, '_style', o.style === undefined ? 'long' : String(o.style));
-        hide(this, '_fallback', fallback);
+        st(this)._locale = loc;
+        st(this)._type = type;
+        st(this)._style = o.style === undefined ? 'long' : String(o.style);
+        st(this)._fallback = fallback;
         ownMethod(this, 'of', function of(code) {
           var c = String(code);
           var name = N.display(loc, type, c);
@@ -1819,13 +1837,13 @@ extension JeffJSIntlBridge {
       }
       DisplayNames.prototype.of = function (code) {
         var c = String(code);
-        var name = N.display(this._locale, this._type, c);
-        if (name === undefined) { return this._fallback === 'none' ? undefined : c; }
+        var name = N.display(sl(this)._locale, sl(this)._type, c);
+        if (name === undefined) { return sl(this)._fallback === 'none' ? undefined : c; }
         return name;
       };
       DisplayNames.prototype.resolvedOptions = function () {
-        return { locale: this._locale, style: this._style, type: this._type,
-                 fallback: this._fallback };
+        return { locale: sl(this)._locale, style: sl(this)._style, type: sl(this)._type,
+                 fallback: sl(this)._fallback };
       };
 
       // ---------------- Intl.Locale ----------------
@@ -1846,12 +1864,12 @@ extension JeffJSIntlBridge {
         if (this.script) { base += '-' + this.script; }
         if (this.region) { base += '-' + this.region; }
         this.baseName = base;
-        hide(this, '_tag', base);
+        st(this)._tag = base;
       }
-      Locale.prototype.toString = function () { return this._tag; };
+      Locale.prototype.toString = function () { return sl(this)._tag; };
       Locale.prototype.maximize = function () { return this; };
       Locale.prototype.minimize = function () { return this; };
-      Locale.prototype.toJSON = function () { return this._tag; };
+      Locale.prototype.toJSON = function () { return sl(this)._tag; };
 
       // ---------------- Intl.Segmenter (grapheme) ----------------
       function makeSegments(arr) {
@@ -1888,8 +1906,8 @@ extension JeffJSIntlBridge {
         if (granularity !== 'grapheme' && granularity !== 'word' && granularity !== 'sentence') {
           throw new RangeError('Value ' + granularity + ' out of range for Intl.Segmenter options property granularity');
         }
-        hide(this, '_locale', N.canonical(locales)[0] || N.defaultLocale());
-        hide(this, '_granularity', granularity);
+        st(this)._locale = N.canonical(locales)[0] || N.defaultLocale();
+        st(this)._granularity = granularity;
         ownMethod(this, 'segment', function segment(input) {
           return makeSegments(N.segments(String(input)));
         });
@@ -1898,7 +1916,7 @@ extension JeffJSIntlBridge {
         return makeSegments(N.segments(String(input)));
       };
       Segmenter.prototype.resolvedOptions = function () {
-        return { locale: this._locale, granularity: this._granularity };
+        return { locale: sl(this)._locale, granularity: sl(this)._granularity };
       };
 
       // ---------------- namespace ----------------
@@ -1923,6 +1941,48 @@ extension JeffJSIntlBridge {
       if (typeof Symbol !== 'undefined' && typeof Symbol.toStringTag !== 'undefined') {
         hide(Intl, Symbol.toStringTag, 'Intl');
       }
+
+      // Shape every function above like one of WebKit's natives (engine-marked:
+      // native toString, no [[Construct]] / prototype unless a constructor), with
+      // WebIDL-like attributes: prototype methods non-enumerable and named after
+      // their key, `format` / `compare` bound getters (ECMA-402 §11.3.3, §15.3.3,
+      // §10.3.3), prototypes tagged "Intl.X" (@@toStringTag). akamai sensor 2 fix.
+      var markNative = (typeof N.markNative === 'function') ? N.markNative : function () {};
+      function nameFn(f, n) {
+        if (typeof f !== 'function' || f.name === n) { return; }
+        try { Object.defineProperty(f, 'name', { value: n, writable: false, enumerable: false, configurable: true }); } catch (e) {}
+      }
+      function nativeMembers(o) {
+        var keys = Object.getOwnPropertyNames(o);
+        for (var i = 0; i < keys.length; i++) {
+          var k = keys[i], d = Object.getOwnPropertyDescriptor(o, k);
+          if (!d || k === 'constructor' || k === 'prototype') { continue; }
+          if (typeof d.value === 'function') {
+            nameFn(d.value, k); markNative(d.value, false);
+            if (d.enumerable) { try { Object.defineProperty(o, k, { enumerable: false }); } catch (e) {} }
+          }
+          if (d.get) { nameFn(d.get, 'get ' + k); markNative(d.get, false); }
+        }
+      }
+      function boundGetter(C, key) {
+        var get = { get: function () { var f = sl(this)['$' + key]; return f; } }.get;
+        nameFn(get, 'get ' + key); markNative(get, false);
+        try { Object.defineProperty(C.prototype, key, { get: get, enumerable: false, configurable: true }); } catch (e) {}
+      }
+      boundGetter(NumberFormat, 'format');
+      boundGetter(DateTimeFormat, 'format');
+      boundGetter(Collator, 'compare');
+      var allCtors = ctors.concat([Locale]);
+      for (var ci = 0; ci < allCtors.length; ci++) {
+        var C = allCtors[ci], tagName = 'Intl.' + C.name;
+        markNative(C, true);
+        nativeMembers(C);
+        nativeMembers(C.prototype);
+        if (typeof Symbol !== 'undefined' && Symbol.toStringTag) {
+          try { Object.defineProperty(C.prototype, Symbol.toStringTag, { value: tagName, writable: false, enumerable: false, configurable: true }); } catch (e) {}
+        }
+      }
+      nativeMembers(Intl);
 
       g.Intl = Intl;
       if (typeof window !== 'undefined' && window !== g) { window.Intl = Intl; }
@@ -1969,6 +2029,11 @@ extension JeffJSIntlBridge {
         }
         return out.join(',');
       });
+
+      var lb = [[Number.prototype, 'toLocaleString'], [Date.prototype, 'toLocaleDateString'],
+                [Date.prototype, 'toLocaleTimeString'], [Date.prototype, 'toLocaleString'],
+                [String.prototype, 'localeCompare'], [Array.prototype, 'toLocaleString']];
+      for (var li = 0; li < lb.length; li++) { var lf = lb[li][0][lb[li][1]]; nameFn(lf, lb[li][1]); markNative(lf, false); }
     })();
     """#
 }

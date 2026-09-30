@@ -978,9 +978,9 @@ func jsDate_setMonth(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Jeff
 
 /// setFullYear([year [, month [, date]]])
 func jsDate_setFullYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+    // ES §21.4.4.21 step 3: "If t is NaN, set t to +0; otherwise LocalTime(t)".
     var t = getDateValue(thisVal)
-    if t.isNaN { t = 0 }
-    t = localTime(t)
+    t = t.isNaN ? 0 : localTime(t)
     let y = optArg(argv, 0) ?? yearFromTime(t)
     let m = optArg(argv, 1) ?? monthFromTime(t)
     let dt = optArg(argv, 2) ?? dateFromTime(t)
@@ -1211,11 +1211,59 @@ func jsDate_toLocaleTimeString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ a
     return .makeString(JeffJSString(swiftString: JeffJSIntlBridge.webKitSpaces(formatter.string(from: date))))
 }
 
-/// toJSON()
+/// toJSON(key) — ES §21.4.4.37, generic: ToPrimitive(this, number); a
+/// non-finite number is null, else Invoke(this, "toISOString").
 func jsDate_toJSON(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+    if thisVal.isUndefined || thisVal.isNull {
+        return ctx.throwTypeError(message: "Type error")
+    }
+    let tv = JeffJSTypeConvert.toPrimitive(ctx: ctx, val: thisVal, hint: HINT_NUMBER)
+    if tv.isException { return .exception }
+    if tv.isNumber {
+        let d = tv.isInt ? Double(tv.toInt32()) : tv.toFloat64()
+        if !d.isFinite { return .null }
+    }
+    tv.freeValue()
+    let method = ctx.getPropertyStr(obj: thisVal, name: "toISOString")
+    if method.isException { return .exception }
+    guard method.isFunction else {
+        method.freeValue()
+        return ctx.throwTypeError(message: "toISOString is not a function")
+    }
+    let r = ctx.callFunction(method, thisVal: thisVal, args: [])
+    method.freeValue()
+    return r
+}
+
+/// getYear() — Annex B §B.2.3.1: YearFromTime(LocalTime(t)) − 1900.
+func jsDate_getYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
-    if t.isNaN || t.isInfinite { return .null }
-    return jsDate_toISOString(ctx, thisVal, argv)
+    if t.isNaN { return .newFloat64(Double.nan) }
+    return .newFloat64(yearFromTime(localTime(t)) - 1900)
+}
+
+/// setYear(year) — Annex B §B.2.3.2 (0…99 means 1900…1999). `argv` is
+/// already numeric (the prototype wrapper converts setter arguments).
+func jsDate_setYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+    var t = getDateValue(thisVal)
+    t = t.isNaN ? 0 : localTime(t)
+    let y = optArg(argv, 0) ?? Double.nan
+    if y.isNaN {
+        setDateValue(thisVal, Double.nan)
+        return .newFloat64(Double.nan)
+    }
+    let yi = y.isInfinite ? y : y.rounded(.towardZero)
+    let yyyy = (yi >= 0 && yi <= 99) ? 1900 + yi : y
+    let d = makeDay(yyyy, monthFromTime(t), dateFromTime(t))
+    let u = timeClip(utcTime(makeDate(d, timeWithinDay(t))))
+    setDateValue(thisVal, u)
+    return .newFloat64(u)
+}
+
+/// True when `v` is a Date object (thisTimeValue's check).
+func jsDate_isDate(_ v: JeffJSValue) -> Bool {
+    guard let obj = v.toObject() else { return false }
+    return obj.classID == JeffJSClassID.date.rawValue
 }
 
 /// valueOf()
@@ -1223,19 +1271,38 @@ func jsDate_valueOf(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJ
     return .newFloat64(getDateValue(thisVal))
 }
 
-/// [Symbol.toPrimitive](hint)
+/// [Symbol.toPrimitive](hint) — ES §21.4.4.45: `this` must be an object; the
+/// hint must be "string", "default" (string first) or "number" (number first);
+/// then OrdinaryToPrimitive. Messages are JavaScriptCore's.
 func jsDate_toPrimitive(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
-    // If hint is "number" or "default", return valueOf(); if "string", return toString().
-    var hint = "default"
+    guard thisVal.isObject else {
+        return ctx.throwTypeError(message: "Date.prototype[Symbol.toPrimitive] expected |this| to be an object.")
+    }
+    var hint = ""
     if argv.count >= 1, argv[0].isString, let s = argv[0].stringValue {
         hint = s.toSwiftString()
     }
-
-    if hint == "number" {
-        return jsDate_valueOf(ctx, thisVal, [])
+    let order: [String]
+    switch hint {
+    case "string", "default": order = ["toString", "valueOf"]
+    case "number": order = ["valueOf", "toString"]
+    default:
+        return ctx.throwTypeError(message: "Date.prototype[Symbol.toPrimitive] expected |hint| to be one of 'string', 'default', or 'number'.")
     }
-    // "string" or "default" -> toString
-    return jsDate_toString(ctx, thisVal, [])
+    for name in order {
+        let method = ctx.getPropertyStr(obj: thisVal, name: name)
+        if method.isException { return .exception }
+        if method.isFunction {
+            let r = ctx.callFunction(method, thisVal: thisVal, args: [])
+            method.freeValue()
+            if r.isException { return .exception }
+            if !r.isObject { return r }
+            r.freeValue()
+        } else {
+            method.freeValue()
+        }
+    }
+    return ctx.throwTypeError(message: "No default value")
 }
 
 // MARK: - Date Built-in Installation
@@ -1247,61 +1314,105 @@ func jeffJS_initDate(ctx: JeffJSContext, globalObj: JeffJSObject) {
     let dateProto = jeffJS_createObject(ctx: ctx, proto: objectProto, classID: UInt16(JeffJSClassID.date.rawValue))
     dateProto.payload = JeffJSObjectPayload.objectData(JeffJSValue.newFloat64(Double.nan))
 
-    // Prototype methods
+    // Prototype methods, in JavaScriptCore's order (DatePrototype.cpp; pages
+    // fingerprint `Object.getOwnPropertyNames(Date.prototype)`), Annex B
+    // getYear/setYear included and toGMTString the *same* function object as
+    // toUTCString (Annex B §B.2.3.3).
+    //
+    // Every method except toJSON checks thisTimeValue ("Type error" in JSC,
+    // `Date.prototype.getTime.call({})` returned NaN), and every setter's
+    // arguments go through ToNumber first (a string year gave NaN; a missing
+    // or undefined argument is NaN, not "keep the current field").
     let protoMethods: [(String, Int, (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue)] = [
-        ("getTime", 0, jsDate_getTime),
-        ("getFullYear", 0, jsDate_getFullYear),
-        ("getMonth", 0, jsDate_getMonth),
-        ("getDate", 0, jsDate_getDate),
-        ("getDay", 0, jsDate_getDay),
-        ("getHours", 0, jsDate_getHours),
-        ("getMinutes", 0, jsDate_getMinutes),
-        ("getSeconds", 0, jsDate_getSeconds),
-        ("getMilliseconds", 0, jsDate_getMilliseconds),
-        ("getTimezoneOffset", 0, jsDate_getTimezoneOffset),
-        ("getUTCFullYear", 0, jsDate_getUTCFullYear),
-        ("getUTCMonth", 0, jsDate_getUTCMonth),
-        ("getUTCDate", 0, jsDate_getUTCDate),
-        ("getUTCDay", 0, jsDate_getUTCDay),
-        ("getUTCHours", 0, jsDate_getUTCHours),
-        ("getUTCMinutes", 0, jsDate_getUTCMinutes),
-        ("getUTCSeconds", 0, jsDate_getUTCSeconds),
-        ("getUTCMilliseconds", 0, jsDate_getUTCMilliseconds),
-        ("setTime", 1, jsDate_setTime),
-        ("setMilliseconds", 1, jsDate_setMilliseconds),
-        ("setSeconds", 2, jsDate_setSeconds),
-        ("setMinutes", 3, jsDate_setMinutes),
-        ("setHours", 4, jsDate_setHours),
-        ("setDate", 1, jsDate_setDate),
-        ("setMonth", 2, jsDate_setMonth),
-        ("setFullYear", 3, jsDate_setFullYear),
-        ("setUTCMilliseconds", 1, jsDate_setUTCMilliseconds),
-        ("setUTCSeconds", 2, jsDate_setUTCSeconds),
-        ("setUTCMinutes", 3, jsDate_setUTCMinutes),
-        ("setUTCHours", 4, jsDate_setUTCHours),
-        ("setUTCDate", 1, jsDate_setUTCDate),
-        ("setUTCMonth", 2, jsDate_setUTCMonth),
-        ("setUTCFullYear", 3, jsDate_setUTCFullYear),
         ("toString", 0, jsDate_toString),
+        ("toISOString", 0, jsDate_toISOString),
         ("toDateString", 0, jsDate_toDateString),
         ("toTimeString", 0, jsDate_toTimeString),
-        ("toISOString", 0, jsDate_toISOString),
-        ("toUTCString", 0, jsDate_toUTCString),
-        ("toGMTString", 0, jsDate_toUTCString),  // alias
         ("toLocaleString", 0, jsDate_toLocaleString),
         ("toLocaleDateString", 0, jsDate_toLocaleDateString),
         ("toLocaleTimeString", 0, jsDate_toLocaleTimeString),
-        ("toJSON", 1, jsDate_toJSON),
         ("valueOf", 0, jsDate_valueOf),
+        ("getTime", 0, jsDate_getTime),
+        ("getFullYear", 0, jsDate_getFullYear),
+        ("getUTCFullYear", 0, jsDate_getUTCFullYear),
+        ("getMonth", 0, jsDate_getMonth),
+        ("getUTCMonth", 0, jsDate_getUTCMonth),
+        ("getDate", 0, jsDate_getDate),
+        ("getUTCDate", 0, jsDate_getUTCDate),
+        ("getDay", 0, jsDate_getDay),
+        ("getUTCDay", 0, jsDate_getUTCDay),
+        ("getHours", 0, jsDate_getHours),
+        ("getUTCHours", 0, jsDate_getUTCHours),
+        ("getMinutes", 0, jsDate_getMinutes),
+        ("getUTCMinutes", 0, jsDate_getUTCMinutes),
+        ("getSeconds", 0, jsDate_getSeconds),
+        ("getUTCSeconds", 0, jsDate_getUTCSeconds),
+        ("getMilliseconds", 0, jsDate_getMilliseconds),
+        ("getUTCMilliseconds", 0, jsDate_getUTCMilliseconds),
+        ("getTimezoneOffset", 0, jsDate_getTimezoneOffset),
+        ("getYear", 0, jsDate_getYear),
+        ("setTime", 1, jsDate_setTime),
+        ("setMilliseconds", 1, jsDate_setMilliseconds),
+        ("setUTCMilliseconds", 1, jsDate_setUTCMilliseconds),
+        ("setSeconds", 2, jsDate_setSeconds),
+        ("setUTCSeconds", 2, jsDate_setUTCSeconds),
+        ("setMinutes", 3, jsDate_setMinutes),
+        ("setUTCMinutes", 3, jsDate_setUTCMinutes),
+        ("setHours", 4, jsDate_setHours),
+        ("setUTCHours", 4, jsDate_setUTCHours),
+        ("setDate", 1, jsDate_setDate),
+        ("setUTCDate", 1, jsDate_setUTCDate),
+        ("setMonth", 2, jsDate_setMonth),
+        ("setUTCMonth", 2, jsDate_setUTCMonth),
+        ("setFullYear", 3, jsDate_setFullYear),
+        ("setUTCFullYear", 3, jsDate_setUTCFullYear),
+        ("setYear", 1, jsDate_setYear),
+        ("toJSON", 1, jsDate_toJSON),
+        ("toUTCString", 0, jsDate_toUTCString),
     ]
 
+    let dateProtoVal0 = JeffJSValue.borrowedObject(dateProto)
     for (name, length, fn) in protoMethods {
-        jeffJS_defineBuiltinFunc(ctx: ctx, obj: dateProto, name: name, length: length, func: fn)
+        let wrapped: (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue
+        if name == "toJSON" {
+            wrapped = fn
+        } else if name.hasPrefix("set") {
+            wrapped = { c, thisVal, argv in
+                guard jsDate_isDate(thisVal) else { return c.throwTypeError(message: "Type error") }
+                var nums: [JeffJSValue] = []
+                nums.reserveCapacity(max(argv.count, 1))
+                for a in argv {
+                    let (d, ok) = JeffJSTypeConvert.toNumber(ctx: c, val: a)
+                    if !ok { return .exception }
+                    nums.append(.newFloat64(d))
+                }
+                if nums.isEmpty { nums.append(.newFloat64(Double.nan)) }
+                return fn(c, thisVal, nums)
+            }
+        } else {
+            wrapped = { c, thisVal, argv in
+                guard jsDate_isDate(thisVal) else { return c.throwTypeError(message: "Type error") }
+                return fn(c, thisVal, argv)
+            }
+        }
+        jeffJS_defineBuiltinFunc(ctx: ctx, obj: dateProto, name: name, length: length, func: wrapped)
     }
+    // toGMTString === toUTCString
+    let utcFn = ctx.getPropertyStr(obj: dateProtoVal0, name: "toUTCString")
+    let gmtAtom = ctx.rt.findAtom("toGMTString")
+    ctx.definePropertyValue(obj: dateProtoVal0, atom: gmtAtom, value: utcFn,
+                            flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+    ctx.rt.freeAtom(gmtAtom)
+    utcFn.freeValue()   // definePropertyValue dups
 
-    // [Symbol.toPrimitive]
-    jeffJS_defineBuiltinFunc(ctx: ctx, obj: dateProto, name: "[Symbol.toPrimitive]",
-                             length: 1, func: jsDate_toPrimitive)
+    // [Symbol.toPrimitive]: a symbol-keyed { writable: false, enumerable:
+    // false, configurable: true } method named "[Symbol.toPrimitive]" (it was
+    // installed under the *string* key "[Symbol.toPrimitive]", so
+    // `new Date(0) == new Date(0).toString()` was false).
+    let toPrimFn = ctx.newCFunction(jsDate_toPrimitive, name: "[Symbol.toPrimitive]", length: 1)
+    ctx.definePropertyValue(obj: dateProtoVal0, atom: JeffJSAtomID.JS_ATOM_Symbol_toPrimitive.rawValue,
+                            value: toPrimFn, flags: JS_PROP_CONFIGURABLE)
+    toPrimFn.freeValue()
 
     // Date constructor object
     let dateCtor = jeffJS_createObject(ctx: ctx, proto: nil, classID: UInt16(JeffJSClassID.cFunction.rawValue))

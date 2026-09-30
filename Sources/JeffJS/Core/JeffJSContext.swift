@@ -931,22 +931,20 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
 
         let funcVal = JeffJSValue.makeObject(obj)
 
-        // Set the name property. This used to intern the function's own name
-        // as the key, so every builtin got a junk self-named property
-        // ([].map had "map", not "name") and fn.name read back undefined.
-        _ = setPropertyInternal(
-            obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
-            value: newStringValue(name),
-            flags: JS_PROP_CONFIGURABLE
-        )
-
-        // Set the length property
-        let lengthAtom = JeffJSAtomID.JS_ATOM_length.rawValue
-        _ = setPropertyInternal(
-            obj: funcVal, atom: lengthAtom,
-            value: .newInt32(Int32(length)),
-            flags: JS_PROP_CONFIGURABLE
-        )
+        // `length` then `name`, each { writable: false, enumerable: false,
+        // configurable: true } (ES §10.2.9 SetFunctionName, §10.2.10
+        // SetFunctionLength, §10.3.4 CreateBuiltinFunction): JSC's own-key order
+        // is ["length", "name"]. These used to be [[Set]]s, which created
+        // writable + enumerable data properties in the order name, length —
+        // `for (k in Math.max)` listed both and Object.getOwnPropertyDescriptor
+        // told every native apart from JSC's (bot-defence "lie" checks).
+        // (Before that, the name was interned as a self-named junk key.)
+        definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
+                            value: .newInt32(Int32(length)), flags: JS_PROP_CONFIGURABLE)
+        let nameVal = newStringValue(name)
+        definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
+                            value: nameVal, flags: JS_PROP_CONFIGURABLE)
+        nameVal.freeValue()   // definePropertyValue dups
 
         return funcVal
     }
@@ -2205,6 +2203,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         objectProto.shape = createShape(self, proto: nil, hashSize: JS_PROP_INITIAL_HASH_SIZE, propSize: JS_PROP_INITIAL_SIZE)
         objectProto.clearProps()
         objectProto.proto = nil  // Object.prototype has no prototype ([[Prototype]] is null)
+        // An immutable prototype exotic object (ES §10.4.7): Object.setPrototypeOf(Object.prototype, x)
+        // throws, Reflect.setPrototypeOf answers false (JSC: "Cannot set prototype of immutable prototype object").
+        objectProto.hasImmutablePrototype = true
         let objectProtoVal = JeffJSValue.makeObject(objectProto)
         classProto[JSClassID.JS_CLASS_OBJECT.rawValue] = objectProtoVal
 
@@ -2884,6 +2885,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             let tagGetter = newCFunction({ ctx, this, _ in
                 jsTypedArray_toStringTag(ctx, this)
             }, name: "get [Symbol.toStringTag]", length: 0)
+            tagGetter.toObject()?.nativeNameKeepsAccessorPrefix = true
             _ = defineProperty(obj: taProto, atom: JeffJSAtomID.JS_ATOM_Symbol_toStringTag.rawValue,
                                value: .undefined, getter: tagGetter,
                                flags: JS_PROP_GETSET | JS_PROP_CONFIGURABLE)
@@ -3569,7 +3571,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         _ = definePropertyValue(obj: errObj, atom: JeffJSAtomID.JS_ATOM_errors.rawValue,
                                 value: newArrayFrom(errors.map { $0.dupValue() }),
                                 flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
-        attachPendingStack(errObj, errorName: "AggregateError", message: "")
+        attachPendingStack(errObj, errorName: "AggregateError", message: "", fromConstructor: true)
         return errObj
     }
 
@@ -3618,7 +3620,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             // `stack` carries the call site: header + one "at fn (file:line:col)"
             // line per live interpreter frame. The frames are captured now and
             // the string is built on first read.
-            self.attachPendingStack(errObj, errorName: "Error", message: msgStr)
+            self.attachPendingStack(errObj, errorName: "Error", message: msgStr, fromConstructor: true)
             return errObj
         }, name: "Error", length: 1)
         // Set Error.prototype on constructor and Error.prototype.constructor = Error
@@ -3679,7 +3681,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                                                  value: self.newArrayFrom(list),
                                                  flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
                 }
-                self.attachPendingStack(errObj, errorName: capturedName, message: msgStr)
+                self.attachPendingStack(errObj, errorName: capturedName, message: msgStr, fromConstructor: true)
                 return errObj
             }, name: name, length: isAggregate ? 2 : 1)
             // Every NativeError constructor's [[Prototype]] is %Error% (§20.5.6.2, §20.5.7.2).
@@ -4484,6 +4486,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 guard let self = self else { return .exception }
                 return getterImpl(self, thisVal)
             }, name: "get \(name)", length: 0)
+            getterFn.toObject()?.nativeNameKeepsAccessorPrefix = true
             setPropertyGetSet(obj: proto, name: name, getter: getterFn, setter: nil)
         }
     }
@@ -4769,11 +4772,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             if !proto.isObject && !proto.isNull {
                 return self.throwTypeError(message: "prototype must be an object or null")
             }
-            if let targetObj = args[0].toObject() {
-                let protoObj = proto.isObject ? proto.toObject() : nil
-                targetObj.proto = protoObj
-            }
-            return .JS_TRUE
+            // [[SetPrototypeOf]] (ES §10.1.2): false for a cycle, a non-extensible
+            // target or Object.prototype, never a throw.
+            return self.setPrototypeOf(args[0], proto: proto) ? .JS_TRUE : .JS_FALSE
         }, name: "setPrototypeOf", length: 2)
         _ = setPropertyStr(obj: reflectObj, name: "setPrototypeOf", value: reflSetPrototypeOf)
     }
@@ -5423,27 +5424,65 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// This is all `stack` needs, and it costs one small array instead of
     /// formatting a multi-line string on every `new Error()`.
     func captureStackFrames(maxDepth: Int = 100) -> [(fb: JeffJSFunctionBytecode, pc: Int)] {
+        var natives: [(before: Int, name: String)] = []
+        return captureStackFrames(maxDepth: maxDepth, natives: &natives, skipInnermostNative: true)
+    }
+
+    /// The frames JavaScriptCore puts in `Error.stack`, innermost first, and the
+    /// host functions among them (`natives`: a `name@[native code]` line above the
+    /// script frame at `before`). As in JSC (ES2015 proper tail calls, strict
+    /// code only), a strict function suspended in `return f(…)` — a tail call —
+    /// has no frame of its own. `skipInnermostNative`: the innermost native is
+    /// the Error constructor itself (`new Error()`), which JSC does not list.
+    func captureStackFrames(maxDepth: Int, natives: inout [(before: Int, name: String)],
+                            skipInnermostNative: Bool) -> [(fb: JeffJSFunctionBytecode, pc: Int)] {
         var out: [(fb: JeffJSFunctionBytecode, pc: Int)] = []
         out.reserveCapacity(8)
         var frame = currentFrame
+        var first = true
         while let f = frame, out.count < maxDepth {
+            if let native = f.nativeCallee, !(first && skipInnermostNative) {
+                let nameVal = native.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_name.rawValue)
+                let raw = nameVal.isString ? (nameVal.stringValue?.toSwiftString() ?? "") : ""
+                // Function.prototype.call / apply never show (JSC compiles them to
+                // direct calls: `f.call(o)` is f's frame, then the caller's).
+                if raw != "call" && raw != "apply" {
+                    natives.append((before: out.count, name: JeffJSBuiltinFunction.nativeCodeName(raw)))
+                }
+            }
             if let obj = f.curFunc.toObject(),
                case .bytecodeFunc(let fbOpt, _, _) = obj.payload,
                let fb = fbOpt {
-                out.append((fb, f.curPC))
+                if !first, fb.isStrictMode, !fb.isGenerator, !fb.isAsyncFunc,
+                   JeffJSContext.isTailCall(fb, f.curPC) {
+                    // Proper tail call: the frame was replaced by its callee.
+                } else {
+                    out.append((fb, f.curPC))
+                }
             }
+            first = false
             frame = f.prevFrame
         }
         return out
     }
 
+    /// Whether the instruction at `pc` is a tail call (`return f(…)` compiled to
+    /// tail_call / tail_call_method by the peephole).
+    static func isTailCall(_ fb: JeffJSFunctionBytecode, _ pc: Int) -> Bool {
+        guard pc >= 0, pc < fb.bytecode.count else { return false }
+        let op = UInt16(fb.bytecode[pc])
+        return op == JeffJSOpcode.tail_call.rawValue || op == JeffJSOpcode.tail_call_method.rawValue
+    }
+
     /// Attach the deferred `stack` of an error object: the frames are captured
     /// now, the string is built on first read.
-    func attachPendingStack(_ errObj: JeffJSValue, errorName: String, message: String) {
+    func attachPendingStack(_ errObj: JeffJSValue, errorName: String, message: String,
+                            fromConstructor: Bool = false) {
         guard let jsObj = errObj.toObject() else { return }
-        let frames = captureStackFrames()
+        var natives: [(before: Int, name: String)] = []
+        let frames = captureStackFrames(maxDepth: 100, natives: &natives, skipInnermostNative: fromConstructor)
         jsObj.setPendingStack(JeffJSPendingStack(errorName: errorName, message: message,
-                                                 frames: frames))
+                                                 frames: frames, natives: natives))
         // JavaScriptCore's own `line` / `column` / `sourceURL` on every error,
         // from the innermost frame with a source URL (WKWebView capture: own
         // names "column,line,message,sourceURL,stack"). akamai navigation fix.
@@ -5486,7 +5525,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         guard let pending = jsObj.pendingStack else { return }
         jsObj.setPendingStack(nil)
         let str = formatStackTrace(errorName: pending.errorName, message: pending.message,
-                                   frames: pending.frames)
+                                   frames: pending.frames, natives: pending.natives)
         let errVal = JeffJSValue.mkPtr(tag: .object, ptr: jsObj)
         _ = definePropertyValue(obj: errVal, atom: JeffJSAtomID.JS_ATOM_stack.rawValue,
                                 value: newStringValue(str),
@@ -5504,10 +5543,15 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// anti-abuse challenge folds `message + ":" + stack` of a provoked
     /// TypeError into its token), so it must match JSC's, not V8's.
     func formatStackTrace(errorName: String, message: String,
-                          frames: [(fb: JeffJSFunctionBytecode, pc: Int)]) -> String {
+                          frames: [(fb: JeffJSFunctionBytecode, pc: Int)],
+                          natives: [(before: Int, name: String)] = []) -> String {
         var lines: [String] = []
-        lines.reserveCapacity(frames.count)
-        for (fbBase, rawPC) in frames {
+        lines.reserveCapacity(frames.count + natives.count)
+        var ni = 0
+        for (index, (fbBase, rawPC)) in frames.enumerated() {
+            while ni < natives.count, natives[ni].before <= index {
+                lines.append("\(natives[ni].name)@[native code]"); ni += 1
+            }
             // A bytecode-cache hit hands back a plain JeffJSFunctionBytecode:
             // no pc2line/pc2col tables, but the function's own line, column,
             // file and name atom survive the round trip.
@@ -5547,6 +5591,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             if lineNum > 0 && colNum > 0 { lines.append("\(funcName)@\(sourceURL):\(lineNum):\(colNum)") }
             else { lines.append("\(funcName)@\(sourceURL)") }
         }
+        while ni < natives.count { lines.append("\(natives[ni].name)@[native code]"); ni += 1 }
         return lines.joined(separator: "\n")
     }
 

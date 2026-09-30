@@ -1383,6 +1383,33 @@ nonisolated final class JeffJSParser {
         }
     }
 
+    /// The call site of the call / `new` / tagged template emitted next, as an
+    /// ordinary line/column record, so a frame suspended at that call reports
+    /// JavaScriptCore's column — the position just past the callee (its
+    /// "divot": `o.a.b.c(1)` → the column of `(`, `o.a.b.c (1)` → the space),
+    /// not the start of the statement. Scripts read `Error().stack` columns
+    /// (Akamai's sensor walks the frames).
+    ///
+    /// The position is resolved when the callee ends (`callSitePos`), not when
+    /// the call is emitted: getLineCol continues from its last answer and a
+    /// query behind it rescans from byte 0 — after the arguments were parsed
+    /// that made one-line bundles (Akamai's 645 KB sensor) quadratic to parse.
+    func callSitePos() -> (line: Int, col: Int) {
+        return s.getLineCol(s.lastPtr)
+    }
+
+    func emitCallSitePos(_ pos: (line: Int, col: Int)) {
+        let (line, col) = pos
+        guard line > 0 else { return }
+        if line != fd.lastLineNum || col != fd.lastColNum {
+            emitOp(.line_num)
+            emitU32(UInt32(line))
+            emitU32(UInt32(col))
+            fd.lastLineNum = line
+            fd.lastColNum = col
+        }
+    }
+
     /// JSC-style expression info for the opcode emitted next: the source
     /// range [start, end) (byte offsets into the script) of the member
     /// access, call or `new` it performs. Runtime errors quote it —
@@ -5852,6 +5879,7 @@ nonisolated final class JeffJSParser {
             && lastEvalCalleeEnd == fd.byteCode.len
         lastEvalCalleeEnd = -1
         lastEvalCalleeFd = nil
+        let parenPtr = callSitePos()   // just past the callee (emitCallSitePos)
 
         if isSuperCall {
             // super(args) in a derived constructor: [[Construct]] the
@@ -5909,6 +5937,7 @@ nonisolated final class JeffJSParser {
         }
         inFlag = savedInFlagCall
         expect(0x29) // ')'
+        emitCallSitePos(parenPtr)
 
         if isSuperCall {
             // Stack: ..., parentCtor, newTarget, arg0, ..., argN
@@ -6227,6 +6256,7 @@ nonisolated final class JeffJSParser {
 
             // Parse constructor arguments
             if tok == 0x28 { // '('
+                let newParenPtr = callSitePos()   // just past the callee
                 next()
                 var argc = 0
                 var hasSpread = false
@@ -6249,6 +6279,7 @@ nonisolated final class JeffJSParser {
                     if tok == 0x2C { next() } else if tok != 0x29 { missingCommaError("Expected ')' to end an argument list."); break }
                 }
                 expect(0x29)
+                emitCallSitePos(newParenPtr)
                 emitExprSpan(newStart, s.lastPtr)
                 if hasSpread {
                     emitOp(.apply_constructor)
@@ -7714,6 +7745,7 @@ nonisolated final class JeffJSParser {
     /// GetTemplateObject requires. It is pushed before the substitutions
     /// so the call sees [tag, templateObject, e0, ...].
     func parseTaggedTemplateCall(isMethodCall: Bool) {
+        let templatePtr = callSitePos()   // just past the tag
         let cpoolIdx = addConstPoolValue(.undefined)
         emitPushConst(cpoolIdx)
 
@@ -7760,6 +7792,7 @@ nonisolated final class JeffJSParser {
             fd.cpool[cpoolIdx] = ctx.newTemplateObject(cooked: cooked, raw: raw)
         }
 
+        emitCallSitePos(templatePtr)
         if isMethodCall {
             emitCallMethod(1 + exprCount)
         } else {

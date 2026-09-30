@@ -171,5 +171,13 @@ extension JeffJSContext {
             }
             v.freeValue()
         }
+
+        // The global object's own built-ins (Object, Math, parseInt, globalThis,
+        // …) are { writable: true, enumerable: false, configurable: true } too
+        // (ES §19 intro): `Object.keys(window)` listed every one of them (292 in
+        // the CLI, ~780 in the app), where JSC lists none. Only what intrinsics
+        // defined is swept — host globals installed afterwards keep their own
+        // attributes.
+        makeOwnPropsNonEnumerable(globalObj)
     }
 }

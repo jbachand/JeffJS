@@ -48,7 +48,9 @@ extension JeffJSContext {
         if v.isNull { return "null" }
         if v.isString { return "\"" + (toSwiftString(v) ?? "") + "\"" }
         if v.isSymbol { return toSwiftString(v) ?? "Symbol()" }
-        if v.isObject { return jscClassName(v) }
+        // A callable is "function" (JSC's errorDescriptionForValue): `new Math.max()`
+        // → "function is not a constructor (evaluating 'new Math.max()')".
+        if v.isObject { return isFunction(v) ? "function" : jscClassName(v) }
         return toSwiftString(v) ?? "\(v.tag)"
     }
 

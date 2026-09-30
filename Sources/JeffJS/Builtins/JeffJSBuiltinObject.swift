@@ -80,15 +80,57 @@ extension JeffJSContext {
     /// JS_SetPrototypeOf equivalent.
     /// The setter re-shapes the object and moves the shape's one counted
     /// reference onto the new prototype, so nothing is dup'd here.
+    ///
+    /// OrdinarySetPrototypeOf (ES §10.1.2.1): answers false — changing nothing —
+    /// when the new prototype chain would reach `obj` (a cycle: every later
+    /// lookup looped forever), when `obj` is not extensible, or when `obj` is
+    /// an immutable prototype exotic object (Object.prototype, §10.4.7). The
+    /// throwing callers word it as JSC does: `setPrototypeRefusal(_:proto:)`.
     @discardableResult
     func setPrototypeOf(_ obj: JeffJSValue, proto: JeffJSValue) -> Bool {
         guard let jsObj = obj.toObject() else { return false }
+        if setPrototypeRefusal(jsObj, proto: proto.toObject()) != nil { return false }
         if jsObj.shape == nil {
             // Tracked, so the collector can see the shape -> proto edge.
             jsObj.shape = createShape(self, proto: nil, hashSize: 0, propSize: 0)
         }
         jsObj.proto = proto.toObject()
         return true
+    }
+
+    /// Marks a JS function the host installed as a platform built-in, so it is
+    /// shaped like one of WebKit's natives: Function.prototype.toString prints
+    /// `function name() {\n    [native code]\n}` (no JS override of toString
+    /// needed — that override was itself a detectable non-native), and unless
+    /// it is an interface object (`isConstructor`), it has no [[Construct]] and
+    /// no `prototype` (WebIDL §3.7.6-3.7.7: operations and attribute accessors
+    /// are built-in function objects that are not constructors). A `prototype`
+    /// that was already materialised is left alone (it is non-configurable).
+    func markPlatformFunction(_ v: JeffJSValue, isConstructor: Bool) {
+        guard let o = v.toObject() else { return }
+        guard case .bytecodeFunc = o.payload else { return }   // natives are native already
+        o.isPlatformFunction = true
+        if !isConstructor,
+           jeffJS_findOwnPropertyIndex(obj: o, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue) < 0 {
+            o.isConstructor = false
+            o.needsLazyPrototype = false
+        }
+    }
+
+    /// Why OrdinarySetPrototypeOf (ES §10.1.2.1) refuses `obj.[[Prototype]] = proto`,
+    /// as JavaScriptCore's TypeError text, or nil when it is allowed. The walk
+    /// stops at a Proxy (step 8.c.i: its [[GetPrototypeOf]] is not ordinary).
+    func setPrototypeRefusal(_ obj: JeffJSObject, proto: JeffJSObject?) -> String? {
+        if obj.proto === proto { return nil }
+        if obj.hasImmutablePrototype { return "Cannot set prototype of immutable prototype object" }
+        if !obj.extensible { return "Attempted to assign to readonly property." }
+        var p = proto
+        while let q = p {
+            if q === obj { return "cyclic __proto__ value" }
+            if case .proxyData = q.payload { break }
+            p = q.proto
+        }
+        return nil
     }
 
     /// JS_HasOwnProperty (key-based).
@@ -773,6 +815,8 @@ struct JeffJSBuiltinObject {
         do {
             let getterVal = ctx.newCFunction(protoGetter, name: "get __proto__", length: 0)
             let setterVal = ctx.newCFunction(protoSetter, name: "set __proto__", length: 1)
+            getterVal.toObject()?.nativeNameKeepsAccessorPrefix = true
+            setterVal.toObject()?.nativeNameKeepsAccessorPrefix = true
             let atom = ctx.rt.findAtom("__proto__")
             _ = ctx.defineProperty(obj: objProto, atom: atom, value: .undefined,
                                    getter: getterVal, setter: setterVal,
@@ -904,10 +948,10 @@ struct JeffJSBuiltinObject {
             return obj.dupValue()   // the caller releases this argument; the result is a new reference
         }
 
-        let success = ctx.setPrototypeOf(obj, proto: proto)
-        if !success {
-            return ctx.throwTypeError("Cyclic __proto__ value")
+        if let o = obj.toObject(), let why = ctx.setPrototypeRefusal(o, proto: proto.toObject()) {
+            return ctx.throwTypeError(why)
         }
+        _ = ctx.setPrototypeOf(obj, proto: proto)
 
         return obj.dupValue()   // the caller releases this argument; the result is a new reference
     }
@@ -1598,10 +1642,10 @@ struct JeffJSBuiltinObject {
             return .undefined
         }
 
-        let success = ctx.setPrototypeOf(this, proto: proto)
-        if !success {
-            return ctx.throwTypeError("Cyclic __proto__ value")
+        if let o = this.toObject(), let why = ctx.setPrototypeRefusal(o, proto: proto.toObject()) {
+            return ctx.throwTypeError(why)
         }
+        _ = ctx.setPrototypeOf(this, proto: proto)
 
         return .undefined
     }

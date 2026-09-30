@@ -1445,6 +1445,11 @@ nonisolated final class JeffJSStackFrame {
     var ownsThis: Bool                = false
     var newTarget: JeffJSValue        = .undefined
     var curPC: Int                    = 0
+    /// The host (native) function this activation is calling right now, if
+    /// any — JavaScriptCore lists it in `Error.stack` as `name@[native code]`
+    /// above the caller (`toString@[native code]`, `map@[native code]`).
+    /// Set around native dispatch; unowned: the callee is live on the stack.
+    unowned(unsafe) var nativeCallee: JeffJSObject? = nil
     var argBuf: [JeffJSValue]         = []
     var argCount: Int                 = 0
     var varBuf: [JeffJSValue]         = []
@@ -1692,6 +1697,15 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
     var isHTMLDDA: Bool                 = false
     /// The context's global object (freeObject tripwire; never recycled).
     var isProtectedGlobal: Bool         = false
+    /// A native ECMAScript accessor ("get size", "get __proto__", "get
+    /// [Symbol.species]") whose source text keeps the "get "/"set " prefix,
+    /// as JavaScriptCore prints them; DOM (WebIDL) accessors print the bare
+    /// attribute name (`function cookie()`). Fills existing flag padding.
+    var nativeNameKeepsAccessorPrefix: Bool = false
+    /// A JS-implemented platform function (a host polyfill standing in for a
+    /// WebKit built-in): Function.prototype.toString prints it as native code.
+    /// Set through `JeffJSContext.markPlatformFunction`.
+    var isPlatformFunction: Bool = false
 
     // -- Class & weak-ref ----------------------------------------------------
 
@@ -2748,11 +2762,15 @@ nonisolated final class JeffJSPendingStack {
     let message: String
     /// (function bytecode, pc) per frame, innermost first.
     var frames: [(fb: JeffJSFunctionBytecode, pc: Int)]
+    /// Native frames: (index of the script frame they sit above, name).
+    var natives: [(before: Int, name: String)] = []
 
     init(errorName: String, message: String,
-         frames: [(fb: JeffJSFunctionBytecode, pc: Int)]) {
+         frames: [(fb: JeffJSFunctionBytecode, pc: Int)],
+         natives: [(before: Int, name: String)] = []) {
         self.errorName = errorName
         self.message = message
         self.frames = frames
+        self.natives = natives
     }
 }

@@ -627,7 +627,11 @@ extension JeffJSContext {
         // C function path (mirrored fields: no payload copy per call). Checked
         // before the bound-function match below, which copies the payload.
         if let cf = obj.cFuncFast {
-            return JeffJSContext.dispatchCFunction(self, cf, thisVal, args, obj.cMagicFast)
+            let nf = currentFrame, prevNative = nf?.nativeCallee
+            nf?.nativeCallee = obj
+            let r = JeffJSContext.dispatchCFunction(self, cf, thisVal, args, obj.cMagicFast)
+            nf?.nativeCallee = prevNative
+            return r
         }
         // Bound function path: unwrap and recurse with bound this/args
         if case .boundFunction(let bound) = obj.payload {
@@ -1394,7 +1398,13 @@ extension JeffJSContext {
             case .constructorOrFunc(let fn):
                 result = fn(self, newTarget, args, true)
             case .generic(let fn):
-                // Some generic C functions can be called as constructors
+                // A builtin that is not a constructor has no [[Construct]]
+                // (ES §10.3, §18: "Built-in function objects that are not
+                // identified as constructors do not implement [[Construct]]"):
+                // `new Math.max()` / `new JSON.stringify()` throw TypeError, as
+                // in JSC. Constructors built through newCFunction carry the
+                // flag or an own `prototype` (isConstructorLike).
+                guard isConstructorLike(funcVal) else { return throwNotAConstructor(funcVal) }
                 let newObj = newObject()
                 let r = fn(self, newObj, args)
                 if r.isException { newObj.freeValue(); return .exception }
@@ -1404,6 +1414,7 @@ extension JeffJSContext {
                 if r.isObject { newObj.freeValue(); result = r }
                 else { r.freeValue(); result = newObj }
             case .genericMagic(let fn):
+                guard isConstructorLike(funcVal) else { return throwNotAConstructor(funcVal) }
                 let newObj = newObject()
                 let r = fn(self, newObj, args, Int(magic))
                 if r.isException { newObj.freeValue(); return .exception }
@@ -1433,7 +1444,9 @@ extension JeffJSContext {
             return js_proxy_construct(self, obj, args, newTarget)
         }
         // Bytecode function constructor path — verify it IS a bytecode function
-        guard case .bytecodeFunc(let fbOpt, _, _) = obj.payload else {
+        // with [[Construct]]: arrows, methods, accessors, generators and async
+        // functions have none (ES §10.2.1.3 / §15.4); `new` on them throws.
+        guard case .bytecodeFunc(let fbOpt, _, _) = obj.payload, obj.isConstructor else {
             return throwNotAConstructor(funcVal)
         }
         // Derived class constructor: `this` is uninitialised until super()
@@ -1692,8 +1705,13 @@ extension JeffJSContext {
             // Bytecode without call-site records: global semantics.
             return eval(input: str.toSwiftString(), filename: "<eval>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         }
-        return performDirectEval(source: str.toSwiftString(), site: sites[site],
-                                 callerFB: callerFB, frame: frame)
+        // JSC lists the eval itself above the caller (`eval@[native code]`).
+        let prevNative = frame.nativeCallee
+        frame.nativeCallee = eo
+        let r = performDirectEval(source: str.toSwiftString(), site: sites[site],
+                                  callerFB: callerFB, frame: frame)
+        frame.nativeCallee = prevNative
+        return r
     }
 
     /// Compile `source` against the call site's bindings (see
@@ -2204,6 +2222,24 @@ extension JeffJSContext {
         // the new prototype; nothing to dup here.
         jsObj.proto = protoObj
         return true
+    }
+
+    /// A method, getter or setter (object literal or class body — every one is
+    /// defined through define_method) is not a constructor and has no own
+    /// `prototype` (ES §15.4.4 DefineMethod → OrdinaryFunctionCreate without
+    /// MakeConstructor): `new ({ m(){} }).m()` throws and
+    /// `Object.getOwnPropertyNames({ m(){} }.m)` is ["length", "name"], as in
+    /// JSC. Closure creation marks every plain function a constructor with a
+    /// lazy prototype; this undoes it for methods.
+    ///
+    /// A class body wires `proto.constructor = C` through define_method too;
+    /// by then C already has its own `prototype` (wired just before), which no
+    /// method ever has at definition time — that is how C stays a constructor.
+    func markMethodFunction(_ funcVal: JeffJSValue) {
+        guard let fo = funcVal.toObject(), case .bytecodeFunc = fo.payload else { return }
+        if jeffJS_findOwnPropertyIndex(obj: fo, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue) >= 0 { return }
+        fo.isConstructor = false
+        fo.needsLazyPrototype = false
     }
 
     /// Sets the [[HomeObject]] internal slot on a method function.
@@ -3450,7 +3486,10 @@ private func executeFastTrace(
                 var cargs = [JeffJSValue](); cargs.reserveCapacity(argc)
                 var ai = 0
                 while ai < argc { cargs.append(buf[calleeSlot + 1 + ai]); ai += 1 }
+                let prevNative = frame.nativeCallee
+                frame.nativeCallee = nObj.asClass
                 let r = JeffJSContext.dispatchCFunction(ctx, cf, .undefined, cargs, nObj.cMagicFast)
+                frame.nativeCallee = prevNative
                 // Native callees borrow their arguments: release the arg slots
                 // here (the general path does the same after callInternal).
                 ai = 0
@@ -3569,7 +3608,10 @@ private func executeFastTrace(
             let calleeSlot = sp - argc - 1
             let thisSlot = calleeSlot - 1
             if thisSlot >= state.spBase, let nObj = buf[calleeSlot].obj, let cf = nObj.cFuncFast {
+                let prevNative = frame.nativeCallee
+                frame.nativeCallee = nObj.asClass
                 let r = jeffJS_nativeCallFromSlots(ctx, rt, cf, buf[thisSlot], buf + calleeSlot + 1, argc, nObj.cMagicFast)
+                frame.nativeCallee = prevNative
                 var ai = 0
                 while ai < argc { buf[calleeSlot + 1 + ai].freeValueFast(); ai += 1 }
                 buf[calleeSlot].freeValueFast(); buf[thisSlot].freeValueFast()
@@ -3767,7 +3809,10 @@ private func executeFastTrace(
                 resume = pc; break traceLoop
             }
             frame.curPC = pc
+            let prevTNative = frame.nativeCallee
+            frame.nativeCallee = tObj.asClass
             let tr = jeffJS_nativeCallFromSlots(ctx, rt, tcf, buf[tThis], buf + tCallee + 1, tArgc, tObj.cMagicFast)
+            frame.nativeCallee = prevTNative
             var tai = 0
             while tai < tArgc { buf[tCallee + 1 + tai].freeValueFast(); tai += 1 }
             buf[tCallee].freeValueFast(); buf[tThis].freeValueFast()
@@ -8501,6 +8546,7 @@ struct JeffJSInterpreter {
                 pc += 3
 
             case .tail_call:
+                frame.curPC = pc   // Error stacks: the call site (and JSC's tail-call frame elision)
                 let tcArgc = Int(readU16(bc, pc + 1))
                 let tcArgs: [JeffJSValue]
                 switch tcArgc {
@@ -8566,6 +8612,7 @@ struct JeffJSInterpreter {
                 continue dispatchLoop
 
             case .tail_call_method:
+                frame.curPC = pc   // Error stacks: the call site (and JSC's tail-call frame elision)
                 let tcmArgc = Int(readU16(bc, pc + 1))
                 let tcmArgs: [JeffJSValue]
                 switch tcmArgc {
@@ -9750,6 +9797,7 @@ struct JeffJSInterpreter {
                 // in OP_define_method; class, static, object-literal methods and
                 // accessors all come through here).
                 ctx.setHomeObject(funcVal: funcVal, homeObj: obj)
+                ctx.markMethodFunction(funcVal)
                 let ok = ctx.defineMethod(obj: obj, atom: atom, funcVal: funcVal,
                                            flags: methodFlags)
                 // `defineProperty` dups what it stores (value and getter/setter
@@ -9771,6 +9819,7 @@ struct JeffJSInterpreter {
                 let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = buf[sp - 1]
                 ctx.setHomeObject(funcVal: funcVal, homeObj: obj)
+                ctx.markMethodFunction(funcVal)
                 let ok = ctx.defineMethodComputed(obj: obj, key: key, funcVal: funcVal,
                                                    flags: methodFlags)
                 // Both operands were popped, so both are ours: the key is only
