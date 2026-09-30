@@ -338,6 +338,8 @@ struct JeffJSTestRunner {
             ("TaggedTemplateNesting", { $0.testTaggedTemplateNesting() }),
             ("ShadowDOM", { $0.testShadowDOM() }),
             ("AwaitSuspension", { $0.testAwaitSuspension() }),
+            ("CSSScoping", { $0.testCSSScoping() }),
+            ("IntlFormatStyles", { $0.testIntlFormatStyles() }),
             ("IteratorHelpers", { $0.testIteratorHelpers() }),
             ("SyntaxErrorText", { $0.testSyntaxErrorText() }),
             ("ObjectLiteralDefine", { $0.testObjectLiteralDefine() }),
