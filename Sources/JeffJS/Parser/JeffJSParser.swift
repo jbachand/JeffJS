@@ -1179,18 +1179,31 @@ nonisolated final class JeffJSParser {
         return JeffJSOpcode(rawValue: UInt16(fd.byteCode.buf[pos]))
     }
 
-    /// Check if the last opcode emitted (before current position) is get_field.
-    /// get_field is 5 bytes: 1 byte opcode + 4 byte atom.
-    func lastEmittedIsGetField() -> (isGetField: Bool, fieldStart: Int, atom: UInt32) {
+    /// Check if the last instruction emitted since `start` (the assignment
+    /// target's first byte) is get_field (5 bytes: opcode + atom).
+    ///
+    /// Walks instruction boundaries from `start`: peeking at `len - 5` alone
+    /// read *operand* bytes as an opcode. `obj[key]` ends with a tagged
+    /// line_num expression span (`emitExprSpan`) + get_array_el, so whenever
+    /// the span's end offset had a low byte of 0x43 (get_field) a compound
+    /// `obj["k"] ^= v` was rewound into the middle of the span and compiled as
+    /// a field store with a garbage atom and no dup2 — a VM stack underflow in
+    /// Akamai's homedepot challenge (`this["dR"]^=this["qR"]` at column 42 283).
+    func lastEmittedIsGetField(from start: Int) -> (isGetField: Bool, fieldStart: Int, atom: UInt32) {
         let len = fd.byteCode.len
-        // get_field is 5 bytes: [opcode, atom0, atom1, atom2, atom3]
-        guard len >= 5 else { return (false, 0, 0) }
-        let pos = len - 5
-        if let op = peekOpcodeAt(pos), op == .get_field {
-            let atom = readU32FromBuf(fd.byteCode.buf, pos + 1)
-            return (true, pos, atom)
+        guard len >= 5, start >= 0, start <= len - 5 else { return (false, 0, 0) }
+        var pos = start
+        var last = -1
+        while pos < len {
+            guard let op = peekOpcodeAt(pos) else { return (false, 0, 0) }
+            let size = Int(jeffJSGetOpcodeInfo(op).size) + (fd.byteCode.buf[pos] == 0 ? 1 : 0)
+            if size <= 0 { return (false, 0, 0) }
+            last = pos
+            pos += size
         }
-        return (false, 0, 0)
+        guard pos == len, last == len - 5, fd.byteCode.buf[last] != 0,
+              peekOpcodeAt(last) == .get_field else { return (false, 0, 0) }
+        return (true, last, readU32FromBuf(fd.byteCode.buf, last + 1))
     }
 
     /// Read a little-endian u32 from a byte buffer.
@@ -5185,7 +5198,7 @@ nonisolated final class JeffJSParser {
             //   2. Compute new value (RHS + binary op)
             //   3. Store back to the same lvalue
             // Check if the last emitted opcode is get_field (for obj.prop += rhs).
-            let fieldCheck = lastEmittedIsGetField()
+            let fieldCheck = lastEmittedIsGetField(from: lhsBcStart)
             if fieldCheck.isGetField {
                 let fieldStart = fieldCheck.fieldStart
                 let atom = fieldCheck.atom

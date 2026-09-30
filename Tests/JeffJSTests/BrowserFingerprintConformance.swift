@@ -23,6 +23,13 @@ import Foundation
 extension JeffJSTestRunner {
 
     static let browserFingerprintCases: [(String, String)] = [
+        // device profile agent (2026-09-30): Akamai's homedepot challenge does
+        // `this["dR"]^=this["qR"]` at a column where the expression span's end
+        // offset had a low byte of 0x43 (get_field): the compound assignment
+        // compiled as a field store with no dup2 → VM stack underflow → 403.
+        // Every padding 0…299 puts that byte at every value.
+        ("compound assignment to obj[\"k\"] at any source offset (expression-span bytes are not opcodes)",
+         #"(function(){ for (var n = 0; n < 300; n++) { var o = {k: 3, j: 5}; var f = new Function('o', ' '.repeat(n) + 'o["k"] ^= o["j"]; o["k"] += 1; return o.k;'); if (f(o) !== 7) return false; var g = new Function(' '.repeat(n) + 'this["dR"] ^= this["qR"]; this.PO = 1; return this.dR;'), p = {dR: 3, qR: 5}; if (g.call(p) !== 6 || p.PO !== 1) return false; } return true; })()"#),
         ("String/Number/Boolean inherit from Function.prototype and have name/length",
          #"[String, Number, Boolean].every(function(C){ return Object.getPrototypeOf(C) === Function.prototype && C.length === 1 && typeof C.name === 'string' && C.name.length > 0 && typeof C.call === 'function'; }) && String.name === 'String' && Number.name === 'Number' && Boolean.name === 'Boolean'"#),
         ("String(String) and template interpolation of a constructor (core-js inspectSource)",
