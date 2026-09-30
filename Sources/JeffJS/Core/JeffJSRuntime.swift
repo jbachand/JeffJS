@@ -91,7 +91,7 @@ struct JSMemoryUsage {
 
 /// Mirrors QuickJS `JSAtomStruct`. Each entry in the atom table.
 /// Atoms are interned strings used as property keys, variable names, etc.
-class JeffJSAtomStruct {
+nonisolated class JeffJSAtomStruct {
     /// Hash value of this atom (JS_ATOM_HASH_MASK bits).
     var hash: UInt32 = 0
     /// Next atom index in the hash chain (0 = end of chain).
@@ -317,7 +317,7 @@ enum JeffJSAtomID: UInt32 {
 /// ctx.free()
 /// rt.free()
 /// ```
-final class JeffJSRuntime {
+nonisolated final class JeffJSRuntime {
 
     // MARK: - Memory Management
 
@@ -578,6 +578,15 @@ final class JeffJSRuntime {
     /// Multiplier on the idle-collection interval, doubled by every idle
     /// collection that reclaimed little (see `jeffJS_idleGCTickSlow`).
     var gcIdleBackoff: Int = 1
+    /// JEFFJS_GC_VERIFYROOTS: the thread that last mutated the GC list, and the
+    /// recent thread changes (JeffJSThreadCheck.swift).
+    var gcListThread: UInt = 0
+    var gcListThreadLog: [String] = []
+    /// The thread running JS on this runtime (`enterJSThread`), and how many
+    /// entries it holds; 0 = nobody. Maintained only when `jeffJS_threadCheck`
+    /// is on (Debug builds, JEFFJS_GC_VERIFYROOTS=1): the one-JS-thread rule.
+    var jsOwnerThread: UInt = 0
+    var jsOwnerDepth: Int = 0
     /// Heap census state (JeffJSHeapCensus.swift, JEFFJS_HEAP_CENSUS_S).
     var heapCensusPrevious: [String: Int] = [:]
     var heapCensusLastTime: Double = 0

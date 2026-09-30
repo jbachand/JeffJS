@@ -38,6 +38,8 @@ func jeffJS_bootstrapDebugFlags() {
     JeffJSGCObjectHeader.trackRefcounts = JeffJSConfig.trackRefcounts
         || ProcessInfo.processInfo.environment["JEFFJS_TRACK_RC"] == "1"
     jeffJS_refDebugMode = JeffJSGCObjectHeader.trackRefcounts || jeffJSZombiesEnabled
+    jeffJS_gcVerifyRoots = JeffJSConfig.gcVerifyRoots
+    if jeffJS_gcVerifyRoots { jeffJS_threadCheck = true }   // Debug builds: always on
     jeffJS_bootstrapHeapCensus()
     if JeffJSGCObjectHeader.trackRefcounts && !jeffJS_rcReportRegistered {
         jeffJS_rcReportRegistered = true

@@ -19,7 +19,7 @@ import Foundation
 /// Holds a weak reference to the target (object or non-registered symbol).
 /// When the target is garbage collected the weak reference is invalidated
 /// and `deref()` returns undefined.
-final class JSWeakRefData {
+nonisolated final class JSWeakRefData {
     /// The weak reference cell pointing at the target object.
     /// `nil` after the target has been collected or the WeakRef finalized.
     var weakRef: JeffJSWeakRef?
@@ -50,7 +50,7 @@ final class JSWeakRefData {
 ///     int has_token;
 /// } JSFinRecEntry;
 /// ```
-final class JSFinRecEntry {
+nonisolated final class JSFinRecEntry {
     /// Link node for the finalization registry's entry list.
     var link: ListNode = ListNode()
 
@@ -89,7 +89,7 @@ final class JSFinRecEntry {
 /// Mirrors QuickJS `JSFinalizationRegistryData`.
 ///
 /// Owns a list of `JSFinRecEntry` entries and a cleanup callback.
-final class JSFinalizationRegistryData {
+nonisolated final class JSFinalizationRegistryData {
     /// The cleanup callback provided to the constructor.
     var cleanupCallback: JeffJSValue = .undefined
 

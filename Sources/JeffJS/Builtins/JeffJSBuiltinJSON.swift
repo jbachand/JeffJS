@@ -32,7 +32,7 @@ private enum JSONToken {
 
 /// Internal state for the recursive-descent JSON parser.
 /// Mirrors the parse state in QuickJS json_parse_value / json_next_token.
-private final class JSONParseState {
+private nonisolated final class JSONParseState {
     let ctx: JeffJSContext
     let input: [UInt8]
     var pos: Int

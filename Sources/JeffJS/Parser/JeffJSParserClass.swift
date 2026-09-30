@@ -21,7 +21,7 @@
 import Foundation
 
 /// Per-class state used while parsing a class body.
-final class JeffJSClassFieldsCtx {
+nonisolated final class JeffJSClassFieldsCtx {
     var className: JSAtom = 0
     var classScope: Int = 0
     var hasExtends = false

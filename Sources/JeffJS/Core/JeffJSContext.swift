@@ -44,7 +44,7 @@ import CoreFoundation
 /// }
 /// ctx.free()
 /// ```
-public final class JeffJSContext: JeffJSTokenizerContext {
+public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
 
     /// Conforms to JeffJSTokenizerContext so the parser can intern atoms
     /// directly into the runtime's atom table (instead of a separate namespace).
@@ -126,8 +126,17 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// iterator prototype, so iterators are themselves iterable.
     var iteratorProto: JeffJSValue = .undefined
     /// Iterator protocol names without predefined atoms, interned once.
-    lazy var iterNextAtom: UInt32 = rt.findAtom("next")
-    lazy var iterReturnAtom: UInt32 = rt.findAtom("return")
+    /// (Not `lazy`: a nonisolated class cannot have lazy properties in Swift 6.)
+    private var _iterNextAtom: UInt32 = 0
+    private var _iterReturnAtom: UInt32 = 0
+    var iterNextAtom: UInt32 {
+        if _iterNextAtom == 0 { _iterNextAtom = rt.findAtom("next") }
+        return _iterNextAtom
+    }
+    var iterReturnAtom: UInt32 {
+        if _iterReturnAtom == 0 { _iterReturnAtom = rt.findAtom("return") }
+        return _iterReturnAtom
+    }
     /// Transition shape of `{ value, done }` iterator results, captured from
     /// the first one built: every later result is put on it directly.
     var iterResultShape: JeffJSShape? = nil
@@ -696,6 +705,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     ///   - evalFlags: Eval flags (JS_EVAL_TYPE_GLOBAL, JS_EVAL_TYPE_MODULE, etc.).
     /// - Returns: The result value, or JS_EXCEPTION on error.
     func eval(input: String, filename: String, evalFlags: Int) -> JeffJSValue {
+        rt.enterJSThread(); defer { rt.exitJSThread() }   // one JS thread per runtime (JeffJSThreadCheck.swift)
         let result = evalInternal(input: input, filename: filename, line: 0, evalFlags: evalFlags)
         // Safe point for GC — parsing and compilation are complete
         if rt.mallocState.mallocSize >= rt.mallocGCThreshold {
@@ -3276,6 +3286,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// Execute precompiled bytecode loaded from a .jfbc file.
     /// Deserializes with atom remapping and runs on the global object.
     func evalPrecompiled(_ bytes: [UInt8]) -> JeffJSValue {
+        rt.enterJSThread(); defer { rt.exitJSThread() }   // one JS thread per runtime (JeffJSThreadCheck.swift)
         let tStart = jeffJSTimePrecompiled ? CFAbsoluteTimeGetCurrent() : 0
         guard let fb = JeffJSBytecodeDeserializer.deserialize(bytes, rt: rt, ctx: self) else {
             return throwInternalError(message: "Failed to deserialize precompiled bytecode")
@@ -6393,7 +6404,7 @@ nonisolated(unsafe) let jeffJSTimePrecompiled = ProcessInfo.processInfo.environm
 /// A weak handle on a JS object, for native closures that need to reach the
 /// function object they are the body of (`Proxy.revocable`'s `revoke`). Weak
 /// on purpose: the strong, GC-visible edge is the object's own property.
-final class JeffJSWeakObjectBox {
+nonisolated final class JeffJSWeakObjectBox {
     weak var obj: JeffJSObject?
     init() {}
 }

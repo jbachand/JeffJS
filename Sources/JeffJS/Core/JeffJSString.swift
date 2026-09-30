@@ -47,7 +47,7 @@ nonisolated class JeffJSStringBase {
     init(refCount: Int, kind: UInt8) { self.refCount = refCount; self.kind = kind }
 }
 
-final class JeffJSString: JeffJSStringBase {
+nonisolated final class JeffJSString: JeffJSStringBase {
     deinit {
         if cachedAtom != 0, let rt = JeffJSGCObjectHeader.activeRuntime { rt.freeAtom(cachedAtom) }
     }
@@ -168,7 +168,7 @@ final class JeffJSString: JeffJSStringBase {
 
 /// Port of QuickJS rope node used by `js_concat_string`.
 /// A rope postpones flattening until the string content is actually needed.
-final class JeffJSStringRope: JeffJSStringBase {
+nonisolated final class JeffJSStringRope: JeffJSStringBase {
     /// Flattened form, built on first read and kept (reads of a string built
     /// with `+=` used to re-flatten the whole rope on every access).
     var flat: JeffJSString? = nil
@@ -826,7 +826,7 @@ private func flattenInto8(_ buf: inout [UInt8], _ offset: inout Int, _ val: Jeff
 // MARK: - StringBuffer (port of QuickJS StringBuffer)
 
 /// Growable string builder matching the QuickJS `StringBuffer` API.
-final class JeffJSStringBuffer: JeffJSStringBase {
+nonisolated final class JeffJSStringBuffer: JeffJSStringBase {
     /// Flat form of the current contents, built on first read and reused
     /// until the next append (every read used to materialise a new string:
     /// a regex loop over a `+=`-built local leaked 80 KB per exec).

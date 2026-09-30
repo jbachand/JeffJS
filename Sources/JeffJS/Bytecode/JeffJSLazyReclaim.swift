@@ -60,7 +60,7 @@ import Synchronization
 let jeffJS_lazyPressureGeneration = Atomic<Int>(0)
 
 /// One reclaim cycle in progress (see the file header).
-final class JeffJSLazyReclaimCycle {
+nonisolated final class JeffJSLazyReclaimCycle {
     /// This cycle's (odd) reclaim phase.
     let phase: Int
     /// Drop every droppable body regardless of use. Only for a cycle that

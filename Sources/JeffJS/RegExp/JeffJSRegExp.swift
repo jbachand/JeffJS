@@ -222,7 +222,7 @@ private func lreIsLineTerminator(_ c: UInt32) -> Bool {
 
 /// Canonicalisation tables for one mode.  Built lazily on first use of a
 /// case-insensitive regexp and kept for the life of the process.
-final class LRECaseTables {
+nonisolated final class LRECaseTables {
     /// Canonical value of every BMP code point (legacy mode: of every code unit).
     let bmp: UnsafeMutablePointer<UInt16>
     /// Supplementary-plane entries whose canonical value differs (unicode mode only).
@@ -700,7 +700,7 @@ private extension Unicode.Scalar {
 // ============================================================================
 
 /// Accumulates regex bytecode during compilation.
-private final class REBytecodeBuilder {
+private nonisolated final class REBytecodeBuilder {
     var code: [UInt8] = []
 
     var count: Int { code.count }
@@ -828,7 +828,7 @@ func lreCompile(pattern: String, flags: JeffJSRegExpFlags) -> JeffJSRegExpCompil
 }
 
 /// The compiler object.  Lives only for the duration of one compile call.
-private final class RECompiler {
+private nonisolated final class RECompiler {
     let pattern: [UInt32]          // code points of the pattern
     var pos: Int = 0               // current position in `pattern`
     let flags: JeffJSRegExpFlags
@@ -2573,7 +2573,7 @@ func lreGetGroupNames(_ bytecode: [UInt8]) -> [String?] {
 /// - Stack and captures use ContiguousArray with pre-allocated capacity.
 /// - Input and bytecode are accessed through UnsafeBufferPointer in the
 ///   hot loop to eliminate bounds checking.
-final class REVirtualMachine {
+nonisolated final class REVirtualMachine {
     let bc: [UInt8]         // full bytecode including header
     let bcStart: Int        // offset of first opcode (after header)
     let bcEnd: Int          // offset past last opcode

@@ -161,7 +161,7 @@ struct JeffJSSavedDestructParam {
 /// let parser = JeffJSParser(s: s, fd: fd)
 /// parser.parseProgram()
 /// ```
-final class JeffJSParser {
+nonisolated final class JeffJSParser {
 
     // -- Parse state (token stream) --
     let s: JeffJSParseState
@@ -4788,7 +4788,7 @@ final class JeffJSParser {
     /// kept so the LHS can be re-parsed as a destructuring pattern. A class,
     /// so the (token-sized) state lives on the heap rather than in the
     /// frames that stay live while the LHS parses.
-    final class LhsPatternState {
+    nonisolated final class LhsPatternState {
         let bufPtr: Int
         let lineNum: Int
         let token: JeffJSToken

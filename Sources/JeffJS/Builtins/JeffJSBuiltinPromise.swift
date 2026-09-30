@@ -84,7 +84,7 @@ func jeffJS_promiseDataFree(_ d: JeffJSPromiseData) {
 /// Opaque data attached to the resolve/reject functions created by
 /// CreateResolvingFunctions. Holds a reference to the promise and a shared
 /// alreadyResolved flag.
-private final class ResolvingFunctionsData {
+private nonisolated final class ResolvingFunctionsData {
     /// Strong reference to the promise object. This MUST be strong — not weak —
     /// because resolve/reject functions can be called asynchronously (e.g., from
     /// fetch callbacks, timer callbacks). A weak reference would allow the promise
@@ -107,7 +107,7 @@ private final class ResolvingFunctionsData {
 // MARK: - Promise.all / allSettled / any Element Closure Data
 
 /// Shared state for Promise.all / allSettled / any element closures.
-private final class PromiseAllData {
+private nonisolated final class PromiseAllData {
     var remainingElements: Int = 1  // Starts at 1 (decremented after iteration)
     var values: [JeffJSValue] = []
     var resolveFunc: JeffJSValue = .undefined
@@ -884,7 +884,7 @@ struct JeffJSBuiltinPromise {
         // any thenable-compatible class): construct C with an executor that
         // captures the resolving functions, so `P.resolve(v) instanceof P`.
         if let ctorObj = ctor.toObject(), ctorObj.isConstructor, ctorObj.cFuncFast == nil {
-            final class CapBox { var resolve: JeffJSValue = .undefined; var reject: JeffJSValue = .undefined }
+            nonisolated final class CapBox { var resolve: JeffJSValue = .undefined; var reject: JeffJSValue = .undefined }
             let box = CapBox()
             let executor = ctx.newCFunction(name: "", length: 2) { c, _, args in
                 if !box.resolve.isUndefined || !box.reject.isUndefined {
@@ -1536,7 +1536,7 @@ struct JeffJSBuiltinPromise {
 /// A JS value retained for the lifetime of the Swift closures that capture
 /// it (native callbacks stored in C function objects); released once, when
 /// the last closure is dropped.
-final class JeffJSRetainedValue {
+nonisolated final class JeffJSRetainedValue {
     let value: JeffJSValue
     init(_ v: JeffJSValue) { value = v.dupValue() }
     deinit { if JeffJSGCObjectHeader.activeRuntime != nil { value.freeValue() } }

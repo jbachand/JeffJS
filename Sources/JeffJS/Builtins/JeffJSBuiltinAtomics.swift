@@ -19,7 +19,7 @@ import Foundation
 /// A single waiter entry on a wait list.  Created by `Atomics.wait`.
 ///
 /// Mirrors the internal waiter struct in QuickJS `js_atomics_wait`.
-final class JSAtomicsWaiter {
+nonisolated final class JSAtomicsWaiter {
     /// The condition variable this waiter blocks on.
     let condition = NSCondition()
 

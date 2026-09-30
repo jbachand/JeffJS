@@ -177,6 +177,11 @@ enum JeffJSConfig {
     static let gcMetalThresholdIsExplicit = envOverride("gc.metalThreshold").flatMap(Int.init) != nil
     static let gcMetalThreadGroupSize = int("gc.metalThreadGroupSize", default: 256)
     static let gcMetalMaxRescue    = int("gc.metalMaxRescueIterations", default: 100)
+    /// `JEFFJS_GC_VERIFYROOTS=1`: before every collection, check that each entry
+    /// of the runtime's GC list is a live header of this runtime (class, list
+    /// index, owner), and log every change of the thread that mutates the list
+    /// (JeffJSThreadCheck.swift). Debug instrument; off by default.
+    static let gcVerifyRoots       = bool("gc.verifyRoots",            default: false)
 
     // MARK: - Atoms
 

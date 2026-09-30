@@ -1220,7 +1220,7 @@ struct JeffJSBytecodeCacheKey {
 ///
 /// The cache is stored on JeffJSRuntime and shared across all contexts in
 /// that runtime.
-final class JeffJSBytecodeCache {
+nonisolated final class JeffJSBytecodeCache {
 
     /// One cached compile. `desc`/`sourceLength` are the in-memory equivalent
     /// of the disk entry header: the same mismatch check runs on both paths,
@@ -1863,7 +1863,7 @@ final class JeffJSBytecodeCache {
 ///   reinstalling or updating the app keeps the cache.
 /// * **Corruption.** A header or deserialize failure deletes the entry
 ///   (`JeffJSBytecodeCache.lookup`).
-final class JeffJSBytecodeDiskStore: @unchecked Sendable {
+nonisolated final class JeffJSBytecodeDiskStore: @unchecked Sendable {
 
     let directory: URL
     let budgetBytes: Int
@@ -2099,7 +2099,7 @@ final class JeffJSBytecodeDiskStore: @unchecked Sendable {
 /// u64 span key (source start << 32 | length) | u32 length | u64 FNV-1a of
 /// the blob | JFBC blob. A record whose checksum does not match is ignored
 /// (its function compiles from source), so a damaged file never runs.
-final class JeffJSLazyBodyStore {
+nonisolated final class JeffJSLazyBodyStore {
     static let magic: UInt32 = 0x4A4C_5A42
     static let version: UInt32 = 1
 

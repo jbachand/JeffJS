@@ -59,7 +59,7 @@ import Metal
 
 /// GPU-accelerated regex matching using Metal compute shaders.
 /// Singleton — lazily initialises the Metal pipeline on first use.
-final class JeffJSMetalRegex {
+nonisolated final class JeffJSMetalRegex {
 
     // MARK: Singleton
 
@@ -924,7 +924,7 @@ private struct NFACompiler {
 // ============================================================================
 
 /// Stub that always returns nil when Metal is unavailable.
-final class JeffJSMetalRegex {
+nonisolated final class JeffJSMetalRegex {
 
     static let shared = JeffJSMetalRegex()
 

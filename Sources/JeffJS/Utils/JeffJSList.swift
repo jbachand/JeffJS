@@ -14,7 +14,7 @@ import Foundation
 
 /// Intrusive doubly-linked list node. When used as a sentinel (head of list),
 /// an empty list has both `prev` and `next` pointing to itself.
-final class ListHead {
+nonisolated final class ListHead {
     var prev: ListHead!
     var next: ListHead!
 

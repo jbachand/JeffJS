@@ -120,7 +120,7 @@ extension JeffJSContext {
 
 /// [[IteratedString]] / [[NextIndex]] of a String Iterator (ES2024 §22.1.5.3). The string
 /// is owned and released once the iterator is exhausted (the spec sets it to undefined).
-final class JeffJSStringIteratorData {
+nonisolated final class JeffJSStringIteratorData {
     private(set) var string: JeffJSValue
     var index = 0
     init(string: JeffJSValue) { self.string = string }

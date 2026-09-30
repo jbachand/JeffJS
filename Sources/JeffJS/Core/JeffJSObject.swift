@@ -92,7 +92,7 @@ func jeffJS_icProtoHit(_ entry: JeffJSICEntry) -> JeffJSValue? {
 /// (`pc < capacity`; a miss path), so a future site that broke the invariant
 /// would lose its cache instead of writing past the table.
 /// `JEFFJS_INTERP_ICTABLEFIXED=1` (`interp.icTableFixed`) = fixed 512 slots (A/B).
-final class JeffJSInlineCache {
+nonisolated final class JeffJSInlineCache {
     static let size = 512
     static let mask = size - 1
     static let minCapacity = 8
@@ -228,7 +228,7 @@ final class JeffJSInlineCache {
 
 /// Describes a hot loop trace that the fast mini-interpreter can execute.
 /// Created by the compiler's fuseBasicBlocks pass after label resolution.
-final class TraceBlockInfo {
+nonisolated final class TraceBlockInfo {
     /// First bytecode offset of the loop region (lowest backward-jump target
     /// among the merged overlapping loops that form this region)
     let entryPC: Int
@@ -264,7 +264,7 @@ final class TraceBlockInfo {
 /// (offset, length) pair into this one buffer, so a script's functions cost
 /// 24 bytes each instead of a private copy of their text, and the buffer
 /// lives exactly as long as some function from that script is alive.
-final class JeffJSSourceText {
+nonisolated final class JeffJSSourceText {
     let bytes: [UInt8]
 
     init(bytes: [UInt8]) { self.bytes = bytes }
@@ -320,7 +320,7 @@ struct JeffJSLazySeed {
 /// The script a lazily compiled function comes from: the source text every
 /// function of it re-parses from, and a line index for column numbers.
 /// One per compiled (or cache-loaded) script, shared by all its functions.
-final class JeffJSLazyScript {
+nonisolated final class JeffJSLazyScript {
     let source: JeffJSSourceText
     let filename: String
     let isModule: Bool
@@ -371,7 +371,7 @@ final class JeffJSLazyScript {
 
 /// Everything a lazily compiled function needs besides its (stub) bytecode
 /// object: where to re-parse it from and whether that happened yet.
-final class JeffJSLazyFunctionInfo {
+nonisolated final class JeffJSLazyFunctionInfo {
     let seed: JeffJSLazySeed
     let script: JeffJSLazyScript
     /// True until the body is compiled into the owning bytecode object.
@@ -391,7 +391,7 @@ final class JeffJSLazyFunctionInfo {
 }
 
 /// Forward reference for `JeffJSFunctionBytecode`.
-class JeffJSFunctionBytecode {
+nonisolated class JeffJSFunctionBytecode {
     var refCount: Int = 1
     var bytecodeLen: Int = 0
     var bytecode: [UInt8] = []
@@ -751,7 +751,7 @@ enum JSCFunctionType {
 /// Intrusive doubly-linked list node used by the GC.
 /// Both prev and next are strong — GC lists require strong pointers to prevent
 /// ARC from deallocating nodes that are still part of the list.
-final class ListNode {
+nonisolated final class ListNode {
     var prev: ListNode?
     var next: ListNode?
 
@@ -992,7 +992,7 @@ struct JeffJSBoundFunction {
 /// built from a single shape is cached on that shape and shared by every
 /// iterator over an object of that shape; the strings are released when the
 /// last holder lets go.
-final class JeffJSForInKeyList {
+nonisolated final class JeffJSForInKeyList {
     let keys: [JeffJSValue]
     init(keys: [JeffJSValue]) { self.keys = keys }
     deinit { for k in keys { k.freeValue() } }
@@ -1002,14 +1002,14 @@ final class JeffJSForInKeyList {
 /// in the iterator object's payload; the old implementation kept the keys in
 /// a JS array under two internal properties and paid five property
 /// operations per iteration.
-final class JeffJSForInIterator {
+nonisolated final class JeffJSForInIterator {
     let keys: JeffJSForInKeyList
     var idx: Int = 0
     init(keys: JeffJSForInKeyList) { self.keys = keys }
 }
 
 /// ArrayBuffer data.
-final class JeffJSArrayBuffer {
+nonisolated final class JeffJSArrayBuffer {
     var refCount: Int = 1
     var byteLength: Int = 0
     var detached: Bool = false
@@ -1025,7 +1025,7 @@ final class JeffJSArrayBuffer {
 }
 
 /// TypedArray data.
-final class JeffJSTypedArray {
+nonisolated final class JeffJSTypedArray {
     var refCount: Int = 1
     var obj: JeffJSObject?
     var buffer: JeffJSObject?
@@ -1063,7 +1063,7 @@ enum JeffJSPromiseStateEnum: UInt8 {
 }
 
 /// Promise data (`JSPromiseData`).
-final class JeffJSPromiseData {
+nonisolated final class JeffJSPromiseData {
     var promiseState: JeffJSPromiseStateEnum = .pending
     var promiseResult: JeffJSValue = .undefined
     var promiseFulfillReactions: [JeffJSPromiseReaction] = []
@@ -1074,7 +1074,7 @@ final class JeffJSPromiseData {
 }
 
 /// Async function execution state.
-final class JeffJSAsyncFunctionState {
+nonisolated final class JeffJSAsyncFunctionState {
     var thisVal: JeffJSValue = .undefined
     var argc: Int = 0
     var throwFlag: Bool = false
@@ -1130,7 +1130,7 @@ struct GeneratorSavedState {
 /// Generator data.
 /// One queued `next` / `return` / `throw` on an async generator, with the
 /// promise capability whose settlement is that call's answer.
-final class JeffJSAsyncGenRequest {
+nonisolated final class JeffJSAsyncGenRequest {
     let completionType: Int
     var value: JeffJSValue      // owned
     var resolve: JeffJSValue    // owned
@@ -1148,7 +1148,7 @@ final class JeffJSAsyncGenRequest {
     }
 }
 
-final class JeffJSGeneratorData {
+nonisolated final class JeffJSGeneratorData {
     var state: JeffJSGeneratorStateEnum = .suspended_start
     var asyncState: JeffJSAsyncFunctionState = JeffJSAsyncFunctionState()
 
@@ -1212,7 +1212,7 @@ final class JeffJSGeneratorData {
 }
 
 /// Map / Set record entry.
-final class JeffJSMapRecord {
+nonisolated final class JeffJSMapRecord {
     var refCount: Int = 1
     var map: JeffJSMapState?
     var key: JeffJSValue = .undefined
@@ -1230,7 +1230,7 @@ final class JeffJSMapRecord {
 }
 
 /// Map / Set state.
-final class JeffJSMapState {
+nonisolated final class JeffJSMapState {
     var isWeak: Bool = false
     /// Live iterators and running `forEach` loops, which address `records`
     /// by index: the table is only compacted while this is zero.
@@ -1248,7 +1248,7 @@ final class JeffJSMapState {
 }
 
 /// Global object extra data.
-final class JeffJSGlobalObject {
+nonisolated final class JeffJSGlobalObject {
     var globalVarCount: Int = 0
     var globalVarNames: [UInt32] = []
     var globalVarValues: [JeffJSValue] = []
@@ -1269,7 +1269,7 @@ struct JeffJSGlobalVarDef {
 /// parent frame's local or arg slot via `parentFrame` + `varIdx`.
 /// When **detached** (after `close_loc`), the current value is copied
 /// into `value` and reads/writes go there instead.
-final class JeffJSVarRef: JeffJSGCObjectHeader {
+nonisolated final class JeffJSVarRef: JeffJSGCObjectHeader {
     /// Var-refs are shared by every closure capturing the same slot and are
     /// kept alive by their varRefs arrays (ARC); the detached value is
     /// released when the last closure lets go. The GC path clears `value`
@@ -1405,7 +1405,7 @@ final class JeffJSVarRef: JeffJSGCObjectHeader {
 ///
 /// Only values outside the 48-bit inline payload live here; everything
 /// smaller is a `shortBigInt` in the NaN-boxed value itself.
-final class JeffJSBigInt: JeffJSGCObjectHeader {
+nonisolated final class JeffJSBigInt: JeffJSGCObjectHeader {
     var value: JBigInt = .zero
 
     var sign: Bool { value.negative }
@@ -1424,7 +1424,7 @@ final class JeffJSBigInt: JeffJSGCObjectHeader {
 
 /// Call-stack frame.
 /// Uses a class (not struct) because it self-references via `prevFrame`.
-final class JeffJSStackFrame {
+nonisolated final class JeffJSStackFrame {
     /// Caller's frame. Strong, not weak: frames form a linear chain that
     /// releaseFrame explicitly breaks, and weak-reference side-table traffic
     /// (formWeakReference/weakLoadStrong) showed up per call in profiles.
@@ -1565,7 +1565,7 @@ enum JeffJSProperty {
 /// Out-of-line payload for the rare non-data property kinds. ARC-managed Swift
 /// class, so getter/setter/varRef lifetimes are handled automatically exactly as
 /// the enum's associated values were — no manual refcounting.
-final class JeffJSPropertyExtra {
+nonisolated final class JeffJSPropertyExtra {
     enum Kind: UInt8 { case getset, varRef, autoInit }
     var kind: Kind
     var getter: JeffJSObject?
@@ -1605,7 +1605,7 @@ final class JeffJSPropertyExtra {
 /// Used by the interpreter's push fast path so that appending an element
 /// doesn't trigger Swift copy-on-write of the `[JeffJSValue]` inside the
 /// `JeffJSObjectPayload.array` enum case.
-final class JeffJSFastArrayStorage {
+nonisolated final class JeffJSFastArrayStorage {
     var values: ContiguousArray<JeffJSValue>
     var count: UInt32
     /// Per-element attribute bits (`attrWritable|attrEnumerable|
@@ -1677,7 +1677,7 @@ final class JeffJSFastArrayStorage {
 // MARK: - JeffJSObject
 
 /// Core object representation.  Mirrors QuickJS `JSObject`.
-final class JeffJSObject: JeffJSGCObjectHeader {
+nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
 
     // -- Object flags (packed as individual bools to keep things readable) ----
 
@@ -2743,7 +2743,7 @@ struct JeffJSObj {
 /// The frames captured when an Error was constructed. `JeffJSContext`
 /// turns this into the `stack` string the first time the property is read
 /// (see materializeErrorStack).
-final class JeffJSPendingStack {
+nonisolated final class JeffJSPendingStack {
     let errorName: String
     let message: String
     /// (function bytecode, pc) per frame, innermost first.

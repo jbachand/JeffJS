@@ -14,7 +14,7 @@ import Foundation
 
 /// Internal timer entry matching QuickJS os_timer in quickjs-libc.c.
 /// Each setTimeout/setInterval call creates one of these.
-private final class JeffJSTimerEntry {
+private nonisolated final class JeffJSTimerEntry {
     let id: Int32
     let callback: JeffJSValue
     let args: [JeffJSValue]
@@ -35,7 +35,7 @@ private final class JeffJSTimerEntry {
 }
 
 /// Internal state for console.count() / console.time() tracking.
-private final class JeffJSConsoleState {
+private nonisolated final class JeffJSConsoleState {
     var countMap: [String: Int] = [:]
     var timerMap: [String: Double] = [:]    // label -> start time (seconds)
     var groupDepth: Int = 0
@@ -1683,7 +1683,7 @@ struct JeffJSStdLib {
 // MARK: - Per-Context State
 
 /// Internal state maintained per JeffJSContext for the standard library.
-private final class JeffJSStdLibState {
+private nonisolated final class JeffJSStdLibState {
     var console: JeffJSConsoleState = JeffJSConsoleState()
     var timers: [Int32: JeffJSTimerEntry] = [:]
     var nextTimerId: Int32 = 1
