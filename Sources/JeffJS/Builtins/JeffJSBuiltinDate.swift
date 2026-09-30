@@ -1064,6 +1064,27 @@ private let dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 private let monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
+/// ES §21.4.4.41.3 TimeZoneString's optional implementation-defined name, as
+/// JavaScriptCore writes it: " (Eastern Daylight Time)" — the zone's long name
+/// in the current locale, daylight or standard for that instant. Pages
+/// fingerprint `new Date().toString()` against the Safari UA (akamai navigation
+/// fix, 2026-09-29; JeffJS printed no name).
+private let tzNameLock = NSLock()
+nonisolated(unsafe) private var tzNameCache: [String: String] = [:]
+private func timeZoneNameSuffix(_ t: Double) -> String {
+    guard t.isFinite else { return "" }
+    let tz = TimeZone.current
+    let date = Date(timeIntervalSince1970: t / 1000)
+    let dst = tz.isDaylightSavingTime(for: date)
+    let key = tz.identifier + (dst ? "|d" : "|s")
+    tzNameLock.lock(); defer { tzNameLock.unlock() }
+    if let cached = tzNameCache[key] { return cached }
+    let name = tz.localizedName(for: dst ? .daylightSaving : .standard, locale: Locale.current)
+    let suffix = name.map { " (\($0))" } ?? ""
+    tzNameCache[key] = suffix
+    return suffix
+}
+
 /// Format a UTC time value into a full toString() format.
 private func formatDateToString(_ t: Double) -> String {
     if t.isNaN { return "Invalid Date" }
@@ -1082,7 +1103,7 @@ private func formatDateToString(_ t: Double) -> String {
 
     return String(format: "%@ %@ %02d %04d %02d:%02d:%02d GMT%@%02d%02d",
                   dayNames[wd], monthNames[m], d, y, h, min, sec,
-                  tzSign, tzH, tzM)
+                  tzSign, tzH, tzM) + timeZoneNameSuffix(t)
 }
 
 /// toString()
@@ -1116,7 +1137,7 @@ func jsDate_toTimeString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [
     let tzSign = tzOffsetMin <= 0 ? "+" : "-"
     let tzH = abs(tzOffsetMin) / 60
     let tzM = abs(tzOffsetMin) % 60
-    let s = String(format: "%02d:%02d:%02d GMT%@%02d%02d", h, min, sec, tzSign, tzH, tzM)
+    let s = String(format: "%02d:%02d:%02d GMT%@%02d%02d", h, min, sec, tzSign, tzH, tzM) + timeZoneNameSuffix(t)
     return .makeString(JeffJSString(swiftString: s))
 }
 
@@ -1167,7 +1188,7 @@ func jsDate_toLocaleString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
     let formatter = DateFormatter()
     formatter.dateStyle = .medium
     formatter.timeStyle = .medium
-    return .makeString(JeffJSString(swiftString: formatter.string(from: date)))
+    return .makeString(JeffJSString(swiftString: JeffJSIntlBridge.webKitSpaces(formatter.string(from: date))))
 }
 
 func jsDate_toLocaleDateString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
@@ -1177,7 +1198,7 @@ func jsDate_toLocaleDateString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ a
     let formatter = DateFormatter()
     formatter.dateStyle = .medium
     formatter.timeStyle = .none
-    return .makeString(JeffJSString(swiftString: formatter.string(from: date)))
+    return .makeString(JeffJSString(swiftString: JeffJSIntlBridge.webKitSpaces(formatter.string(from: date))))
 }
 
 func jsDate_toLocaleTimeString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
@@ -1187,7 +1208,7 @@ func jsDate_toLocaleTimeString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ a
     let formatter = DateFormatter()
     formatter.dateStyle = .none
     formatter.timeStyle = .medium
-    return .makeString(JeffJSString(swiftString: formatter.string(from: date)))
+    return .makeString(JeffJSString(swiftString: JeffJSIntlBridge.webKitSpaces(formatter.string(from: date))))
 }
 
 /// toJSON()
@@ -1317,6 +1338,15 @@ func jeffJS_initDate(ctx: JeffJSContext, globalObj: JeffJSObject) {
     jeffJS_defineBuiltinFunc(ctx: ctx, obj: dateCtor, name: "now", length: 0, func: jsDate_now)
     jeffJS_defineBuiltinFunc(ctx: ctx, obj: dateCtor, name: "parse", length: 1, func: jsDate_parse)
     jeffJS_defineBuiltinFunc(ctx: ctx, obj: dateCtor, name: "UTC", length: 7, func: jsDate_UTC)
+
+    // Date.name / Date.length (ES §21.4.2: length 7). akamai navigation fix: they
+    // were missing (`String(Date)` printed "function () {").
+    ctx.definePropertyValue(obj: .makeObject(dateCtor), atom: JeffJSAtomID.JS_ATOM_length.rawValue,
+                            value: JeffJSValue.newInt32(7), flags: JS_PROP_CONFIGURABLE)
+    let dateName = ctx.newStringValue("Date")
+    ctx.definePropertyValue(obj: .makeObject(dateCtor), atom: JeffJSAtomID.JS_ATOM_name.rawValue,
+                            value: dateName, flags: JS_PROP_CONFIGURABLE)
+    dateName.freeValue()   // definePropertyValue dups
 
     // Install on global
     jeffJS_setPropertyStr(ctx: ctx, obj: globalObj, name: "Date", value: .makeObject(dateCtor))

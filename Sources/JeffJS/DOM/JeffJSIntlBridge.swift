@@ -843,7 +843,16 @@ extension JeffJSIntlBridge {
 
     func formatDate(_ spec: DateSpec, _ ms: Double) -> String {
         let date = Date(timeIntervalSince1970: ms / 1000.0)
-        return dateFormatter(spec).string(from: date)
+        return Self.webKitSpaces(dateFormatter(spec).string(from: date))
+    }
+
+    /// WebKit's Intl.DateTimeFormat writes ICU's U+202F NARROW NO-BREAK SPACE (and
+    /// U+2009 THIN SPACE) as an ASCII space ("7:00:00 PM"), for web compatibility;
+    /// WKWebView capture on iOS 26 (akamai navigation fix, 2026-09-29). JeffJS
+    /// printed U+202F — a byte-level engine tell in `toLocaleString()`.
+    nonisolated static func webKitSpaces(_ s: String) -> String {
+        guard s.unicodeScalars.contains(where: { $0.value == 0x202F || $0.value == 0x2009 }) else { return s }
+        return s.replacingOccurrences(of: "\u{202F}", with: " ").replacingOccurrences(of: "\u{2009}", with: " ")
     }
 
     func dateParts(_ spec: DateSpec, _ ms: Double) -> [(String, String)] {
@@ -851,11 +860,11 @@ extension JeffJSIntlBridge {
         var out: [(String, String)] = []
         for tok in JeffJSIntlBridge.patternTokens(spec.pattern) {
             guard let f = tok.field else {
-                if !tok.text.isEmpty { out.append(("literal", tok.text)) }
+                if !tok.text.isEmpty { out.append(("literal", Self.webKitSpaces(tok.text))) }
                 continue
             }
             let type = JeffJSIntlBridge.partType(for: f)
-            let value = dateFormatter(spec, pattern: tok.text).string(from: date)
+            let value = Self.webKitSpaces(dateFormatter(spec, pattern: tok.text).string(from: date))
             out.append((type, value))
         }
         return out

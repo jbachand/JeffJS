@@ -389,6 +389,15 @@ final class JeffJSDOMBridge {
         self.documentJSValue = docObj.dupValue()
         ctx.setPropertyStr(obj: global, name: "document", value: docObj)
 
+        // -- Document / HTMLDocument interface objects (WebIDL §3.7) --
+        // The page document's chain is HTMLDocument.prototype → Document.prototype
+        // → EventTarget.prototype, and Document attributes that are accessors in
+        // WebIDL live on Document.prototype (`cookie`, `referrer`), not on the
+        // instance: bot-defence scripts (Akamai's sensor) read
+        // `Object.getOwnPropertyDescriptor(Document.prototype, 'cookie').get`.
+        // akamai navigation fix, 2026-09-29.
+        installDocumentInterfaces(ctx: ctx, global: global)
+
         // -- Constructor stubs (Window, Document, HTMLDocument, Node, Element, etc.) --
         // Browsers expose these as global constructor functions. Frameworks like React
         // check `typeof Document !== 'undefined'` to detect a DOM environment.
@@ -443,6 +452,63 @@ final class JeffJSDOMBridge {
     }
 
     // MARK: - Document Object
+
+    /// `document.referrer` (HTML §3.1.3: the navigation request's referrer after
+    /// its policy). The host sets it before `register`; "" = none.
+    var documentReferrer: String = ""
+
+    /// WebIDL interface objects for the page document: `Document` and
+    /// `HTMLDocument` constructors whose `prototype`s form the document's chain
+    /// (`document instanceof HTMLDocument/Document`, `Object.prototype.toString`
+    /// = `[object HTMLDocument]`), and the `referrer` attribute as an accessor on
+    /// `Document.prototype` (WebIDL §3.7.6: regular attributes are accessor
+    /// properties of the interface prototype object). `cookie` is added there by
+    /// `JeffJSCookieBridge`. Only when no host defined `Document` first.
+    private func installDocumentInterfaces(ctx: JeffJSContext, global: JeffJSValue) {
+        let existing = ctx.getPropertyStr(obj: global, name: "Document")
+        let hostDefined = !existing.isUndefined
+        existing.freeValue()
+        guard !hostDefined, let doc = documentJSValue else { return }
+        ctx.setPropertyStr(obj: global, name: "__rnDocTmp", value: doc.dupValue())
+        let r = ctx.eval(input: """
+        (function(doc) {
+          var base = Object.getPrototypeOf(doc);
+          var Document = function Document() {};
+          var HTMLDocument = function HTMLDocument() {};
+          var dp = Object.create(base), hp = Object.create(dp);
+          Object.defineProperty(dp, 'constructor', { value: Document, writable: true, configurable: true });
+          Object.defineProperty(hp, 'constructor', { value: HTMLDocument, writable: true, configurable: true });
+          if (typeof Symbol === 'function' && Symbol.toStringTag) {
+            Object.defineProperty(dp, Symbol.toStringTag, { value: 'Document', configurable: true });
+            Object.defineProperty(hp, Symbol.toStringTag, { value: 'HTMLDocument', configurable: true });
+          }
+          Object.defineProperty(Document, 'prototype', { value: dp, writable: false });
+          Object.defineProperty(HTMLDocument, 'prototype', { value: hp, writable: false });
+          Object.setPrototypeOf(HTMLDocument, Document);
+          Object.setPrototypeOf(doc, hp);
+          delete doc.referrer;
+          Object.defineProperty(window, 'Document', { value: Document, writable: true, configurable: true });
+          Object.defineProperty(window, 'HTMLDocument', { value: HTMLDocument, writable: true, configurable: true });
+        })(__rnDocTmp); delete window.__rnDocTmp;
+        """, filename: "<dom-document-interfaces>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+        r.freeValue()
+        // `referrer`: an accessor on Document.prototype (the page document's value;
+        // "" for any other document), replacing the instance's data property.
+        let docCtor = ctx.getPropertyStr(obj: global, name: "Document")
+        defer { docCtor.freeValue() }
+        let proto = ctx.getPropertyStr(obj: docCtor, name: "prototype")
+        defer { proto.freeValue() }
+        guard proto.isObject else { return }
+        weak var pageDocument = doc.toObject()
+        let getter = ctx.newCFunction({ [weak self] ctx, thisVal, _ in
+            guard thisVal.isObject else {
+                return ctx.throwTypeError(message: "The Document.referrer getter can only be used on instances of Document")
+            }
+            guard let self, thisVal.toObject() === pageDocument else { return ctx.newStringValue("") }
+            return ctx.newStringValue(self.documentReferrer)
+        }, name: "get referrer", length: 0)
+        ctx.setPropertyGetSet(obj: proto, name: "referrer", getter: getter, setter: nil)
+    }
 
     private func buildDocumentObject(ctx: JeffJSContext) -> JeffJSValue {
         // Document is an EventTarget: chain to EventTarget.prototype so it
