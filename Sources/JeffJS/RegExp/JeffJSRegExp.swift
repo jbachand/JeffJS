@@ -363,6 +363,19 @@ private func lreGetUnicodePropertyRanges(_ name: String, negate: Bool) -> [CharR
                   .replacingOccurrences(of: "-", with: "")
                   .replacingOccurrences(of: " ", with: "")
 
+    // ECMA-262 §22.2.2.9 (tables 66-67): a lone name is a General_Category value or a binary
+    // property, by canonical name *or alias* (PropertyValueAliases.txt / PropertyAliases.txt),
+    // read from the scalar's own Unicode properties. homedepot's my-homepage bundle compiles
+    // /([\p{Alpha}\p{N}_]|$)/u and died on `Alpha` (Alphabetic's alias); Lu/Lt/Lm/Lo/N were also
+    // approximations (Lu = the Uppercase property, N = any numeric type, Lt = upper && lower).
+    // The explicit tables below (ASCII, Any, Assigned, Emoji_Component, Extended_Pictographic,
+    // Regional_Indicator) and the scripts stay where they were.
+    if let predicate = lreGeneralCategoryPredicate(key) ?? lreBinaryPropertyPredicate(key) {
+        var result = crNormalize(lreUnicodeCategoryRanges(predicate))
+        if negate { result = crComplement(result) }
+        return result
+    }
+
     var ranges: [CharRange]? = nil
 
     // --- General Category shortcuts ---
@@ -456,7 +469,7 @@ private func lreGetUnicodePropertyRanges(_ name: String, negate: Bool) -> [CharR
         ranges = lreUnicodeCategoryRanges { $0.properties.isEmojiModifier }
     case "emojimodifierbase":
         ranges = lreUnicodeCategoryRanges { $0.properties.isEmojiModifierBase }
-    case "emojicomponent":
+    case "ecomp", "emojicomponent":
         // Emoji_Component (Unicode 15.1): keycap bases, VS16, ZWJ, skin tone modifiers, tag chars
         ranges = [
             CharRange(0x0023, 0x0023), CharRange(0x002A, 0x002A), CharRange(0x0030, 0x0039),
@@ -464,9 +477,9 @@ private func lreGetUnicodePropertyRanges(_ name: String, negate: Bool) -> [CharR
             CharRange(0x1F1E6, 0x1F1FF), CharRange(0x1F3FB, 0x1F3FF),
             CharRange(0xE0020, 0xE007F),
         ]
-    case "regionalindicator":
+    case "ri", "regionalindicator":
         ranges = [CharRange(0x1F1E6, 0x1F1FF)]
-    case "extendedpictographic":
+    case "extpict", "extendedpictographic":
         // Extended_Pictographic (Unicode 15.1) — full range table
         ranges = [
             // BMP
@@ -544,6 +557,113 @@ private func lreGetUnicodePropertyRanges(_ name: String, negate: Bool) -> [CharR
     return result
 }
 
+/// General_Category values (ECMA-262 table 66) by long name or alias, keys normalised like
+/// `lreGetUnicodePropertyRanges` (lowercased, `_`/`-`/space removed).
+private func lreGeneralCategoryPredicate(_ key: String) -> ((Unicode.Scalar) -> Bool)? {
+    typealias G = Unicode.GeneralCategory
+    let cats: [G]
+    switch key {
+    case "l", "letter": cats = [.uppercaseLetter, .lowercaseLetter, .titlecaseLetter, .modifierLetter, .otherLetter]
+    case "lc", "casedletter", "l&": cats = [.uppercaseLetter, .lowercaseLetter, .titlecaseLetter]
+    case "lu", "uppercaseletter": cats = [.uppercaseLetter]
+    case "ll", "lowercaseletter": cats = [.lowercaseLetter]
+    case "lt", "titlecaseletter": cats = [.titlecaseLetter]
+    case "lm", "modifierletter": cats = [.modifierLetter]
+    case "lo", "otherletter": cats = [.otherLetter]
+    case "m", "mark", "combiningmark": cats = [.nonspacingMark, .spacingMark, .enclosingMark]
+    case "mn", "nonspacingmark": cats = [.nonspacingMark]
+    case "mc", "spacingmark": cats = [.spacingMark]
+    case "me", "enclosingmark": cats = [.enclosingMark]
+    case "n", "number": cats = [.decimalNumber, .letterNumber, .otherNumber]
+    case "nd", "decimalnumber", "digit": cats = [.decimalNumber]
+    case "nl", "letternumber": cats = [.letterNumber]
+    case "no", "othernumber": cats = [.otherNumber]
+    case "p", "punctuation", "punct":
+        cats = [.connectorPunctuation, .dashPunctuation, .openPunctuation, .closePunctuation,
+                .initialPunctuation, .finalPunctuation, .otherPunctuation]
+    case "pc", "connectorpunctuation": cats = [.connectorPunctuation]
+    case "pd", "dashpunctuation": cats = [.dashPunctuation]
+    case "ps", "openpunctuation": cats = [.openPunctuation]
+    case "pe", "closepunctuation": cats = [.closePunctuation]
+    case "pi", "initialpunctuation": cats = [.initialPunctuation]
+    case "pf", "finalpunctuation": cats = [.finalPunctuation]
+    case "po", "otherpunctuation": cats = [.otherPunctuation]
+    case "s", "symbol": cats = [.mathSymbol, .currencySymbol, .modifierSymbol, .otherSymbol]
+    case "sm", "mathsymbol": cats = [.mathSymbol]
+    case "sc", "currencysymbol": cats = [.currencySymbol]
+    case "sk", "modifiersymbol": cats = [.modifierSymbol]
+    case "so", "othersymbol": cats = [.otherSymbol]
+    case "z", "separator": cats = [.spaceSeparator, .lineSeparator, .paragraphSeparator]
+    case "zs", "spaceseparator": cats = [.spaceSeparator]
+    case "zl", "lineseparator": cats = [.lineSeparator]
+    case "zp", "paragraphseparator": cats = [.paragraphSeparator]
+    case "c", "other": cats = [.control, .format, .surrogate, .privateUse, .unassigned]
+    case "cc", "control", "cntrl": cats = [.control]
+    case "cf", "format": cats = [.format]
+    case "cs", "surrogate": cats = [.surrogate]
+    case "co", "privateuse": cats = [.privateUse]
+    case "cn", "unassigned": cats = [.unassigned]
+    default: return nil
+    }
+    return { scalar in cats.contains(scalar.properties.generalCategory) }
+}
+
+/// Binary Unicode properties (ECMA-262 table 67) by name or alias, except the ones with explicit
+/// range tables in `lreGetUnicodePropertyRanges` (ASCII, Any, Assigned, Emoji_Component,
+/// Extended_Pictographic, Regional_Indicator).
+private func lreBinaryPropertyPredicate(_ key: String) -> ((Unicode.Scalar) -> Bool)? {
+    switch key {
+    case "alpha", "alphabetic": return { $0.properties.isAlphabetic }
+    case "ahex", "asciihexdigit": return { $0.properties.isASCIIHexDigit }
+    case "bidic", "bidicontrol": return { $0.properties.isBidiControl }
+    case "bidim", "bidimirrored": return { $0.properties.isBidiMirrored }
+    case "cased": return { $0.properties.isCased }
+    case "ci", "caseignorable": return { $0.properties.isCaseIgnorable }
+    case "cwcf", "changeswhencasefolded": return { $0.properties.changesWhenCaseFolded }
+    case "cwcm", "changeswhencasemapped": return { $0.properties.changesWhenCaseMapped }
+    case "cwkcf", "changeswhennfkccasefolded": return { $0.properties.changesWhenNFKCCaseFolded }
+    case "cwl", "changeswhenlowercased": return { $0.properties.changesWhenLowercased }
+    case "cwt", "changeswhentitlecased": return { $0.properties.changesWhenTitlecased }
+    case "cwu", "changeswhenuppercased": return { $0.properties.changesWhenUppercased }
+    case "dash": return { $0.properties.isDash }
+    case "dep", "deprecated": return { $0.properties.isDeprecated }
+    case "di", "defaultignorablecodepoint": return { $0.properties.isDefaultIgnorableCodePoint }
+    case "dia", "diacritic": return { $0.properties.isDiacritic }
+    case "emoji": return { $0.properties.isEmoji }
+    case "ebase", "emojimodifierbase": return { $0.properties.isEmojiModifierBase }
+    case "emod", "emojimodifier": return { $0.properties.isEmojiModifier }
+    case "epres", "emojipresentation": return { $0.properties.isEmojiPresentation }
+    case "ext", "extender": return { $0.properties.isExtender }
+    case "grbase", "graphemebase": return { $0.properties.isGraphemeBase }
+    case "grext", "graphemeextend": return { $0.properties.isGraphemeExtend }
+    case "hex", "hexdigit": return { $0.properties.isHexDigit }
+    case "idc", "idcontinue": return { $0.properties.isIDContinue }
+    case "ids", "idstart": return { $0.properties.isIDStart }
+    case "ideo", "ideographic": return { $0.properties.isIdeographic }
+    case "idsb", "idsbinaryoperator": return { $0.properties.isIDSBinaryOperator }
+    case "idst", "idstrinaryoperator": return { $0.properties.isIDSTrinaryOperator }
+    case "joinc", "joincontrol": return { $0.properties.isJoinControl }
+    case "loe", "logicalorderexception": return { $0.properties.isLogicalOrderException }
+    case "lower", "lowercase": return { $0.properties.isLowercase }
+    case "math": return { $0.properties.isMath }
+    case "nchar", "noncharactercodepoint": return { $0.properties.isNoncharacterCodePoint }
+    case "patsyn", "patternsyntax": return { $0.properties.isPatternSyntax }
+    case "patws", "patternwhitespace": return { $0.properties.isPatternWhitespace }
+    case "qmark", "quotationmark": return { $0.properties.isQuotationMark }
+    case "radical": return { $0.properties.isRadical }
+    case "sd", "softdotted": return { $0.properties.isSoftDotted }
+    case "sterm", "sentenceterminal": return { $0.properties.isSentenceTerminal }
+    case "term", "terminalpunctuation": return { $0.properties.isTerminalPunctuation }
+    case "uideo", "unifiedideograph": return { $0.properties.isUnifiedIdeograph }
+    case "upper", "uppercase": return { $0.properties.isUppercase }
+    case "vs", "variationselector": return { $0.properties.isVariationSelector }
+    case "wspace", "whitespace", "space": return { $0.properties.isWhitespace }
+    case "xidc", "xidcontinue": return { $0.properties.isXIDContinue }
+    case "xids", "xidstart": return { $0.properties.isXIDStart }
+    default: return nil
+    }
+}
+
 /// Build character ranges by scanning Unicode scalars that match a predicate.
 /// We scan BMP + a small portion of supplementary planes.
 private func lreUnicodeCategoryRanges(_ predicate: (Unicode.Scalar) -> Bool) -> [CharRange] {
@@ -576,8 +696,8 @@ private func lreUnicodeCategoryRanges(_ predicate: (Unicode.Scalar) -> Bool) -> 
     // Supplementary (common blocks)
     scan(0x10000, 0x1FFFF)
     scan(0x20000, 0x2FA1F)
-    // Emoji block
-    scan(0x1F000, 0x1FAFF)
+    scan(0x30000, 0x323AF)   // CJK Unified Ideographs Extension G/H (Alphabetic, Ideographic, ID_Start)
+    scan(0xE0000, 0xE01EF)   // tags + variation selectors supplement (Default_Ignorable, VS, Cf)
 
     return ranges
 }

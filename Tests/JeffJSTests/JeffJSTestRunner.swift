@@ -344,6 +344,7 @@ struct JeffJSTestRunner {
             ("IteratorHelpers", { $0.testIteratorHelpers() }),
             ("SyntaxErrorText", { $0.testSyntaxErrorText() }),
             ("ObjectLiteralDefine", { $0.testObjectLiteralDefine() }),
+            ("RegExpPropertyEscape", { $0.testRegExpPropertyEscape() }),
             ("DOMNodeInterface", { $0.testDOMNodeInterface() }),
         ]
     }
