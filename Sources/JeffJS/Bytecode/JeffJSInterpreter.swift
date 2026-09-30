@@ -11239,7 +11239,33 @@ struct JeffJSInterpreter {
                 // Since JeffJS runs single-threaded without a real event loop,
                 // we implement synchronous unwrapping: drain the microtask queue
                 // to settle pending Promises, then extract the result directly.
-                let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                var val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+
+                // ES §27.7.5.3 Await(value): PromiseResolve(%Promise%, value),
+                // PerformPromiseThen, then *always* suspend — the continuation
+                // is a job, so `await 0` / `await settledPromise` let every job
+                // queued before it run first (`p.then(f); await 0; g()` is f
+                // then g). The synchronous unwrapping below (resume at once on
+                // a non-promise or a settled promise, drain the job queue on a
+                // pending one) reordered async code against promise reactions,
+                // MutationObserver and slotchange delivery (reddit's Lit
+                // updates, `await scheduler?.yield?.()`). Inside an async
+                // function or async generator body every await now takes the
+                // suspension path below; elsewhere (no activation to suspend)
+                // the old unwrapping stays. A/B: JEFFJS_INTERP_AWAITALWAYSSUSPENDS=0.
+                let awaitCanSuspend = (fb.isGenerator && fb.isAsyncFunc)
+                    || (!ctx._asyncResolve.isUndefined && !fb.isGenerator)
+                let awaitAlwaysSuspends = awaitCanSuspend && JeffJSConfig.awaitAlwaysSuspends
+                if awaitAlwaysSuspends {
+                    var isNativePromise = false
+                    if let o = val.toObject(), case .promiseData = o.payload { isNativePromise = true }
+                    if !isNativePromise {
+                        let wrapped = JeffJSBuiltinPromise.resolve(ctx: ctx, this: ctx.promiseCtor, args: [val])
+                        val.freeValue()
+                        if wrapped.isException { retVal = .exception; break dispatchLoop }
+                        val = wrapped
+                    }
+                }
 
                 // Fast path: non-object values pass through unchanged.
                 // `await 42` === 42, `await "hello"` === "hello"
@@ -11257,11 +11283,11 @@ struct JeffJSInterpreter {
                     // synchronously, but chained Promises (e.g. via .then())
                     // settle via enqueued reaction jobs. Draining gives them
                     // a chance to complete.
-                    if promData.promiseState == .pending {
+                    if !awaitAlwaysSuspends && promData.promiseState == .pending {
                         _ = ctx.rt.executePendingJobs()
                     }
 
-                    switch promData.promiseState {
+                    switch awaitAlwaysSuspends ? JeffJSPromiseStateEnum.pending : promData.promiseState {
                     case .fulfilled:
                         // Dup: the promise owns its result; the VM stack takes
                         // its own reference (a borrowed push here over-freed).
