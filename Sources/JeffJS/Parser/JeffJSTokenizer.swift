@@ -237,7 +237,11 @@ private let keywordTable: [(String, Int)] = [
     ("static",      JSTokenType.TOK_STATIC.rawValue),
     ("yield",       JSTokenType.TOK_YIELD.rawValue),
     ("await",       JSTokenType.TOK_AWAIT.rawValue),
-    ("of",          JSTokenType.TOK_OF.rawValue),
+    // "of" is not a keyword either (ES §12.7.2: not a ReservedWord): it is an identifier that
+    // only a for-of head reads as `of` (the parser checks `isIdent("of")` there). As a keyword
+    // token it was refused as a binding everywhere a pattern or parameter wants a TOK_IDENT —
+    // homedepot's PLP bundle has `const{…,string:of,…}=l` and died with "Unexpected identifier
+    // 'of'" (homedepot agent, 2026-09-30).
     // "accessor" is not a keyword: it is only contextual inside a class body
     // (decorators proposal) and a valid identifier / property name everywhere
     // else (`{accessor: 1}`, `o.accessor`, `static accessor(e)` — lowes.com).
@@ -876,8 +880,7 @@ extension JeffJSParseState {
                 if b[s + 1] == 0x66 { return JSTokenType.TOK_IF.rawValue } // if
                 if b[s + 1] == 0x6E { return JSTokenType.TOK_IN.rawValue } // in
                 return 0
-            case 0x6F: // o
-                if b[s + 1] == 0x66 { return JSTokenType.TOK_OF.rawValue } // of
+            case 0x6F: // o — "of" is an identifier (see keywordTable)
                 return 0
             default: return 0
             }

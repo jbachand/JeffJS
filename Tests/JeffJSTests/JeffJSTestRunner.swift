@@ -345,6 +345,7 @@ struct JeffJSTestRunner {
             ("SyntaxErrorText", { $0.testSyntaxErrorText() }),
             ("ObjectLiteralDefine", { $0.testObjectLiteralDefine() }),
             ("RegExpPropertyEscape", { $0.testRegExpPropertyEscape() }),
+            ("OfIdentifier", { $0.testOfIdentifier() }),
             ("DOMNodeInterface", { $0.testDOMNodeInterface() }),
         ]
     }
