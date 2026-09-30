@@ -3312,6 +3312,11 @@ final class JeffJSDOMBridge {
         onMutated?([node.id])
     }
 
+    /// Several nodes at once (one host callback).
+    func notifyMutations(_ ids: [UUID]) {
+        if !ids.isEmpty { onMutated?(Set(ids)) }
+    }
+
     /// Finds the first element node matching a predicate (DFS).
     func findElement(in node: DOMNode, where predicate: (DOMNode) -> Bool) -> DOMNode? {
         if node.nodeType == .element && predicate(node) { return node }

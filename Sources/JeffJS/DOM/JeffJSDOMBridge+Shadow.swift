@@ -294,9 +294,50 @@ extension JeffJSDOMBridge {
         }
     }
 
+    /// Elements at or below `start` (optionally with `localName`), in
+    /// shadow-including preorder: an element, then its shadow tree, then its
+    /// children (DOM §4.2.2 "shadow-including tree order"). Iterative.
+    func shadowIncludingElements(from start: DOMNode, localName: String?) -> [DOMNode] {
+        var out: [DOMNode] = []
+        var stack: [DOMNode] = [start]
+        while let n = stack.popLast() {
+            if n.nodeType == .element, localName == nil || n.tagName == localName { out.append(n) }
+            let kids = n.children
+            if !kids.isEmpty { stack.append(contentsOf: kids.reversed()) }
+            if let r = n.shadowRoot { stack.append(r) }
+        }
+        return out
+    }
+
     /// Installs `document.__rnSetCEHook(fn)` (the app's customElements
-    /// implementation registers its reaction runner; null removes it).
+    /// implementation registers its reaction runner; null removes it) and
+    /// `document.__rnCEDefined(name)`: `name` is now defined, so `:defined`
+    /// (Selectors 4 §13.5, HTML §4.13: the element's custom element state is
+    /// "custom") matches its elements — they are reported as mutated so the
+    /// host restyles them.
     func installCustomElementHookSetter(on doc: JeffJSValue, ctx: JeffJSContext) {
+        ctx.setPropertyFunc(obj: doc, name: "__rnCEDefined", fn: { [weak self] ctx, _, args in
+            guard let self, let name = self.extractString(ctx: ctx, args: args, index: 0)?.lowercased(),
+                  !name.isEmpty else { return ctx.newArray() }
+            var names = DOMNode.definedCustomElements
+            if names.insert(name).inserted {
+                DOMNode.definedCustomElements = names
+                DOMNode.bumpSelectorEpoch()
+            }
+            // The document's elements with that local name, shadow-including
+            // tree order (HTML §4.13.4 define step 18: the upgrade candidates).
+            let found = self.shadowIncludingElements(from: self.root, localName: name)
+            self.notifyMutations(found.map { $0.id })
+            return self.wrapElementArray(found, ctx: ctx)
+        }, length: 1)
+        // `document.__rnShadowIncludingElements(root, localName?)`: the element
+        // descendants of `root` (inclusive), shadow-including tree order — for
+        // `customElements.upgrade(root)` (closed roots included).
+        ctx.setPropertyFunc(obj: doc, name: "__rnShadowIncludingElements", fn: { [weak self] ctx, _, args in
+            guard let self, let first = args.first, let start = self.nodeArgument(first) else { return ctx.newArray() }
+            let name = args.count > 1 ? self.extractString(ctx: ctx, args: args, index: 1)?.lowercased() : nil
+            return self.wrapElementArray(self.shadowIncludingElements(from: start, localName: name), ctx: ctx)
+        }, length: 2)
         ctx.setPropertyFunc(obj: doc, name: "__rnSetCEHook", fn: { [weak self] ctx, _, args in
             guard let self else { return .undefined }
             self.customElementHook?.freeValue()

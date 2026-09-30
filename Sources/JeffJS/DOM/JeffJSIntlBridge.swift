@@ -434,7 +434,13 @@ extension JeffJSIntlBridge {
             if let c = spec.currency { f.currencyCode = c }
         default: f.numberStyle = .decimal
         }
-        f.usesGroupingSeparator = spec.useGrouping
+        // ECMA-402 §16.5.4 scientific notation: mantissa + "E" + exponent (engineering
+        // is formatted from a decimal mantissa in `formatNumber`).
+        if spec.notation == "scientific" {
+            f.numberStyle = .scientific
+            f.exponentSymbol = "E"
+        }
+        f.usesGroupingSeparator = spec.useGrouping && spec.notation != "scientific"
         f.minimumIntegerDigits = spec.minInt
         if let mn = spec.minSig, let mx = spec.maxSig, overrideMaxFrac == nil {
             f.usesSignificantDigits = true
@@ -482,7 +488,14 @@ extension JeffJSIntlBridge {
         if value.isInfinite { return value < 0 ? "-∞" : "∞" }
 
         var body: String
-        if spec.notation == "compact" {
+        if spec.notation == "engineering" && value != 0 {
+            let sign = value < 0 ? "-" : ""
+            let exponent = Int((log10(abs(value)) / 3).rounded(.down)) * 3
+            let mantissa = abs(value) / pow(10, Double(exponent))
+            var mspec = spec; mspec.notation = "standard"; mspec.useGrouping = false; mspec.style = "decimal"
+            let f = numberFormatter(mspec)
+            body = sign + (f.string(from: NSNumber(value: mantissa)) ?? "\(mantissa)") + "E\(exponent)"
+        } else if spec.notation == "compact" {
             let sign = value < 0 ? "-" : ""
             let (scaled, suffix, frac) = JeffJSIntlBridge.compactScale(abs(value))
             let f = numberFormatter(spec, overrideMaxFrac: frac)
@@ -505,10 +518,77 @@ extension JeffJSIntlBridge {
         }
 
         if spec.style == "unit", let unit = spec.unit {
+            // ECMA-402 §16.5.9 unit display through CLDR (MeasurementFormatter:
+            // long = "10,000 bits", short = "16 hr", narrow = "16h"), the number
+            // part formatted with this spec's own formatter (grouping, digits,
+            // scientific notation — `1E4 bits`).
+            if spec.notation != "compact", spec.notation != "engineering", spec.signDisplay == "auto",
+               let dim = JeffJSIntlBridge.foundationUnit(unit) {
+                let m = MeasurementFormatter()
+                let base = spec.locale.components(separatedBy: "-u-").first?.components(separatedBy: "-x-").first ?? spec.locale
+                m.locale = Locale(identifier: base.replacingOccurrences(of: "-", with: "_"))
+                m.unitOptions = .providedUnit
+                m.unitStyle = spec.unitDisplay == "long" ? .long : (spec.unitDisplay == "narrow" ? .short : .medium)
+                m.numberFormatter = numberFormatter(spec)
+                return m.string(from: Measurement(value: value, unit: dim))
+            }
             let short = unit.split(separator: "-").last.map(String.init) ?? unit
             body = body + " " + (spec.unitDisplay == "narrow" ? short : short)
         }
         return body
+    }
+
+    /// ECMA-402 sanctioned units (Table 2) and the compound units Foundation
+    /// knows, as Foundation dimensions (nil: not representable — day, week,
+    /// month, year, percent… keep the plain suffix).
+    static func foundationUnit(_ id: String) -> Dimension? {
+        switch id {
+        case "acre": return UnitArea.acres
+        case "hectare": return UnitArea.hectares
+        case "bit": return UnitInformationStorage.bits
+        case "byte": return UnitInformationStorage.bytes
+        case "kilobit": return UnitInformationStorage.kilobits
+        case "kilobyte": return UnitInformationStorage.kilobytes
+        case "megabit": return UnitInformationStorage.megabits
+        case "megabyte": return UnitInformationStorage.megabytes
+        case "gigabit": return UnitInformationStorage.gigabits
+        case "gigabyte": return UnitInformationStorage.gigabytes
+        case "terabit": return UnitInformationStorage.terabits
+        case "terabyte": return UnitInformationStorage.terabytes
+        case "petabyte": return UnitInformationStorage.petabytes
+        case "celsius": return UnitTemperature.celsius
+        case "fahrenheit": return UnitTemperature.fahrenheit
+        case "degree": return UnitAngle.degrees
+        case "millimeter": return UnitLength.millimeters
+        case "centimeter": return UnitLength.centimeters
+        case "meter": return UnitLength.meters
+        case "kilometer": return UnitLength.kilometers
+        case "inch": return UnitLength.inches
+        case "foot": return UnitLength.feet
+        case "yard": return UnitLength.yards
+        case "mile": return UnitLength.miles
+        case "mile-scandinavian": return UnitLength.scandinavianMiles
+        case "milliliter": return UnitVolume.milliliters
+        case "liter": return UnitVolume.liters
+        case "fluid-ounce": return UnitVolume.fluidOunces
+        case "gallon": return UnitVolume.gallons
+        case "gram": return UnitMass.grams
+        case "kilogram": return UnitMass.kilograms
+        case "ounce": return UnitMass.ounces
+        case "pound": return UnitMass.pounds
+        case "stone": return UnitMass.stones
+        case "nanosecond": return UnitDuration.nanoseconds
+        case "microsecond": return UnitDuration.microseconds
+        case "millisecond": return UnitDuration.milliseconds
+        case "second": return UnitDuration.seconds
+        case "minute": return UnitDuration.minutes
+        case "hour": return UnitDuration.hours
+        case "kilometer-per-hour": return UnitSpeed.kilometersPerHour
+        case "mile-per-hour": return UnitSpeed.milesPerHour
+        case "meter-per-second": return UnitSpeed.metersPerSecond
+        case "mile-per-gallon": return UnitFuelEfficiency.milesPerGallon
+        default: return nil
+        }
     }
 
     private func f_minusSign(_ spec: NumberSpec) -> String? { return numberFormatter(spec).minusSign }
@@ -1027,8 +1107,33 @@ extension JeffJSIntlBridge {
     /// English relative time. `numeric: "auto"` uses the CLDR named forms
     /// (yesterday/today/tomorrow, last/this/next <unit>, now).
     static func relativeTime(locale tag: String, numeric: String,
-                             value: Double, unit: String) -> String {
+                             value: Double, unit: String, style: String = "long") -> String {
         let lang = tag.split(separator: "-").first.map(String.init)?.lowercased() ?? "en"
+        // ECMA-402 §17.5 `style: "short" | "narrow"` — CLDR's abbreviated forms
+        // (en: "16 hr. ago", "16h ago") from RelativeDateTimeFormatter (ICU, as
+        // WebKit), for whole values of the units it has; long style keeps the
+        // rules below.
+        if style != "long", value == value.rounded(), abs(value) < 1e9, unit != "quarter" {
+            var dc = DateComponents()
+            let v = Int(value)
+            switch unit {
+            case "second": dc.second = v
+            case "minute": dc.minute = v
+            case "hour": dc.hour = v
+            case "day": dc.day = v
+            case "week": dc.weekOfMonth = v
+            case "month": dc.month = v
+            default: dc.year = v
+            }
+            let f = RelativeDateTimeFormatter()
+            // The BCP 47 tag without its extensions, in ICU form: Foundation's
+            // formatters trap on "en-US-u-nu-latn" (reddit's timeago locale).
+            let base = tag.components(separatedBy: "-u-").first?.components(separatedBy: "-x-").first ?? tag
+            f.locale = Locale(identifier: base.replacingOccurrences(of: "-", with: "_"))
+            f.dateTimeStyle = numeric == "auto" ? .named : .numeric
+            f.unitsStyle = style == "narrow" ? .abbreviated : .short
+            return f.localizedString(from: dc)
+        }
         if numeric == "auto" && (value == -1 || value == 0 || value == 1) && lang == "en" {
             switch unit {
             case "day":
@@ -1376,6 +1481,7 @@ extension JeffJSIntlBridge {
             let numeric = ctx.toSwiftString(args[1]) ?? "always"
             let value = ctx.toFloat64(args[2]) ?? 0
             let rawUnit = ctx.toSwiftString(args[3]) ?? ""
+            let style = args.count > 4 ? (ctx.toSwiftString(args[4]) ?? "long") : "long"
             guard let unit = JeffJSIntlBridge.normalizeUnit(rawUnit) else {
                 return ctx.throwRangeError(message: "Invalid unit argument for format() '\(rawUnit)'")
             }
@@ -1383,7 +1489,7 @@ extension JeffJSIntlBridge {
                 return ctx.throwRangeError(message: "Value need to be finite number for format()")
             }
             return ctx.newStringValue(
-                JeffJSIntlBridge.relativeTime(locale: tag, numeric: numeric, value: value, unit: unit))
+                JeffJSIntlBridge.relativeTime(locale: tag, numeric: numeric, value: value, unit: unit, style: style))
         }, length: 4)
 
         ctx.setPropertyFunc(obj: n, name: "list", fn: { [weak self] ctx, _, args in
@@ -1617,14 +1723,27 @@ extension JeffJSIntlBridge {
         hide(this, '_numeric', numeric);
         hide(this, '_style', style);
         ownMethod(this, 'format', function format(value, unit) {
-          return N.relative(loc, numeric, Number(value), String(unit));
+          return N.relative(loc, numeric, Number(value), String(unit), style);
         });
       }
       RelativeTimeFormat.prototype.format = function (value, unit) {
-        return N.relative(this._locale, this._numeric, Number(value), String(unit));
+        return N.relative(this._locale, this._numeric, Number(value), String(unit), this._style);
       };
+      // ECMA-402 §17.5.3 PartitionRelativeTimePattern: the number's parts
+      // (tagged with the singular unit) between the pattern's literals.
       RelativeTimeFormat.prototype.formatToParts = function (value, unit) {
-        return [{ type: 'literal', value: this.format(value, unit) }];
+        var text = this.format(value, unit);
+        var u = String(unit).replace(/s$/, '');
+        var nf = new NumberFormat(this._locale);
+        var num = nf.format(Math.abs(Number(value)));
+        var i = text.indexOf(num);
+        if (i < 0) return [{ type: 'literal', value: text }];
+        var out = [];
+        if (i > 0) out.push({ type: 'literal', value: text.slice(0, i) });
+        var np = nf.formatToParts(Math.abs(Number(value)));
+        for (var k = 0; k < np.length; k++) out.push({ type: np[k].type, value: np[k].value, unit: u });
+        if (i + num.length < text.length) out.push({ type: 'literal', value: text.slice(i + num.length) });
+        return out;
       };
       RelativeTimeFormat.prototype.resolvedOptions = function () {
         return { locale: this._locale, style: this._style, numeric: this._numeric,
