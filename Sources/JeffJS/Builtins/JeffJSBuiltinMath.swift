@@ -699,9 +699,20 @@ func jeffJS_defineBuiltinFunc(ctx: JeffJSContext, obj: JeffJSObject,
 /// was appended and the Math object landed in the global's *last* slot —
 /// `unescape` (`typeof unescape` was "object", `[object Math]`; Akamai's sensor
 /// enumerates window's functions and diverged there).
+///
+/// An existing property is left as it is (the value is released): the base
+/// intrinsics' `Date` / `ArrayBuffer` / `Math` are the complete ones, and the
+/// old code never changed a named property that already existed either — it
+/// only clobbered the last slot. Replacing them installed jeffJS_initDate's
+/// `Date`, which has no `getYear` (apple.com's ac-analytics threw).
 func jeffJS_setPropertyStr(ctx: JeffJSContext, obj: JeffJSObject,
                            name: String, value: JeffJSValue) {
     let atom = ctx.rt.findAtom(name)
+    if jeffJS_findOwnPropertyIndex(obj: obj, atom: atom) >= 0 {
+        value.freeValue()
+        ctx.rt.freeAtom(atom)
+        return
+    }
     let objVal = JeffJSValue.borrowedObject(obj)
     ctx.definePropertyValue(obj: objVal, atom: atom,
                             value: value, flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)

@@ -415,6 +415,21 @@ final class JeffJSDOMBridge {
         // akamai navigation fix, 2026-09-29.
         installDocumentInterfaces(ctx: ctx, global: global)
 
+        // -- `__jeffjsMarkNative(fn, isInterface)`: the host's platform-surface pass
+        // (the app's SafariSurface) shapes each JS-implemented platform function like
+        // a WebKit native through JeffJSContext.markPlatformFunction, then deletes this
+        // hook. Non-enumerable. akamai sensor 2 fix, 2026-09-30.
+        let markFn = ctx.newCFunction({ ctx, _, args in
+            guard let f = args.first else { return .undefined }
+            ctx.markPlatformFunction(f, isConstructor: args.count > 1 && args[1].isBool && args[1].toBool())
+            return .undefined
+        }, name: "__jeffjsMarkNative", length: 2)
+        let markAtom = ctx.rt.findAtom("__jeffjsMarkNative")
+        ctx.definePropertyValue(obj: global, atom: markAtom, value: markFn,
+                                flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+        ctx.rt.freeAtom(markAtom)
+        markFn.freeValue()   // definePropertyValue dups
+
         // -- Constructor stubs (Window, Document, HTMLDocument, Node, Element, etc.) --
         // Browsers expose these as global constructor functions. Frameworks like React
         // check `typeof Document !== 'undefined'` to detect a DOM environment.
