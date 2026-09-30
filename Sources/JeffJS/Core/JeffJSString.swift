@@ -49,7 +49,14 @@ nonisolated class JeffJSStringBase {
 
 nonisolated final class JeffJSString: JeffJSStringBase {
     deinit {
-        if cachedAtom != 0, let rt = JeffJSGCObjectHeader.activeRuntime { rt.freeAtom(cachedAtom) }
+        // Only in the runtime that interned it: `activeRuntime` is whichever
+        // runtime last ran, and a string of a torn-down runtime can die while
+        // another one runs (on another thread) — freeing its atom id there
+        // released an unrelated live atom.
+        if cachedAtom != 0, let rt = JeffJSGCObjectHeader.activeRuntime,
+           rt.atomOwnerID == cachedAtomRuntime {
+            rt.freeAtom(cachedAtom)
+        }
     }
 
     // -- Reference counting --------------------------------------------------
@@ -101,6 +108,8 @@ nonisolated final class JeffJSString: JeffJSStringBase {
     /// (JeffJSRuntime.findAtom(jsString:)); holds one atom reference, released
     /// in deinit. 0 = none.
     var cachedAtom: UInt32 = 0
+    /// `JeffJSRuntime.atomOwnerID` of the runtime `cachedAtom` belongs to.
+    var cachedAtomRuntime: UInt32 = 0
 
     // -- Storage -------------------------------------------------------------
 

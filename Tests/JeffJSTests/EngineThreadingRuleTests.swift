@@ -127,6 +127,38 @@ final class EngineThreadingRuleTests: XCTestCase {
         XCTAssertTrue(reports.isEmpty, reports.joined(separator: "\n"))
     }
 
+    /// A string's cached atom belongs to the runtime that interned it. The
+    /// deinit used to release it in `activeRuntime` — whichever runtime ran
+    /// last — so a string of the previous page's runtime (torn down on a
+    /// utility queue while the next page runs) decremented an unrelated live
+    /// atom of the new runtime.
+    func testCachedAtomIsReleasedOnlyInItsRuntime() {
+        let rt1 = JeffJSRuntime()
+        let ctx1 = rt1.newContext()
+        let rt2 = JeffJSRuntime()
+        let ctx2 = rt2.newContext()
+        defer { ctx2.free(); rt2.free(); ctx1.free(); rt1.free() }
+        XCTAssertNotEqual(rt1.atomOwnerID, rt2.atomOwnerID)
+
+        var key: JeffJSString? = JeffJSString(swiftString: "zzThreadRuleKeyA")
+        let a1 = rt1.findAtom(jsString: key!)      // caches one reference on the string
+        rt1.freeAtom(a1)                            // drop the returned one
+        let a2 = rt2.findAtom("zzThreadRuleKeyB")   // a live atom of rt2
+        guard Int(a1) < rt2.atomCount, let entry = rt2.atomArray[Int(a1)] else {
+            return XCTFail("rt2 has no atom at index \(a1) (runtimes interned differently: \(a1) vs \(a2))")
+        }
+        _ = rt2.dupAtom(a1)                         // keep it listed whatever happens
+        let before = entry.refCount
+        weak var dying = key
+        JeffJSGCObjectHeader.activeRuntime = rt2    // the next page runs
+        key = nil                                   // the old page's string dies
+        XCTAssertNil(dying, "the string did not deallocate; the test proves nothing")
+        XCTAssertTrue(rt2.atomArray[Int(a1)] === entry)
+        XCTAssertEqual(entry.refCount, before, "releasing rt1's string released an atom of rt2")
+        rt2.freeAtom(a1)
+        rt2.freeAtom(a2)
+    }
+
     func testVerifierAcceptsHealthyHeap() {
         let rt = JeffJSRuntime()
         let ctx = rt.newContext()

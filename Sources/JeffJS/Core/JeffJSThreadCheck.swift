@@ -171,3 +171,14 @@ func jeffJS_gcVerifyList(_ rt: JeffJSRuntime, _ phase: StaticString) {
         }
     }
 }
+
+/// Runtime identities (`JeffJSRuntime.atomOwnerID`); runtimes may be created
+/// on any thread.
+private let jeffJS_runtimeIDLock = NSLock()
+nonisolated(unsafe) private var jeffJS_runtimeIDNext: UInt32 = 0
+func jeffJS_nextRuntimeID() -> UInt32 {
+    jeffJS_runtimeIDLock.lock(); defer { jeffJS_runtimeIDLock.unlock() }
+    jeffJS_runtimeIDNext &+= 1
+    if jeffJS_runtimeIDNext == 0 { jeffJS_runtimeIDNext = 1 }
+    return jeffJS_runtimeIDNext
+}

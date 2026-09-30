@@ -342,6 +342,12 @@ nonisolated final class JeffJSRuntime {
     var atomArray: [JeffJSAtomStruct?]
     /// Head of the atom free list (index of first free slot, 0 = none free).
     var atomFreeIndex: Int
+    /// This runtime's identity for atoms cached on strings
+    /// (`JeffJSString.cachedAtomRuntime`): a string's deinit releases its
+    /// cached atom only in the runtime that interned it, never in whichever
+    /// runtime happens to be `activeRuntime` (teardown frees the previous
+    /// page's runtime on a utility queue while the next page's runs).
+    let atomOwnerID: UInt32 = jeffJS_nextRuntimeID()
 
     // MARK: - Class System
 
@@ -1284,6 +1290,7 @@ nonisolated final class JeffJSRuntime {
         if let idx = js.canonicalArrayIndex() {
             let atom = idx | JS_ATOM_TAG_INT
             js.cachedAtom = atom   // tagged atoms are not refcounted
+            js.cachedAtomRuntime = atomOwnerID
             return atom
         }
         guard atomHashSize > 0, !atomHash.isEmpty else { return 0 }
@@ -1322,6 +1329,7 @@ nonisolated final class JeffJSRuntime {
         }
         // Cache with its own reference (released by the string's deinit).
         js.cachedAtom = dupAtom(atom)
+        js.cachedAtomRuntime = atomOwnerID
         return atom
     }
 
