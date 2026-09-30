@@ -5804,13 +5804,11 @@ final class JeffJSParser {
 
             case JSTokenType.TOK_TEMPLATE.rawValue: // tagged template
                 // Inside a substitution the tokenizer never yields
-                // TOK_TEMPLATE for the closing `}` any more (the level is
-                // zeroed while the expression is parsed), but keep the
-                // guard: that token would belong to the outer literal.
-                if inTemplateExpr {
-                    lastExprWasSuper = false
-                    return
-                }
+                // TOK_TEMPLATE for the closing `}` (the level is zeroed while
+                // the expression is parsed), so a template here is always a
+                // tagged template — `${html`<b>${x}</b>`}` (Lit). The old
+                // `inTemplateExpr` guard returned instead, and every tagged
+                // template inside a substitution was a SyntaxError.
                 promoteParenthesizedMemberCallee()
                 lastExprWasSuper = false
                 let isMethodCall = pendingMethodCall
