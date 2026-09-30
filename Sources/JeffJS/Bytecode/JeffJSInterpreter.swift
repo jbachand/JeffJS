@@ -6970,6 +6970,18 @@ struct JeffJSInterpreter {
     /// 200 levels ≈ 400KB which fits comfortably in a 2MB+ thread stack.
     /// Both callFunction and callInternal increment this counter.
     static let maxCallDepth = JeffJSConfig.maxCallDepth
+
+    /// `JEFFJS_STACK_DEBUG=1`: besides the runtime's `[stack] trip` line, print the JS stack of
+    /// the RangeError a native-stack trip throws (pages usually log only its message).
+    static let stackDebug = ProcessInfo.processInfo.environment["JEFFJS_STACK_DEBUG"] == "1"
+    static func logStackTrip(_ ctx: JeffJSContext) {
+        let exc = ctx.rt.currentException
+        guard exc.isObject else { return }
+        let stack = ctx.getPropertyStr(obj: exc, name: "stack")
+        let text = ctx.toSwiftString(stack) ?? "?"
+        stack.freeValue()
+        FileHandle.standardError.write("[stack] js stack at trip (depth \(ctx.callDepth)):\n\(text.prefix(6000))\n".data(using: .utf8)!)
+    }
     static var traceOpcodes = JeffJSConfig.traceOpcodes
 
     static func callInternal(
@@ -6999,6 +7011,7 @@ struct JeffJSInterpreter {
         // use; check the real stack pointer every call.
         if ctx.rt.checkStackOverflow() {
             _ = ctx.throwRangeError(message: "Maximum call stack size exceeded.")
+            if JeffJSInterpreter.stackDebug { JeffJSInterpreter.logStackTrip(ctx) }
             return .exception
         }
 
