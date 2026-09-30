@@ -107,6 +107,7 @@ struct JeffJSBuiltinArray {
 
         // @@species getter
         let speciesGetterVal = ctx.newCFunction(speciesGetter, name: "get [Symbol.species]", length: 0)
+        speciesGetterVal.toObject()?.nativeNameKeepsAccessorPrefix = true
         ctx.setPropertyGetSet(obj: arrayCtor,
                               atom: ctx.rt.dupAtom(JeffJSAtomID.JS_ATOM_Symbol_species.rawValue),
                               getter: speciesGetterVal, setter: nil)

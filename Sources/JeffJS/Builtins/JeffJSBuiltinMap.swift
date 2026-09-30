@@ -1452,6 +1452,7 @@ struct JeffJSBuiltinMap {
             let sizeGetter = ctx.newCFunction({ c, this, args in
                 return js_map_get_size(c, this, Int(MAGIC_MAP))
             }, name: "get size", length: 0)
+            sizeGetter.toObject()?.nativeNameKeepsAccessorPrefix = true
             ctx.setPropertyGetSet(obj: mapProto, name: "size", getter: sizeGetter, setter: nil)
             // Map.groupBy static method
             let mapCtor = ctx.getPropertyStr(obj: ctx.globalObj, name: "Map")
@@ -1478,6 +1479,7 @@ struct JeffJSBuiltinMap {
             let sizeGetter = ctx.newCFunction({ c, this, args in
                 return js_map_get_size(c, this, Int(MAGIC_SET))
             }, name: "get size", length: 0)
+            sizeGetter.toObject()?.nativeNameKeepsAccessorPrefix = true
             ctx.setPropertyGetSet(obj: setProto, name: "size", getter: sizeGetter, setter: nil)
 
             // Explicit registration for Set.prototype.delete (JS keyword name).
@@ -1530,6 +1532,7 @@ struct JeffJSBuiltinMap {
                 let getter = ctx.newCFunction({ c, this, args in
                     return fn(c, this, capturedMagic)
                 }, name: "get \(entry.name)", length: 0)
+                getter.toObject()?.nativeNameKeepsAccessorPrefix = true
                 ctx.setPropertyGetSet(obj: obj, name: entry.name, getter: getter, setter: nil)
             case .iteratorNext(let fn):
                 // QuickJS-style next: returns the value and reports completion

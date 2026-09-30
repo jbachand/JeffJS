@@ -1663,6 +1663,17 @@ func jeffJS_addGetterProperty(
     getterObj.shape = jeffJS_rootShape(ctx, proto: fnProto)
     getterObj.proto = fnProto
     getterObj.clearProps()
+    // `length` 0 and `name` "get <name>" like every other builtin accessor
+    // (ES §10.2.9 with prefix "get"); JSC prints it `function get byteLength()`.
+    // Unnamed, it printed `function anonymous()`.
+    let getterVal = JeffJSValue.borrowedObject(getterObj)
+    ctx.definePropertyValue(obj: getterVal, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
+                            value: .newInt32(0), flags: JS_PROP_CONFIGURABLE)
+    let nameVal = ctx.newStringValue("get " + name)
+    ctx.definePropertyValue(obj: getterVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
+                            value: nameVal, flags: JS_PROP_CONFIGURABLE)
+    nameVal.freeValue()
+    getterObj.nativeNameKeepsAccessorPrefix = true
 
     let atom = ctx.rt.findAtom(name)
     jeffJS_addProperty(ctx: ctx, obj: proto, atom: atom, flags: [.configurable, .getset])

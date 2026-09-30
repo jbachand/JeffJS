@@ -693,15 +693,19 @@ func jeffJS_defineBuiltinFunc(ctx: JeffJSContext, obj: JeffJSObject,
 
 /// Set a named property on an object (for global installation).
 /// Uses the atom-based shape system so that property lookup works correctly.
+/// Defines `name` = `value` { writable, configurable, not enumerable } on `obj`,
+/// consuming `value`. A define, not "append a slot and write the last one": the
+/// global already had a `Math` placeholder from the base intrinsics, so no slot
+/// was appended and the Math object landed in the global's *last* slot —
+/// `unescape` (`typeof unescape` was "object", `[object Math]`; Akamai's sensor
+/// enumerates window's functions and diverged there).
 func jeffJS_setPropertyStr(ctx: JeffJSContext, obj: JeffJSObject,
                            name: String, value: JeffJSValue) {
     let atom = ctx.rt.findAtom(name)
-    let flags: JeffJSPropertyFlags = [.writable, .configurable]
-    jeffJS_addProperty(ctx: ctx, obj: obj, atom: atom, flags: flags)
-    // Set the value in the slot that jeffJS_addProperty just appended.
-    if !obj.propValues.isEmpty {
-        obj.setPropEntry(at: obj.propValues.count - 1, .value(value))
-    }
+    let objVal = JeffJSValue.borrowedObject(obj)
+    ctx.definePropertyValue(obj: objVal, atom: atom,
+                            value: value, flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+    value.freeValue()   // definePropertyValue dups
     ctx.rt.freeAtom(atom)
 }
 
