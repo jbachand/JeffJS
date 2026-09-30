@@ -899,7 +899,7 @@ final class JeffJSDOMBridge {
     func parseDetachedDocument(html: String, ctx: JeffJSContext) -> JeffJSValue {
         // DOMParser / parseHTMLUnsafe documents: their scripts never run,
         // not even once adopted into the page (HTML §8.5.1).
-        let doc = HTMLParser.parse(html, scriptingEnabled: false)
+        let doc = HTMLParser.parse(html, scriptingEnabled: false, allowDeclarativeShadowRoots: false)
         Self.markScriptsAlreadyStarted(in: [doc])
         return wrapDetachedDocument(doc, ctx: ctx)
     }

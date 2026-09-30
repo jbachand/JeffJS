@@ -344,12 +344,12 @@ public struct CSSSpecificity: Comparable, Sendable {
             let spec = mostSpecific(arg)
             ids += spec.ids; classes += spec.classes; elements += spec.elements
         case .slottedArgument(let arg):
-            // CSS Scoping 1 §3.2.2: a pseudo-element, plus its argument.
-            elements += 1
+            // CSS Scoping 1 §3.2.2: a pseudo-element (the (0,0,1) is added by
+            // `calculate` for `pseudoElement`), plus its argument.
             let spec = mostSpecific(arg)
             ids += spec.ids; classes += spec.classes; elements += spec.elements
         case .partArgument:
-            elements += 1
+            break   // the pseudo-element's (0,0,1) comes from `calculate`
         case .element, .pseudoElementMarker:
             elements += 1
         case .universal:
