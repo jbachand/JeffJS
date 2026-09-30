@@ -667,9 +667,14 @@ nonisolated public final class JeffJSMemoryCookieJar: JeffJSCookieJar, @unchecke
 
 // MARK: - document.cookie
 
-/// Installs `document.cookie` (a native accessor on the document object) over
-/// a cookie jar, for the document at `documentURL()`. Register after the DOM
-/// bridge (the document object must exist); a host polyfill guarded by
+/// Installs `document.cookie` over a cookie jar, for the document at
+/// `documentURL()`: a native accessor on `Document.prototype` (WebIDL §3.7.6 —
+/// `Object.getOwnPropertyDescriptor(Document.prototype, 'cookie').get` is what
+/// Akamai's sensor calls; akamai navigation fix, 2026-09-29), or on the document
+/// object when no `Document.prototype` is in its chain. Only the page document
+/// reads/writes the jar; any other document gets "" (a cookie-averse document,
+/// HTML §3.1.3); a non-object `this` throws. Register after the DOM bridge (the
+/// document object must exist); a host polyfill guarded by
 /// `typeof document.cookie !== 'string'` then leaves it alone.
 @MainActor
 final class JeffJSCookieBridge {
@@ -688,11 +693,20 @@ final class JeffJSCookieBridge {
         let doc = ctx.getPropertyStr(obj: global, name: "document")
         defer { doc.freeValue() }
         guard doc.isObject else { return }
-        let getter = ctx.newCFunction({ [weak self] ctx, _, _ in
+        weak var pageDocument = doc.toObject()
+        let getter = ctx.newCFunction({ [weak self] ctx, thisVal, _ in
+            guard thisVal.isObject else {
+                return ctx.throwTypeError(message: "The Document.cookie getter can only be used on instances of Document")
+            }
+            guard thisVal.toObject() === pageDocument else { return ctx.newStringValue("") }
             guard let self, let url = self.documentURL() else { return ctx.newStringValue("") }
             return ctx.newStringValue(self.jar.documentCookie(for: url))
         }, name: "get cookie", length: 0)
-        let setter = ctx.newCFunction({ [weak self] ctx, _, args in
+        let setter = ctx.newCFunction({ [weak self] ctx, thisVal, args in
+            guard thisVal.isObject else {
+                return ctx.throwTypeError(message: "The Document.cookie setter can only be used on instances of Document")
+            }
+            guard thisVal.toObject() === pageDocument else { return JeffJSValue.undefined }
             guard let self, let url = self.documentURL() else { return JeffJSValue.undefined }
             let s = ctx.toSwiftString(args.first ?? .undefined) ?? ""
             let before = JeffJSCookieBridge.debug ? self.jar.documentCookie(for: url).utf8.count : 0
@@ -708,6 +722,18 @@ final class JeffJSCookieBridge {
             }
             return JeffJSValue.undefined
         }, name: "set cookie", length: 1)
-        ctx.setPropertyGetSet(obj: doc, name: "cookie", getter: getter, setter: setter)
+        // Document.prototype when it is on the document's chain (the DOM bridge's
+        // `installDocumentInterfaces`), else the instance.
+        var target = doc
+        let ctor = ctx.getPropertyStr(obj: global, name: "Document")
+        let proto = ctor.isObject ? ctx.getPropertyStr(obj: ctor, name: "prototype") : JeffJSValue.undefined
+        ctor.freeValue()
+        defer { proto.freeValue() }
+        if proto.isObject, let p = proto.toObject() {
+            var o = doc.toObject()?.proto
+            while let cur = o, cur !== p { o = cur.proto }
+            if o != nil { target = proto }
+        }
+        ctx.setPropertyGetSet(obj: target, name: "cookie", getter: getter, setter: setter)
     }
 }

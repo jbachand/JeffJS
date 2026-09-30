@@ -2497,6 +2497,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
             return resultObj
         }, name: "revocable", length: 2)
         _ = setPropertyStr(obj: proxyCtor, name: "revocable", value: revocableFunc)
+        // Proxy.name (ES §10.2.9); it read undefined. akamai navigation fix.
+        let proxyName = newStringValue("Proxy")
+        definePropertyValue(obj: proxyCtor, atom: JeffJSAtomID.JS_ATOM_name.rawValue, value: proxyName, flags: JS_PROP_CONFIGURABLE)
+        proxyName.freeValue()   // definePropertyValue dups
 
         _ = setPropertyStr(obj: globalObj, name: "Proxy", value: proxyCtor)
 
@@ -4084,6 +4088,28 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         }
     }
 
+    /// JavaScriptCore's Error.captureStackTrace(target[, constructorOpt]) and
+    /// Error.stackTraceLimit (Safari 17+; WKWebView capture: "function 100"), on
+    /// the global Error once every init phase has run. akamai navigation fix.
+    private func installErrorCaptureStackTrace() {
+        let errorCtor = getPropertyStr(obj: globalObj, name: "Error")
+        defer { errorCtor.freeValue() }
+        guard errorCtor.isObject else { return }
+        let capture = newCFunction({ c, _, args in
+            guard let target = args.first, target.isObject else {
+                return c.throwTypeError(message: "First argument must be an object")
+            }
+            let stack = c.formatStackTrace(errorName: "", message: "", frames: c.captureStackFrames())
+            let v = c.newStringValue(stack)
+            c.definePropertyValue(obj: target, atom: JeffJSAtomID.JS_ATOM_stack.rawValue, value: v,
+                                  flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+            v.freeValue()   // definePropertyValue dups
+            return .undefined
+        }, name: "captureStackTrace", length: 1)
+        _ = setPropertyStr(obj: errorCtor, name: "captureStackTrace", value: capture)
+        _ = setPropertyStr(obj: errorCtor, name: "stackTraceLimit", value: JeffJSValue.newInt32(100))
+    }
+
     /// A primitive wrapper's prototype is an ordinary object that inherits
     /// from `Object.prototype` (ES §20.3.3, §21.1.3, §22.1.3, §20.4.3).
     /// `newObjectClass(classID:)` reads its prototype out of
@@ -4193,10 +4219,10 @@ public final class JeffJSContext: JeffJSTokenizerContext {
         symCtorObj.proto = symCtorProtoObj
         let symbolCtor = JeffJSValue.makeObject(symCtorObj)
 
-        // Set name and length on the Symbol constructor
-        let symNameAtom = rt.findAtom("Symbol")
-        _ = setPropertyInternal(obj: symbolCtor, atom: symNameAtom, value: newStringValue("Symbol"), flags: JS_PROP_CONFIGURABLE)
-        rt.freeAtom(symNameAtom)
+        // Set name and length on the Symbol constructor (the name went under a
+        // property *called* "Symbol", so `Symbol.name` read undefined; akamai
+        // navigation fix).
+        _ = setPropertyInternal(obj: symbolCtor, atom: JeffJSAtomID.JS_ATOM_name.rawValue, value: newStringValue("Symbol"), flags: JS_PROP_CONFIGURABLE)
         let symLenAtom = JeffJSAtomID.JS_ATOM_length.rawValue
         _ = setPropertyInternal(obj: symbolCtor, atom: symLenAtom, value: .newInt32(0), flags: JS_PROP_CONFIGURABLE)
 
@@ -4255,6 +4281,7 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// and serves as the single authoritative fix-up.
     private func fixUpKeywordNamedMethods() {
         fixUpWrapperPrototypeChains()
+        installErrorCaptureStackTrace()
         // --- Symbol.for / Symbol.keyFor (static methods on Symbol constructor) ---
         let symbolCtor = getPropertyStr(obj: globalObj, name: "Symbol")
         if symbolCtor.isObject {
@@ -5403,8 +5430,44 @@ public final class JeffJSContext: JeffJSTokenizerContext {
     /// now, the string is built on first read.
     func attachPendingStack(_ errObj: JeffJSValue, errorName: String, message: String) {
         guard let jsObj = errObj.toObject() else { return }
+        let frames = captureStackFrames()
         jsObj.setPendingStack(JeffJSPendingStack(errorName: errorName, message: message,
-                                                 frames: captureStackFrames()))
+                                                 frames: frames))
+        // JavaScriptCore's own `line` / `column` / `sourceURL` on every error,
+        // from the innermost frame with a source URL (WKWebView capture: own
+        // names "column,line,message,sourceURL,stack"). akamai navigation fix.
+        if let (line, col, url) = errorSourcePosition(frames) {
+            let flags = JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE
+            let lineAtom = rt.findAtom("line"), colAtom = rt.findAtom("column")
+            definePropertyValue(obj: errObj, atom: lineAtom, value: JeffJSValue.newInt32(Int32(clamping: line)), flags: flags)
+            definePropertyValue(obj: errObj, atom: colAtom, value: JeffJSValue.newInt32(Int32(clamping: col)), flags: flags)
+            rt.freeAtom(lineAtom); rt.freeAtom(colAtom)
+            if !url.isEmpty {   // JSC: no sourceURL for code without a URL (eval, <inline> here)
+                let urlAtom = rt.findAtom("sourceURL")
+                let u = newStringValue(url)
+                definePropertyValue(obj: errObj, atom: urlAtom, value: u, flags: flags)
+                u.freeValue()   // definePropertyValue dups
+                rt.freeAtom(urlAtom)
+            }
+        }
+    }
+
+    /// (line, column, URL) of the innermost script frame (URL "" when it has none).
+    func errorSourcePosition(_ frames: [(fb: JeffJSFunctionBytecode, pc: Int)]) -> (Int, Int, String)? {
+        for (fbBase, rawPC) in frames {
+            let fbc = fbBase as? JeffJSFunctionBytecodeCompiled
+            let filename = (fbc?.debugFilenameAtom ?? 0) != 0
+                ? (rt.atomToString(fbc!.debugFilenameAtom) ?? "")
+                : (fbBase.fileName?.toSwiftString() ?? "")
+            let url = JeffJSContext.stackSourceURL(filename)
+            let pc = fbBase.bytecodeLen > 0 ? max(0, min(rawPC, fbBase.bytecodeLen - 1)) : 0
+            var line = (fbc?.debugPc2lineBuf.isEmpty ?? true) ? 0 : fbc!.lineForPC(pc)
+            var col = (fbc?.debugPc2colBuf.isEmpty ?? true) ? 0 : fbc!.colForPC(pc)
+            if line <= 0 { line = fbBase.lineNum }
+            if col <= 0 { col = fbBase.colNum }
+            return (max(line, 0), max(col, 0), url)
+        }
+        return nil
     }
 
     /// Format and install the deferred `stack` property.

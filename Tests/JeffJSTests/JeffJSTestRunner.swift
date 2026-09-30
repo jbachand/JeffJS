@@ -330,6 +330,7 @@ struct JeffJSTestRunner {
             ("AggregateError", { $0.testAggregateError() }),
             ("NamedEvaluation", { $0.testNamedEvaluation() }),
             ("ClassConstructorCall", { $0.testClassConstructorCall() }),
+            ("BrowserFingerprint", { $0.testBrowserFingerprint() }),
             ("ProgramCompletion", { $0.testProgramCompletion() }),
             ("Redeclaration", { $0.testRedeclaration() }),
             ("DOMParserInsertion", { $0.testDOMParserInsertion() }),
@@ -12951,7 +12952,7 @@ extension JeffJSTestRunner {
             if (rd6.name !== 'renamed') return false;
             function del6() {}
             delete del6.name;
-            return rd6.name === 'renamed' && del6.name === undefined &&
+            return rd6.name === 'renamed' && del6.name === '' &&   // Function.prototype.name is "" (ES §20.2.3)
                    Object.getOwnPropertyNames(del6).indexOf('name') < 0;
         """, expect: true)
         // Assigning F.prototype keeps it non-enumerable and constructible.

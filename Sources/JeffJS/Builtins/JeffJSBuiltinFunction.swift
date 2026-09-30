@@ -69,6 +69,49 @@ struct JeffJSBuiltinFunction {
             return toString(ctx: ctxArg, this: thisVal, args: args)
         }, name: "toString", length: 0)
         _ = ctx.setPropertyStr(obj: ctx.functionProto, name: "toString", value: toStringMethod)
+
+        installFunctionPrototypeShape(ctx: ctx)
+    }
+
+    /// The rest of Function.prototype's own properties (ES §20.2.3; what
+    /// JavaScriptCore has): `length` 0, `name` "", `constructor` = Function,
+    /// `[Symbol.hasInstance]` (non-writable, non-enumerable, non-configurable), and
+    /// JSC's `arguments` / `caller` accessors (here `null`, never a throw: sloppy
+    /// code reads `f.caller`). The phase-1 stub put the hasInstance function under a
+    /// *string* key "@@hasInstance", and `(function(){}).constructor` was Object.
+    /// akamai navigation fix, 2026-09-29 (bot defence reads these shapes).
+    static func installFunctionPrototypeShape(ctx: JeffJSContext) {
+        let fp = ctx.functionProto
+        guard fp.isObject else { return }
+        let junk = ctx.rt.findAtom("@@hasInstance")
+        _ = ctx.deleteProperty(obj: fp, atom: junk)
+        ctx.rt.freeAtom(junk)
+
+        ctx.definePropertyValue(obj: fp, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
+                                value: JeffJSValue.newInt32(0), flags: JS_PROP_CONFIGURABLE)
+        let emptyName = ctx.newStringValue("")
+        ctx.definePropertyValue(obj: fp, atom: JeffJSAtomID.JS_ATOM_name.rawValue, value: emptyName, flags: JS_PROP_CONFIGURABLE)
+        emptyName.freeValue()
+
+        let fnCtor = ctx.getPropertyStr(obj: ctx.globalObj, name: "Function")
+        if fnCtor.isObject {
+            let ctorAtom = ctx.rt.findAtom("constructor")
+            ctx.definePropertyValue(obj: fp, atom: ctorAtom, value: fnCtor, flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+            ctx.rt.freeAtom(ctorAtom)
+        }
+        fnCtor.freeValue()
+
+        let hasInstanceFn = ctx.newCFunction({ c, thisVal, args in
+            hasInstance(ctx: c, this: thisVal, args: args)
+        }, name: "[Symbol.hasInstance]", length: 1)
+        ctx.definePropertyValue(obj: fp, atom: JSPredefinedAtom.Symbol_hasInstance.rawValue, value: hasInstanceFn, flags: 0)
+        hasInstanceFn.freeValue()
+
+        for name in ["arguments", "caller"] {
+            let getter = ctx.newCFunction({ _, _, _ in JeffJSValue.null }, name: name, length: 0)
+            let setter = ctx.newCFunction({ _, _, _ in JeffJSValue.undefined }, name: name, length: 1)
+            ctx.setPropertyGetSet(obj: fp, name: name, getter: getter, setter: setter)
+        }
     }
 
     // MARK: - Function.prototype (callable, returns undefined)
@@ -298,6 +341,15 @@ struct JeffJSBuiltinFunction {
 
     // MARK: - Function.prototype.toString
 
+    /// The name JavaScriptCore puts in a native function's source text: the
+    /// function's `name` without its "bound " / "get " / "set " prefixes.
+    static func nativeCodeName(_ name: String) -> String {
+        var n = Substring(name)
+        while n.hasPrefix("bound ") { n = n.dropFirst(6) }
+        if n.hasPrefix("get ") || n.hasPrefix("set ") { n = n.dropFirst(4) }
+        return String(n)
+    }
+
     /// `Function.prototype.toString()`
     /// Returns the source code of the function, or a "[native code]" placeholder.
     ///
@@ -327,14 +379,17 @@ struct JeffJSBuiltinFunction {
             return JeffJSValue.makeString(JeffJSString(swiftString: result))
 
         case .cFunc(_, _, _, _, _):
-            // C function — return "function name() {\n    [native code]\n}"
-            let name = getFunctionName(obj: obj)
+            // C function — "function name() {\n    [native code]\n}", named as
+            // JavaScriptCore prints it: an accessor's "get x" / "set x" is "x"
+            // (`function cookie()`, WKWebView capture; pages fingerprint it).
+            let name = nativeCodeName(getFunctionName(obj: obj))
             let result = "function \(name)() {\n    [native code]\n}"
             return JeffJSValue.makeString(JeffJSString(swiftString: result))
 
         case .boundFunction(_):
-            // Bound function — return "function () {\n    [native code]\n}"
-            let name = getFunctionName(obj: obj)
+            // Bound function — JavaScriptCore prints the target's name without
+            // the "bound " prefix: `f.bind(o)` → "function f() { [native code] }".
+            let name = nativeCodeName(getFunctionName(obj: obj))
             let result = "function \(name)() {\n    [native code]\n}"
             return JeffJSValue.makeString(JeffJSString(swiftString: result))
 

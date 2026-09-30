@@ -575,7 +575,7 @@ extension JeffJSContext {
         callDepth += 1
         defer { callDepth -= 1 }
         if callDepth > JeffJSInterpreter.maxCallDepth {
-            return throwInternalError(message: "Maximum call stack size exceeded")
+            return throwRangeError(message: "Maximum call stack size exceeded.")
         }
         if callDepth == 1 {
             rt.updateStackLimitForCurrentThread()
@@ -584,7 +584,7 @@ extension JeffJSContext {
             jeffJS_heapCensusTick(rt)
         }
         if rt.checkStackOverflow() {
-            return throwInternalError(message: "Maximum call stack size exceeded")
+            return throwRangeError(message: "Maximum call stack size exceeded.")
         }
 
         guard let obj = funcVal.toObject() else {
@@ -1701,7 +1701,7 @@ extension JeffJSContext {
                                    callerFB: JeffJSFunctionBytecode,
                                    frame: JeffJSStackFrame) -> JeffJSValue {
         if rt.checkStackOverflow() {
-            return throwInternalError(message: "Maximum call stack size exceeded")
+            return throwRangeError(message: "Maximum call stack size exceeded.")
         }
         let parseState = JeffJSParseState(source: source, filename: "<eval>", ctx: self)
         parseState.allowHTMLComments = true
@@ -1864,6 +1864,7 @@ extension JeffJSContext {
         }
         if throwRefError {
             let name = atomToSwiftString(atom)
+            if jeffJSRefErrDebug { print("[RefErr] getGlobalVar atom=\(atom) name=\(name)") }
             _ = throwReferenceError(message: "Can't find variable: \(name)")
             return .exception
         }
@@ -6943,7 +6944,7 @@ struct JeffJSInterpreter {
         ctx.callDepth += 1
         defer { ctx.callDepth -= 1 }
         if ctx.callDepth > maxCallDepth {
-            _ = ctx.throwInternalError(message: "Maximum call stack size exceeded")
+            _ = ctx.throwRangeError(message: "Maximum call stack size exceeded.")
             return .exception
         }
         // Entering JS from native: bind the guard to this thread's stack.
@@ -6951,7 +6952,7 @@ struct JeffJSInterpreter {
         // Native frames are large, so the depth limit alone does not bound stack
         // use; check the real stack pointer every call.
         if ctx.rt.checkStackOverflow() {
-            _ = ctx.throwInternalError(message: "Maximum call stack size exceeded")
+            _ = ctx.throwRangeError(message: "Maximum call stack size exceeded.")
             return .exception
         }
 
@@ -8056,7 +8057,7 @@ struct JeffJSInterpreter {
                     // Depth guard (checked before any state mutation; on overflow
                     // args+funcVal stay on the caller stack and unwind normally).
                     if rt.inlineStackTop - inlineBase > 10000 {
-                        _ = ctx.throwInternalError(message: "Maximum call stack size exceeded")
+                        _ = ctx.throwRangeError(message: "Maximum call stack size exceeded.")
                         retVal = .exception
                         break dispatchLoop
                     }
@@ -8321,7 +8322,7 @@ struct JeffJSInterpreter {
                    let cmCallObj = buf[cmCalleeSlot].obj,
                    let cmFastFb = cmCallObj.fbFast, !cmFastFb.isGenerator, !cmFastFb.isAsyncFunc {
                     if rt.inlineStackTop - inlineBase > 10000 {
-                        _ = ctx.throwInternalError(message: "Maximum call stack size exceeded")
+                        _ = ctx.throwRangeError(message: "Maximum call stack size exceeded.")
                         retVal = .exception
                         break dispatchLoop
                     }
@@ -8981,6 +8982,7 @@ struct JeffJSInterpreter {
                 }
                 let val = ctx.getGlobalVar(atom: atom, throwRefError: !nextIsTypeof)
                 if val.isException {
+                    if jeffJSRefErrDebug { jeffJSDumpRefError(ctx: ctx, fb: fb, pc: pc, atom: atom) }
                     retVal = .exception
                     break dispatchLoop
                 }
@@ -13003,4 +13005,29 @@ func jeffJS_bitNotSlow(_ ctx: JeffJSContext, _ val: JeffJSValue) -> JeffJSValue 
     let (i, ok) = JeffJSTypeConvert.toInt32(ctx: ctx, val: val)
     val.freeValue()
     return ok ? .newInt32(~i) : .exception
+}
+
+
+// MARK: - JEFFJS_REFERR_DEBUG (akamai navigation fix, 2026-09-29)
+
+/// `JEFFJS_REFERR_DEBUG=1`: an unresolvable `get_var` prints the function, pc,
+/// atom and the function's own source text around it to stderr — to catch
+/// a reference compiled against the wrong atom ("Can't find variable: CONNECT"
+/// for a local `nF--` in Akamai's challenge script on homedepot).
+let jeffJSRefErrDebug = ProcessInfo.processInfo.environment["JEFFJS_REFERR_DEBUG"] == "1"
+
+func jeffJSDumpRefError(ctx: JeffJSContext, fb: JeffJSFunctionBytecode, pc: Int, atom: UInt32) {
+    let name = ctx.rt.atomToString(atom) ?? "?"
+    let fn = ctx.rt.atomToString(fb.nameAtom) ?? "?"
+    var src = ""
+    if let t = fb.sourceText, fb.sourceLen > 0 {
+        let a = max(0, Int(fb.sourceStart)), b = min(t.bytes.count, a + min(Int(fb.sourceLen), 400))
+        src = String(decoding: t.bytes[a..<b], as: UTF8.self)
+    }
+    let cvars = fb.closureVarsList.prefix(40).map { (ctx.rt.atomToString($0.varName) ?? "?") + ($0.isLocal ? "L" : $0.isArg ? "A" : "R") + String($0.varIdx) }.joined(separator: ",")
+    var ops = ""
+    let bc = fb.bytecode
+    if pc < bc.count { ops = bc[max(0, pc - 12)..<min(bc.count, pc + 12)].map { String(format: "%02x", $0) }.joined(separator: " ") }
+    FileHandle.standardError.write(("[RefErr] atom=\(atom) name=\(name) fn=\(fn) pc=\(pc) len=\(fb.bytecodeLen) args=\(fb.argCount) vars=\(fb.varCount) cvars=\(fb.closureVarCount) [\(cvars)] strict=\(fb.isStrictMode) bc=\(ops)\n[RefErr] src: \(src.prefix(400))\n").data(using: .utf8)!)
+    print("[RefErr] atom=\(atom) name=\(name) fn=\(fn) pc=\(pc) vars=\(fb.varCount) cvars=[\(cvars)] src=\(src.prefix(300))")
 }

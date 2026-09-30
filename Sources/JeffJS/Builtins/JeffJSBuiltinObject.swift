@@ -455,9 +455,10 @@ extension JeffJSContext {
             return newArrayWithLength(0)
         }
         // A function's deferred own properties have to exist before they can
-        // be listed.
+        // be listed; so does an error's deferred `stack` (JSC lists it).
         if jsObj.needsLazyNameLength { materializeFunctionNameLength(jsObj) }
         if jsObj.needsLazyPrototype { materializeFunctionPrototype(jsObj) }
+        if jsObj.pendingStack != nil { materializeErrorStack(jsObj) }
 
         let wantStrings = (flags & JS_GPN_STRING_MASK) != 0
         let wantSymbols = (flags & JS_GPN_SYMBOL_MASK) != 0
