@@ -68,7 +68,7 @@ struct JeffJSEvalItem {
 }
 
 /// Everything the eval code needs to know about one direct `eval` call site.
-final class JeffJSEvalSite {
+nonisolated final class JeffJSEvalSite {
     var items: [JeffJSEvalItem] = []
     /// Name of the hidden local (see JeffJSFunctionDefCompiler.varObjIdx)
     /// holding the object that receives the sloppy eval code's `var` and
@@ -147,7 +147,7 @@ func != (lhs: JeffJSOpcode?, rhs: JeffJSOpcode) -> Bool {
     return l.rawValue != rhs.rawValue
 }
 
-class JeffJSFunctionDefCompiler {
+nonisolated class JeffJSFunctionDefCompiler {
     // -- Name lookup index for JeffJSCompiler.findLocalVar (large functions) --
     /// `vars.count` / `scopes.count` when the index was built (-1: never).
     var varLookupVarCount: Int = -1
@@ -394,7 +394,7 @@ class JeffJSFunctionDefCompiler {
 /// The compiled bytecode object produced by createFunction.
 /// This extends the JeffJSFunctionBytecode stub in JeffJSObject.swift with
 /// all fields needed by the interpreter.
-class JeffJSFunctionBytecodeCompiled: JeffJSFunctionBytecode {
+nonisolated class JeffJSFunctionBytecodeCompiled: JeffJSFunctionBytecode {
     // All fields are inherited from JeffJSFunctionBytecode.
     // Additional compiler-produced fields:
     var vardefs: [JeffJSBytecodeVarDef] = []

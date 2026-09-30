@@ -24,7 +24,7 @@ import Foundation
 ///
 /// Thread safety: In a single-threaded JS engine this needs no locking.
 /// If multi-context support is added, the registry lives on the runtime.
-final class JeffJSSymbolRegistry {
+nonisolated final class JeffJSSymbolRegistry {
     /// Maps description string -> atom index of the global symbol.
     var entries: [String: UInt32] = [:]
 

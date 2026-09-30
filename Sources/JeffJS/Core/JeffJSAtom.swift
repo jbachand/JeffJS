@@ -49,7 +49,7 @@ enum JSAtomType: UInt8 {
 ///     union { uint8_t str8[0]; uint16_t str16[0]; };
 /// } JSAtomStruct;
 /// ```
-class JSAtomEntry {
+nonisolated class JSAtomEntry {
     var refCount: Int32
     var isWideChar: Bool
     var atomType: JSAtomType
@@ -74,7 +74,7 @@ class JSAtomEntry {
 /// QuickJS stores atoms in a dynamic array (`atom_array`) indexed by atom id.
 /// A separate hash table (`atom_hash`) maps hash values to atom ids for lookup.
 /// Free slots form a linked list through `hash_next`.
-class JSAtomTable {
+nonisolated class JSAtomTable {
 
     /// The atom array. Index 0 is unused (JS_ATOM_NULL).
     /// Indices 1..predefinedCount are the predefined atoms.

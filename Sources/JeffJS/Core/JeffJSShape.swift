@@ -21,7 +21,7 @@ import Foundation
 /// In the C implementation the property-hash array is stored at a *negative*
 /// offset from the shape pointer.  In Swift we store it as a normal array member
 /// (`propHash`).
-final class JeffJSShape: JeffJSGCObjectHeader {
+nonisolated final class JeffJSShape: JeffJSGCObjectHeader {
 
     // Sentinel value for an empty hash-chain link.
     static let noNext: UInt32 = 0xFFFF_FFFF

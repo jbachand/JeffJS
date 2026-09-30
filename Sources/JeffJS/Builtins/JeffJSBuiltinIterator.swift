@@ -23,7 +23,7 @@ import Foundation
 /// Each call to .next()/.return()/.throw() creates one of these.
 ///
 /// Mirrors QuickJS `JSAsyncGeneratorRequest`.
-final class JeffJSAsyncGeneratorRequest {
+nonisolated final class JeffJSAsyncGeneratorRequest {
     /// Completion type: 0 = next, 1 = return, 2 = throw
     var completionType: Int
     /// The value passed to next(value), return(value), or throw(value)
@@ -51,7 +51,7 @@ final class JeffJSAsyncGeneratorRequest {
 /// CreateIteratorFromClosure gives it) or of a %WrapForValidIteratorPrototype%
 /// object (`kind == .wrap`: just [[Iterated]]). Lives in the object's payload;
 /// the object has no own properties. Every JeffJSValue here is owned.
-final class JeffJSIteratorHelperData {
+nonisolated final class JeffJSIteratorHelperData {
     enum Kind { case map, filter, take, drop, flatMap, concat, wrap }
     enum State { case suspendedStart, suspendedYield, executing, completed }
 

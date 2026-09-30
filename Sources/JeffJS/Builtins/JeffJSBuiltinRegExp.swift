@@ -1462,7 +1462,7 @@ func js_regexp_get_species(
 /// Internal state for the RegExp String Iterator.
 ///
 /// Mirrors QuickJS `JSRegExpStringIteratorData`.
-final class JSRegExpStringIteratorData {
+nonisolated final class JSRegExpStringIteratorData {
     var iteratingRegExp: JeffJSObject
     /// Flat view of `iteratedValue` (kept alive by it).
     var iteratedString: JeffJSString

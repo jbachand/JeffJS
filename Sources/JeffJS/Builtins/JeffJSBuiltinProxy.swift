@@ -178,7 +178,7 @@ func js_proxy_revocable(_ ctx: JeffJSContext,
 }
 
 /// Internal data for the revoke function closure.
-private final class ProxyRevokeData {
+private nonisolated final class ProxyRevokeData {
     var proxyValue: JeffJSValue
 
     init(proxyValue: JeffJSValue) {

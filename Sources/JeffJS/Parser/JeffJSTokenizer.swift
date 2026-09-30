@@ -94,7 +94,7 @@ struct JeffJSToken {
 
 /// Mutable state for the tokenizer and parser.
 /// Mirrors `JSParseState` in quickjs.c.
-class JeffJSParseState {
+nonisolated class JeffJSParseState {
 
     // -- Context --
     weak var ctx: JeffJSTokenizerContext?
@@ -181,7 +181,7 @@ protocol JeffJSTokenizerContext: AnyObject {
 // MARK: - Placeholder for JeffJSFunctionDef
 
 /// Forward declaration placeholder — the real type lives in the parser/compiler.
-class JeffJSFunctionDef {
+nonisolated class JeffJSFunctionDef {
     var jsMode: Int = 0   // JS_MODE_STRICT etc.
     var isStrict: Bool { return jsMode & JS_MODE_STRICT != 0 }
 }
@@ -3253,7 +3253,7 @@ func jeffJS_canStartExpr(_ tokType: Int) -> Bool {
 
 /// A minimal tokenizer context that uses a simple dictionary for atoms.
 /// Used for standalone tokenization without a full JeffJSContext.
-final class JeffJSSimpleTokenizerContext: JeffJSTokenizerContext {
+nonisolated final class JeffJSSimpleTokenizerContext: JeffJSTokenizerContext {
     private var atoms: [String: UInt32] = [:]
     private var _names: [UInt32: String] = [:]
     private var nextAtomID: UInt32 = 1

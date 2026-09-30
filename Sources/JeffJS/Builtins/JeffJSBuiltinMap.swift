@@ -778,7 +778,7 @@ func js_weakset_add(_ ctx: JeffJSContext,
 
 /// Iterator state for Map/Set iterators.
 /// Mirrors `JSMapIteratorData` in QuickJS.
-final class JSMapIteratorData {
+nonisolated final class JSMapIteratorData {
     /// The Map or Set object being iterated.
     var obj: JeffJSValue = .undefined
 
@@ -1569,7 +1569,7 @@ struct JeffJSBuiltinMap {
 /// For the cycle collector a record's value is a child of its **key**, not of
 /// the collection (an ephemeron, see `markObject`): `wm.set(o, { o })` is
 /// garbage as soon as `o` is unreachable, although `wm` itself lives on.
-final class JeffJSWeakKeyMarker {
+nonisolated final class JeffJSWeakKeyMarker {
     static let shared = JeffJSWeakKeyMarker()
 }
 

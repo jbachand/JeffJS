@@ -1363,6 +1363,7 @@ extension JeffJSContext {
             // The property key of a private name is a unique private atom,
             // never the description string (a public `x` must not alias `#x`).
             atomStr.cachedAtom = rt.newPrivateAtom(desc)
+            atomStr.cachedAtomRuntime = rt.atomOwnerID
         }
         return JeffJSValue.mkPtr(tag: .symbol, ptr: atomStr)
     }

@@ -91,7 +91,7 @@ struct JSMemoryUsage {
 
 /// Mirrors QuickJS `JSAtomStruct`. Each entry in the atom table.
 /// Atoms are interned strings used as property keys, variable names, etc.
-class JeffJSAtomStruct {
+nonisolated class JeffJSAtomStruct {
     /// Hash value of this atom (JS_ATOM_HASH_MASK bits).
     var hash: UInt32 = 0
     /// Next atom index in the hash chain (0 = end of chain).
@@ -317,7 +317,7 @@ enum JeffJSAtomID: UInt32 {
 /// ctx.free()
 /// rt.free()
 /// ```
-final class JeffJSRuntime {
+nonisolated final class JeffJSRuntime {
 
     // MARK: - Memory Management
 
@@ -342,6 +342,12 @@ final class JeffJSRuntime {
     var atomArray: [JeffJSAtomStruct?]
     /// Head of the atom free list (index of first free slot, 0 = none free).
     var atomFreeIndex: Int
+    /// This runtime's identity for atoms cached on strings
+    /// (`JeffJSString.cachedAtomRuntime`): a string's deinit releases its
+    /// cached atom only in the runtime that interned it, never in whichever
+    /// runtime happens to be `activeRuntime` (teardown frees the previous
+    /// page's runtime on a utility queue while the next page's runs).
+    let atomOwnerID: UInt32 = jeffJS_nextRuntimeID()
 
     // MARK: - Class System
 
@@ -578,6 +584,15 @@ final class JeffJSRuntime {
     /// Multiplier on the idle-collection interval, doubled by every idle
     /// collection that reclaimed little (see `jeffJS_idleGCTickSlow`).
     var gcIdleBackoff: Int = 1
+    /// JEFFJS_GC_VERIFYROOTS: the thread that last mutated the GC list, and the
+    /// recent thread changes (JeffJSThreadCheck.swift).
+    var gcListThread: UInt = 0
+    var gcListThreadLog: [String] = []
+    /// The thread running JS on this runtime (`enterJSThread`), and how many
+    /// entries it holds; 0 = nobody. Maintained only when `jeffJS_threadCheck`
+    /// is on (Debug builds, JEFFJS_GC_VERIFYROOTS=1): the one-JS-thread rule.
+    var jsOwnerThread: UInt = 0
+    var jsOwnerDepth: Int = 0
     /// Heap census state (JeffJSHeapCensus.swift, JEFFJS_HEAP_CENSUS_S).
     var heapCensusPrevious: [String: Int] = [:]
     var heapCensusLastTime: Double = 0
@@ -1275,6 +1290,7 @@ final class JeffJSRuntime {
         if let idx = js.canonicalArrayIndex() {
             let atom = idx | JS_ATOM_TAG_INT
             js.cachedAtom = atom   // tagged atoms are not refcounted
+            js.cachedAtomRuntime = atomOwnerID
             return atom
         }
         guard atomHashSize > 0, !atomHash.isEmpty else { return 0 }
@@ -1313,6 +1329,7 @@ final class JeffJSRuntime {
         }
         // Cache with its own reference (released by the string's deinit).
         js.cachedAtom = dupAtom(atom)
+        js.cachedAtomRuntime = atomOwnerID
         return atom
     }
 

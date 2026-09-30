@@ -39,7 +39,7 @@ struct JeffJSGCMark {
 
 /// A weak reference cell that can be invalidated when the target is collected.
 /// Matches the WeakRef / weak-map semantics in quickjs.c.
-final class JeffJSWeakRef {
+nonisolated final class JeffJSWeakRef {
     /// The target object.  Set to `nil` when the target is freed.
     weak var target: JeffJSObject?
 
@@ -78,6 +78,8 @@ private let JS_GC_OBJ_COST = JeffJSConfig.gcObjectCost
 /// Append `header` to the runtime's main GC object list.
 /// Called every time a new GC-managed object is created.
 func addGCObject(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
+    if jeffJS_threadCheck { jeffJS_checkJSThread(rt, "list add") }
+    if jeffJS_gcVerifyRoots { jeffJS_gcListNoteThread(rt, "add") }
     header.gcListIndex = rt.gcObjects.count
     rt.gcObjects.append(Unmanaged.passUnretained(header))
     header.mark = JeffJSGCMark.white
@@ -91,6 +93,8 @@ func addGCObject(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
 /// O(1) via the intrusive gcListIndex + swap-remove (list order is
 /// irrelevant to the collector, which always iterates the whole array).
 func removeGCObject(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
+    if jeffJS_threadCheck { jeffJS_checkJSThread(rt, "list remove") }
+    if jeffJS_gcVerifyRoots { jeffJS_gcListNoteThread(rt, "remove") }
     let li = header.gcListIndex
     let me = Unmanaged.passUnretained(header).toOpaque()
     if li >= 0 {
@@ -303,6 +307,8 @@ func runGC(_ rt: JeffJSRuntime) {
     // decremented into the negative and confuse the scan.
     freeZeroRefcount(rt)
     let freedBefore = rt.gcCyclesFreed
+    if jeffJS_threadCheck { jeffJS_checkJSThread(rt, "collection") }
+    if jeffJS_gcVerifyRoots { jeffJS_gcVerifyList(rt, "runGC") }
 
     #if canImport(Metal)
     // The GPU collector declines (returns false) rather than guesses: a kernel

@@ -37,7 +37,7 @@ struct MetalGCNode {
 
 /// Singleton orchestrator for Metal-accelerated garbage collection.
 /// Lazily initializes Metal resources on first use.
-final class JeffJSMetalGC {
+nonisolated final class JeffJSMetalGC {
 
     static let shared = JeffJSMetalGC()
 
