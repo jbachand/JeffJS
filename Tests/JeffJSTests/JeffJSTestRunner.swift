@@ -335,6 +335,8 @@ struct JeffJSTestRunner {
             ("DOMParserInsertion", { $0.testDOMParserInsertion() }),
             ("LoneSurrogate", { $0.testLoneSurrogate() }),
             ("TaggedTemplateNesting", { $0.testTaggedTemplateNesting() }),
+            ("ShadowDOM", { $0.testShadowDOM() }),
+            ("AwaitSuspension", { $0.testAwaitSuspension() }),
             ("IteratorHelpers", { $0.testIteratorHelpers() }),
             ("SyntaxErrorText", { $0.testSyntaxErrorText() }),
             ("ObjectLiteralDefine", { $0.testObjectLiteralDefine() }),

@@ -411,13 +411,13 @@ public struct CSSSelectorMatcher: Sendable {
     ) -> Bool {
         switch parts[index].combinator ?? .descendant {
         case .child:
-            guard let parent = node.parent else { return false }
+            guard let parent = selectorParent(of: node) else { return false }
             return matchesChain(parts, index - 1, node: parent, context: context)
         case .descendant:
-            var cursor = node.parent
+            var cursor = selectorParent(of: node)
             while let ancestor = cursor {
                 if matchesChain(parts, index - 1, node: ancestor, context: context) { return true }
-                cursor = ancestor.parent
+                cursor = selectorParent(of: ancestor)
             }
             return false
         case .adjacentSibling:
@@ -431,6 +431,16 @@ public struct CSSSelectorMatcher: Sendable {
             }
             return false
         }
+    }
+
+    /// The parent a combinator steps to: the DOM-tree parent, which ends at a
+    /// shadow root (whose stored parent is its host — `DOMNode+Shadow.swift`).
+    /// Selectors never match across a shadow boundary (CSS Scoping 1 §3.1).
+    @inline(__always)
+    static func selectorParent(of node: DOMNode) -> DOMNode? {
+        guard let p = node.parent else { return nil }
+        if DOMNode.anyShadowRoots, p.isShadowRoot { return nil }
+        return p
     }
 
     /// Test whether a compound selector matches a single node.

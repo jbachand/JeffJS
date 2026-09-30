@@ -71,6 +71,18 @@ final class JeffJSDOMBridge {
     /// browser behavior where methods are on HTMLElement.prototype, not per-element.
     private var elementPrototype: JeffJSValue?
 
+    /// `ShadowRoot.prototype` (chains to the element prototype): shadow root
+    /// wrappers get it in `wrapElement` (`JeffJSDOMBridge+Shadow.swift`).
+    var shadowRootPrototype: JeffJSValue?
+    /// The page's custom element reaction hook (`document.__rnSetCEHook(fn)`,
+    /// installed by the app's customElements implementation): called
+    /// synchronously at the end of each DOM mutation that connects, disconnects
+    /// or changes an attribute of a custom element candidate (HTML §4.13.6
+    /// custom element reactions). nil = no definitions yet, nothing is walked.
+    var customElementHook: JeffJSValue?
+    /// Slots signalled since the last `slotchange` delivery (DOM "signal slots").
+    var pendingSlotChanges: [DOMNode] = []
+
     /// The engine's EventTarget implementation. `document` and the element
     /// prototype chain to its `EventTarget.prototype`, so window, document and
     /// every node share one addEventListener/removeEventListener/dispatchEvent
@@ -245,6 +257,11 @@ final class JeffJSDOMBridge {
 
         elementPrototype?.freeValue()
         elementPrototype = nil
+        shadowRootPrototype?.freeValue()
+        shadowRootPrototype = nil
+        customElementHook?.freeValue()
+        customElementHook = nil
+        pendingSlotChanges = []
         parserOrder = []
         parserInsertedThrough = -1
         parserInsertionsStarted = false
@@ -479,6 +496,7 @@ final class JeffJSDOMBridge {
 
         // -- Methods --
         registerDocumentMethods(on: doc, ctx: ctx)
+        installCustomElementHookSetter(on: doc, ctx: ctx)
 
         // -- Element-returning property getters via methods --
         // Since JeffJS doesn't support Object.defineProperty with native
@@ -1106,6 +1124,7 @@ final class JeffJSDOMBridge {
         if let obj = el.toObject() {
             obj.payload = .opaque(node)
         }
+        if node.isShadowRoot, let srProto = shadowRootPrototype { _ = ctx.setPrototypeOf(el, proto: srProto) }
 
         // -- Per-instance read-only properties --
         ctx.setPropertyStr(obj: el, name: "nodeType", value: .newInt32(nodeTypeInt(node)))
@@ -1227,6 +1246,9 @@ final class JeffJSDOMBridge {
 
         // Install accessor properties (textContent, className, etc.) on the prototype
         installElementPropertyShim(on: proto, ctx: ctx)
+
+        // Shadow DOM: attachShadow / shadowRoot / slots (JeffJSDOMBridge+Shadow.swift).
+        registerShadowDOMAPI(on: proto, ctx: ctx)
 
         // on* event handler IDL attributes (HTML §8.1.8.1): accessors that
         // read null until set, store a function/object (anything else is
@@ -1788,7 +1810,8 @@ final class JeffJSDOMBridge {
             let html = self.extractString(ctx: ctx, args: args, index: 0) ?? ""
             self.maybeCollectDetachedNodes()
             // One childList record: every old child removed, the parse added.
-            self.replaceAllChildren(of: targetNode, with: Self.parseHTMLFragment(html, context: element))
+            // A ShadowRoot's markup is parsed with its host as the context element.
+            self.replaceAllChildren(of: targetNode, with: Self.parseHTMLFragment(html, context: element.shadowHost ?? element))
             self.notifyMutation(for: targetNode)
             return JeffJSValue.undefined
         }, length: 1)
@@ -2066,7 +2089,8 @@ final class JeffJSDOMBridge {
         ctx.setPropertyFunc(obj: el, name: "__get_parentNode", fn: { [weak self] ctx, thisVal, _ in
             guard let self else { return JeffJSValue.null }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.null }
-            guard let parent = targetNode.parent else { return JeffJSValue.null }
+            // A shadow root has no DOM parent (its stored parent is the host).
+            guard let parent = targetNode.domParent else { return JeffJSValue.null }
             // `document.documentElement.parentNode === document` in browsers, so
             // hand back the real document object rather than a wrapper around the
             // root node — `getRootNode()`/`isConnected` walks depend on it.
@@ -2079,7 +2103,7 @@ final class JeffJSDOMBridge {
         ctx.setPropertyFunc(obj: el, name: "__get_parentElement", fn: { [weak self] ctx, thisVal, _ in
             guard let self else { return JeffJSValue.null }
             guard let targetNode = self.extractNode(from: thisVal) else { return JeffJSValue.null }
-            guard let parent = targetNode.parent, parent.nodeType == .element else { return JeffJSValue.null }
+            guard let parent = targetNode.domParent, parent.nodeType == .element else { return JeffJSValue.null }
             return self.wrapElement(parent, ctx: ctx)
         }, length: 0)
 
@@ -3121,12 +3145,18 @@ final class JeffJSDOMBridge {
                   let other = self.nodeArgument(args[0]) else { return .newBool(false) }
             return .newBool(self.nodesEqual(n, other))
         }, length: 1)
-        // getRootNode(options) — the root: the topmost inclusive ancestor
-        // (shadow roots are the app's JS polyfill and are not in this tree).
-        ctx.setPropertyFunc(obj: obj, name: "getRootNode", fn: { [weak self] ctx, thisVal, _ in
+        // getRootNode(options) — DOM §4.4: the root of the node's tree, which
+        // is its shadow root inside a shadow tree; `{composed: true}` = the
+        // shadow-including root (DOMNode.rootNode(composed:)).
+        ctx.setPropertyFunc(obj: obj, name: "getRootNode", fn: { [weak self] ctx, thisVal, args in
             guard let self, let n = node(thisVal) else { return thisVal.dupValue() }
-            var top = n
-            while let p = top.parent { top = p }
+            var composed = false
+            if let opts = args.first, opts.isObject {
+                let c = ctx.getPropertyStr(obj: opts, name: "composed")
+                composed = ctx.toBool(c)
+                c.freeValue()
+            }
+            let top = n.rootNode(composed: composed)
             if top === n { return thisVal.dupValue() }
             return self.jsValue(for: top, ctx: ctx)
         }, length: 0)
