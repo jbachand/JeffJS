@@ -307,8 +307,16 @@ struct JeffJSBuiltinNumber {
     }
 
     /// Convert a double to a string in a given radix (2-36).
-    /// For radix 10 this uses the standard double-to-string algorithm (DtoA).
-    /// For other radices it uses the spec's algorithm.
+    /// Radix 10 is ES Number::toString. Other radices print what
+    /// JavaScriptCore prints (`toStringWithRadixInternal`, NumberPrototype.cpp):
+    /// the integer part exactly (every digit of a double above 2^53, not a
+    /// float division's rounding), and the shortest fraction that still
+    /// identifies the double — digits are written while the remainder is at
+    /// least half the gap to the neighbouring doubles, rounding half to even —
+    /// computed in exact binary arithmetic. `(123.456).toString(36)` is
+    /// "3f.gez4w97ry" (it was "3f.gez4w97ry0a1": a fixed 52-bit digit budget),
+    /// `(2**60).toString(36)` "8rc4kbdvss1s" (was "…ss0s"). Bot-defence
+    /// scripts print Math.random() in base 36.
     static func numberToStringRadix(_ d: Double, _ radix: Int) -> String {
         if d.isNaN { return "NaN" }
         if d.isInfinite { return d > 0 ? "Infinity" : "-Infinity" }
@@ -318,55 +326,77 @@ struct JeffJSBuiltinNumber {
             return numberToStringBase10(d)
         }
 
-        // For non-base-10, handle the sign, then convert the magnitude
+        let digitChars: [UInt8] = Array("0123456789abcdefghijklmnopqrstuvwxyz".utf8)
         let negative = d < 0
-        var val = negative ? -d : d
+        let number = negative ? -d : d
+        var integerPart = Foundation.floor(number)
+        let fractionPart = number - integerPart
+        var fracDigits: [UInt8] = []
 
-        // Integer part
-        var intPart = Foundation.floor(val)
-        var fracPart = val - intPart
-
-        let digits = "0123456789abcdefghijklmnopqrstuvwxyz"
-        let digitsArray = Array(digits)
-
-        // Build integer digits
-        var intDigits = [Character]()
-        if intPart == 0 {
-            intDigits.append("0")
-        } else {
-            while intPart >= 1 {
-                let digit = Int(intPart.truncatingRemainder(dividingBy: Double(radix)))
-                intDigits.append(digitsArray[digit])
-                intPart = Foundation.floor(intPart / Double(radix))
+        if fractionPart != 0 {
+            // integerPart < 2^53 here (a double with a fraction is below 2^52).
+            let integerPartIsOdd = (UInt64(integerPart) & 1) == 1
+            var isOddInOddRadix = integerPartIsOdd
+            var digit = integerPartIsOdd ? 1 : 0
+            let r = UInt32(radix)
+            var fraction = RadixFixedPoint(fractionPart, halve: false)
+            let deltaNext = number.nextUp - number
+            let deltaLast = number - number.nextDown
+            var halfNext = RadixFixedPoint(deltaNext, halve: true)
+            var halfLast = RadixFixedPoint(deltaLast, halve: true)
+            var roundUp = false
+            while true {
+                let c = fraction.compareHalf()
+                if c > 0 || (c == 0 && ((radix & 1) == 1 ? isOddInOddRadix : (digit & 1) == 1)) {
+                    if fraction.sumGreaterThanOne(halfNext) { roundUp = true; break }
+                } else if fraction.isLess(than: halfLast) {
+                    break
+                }
+                fraction.multiply(by: r)
+                digit = fraction.floorAndSubtract()
+                if (digit & 1) == 1 { isOddInOddRadix.toggle() }
+                fracDigits.append(digitChars[digit])
+                halfNext.multiply(by: r)
+                halfLast.multiply(by: r)
+                if fracDigits.count > 1100 { break }   // cannot happen; bounds the loop
             }
-            intDigits.reverse()
+            if roundUp {
+                while let last = fracDigits.last, last == digitChars[radix - 1] { fracDigits.removeLast() }
+                if let last = fracDigits.last {
+                    fracDigits[fracDigits.count - 1] = (last == UInt8(ascii: "9")) ? UInt8(ascii: "a") : last + 1
+                } else {
+                    integerPart += 1
+                }
+            } else {
+                while let last = fracDigits.last, last == UInt8(ascii: "0") { fracDigits.removeLast() }
+            }
         }
 
-        // Build fractional digits (up to ~52 / log2(radix) digits precision)
-        var fracDigits = [Character]()
-        if fracPart > 0 {
-            let maxFracDigits = Int(ceil(52.0 / log2(Double(radix)))) + 1
-            for _ in 0..<maxFracDigits {
-                fracPart *= Double(radix)
-                let digit = Int(fracPart)
-                fracDigits.append(digitsArray[digit])
-                fracPart -= Double(digit)
-                if fracPart < 1e-15 { break }
+        // Integer digits, exact (a double integer up to 2^1024 as a big integer).
+        var limbs = RadixFixedPoint.integerLimbs(integerPart)
+        var intDigits: [UInt8] = []
+        repeat {
+            var rem: UInt64 = 0
+            var i = limbs.count - 1
+            while i >= 0 {
+                let cur = (rem << 32) | UInt64(limbs[i])
+                limbs[i] = UInt32(cur / UInt64(radix))
+                rem = cur % UInt64(radix)
+                i -= 1
             }
-            // Remove trailing zeros
-            while let last = fracDigits.last, last == "0" {
-                fracDigits.removeLast()
-            }
-        }
+            intDigits.append(digitChars[Int(rem)])
+            while let top = limbs.last, top == 0 { limbs.removeLast() }
+        } while !limbs.isEmpty
 
-        var result = ""
-        if negative { result.append("-") }
-        result.append(contentsOf: intDigits)
+        var out: [UInt8] = []
+        out.reserveCapacity(intDigits.count + fracDigits.count + 2)
+        if negative { out.append(UInt8(ascii: "-")) }
+        out.append(contentsOf: intDigits.reversed())
         if !fracDigits.isEmpty {
-            result.append(".")
-            result.append(contentsOf: fracDigits)
+            out.append(UInt8(ascii: "."))
+            out.append(contentsOf: fracDigits)
         }
-        return result
+        return String(decoding: out, as: UTF8.self)
     }
 
     /// Standard Number-to-String for base 10, matching the ECMAScript spec
@@ -1065,4 +1095,107 @@ func jeffJS_formatDoubleJS(_ d: Double) -> String {
                      : String(digits[0]) + "." + String(digits[1...]) + "e" + expStr
     }
     return negative ? "-" + out : out
+}
+
+
+/// Exact non-negative binary fixed point for `numberToStringRadix`: value =
+/// N / 2^scaleBits, N in little-endian 32-bit limbs. Every double below 2 is
+/// exact here (the smallest half-gap is 2^-1075), and multiplying by a radix
+/// (≤ 36) only grows the integer bits the loop floors away.
+struct RadixFixedPoint {
+    static let scaleBits = 1088          // 34 limbs of fraction
+    static let limbCount = 36            // + 2 limbs of integer headroom
+    var limbs: [UInt32]
+
+    /// `value` (or value / 2 when `halve`) for a finite 0 ≤ value < 2.
+    init(_ value: Double, halve: Bool) {
+        limbs = [UInt32](repeating: 0, count: RadixFixedPoint.limbCount)
+        if value == 0 { return }
+        let bits = value.bitPattern
+        let expField = Int((bits >> 52) & 0x7FF)
+        var mantissa = bits & 0xF_FFFF_FFFF_FFFF
+        var exp: Int
+        if expField == 0 { exp = -1074 } else { mantissa |= 1 << 52; exp = expField - 1075 }
+        if halve { exp -= 1 }
+        let shift = RadixFixedPoint.scaleBits + exp     // ≥ 1088 - 1075 > 0
+        var m = mantissa
+        var bit = shift
+        while m != 0 {
+            let limb = bit / 32, off = bit % 32
+            let chunk = m & 0xFFFF_FFFF
+            let wide = chunk << UInt64(off)
+            if limb < limbs.count { limbs[limb] |= UInt32(truncatingIfNeeded: wide) }
+            if limb + 1 < limbs.count { limbs[limb + 1] |= UInt32(truncatingIfNeeded: wide >> 32) }
+            m >>= 32
+            bit += 32
+        }
+    }
+
+    /// Limbs of a non-negative double integer (exact).
+    static func integerLimbs(_ value: Double) -> [UInt32] {
+        if value < 1 { return [0] }
+        let bits = value.bitPattern
+        let expField = Int((bits >> 52) & 0x7FF)
+        let mantissa = (bits & 0xF_FFFF_FFFF_FFFF) | (1 << 52)
+        let exp = expField - 1075
+        if exp <= 0 { let v = mantissa >> UInt64(-exp); return [UInt32(v & 0xFFFF_FFFF), UInt32(v >> 32)] }
+        var out = [UInt32](repeating: 0, count: (exp + 53) / 32 + 2)
+        let limb = exp / 32, off = UInt64(exp % 32)
+        let lo = (mantissa & 0xFFFF_FFFF) << off, hi = (mantissa >> 32) << off
+        out[limb] |= UInt32(truncatingIfNeeded: lo)
+        out[limb + 1] |= UInt32(truncatingIfNeeded: lo >> 32) | UInt32(truncatingIfNeeded: hi)
+        out[limb + 2] |= UInt32(truncatingIfNeeded: hi >> 32)
+        while let top = out.last, top == 0, out.count > 1 { out.removeLast() }
+        return out
+    }
+
+    mutating func multiply(by r: UInt32) {
+        var carry: UInt64 = 0
+        for i in 0..<limbs.count {
+            let v = UInt64(limbs[i]) * UInt64(r) + carry
+            limbs[i] = UInt32(v & 0xFFFF_FFFF)
+            carry = v >> 32
+        }
+    }
+
+    /// The integer part (a digit < radix); leaves the fraction.
+    mutating func floorAndSubtract() -> Int {
+        let base = RadixFixedPoint.scaleBits / 32
+        var v = 0
+        for i in stride(from: limbs.count - 1, through: base, by: -1) { v = v << 32 | Int(limbs[i]); limbs[i] = 0 }
+        return v
+    }
+
+    /// -1 / 0 / 1 as the value is below / equal to / above 1/2.
+    func compareHalf() -> Int {
+        let base = RadixFixedPoint.scaleBits / 32
+        for i in base..<limbs.count where limbs[i] != 0 { return 1 }
+        let top = limbs[base - 1]
+        if top > 0x8000_0000 { return 1 }
+        if top < 0x8000_0000 { return -1 }
+        for i in 0..<(base - 1) where limbs[i] != 0 { return 1 }
+        return 0
+    }
+
+    func isLess(than o: RadixFixedPoint) -> Bool {
+        for i in stride(from: limbs.count - 1, through: 0, by: -1) where limbs[i] != o.limbs[i] { return limbs[i] < o.limbs[i] }
+        return false
+    }
+
+    /// self + o > 1
+    func sumGreaterThanOne(_ o: RadixFixedPoint) -> Bool {
+        var sum = [UInt32](repeating: 0, count: limbs.count)
+        var carry: UInt64 = 0
+        for i in 0..<limbs.count {
+            let v = UInt64(limbs[i]) + UInt64(o.limbs[i]) + carry
+            sum[i] = UInt32(v & 0xFFFF_FFFF); carry = v >> 32
+        }
+        let base = RadixFixedPoint.scaleBits / 32
+        var intPart: UInt64 = carry
+        for i in stride(from: limbs.count - 1, through: base, by: -1) { intPart = intPart << 32 | UInt64(sum[i]) }
+        if intPart > 1 { return true }
+        if intPart < 1 { return false }
+        for i in 0..<base where sum[i] != 0 { return true }
+        return false
+    }
 }

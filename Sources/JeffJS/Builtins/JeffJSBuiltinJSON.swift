@@ -1054,28 +1054,13 @@ struct JeffJSBuiltinJSON {
         return result
     }
 
-    /// Format a number for JSON output.
-    /// Matches QuickJS behavior: integers print without decimal, doubles use
-    /// the shortest representation.
+    /// Format a number for JSON output: SerializeJSONProperty step 9 is
+    /// ToString(value) (ES §25.5.2.2), i.e. Number::toString — `1e-7` and
+    /// `0.000001`, not Swift's `String(Double)` ("1e-07", "1e-06"), which
+    /// every JSON.stringify of a small number used to print.
     private static func formatNumber(_ num: Double) -> String {
-        if num == 0 {
-            // Handle -0 -> "0"
-            return "0"
-        }
-        if num == num.rounded(.towardZero) && !num.isInfinite && abs(num) < 1e20 {
-            // Integer-valued doubles get no decimal point
-            if num >= Double(Int64.min) && num <= Double(Int64.max) {
-                return String(Int64(num))
-            }
-        }
-        // Use Swift's default Double-to-String, which produces the shortest
-        // representation that round-trips (matches the spec requirement).
-        var s = String(num)
-        // Remove trailing ".0" for integer-valued doubles not caught above
-        if s.hasSuffix(".0") {
-            s = String(s.dropLast(2))
-        }
-        return s
+        if num == 0 { return "0" }   // -0 -> "0"
+        return JeffJSBuiltinNumber.numberToStringBase10(num)
     }
 }
 

@@ -36,8 +36,10 @@ extension JeffJSTestRunner {
          #"String(String) === 'function String() {\n    [native code]\n}' && (Number + '') === 'function Number() {\n    [native code]\n}' && `${Boolean}`.indexOf('function Boolean()') === 0 && String(String).split('String').length === 2"#),
         ("Date, Symbol and Proxy have their names; Date.length is 7",
          #"Date.name === 'Date' && Date.length === 7 && Symbol.name === 'Symbol' && Symbol.length === 0 && Proxy.name === 'Proxy' && !Object.prototype.hasOwnProperty.call(Symbol, 'Symbol')"#),
+        // JSC keeps "get " for ECMAScript builtin accessors (`function get size()`)
+        // and drops it for DOM attributes (`function cookie()`); akamai sensor 2 fix.
         ("native accessors and bound functions print JSC's names",
-         #"(function(){ var g = Object.getOwnPropertyDescriptor(Map.prototype, 'size').get; function f(){} return g.name === 'get size' && Function.prototype.toString.call(g) === 'function size() {\n    [native code]\n}' && f.bind(null).name === 'bound f' && f.bind(null).toString() === 'function f() {\n    [native code]\n}'; })()"#),
+         #"(function(){ var g = Object.getOwnPropertyDescriptor(Map.prototype, 'size').get; function f(){} return g.name === 'get size' && Function.prototype.toString.call(g) === 'function get size() {\n    [native code]\n}' && f.bind(null).name === 'bound f' && f.bind(null).toString() === 'function f() {\n    [native code]\n}'; })()"#),
         ("Date.prototype.toString ends with a time zone name and round-trips",
          #"(function(){ var d = new Date(1790000000000), s = d.toString(); return /GMT[+-]\d{4} \([^)]+\)$/.test(s) && /GMT[+-]\d{4} \([^)]+\)$/.test(d.toTimeString()) && Date.parse(s) === 1790000000000; })()"#),
         ("stack overflow is JSC's RangeError 'Maximum call stack size exceeded.' (no InternalError)",

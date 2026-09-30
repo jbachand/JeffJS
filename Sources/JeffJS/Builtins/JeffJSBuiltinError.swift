@@ -410,7 +410,7 @@ struct JeffJSBuiltinError {
         // The frames come from the interpreter's live activation chain
         // (ctx.currentFrame). `rt.currentStackFrame`, which this used to walk,
         // is never assigned, so every stack was just the header line.
-        ctx.attachPendingStack(obj, errorName: errorName, message: message)
+        ctx.attachPendingStack(obj, errorName: errorName, message: message, fromConstructor: true)
     }
 
     // MARK: - Error.isError (ES2024 proposal)

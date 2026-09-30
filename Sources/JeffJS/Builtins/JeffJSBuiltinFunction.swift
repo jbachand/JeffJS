@@ -108,10 +108,93 @@ struct JeffJSBuiltinFunction {
         hasInstanceFn.freeValue()
 
         for name in ["arguments", "caller"] {
-            let getter = ctx.newCFunction({ _, _, _ in JeffJSValue.null }, name: name, length: 0)
-            let setter = ctx.newCFunction({ _, _, _ in JeffJSValue.undefined }, name: name, length: 1)
+            let isCaller = name == "caller"
+            let getter = ctx.newCFunction({ c, thisVal, _ in
+                isCaller ? callerGetter(ctx: c, this: thisVal) : argumentsGetter(ctx: c, this: thisVal)
+            }, name: name, length: 0)
+            // Assignment is ignored (JSC), but only for a function that may be asked.
+            let setter = ctx.newCFunction({ c, thisVal, _ in
+                sloppyOrdinaryFunction(thisVal) == nil ? c.throwTypeError(restrictedPropertyMessage) : .undefined
+            }, name: name, length: 1)
             ctx.setPropertyGetSet(obj: fp, name: name, getter: getter, setter: setter)
         }
+    }
+
+    // MARK: - Function.prototype.caller / .arguments (JSC's legacy accessors)
+
+    /// JSC's TypeError text for `caller` / `arguments` of a function that has none.
+    static let restrictedPropertyMessage = "'arguments', 'callee', and 'caller' cannot be accessed in this context."
+
+    /// The function whose `caller` / `arguments` JavaScriptCore answers: a sloppy,
+    /// ordinary function (not strict, arrow, method, accessor, class, generator,
+    /// async, bound or native). Everything else throws — `Math.max.caller`,
+    /// `(() => 1).caller`, `({ m(){} }).m.arguments` (ES §17 "Forbidden
+    /// Extensions", JSC's `FunctionPrototype` accessors).
+    static func sloppyOrdinaryFunction(_ v: JeffJSValue) -> JeffJSObject? {
+        guard let o = v.toObject(), o.isConstructor else { return nil }
+        var fb = o.fbFast
+        if fb == nil, case .bytecodeFunc(let f, _, _) = o.payload { fb = f }
+        guard let b = fb, !b.isStrictMode, !b.isArrow, !b.isGenerator, !b.isAsyncFunc,
+              !b.isDerivedClassConstructor else { return nil }
+        return o
+    }
+
+    /// The innermost active frame running `fo`, if it is on the stack.
+    static func activeFrame(ctx: JeffJSContext, of fo: JeffJSObject) -> JeffJSStackFrame? {
+        var f = ctx.currentFrame
+        var guardCount = 0
+        while let fr = f, guardCount < 100_000 {
+            if let o = fr.curFunc.toObject(), o === fo { return fr }
+            f = fr.prevFrame
+            guardCount += 1
+        }
+        return nil
+    }
+
+    /// `f.caller`: the function that called the innermost activation of `f`
+    /// when that caller is a sloppy function; null when `f` is not running or
+    /// was called from global / eval code or from strict code (JSC).
+    static func callerGetter(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
+        guard let fo = sloppyOrdinaryFunction(this) else {
+            return ctx.throwTypeError(restrictedPropertyMessage)
+        }
+        guard let fr = activeFrame(ctx: ctx, of: fo), let prev = fr.prevFrame,
+              let co = prev.curFunc.toObject() else { return .null }
+        var cfb = co.fbFast
+        if cfb == nil, case .bytecodeFunc(let f, _, _) = co.payload { cfb = f }
+        guard let b = cfb, !b.isStrictMode, !b.isTopLevelCode else { return .null }
+        return prev.curFunc.dupValue()
+    }
+
+    /// `f.arguments`: a fresh Arguments object with the innermost activation's
+    /// arguments while `f` runs, else null (JSC).
+    static func argumentsGetter(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
+        guard let fo = sloppyOrdinaryFunction(this) else {
+            return ctx.throwTypeError(restrictedPropertyMessage)
+        }
+        guard let fr = activeFrame(ctx: ctx, of: fo) else { return .null }
+        var values: [JeffJSValue] = []
+        if let b = fr.buf {
+            for i in 0 ..< fr.argCount { values.append(b[i]) }
+        } else {
+            values = Array(fr.argBuf.prefix(fr.argCount))
+        }
+        let argsObj = ctx.newObject()
+        guard let o = argsObj.toObject() else { return argsObj }
+        o.classID = JeffJSClassID.arguments.rawValue
+        for (i, v) in values.enumerated() {
+            _ = ctx.setPropertyUint32(obj: argsObj, index: UInt32(i), value: v.dupValue())
+        }
+        let wc = JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE
+        _ = ctx.definePropertyValue(obj: argsObj, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
+                                    value: .newInt32(Int32(values.count)), flags: wc)
+        _ = ctx.definePropertyValue(obj: argsObj, atom: JeffJSAtomID.JS_ATOM_callee.rawValue,
+                                    value: this, flags: wc)
+        if ctx.arrayProtoValues.isFunction {
+            _ = ctx.definePropertyValue(obj: argsObj, atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue,
+                                        value: ctx.arrayProtoValues, flags: wc)
+        }
+        return argsObj
     }
 
     // MARK: - Function.prototype (callable, returns undefined)
@@ -332,10 +415,13 @@ struct JeffJSBuiltinFunction {
         guard let boundObj = boundVal.toObject() else { return boundVal }
         boundObj.payload = .boundFunction(JeffJSBoundFunction(funcObj: this.dupValue(), thisVal: thisArg,
                                                               argc: boundArgs.count, argv: boundArgs))
-        _ = ctx.definePropertyValue(obj: boundVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
-                                    value: ctx.newStringValue(boundName), flags: JS_PROP_CONFIGURABLE)
+        // `length` then `name` (ES §20.2.3.2 steps 5-10; JSC's own-key order).
         _ = ctx.definePropertyValue(obj: boundVal, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
                                     value: newLengthVal, flags: JS_PROP_CONFIGURABLE)
+        let nameVal = ctx.newStringValue(boundName)
+        _ = ctx.definePropertyValue(obj: boundVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
+                                    value: nameVal, flags: JS_PROP_CONFIGURABLE)
+        nameVal.freeValue()   // definePropertyValue dups
         return boundVal
     }
 
@@ -343,10 +429,10 @@ struct JeffJSBuiltinFunction {
 
     /// The name JavaScriptCore puts in a native function's source text: the
     /// function's `name` without its "bound " / "get " / "set " prefixes.
-    static func nativeCodeName(_ name: String) -> String {
+    static func nativeCodeName(_ name: String, keepAccessorPrefix: Bool = false) -> String {
         var n = Substring(name)
         while n.hasPrefix("bound ") { n = n.dropFirst(6) }
-        if n.hasPrefix("get ") || n.hasPrefix("set ") { n = n.dropFirst(4) }
+        if !keepAccessorPrefix, n.hasPrefix("get ") || n.hasPrefix("set ") { n = n.dropFirst(4) }
         return String(n)
     }
 
@@ -356,13 +442,24 @@ struct JeffJSBuiltinFunction {
     /// Mirrors `js_function_toString` in QuickJS.
     static func toString(ctx: JeffJSContext, this: JeffJSValue,
                          args: [JeffJSValue]) -> JeffJSValue {
+        // JSC's text for a non-function receiver is the bare "Type error"
+        // (bot-defence scripts compare it: Function.prototype.toString.call(
+        // Object.create(fn)) must fail exactly like WebKit's).
         guard let obj = getObject(this) else {
-            return ctx.throwTypeError("not a function")
+            return ctx.throwTypeError("Type error")
         }
 
         let classID = obj.classID
 
         switch obj.payload {
+        case .bytecodeFunc(_, _, _) where obj.isPlatformFunction:
+            // A host polyfill standing in for a WebKit built-in prints the
+            // way WebKit prints its natives (DOM naming: no "get "/"set ").
+            // Its `name` may still be the closure's deferred one.
+            if obj.needsLazyNameLength { ctx.materializeFunctionNameLength(obj) }
+            let name = nativeCodeName(getFunctionName(obj: obj))
+            return JeffJSValue.makeString(JeffJSString(swiftString: "function \(name)() {\n    [native code]\n}"))
+
         case .bytecodeFunc(let functionBytecode, _, _):
             // Bytecode function — the parser recorded the source span of every
             // function it compiled (QuickJS `JSFunctionDef.source`), so return
@@ -380,9 +477,12 @@ struct JeffJSBuiltinFunction {
 
         case .cFunc(_, _, _, _, _):
             // C function — "function name() {\n    [native code]\n}", named as
-            // JavaScriptCore prints it: an accessor's "get x" / "set x" is "x"
-            // (`function cookie()`, WKWebView capture; pages fingerprint it).
-            let name = nativeCodeName(getFunctionName(obj: obj))
+            // JavaScriptCore prints it: a DOM accessor's "get x" / "set x" is
+            // "x" (`function cookie()`), an ECMAScript builtin accessor keeps
+            // it (`function get size()`, `function get __proto__()`) — both
+            // from a WKWebView capture; pages fingerprint them.
+            let name = nativeCodeName(getFunctionName(obj: obj),
+                                      keepAccessorPrefix: obj.nativeNameKeepsAccessorPrefix)
             let result = "function \(name)() {\n    [native code]\n}"
             return JeffJSValue.makeString(JeffJSString(swiftString: result))
 
@@ -397,11 +497,13 @@ struct JeffJSBuiltinFunction {
             // Not a recognized function type. If it has a call handler
             // (proxy or class-based callable), still produce output.
             if classID == JeffJSClassID.proxy.rawValue {
-                // Proxy wrapping a function
-                let result = "function () {\n    [native code]\n}"
+                // Proxy wrapping a function: JSC names its callable proxy class
+                // "ProxyObject" — `Function.prototype.toString.call(new
+                // Proxy(Math.max, {}))` is "function ProxyObject() {…}".
+                let result = "function ProxyObject() {\n    [native code]\n}"
                 return JeffJSValue.makeString(JeffJSString(swiftString: result))
             }
-            return ctx.throwTypeError("Function.prototype.toString requires that 'this' be a Function")
+            return ctx.throwTypeError("Type error")
         }
     }
 

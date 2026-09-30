@@ -155,6 +155,13 @@ final class JeffJSDynamicImportBridge {
                 }
                 resolveRef.freeValue()
                 rejectRef.freeValue()
+                // This Task is a task of its own: settling the import's promise
+                // only queues its reactions, so perform the microtask checkpoint
+                // (HTML §8.1.7.3) here. Without it `await import(x)` resumed only
+                // when some later task happened to drain the queue — never, on a
+                // page with no timers (RendererModuleTest stayed "running…" once
+                // import() targets stopped being bundled with their importer).
+                if jsCtx.callDepth == 0 { _ = jsCtx.rt.executePendingJobs() }
             }
 
             return JeffJSValue.undefined

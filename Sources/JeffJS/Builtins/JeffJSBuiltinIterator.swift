@@ -191,6 +191,8 @@ struct JeffJSBuiltinIterator {
                 setterThatIgnoresPrototypeProperties(ctx: ctx, this: this, atom: atom,
                                                      value: args.isEmpty ? .undefined : args[0])
             }, name: "set \(label)", length: 1)
+            getter.toObject()?.nativeNameKeepsAccessorPrefix = true
+            setter.toObject()?.nativeNameKeepsAccessorPrefix = true
             _ = ctx.defineProperty(obj: iterProto, atom: atom, value: .undefined,
                                    getter: getter, setter: setter,
                                    flags: JS_PROP_HAS_GET | JS_PROP_HAS_SET | JS_PROP_HAS_CONFIGURABLE |

@@ -525,13 +525,15 @@ func js_regexp_toString(
     buf.putc8(0x2F) // '/'
 
     if let sourceStr = sourceVal.stringValue {
-        // Escape forward slashes in the source.
-        for i in 0 ..< sourceStr.len {
-            let ch = jeffJS_getString(str: sourceStr, at: i)
-            if ch == 0x2F { // '/'
-                buf.putc8(0x5C) // '\'
-            }
-            buf.putc(ch)
+        // `source` is already EscapeRegExpPattern'd (js_regexp_get_source /
+        // js_regexp_escapedSource); a second pass turned /a\/b/ into /a\\/b/.
+        // A subclass's own `source` string is used as is (ES §22.2.6.17).
+        if obj.classID == JSClassID.JS_CLASS_REGEXP.rawValue {
+            let esc = JeffJSValue.makeString(js_regexp_escapedSource(sourceStr))   // owned
+            if let e = esc.stringValue { buf.concat(e) }
+            esc.freeValue()
+        } else {
+            buf.concat(sourceStr)
         }
     } else {
         buf.puts8("(?:)")
@@ -711,12 +713,52 @@ func js_regexp_get_source(
     }
 
     if let pattern = js_regexp_getPattern(obj) {
-        if pattern.len == 0 {
-            return JeffJSValue.makeString(JeffJSString(swiftString: "(?:)"))
-        }
-        return JeffJSValue.borrowedString(pattern).dupValue()
+        return JeffJSValue.makeString(js_regexp_escapedSource(pattern))
     }
     return JeffJSValue.makeString(JeffJSString(swiftString: "(?:)"))
+}
+
+/// EscapeRegExpPattern (ES §22.2.6.13.1) as JavaScriptCore writes it: "(?:)"
+/// for an empty pattern, a "/" that is neither escaped nor inside a class
+/// becomes "\/", and line terminators become "\n", "\r", "\u2028",
+/// "\u2029" — so `new RegExp("a/b").source` is "a\/b" and `/a\/b/.source`
+/// stays "a\/b" (it was "a/b", and toString escaped the escape: "/a\\/b/").
+func js_regexp_escapedSource(_ pattern: JeffJSString) -> JeffJSString {
+    if pattern.len == 0 { return JeffJSString(swiftString: "(?:)") }
+    var out: [UInt16] = []
+    out.reserveCapacity(pattern.len + 4)
+    var inClass = false
+    var escaped = false
+    var changed = false
+    for i in 0 ..< pattern.len {
+        let ch = UInt16(truncatingIfNeeded: jeffJS_getString(str: pattern, at: i))
+        switch ch {
+        case 0x0A, 0x0D, 0x2028, 0x2029:
+            if !escaped { out.append(0x5C) }
+            switch ch {
+            case 0x0A: out.append(0x6E)                              // n
+            case 0x0D: out.append(0x72)                              // r
+            case 0x2028: out.append(contentsOf: Array("u2028".utf16))
+            default: out.append(contentsOf: Array("u2029".utf16))
+            }
+            changed = true
+            escaped = false
+            continue
+        case 0x2F where !escaped && !inClass:
+            out.append(0x5C); out.append(0x2F)
+            changed = true
+            continue
+        default:
+            break
+        }
+        out.append(ch)
+        if escaped { escaped = false; continue }
+        if ch == 0x5C { escaped = true }
+        else if ch == 0x5B { inClass = true }
+        else if ch == 0x5D { inClass = false }
+    }
+    if !changed { return pattern.retain() }
+    return JeffJSString(swiftString: String(decoding: out, as: UTF16.self))
 }
 
 /// `get RegExp.prototype.flags`

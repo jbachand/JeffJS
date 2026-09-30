@@ -44,7 +44,8 @@ extension JeffJSTestRunner {
         ("tokenizer texts (JSC)",
          #"__se("'abc") === 'Unexpected EOF' && __se('`abc') === 'Unexpected EOF' && __se('`${`') === 'Unexpected EOF' && __se('/abc') === "Unterminated regular expression literal '/abc'" && __se('x = /a\n/') === "Unterminated regular expression literal '/a'" && __se('var 1a') === 'No identifiers allowed directly after numeric literal' && __se('@') === "Invalid character: '@'" && __se('/* x') === 'Multiline comment was not closed properly' && __se('0x') === "No hexadecimal digits after '0x'" && __se('1e') === 'Non-number found after exponent indicator'"#),
         ("a script's parse error has its location in the stack; eval keeps the caller's frames",
-         #"(function f(){ try { (0, eval)('a b'); } catch (e) { return typeof e.stack === 'string' && e.stack.indexOf('<eval>') < 0 && e.stack.indexOf('f@') === 0; } })()"#),
+         // JSC: "eval@[native code]\nf@…" — the eval itself is a native frame (akamai sensor 2).
+         #"(function f(){ try { (0, eval)('a b'); } catch (e) { return typeof e.stack === 'string' && e.stack.indexOf('<eval>') < 0 && e.stack.indexOf('eval@[native code]\nf@') === 0; } })() && (function g(){ try { eval('a b'); } catch (e) { return e.stack.indexOf('eval@[native code]\ng@') === 0; } })()"#),
     ]
 
     mutating func testSyntaxErrorText() {
