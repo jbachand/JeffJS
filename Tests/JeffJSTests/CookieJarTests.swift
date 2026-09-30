@@ -177,6 +177,31 @@ final class CookieJarTests: XCTestCase {
         XCTAssertEqual(s, "string|c=3; a=1|a=1")
     }
 
+    /// WebIDL §3.7.6: `cookie` and `referrer` are accessors on Document.prototype,
+    /// not own properties of the document; the page document is an HTMLDocument.
+    /// Akamai's sensor calls `Object.getOwnPropertyDescriptor(Document.prototype,
+    /// 'cookie').get` (akamai navigation fix, 2026-09-29).
+    @MainActor
+    func testDocumentCookieIsAnAccessorOnDocumentPrototype() {
+        let env = JeffJSEnvironment(configuration: .init(baseURL: URL(string: "https://www.example.com/p")!,
+                                                         storageScope: "jeffjs.cookietest.\(UUID().uuidString)"))
+        let r = env.eval("""
+        var d = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
+        var rd = Object.getOwnPropertyDescriptor(Document.prototype, 'referrer');
+        d.set.call(document, 'k=v');
+        var threw = ''; try { d.get.call(undefined); } catch (e) { threw = e.name; }
+        [typeof d.get, typeof d.set, d.enumerable, d.configurable, d.get.call(document), document.cookie,
+         d.get.call({}), threw, typeof rd.get, rd.set === undefined, document.referrer,
+         Object.prototype.hasOwnProperty.call(document, 'cookie'), Object.prototype.hasOwnProperty.call(document, 'referrer'),
+         document instanceof HTMLDocument, document instanceof Document,
+         Object.getPrototypeOf(document) === HTMLDocument.prototype,
+         Object.getPrototypeOf(HTMLDocument.prototype) === Document.prototype,
+         Object.prototype.toString.call(document)].join('|');
+        """)
+        guard case .success(let s) = r else { return XCTFail("\(r)") }
+        XCTAssertEqual(s, "function|function|true|true|k=v|k=v||TypeError|function|true||false|false|true|true|true|true|[object HTMLDocument]")
+    }
+
     // MARK: partitions and persistence
 
     /// The same third-party host embedded on two sites gets two cookies.

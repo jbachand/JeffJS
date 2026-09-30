@@ -658,6 +658,13 @@ final class JeffJSFetchBridge {
         if let header = jar.cookieHeader(for: url, sameSite: sameSite) {
             request.setValue(header, forHTTPHeaderField: "Cookie")
         }
+        if JeffJSCookieBridge.debug {
+            // JEFFJS_COOKIE_DEBUG=1: every fetch/XHR request's cookie names (the
+            // Akamai sensor POST must carry `_abck`/`bm_sz`).
+            let names = (request.value(forHTTPHeaderField: "Cookie") ?? "").split(separator: ";")
+                .map { $0.split(separator: "=", maxSplits: 1).first.map { $0.trimmingCharacters(in: .whitespaces) } ?? "" }
+            print("[FetchCookie] attach \(request.httpMethod ?? "GET") \(url.absoluteString.prefix(120)) sameSite=\(sameSite) cookies=\(names.joined(separator: ","))")
+        }
     }
 
     /// Redirect hook for the jar: store the 3xx's cookies, attach the next hop's.
@@ -689,6 +696,12 @@ final class JeffJSFetchBridge {
         guard let jar = cookieJar, let response, !fromCache,
               Self.jarCredentialsApply(url, credentials: credentials, documentOrigin: documentOrigin) else { return }
         jar.store(response: response, for: url)
+        if JeffJSCookieBridge.debug {
+            let setCookies = response.allHeaderFields.compactMap { k, v -> String? in
+                (k as? String)?.lowercased() == "set-cookie" ? "\(v)" : nil
+            }.joined(separator: ", ")
+            print("[FetchCookie] store \(response.statusCode) \(url.absoluteString.prefix(120)) set-cookie=\(setCookies.prefix(300))")
+        }
     }
 
     // MARK: - Origin helpers

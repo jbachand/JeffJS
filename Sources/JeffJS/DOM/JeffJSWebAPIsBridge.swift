@@ -82,9 +82,12 @@ final class JeffJSWebAPIsBridge {
         let perf = ctx.newObject()
         let startMS = initTimeMS
 
-        // performance.now() → high-resolution timestamp
+        // performance.now(): HR-Time §4.3 "coarsen time" as WebKit does without
+        // cross-origin isolation — whole milliseconds (WKWebView capture: 50 of 50
+        // readings integral; JeffJS's sub-millisecond values are a non-Safari tell
+        // for bot defence). akamai navigation fix, 2026-09-29.
         ctx.setPropertyFunc(obj: perf, name: "now", fn: { _, _, _ in
-            return .newFloat64(CFAbsoluteTimeGetCurrent() * 1000 - startMS)
+            return .newFloat64((CFAbsoluteTimeGetCurrent() * 1000 - startMS).rounded(.down))
         }, length: 0)
 
         // performance.timeOrigin

@@ -78,7 +78,20 @@ extension JeffJSContext {
         let protoObj = functionProto.isObject ? functionProto.toObject() : nil
         obj.shape = jeffJS_rootShape(self, proto: protoObj)
         obj.clearProps()
-        return JeffJSValue.makeObject(obj)
+        // [[Prototype]] is Function.prototype (ES §10.3): lookups read obj.proto,
+        // not the shape's — String/Number/Boolean had none, so `String + ""`
+        // threw "Cannot convert object to primitive value" (core-js's
+        // inspectSource does `String(String)`: Adobe's sync.js, lowes' vendors),
+        // and `String.name` / `.length` (ES §10.2.9, §10.2.10) were missing.
+        // akamai navigation fix, 2026-09-29.
+        obj.proto = protoObj
+        let funcVal = JeffJSValue.makeObject(obj)
+        definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
+                            value: JeffJSValue.newInt32(Int32(length)), flags: JS_PROP_CONFIGURABLE)
+        let nameVal = newStringValue(name)
+        definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue, value: nameVal, flags: JS_PROP_CONFIGURABLE)
+        nameVal.freeValue()   // definePropertyValue dups
+        return funcVal
     }
 
     /// Create a new object from a new.target value.
