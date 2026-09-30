@@ -131,7 +131,9 @@ final class JeffJSDynamicImportBridge {
                     delegate.cacheModuleBundle(bundle, for: resolvedURL)
 
                     // Evaluate the bundle in JeffJS
-                    let evalResult = jsCtx.eval(input: bundle, filename: resolvedURL.lastPathComponent, evalFlags: JS_EVAL_TYPE_GLOBAL)
+                    // The module's URL names its code (`Error.stack` frames read
+                    // `fn@<url>:line:col`, as in WebKit), not its last path component.
+                    let evalResult = jsCtx.eval(input: bundle, filename: resolvedURL.absoluteString, evalFlags: JS_EVAL_TYPE_GLOBAL)
                     if evalResult.isException {
                         let exc = jsCtx.getException()
                         let errMsg = jsCtx.toSwiftString(exc) ?? "Module evaluation failed"
@@ -185,10 +187,20 @@ final class JeffJSDynamicImportBridge {
         if trimmed.hasPrefix("/") || trimmed.hasPrefix(".") {
             return URL(string: trimmed, relativeTo: moduleURL)?.absoluteURL
         }
-
-        // Bare specifier fallback for common ESM packages.
-        let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? trimmed
-        return URL(string: "https://esm.sh/\(encoded)")
+        // HTML §8.1.5.5 "resolve a module specifier": a specifier that parses as
+        // an absolute URL is that URL, whatever its scheme — `import("data:…")`,
+        // `blob:` (reddit's suspense executor re-imports its head `data:` module
+        // scripts). Anything else is a bare specifier, which fails without an
+        // import map (WebKit: "Module name, 'x' does not resolve to a valid
+        // URL."). It used to be fetched from https://esm.sh/<specifier>, which
+        // turned `data:` URLs into 403s and ran npm packages (reddit's
+        // `import("ws")`) no browser would load. reddit / shadow DOM agent.
+        if let colon = trimmed.firstIndex(of: ":"), colon != trimmed.startIndex,
+           trimmed[..<colon].allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "+" || $0 == "-" || $0 == ".") }),
+           trimmed.first?.isLetter == true, let url = URL(string: trimmed) {
+            return url
+        }
+        return nil
     }
 
     /// Escapes a string for safe embedding in JS single-quoted strings.

@@ -61,6 +61,10 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
         var classGeneration: UInt64 = 0
         /// Selector-matching cache (`DOMNode+SelectorCache.swift`).
         var selectorCache = DOMSelectorCacheEntry()
+        /// Shadow DOM (`DOMNode+Shadow.swift`): the shadow root a host has
+        /// attached (open or closed), and — on a shadow root — its record.
+        var shadowRoot: DOMNode?
+        var shadowInfo: DOMShadowRootInfo?
 
         init(attributes: [String: String], textContent: String?) {
             self.attributes = attributes
@@ -733,7 +737,7 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
         let list = CSSSelectorParser.parse(selector)
         guard !list.selectors.isEmpty else { return nil }
         let context = CSSMatchContext(scope: self)
-        var cursor: DOMNode? = nodeType == .element ? self : parent
+        var cursor: DOMNode? = nodeType == .element ? self : CSSSelectorMatcher.selectorParent(of: self)
         while let node = cursor {
             if node.nodeType == .element,
                list.selectors.contains(where: {
@@ -741,7 +745,8 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
                }) {
                 return node
             }
-            cursor = node.parent
+            // Stops at a shadow root (its stored parent is the host).
+            cursor = CSSSelectorMatcher.selectorParent(of: node)
         }
         return nil
     }

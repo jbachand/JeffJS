@@ -144,6 +144,11 @@ enum JeffJSConfig {
     /// IC table size fix 2026-09-29). A/B: `JEFFJS_INTERP_ICTABLEFIXED=1`.
     static let icTableFixed        = bool("interp.icTableFixed",       default: false)
 
+    /// `await` inside an async function / async generator always suspends and
+    /// resumes from a job (ES §27.7.5.3). false = the old synchronous
+    /// unwrapping (A/B: `JEFFJS_INTERP_AWAITALWAYSSUSPENDS=0`).
+    static let awaitAlwaysSuspends = bool("interp.awaitAlwaysSuspends", default: true)
+
     // MARK: - Trace Blocks
 
     static let traceHitThreshold   = int("trace.hitThreshold",         default: 2)

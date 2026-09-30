@@ -58,6 +58,20 @@ public enum CSSSelectorComponent: Sendable {
     case pseudoElementMarker(CSSPseudoElement)
     /// A pseudo-class we understand but that can never match here (`:visited`).
     case neverMatches
+    /// CSS Scoping 1 §3.2.1 `:host` / `:host(<compound>)`: matches only the
+    /// shadow host of the tree whose rule is being matched
+    /// (`CSSMatchContext.shadowHost`), featureless otherwise.
+    case pseudoHost([CSSComplexSelector]?)
+    /// CSS Scoping 1 §3.2.1 `:host-context(<compound>)`: the host, when it or a
+    /// shadow-including ancestor matches the argument.
+    case pseudoHostContext([CSSComplexSelector])
+    /// The argument of `::slotted(<compound>)` (CSS Scoping 1 §3.2.2), kept in
+    /// the subject compound of a selector whose `pseudoElement` is `.slotted`;
+    /// ignored by element matching (the style resolver matches the compound
+    /// against the slot and the argument against each slotted element).
+    case slottedArgument([CSSComplexSelector])
+    /// The part names of `::part(<ident>+)` (CSS Shadow Parts 1 §4.1).
+    case partArgument([String])
     /// A pseudo-class/element we do not implement. Never matches, and makes
     /// `CSSSelector.isSupported` report false.
     case unsupported(String)
@@ -74,6 +88,10 @@ public enum CSSPseudoElement: String, Sendable {
     case firstLetter = "first-letter"
     case backdrop = "backdrop"
     case fileSelectorButton = "file-selector-button"
+    /// `::slotted()` (CSS Scoping 1 §3.2.2) — see `CSSSelectorComponent.slottedArgument`.
+    case slotted = "slotted"
+    /// `::part()` (CSS Shadow Parts 1) — see `CSSSelectorComponent.partArgument`.
+    case part = "part"
 }
 
 public enum CSSAttributeOperator: Sendable {
@@ -314,6 +332,24 @@ public struct CSSSpecificity: Comparable, Sendable {
         case .pseudoWhere:
             // :where() always contributes zero specificity.
             break
+        case .pseudoHost(let arg):
+            // CSS Scoping 1 §3.2.1: a pseudo-class, plus its argument.
+            classes += 1
+            if let arg {
+                let spec = mostSpecific(arg)
+                ids += spec.ids; classes += spec.classes; elements += spec.elements
+            }
+        case .pseudoHostContext(let arg):
+            classes += 1
+            let spec = mostSpecific(arg)
+            ids += spec.ids; classes += spec.classes; elements += spec.elements
+        case .slottedArgument(let arg):
+            // CSS Scoping 1 §3.2.2: a pseudo-element, plus its argument.
+            elements += 1
+            let spec = mostSpecific(arg)
+            ids += spec.ids; classes += spec.classes; elements += spec.elements
+        case .partArgument:
+            elements += 1
         case .element, .pseudoElementMarker:
             elements += 1
         case .universal:
@@ -336,9 +372,15 @@ public struct CSSMatchContext: Sendable {
     /// The `:scope` element. `querySelectorAll` sets it to the node it was
     /// called on; `:has()` re-points it at the anchor element.
     public var scope: DOMNode?
+    /// The shadow host of the tree whose rules are being matched (CSS Scoping
+    /// 1 §3): `:host` matches only it, and a combinator stepping out of that
+    /// tree's shadow root reaches it (featureless: only `:host`-family
+    /// compounds match it). nil = a document-tree rule.
+    public var shadowHost: DOMNode?
 
-    public init(scope: DOMNode? = nil) {
+    public init(scope: DOMNode? = nil, shadowHost: DOMNode? = nil) {
         self.scope = scope
+        self.shadowHost = shadowHost
     }
 
     /// No scoping element — `:scope` then behaves like `:root`.
@@ -411,13 +453,13 @@ public struct CSSSelectorMatcher: Sendable {
     ) -> Bool {
         switch parts[index].combinator ?? .descendant {
         case .child:
-            guard let parent = node.parent else { return false }
+            guard let parent = selectorParent(of: node, context: context) else { return false }
             return matchesChain(parts, index - 1, node: parent, context: context)
         case .descendant:
-            var cursor = node.parent
+            var cursor = selectorParent(of: node, context: context)
             while let ancestor = cursor {
                 if matchesChain(parts, index - 1, node: ancestor, context: context) { return true }
-                cursor = ancestor.parent
+                cursor = selectorParent(of: ancestor, context: context)
             }
             return false
         case .adjacentSibling:
@@ -433,6 +475,69 @@ public struct CSSSelectorMatcher: Sendable {
         }
     }
 
+    /// The parent a combinator steps to: the DOM-tree parent, which ends at a
+    /// shadow root (whose stored parent is its host — `DOMNode+Shadow.swift`).
+    /// Selectors never match across a shadow boundary (CSS Scoping 1 §3.1).
+    @inline(__always)
+    static func selectorParent(of node: DOMNode) -> DOMNode? {
+        guard let p = node.parent else { return nil }
+        if DOMNode.anyShadowRoots, p.isShadowRoot { return nil }
+        return p
+    }
+
+    /// `selectorParent(of:)` for a rule of a shadow tree: stepping out of the
+    /// rule's own shadow root reaches its host (CSS Scoping 1 §3.2.1: "the
+    /// host … is treated as the parent of the shadow root's top-level
+    /// elements" for `:host > x` / `:host x`); the host's own parent is never
+    /// reached (the host is featureless and ends the chain).
+    @inline(__always)
+    static func selectorParent(of node: DOMNode, context: CSSMatchContext) -> DOMNode? {
+        guard let host = context.shadowHost else { return selectorParent(of: node) }
+        if node === host { return nil }
+        guard let p = node.parent else { return nil }
+        if DOMNode.anyShadowRoots, p.isShadowRoot { return p.shadowHost === host ? host : nil }
+        return p
+    }
+
+    /// CSS Scoping 1 §3.1: in the context of its own shadow tree's rules the
+    /// host is featureless — only `:host`, `:host()`, `:host-context()` (alone
+    /// or with `*`) can match it.
+    private static func matchesFeaturelessHost(_ selector: CSSCompoundSelector, host: DOMNode,
+                                               context: CSSMatchContext) -> Bool {
+        var sawHost = false
+        for component in selector.components {
+            switch component {
+            case .universal:
+                continue
+            case .pseudoHost(let arg):
+                sawHost = true
+                if let arg {
+                    // The argument matches the host as an element of *its* tree.
+                    let outer = CSSMatchContext(scope: nil, shadowHost: nil)
+                    guard arg.contains(where: { matches($0, node: host, context: outer) }) else { return false }
+                }
+            case .pseudoHostContext(let arg):
+                sawHost = true
+                var cur: DOMNode? = host
+                var found = false
+                let outer = CSSMatchContext(scope: nil, shadowHost: nil)
+                while let c = cur, !found {
+                    if c.nodeType == .element, arg.contains(where: { matches($0, node: c, context: outer) }) { found = true }
+                    cur = c.parent   // shadow-including ancestors
+                }
+                guard found else { return false }
+            case .pseudoMatchesAny(let list), .pseudoWhere(let list):
+                guard list.contains(where: { matches($0, node: host, context: context) }) else { return false }
+                sawHost = true
+            case .pseudoNot(let list):
+                if list.contains(where: { matches($0, node: host, context: context) }) { return false }
+            default:
+                return false
+            }
+        }
+        return sawHost
+    }
+
     /// Test whether a compound selector matches a single node.
     public static func matchesCompound(_ selector: CSSCompoundSelector, node: DOMNode) -> Bool {
         matchesCompound(selector, node: node, context: .none)
@@ -442,6 +547,9 @@ public struct CSSSelectorMatcher: Sendable {
         // Only elements match — except the scoping root, which may be a
         // document or fragment when `:scope > x` is evaluated.
         guard node.nodeType == .element || node === context.scope else { return false }
+        if let host = context.shadowHost, node === host {
+            return matchesFeaturelessHost(selector, host: host, context: context)
+        }
 
         for component in selector.components {
             switch component {
@@ -536,10 +644,13 @@ public struct CSSSelectorMatcher: Sendable {
                 guard matchesLang(node, ranges: ranges) else { return false }
             case .pseudoDir(let direction):
                 guard resolvedDirection(node) == direction else { return false }
-            case .pseudoElementMarker:
+            case .pseudoElementMarker, .slottedArgument, .partArgument:
                 // Pseudo-element markers are extracted during parsing; if one
                 // remains in components it should not affect element matching.
                 break
+            case .pseudoHost, .pseudoHostContext:
+                // Only the context's host (handled above) matches `:host`.
+                return false
             case .neverMatches, .unsupported:
                 return false
             }
@@ -1272,6 +1383,9 @@ public struct CSSSelectorParser: Sendable {
                     pseudoElement = pseudo
                     return nil
                 }
+                // `::slotted()` / `::part()` keep their argument in the compound.
+                if case .slottedArgument = component { pseudoElement = .slotted }
+                if case .partArgument = component { pseudoElement = .part }
                 return component
             }
             if pseudoElement != nil {
@@ -1514,12 +1628,28 @@ public struct CSSSelectorParser: Sendable {
             index += 1
             let pseudoName = consumeIdentifier(chars, &index)?.lowercased()
             // Consume optional arguments like ::slotted(...) / ::part(...)
+            var pseudoArgument: String?
             if index < chars.count, chars[index] == "(" {
-                _ = consumeParenthesizedContent(chars, &index)
+                pseudoArgument = consumeParenthesizedContent(chars, &index)
             }
             guard let pseudoName else {
                 valid = false
                 return nil
+            }
+            // CSS Scoping 1 §3.2.2 / Shadow Parts 1 §4.1.
+            if pseudoName == "slotted", let arg = pseudoArgument {
+                let list = parse(arg.trimmingCharacters(in: .whitespaces))
+                guard list.isValid, !list.selectors.isEmpty,
+                      list.selectors.allSatisfy({ $0.parts.count == 1 && $0.pseudoElement == nil }) else {
+                    valid = false
+                    return .unsupported("::slotted()")
+                }
+                return .slottedArgument(list.selectors)
+            }
+            if pseudoName == "part", let arg = pseudoArgument {
+                let names = splitTopLevel(arg, separator: " ").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+                guard !names.isEmpty else { valid = false; return .unsupported("::part()") }
+                return .partArgument(names)
             }
             if let pseudo = CSSPseudoElement(rawValue: pseudoName) {
                 return .pseudoElementMarker(pseudo)
@@ -1603,6 +1733,8 @@ public struct CSSSelectorParser: Sendable {
             return .pseudoDefault
         case "defined":
             return .pseudoDefined
+        case "host" where index >= chars.count || chars[index] != "(":
+            return .pseudoHost(nil)
         default:
             break
         }
@@ -1669,6 +1801,15 @@ public struct CSSSelectorParser: Sendable {
                 return .unsupported(":lang()")
             }
             return .pseudoLang(ranges)
+        case "host", "host-context":
+            // CSS Scoping 1 §3.2.1: `<compound-selector>` arguments.
+            let list = parse(trimmedArg)
+            guard list.isValid, !list.selectors.isEmpty,
+                  list.selectors.allSatisfy({ $0.parts.count == 1 && $0.pseudoElement == nil }) else {
+                valid = false
+                return .unsupported(":\(pseudoName)()")
+            }
+            return pseudoName == "host" ? .pseudoHost(list.selectors) : .pseudoHostContext(list.selectors)
         case "dir":
             let direction = unquote(trimmedArg).lowercased()
             guard direction == "ltr" || direction == "rtl" else {

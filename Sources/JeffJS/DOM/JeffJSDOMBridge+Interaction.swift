@@ -129,7 +129,12 @@ extension JeffJSDOMBridge {
     /// its own ancestor (HierarchyRequestError).
     @discardableResult
     func insertNode(_ node: DOMNode, into parent: DOMNode, before child: DOMNode?) -> Bool {
-        if node === parent || nodeContains(node, child: parent) { return false }
+        // DOM §4.2.3 "ensure pre-insert validity": `node` must not be a
+        // host-including inclusive ancestor of `parent` (the stored parent of a
+        // shadow root is its host, so this walk crosses shadow boundaries).
+        var up: DOMNode? = parent
+        while let u = up { if u === node { return false }; up = u.parent }
+        if node.isShadowRoot { return false }
         if node.nodeType == .document { return false }
         var reference = child
         if let r = reference, r.parent !== parent { reference = nil }
@@ -158,6 +163,7 @@ extension JeffJSDOMBridge {
         }
         queueChildListRecord(target: parent, added: nodes, removed: [], previous: previous, next: ref)
         runScriptInsertionSteps(inserted: nodes, parent: parent)
+        afterTreeMutation(parent: parent, inserted: nodes, removed: [])
     }
 
     /// Empties a DocumentFragment (one record on the fragment) and returns
@@ -186,6 +192,7 @@ extension JeffJSDOMBridge {
             queueChildListRecord(target: parent, added: [], removed: [node], previous: previous, next: next)
         }
         nodeLeftTree(node)
+        afterTreeMutation(parent: parent, inserted: [], removed: [node])
     }
 
     /// "Replace all" (innerHTML, textContent, replaceChildren, innerText):
@@ -215,6 +222,7 @@ extension JeffJSDOMBridge {
         if !added.isEmpty || !removed.isEmpty {
             queueChildListRecord(target: parent, added: added, removed: removed, previous: nil, next: nil)
             runScriptInsertionSteps(inserted: added, parent: parent)
+            afterTreeMutation(parent: parent, inserted: added, removed: removed)
         }
     }
 
@@ -257,6 +265,7 @@ extension JeffJSDOMBridge {
                              next: (reference?.parent === parent) ? reference : nil)
         nodeLeftTree(old)
         runScriptInsertionSteps(inserted: flat, parent: parent)
+        afterTreeMutation(parent: parent, inserted: flat, removed: [old])
     }
 
     /// DOM "convert nodes into a node" for append/prepend/before/after/
@@ -333,6 +342,15 @@ extension JeffJSDOMBridge {
 
     private func attributeChanged(_ node: DOMNode, name: String, oldValue: String?, newValue: String?) {
         queueAttributeRecord(target: node, name: name, oldValue: oldValue)
+        // HTML §4.13.6: attributeChangedCallback reactions; DOM §4.2.2.4: a
+        // slottable's `slot` / a slot's `name` changes the tree's assignment.
+        if customElementHook != nil {
+            runCustomElementAttributeReaction(node, name: name, oldValue: oldValue, newValue: newValue)
+        }
+        if DOMNode.anyShadowRoots {
+            if name == "slot", let host = node.parent, let root = host.shadowRoot { signalSlotChanges(in: root) }
+            if name == "name", node.isSlotElement { signalSlotChanges(in: node.containingShadowRoot) }
+        }
         if Self.isHTMLScript(node) {
             // HTML §4.12.1: an `async` attribute change clears "non-blocking";
             // a `src` set where there was none prepares a connected script.
@@ -584,7 +602,9 @@ extension JeffJSDOMBridge {
                     result[reg.observerID] = (result[reg.observerID] ?? false) || wantsOld
                 }
             }
-            cursor = node.parent
+            // DOM §4.3 "inclusive ancestors": a subtree observer never sees a
+            // shadow tree's mutations (the root's stored parent is its host).
+            cursor = node.domParent
         }
         return result
     }

@@ -1734,6 +1734,22 @@ struct JSRegExpCapture {
 /// the full match).  Returns `nil` when there is no match.
 ///
 /// Mirrors QuickJS `lre_exec`.
+/// `JEFFJS_REGEX_WATCH=1` (diagnostic, see `js_regexp_execInternal`).
+let jeffJSRegexWatch = ProcessInfo.processInfo.environment["JEFFJS_REGEX_WATCH"] == "1"
+
+func jeffJSRegexWatchReport(_ ctx: JeffJSContext, _ obj: JeffJSObject, flags: Int, inputLength: Int, tried: Int, ms: Double, done: Bool, input: [UInt32] = []) {
+    var source = "?"
+    if case .regexp(let pattern, _) = obj.payload, let p = pattern { source = p.toSwiftString() }
+    if source.count > 300 { source = String(source.prefix(300)) + "…" }
+    let line = "[jeffjs:regex] \(done ? "slow" : "still running") /\(source)/ flags=\(flags) input=\(inputLength) "
+        + "starts=\(tried) \(String(format: "%.0f", ms)) ms\n"
+        + "[jeffjs:regex]   input: " + String(String.UnicodeScalarView(input.prefix(240).compactMap { Unicode.Scalar($0) })).replacingOccurrences(of: "\n", with: "\\n") + "\n"
+        + "[jeffjs:regex]   at " + ctx.formatStackTrace(errorName: "", message: "", frames: ctx.captureStackFrames(maxDepth: 8))
+            .split(separator: "\n").map { String($0.prefix(160)) }.joined(separator: " <- ") + "\n"
+    FileHandle.standardError.write(line.data(using: .utf8)!)
+    print(line, terminator: "")
+}
+
 private func js_regexp_execInternal(
     ctx: JeffJSContext,
     obj: JeffJSObject,
@@ -1806,8 +1822,26 @@ private func js_regexp_execInternal(
     let vm = REVirtualMachine(bytecode: bytecode, input: inputCodeUnits,
                               startPos: startIndex, flags: regexpFlags)
     var pos = startIndex
+    // `JEFFJS_REGEX_WATCH=1`: name every exec that takes > 250 ms (pattern,
+    // flags, input length, start positions tried) — a page stalled in regex
+    // backtracking shows only REVirtualMachine frames in a sample.
+    let watchStart = jeffJSRegexWatch ? CFAbsoluteTimeGetCurrent() : 0
+    var watchReported = false
+    defer {
+        if jeffJSRegexWatch {
+            let ms = (CFAbsoluteTimeGetCurrent() - watchStart) * 1000
+            if ms > 250 { jeffJSRegexWatchReport(ctx, obj, flags: flags, inputLength: inputCodeUnits.count,
+                                                 tried: pos - startIndex + 1, ms: ms, done: true, input: inputCodeUnits) }
+        }
+    }
     while pos <= inputCodeUnits.count {
         vm.reset(startPos: pos)
+        if jeffJSRegexWatch, !watchReported, (pos - startIndex) & 1023 == 0,
+           CFAbsoluteTimeGetCurrent() - watchStart > 2 {
+            watchReported = true
+            jeffJSRegexWatchReport(ctx, obj, flags: flags, inputLength: inputCodeUnits.count,
+                                   tried: pos - startIndex, ms: (CFAbsoluteTimeGetCurrent() - watchStart) * 1000, done: false)
+        }
         let result = vm.exec()
 
         if result.result == .match {
