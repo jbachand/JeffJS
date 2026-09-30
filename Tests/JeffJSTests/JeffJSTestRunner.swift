@@ -339,6 +339,7 @@ struct JeffJSTestRunner {
             ("ShadowDOM", { $0.testShadowDOM() }),
             ("AwaitSuspension", { $0.testAwaitSuspension() }),
             ("CSSScoping", { $0.testCSSScoping() }),
+            ("DeclarativeShadowDOM", { $0.testDeclarativeShadowDOM() }),
             ("IntlFormatStyles", { $0.testIntlFormatStyles() }),
             ("IteratorHelpers", { $0.testIteratorHelpers() }),
             ("SyntaxErrorText", { $0.testSyntaxErrorText() }),

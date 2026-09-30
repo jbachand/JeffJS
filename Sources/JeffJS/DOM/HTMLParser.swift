@@ -8,8 +8,12 @@ public struct HTMLParser: Sendable {
     /// Parse a whole document. `scriptingEnabled` mirrors the flag in
     /// §13.2.6.4.4: with scripting on (a browser's default, and ours) the
     /// contents of `<noscript>` are *raw text* and never become elements.
-    public static func parse(_ html: String, scriptingEnabled: Bool = true) -> DOMNode {
+    /// `allowDeclarativeShadowRoots` (HTML §13.2.6.4.4): the page's own parse
+    /// attaches `<template shadowrootmode>` roots; DOMParser does not.
+    public static func parse(_ html: String, scriptingEnabled: Bool = true,
+                             allowDeclarativeShadowRoots: Bool = true) -> DOMNode {
         let builder = HTMLTreeBuilder(html: html, scriptingEnabled: scriptingEnabled)
+        builder.allowDeclarativeShadowRoots = allowDeclarativeShadowRoots
         return builder.buildDocument()
     }
 
@@ -126,6 +130,7 @@ final class HTMLTreeBuilder {
     /// the start tag is dropped (§13.2.6.4.7).
     private var ignoreNextLF = false
     private var fragmentParsing = false
+    var allowDeclarativeShadowRoots = true
     private var contextElement: DOMNode?
 
     /// WebKit's `maximumHTMLParserDOMTreeDepth` (`Settings::defaultMaximumHTMLParserDOMTreeDepth`
@@ -769,10 +774,37 @@ final class HTMLTreeBuilder {
     private func closeTemplate() {
         guard openElements.contains(where: { isHTMLElement($0, "template") }) else { return }
         generateImpliedEndTagsThoroughly()
+        let template = openElements.last(where: { isHTMLElement($0, "template") })
         popUntil("template")
         clearActiveFormattingToMarker()
         if !templateModes.isEmpty { templateModes.removeLast() }
         resetInsertionModeAppropriately()
+        if let template { attachDeclarativeShadowRoot(template) }
+    }
+
+    /// HTML §13.2.6.4.4 "in head" `<template shadowrootmode>` (declarative shadow
+    /// DOM, document parser only — fragment parsing (innerHTML) never creates
+    /// one): when the template's parent can host a shadow root and has none, the
+    /// template is not inserted; its contents become a declarative shadow root
+    /// of the parent (`DOMNode.attachShadowRoot(declarative:)`), with
+    /// `shadowrootdelegatesfocus` / `shadowrootclonable` / `shadowrootserializable`.
+    /// This parser keeps a template's parsed children on the element (the
+    /// bridge moves them into `.content` on first use), so they are moved into
+    /// the root when the template closes; otherwise it stays an ordinary template.
+    private func attachDeclarativeShadowRoot(_ template: DOMNode) {
+        guard !fragmentParsing, allowDeclarativeShadowRoots,
+              let mode = template.attributeValue("shadowrootmode")?.lowercased(), mode == "open" || mode == "closed",
+              let host = template.parent, host.nodeType == .element, host.shadowRoot == nil else { return }
+        guard let root = host.attachShadowRoot(mode: mode,
+                                               delegatesFocus: template.hasAttributeValue("shadowrootdelegatesfocus"),
+                                               clonable: template.hasAttributeValue("shadowrootclonable"),
+                                               serializable: template.hasAttributeValue("shadowrootserializable"),
+                                               declarative: true) else { return }
+        for child in template.detachChildrenArray() {
+            child.parent = nil
+            root.appendChild(child)
+        }
+        host.removeChild(template)
     }
 
     // MARK: - "in head noscript" (scripting disabled)
