@@ -65,6 +65,11 @@ extension JeffJSContext {
     /// obj.proto is the single source of truth for the prototype.
     func getPrototypeOf(_ val: JeffJSValue) -> JeffJSValue {
         guard let obj = val.toObject() else { return .null }
+        // A Proxy's [[GetPrototypeOf]] is its trap, else its target's (ES
+        // §10.5.1); the proxy object's own `proto` is not it.
+        if obj.classID == JeffJSClassID.proxy.rawValue || obj.classID == JSClassID.JS_CLASS_PROXY.rawValue {
+            return js_proxy_getPrototypeOf(self, obj)
+        }
         if let proto = obj.proto {
             // Owned result (Round 9: anything returned is dup'd). `obj.proto`
             // is a borrow, so returning it unduped let the caller's freeValue
@@ -75,6 +80,20 @@ extension JeffJSContext {
             return JeffJSValue.makeObjectRecycled(proto).dupValue()
         }
         return .null
+    }
+
+    /// The next object of a prototype-chain walk (`instanceof`): `obj.proto`,
+    /// or for a Proxy its [[GetPrototypeOf]] (an owned value appended to
+    /// `keep`, which the caller frees after the walk). An exception from a
+    /// trap ends the walk (left pending).
+    func prototypeForWalk(_ obj: JeffJSObject, keep: inout [JeffJSValue]) -> JeffJSObject? {
+        guard obj.classID == JeffJSClassID.proxy.rawValue || obj.classID == JSClassID.JS_CLASS_PROXY.rawValue else {
+            return obj.proto
+        }
+        let v = js_proxy_getPrototypeOf(self, obj)
+        if v.isException { return nil }
+        keep.append(v)
+        return v.toObject()
     }
 
     /// JS_SetPrototypeOf equivalent.

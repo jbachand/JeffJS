@@ -227,13 +227,9 @@ func js_proxy_getPrototypeOf(_ ctx: JeffJSContext,
 
     let trap = getTrap(ctx, pd.handler, JSPredefinedAtom.getPrototypeOf.rawValue)
     if trap.isUndefined {
-        // Fall through to target.
-        if let targetObj = pd.target.toObject(), let shape = targetObj.shape {
-            if let proto = shape.proto {
-                return JeffJSValue.makeObject(proto).dupValue()
-            }
-        }
-        return .null
+        // Fall through to the target's [[GetPrototypeOf]] (obj.proto is the
+        // source of truth; a proxy target forwards again).
+        return ctx.getPrototypeOf(pd.target)
     }
 
     // Call trap(target).
@@ -341,7 +337,9 @@ func js_proxy_getOwnPropertyDescriptor(_ ctx: JeffJSContext,
 
     // Call trap(target, key).
     let propName: JeffJSValue
-    if let name = ctx.rt.atomToString(atom) {
+    if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
+        propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+    } else if let name = ctx.rt.atomToString(atom) {
         propName = ctx.newStringValue(name)
     } else {
         propName = .undefined
@@ -375,7 +373,9 @@ func js_proxy_defineProperty(_ ctx: JeffJSContext,
 
     // Call trap(target, key, descriptor).
     let propName: JeffJSValue
-    if let name = ctx.rt.atomToString(atom) {
+    if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
+        propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+    } else if let name = ctx.rt.atomToString(atom) {
         propName = ctx.newStringValue(name)
     } else {
         propName = .undefined
@@ -403,7 +403,9 @@ func js_proxy_has(_ ctx: JeffJSContext,
 
     // Call trap(target, key).
     let propName: JeffJSValue
-    if let name = ctx.rt.atomToString(atom) {
+    if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
+        propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+    } else if let name = ctx.rt.atomToString(atom) {
         propName = ctx.newStringValue(name)
     } else {
         propName = .undefined
@@ -431,7 +433,9 @@ func js_proxy_get(_ ctx: JeffJSContext,
 
     // Call trap(target, key, receiver).
     let propName: JeffJSValue
-    if let name = ctx.rt.atomToString(atom) {
+    if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
+        propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+    } else if let name = ctx.rt.atomToString(atom) {
         propName = ctx.newStringValue(name)
     } else {
         propName = .undefined
@@ -460,7 +464,9 @@ func js_proxy_set(_ ctx: JeffJSContext,
 
     // Call trap(target, key, value, receiver).
     let propName: JeffJSValue
-    if let name = ctx.rt.atomToString(atom) {
+    if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
+        propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+    } else if let name = ctx.rt.atomToString(atom) {
         propName = ctx.newStringValue(name)
     } else {
         propName = .undefined
@@ -487,7 +493,9 @@ func js_proxy_deleteProperty(_ ctx: JeffJSContext,
 
     // Call trap(target, property).
     let propName: JeffJSValue
-    if let name = ctx.rt.atomToString(atom) {
+    if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
+        propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+    } else if let name = ctx.rt.atomToString(atom) {
         propName = ctx.newStringValue(name)
     } else {
         propName = .undefined

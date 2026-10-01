@@ -536,10 +536,13 @@ extension JeffJSContext {
         guard protoVal.isObject, let targetProto = protoVal.toObject() else { return false }
         // 5. Walk the prototype chain of val looking for P.
         //    obj.proto is the single source of truth for the prototype.
-        var current: JeffJSObject? = valObj.proto
+        //    A Proxy on the chain answers with its [[GetPrototypeOf]].
+        var keep: [JeffJSValue] = []
+        defer { for v in keep { v.freeValue() } }
+        var current: JeffJSObject? = prototypeForWalk(valObj, keep: &keep)
         while let cur = current {
             if cur === targetProto { return true }
-            current = cur.proto
+            current = prototypeForWalk(cur, keep: &keep)
         }
         return false
     }

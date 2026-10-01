@@ -1451,7 +1451,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 rt.freeAtom(trapAtom)
                 if trap.isObject, let trapObj = trap.toObject(), trapObj.isCallable {
                     let propName: JeffJSValue
-                    if let name = rt.atomToString(atom) {
+                    if rt.atomIsSymbol(atom), let sym = rt.symbolStringForAtom(atom) {
+                        propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+                    } else if let name = rt.atomToString(atom) {
                         propName = newStringValue(name)
                     } else {
                         propName = .JS_UNDEFINED
@@ -1580,7 +1582,12 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                     if trap.isObject, let trapObj = trap.toObject(), trapObj.isCallable {
                         // Call trap(target, property)
                         let propName: JeffJSValue
-                        if let name = rt.atomToString(atom) {
+                        if rt.atomIsSymbol(atom), let sym = rt.symbolStringForAtom(atom) {
+                            // A symbol key reaches the trap as the Symbol (it was its
+                            // description string: Object.prototype.toString through a
+                            // Proxy with a get trap read "Symbol.toStringTag").
+                            propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+                        } else if let name = rt.atomToString(atom) {
                             propName = newStringValue(name)
                         } else {
                             propName = .JS_UNDEFINED
@@ -4987,7 +4994,12 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                     if trap.isObject, let trapObj = trap.toObject(), trapObj.isCallable {
                         // Call trap(target, property, receiver)
                         let propName: JeffJSValue
-                        if let name = rt.atomToString(atom) {
+                        if rt.atomIsSymbol(atom), let sym = rt.symbolStringForAtom(atom) {
+                            // A symbol key reaches the trap as the Symbol (it was its
+                            // description string: Object.prototype.toString through a
+                            // Proxy with a get trap read "Symbol.toStringTag").
+                            propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+                        } else if let name = rt.atomToString(atom) {
                             propName = newStringValue(name)
                         } else {
                             propName = .JS_UNDEFINED
@@ -5217,7 +5229,12 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                     if trap.isObject, let trapObj = trap.toObject(), trapObj.isCallable {
                         // Call trap(target, property, value, receiver)
                         let propName: JeffJSValue
-                        if let name = rt.atomToString(atom) {
+                        if rt.atomIsSymbol(atom), let sym = rt.symbolStringForAtom(atom) {
+                            // A symbol key reaches the trap as the Symbol (it was its
+                            // description string: Object.prototype.toString through a
+                            // Proxy with a get trap read "Symbol.toStringTag").
+                            propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+                        } else if let name = rt.atomToString(atom) {
                             propName = newStringValue(name)
                         } else {
                             propName = .JS_UNDEFINED

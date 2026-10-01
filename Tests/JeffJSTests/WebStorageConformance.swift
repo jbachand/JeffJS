@@ -58,6 +58,21 @@ extension JeffJSTestRunner {
          "(localStorage.setItem('q', '1'), localStorage.clear(), localStorage.length === 0 && localStorage.getItem('q') === null)"),
         ("sessionStorage is a separate area",
          "(localStorage.setItem('s', 'L'), sessionStorage.setItem('s', 'S'), localStorage.getItem('s') === 'L' && sessionStorage.getItem('s') === 'S' && (sessionStorage.removeItem('s'), localStorage.getItem('s') === 'L'))"),
+        ("a Proxy over a Storage-shaped target keeps its interface (the host's Storage exotic object)",
+         """
+         (function () {
+           var P = {}; Object.defineProperty(P, Symbol.toStringTag, { value: 'Storage', configurable: true });
+           function F() {} F.prototype = P;
+           var t = Object.create(P), seen = [];
+           var px = new Proxy(t, { get: function (t, k, r) { seen.push(typeof k); return Reflect.get(t, k, r); } });
+           var bare = new Proxy(t, {});
+           var hooked = new Proxy(t, { getPrototypeOf: function () { return Array.prototype; } });
+           return px instanceof F && Object.getPrototypeOf(px) === P && Object.prototype.toString.call(px) === '[object Storage]'
+             && seen.indexOf('symbol') >= 0 && bare instanceof F && Object.getPrototypeOf(bare) === P
+             && hooked instanceof Array && !(hooked instanceof F) && Object.getPrototypeOf(hooked) === Array.prototype
+             && new Proxy(px, {}) instanceof F;
+         })()
+         """),
         ("sessionStorage has the quota too",
          "(function(){ var t = false; try { sessionStorage.setItem('big', 'x'.repeat(5 * 1024 * 1024 + 1)); } catch (e) { t = e.name === 'QuotaExceededError'; } return t && sessionStorage.getItem('big') === null; })()"),
     ]

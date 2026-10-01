@@ -662,9 +662,12 @@ struct JeffJSBuiltinFunction {
         }
 
         // Walk the prototype chain of val (obj.proto is the single source of truth)
+        // (a Proxy on the chain answers with its [[GetPrototypeOf]])
+        var keep: [JeffJSValue] = []
+        defer { for v in keep { v.freeValue() } }
         let maxProtoChain = 1000
         for _ in 0..<maxProtoChain {
-            guard let parentProto = valObj.proto else {
+            guard let parentProto = ctx.prototypeForWalk(valObj, keep: &keep) else {
                 return false
             }
             if parentProto === protoObj {

@@ -141,7 +141,7 @@ nonisolated public protocol JeffJSWebStorageStore: AnyObject, Sendable {
     func getItem(_ key: String, origin: String, area: String) -> String?
     /// Stores `value`; returns the previous value (nil = new key). Throws
     /// `JeffJSWebStorageError.quotaExceeded` without changing anything when
-    /// the origin would go past its quota.
+    /// the area would go past its quota (one quota per origin and area).
     func setItem(_ value: String, forKey key: String, origin: String, area: String) throws -> String?
     /// Removes `key`; returns the removed value (nil = there was none).
     func removeItem(_ key: String, origin: String, area: String) -> String?
@@ -164,7 +164,8 @@ nonisolated public extension JeffJSWebStorageStore {
 // MARK: - In-memory store
 
 /// The default store (CLI, tests, `sessionStorage`): every origin's areas in
-/// memory, one quota per origin shared by its areas.
+/// memory, one quota per area (WebKit: per `StorageMap`, so the legacy
+/// namespaces never eat into `localStorage`'s 5 MB).
 nonisolated public final class JeffJSMemoryWebStorage: JeffJSWebStorageStore, @unchecked Sendable {
     public let quotaBytes: Int
     private let lock = NSLock()
@@ -173,10 +174,6 @@ nonisolated public final class JeffJSMemoryWebStorage: JeffJSWebStorageStore, @u
     /// `quotaBytes` nil = `storage.localQuotaBytes`; 0 = no quota.
     public init(quotaBytes: Int? = nil) {
         self.quotaBytes = quotaBytes ?? JeffJSConfig.storageLocalQuotaBytes
-    }
-
-    private func otherBytes(_ areas: [String: JeffJSWebStorageArea], except area: String) -> Int {
-        areas.reduce(0) { $0 + ($1.key == area ? 0 : $1.value.bytes) }
     }
 
     public func getItem(_ key: String, origin: String, area: String) -> String? {
@@ -188,8 +185,7 @@ nonisolated public final class JeffJSMemoryWebStorage: JeffJSWebStorageStore, @u
         lock.lock(); defer { lock.unlock() }
         var areas = origins[origin] ?? [:]
         var a = areas[area] ?? JeffJSWebStorageArea()
-        let old = try a.set(key, value, quota: quotaBytes > 0 ? quotaBytes : nil,
-                            extraBytes: otherBytes(areas, except: area))
+        let old = try a.set(key, value, quota: quotaBytes > 0 ? quotaBytes : nil)
         areas[area] = a
         origins[origin] = areas
         return old
