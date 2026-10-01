@@ -70,7 +70,11 @@ extension JeffJSTestRunner {
            return px instanceof F && Object.getPrototypeOf(px) === P && Object.prototype.toString.call(px) === '[object Storage]'
              && seen.indexOf('symbol') >= 0 && bare instanceof F && Object.getPrototypeOf(bare) === P
              && hooked instanceof Array && !(hooked instanceof F) && Object.getPrototypeOf(hooked) === Array.prototype
-             && new Proxy(px, {}) instanceof F;
+             && new Proxy(px, {}) instanceof F
+             && Object.prototype.hasOwnProperty.call(new Proxy({}, { getOwnPropertyDescriptor: function (t, k) {
+                  return k === 'item' ? { value: 1, writable: true, enumerable: true, configurable: true } : undefined; } }), 'item')
+             && !Object.prototype.hasOwnProperty.call(new Proxy({}, { getOwnPropertyDescriptor: function () { return undefined; } }), 'item')
+             && Object.prototype.hasOwnProperty.call(new Proxy({ own: 1 }, {}), 'own');
          })()
          """),
         ("sessionStorage has the quota too",

@@ -178,6 +178,16 @@ extension JeffJSContext {
             return 0
         }
         defer { if ownedAtom { rt.freeAtom(atom) } }
+        // A Proxy's [[GetOwnProperty]] is its getOwnPropertyDescriptor trap
+        // (or its target's): `Object.prototype.hasOwnProperty.call(proxy, k)`
+        // read the proxy object's own (empty) shape — `for (k in
+        // localStorage) if (localStorage.hasOwnProperty(k))` saw no item.
+        if jsObj.classID == JeffJSClassID.proxy.rawValue || jsObj.classID == JSClassID.JS_CLASS_PROXY.rawValue {
+            let desc = js_proxy_getOwnPropertyDescriptor(self, jsObj, atom)
+            if desc.isException { return -1 }
+            defer { desc.freeValue() }
+            return desc.isUndefined ? 0 : 1
+        }
         if hasOwnPropertyAtom(jsObj, atom) { return 1 }
         if let idx = rt.atomToUInt32(atom) {
             let alt = (atom & JS_ATOM_TAG_INT) != 0 ? rt.findAtom(String(idx))
