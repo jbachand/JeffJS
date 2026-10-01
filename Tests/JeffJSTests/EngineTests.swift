@@ -50,6 +50,31 @@ final class EngineTests: XCTestCase {
         for f in failures.prefix(60) { print("  \(f)") }
     }
 
+    /// Ad-hoc realm probe: each line of $JEFFJS_REALM_PROBE is evaluated in a main
+    /// context where `w` is a second realm's global; prints line → result.
+    func testRealmProbe() {
+        let rt = JeffJSRuntime()
+        let ctx = rt.newContext()
+        guard let realm = rt.newRealm() else { return }
+        let g = ctx.getGlobalObject(), wg = realm.getGlobalObject()
+        ctx.setPropertyStr(obj: g, name: "w", value: wg.dupValue())
+        for line in (ProcessInfo.processInfo.environment["JEFFJS_REALM_PROBE"] ?? "").split(separator: "\n") {
+            let r = ctx.eval(input: String(line), filename: "<probe>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+            if r.isException { let e = ctx.getException(); print("PROBE \(line) => THROW \(ctx.toSwiftString(e) ?? "?")"); e.freeValue() }
+            else { print("PROBE \(line) => \(ctx.toSwiftString(r) ?? "?")") }
+            r.freeValue()
+        }
+    }
+
+    /// The "Realms" group alone (`swift test -c release --filter EngineTests/testRealmsGroup`).
+    func testRealmsGroup() {
+        var runner = JeffJSTestRunner()
+        runner.testRealms()
+        print("Realms: \(runner.passCount) passed, \(runner.failCount) failed")
+        for f in runner.errors { print("  \(f)") }
+        XCTAssertEqual(runner.failCount, 0)
+    }
+
     func testPerfBenchmarks() {
         let report = JeffJSPerfTests.runAll()
         print(report)

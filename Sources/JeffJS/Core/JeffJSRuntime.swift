@@ -1002,7 +1002,56 @@ nonisolated final class JeffJSRuntime {
     /// - Returns: A new JeffJSContext ready for script evaluation.
     func newContext() -> JeffJSContext {
         let ctx = JeffJSContext(rt: self)
+        // The first ordinary context is the realm of every index-0 function
+        // (the host's main realm): a call from an extra realm into one of
+        // them switches back to it.
+        if realmTable[0] == nil { realmTable[0] = Unmanaged.passUnretained(ctx) }
         return ctx
+    }
+
+    // MARK: - Realms (ES §9.3; HTML §7.1 / §10.1: one realm per global object)
+
+    /// Realm contexts by `realmIndex`: slot 0 is the runtime's first ordinary
+    /// context (every function of an ordinary context carries index 0, so
+    /// calls among ordinary contexts never switch), 1…255 the `newRealm()`s.
+    /// Unretained: the host owns each realm context and frees it before the
+    /// runtime; `releaseRealm` clears its slot.
+    var realmTable: [Unmanaged<JeffJSContext>?] = Array(repeating: nil, count: 256)
+    /// Next unused realm index. Indices are never reused within a runtime: a
+    /// function of a released realm must not start running in a new one.
+    private var nextRealmIndex: Int = 1
+
+    /// Creates an additional realm — a context with its own global object and
+    /// intrinsics (`iframe.contentWindow.Array !== Array`) — that shares this
+    /// runtime's heap, atoms and job queue with the other contexts, so values
+    /// pass between realms by reference. Unlike contexts from `newContext()`,
+    /// a realm's functions carry its index, and calling one from another
+    /// realm switches to the callee's realm for the call (ES §10.2.1.1
+    /// PrepareForOrdinaryCall: the callee's [[Realm]] becomes the current
+    /// Realm): `w.Function('return this')()` is `w`, a sloppy call's `this` is
+    /// `w`'s global, `new w.Array()` has `w`'s prototype. Nil after 255 realms.
+    func newRealm(addIntrinsics: Bool = true) -> JeffJSContext? {
+        guard nextRealmIndex < realmTable.count else { return nil }
+        let index = UInt8(nextRealmIndex)
+        nextRealmIndex += 1
+        let ctx = JeffJSContext(rt: self, addIntrinsics: addIntrinsics, realmIndex: index)
+        realmTable[Int(index)] = Unmanaged.passUnretained(ctx)
+        return ctx
+    }
+
+    /// The realm a function object belongs to, when it is one made by
+    /// `newRealm()` and still alive.
+    @inline(__always)
+    func realm(at index: UInt8) -> JeffJSContext? {
+        realmTable[Int(index)]?.takeUnretainedValue()
+    }
+
+    /// Forgets a realm before its context is freed: its functions then run in
+    /// their caller's realm (a host must not free a realm whose objects are
+    /// still in use).
+    func releaseRealm(_ ctx: JeffJSContext) {
+        let i = Int(ctx.realmIndex)
+        if i < realmTable.count, realmTable[i]?.takeUnretainedValue() === ctx { realmTable[i] = nil }
     }
 
     /// Creates a new raw context without any intrinsics.

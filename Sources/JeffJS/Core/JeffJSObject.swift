@@ -1706,6 +1706,14 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
     /// WebKit built-in): Function.prototype.toString prints it as native code.
     /// Set through `JeffJSContext.markPlatformFunction`.
     var isPlatformFunction: Bool = false
+    /// The realm (JeffJSContext.realmIndex) a function object belongs to: the
+    /// context whose code created the closure, or a native function's
+    /// `realm`. 0 for everything created by a runtime's ordinary contexts.
+    /// Calls switch to the callee's realm when it differs from the caller's
+    /// (ES §10.2.1.1 PrepareForOrdinaryCall step 4-6, §10.3.1 [[Call]] of
+    /// built-ins: the callee's realm becomes the current Realm Record). Fills
+    /// existing flag padding.
+    var realmIndex: UInt8 = 0
 
     // -- Class & weak-ref ----------------------------------------------------
 
@@ -1745,7 +1753,10 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
 
     var payload: JeffJSObjectPayload    = .opaque(nil) {
         didSet {
-            if case .cFunc(_, let cf, _, _, let magic) = payload { cFuncFast = cf; cMagicFast = Int(magic) }
+            if case .cFunc(let realm, let cf, _, _, let magic) = payload {
+                cFuncFast = cf; cMagicFast = Int(magic)
+                if let realm { realmIndex = realm.realmIndex }
+            }
             else if cFuncFast != nil { cFuncFast = nil }
         }
     }
@@ -2683,6 +2694,7 @@ struct JeffJSObj {
     }
     @inline(__always) var fbFastU: Unmanaged<JeffJSFunctionBytecode>? { _obj.fbFastU }
     @inline(__always) var cFuncFast: JSCFunctionType? { _obj.cFuncFast }
+    @inline(__always) var realmIndex: UInt8 { _obj.realmIndex }
     @inline(__always) var cMagicFast: Int { _obj.cMagicFast }
 
     @inline(__always) var varRefsRaw: UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>? { _obj.varRefsRaw }
