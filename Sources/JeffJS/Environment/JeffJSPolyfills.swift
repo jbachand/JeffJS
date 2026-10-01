@@ -912,11 +912,10 @@ public enum JeffJSPolyfills {
         __nativeStorage.clear('local_storage');
       },
       key: function(index) {
-        var keys = __nativeStorage.keys('local_storage');
-        return (index >= 0 && index < keys.length) ? keys[index] : null;
+        return __nativeStorage.key('local_storage', index);
       },
       get length() {
-        return __nativeStorage.keys('local_storage').length;
+        return __nativeStorage.length('local_storage');
       }
     };
   }
@@ -937,11 +936,10 @@ public enum JeffJSPolyfills {
         __nativeStorage.clear('session_storage');
       },
       key: function(index) {
-        var keys = __nativeStorage.keys('session_storage');
-        return (index >= 0 && index < keys.length) ? keys[index] : null;
+        return __nativeStorage.key('session_storage', index);
       },
       get length() {
-        return __nativeStorage.keys('session_storage').length;
+        return __nativeStorage.length('session_storage');
       }
     };
   }
