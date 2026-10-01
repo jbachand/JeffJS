@@ -454,14 +454,22 @@ func js_init_symbol_builtin(_ ctx: JeffJSContext,
     for wks in js_well_known_symbols {
         // Each well-known symbol is a symbol-typed atom from the predefined table.
         // We create a symbol value from the atom.
-        let symStr = JeffJSString(swiftString: wks.description)
-        symStr.atomType = JSAtomType.symbol.rawValue
-        // Bind the symbol to its predefined JS_ATOM_Symbol_* id and mark that
-        // atom symbol-typed, so a well-known symbol used as a property key
-        // reaches the same atom the engine's internal
-        // `getProperty(obj:atom: JS_ATOM_Symbol_iterator)` calls use, while
-        // for-in / Object.keys / JSON.stringify still skip it.
-        ctx.rt.bindSymbolAtom(symStr, atom: wks.atomID)
+        // Well-known symbols are shared by all realms (ES §6.1.5.1): a second
+        // context of the runtime (an iframe's realm) reuses the first one's.
+        let symStr: JeffJSString
+        if let existing = ctx.rt.symbolStringForAtom(wks.atomID) {
+            symStr = existing
+            existing.refCount += 1   // the value installed below
+        } else {
+            symStr = JeffJSString(swiftString: wks.description)
+            symStr.atomType = JSAtomType.symbol.rawValue
+            // Bind the symbol to its predefined JS_ATOM_Symbol_* id and mark that
+            // atom symbol-typed, so a well-known symbol used as a property key
+            // reaches the same atom the engine's internal
+            // `getProperty(obj:atom: JS_ATOM_Symbol_iterator)` calls use, while
+            // for-in / Object.keys / JSON.stringify still skip it.
+            ctx.rt.bindSymbolAtom(symStr, atom: wks.atomID)
+        }
         let symVal = JeffJSValue.mkPtr(tag: .symbol, ptr: symStr)
 
         // Install as a non-writable, non-enumerable, non-configurable property.

@@ -109,7 +109,7 @@ extension JeffJSDOMBridge {
     /// The JS value for a node: the page root is `document`.
     func jsValue(for node: DOMNode, ctx: JeffJSContext) -> JeffJSValue {
         if node === root, let doc = documentJSValue { return doc.dupValue() }
-        return wrapElement(node, ctx: ctx)
+        return wrapElement(node, ctx: ctx)   // routes another realm's document / nodes
     }
 
     /// A DOM node from a JS value: element wrappers by payload, `document`
@@ -117,7 +117,7 @@ extension JeffJSDOMBridge {
     func nodeFromValue(_ value: JeffJSValue) -> DOMNode? {
         if let node = extractNode(from: value) { return node }
         if value.isObject, let doc = documentJSValue, value == doc { return root }
-        return nil
+        return otherRealmDocument(value)
     }
 
     // MARK: - Tree mutations (DOM §4.2.3)

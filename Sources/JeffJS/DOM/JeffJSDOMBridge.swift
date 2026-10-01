@@ -36,7 +36,7 @@ final class JeffJSDOMBridge {
 
     // MARK: - State
 
-    private(set) var root: DOMNode
+    internal(set) var root: DOMNode
     private let baseURL: URL
     private let onMutated: JeffJSDOMMutationObserver?
     /// Host script runner: called once per script-inserted `<script>` element
@@ -301,6 +301,7 @@ final class JeffJSDOMBridge {
         detachedCandidateIDs.removeAll()
 
         nodeRegistry.removeAll()
+        leaveRealmRegistry()
         layoutRects.removeAll()
         elementScrollPositions.removeAll()
         scrollSizeCache.removeAll()
@@ -1190,6 +1191,12 @@ final class JeffJSDOMBridge {
     func wrapElement(_ node: DOMNode, ctx: JeffJSContext) -> JeffJSValue {
         if let cached = elementCache[node.id] {
             return cached.dupValue()
+        }
+        // A node of another realm's document is that realm's wrapper
+        // (JeffJSDOMBridge+Realms.swift).
+        if !Self.realmBridges.isEmpty, let owner = realmOwner(of: node), let octx = owner.jsContext {
+            if node === owner.root, let doc = owner.documentValue { return doc.dupValue() }
+            return owner.wrapElement(node, ctx: octx)
         }
 
         // Lazily build the shared element prototype (methods + accessors)
@@ -3343,6 +3350,16 @@ final class JeffJSDOMBridge {
         if let node = extractNode(from: val) { return node }
         if let docVal = documentJSValue, let a = val.toObject(), let b = docVal.toObject(), a === b {
             return root
+        }
+        return otherRealmDocument(val)
+    }
+
+    /// Another realm's `document` object (it carries no node payload) as its root.
+    func otherRealmDocument(_ val: JeffJSValue) -> DOMNode? {
+        guard Self.realmBridges.count > 1, let a = val.toObject() else { return nil }
+        for wb in Self.realmBridges {
+            guard let b = wb.value, b !== self, let d = b.documentJSValue?.toObject(), d === a else { continue }
+            return b.root
         }
         return nil
     }

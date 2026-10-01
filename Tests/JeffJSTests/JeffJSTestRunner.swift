@@ -348,6 +348,8 @@ struct JeffJSTestRunner {
             ("RegExpPropertyEscape", { $0.testRegExpPropertyEscape() }),
             ("OfIdentifier", { $0.testOfIdentifier() }),
             ("DOMNodeInterface", { $0.testDOMNodeInterface() }),
+            ("Realms", { $0.testRealms() }),
+            ("RealmsDOM", { $0.testRealmsDOM() }),
         ]
     }
 

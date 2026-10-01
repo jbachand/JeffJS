@@ -447,6 +447,17 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// unowned(unsafe): frames are immortal (see JeffJSStackFrame.prevFrame).
     unowned(unsafe) var currentFrame: JeffJSStackFrame? = nil
 
+    /// This context's slot in its runtime's realm table (see
+    /// `JeffJSRuntime.newRealm()`): 0 for ordinary contexts, 1…255 for the
+    /// extra realms a host creates next to its main one (an `<iframe>`'s
+    /// window, a worker's global). Function objects carry the index of the
+    /// realm that created them; a call whose callee is in another realm runs
+    /// in that realm (`JeffJSContext.callInRealm`).
+    private(set) var realmIndex: UInt8 = 0
+    /// The realm the innermost cross-realm call into this one came from
+    /// (set by `callInRealm` for the call's duration).
+    unowned(unsafe) var enteredFromRealm: JeffJSContext? = nil
+
     /// Whether the one-time Math builtin fixup has been applied for this context.
     var mathFixupApplied: Bool = false
 
@@ -466,10 +477,11 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// - Parameters:
     ///   - rt: The parent runtime.
     ///   - addIntrinsics: Whether to add standard intrinsics (default: true).
-    init(rt: JeffJSRuntime, addIntrinsics: Bool = true) {
+    init(rt: JeffJSRuntime, addIntrinsics: Bool = true, realmIndex: UInt8 = 0) {
         // Set the active runtime so all objects created during init get the back-pointer
         JeffJSGCObjectHeader.activeRuntime = rt
         self.rt = rt
+        self.realmIndex = realmIndex
         self.header = JeffJSGCObjectHeader()
         defer { if jeffJSZombiesEnabled { JeffJSZombieDebug.context = self } }
         self.header.gcObjType = .jsObject
@@ -523,8 +535,13 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // Create the global object
         initGlobalObject()
 
-        // Add standard intrinsics if requested
+        // Add standard intrinsics if requested. The intrinsic setup replaces
+        // placeholders and was written for a runtime whose frees are still
+        // off (`initComplete` false): a second context on a live runtime (a
+        // realm, see JeffJSRuntime.newRealm) builds its intrinsics the same
+        // way, then turns frees back on.
         if addIntrinsics {
+            rt.initComplete = false
             // Phase 1: Core inline intrinsics (creates global object, prototypes,
             // and placeholder constructors in the correct dependency order).
             addIntrinsicBaseObjects()
@@ -627,6 +644,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     ///
     /// After calling free(), the context must not be used.
     func free() {
+        // No call switches into this context any more (JeffJSRuntime.realmTable).
+        rt.releaseRealm(self)
         // Disable cascading frees during teardown. Individual refcount decrements
         // happen below; bulk deallocation is handled by runtime.free() → clearGCState().
         rt.initComplete = false
@@ -3324,6 +3343,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             varRefs: [],
             homeObject: nil
         )
+        funcObj.realmIndex = realmIndex
         fb.liveClosures &+= 1   // perf/memory-census (uncounted in freeObject)
         funcObj.fbFast = fb
         funcObj.varRefsFast = []
@@ -4258,9 +4278,16 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // `getProperty(obj:atom: JS_ATOM_Symbol_toPrimitive)` lookups use, and
         // so the atom is marked symbol-typed (kept out of for-in/Object.keys).
         for wks in js_well_known_symbols {
-            let symStr = JeffJSString(swiftString: wks.description)
-            symStr.atomType = JSAtomType.symbol.rawValue
-            rt.bindSymbolAtom(symStr, atom: wks.atomID)
+            // Shared by every realm of the runtime (ES §6.1.5.1).
+            let symStr: JeffJSString
+            if let existing = rt.symbolStringForAtom(wks.atomID) {
+                symStr = existing
+                existing.refCount += 1
+            } else {
+                symStr = JeffJSString(swiftString: wks.description)
+                symStr.atomType = JSAtomType.symbol.rawValue
+                rt.bindSymbolAtom(symStr, atom: wks.atomID)
+            }
             let symVal = JeffJSValue.mkPtr(tag: .symbol, ptr: symStr)
             _ = setPropertyStr(obj: symbolCtor, name: wks.name, value: symVal)
         }

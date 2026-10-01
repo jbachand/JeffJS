@@ -53,6 +53,7 @@ func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
         o.tmpMark = false
         o.mark = JeffJSGCMark.white
         o.weakrefCount = 0
+        o.realmIndex = 0
         o.lazyFlags = 0            // clears needsLazyPrototype / NameLength / stack
                                    // (the captured stack lives in payload, reset below)
         if let capturedThis = o.arrowThisVal {

@@ -564,6 +564,33 @@ extension JeffJSContext {
         }
     }
 
+    /// Runs `body` as a call in `target`'s realm. The call stack is one
+    /// agent-wide stack (ES §9.4 execution contexts): the target continues
+    /// the caller's frame chain and depth for the duration of the call, so
+    /// `Error().stack`, `fn.caller` and the depth guard see the whole stack,
+    /// and gets its own back afterwards (the target may itself be running
+    /// further down the stack: A → B → A → B).
+    @inline(never)
+    func callInRealm(_ target: JeffJSContext, _ body: (JeffJSContext) -> JeffJSValue) -> JeffJSValue {
+        let savedFrame = target.currentFrame
+        let savedDepth = target.callDepth
+        let savedEntered = target.enteredFromRealm
+        target.currentFrame = currentFrame
+        target.callDepth = callDepth
+        target.enteredFromRealm = self
+        let r = body(target)
+        target.currentFrame = savedFrame
+        target.callDepth = savedDepth
+        target.enteredFromRealm = savedEntered
+        return r
+    }
+
+    /// The global object of the realm whose code called into this one (the
+    /// "incumbent" global of HTML §8.1.3.5, approximated by the realm the
+    /// current cross-realm call came from), else this realm's own global.
+    /// `postMessage` reports it as the event's `source`. Not retained.
+    var incumbentGlobal: JeffJSValue { enteredFromRealm?.globalObj ?? globalObj }
+
     func callFunction(_ funcVal: JeffJSValue, thisVal: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         if jeffJSZombiesEnabled, let zo = funcVal.obj, zo.asClass.freeMark {
             JeffJSZombieDebug.reportTouch("CALL", zo.asClass)   // calling a dead function: an under-retained reference
@@ -617,6 +644,10 @@ extension JeffJSContext {
                 return throwTypeError(message: "\(desc) is not a function\(hint)")
             }
             return throwNotAFunction(funcVal)
+        }
+        // A callee from another realm runs in its realm (see callInRealm).
+        if obj.realmIndex != realmIndex, let target = rt.realm(at: obj.realmIndex), target !== self {
+            return callInRealm(target) { $0.callFunction(funcVal, thisVal: thisVal, args: args) }
         }
         // Hot path: plain bytecode function — skip the payload-enum matches
         // below (each one copies the payload, retaining FB + varRefs array).
@@ -1191,6 +1222,7 @@ extension JeffJSContext {
             inheritedHome = h
         }
         obj.payload = .bytecodeFunc(functionBytecode: innerFB, varRefs: childVarRefs, homeObject: inheritedHome)
+        obj.realmIndex = realmIndex   // the closure belongs to the realm running its enclosing code
         innerFB.liveClosures &+= 1   // perf/memory-census (uncounted in freeObject)
         // A lazy function whose body is not compiled yet keeps fbFast nil:
         // every call path then reaches callInternal's payload path, which
@@ -1384,6 +1416,9 @@ extension JeffJSContext {
                          args: [JeffJSValue]) -> JeffJSValue {
         guard let obj = funcVal.toObject() else {
             return throwNotAConstructor(funcVal)
+        }
+        if obj.realmIndex != realmIndex, let target = rt.realm(at: obj.realmIndex), target !== self {
+            return callInRealm(target) { $0.callConstructor(funcVal, newTarget: newTarget, args: args) }
         }
         // C function constructor path. Builtins allocate their own instance
         // with the class prototype; when constructed through a subclass or
@@ -1783,6 +1818,7 @@ extension JeffJSContext {
             refs.append(vr)
         }
         obj.payload = .bytecodeFunc(functionBytecode: fb, varRefs: refs, homeObject: home)
+        obj.realmIndex = realmIndex
         fb.liveClosures &+= 1   // perf/memory-census (uncounted in freeObject)
         obj.fbFast = fb
         obj.varRefsFast = refs
@@ -3150,6 +3186,9 @@ private func executeFastTrace(
     rt: JeffJSRuntime,
     inlineBase: Int
 ) -> Int {
+    // Calls leave the trace for the general path when the callee is in
+    // another realm (the switch lives in callFunction / callInternal).
+    let ctxRealm = ctx.realmIndex
     // Unpack the per-opcode state into locals (registers). Values that only
     // calls/returns touch (capacity, stack base, function object, flags,
     // ownership bits) stay in `state`: as locals they pushed this function
@@ -3480,7 +3519,7 @@ private func executeFastTrace(
             default: argc = 3; instrSize = 1
             }
             let calleeSlot = sp - argc - 1
-            if calleeSlot >= state.spBase, let nObj = buf[calleeSlot].obj, let cf = nObj.cFuncFast {
+            if calleeSlot >= state.spBase, let nObj = buf[calleeSlot].obj, nObj.realmIndex == ctxRealm, let cf = nObj.cFuncFast {
                 // Native callee: dispatch from the trace. A deopt per native
                 // call made Math.* loops bounce between trace and main loop.
                 var cargs = [JeffJSValue](); cargs.reserveCapacity(argc)
@@ -3503,6 +3542,7 @@ private func executeFastTrace(
             }
             guard calleeSlot >= state.spBase,
                   let callObj = buf[calleeSlot].obj,
+                  callObj.realmIndex == ctxRealm,
                   let fbU = callObj.fbFastU,
                   rt.inlineStackTop - inlineBase <= 10000 else { resume = pc; break traceLoop }
             unowned(unsafe) let fastFb: JeffJSFunctionBytecode = fbU.takeUnretainedValue()
@@ -3607,7 +3647,7 @@ private func executeFastTrace(
             let instrSize = 3
             let calleeSlot = sp - argc - 1
             let thisSlot = calleeSlot - 1
-            if thisSlot >= state.spBase, let nObj = buf[calleeSlot].obj, let cf = nObj.cFuncFast {
+            if thisSlot >= state.spBase, let nObj = buf[calleeSlot].obj, nObj.realmIndex == ctxRealm, let cf = nObj.cFuncFast {
                 let prevNative = frame.nativeCallee
                 frame.nativeCallee = nObj.asClass
                 let r = jeffJS_nativeCallFromSlots(ctx, rt, cf, buf[thisSlot], buf + calleeSlot + 1, argc, nObj.cMagicFast)
@@ -3623,6 +3663,7 @@ private func executeFastTrace(
             }
             guard thisSlot >= state.spBase,
                   let callObj = buf[calleeSlot].obj,
+                  callObj.realmIndex == ctxRealm,
                   let fbU = callObj.fbFastU,
                   rt.inlineStackTop - inlineBase <= 10000 else { resume = pc; break traceLoop }
             unowned(unsafe) let fastFb: JeffJSFunctionBytecode = fbU.takeUnretainedValue()
@@ -3709,6 +3750,7 @@ private func executeFastTrace(
             let instrSize = 4
             guard argc == 0,
                   let callObj = buf[varBase + locIdx].obj,
+                  callObj.realmIndex == ctxRealm,
                   let fbU = callObj.fbFastU,
                   rt.inlineStackTop - inlineBase <= 10000 else { resume = pc; break traceLoop }
             unowned(unsafe) let fastFb: JeffJSFunctionBytecode = fbU.takeUnretainedValue()
@@ -3805,7 +3847,7 @@ private func executeFastTrace(
             let tCallee = sp - tArgc - 1
             let tThis = tCallee - 1
             guard rt.inlineStackTop != inlineBase, !frame.hasLiveVarRefs,
-                  tThis >= state.spBase, let tObj = buf[tCallee].obj, let tcf = tObj.cFuncFast else {
+                  tThis >= state.spBase, let tObj = buf[tCallee].obj, tObj.realmIndex == ctxRealm, let tcf = tObj.cFuncFast else {
                 resume = pc; break traceLoop
             }
             frame.curPC = pc
@@ -7026,6 +7068,16 @@ struct JeffJSInterpreter {
             _ = ctx.throwNotAFunction(funcObj)
             return .exception
         }
+        // A callee from another realm runs in its realm (ES §10.2.1.1): every
+        // path that reaches here directly (the interpreter's general call
+        // paths, generator / async resumption) switches like callFunction.
+        if obj.realmIndex != ctx.realmIndex, let target = ctx.rt.realm(at: obj.realmIndex), target !== ctx {
+            return ctx.callInRealm(target) {
+                callInternal(ctx: $0, funcObj: funcObj, thisVal: thisVal, args: args, flags: flags,
+                             newTarget: newTarget, generatorObject: generatorObject, resumeState: resumeState,
+                             resumeValue: resumeValue, resumeCompletionType: resumeCompletionType)
+            }
+        }
 
         // Hot path: a plain bytecode function. The denormalized fbFast field
         // avoids pattern-matching the payload enum, which copies it (retaining
@@ -7096,6 +7148,7 @@ struct JeffJSInterpreter {
         // runtime's cached copies — plain stored-property loads — because even
         // one static-let accessor per call shows up at 250k calls/sec.
         let rt = ctx.rt
+        let ctxRealm = ctx.realmIndex
         let traceOps = rt.cfgTraceOpcodes
         let traceLast = jeffJSTraceLast   // register copy: read per opcode below
         let inlineCallsEnabled = rt.cfgUseInlineCalls
@@ -8110,7 +8163,7 @@ struct JeffJSInterpreter {
                 // the FB and the varRefs array) on every call. nil fbFast
                 // (never called before) takes the slow path, which backfills it.
                 if inlineCallsEnabled, calleeSlot >= spBase,
-                   let callObj = funcVal.obj,
+                   let callObj = funcVal.obj, callObj.realmIndex == ctxRealm,
                    let fastFb = callObj.fbFast, !fastFb.isGenerator, !fastFb.isAsyncFunc {
                     let fastVarRefsOpt = callObj.varRefsFast
                     // Depth guard (checked before any state mutation; on overflow
@@ -8312,7 +8365,7 @@ struct JeffJSInterpreter {
                 if inlineCallsEnabled, let callObj = ctx.funcProtoCallObj,
                    sp - argc - 2 >= spBase,
                    let fnObj = buf[sp - argc - 1].obj, fnObj === callObj,
-                   let target = buf[sp - argc - 2].obj,
+                   let target = buf[sp - argc - 2].obj, target.realmIndex == ctxRealm,
                    let targetFb = target.fbFast, !targetFb.isGenerator, !targetFb.isAsyncFunc {
                     let calleeSlot = sp - argc - 1
                     let thisSlot = calleeSlot - 1
@@ -8378,7 +8431,7 @@ struct JeffJSInterpreter {
                 let cmCalleeSlot = sp - argc - 1
                 let cmThisSlot = cmCalleeSlot - 1
                 if inlineCallsEnabled, cmThisSlot >= spBase,
-                   let cmCallObj = buf[cmCalleeSlot].obj,
+                   let cmCallObj = buf[cmCalleeSlot].obj, cmCallObj.realmIndex == ctxRealm,
                    let cmFastFb = cmCallObj.fbFast, !cmFastFb.isGenerator, !cmFastFb.isAsyncFunc {
                     if rt.inlineStackTop - inlineBase > 10000 {
                         _ = ctx.throwRangeError(message: "Maximum call stack size exceeded.")
@@ -12402,7 +12455,7 @@ struct JeffJSInterpreter {
                 // which made every zero-arg closure call a full recursive
                 // callInternal with an args array).
                 if inlineCallsEnabled, argc == 0,
-                   let callObj = buf[varBase + locIdx].obj,
+                   let callObj = buf[varBase + locIdx].obj, callObj.realmIndex == ctxRealm,
                    let fastFb = callObj.fbFast, !fastFb.isGenerator, !fastFb.isAsyncFunc,
                    rt.inlineStackTop - inlineBase <= 10000 {
                     let calleeSlot = sp
