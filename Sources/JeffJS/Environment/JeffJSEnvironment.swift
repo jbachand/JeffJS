@@ -54,6 +54,12 @@ public final class JeffJSEnvironment {
         /// The page's cookie jar (`document.cookie`, fetch/XHR, WebSocket). Nil
         /// gives a fresh in-memory `JeffJSMemoryCookieJar` for the base URL's site.
         public var cookieJar: (any JeffJSCookieJar)?
+        /// The persistent Web Storage store (`localStorage`), keyed by the base
+        /// URL's origin. Nil gives this environment its own in-memory store.
+        public var webStorage: (any JeffJSWebStorageStore)?
+        /// The top-level browsing context (its `sessionStorage`); nil = a new
+        /// one per environment, like a new tab.
+        public var browsingContext: String?
 
         public init(
             baseURL: URL = URL(string: "about:blank")!,
@@ -66,7 +72,9 @@ public final class JeffJSEnvironment {
             dynamicImportDelegate: JeffJSDynamicImportDelegate? = nil,
             additionalPolyfills: [String] = [],
             startupScripts: [String] = [],
-            cookieJar: (any JeffJSCookieJar)? = nil
+            cookieJar: (any JeffJSCookieJar)? = nil,
+            webStorage: (any JeffJSWebStorageStore)? = nil,
+            browsingContext: String? = nil
         ) {
             self.baseURL = baseURL
             self.userAgent = userAgent
@@ -79,6 +87,8 @@ public final class JeffJSEnvironment {
             self.additionalPolyfills = additionalPolyfills
             self.startupScripts = startupScripts
             self.cookieJar = cookieJar
+            self.webStorage = webStorage
+            self.browsingContext = browsingContext
         }
     }
 
@@ -237,7 +247,10 @@ public final class JeffJSEnvironment {
         self.domBridge = domBridge
 
         // 10. Register storage bridge
-        let storageBridge = JeffJSStorageBridge(scope: configuration.storageScope)
+        let storageBridge = JeffJSStorageBridge(
+            url: configuration.baseURL,
+            browsingContext: configuration.browsingContext ?? UUID().uuidString,
+            store: configuration.webStorage ?? JeffJSMemoryWebStorage())
         storageBridge.register(on: ctx)
         self.storageBridge = storageBridge
 

@@ -137,6 +137,22 @@ enum JeffJSConfig {
     /// (`JEFFJS_COMPILE_LAZYDROPSTRESS=1 swift test …`).
     static let lazyDropStress      = bool("compile.lazyDropStress",    default: false)
 
+    // MARK: - Web Storage
+
+    /// Bytes one origin's `localStorage` may hold (keys + values, WebKit's
+    /// `StorageMap` counting: a string of Latin-1 code units costs one byte
+    /// per unit, any other two). Safari: 5 MB; watch-sized on watchOS. A
+    /// `setItem` past it throws `QuotaExceededError`.
+    static let storageLocalQuotaBytes = int("storage.localQuotaBytes", default: platformBudget(iOS: 5, watch: 1))
+    /// The same for one origin's `sessionStorage` (in memory).
+    static let storageSessionQuotaBytes = int("storage.sessionQuotaBytes", default: platformBudget(iOS: 5, watch: 1))
+    /// Bytes every origin's persisted `localStorage` may hold together; a host
+    /// store evicts whole origins, least recently used first, past it.
+    static let storageTotalBudgetBytes = int("storage.totalBudgetBytes", default: platformBudget(iOS: 50, watch: 8))
+    /// One `[WebStorage] …` line per write (`JEFFJS_STORAGE_DEBUG=1`); quota
+    /// rejections are always printed.
+    static let storageDebug = bool("storage.debug", default: false)
+
     // MARK: - Interpreter
 
     /// Inline-cache tables have a fixed 512 slots (28 KB) instead of the next

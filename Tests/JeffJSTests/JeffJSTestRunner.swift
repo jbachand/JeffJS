@@ -328,6 +328,7 @@ struct JeffJSTestRunner {
             ("LazyCompile", { $0.testLazyCompile() }),
             ("StringIterator", { $0.testStringIterator() }),
             ("AggregateError", { $0.testAggregateError() }),
+            ("WebStorage", { $0.testWebStorage() }),
             ("NamedEvaluation", { $0.testNamedEvaluation() }),
             ("ClassConstructorCall", { $0.testClassConstructorCall() }),
             ("BrowserFingerprint", { $0.testBrowserFingerprint() }),
