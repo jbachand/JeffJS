@@ -70,6 +70,7 @@ final class EngineTests: XCTestCase {
     func testRealmsGroup() {
         var runner = JeffJSTestRunner()
         runner.testRealms()
+        runner.testRealmsDOM()
         print("Realms: \(runner.passCount) passed, \(runner.failCount) failed")
         for f in runner.errors { print("  \(f)") }
         XCTAssertEqual(runner.failCount, 0)

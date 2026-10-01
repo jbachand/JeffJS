@@ -42,6 +42,46 @@ extension JeffJSTestRunner {
          "[1, 2].map(w.eval('(function(x){ return [] instanceof Array && this === globalThis; })')).join() === 'true,true' && w.eval('[1]').map(function(){ return [] instanceof Array; })[0] === true"),
     ]
 
+    /// DOM: `w` is a second realm whose document is a separate DOMNode tree
+    /// (`JeffJSEnvironment.makeChildRealm`, as a host does for an iframe).
+    static let realmDOMCases: [(String, String)] = [
+        ("each realm has its own document and wrappers",
+         "w.document !== document && w.document.body !== document.body && w.eval('document') === w.document && w.document.body.parentNode.parentNode === w.document && !document.contains(w.document.body)"),
+        ("elements are made with their own realm's prototypes",
+         "Object.getPrototypeOf(w.document.createElement('div')) !== Object.getPrototypeOf(document.createElement('div')) && w.document.createElement('div').ownerDocument === w.document && w.eval(`document.createElement('i')`) instanceof w.Object"),
+        ("a node keeps its wrapper when it moves to another realm's document",
+         "(function(){ var p = document.createElement('p'); w.document.body.appendChild(p); return w.document.body.lastChild === p && p.parentNode === w.document.body && w.document.querySelector('p') === p; })()"),
+        ("nodes of the nested document read from the embedder are the nested realm's",
+         "(function(){ var s = w.document.createElement('span'); s.id = 'realmspan'; w.document.body.appendChild(s); var got = w.document.getElementById('realmspan'); return got === s && Object.getPrototypeOf(got) === Object.getPrototypeOf(w.document.body) && w.eval(`document.getElementById('realmspan')`) === s; })()"),
+    ]
+
+    mutating func testRealmsDOM() {
+        var outcomes: [(Bool, String)] = []
+        func onMain(_ body: @escaping @MainActor () -> Void) {
+            if Thread.isMainThread { MainActor.assumeIsolated { body() } } else { DispatchQueue.main.sync { MainActor.assumeIsolated { body() } } }
+        }
+        onMain {
+            let e = JeffJSEnvironment()
+            let child = DOMNode.document()
+            let html = DOMNode.element(tag: "html")
+            html.appendChild(DOMNode.element(tag: "head"))
+            html.appendChild(DOMNode.element(tag: "body"))
+            child.appendChild(html)
+            guard let wg = e.makeChildRealm(document: child) else { outcomes.append((false, "RealmsDOM: no realm")); return }
+            let ctx = e.context
+            let g = ctx.getGlobalObject()
+            ctx.setPropertyStr(obj: g, name: "w", value: wg)
+            g.freeValue()
+            for (name, js) in JeffJSTestRunner.realmDOMCases {
+                switch e.eval(js, filename: "<realms-dom>") {
+                case .success(let v): outcomes.append((v == "true", "RealmsDOM: \(name) -> \(v ?? "undefined")"))
+                case .exception(let m): outcomes.append((false, "RealmsDOM: \(name) threw \(m)"))
+                }
+            }
+        }
+        for (ok, message) in outcomes { assert(ok, message) }
+    }
+
     mutating func testRealms() {
         // A runtime of its own: the shared test context stays single-realm.
         let rt = JeffJSRuntime()

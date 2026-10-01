@@ -337,6 +337,28 @@ public final class JeffJSEnvironment {
 
     /// Evaluate JavaScript source code and return the result.
     @discardableResult
+    /// A second realm on this environment's runtime (an `<iframe>`'s window:
+    /// JeffJSRuntime.newRealm) whose `document` is `document` — DOM and event
+    /// bridges registered on it, both bridges in the realm routing table
+    /// (JeffJSDOMBridge+Realms.swift). Its global is returned owned; the realm
+    /// lives as long as the runtime. Hosts with polyfills do the same and then
+    /// run their polyfills in the new realm.
+    func makeChildRealm(document child: DOMNode, baseURL: URL? = nil) -> JeffJSValue? {
+        guard let realm = runtime.newRealm() else { return nil }
+        let bridge = JeffJSDOMBridge(root: child, baseURL: baseURL ?? configuration.baseURL,
+                                     onMutated: nil, onScriptExecution: nil)
+        let events = JeffJSEventBridge()
+        events.domBridge = bridge
+        events.register(on: realm)
+        bridge.eventBridge = events
+        bridge.register(on: realm)
+        domBridge?.joinRealmRegistry()
+        bridge.joinRealmRegistry()
+        childRealms.append((realm, bridge, events))
+        return realm.getGlobalObject()
+    }
+    private var childRealms: [(JeffJSContext, JeffJSDOMBridge, JeffJSEventBridge)] = []
+
     public func eval(_ source: String, filename: String = "<eval>") -> JeffJSEvalResult {
         let result = context.eval(input: source, filename: filename, evalFlags: JS_EVAL_TYPE_GLOBAL)
         if result.isException {

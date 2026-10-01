@@ -454,6 +454,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// realm that created them; a call whose callee is in another realm runs
     /// in that realm (`JeffJSContext.callInRealm`).
     private(set) var realmIndex: UInt8 = 0
+    /// The realm the innermost cross-realm call into this one came from
+    /// (set by `callInRealm` for the call's duration).
+    unowned(unsafe) var enteredFromRealm: JeffJSContext? = nil
 
     /// Whether the one-time Math builtin fixup has been applied for this context.
     var mathFixupApplied: Bool = false

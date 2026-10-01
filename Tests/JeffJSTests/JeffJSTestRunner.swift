@@ -347,6 +347,7 @@ struct JeffJSTestRunner {
             ("ObjectLiteralDefine", { $0.testObjectLiteralDefine() }),
             ("DOMNodeInterface", { $0.testDOMNodeInterface() }),
             ("Realms", { $0.testRealms() }),
+            ("RealmsDOM", { $0.testRealmsDOM() }),
         ]
     }
 

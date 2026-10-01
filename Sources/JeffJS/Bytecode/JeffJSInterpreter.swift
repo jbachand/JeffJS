@@ -574,13 +574,22 @@ extension JeffJSContext {
     func callInRealm(_ target: JeffJSContext, _ body: (JeffJSContext) -> JeffJSValue) -> JeffJSValue {
         let savedFrame = target.currentFrame
         let savedDepth = target.callDepth
+        let savedEntered = target.enteredFromRealm
         target.currentFrame = currentFrame
         target.callDepth = callDepth
+        target.enteredFromRealm = self
         let r = body(target)
         target.currentFrame = savedFrame
         target.callDepth = savedDepth
+        target.enteredFromRealm = savedEntered
         return r
     }
+
+    /// The global object of the realm whose code called into this one (the
+    /// "incumbent" global of HTML §8.1.3.5, approximated by the realm the
+    /// current cross-realm call came from), else this realm's own global.
+    /// `postMessage` reports it as the event's `source`. Not retained.
+    var incumbentGlobal: JeffJSValue { enteredFromRealm?.globalObj ?? globalObj }
 
     func callFunction(_ funcVal: JeffJSValue, thisVal: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         if jeffJSZombiesEnabled, let zo = funcVal.obj, zo.asClass.freeMark {
