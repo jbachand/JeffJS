@@ -609,7 +609,10 @@ extension JeffJSContext {
         }
         if callDepth == 1 {
             rt.updateStackLimitForCurrentThread()
-            // A task boundary: the host is calling in from its event loop.
+            // A task boundary: the host is calling in from its event loop. A previous
+            // task ended by an interrupt must not make this one's exceptions
+            // uncatchable (eval resets it the same way).
+            interruptTerminated = false
             jeffJS_idleGCTick(rt)
             jeffJS_heapCensusTick(rt)
         }
@@ -7242,6 +7245,8 @@ struct JeffJSInterpreter {
         // Push frame
         ctx.currentFrame = frame
         frame.spBase = 0
+        // This activation's own (base) frame: `frame` moves to inline-called frames.
+        unowned(unsafe) let baseFrame: JeffJSStackFrame = frame
 
         var pc = 0  // program counter (index into bc[])
         var retVal: JeffJSValue = .undefined
@@ -12877,8 +12882,12 @@ struct JeffJSInterpreter {
             }
         }
 
-        // Restore previous frame
-        ctx.currentFrame = frame.prevFrame
+        // Restore previous frame. An uncatchable interrupt leaves the loop from the
+        // inline-called frame it fired in; the frame current before this activation
+        // is the base frame's previous one, not that inline frame's caller (which
+        // stayed current — a dangling frame for the host's idle checks and for
+        // every later stack walk; InterruptTerminationTests).
+        ctx.currentFrame = frame === baseFrame ? frame.prevFrame : baseFrame.prevFrame
 
         // Release the contiguous buffer to pool
         if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }

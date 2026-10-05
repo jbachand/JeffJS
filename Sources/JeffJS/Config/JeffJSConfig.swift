@@ -198,6 +198,11 @@ enum JeffJSConfig {
     /// index, owner), and log every change of the thread that mutates the list
     /// (JeffJSThreadCheck.swift). Debug instrument; off by default.
     static let gcVerifyRoots       = bool("gc.verifyRoots",            default: false)
+    /// `JeffJSRuntime.free()` frees the heap that is still alive (objects, the
+    /// strings and bytecode they hold) as one dead group before it empties the
+    /// lists; false = the old behaviour, which only dropped the references and
+    /// leaked every live object's allocation (A/B: JEFFJS_GC_TEARDOWNFREESHEAP=0).
+    static let gcTeardownFreesHeap = bool("gc.teardownFreesHeap",      default: true)
 
     // MARK: - Atoms
 

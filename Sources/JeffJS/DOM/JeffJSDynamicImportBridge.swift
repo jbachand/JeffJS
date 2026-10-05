@@ -128,6 +128,11 @@ final class JeffJSDynamicImportBridge {
                             userAgent: userAgent
                         )
                     }.value
+                    // The host may have torn the engine down while the bundle was built
+                    // (navigation, or the watch's memory/time budgets stopping JS): the
+                    // context captured above then belongs to a freed runtime — evaluating
+                    // into it crashed in dupAtom. Drop the callbacks with the runtime.
+                    guard delegate.jsContext === jsCtx else { return }
                     delegate.cacheModuleBundle(bundle, for: resolvedURL)
 
                     // Evaluate the bundle in JeffJS
@@ -150,6 +155,7 @@ final class JeffJSDynamicImportBridge {
                         _ = jsCtx.call(resolveRef, this: .undefined, args: [exportsResult])
                     }
                 } catch {
+                    guard delegate.jsContext === jsCtx else { return }   // torn down meanwhile (see above)
                     _ = jsCtx.call(rejectRef, this: .undefined,
                                    args: [jsCtx.newStringValue("Failed to load module: \(error.localizedDescription)")])
                 }

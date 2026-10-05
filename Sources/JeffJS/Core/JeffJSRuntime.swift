@@ -843,6 +843,16 @@ nonisolated final class JeffJSRuntime {
         // Free all pending jobs (including their duped arg values)
         freeJobQueue()
 
+        // The contexts are gone, so everything still on the GC lists is one
+        // unreachable group: free it the way the cycle collector frees a dead
+        // cycle (every edge broken first, then the allocations handed back).
+        // `clearGCState` below only *drops* references, and a JeffJSValue is a
+        // raw pointer whose +1 is given back only on the free path — so every
+        // object, string and bytecode body the page still held outlived the
+        // runtime (a whole page's JS heap per navigation; homedepot ~230 k
+        // objects / 300 k strings). RuntimeTeardownReleaseTests.
+        if JeffJSConfig.gcTeardownFreesHeap { freeRemainingHeap() }
+
         // Free global symbol registry values
         for (_, val) in globalSymbolRegistry {
             freeValue(self, val)
@@ -883,6 +893,58 @@ nonisolated final class JeffJSRuntime {
         gcZeroRefCountList = ListHead()
         tmpObjList = ListHead()
         weakrefList = ListHead()
+    }
+
+    /// Teardown: frees every object still listed as one dead group
+    /// (`gcFreeDeadObjects`), with frees that reach zero deferred into the group.
+    private func freeRemainingHeap() {
+        guard gcPhase == .JS_GC_PHASE_NONE, !inFreeChain else { return }
+        // The context's free disabled cascading (initComplete = false); the
+        // collector's group free does its own ordering and must see the frees.
+        let savedInit = initComplete
+        initComplete = true
+        gcPhase = .JS_GC_PHASE_REMOVE_CYCLES
+        freeZeroRefcount(self)
+        var dead: [JeffJSGCObjectHeader] = []
+        dead.reserveCapacity(gcObjects.count + gcTmpObjects.count)
+        for u in gcObjects { let h = u.takeUnretainedValue(); h.gcListIndex = -1; dead.append(h) }
+        for u in gcTmpObjects { let h = u.takeUnretainedValue(); h.gcListIndex = -1; dead.append(h) }
+        gcObjects.removeAll()
+        gcTmpObjects.removeAll()
+        // Function bodies are not GC objects, and a function object's payload does
+        // not count a reference to its body (`liveClosures` does): once a script has
+        // run, a body its closures still use has no counted owner, so nothing would
+        // ever free it — its constant pool (strings, nested bodies) included. Collect
+        // every body the dying functions reach, before the group free empties their
+        // payloads, and release them after it.
+        var bodies: [ObjectIdentifier: JeffJSFunctionBytecode] = [:]
+        var pending: [JeffJSFunctionBytecode] = []
+        for h in dead where h.gcObjType == .jsObject || h.gcObjType == .functionBytecode {
+            let o = unsafeBitCast(h, to: JeffJSObject.self)
+            if case .bytecodeFunc(let fb, _, _) = o.payload, let fb,
+               bodies.updateValue(fb, forKey: ObjectIdentifier(fb)) == nil {
+                pending.append(fb)
+            }
+        }
+        while let fb = pending.popLast() {
+            for v in fb.cpool {
+                if let child = v.toFunctionBytecode(), bodies.updateValue(child, forKey: ObjectIdentifier(child)) == nil {
+                    pending.append(child)
+                }
+            }
+        }
+        gcFreeDeadObjects(self, dead)
+        for fb in bodies.values where !fb.cpool.isEmpty {
+            let pool = fb.cpool
+            fb.cpool = []
+            for v in pool where !v.isFunctionBytecode { v.freeValue() }
+        }
+        for fb in bodies.values where fb.refCount > 0 {
+            fb.refCount = 0
+            Unmanaged.passUnretained(fb).release()   // the creation reference
+        }
+        gcPhase = .JS_GC_PHASE_NONE
+        initComplete = savedInit
     }
 
     // MARK: - Stack Management
