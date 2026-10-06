@@ -110,7 +110,7 @@ final class ObjectSizeRefLeakTests: XCTestCase {
     func testCompactLayouts() {
         // The point of the change: fail loudly if a field sneaks back in.
         XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSObject.self), 96)
-        XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSString.self), 64)
+        XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSString.self), 48)
         XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSStringRope.self), 64)
         XCTAssertEqual(MemoryLayout<JeffJSPropStorage>.size, 16)
         // Each at or under a malloc size class boundary (xzone: 16-byte steps

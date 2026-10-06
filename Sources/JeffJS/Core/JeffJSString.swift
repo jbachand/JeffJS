@@ -35,7 +35,13 @@ enum JeffJSStringStorage {
 // nonisolated for the same reason as JeffJSGCObjectHeader: strings are freed
 // off the main actor, and JeffJSString has a deinit.
 nonisolated class JeffJSStringBase {
-    var refCount: Int
+    /// 32-bit storage (perf/watch-object-size): with the flags it packs the
+    /// flat string into 48 bytes.
+    final var _rc: Int32
+    final var refCount: Int {
+        @inline(__always) get { Int(_rc) }
+        @inline(__always) set { _rc = Int32(truncatingIfNeeded: newValue) }
+    }
     /// UAF tripwire (zombie mode).
     var freeMark: Bool = false
     /// Representation tag so callers can `unsafeDowncast` instead of running
@@ -44,7 +50,7 @@ nonisolated class JeffJSStringBase {
     static let kindRope: UInt8 = 1
     static let kindBuffer: UInt8 = 2
     let kind: UInt8
-    init(refCount: Int, kind: UInt8) { self.refCount = refCount; self.kind = kind }
+    init(refCount: Int, kind: UInt8) { self._rc = Int32(truncatingIfNeeded: refCount); self.kind = kind }
 }
 
 nonisolated final class JeffJSString: JeffJSStringBase {
@@ -119,7 +125,30 @@ nonisolated final class JeffJSString: JeffJSStringBase {
     }
     // -- Storage -------------------------------------------------------------
 
-    var storage: JeffJSStringStorage
+    /// The characters, as one 8-byte enum of ContiguousArrays (an enum of
+    /// two Arrays is 9 bytes: no spare bits through Array's bridge storage).
+    /// `storage` presents them as before; Array <-> ContiguousArray share the
+    /// buffer, so the conversion is O(1) both ways.
+    private enum Chars {
+        case c8(ContiguousArray<UInt8>)
+        case c16(ContiguousArray<UInt16>)
+    }
+    private var _chars: Chars
+
+    var storage: JeffJSStringStorage {
+        @inline(__always) get {
+            switch _chars {
+            case .c8(let c): return .str8(Array(c))
+            case .c16(let c): return .str16(Array(c))
+            }
+        }
+        set {
+            switch newValue {
+            case .str8(let a): _chars = .c8(ContiguousArray(a))
+            case .str16(let a): _chars = .c16(ContiguousArray(a))
+            }
+        }
+    }
 
     // -- Convenience accessors -----------------------------------------------
 
@@ -161,7 +190,10 @@ nonisolated final class JeffJSString: JeffJSStringBase {
         self._len = UInt32(truncatingIfNeeded: len)
         self.isWideChar = isWideChar
         self._hashAndAtomType = (hash & 0x3FFF_FFFF) | (UInt32(atomType & 0x3) << 30)
-        self.storage = storage
+        switch storage {
+        case .str8(let a): self._chars = .c8(ContiguousArray(a))
+        case .str16(let a): self._chars = .c16(ContiguousArray(a))
+        }
         super.init(refCount: refCount, kind: JeffJSStringBase.kindFlat)
     }
 
