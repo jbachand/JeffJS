@@ -106,4 +106,32 @@ final class ObjectSizeRefLeakTests: XCTestCase {
             v.freeValue()
         }
     }
+
+    func testCompactLayouts() {
+        // The point of the change: fail loudly if a field sneaks back in.
+        XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSObject.self), 96)
+        XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSString.self), 64)
+        XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSStringRope.self), 64)
+        XCTAssertEqual(MemoryLayout<JeffJSPropStorage>.size, 16)
+    }
+
+    /// Plain objects never allocate the side box; a prototype read goes
+    /// through the shape.
+    func testPlainObjectsHaveNoSideBox() {
+        withContext { ctx in
+            let v = ctx.eval(input: "var p = {x: 1}; var o = Object.create(p); o.y = 2; [{a: 1}, o, Object.create(null)]",
+                             filename: "<aux>", evalFlags: 0)
+            XCTAssertFalse(v.isException)
+            for i in 0..<3 {
+                let e = ctx.getPropertyUInt32(obj: v, index: UInt32(i))
+                XCTAssertNil(e.toObject()?.aux, "element \(i) allocated a side box")
+                e.freeValue()
+            }
+            let o = ctx.getPropertyUInt32(obj: v, index: 1)
+            let x = ctx.getPropertyStr(obj: o, name: "x")
+            XCTAssertEqual(x.toInt32(), 1)
+            o.freeValue()
+            v.freeValue()
+        }
+    }
 }
