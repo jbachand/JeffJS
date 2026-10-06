@@ -1223,7 +1223,7 @@ func jsDate_toJSON(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJS
         let d = tv.isInt ? Double(tv.toInt32()) : tv.toFloat64()
         if !d.isFinite { return .null }
     }
-    tv.freeValue()
+    if thisVal.isObject { tv.freeValue() }   // owned only for an object (toPrimitive)
     let method = ctx.getPropertyStr(obj: thisVal, name: "toISOString")
     if method.isException { return .exception }
     guard method.isFunction else {

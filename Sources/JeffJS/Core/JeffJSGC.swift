@@ -1009,6 +1009,10 @@ func markObject(_ rt: JeffJSRuntime,
             if let c = r.handler.toGCObjectHeader() { markFunc(rt, c) }
             if let c = r.resultPromise.toGCObjectHeader() { markFunc(rt, c) }
         }
+    case .opaque(let o):
+        // A live Map/Set iterator owns its collection (released by
+        // freeObject or its last next()).
+        if jeffJS_refLeakFix, let it = o as? JSMapIteratorData, let c = it.obj.toGCObjectHeader() { markFunc(rt, c) }
     case .boundFunction(let bf):
         // A bound function owns its target, `this` and arguments (released
         // by freeObject): `obj.cb = obj.m.bind(obj)` is a cycle.
@@ -1215,6 +1219,15 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     if case .mapState(let ms) = savedPayload { jeffJS_mapStateFree(ms) }
     // A promise owns its settled value and every reaction still queued on it.
     if case .promiseData(let pd) = savedPayload { jeffJS_promiseDataFree(pd) }
+    // A Map/Set iterator owns a reference to its collection until it is
+    // exhausted (js_map_iterator_create dups it, the final next() releases
+    // it). An iterator dropped early — `for (x of set) break`, `[a] = set`
+    // — leaked the collection and everything in it.
+    if jeffJS_refLeakFix, case .opaque(let o) = savedPayload, let it = o as? JSMapIteratorData, !it.obj.isUndefined {
+        let c = it.obj
+        it.obj = .undefined
+        freeValue(rt, c)
+    }
     // A RegExp owns a counted reference on its pattern string (see
     // "Pattern ownership" in JeffJSBuiltinRegExp.swift).
     if case .regexp(let pattern, _) = savedPayload { js_regexp_releasePattern(pattern) }
@@ -1488,4 +1501,18 @@ func jsRealloc(_ rt: JeffJSRuntime,
     rt.mallocState.mallocSize += delta
 
     return newPtr
+}
+
+// MARK: - Refcount-leak fixes switch
+
+/// False only under `JEFFJS_GC_LEGACYREFLEAKS=1` (A/B of the 2026-10-05
+/// refcount-leak fixes, see `JeffJSConfig.gcLegacyRefLeaks`). A stored
+/// global with a literal initialiser (no lazy-init guard on reads); set from
+/// the config when a runtime is created.
+nonisolated(unsafe) var jeffJS_refLeakFix: Bool = true
+
+/// Release an owned value that the pre-fix code leaked.
+@inline(__always)
+func jeffJS_leakFixFree(_ v: JeffJSValue) {
+    if jeffJS_refLeakFix { v.freeValue() }
 }

@@ -916,6 +916,7 @@ struct JeffJSBuiltinArray {
                 let str = ctx.jsValueToString(elem) ?? ""
                 result += str
             }
+            jeffJS_leakFixFree(elem)   // owned (was leaked: one ref per element per join)
         }
 
         return ctx.newStringValue(result)
@@ -1800,7 +1801,9 @@ struct JeffJSBuiltinArray {
 
         let joinAtom = ctx.rt.findAtom("join")
         let joinFn = ctx.getProperty(obj: obj, atom: joinAtom)
+        if jeffJS_refLeakFix { ctx.rt.freeAtom(joinAtom) }
         if joinFn.isException { return joinFn }
+        defer { jeffJS_leakFixFree(joinFn) }
 
         if ctx.isCallable(joinFn) {
             return ctx.call(joinFn, this: obj, args: [])

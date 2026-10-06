@@ -261,6 +261,13 @@ enum JeffJSConfig {
     /// lists; false = the old behaviour, which only dropped the references and
     /// leaked every live object's allocation (A/B: JEFFJS_GC_TEARDOWNFREESHEAP=0).
     static let gcTeardownFreesHeap = bool("gc.teardownFreesHeap",      default: true)
+    /// The 2026-10-05 refcount-leak fixes (perf/watch-object-size): builtins
+    /// and conversions that dropped an owned value un-freed — ToPrimitive /
+    /// ToString of objects, `+` and comparisons on objects, Array join,
+    /// propertyIsEnumerable, getOwnPropertyDescriptors, Object.fromEntries,
+    /// early-closed Map/Set iterators, the async-function capability.
+    /// true = the old leaking behaviour, for A/B (JEFFJS_GC_LEGACYREFLEAKS=1).
+    static let gcLegacyRefLeaks    = bool("gc.legacyRefLeaks",         default: false)
 
     // MARK: - Atoms
 

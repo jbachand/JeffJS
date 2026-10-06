@@ -2264,15 +2264,21 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // 1. Check for [Symbol.toPrimitive]
         let toPrimAtom = JeffJSAtomID.JS_ATOM_Symbol_toPrimitive.rawValue
         let exoticPrim = getPropertyInternal(obj: val, atom: toPrimAtom, receiver: val)
+        if exoticPrim.isException { return exoticPrim }
         if !exoticPrim.isUndefined && !exoticPrim.isNull {
             if exoticPrim.isFunction {
+                // Method, hint and an object result are owned here (leaked
+                // once per conversion before).
                 let hintVal = newStringValue(preferredType)
                 let result = callFunction(exoticPrim, thisVal: val, args: [hintVal])
+                jeffJS_leakFixFree(exoticPrim); jeffJS_leakFixFree(hintVal)
                 if result.isException { return result }
                 if !result.isObject { return result }
+                jeffJS_leakFixFree(result)
                 return throwTypeError(message: "Cannot convert object to primitive value")
             }
         }
+        jeffJS_leakFixFree(exoticPrim)
 
         // 2. OrdinaryToPrimitive: try two methods depending on the hint
         let methodNames: [String]
@@ -2285,11 +2291,16 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
 
         for name in methodNames {
             let method = getPropertyStr(obj: val, name: name)
+            if method.isException { return method }
             if method.isFunction {
                 let result = callFunction(method, thisVal: val, args: [])
+                jeffJS_leakFixFree(method)
                 if result.isException { return result }
                 if !result.isObject { return result }
                 // Result was an object — try the next method
+                jeffJS_leakFixFree(result)
+            } else {
+                jeffJS_leakFixFree(method)
             }
         }
 
@@ -6463,6 +6474,9 @@ extension JeffJSContext {
     func jsValueToString(_ val: JeffJSValue) -> String? {
         let str = toString(val)
         if str.isException { return nil }
+        // toString's result is owned: it was leaked on every call (the
+        // "undefined" / "" / number strings orphaned on every heavy page).
+        defer { jeffJS_leakFixFree(str) }
         return str.stringValue?.toSwiftString()
     }
 
