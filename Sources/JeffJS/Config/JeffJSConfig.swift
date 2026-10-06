@@ -215,6 +215,14 @@ enum JeffJSConfig {
     /// A/B: `JEFFJS_INTERP_FASTARGUMENTS=0`.
     static let fastArguments       = bool("interp.fastArguments",      default: true)
 
+    /// Naming a fresh closure (`var f = function () {}`, `{ m: () => {} }`,
+    /// set_name) and materialising a function's deferred `length` / `name`
+    /// put both slots on the cached `[length, name]` transition shape in one
+    /// step: set_name used to materialise both through two defineProperty
+    /// transitions and then define `name` a third time (~30% of a
+    /// closure-heavy loop). A/B: `JEFFJS_INTERP_FASTFUNCTIONNAME=0`.
+    static let fastFunctionName    = bool("interp.fastFunctionName",   default: true)
+
     // MARK: - Trace Blocks
 
     static let traceHitThreshold   = int("trace.hitThreshold",         default: 2)

@@ -18,6 +18,8 @@ nonisolated(unsafe) private var jeffJS_profSelf: [String: Int] = [:]
 nonisolated(unsafe) private var jeffJS_profLine: [String: Int] = [:]
 nonisolated(unsafe) private var jeffJS_profIncl: [String: Int] = [:]
 nonisolated(unsafe) private var jeffJS_profTotal = 0
+nonisolated(unsafe) var jeffJS_icStats = [Int](repeating: 0, count: 8)
+@inline(__always) func jeffJS_icCount(_ k: Int) { jeffJS_icStats[k] &+= 1 }
 nonisolated(unsafe) private var jeffJS_profNames: [ObjectIdentifier: (JeffJSFunctionBytecode, String)] = [:]
 
 private func jeffJS_profName(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode) -> String {
@@ -91,6 +93,9 @@ func jeffJS_profDump(label: String) {
     for (k, v) in jeffJS_profIncl.sorted(by: { $0.value > $1.value }).prefix(60) {
         out += String(format: "[jsprof] %6d %5.1f%% ", v, Double(v) * 100 / Double(jeffJS_profTotal)) + k + "\n"
     }
+    let ic = jeffJS_icStats
+    out += "[jsprof] ic named: main hit=\(ic[0]) miss=\(ic[1]) trace hit=\(ic[2]); keyed miss get=\(ic[4]) put=\(ic[5])\n"
+    jeffJS_icStats = [Int](repeating: 0, count: 8)
     print(out)
     fflush(stdout)
     jeffJS_profSelf = [:]; jeffJS_profLine = [:]; jeffJS_profIncl = [:]; jeffJS_profTotal = 0

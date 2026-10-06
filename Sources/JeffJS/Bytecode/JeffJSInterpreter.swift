@@ -211,6 +211,9 @@ func jeffJS_keyedICGet(_ ents: UnsafeMutablePointer<JeffJSICEntry>?, _ pc: Int, 
 @inline(never)
 func jeffJS_keyedGetMiss(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int,
                          _ obj: JeffJSValue, _ jsObj: JeffJSObj, _ atom: UInt32) -> JeffJSValue {
+    #if JEFFJS_JSPROF
+    jeffJS_icCount(4)
+    #endif
     let val = ctx.getProperty(obj: obj, atom: atom)
     if val.isException { return val }
     if jsObj.shapeIdentity != nil, !jeffJS_keyedCacheExcluded(jsObj), let shape = jsObj.shape {
@@ -314,6 +317,9 @@ func jeffJS_traceArrayFrom(_ ctx: JeffJSContext, _ buf: UnsafeMutablePointer<Jef
 @inline(never)
 func jeffJS_keyedPutMiss(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int,
                          _ obj: JeffJSValue, _ jsObj: JeffJSObj, _ atom: UInt32, _ val: JeffJSValue) -> Bool {
+    #if JEFFJS_JSPROF
+    jeffJS_icCount(5)
+    #endif
     let ok = ctx.setPropertyChecked(obj: obj, atom: atom, value: val, strict: fb.isStrictMode)
     if ok < 0 { return false }
     // Never cache `arr.length = n` (the slot write would skip truncation).
@@ -389,6 +395,8 @@ nonisolated(unsafe) let jeffJSFastNativeCalls = JeffJSConfig.fastNativeCalls
 nonisolated(unsafe) let jeffJSFastObjectBuiltins = JeffJSConfig.fastObjectBuiltins
 /// interp.fastArguments (JeffJSConfig), read once.
 nonisolated(unsafe) let jeffJSFastArguments = JeffJSConfig.fastArguments
+/// interp.fastFunctionName (JeffJSConfig), read once.
+nonisolated(unsafe) let jeffJSFastFunctionName = JeffJSConfig.fastFunctionName
 nonisolated(unsafe) let jeffJSNoTrace = ProcessInfo.processInfo.environment["JEFFJS_NO_TRACE"] != nil
 
 // JEFFJS_TRACE_LAST=1: keep the last 128 (function, pc, opcode) triples the
@@ -1369,12 +1377,51 @@ extension JeffJSContext {
     /// { writable: false, enumerable: false, configurable: true }.
     /// Self-guarding: a property already defined in the meantime (an explicit
     /// `set_name`, `Object.defineProperty`) is left untouched.
+    /// interp.fastFunctionName: put a property-less function object on the
+    /// cached `[length, name]` shape with these values (`name` owned, moved
+    /// in). false (nothing changed) when the object or the cache does not fit.
+    func installFunctionNameLength(_ funcObj: JeffJSObject, length: Int32, name: JeffJSValue) -> Bool {
+        guard jeffJSFastFunctionName, funcObj.propValues.count == 0, let old = funcObj.shape, old.propCount == 0,
+              let shape = funcNameLengthShape, shape.isHashed, shape.propCount == 2,
+              shape.proto === old.proto else { return false }
+        funcObj.needsLazyNameLength = false
+        shape.refCount += 1
+        funcObj.shape = shape
+        jeffJS_leaveShape(rt, old)
+        funcObj.appendDataValue(.newInt32(length))
+        funcObj.appendDataValue(name)
+        return true
+    }
+
+    /// Records `funcObj`'s shape as the `[length, name]` cache when it is
+    /// exactly that (both { configurable } only), for installFunctionNameLength.
+    func noteFunctionNameLengthShape(_ funcObj: JeffJSObject) {
+        guard jeffJSFastFunctionName, let sh = funcObj.shape, sh.isHashed, sh.propCount == 2,
+              funcObj.propValues.count == 2, funcObj.propExtraCount == 0,
+              funcNameLengthShape !== sh, sh.prop.count >= 2,
+              sh.prop[0].atom == JeffJSAtomID.JS_ATOM_length.rawValue,
+              sh.prop[1].atom == JeffJSAtomID.JS_ATOM_name.rawValue,
+              sh.prop[0].flags.rawValue == UInt32(JS_PROP_CONFIGURABLE),
+              sh.prop[1].flags.rawValue == UInt32(JS_PROP_CONFIGURABLE) else { return }
+        // Keep the shape of the plain function prototype only (closures of
+        // other kinds use other prototypes and keep the slow path).
+        guard sh.proto === functionProto.toObject() else { return }
+        if let prev = funcNameLengthShape { jeffJS_leaveShape(rt, prev) }
+        sh.refCount += 1   // the context keeps it alive
+        funcNameLengthShape = sh
+    }
+
     func materializeFunctionNameLength(_ funcObj: JeffJSObject) {
         funcObj.needsLazyNameLength = false
         // fbFast is nil until a lazily compiled function's first call.
         var payloadFB: JeffJSFunctionBytecode? = nil
         if funcObj.fbFast == nil, case .bytecodeFunc(let f, _, _) = funcObj.payload { payloadFB = f }
         guard let fb = funcObj.fbFast ?? payloadFB else { return }
+        if jeffJSFastFunctionName, funcObj.propValues.count == 0 {
+            let nameVal = fb.nameAtom != 0 ? atomToString(fb.nameAtom) : newString("")
+            if installFunctionNameLength(funcObj, length: Int32(fb.definedArgCount), name: nameVal) { return }
+            nameVal.freeValue()
+        }
         // Borrowed receiver: nothing here stores a reference to the function
         // itself (only two fresh primitives), so it must NOT be released --
         // and it must not be *retained* either (mkPtr takes an ARC retain that
@@ -2299,11 +2346,23 @@ extension JeffJSContext {
         guard atom != 0 else { return }
         let nameValue = atomToString(atom)
         if nameValue.isUndefined { return }
+        // interp.fastFunctionName: a fresh closure goes straight onto the
+        // cached [length, name] shape.
+        var wasBare = false
+        if jeffJSFastFunctionName, let o = funcVal.toObject(), o.needsLazyNameLength, o.propValues.count == 0 {
+            var payloadFB: JeffJSFunctionBytecode? = nil
+            if o.fbFast == nil, case .bytecodeFunc(let f, _, _) = o.payload { payloadFB = f }
+            if let fb = o.fbFast ?? payloadFB {
+                if installFunctionNameLength(o, length: Int32(fb.definedArgCount), name: nameValue) { return }
+                wasBare = true
+            }
+        }
         // Function "name": non-writable, non-enumerable, configurable.
         // Defining it here wins over the lazy name (materialize self-guards).
         _ = definePropertyValue(obj: funcVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
                                 value: nameValue, flags: JS_PROP_CONFIGURABLE)
         nameValue.freeValue()
+        if wasBare, let o = funcVal.toObject() { noteFunctionNameLengthShape(o) }
     }
 
     /// Sets the .name property on a function from a computed key.
@@ -4113,6 +4172,9 @@ private func executeFastTrace(
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
             if let hv = icHit {
+                #if JEFFJS_JSPROF
+                jeffJS_icCount(2)
+                #endif
                 buf[sp - 1] = hv.dupValueFast()
                 obj.freeValueFast()
                 pc += 5
@@ -4139,6 +4201,9 @@ private func executeFastTrace(
                 icHit = ctx.arrayProtoPushVal
             }
             if let hv = icHit {
+                #if JEFFJS_JSPROF
+                jeffJS_icCount(2)
+                #endif
                 buf[sp] = hv.dupValueFast(); sp += 1
                 pc += 5
             } else {
@@ -4167,6 +4232,9 @@ private func executeFastTrace(
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
             if let hv = icHit {
+                #if JEFFJS_JSPROF
+                jeffJS_icCount(2)
+                #endif
                 buf[sp] = hv.dupValueFast(); sp += 1
                 pc += 6
             } else {
@@ -4186,6 +4254,9 @@ private func executeFastTrace(
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
             if let hv = icHit {
+                #if JEFFJS_JSPROF
+                jeffJS_icCount(2)
+                #endif
                 buf[sp] = hv.dupValueFast(); sp += 1
                 pc += 5
             } else {
@@ -5442,6 +5513,9 @@ private func executeFastTraceLean(
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
             if let hv = icHit {
+                #if JEFFJS_JSPROF
+                jeffJS_icCount(2)
+                #endif
                 buf[sp - 1] = hv.dupValueFast()
                 obj.freeValueFast()
                 pc += 5
@@ -5457,6 +5531,9 @@ private func executeFastTraceLean(
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
             if let hv = icHit {
+                #if JEFFJS_JSPROF
+                jeffJS_icCount(2)
+                #endif
                 buf[sp] = hv.dupValueFast(); sp += 1
                 pc += 5
             } else {
@@ -5485,6 +5562,9 @@ private func executeFastTraceLean(
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
             if let hv = icHit {
+                #if JEFFJS_JSPROF
+                jeffJS_icCount(2)
+                #endif
                 buf[sp] = hv.dupValueFast(); sp += 1
                 pc += 6
             } else {
@@ -5499,6 +5579,9 @@ private func executeFastTraceLean(
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
             if let hv = icHit {
+                #if JEFFJS_JSPROF
+                jeffJS_icCount(2)
+                #endif
                 buf[sp] = hv.dupValueFast(); sp += 1
                 pc += 5
             } else {
@@ -9429,6 +9512,9 @@ struct JeffJSInterpreter {
                             }
                         }
                         if let hv = icHit {
+                            #if JEFFJS_JSPROF
+                            jeffJS_icCount(0)
+                            #endif
                             do {
                                 buf[sp] = hv.dupValue(); sp += 1
                                 obj.freeValue()
@@ -9438,6 +9524,9 @@ struct JeffJSInterpreter {
                         }
                     }
                     // IC miss: full lookup + cache update
+                    #if JEFFJS_JSPROF
+                    jeffJS_icCount(1)
+                    #endif
                     let val = ctx.getProperty(obj: obj, atom: atom)
                     if val.isException { obj.freeValue(); retVal = .exception; break dispatchLoop }
                     buf[sp] = val; sp += 1
@@ -9588,6 +9677,9 @@ struct JeffJSInterpreter {
                             }
                         }
                         if let hv = icHit {
+                            #if JEFFJS_JSPROF
+                            jeffJS_icCount(0)
+                            #endif
                             do {
                                 buf[sp] = hv.dupValue(); sp += 1
                                 pc += 5
@@ -9596,6 +9688,9 @@ struct JeffJSInterpreter {
                         }
                     }
                     // IC miss: full lookup + cache update
+                    #if JEFFJS_JSPROF
+                    jeffJS_icCount(1)
+                    #endif
                     let val = ctx.getProperty(obj: obj, atom: atom)
                     if val.isException { retVal = .exception; break dispatchLoop }
                     buf[sp] = val; sp += 1
@@ -12517,6 +12612,9 @@ struct JeffJSInterpreter {
                             }
                         }
                         if let hv = icHit {
+                            #if JEFFJS_JSPROF
+                            jeffJS_icCount(0)
+                            #endif
                             do {
                                 buf[sp] = hv.dupValue(); sp += 1
                                 pc += 6
@@ -12563,6 +12661,9 @@ struct JeffJSInterpreter {
                             }
                         }
                         if let hv = icHit {
+                            #if JEFFJS_JSPROF
+                            jeffJS_icCount(0)
+                            #endif
                             do {
                                 buf[sp] = hv.dupValue(); sp += 1
                                 pc += 5

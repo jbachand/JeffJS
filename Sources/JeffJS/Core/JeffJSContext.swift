@@ -189,6 +189,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         return newString(text)
     }
 
+    /// interp.fastFunctionName: transition shape of a plain function object
+    /// whose only own properties are `length` then `name` (pinned).
+    var funcNameLengthShape: JeffJSShape? = nil
+
     /// interp.fastArrayBuiltins: the intrinsic %Array% and its original
     /// `get [Symbol.species]` (references held by the context; identity only).
     var arrayCtorIntrinsic: JeffJSValue = .JS_UNDEFINED
@@ -857,6 +861,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         globalVarObj = .JS_UNDEFINED
 
         // Free shapes
+        funcNameLengthShape = nil
+        arrayIterShape = nil
         arrayShape = nil
         plainObjectRootShape = nil
         argumentsShape = nil
