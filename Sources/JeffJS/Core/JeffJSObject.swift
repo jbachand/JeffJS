@@ -2326,6 +2326,9 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
                rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain {
                 runGC(rt)
             }
+        } else if let rt = ownerRuntime {
+            // Untracked, so the runtime's teardown finds it here (JeffJSRuntime.initObjects).
+            rt.initObjects.append(Unmanaged.passRetained(self))
         }
     }
 

@@ -801,6 +801,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // Teardown is the one legitimate time to free the global object.
         if let gObj = globalObj.toObject() {
             rt.protectedGlobals.remove(ObjectIdentifier(gObj))
+            gObj.isProtectedGlobal = false   // freed by the runtime's teardown now (not a mid-run over-release)
         }
 
         // Free loaded modules
@@ -860,7 +861,19 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         globalObj = .JS_UNDEFINED
         globalVarObj = .JS_UNDEFINED
 
-        // Free shapes
+        // Free shapes. The cached ones carry the count the context took to keep
+        // them alive ("the context keeps it alive"): give it back, or a hashed
+        // shape never reaches zero — the runtime's teardown keeps a shape with
+        // owners outside the dead group — and pins the runtime (ownerRuntime).
+        for sh in [funcNameLengthShape, arrayIterShape, arrayShape, plainObjectRootShape,
+                   iterResultShape, regexpMatchShape] {
+            if let sh { jeffJS_leaveShape(rt, sh) }
+        }
+        for i in argumentsShapes.indices {
+            if let sh = argumentsShapes[i] { jeffJS_leaveShape(rt, sh); argumentsShapes[i] = nil }
+        }
+        iterResultShape = nil
+        regexpMatchShape = nil
         funcNameLengthShape = nil
         arrayIterShape = nil
         arrayShape = nil

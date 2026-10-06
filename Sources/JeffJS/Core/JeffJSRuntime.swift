@@ -446,6 +446,16 @@ nonisolated final class JeffJSRuntime {
     /// `sharedStringsCapacity`. perf/watch-object-size: homedepot kept ~10 k
     /// separate "" strings and thousands of "div"/"DIV"/"undefined".
     var sharedStrings: [String: JeffJSString] = [:]
+    /// Objects built while a context installs its intrinsics (`initComplete`
+    /// false: prototypes, constructors, every builtin function, the global
+    /// object). They are kept off the GC list on purpose (JeffJSObject.init), so
+    /// no list reaches them at teardown: `free()` frees them with the rest of the
+    /// heap through this list (one retain each, given back at the end). Before,
+    /// ~1 000 builtins per context outlived it — and through their `ownerRuntime`
+    /// / realm back-pointers the runtime and the context too, with everything
+    /// those still held (shared strings, bodies, script sources): the watch's
+    /// navigation leak. A/B: JEFFJS_GC_TEARDOWNFREESINITOBJECTS=0.
+    var initObjects: [Unmanaged<JeffJSObject>] = []
     static let sharedStringsCapacity = 4096
 
 
@@ -900,6 +910,11 @@ nonisolated final class JeffJSRuntime {
             JeffJSGCObjectHeader.activeRuntime = nil
         }
 
+        // The contexts' intrinsics (never listed): the ones still alive join the
+        // teardown's dead group. Taken before the pools drain — a parked object
+        // is already dead and is the pool's to release.
+        let initDead = JeffJSConfig.gcTeardownFreesHeap ? takeLiveInitObjects() : []
+
         // Return pooled interpreter buffers/frames to the allocator
         drainInterpPools()
         drainObjectPool()
@@ -918,7 +933,20 @@ nonisolated final class JeffJSRuntime {
         // object, string and bytecode body the page still held outlived the
         // runtime (a whole page's JS heap per navigation; homedepot ~230 k
         // objects / 300 k strings). RuntimeTeardownReleaseTests.
-        if JeffJSConfig.gcTeardownFreesHeap { freeRemainingHeap() }
+        if JeffJSConfig.gcTeardownFreesHeap { freeRemainingHeap(also: initDead) }
+        // The registry's own retains (objects freed above, or earlier, go now).
+        for u in initObjects { u.release() }
+        initObjects = []
+        // String caches (each entry: the cache's count + its Swift reference).
+        // Normally they go with the runtime object; dropped here as well so a
+        // runtime something still points at (a leaked object's ownerRuntime)
+        // does not keep thousands of strings alive.
+        atomJSStrings.removeAll()
+        sharedStrings.removeAll()
+        symbolAtomStrings.removeAll()
+        symbolAtoms.removeAll()
+        for i in intKeyStrings.indices { intKeyStrings[i] = nil }
+        for i in typeofStrings.indices { typeofStrings[i] = nil }
 
         // Free global symbol registry values
         for (_, val) in globalSymbolRegistry {
@@ -964,7 +992,25 @@ nonisolated final class JeffJSRuntime {
 
     /// Teardown: frees every object still listed as one dead group
     /// (`gcFreeDeadObjects`), with frees that reach zero deferred into the group.
-    private func freeRemainingHeap() {
+    /// The registered intrinsics still alive and on no list (not freed — a freed
+    /// one is at -1 —, not parked in a pool, not listed since: a listed one is
+    /// already in the dead group).
+    private func takeLiveInitObjects() -> [JeffJSGCObjectHeader] {
+        guard !initObjects.isEmpty else { return [] }
+        var parked = Set<ObjectIdentifier>()
+        for o in objectPool { parked.insert(ObjectIdentifier(o)) }
+        for o in arrayPool { parked.insert(ObjectIdentifier(o)) }
+        for o in functionPool { parked.insert(ObjectIdentifier(o)) }
+        var out: [JeffJSGCObjectHeader] = []
+        out.reserveCapacity(initObjects.count)
+        for u in initObjects {
+            let o = u.takeUnretainedValue()
+            if o.gcListIndex == -1, o.refCount >= 0, !parked.contains(ObjectIdentifier(o)) { out.append(o) }
+        }
+        return out
+    }
+
+    private func freeRemainingHeap(also initDead: [JeffJSGCObjectHeader] = []) {
         guard gcPhase == .JS_GC_PHASE_NONE, !inFreeChain else { return }
         // The context's free disabled cascading (initComplete = false); the
         // collector's group free does its own ordering and must see the frees.
@@ -976,6 +1022,7 @@ nonisolated final class JeffJSRuntime {
         dead.reserveCapacity(gcObjects.count + gcTmpObjects.count)
         for u in gcObjects { let h = u.takeUnretainedValue(); h.gcListIndex = -1; dead.append(h) }
         for u in gcTmpObjects { let h = u.takeUnretainedValue(); h.gcListIndex = -1; dead.append(h) }
+        if JeffJSConfig.gcTeardownFreesInitObjects { dead.append(contentsOf: initDead) }
         gcObjects.removeAll()
         gcTmpObjects.removeAll()
         // Function bodies are not GC objects, and a function object's payload does

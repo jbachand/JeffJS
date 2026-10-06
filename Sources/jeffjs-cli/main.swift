@@ -248,6 +248,15 @@ if args.contains("--teardown-report") {
                      Double(cliMallocInUse()) / 1_048_576) + counts.joined(separator: " "))
         print(orphanReport(className: "JeffJS.JeffJSString") { JeffJSHeapDebug.describeString(at: $0) })
         print(orphanReport(className: "JeffJS.JeffJSObject") { JeffJSHeapDebug.describeObject(at: $0) })
+        if let rc = args.first(where: { $0.hasPrefix("--refs=") }) { print(referrerReport(className: String(rc.dropFirst(7)))) }
+        var hist: [String: Int] = [:]
+        for a in liveInstances(className: "JeffJS.JeffJSObject") {
+            if let p = UnsafeRawPointer(bitPattern: a), let d = JeffJSHeapDebug.describeObject(at: p) {
+                let key = d.replacingOccurrences(of: #" props=\d+"#, with: "", options: .regularExpression)
+                hist[key, default: 0] += 1
+            }
+        }
+        for (k, n) in hist.sorted(by: { $0.value > $1.value }).prefix(15) { print("[teardown]   object \(n) x \(k)") }
     }
 }
 exit(status)

@@ -266,6 +266,12 @@ enum JeffJSConfig {
     /// lists; false = the old behaviour, which only dropped the references and
     /// leaked every live object's allocation (A/B: JEFFJS_GC_TEARDOWNFREESHEAP=0).
     static let gcTeardownFreesHeap = bool("gc.teardownFreesHeap",      default: true)
+    /// With gcTeardownFreesHeap: the contexts' intrinsics (built before
+    /// `initComplete`, never on the GC list) are freed with the rest of the heap
+    /// (JeffJSRuntime.initObjects); false = they — and through their back-pointers
+    /// the runtime and its contexts — outlive `free()` (A/B:
+    /// JEFFJS_GC_TEARDOWNFREESINITOBJECTS=0).
+    static let gcTeardownFreesInitObjects = bool("gc.teardownFreesInitObjects", default: true)
     /// The 2026-10-05 refcount-leak fixes (perf/watch-object-size): builtins
     /// and conversions that dropped an owned value un-freed — ToPrimitive /
     /// ToString of objects, `+` and comparisons on objects, Array join,

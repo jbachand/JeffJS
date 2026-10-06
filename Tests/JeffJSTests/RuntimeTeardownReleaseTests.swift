@@ -48,6 +48,43 @@ final class RuntimeTeardownReleaseTests: XCTestCase {
         XCTAssertNil(body, "a live function body outlived its runtime")
     }
 
+    /// The intrinsics a context installs (prototypes, constructors, builtin
+    /// functions, the global object) are kept off the GC list, so before
+    /// JeffJSRuntime.initObjects nothing freed them: ~1 000 builtins per context
+    /// outlived it, and through their runtime / realm back-pointers the runtime
+    /// and the context too, with what those still held (a page per navigation).
+    func testFreeReleasesIntrinsicsContextAndRuntime() throws {
+        try XCTSkipIf(ProcessInfo.processInfo.environment["JEFFJS_ZOMBIES"] == "1", "zombie mode keeps every freed object allocated on purpose")
+        weak var builtin: JeffJSObject?
+        weak var proto: JeffJSObject?
+        weak var weakContext: JeffJSContext?
+        weak var weakRuntime: JeffJSRuntime?
+        do {
+            let rt = JeffJSRuntime()
+            let ctx = rt.newContext()
+            let f = ctx.eval(input: "Array.prototype.push", filename: "<intrinsic>", evalFlags: 0)
+            let p = ctx.eval(input: "Object.prototype", filename: "<intrinsic>", evalFlags: 0)
+            XCTAssertFalse(f.isException); XCTAssertFalse(p.isException)
+            builtin = f.toObject()
+            proto = p.toObject()
+            f.freeValue(); p.freeValue()
+            weakContext = ctx
+            weakRuntime = rt
+            ctx.free()
+            rt.free()
+        }
+        XCTAssertNil(builtin, "a builtin function outlived its runtime")
+        XCTAssertNil(proto, "Object.prototype outlived its runtime")
+        XCTAssertNil(weakContext, "the context outlived its free()")
+        // The runtime object itself can still be pinned by a few objects whose
+        // Swift retain leaked (their `ownerRuntime`; open) — but it holds nothing
+        // any more: free() empties its string caches.
+        if let rt = weakRuntime {
+            XCTAssertTrue(rt.sharedStrings.isEmpty && rt.atomJSStrings.isEmpty && rt.initObjects.isEmpty,
+                          "a freed runtime still holds its caches")
+        }
+    }
+
     /// A lazily compiled function's body is parsed and thrown away (only its free
     /// names are kept); the string literals the parser put in its constant pool —
     /// and in the pools of the definitions nested in it — own one reference each,
