@@ -387,6 +387,8 @@ nonisolated(unsafe) let jeffJSFastArrayBuiltins = JeffJSConfig.fastArrayBuiltins
 nonisolated(unsafe) let jeffJSFastNativeCalls = JeffJSConfig.fastNativeCalls
 /// interp.fastObjectBuiltins (JeffJSConfig), read once.
 nonisolated(unsafe) let jeffJSFastObjectBuiltins = JeffJSConfig.fastObjectBuiltins
+/// interp.fastArguments (JeffJSConfig), read once.
+nonisolated(unsafe) let jeffJSFastArguments = JeffJSConfig.fastArguments
 nonisolated(unsafe) let jeffJSNoTrace = ProcessInfo.processInfo.environment["JEFFJS_NO_TRACE"] != nil
 
 // JEFFJS_TRACE_LAST=1: keep the last 128 (function, pc, opcode) triples the
@@ -956,6 +958,66 @@ extension JeffJSContext {
         frame.liveVarRefs.append(vr)
         frame.hasLiveVarRefs = true
         return vr
+    }
+
+    /// interp.fastArguments: the arguments object of `frame`, reading the
+    /// `argc` argument values from the frame's slots `argp[0..<argc]` (the
+    /// interpreter buffer) instead of the materialised `frame.argBuf`. Same
+    /// object as newSpecialObject builds (mapped: var-ref slots for the
+    /// formal parameters, `callee` = the function; unmapped: poisoned
+    /// `callee`), with its property storage reserved up front.
+    func newArgumentsObject(mapped: Bool, frame: JeffJSStackFrame,
+                            argp: UnsafeMutablePointer<JeffJSValue>, argc: Int) -> JeffJSValue {
+        var mappedCount = 0
+        if mapped, let fb = frame.curFunc.toObject()?.fbFast {
+            mappedCount = min(argc, Int(fb.argCount))
+        }
+        let argsObj = newObject()
+        guard let o = argsObj.toObject() else { return argsObj }
+        o.classID = mapped ? JeffJSClassID.mappedArguments.rawValue : JeffJSClassID.arguments.rawValue
+        let iterFn: JeffJSValue = arrayProtoValues.isFunction ? arrayProtoValues.dupValue() : .undefined
+        let fixedCount = 3   // length, callee, @@iterator
+        let shapeKey = argc * 18 + mappedCount * 2 + (mapped ? 1 : 0)
+        if argc <= 8, mappedCount <= 8,
+           let shape = argumentsShapes[shapeKey],
+           shape.isHashed, shape.propCount == argc + fixedCount,
+           o.propValues.count == 0, let old = o.shape {
+            shape.refCount += 1
+            o.shape = shape
+            jeffJS_leaveShape(rt, old)
+            o.propValues.reserveCapacity(argc + fixedCount)
+            if mappedCount > 0 || !mapped { o.propExtra.reserveCapacity(argc + fixedCount) }
+            for i in 0 ..< argc {
+                if i < mappedCount {
+                    o.appendProp(.varRef(jeffJS_argVarRef(frame, i)))
+                } else {
+                    o.appendDataValue(argp[i].dupValue())
+                }
+            }
+            o.appendDataValue(.newInt32(Int32(argc)))                  // length
+            if mapped {
+                o.appendDataValue(frame.curFunc.dupValue())            // callee
+            } else if let tte = throwTypeError.toObject() {
+                _ = throwTypeError.dupValue()                          // getter
+                _ = throwTypeError.dupValue()                          // setter
+                o.appendProp(.getset(getter: tte, setter: tte))        // callee (poison)
+            } else {
+                o.appendDataValue(.undefined)
+            }
+            o.appendDataValue(iterFn)                                  // @@iterator
+            return argsObj
+        }
+        // First object of this kind/argc: the general builder (it records the
+        // transition shape), fed from the slots.
+        iterFn.freeValue()
+        argsObj.freeValue()
+        let saved = frame.argBuf, savedLive = frame.bufArraysLive
+        frame.argBuf = Array(UnsafeBufferPointer(start: argp, count: argc))
+        let r = newSpecialObject(kind: mapped ? SpecialObjectType.mappedArguments.rawValue
+                                              : SpecialObjectType.arguments.rawValue, frame: frame)
+        frame.argBuf = saved
+        frame.bufArraysLive = savedLive || frame.bufArraysLive
+        return r
     }
 
     /// Creates a special object (arguments, mapped arguments, etc.) based on kind.
@@ -8003,6 +8065,16 @@ struct JeffJSInterpreter {
 
             case .special_object:
                 let kind = readU8(bc, pc + 1)
+                // interp.fastArguments: the arguments object reads the
+                // argument slots in place (no argBuf/varBuf materialisation).
+                if jeffJSFastArguments, kind <= SpecialObjectType.mappedArguments.rawValue {
+                    let argc = min(frame.argCount, varBase)
+                    let obj = ctx.newArgumentsObject(mapped: kind == SpecialObjectType.mappedArguments.rawValue,
+                                                     frame: frame, argp: buf, argc: argc)
+                    buf[sp] = obj; sp += 1
+                    pc += 2
+                    break
+                }
                 // Sync buf → frame since newSpecialObject reads frame.argBuf
                 jeffJS_syncBufToFrame(frame, buf, varBase)
                 let obj = ctx.newSpecialObject(kind: kind, frame: frame)
@@ -8011,6 +8083,18 @@ struct JeffJSInterpreter {
 
             case .rest:
                 let argIdx = Int(readU16(bc, pc + 1))
+                if jeffJSFastArguments {
+                    // interp.fastArguments: one-shot fill from the slots.
+                    let argc = min(frame.argCount, varBase)
+                    var items: [JeffJSValue] = []
+                    if argIdx < argc {
+                        items.reserveCapacity(argc - argIdx)
+                        for i in argIdx..<argc { items.append(buf[i].dupValue()) }
+                    }
+                    buf[sp] = ctx.newArrayFrom(items); sp += 1
+                    pc += 3
+                    break
+                }
                 // Build args array from buf for createRestArray
                 var restSrcArgs = [JeffJSValue](repeating: .undefined, count: varBase)
                 for i in 0..<varBase { restSrcArgs[i] = buf[i] }

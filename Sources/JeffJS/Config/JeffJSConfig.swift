@@ -206,6 +206,15 @@ enum JeffJSConfig {
     /// per freed object. A/B: `JEFFJS_INTERP_FASTFREECHAIN=0`.
     static let fastFreeChain       = bool("interp.fastFreeChain",      default: true)
 
+    /// `arguments` objects and rest parameters are built straight from the
+    /// frame's argument slots: no materialised `argBuf`/`varBuf` copies per
+    /// creation (two array allocations), property storage sized once, and
+    /// the rest array filled in one shot. A mapped/unmapped arguments object
+    /// cost ~16k / ~11k instructions per call (QuickJS ~1.2k); Babel's
+    /// `_objectSpread2` / `_extends` helpers create one per call.
+    /// A/B: `JEFFJS_INTERP_FASTARGUMENTS=0`.
+    static let fastArguments       = bool("interp.fastArguments",      default: true)
+
     // MARK: - Trace Blocks
 
     static let traceHitThreshold   = int("trace.hitThreshold",         default: 2)
