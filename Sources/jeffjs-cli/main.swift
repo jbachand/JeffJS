@@ -224,8 +224,31 @@ let status: Int32 = MainActor.assumeIsolated {
     env.flushBytecodeCache()
     // --teardown exercises context/runtime free (the path the test suite runs
     // between groups); the CLI otherwise leaves it to process exit.
-    if args.contains("--teardown") { env.teardown() }
+    if args.contains("--teardown") || args.contains("--teardown-report") {
+        if args.contains("--teardown-report") {
+            print(String(format: "[teardown] before: gcObjects=%d footprint=%.1fMB", env.gcStatistics.liveObjects, cliFootprintMB()))
+        }
+        env.teardown()
+    }
     return status
+}
+// --teardown-report (with --page / scripts): after the environment's teardown and release, what
+// the freed runtime left behind — engine instances still alive (nothing should be: the app frees a
+// page's runtime at every navigation) and the strings among them that nothing points to.
+if args.contains("--teardown-report") {
+    MainActor.assumeIsolated {
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+        var counts: [String] = []
+        for c in ["JeffJSString", "JeffJSObject", "JeffJSObjectAux", "JeffJSFunctionBytecodeCompiled",
+                  "JeffJSFunctionBytecodeCold", "JeffJSShape", "JeffJSVarRef", "JeffJSAtomStruct",
+                  "JeffJSContext", "JeffJSRuntime"] {
+            counts.append("\(c)=\(liveInstances(className: "JeffJS." + c).count)")
+        }
+        print(String(format: "[teardown] after: footprint=%.1fMB mallocInUse=%.1fMB ", cliFootprintMB(),
+                     Double(cliMallocInUse()) / 1_048_576) + counts.joined(separator: " "))
+        print(orphanReport(className: "JeffJS.JeffJSString") { JeffJSHeapDebug.describeString(at: $0) })
+        print(orphanReport(className: "JeffJS.JeffJSObject") { JeffJSHeapDebug.describeObject(at: $0) })
+    }
 }
 exit(status)
 

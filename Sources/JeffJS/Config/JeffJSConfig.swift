@@ -136,6 +136,11 @@ enum JeffJSConfig {
     /// every lazily compiled body is dropped and recompiled between tasks
     /// (`JEFFJS_COMPILE_LAZYDROPSTRESS=1 swift test …`).
     static let lazyDropStress      = bool("compile.lazyDropStress",    default: false)
+    /// A lazy candidate's parsed-then-dropped body gives back the string /
+    /// BigInt literals of its constant pool (JeffJSCompiler.releaseDroppedConstants);
+    /// false = the old leak, one reference per literal per parse (A/B:
+    /// JEFFJS_COMPILE_LAZYDROPFREESCONSTANTS=0).
+    static let lazyDropFreesConstants = bool("compile.lazyDropFreesConstants", default: true)
 
     // MARK: - Web Storage
 

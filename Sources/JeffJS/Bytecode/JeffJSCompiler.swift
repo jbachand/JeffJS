@@ -5482,7 +5482,10 @@ extension JeffJSCompiler {
         rt.lazyStats.stubSourceBytes += child.sourceEnd - child.sourceStart
 
         // The definition is not needed any more: free its buffers now rather
-        // than when the whole tree is released.
+        // than when the whole tree is released. Its constant pool (and its nested
+        // definitions') owns a reference on every string / BigInt literal the
+        // parser put there: give them back (releaseDroppedConstants).
+        releaseDroppedConstants(child)
         child.byteCode = DynBuf()
         child.childFunctions = []
         child.vars = []
@@ -5536,6 +5539,7 @@ extension JeffJSCompiler {
         if top.evalSite != nil { return }
         guard let scan = lazyScan(root: child) else { return }
         child.lazyDropped = scan
+        releaseDroppedConstants(child)
         child.byteCode = DynBuf()
         child.childFunctions = []
         child.vars = []
@@ -5551,6 +5555,29 @@ extension JeffJSCompiler {
         child.hoistedFuncDeclRanges = []
         child.pc2Events = []
         child.tdzInitPos = [:]
+    }
+
+    /// A lazy candidate's parsed body is thrown away (lazyDropAtParseEnd /
+    /// lazyStubOrEager): its definition and every definition nested in it own one
+    /// reference on each string and BigInt literal in their constant pools
+    /// (`addConstPoolValue(JeffJSValue.makeString(…))`). Emptying the arrays only
+    /// dropped the raw pointers, so every literal of every lazily compiled
+    /// function leaked at parse time — and again at each re-parse (a stub's first
+    /// call) — never freed, not even by the runtime's teardown (no holder left:
+    /// wikipedia 36 k strings, homedepot tens of MB per page, surviving every
+    /// navigation). Function bytecode values are not owned here (none exist before
+    /// the parent compiles; skip them like freeRemainingHeap does).
+    static func releaseDroppedConstants(_ def: JeffJSFunctionDefCompiler) {
+        guard JeffJSConfig.lazyDropFreesConstants else { return }
+        var stack: [JeffJSFunctionDefCompiler] = [def]
+        while let d = stack.popLast() {
+            if !d.cpool.isEmpty {
+                let pool = d.cpool
+                d.cpool = []
+                for v in pool where !v.isFunctionBytecode { v.freeValue() }
+            }
+            stack.append(contentsOf: d.childFunctions)
+        }
     }
 
     /// Re-parse dropped child `child` of `parent` from the script text so it

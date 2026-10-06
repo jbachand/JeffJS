@@ -47,4 +47,33 @@ final class RuntimeTeardownReleaseTests: XCTestCase {
         XCTAssertNil(string, "a live string outlived its runtime")
         XCTAssertNil(body, "a live function body outlived its runtime")
     }
+
+    /// A lazily compiled function's body is parsed and thrown away (only its free
+    /// names are kept); the string literals the parser put in its constant pool —
+    /// and in the pools of the definitions nested in it — own one reference each,
+    /// which the drop must give back (JeffJSCompiler.releaseDroppedConstants). It
+    /// used to empty the arrays only: every literal of every lazy function leaked
+    /// at parse time, beyond the reach of the runtime's teardown (wikipedia: 36 k
+    /// strings per page view).
+    func testDroppedLazyDefinitionReleasesItsLiterals() throws {
+        try XCTSkipIf(ProcessInfo.processInfo.environment["JEFFJS_ZOMBIES"] == "1", "zombie mode keeps every freed object allocated on purpose")
+        weak var outerLiteral: JeffJSStringBase?
+        weak var innerLiteral: JeffJSStringBase?
+        do {
+            let outer = JeffJSFunctionDefCompiler()
+            let inner = JeffJSFunctionDefCompiler()
+            outer.childFunctions = [inner]
+            let a = JeffJSValue.makeString(JeffJSString(swiftString: "outer literal " + String(repeating: "a", count: 40)))
+            let b = JeffJSValue.makeString(JeffJSString(swiftString: "inner literal " + String(repeating: "b", count: 40)))
+            outerLiteral = a.stringBase
+            innerLiteral = b.stringBase
+            outer.cpool = [.undefined, a, JeffJSValue.newFloat64(1.5)]
+            inner.cpool = [b]
+            XCTAssertNotNil(outerLiteral); XCTAssertNotNil(innerLiteral)
+            JeffJSCompiler.releaseDroppedConstants(outer)
+            XCTAssertTrue(outer.cpool.isEmpty); XCTAssertTrue(inner.cpool.isEmpty)
+        }
+        XCTAssertNil(outerLiteral, "a dropped lazy body's literal leaked")
+        XCTAssertNil(innerLiteral, "a literal of a definition nested in a dropped lazy body leaked")
+    }
 }
