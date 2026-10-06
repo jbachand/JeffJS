@@ -2342,46 +2342,91 @@ nonisolated class JeffJSSideSlot {
     init() {}
 }
 
-nonisolated final class JeffJSObjectAux: JeffJSSideSlot {
-    var payload: JeffJSObjectPayload = .opaque(nil)
-    /// An array's element store while the array also needs this box.
+/// The side box's rarely set fields (native functions, wrapper objects,
+/// weak keys, shape-less prototypes, boxed arrays), one level further out so
+/// a closure's box stays at 128 bytes (perf/watch-object-size).
+nonisolated final class JeffJSObjectAuxRare {
     var fastArrayValues: JeffJSFastArrayStorage? = nil
     var cFuncFast: JSCFunctionType? = nil
-    // 32-bit counters packed after the optionals' tag bytes (192-byte box).
-    private var _cMagicFast: Int32 = 0
-    private var _varRefsRawCount: Int32 = 0
-    private var _storedCFunctionLength: Int32 = 0
+    var cMagicFast: Int32 = 0
+    var storedCFunctionLength: Int32 = 0
     var weakrefCount: UInt32 = 0
+    var firstWeakRef: AnyObject? = nil
+    var storedProto: JeffJSObject? = nil
+    var storedCFunction: ((JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue)? = nil
+    var storedPrimitiveValue: JeffJSValue = .undefined
+    init() {}
+}
+
+nonisolated final class JeffJSObjectAux: JeffJSSideSlot {
+    // Layout: what a closure uses inline (payload, body, var-refs and their
+    // raw mirror, captured `this`, accessor slots), the rest in `rare`.
+    var payload: JeffJSObjectPayload = .opaque(nil)
+    var fbFast: JeffJSFunctionBytecode? = nil
+    var varRefsFast: [JeffJSVarRef?] = []
+    var varRefsRaw: UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>? = nil
+    private var _varRefsRawCount: Int32 = 0
     /// Slots allocated at `varRefsRaw` (kept across setVarRefs, so a pooled
     /// closure re-captures without a malloc).
     private var _varRefsRawCapacity: Int32 = 0
-    var cMagicFast: Int {
-        get { Int(_cMagicFast) }
-        set { _cMagicFast = Int32(truncatingIfNeeded: newValue) }
+    var arrowThisVal: JeffJSValue? = nil
+    var propExtra: ContiguousArray<JeffJSPropertyExtra?> = []
+    var rare: JeffJSObjectAuxRare? = nil
+
+    @inline(__always) private func rareBox() -> JeffJSObjectAuxRare {
+        if let r = rare { return r }
+        let r = JeffJSObjectAuxRare()
+        rare = r
+        return r
     }
+
     var varRefsRawCount: Int {
         get { Int(_varRefsRawCount) }
         set { _varRefsRawCount = Int32(truncatingIfNeeded: newValue) }
     }
-    var storedCFunctionLength: Int {
-        get { Int(_storedCFunctionLength) }
-        set { _storedCFunctionLength = Int32(truncatingIfNeeded: newValue) }
-    }
-    var fbFast: JeffJSFunctionBytecode? = nil
     /// Unretained view of `fbFast` (its bits; no field).
     var fbFastU: Unmanaged<JeffJSFunctionBytecode>? {
         @inline(__always) get {
             unsafeBitCast(fbFast, to: UnsafeRawPointer?.self).map { Unmanaged<JeffJSFunctionBytecode>.fromOpaque($0) }
         }
     }
-    var varRefsFast: [JeffJSVarRef?] = []
-    var varRefsRaw: UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>? = nil
-    var arrowThisVal: JeffJSValue? = nil
-    var firstWeakRef: AnyObject? = nil
-    var propExtra: ContiguousArray<JeffJSPropertyExtra?> = []
-    var storedProto: JeffJSObject? = nil
-    var storedCFunction: ((JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue)? = nil
-    var storedPrimitiveValue: JeffJSValue = .undefined
+    /// An array's element store while the array also needs this box.
+    var fastArrayValues: JeffJSFastArrayStorage? {
+        get { rare?.fastArrayValues }
+        set { if newValue == nil && rare == nil { return }; rareBox().fastArrayValues = newValue }
+    }
+    var cFuncFast: JSCFunctionType? {
+        get { rare?.cFuncFast }
+        set { if newValue == nil && rare == nil { return }; rareBox().cFuncFast = newValue }
+    }
+    var cMagicFast: Int {
+        get { Int(rare?.cMagicFast ?? 0) }
+        set { if newValue == 0 && rare == nil { return }; rareBox().cMagicFast = Int32(truncatingIfNeeded: newValue) }
+    }
+    var storedCFunctionLength: Int {
+        get { Int(rare?.storedCFunctionLength ?? 0) }
+        set { if newValue == 0 && rare == nil { return }; rareBox().storedCFunctionLength = Int32(truncatingIfNeeded: newValue) }
+    }
+    var weakrefCount: UInt32 {
+        get { rare?.weakrefCount ?? 0 }
+        set { if newValue == 0 && rare == nil { return }; rareBox().weakrefCount = newValue }
+    }
+    var firstWeakRef: AnyObject? {
+        get { rare?.firstWeakRef }
+        set { if newValue == nil && rare == nil { return }; rareBox().firstWeakRef = newValue }
+    }
+    var storedProto: JeffJSObject? {
+        get { rare?.storedProto }
+        set { if newValue == nil && rare == nil { return }; rareBox().storedProto = newValue }
+    }
+    var storedCFunction: ((JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue)? {
+        get { rare?.storedCFunction }
+        set { if newValue == nil && rare == nil { return }; rareBox().storedCFunction = newValue }
+    }
+    var storedPrimitiveValue: JeffJSValue {
+        get { rare?.storedPrimitiveValue ?? .undefined }
+        set { if newValue.isUndefined && rare == nil { return }; rareBox().storedPrimitiveValue = newValue }
+    }
 
     override init() {}
 

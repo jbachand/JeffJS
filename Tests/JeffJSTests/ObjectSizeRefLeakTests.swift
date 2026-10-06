@@ -115,7 +115,7 @@ final class ObjectSizeRefLeakTests: XCTestCase {
         XCTAssertEqual(MemoryLayout<JeffJSPropStorage>.size, 16)
         // Each at or under a malloc size class boundary (xzone: 16-byte steps
         // to 128, then 32): 192, 256, 112, 64, 64.
-        XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSObjectAux.self), 192)
+        XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSObjectAux.self), 128)
         XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSFunctionBytecodeCompiled.self), 256)
         XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSShape.self), 112)
         XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSAtomStruct.self), 64)
