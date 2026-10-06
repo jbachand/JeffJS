@@ -1686,7 +1686,7 @@ nonisolated final class JeffJSPropertyExtra {
     private var _b: AnyObject?
     var autoRealmAndId: UInt
 
-    private final class OpaqueBox { let value: Any; init(_ v: Any) { value = v } }
+    nonisolated private final class OpaqueBox { let value: Any; init(_ v: Any) { value = v } }
 
     var getter: JeffJSObject? {
         @inline(__always) get { kind == .getset ? _a.map { unsafeDowncast($0, to: JeffJSObject.self) } : nil }
