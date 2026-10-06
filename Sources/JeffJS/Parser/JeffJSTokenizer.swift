@@ -765,7 +765,7 @@ extension JeffJSParseState {
                 bufPtr += 1
                 guard bufPtr < bufLen && buf[bufPtr] == 0x75 else { // 'u'
                     syntaxError("invalid escape in identifier")
-                    return (String(bytes: identBuf, encoding: .utf8) ?? "", hasEscape)
+                    return (String(decoding: identBuf, as: UTF8.self), hasEscape)
                 }
                 bufPtr += 1
                 hasEscape = true
@@ -773,7 +773,7 @@ extension JeffJSParseState {
                 let cp = parseUnicodeEscape()
                 guard cp != UInt32.max else {
                     syntaxError("invalid unicode escape in identifier")
-                    return (String(bytes: identBuf, encoding: .utf8) ?? "", hasEscape)
+                    return (String(decoding: identBuf, as: UTF8.self), hasEscape)
                 }
                 // Validate that the code point is valid at this position
                 if identBuf.isEmpty {
@@ -784,7 +784,7 @@ extension JeffJSParseState {
                 } else {
                     guard jeffJS_isIdentNext(cp) else {
                         syntaxError("invalid identifier character")
-                        return (String(bytes: identBuf, encoding: .utf8) ?? "", hasEscape)
+                        return (String(decoding: identBuf, as: UTF8.self), hasEscape)
                     }
                 }
                 JeffJSParseState.appendUTF8(cp, to: &identBuf)
@@ -815,7 +815,7 @@ extension JeffJSParseState {
             }
         }
 
-        let ident = String(bytes: identBuf, encoding: .utf8) ?? ""
+        let ident = String(decoding: identBuf, as: UTF8.self)
         return (ident, hasEscape)
     }
 
@@ -2015,7 +2015,7 @@ extension JeffJSParseState {
         guard start < end && end <= bufLen else { return "0" }
         // Numeric separators (`1_000`) are validated while scanning; drop
         // them before conversion (the hex/octal/binary paths do the same).
-        return String(bytes: buf[start..<end].filter { $0 != 0x5F }, encoding: .utf8) ?? "0"
+        return String(decoding: buf[start..<end].filter { $0 != 0x5F }, as: UTF8.self)
     }
 }
 

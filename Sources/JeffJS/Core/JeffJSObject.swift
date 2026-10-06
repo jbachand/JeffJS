@@ -2054,6 +2054,15 @@ func jeffJS_createObject(ctx: JeffJSContext,
 /// copies that dominate profiles when enums with payloads cross function
 /// boundaries.
 ///
+/// True when `o` keeps its elements in the fast-array store (ref-type
+/// storage or the `.array` payload).
+@inline(__always)
+func jeffJS_isFastArray(_ o: JeffJSObject) -> Bool {
+    if o._fastArrayValues != nil { return true }
+    if case .array = o.payload { return true }
+    return false
+}
+
 /// Mirrors `find_own_property` in QuickJS.
 @inline(__always)
 func jeffJS_findOwnPropertyIndex(obj: JeffJSObject, atom: UInt32) -> Int {

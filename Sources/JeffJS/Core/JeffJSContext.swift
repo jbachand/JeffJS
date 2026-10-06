@@ -167,6 +167,154 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// groups), captured from the first one built.
     var regexpMatchShape: JeffJSShape? = nil
 
+    // MARK: Array iterators (interp.fastIterators)
+
+    /// %ArrayIteratorPrototype%.next, shared by every array iterator. The
+    /// context holds a reference so the for-of fast path can recognise it by
+    /// identity (the prototype's `next` slot holds another).
+    var arrayIterNextVal: JeffJSValue = .JS_UNDEFINED
+    /// interp.fastObjectBuiltins: "[object Tag]" results of
+    /// Object.prototype.toString for the builtin tags (strings are immutable,
+    /// so one shared reference per tag; released with the context).
+    var objectToStringCache: [JeffJSValue] = []
+    func cachedObjectToString(_ slot: Int, _ text: String) -> JeffJSValue {
+        if objectToStringCache.isEmpty { objectToStringCache = Array(repeating: .JS_UNDEFINED, count: 12) }
+        if slot < objectToStringCache.count {
+            let v = objectToStringCache[slot]
+            if v.isString { return v.dupValue() }
+            let nv = newString(text)
+            objectToStringCache[slot] = nv.dupValue()
+            return nv
+        }
+        return newString(text)
+    }
+
+    /// interp.fastFunctionName: transition shape of a plain function object
+    /// whose only own properties are `length` then `name` (pinned).
+    var funcNameLengthShape: JeffJSShape? = nil
+
+    /// interp.fastArrayBuiltins: the intrinsic %Array% and its original
+    /// `get [Symbol.species]` (references held by the context; identity only).
+    var arrayCtorIntrinsic: JeffJSValue = .JS_UNDEFINED
+    var arraySpeciesGetterVal: JeffJSValue = .JS_UNDEFINED
+    /// Transition shape of an array iterator `{_target, _index, _kind}`,
+    /// captured from the first one built (pinned: refCount + 1).
+    var arrayIterShape: JeffJSShape? = nil
+    private var _atomIterTarget: UInt32 = 0
+    private var _atomIterIndex: UInt32 = 0
+    private var _atomIterKind: UInt32 = 0
+    var atomIterTarget: UInt32 { if _atomIterTarget == 0 { _atomIterTarget = rt.findAtom("_target") }; return _atomIterTarget }
+    var atomIterIndex: UInt32 { if _atomIterIndex == 0 { _atomIterIndex = rt.findAtom("_index") }; return _atomIterIndex }
+    var atomIterKind: UInt32 { if _atomIterKind == 0 { _atomIterKind = rt.findAtom("_kind") }; return _atomIterKind }
+
+    /// Defines the shared `next` on %ArrayIteratorPrototype% (once).
+    func ensureArrayIterNext() {
+        if arrayIterNextVal.isObject { return }
+        let fn = newCFunction({ ctx, this, _ in ctx.arrayIteratorNext(this) }, name: "next", length: 0)
+        let aiProto = classProto[JSClassID.JS_CLASS_ARRAY_ITERATOR.rawValue]
+        if aiProto.isObject {
+            _ = definePropertyValue(obj: aiProto, atom: iterNextAtom, value: fn,
+                                    flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+        }
+        arrayIterNextVal = fn
+    }
+
+    /// %ArrayIteratorPrototype%.next() (ES §23.1.5.2.1).
+    func arrayIteratorNext(_ this: JeffJSValue) -> JeffJSValue {
+        guard let o = this.toObject() else { return makeIterResult(value: .undefined, done: true) }
+        let st = arrayIterStep(o)
+        if st.exception { return .exception }
+        return makeIterResult(value: st.value, done: st.done)
+    }
+
+    /// One step of an array iterator: the next value (owned) or done. On the
+    /// cached shape the state is read and written in its slots; any other
+    /// object goes through ordinary property access (the old behaviour).
+    /// Once done, `_target` is cleared ([[IteratedObject]] = undefined), so a
+    /// later push to the array does not resume a finished iteration.
+    func arrayIterStep(_ o: JeffJSObject) -> (value: JeffJSValue, done: Bool, exception: Bool) {
+        let fast: Bool
+        if let sh = arrayIterShape, let os = o.shape, os === sh, o.propValues.count >= 3, o.propExtraCount == 0 {
+            fast = true
+        } else {
+            fast = false
+        }
+        let target: JeffJSValue
+        let idx: Int
+        let kind: Int
+        if fast {
+            target = o.propValues[0]          // borrowed
+            let iv = o.propValues[1]
+            idx = iv.isInt ? Int(iv.toInt32()) : 0
+            let kv = o.propValues[2]
+            kind = kv.isInt ? Int(kv.toInt32()) : 1
+        } else {
+            let selfVal = JeffJSValue.makeObject(o)
+            target = getProperty(obj: selfVal, atom: atomIterTarget)   // owned
+            let iv = getProperty(obj: selfVal, atom: atomIterIndex)
+            let kv = getProperty(obj: selfVal, atom: atomIterKind)
+            idx = iv.isInt ? Int(iv.toInt32()) : 0
+            kind = kv.isInt ? Int(kv.toInt32()) : 1
+            iv.freeValue(); kv.freeValue()
+        }
+        defer { if !fast { target.freeValue() } }
+        guard target.isObject, let tobj = target.toObject() else {
+            return (.undefined, true, false)
+        }
+        // Length: a fast array's count, else ToLength(target.length).
+        var len = 0
+        var fastArray = false
+        if tobj.classID == JeffJSClassID.array.rawValue {
+            if let storage = tobj._fastArrayValues {
+                len = Int(storage.count); fastArray = true
+            } else if case .array(_, _, let c) = tobj.payload {
+                len = Int(c); fastArray = true
+            }
+        }
+        if !fastArray {
+            let lv = getProperty(obj: target, atom: JeffJSAtomID.JS_ATOM_length.rawValue)
+            if lv.isException { return (.undefined, true, true) }
+            if lv.isInt { len = Int(lv.toInt32()) }
+            else if lv.isFloat64 { let d = lv.toFloat64(); len = d.isFinite && d > 0 ? Int(min(d, 9007199254740991)) : 0 }
+            lv.freeValue()
+        }
+        if idx >= len {
+            let selfVal = JeffJSValue.makeObject(o)
+            if fast {
+                let old = o.propValues[0]
+                o.propValues[0] = .undefined
+                old.freeValue()
+            } else {
+                _ = setProperty(obj: selfVal, atom: atomIterTarget, value: .undefined)
+            }
+            return (.undefined, true, false)
+        }
+        if fast {
+            o.propValues[1] = .newInt32(Int32(truncatingIfNeeded: idx + 1))
+        } else {
+            _ = setProperty(obj: JeffJSValue.makeObject(o), atom: atomIterIndex,
+                            value: .newInt32(Int32(truncatingIfNeeded: idx + 1)))
+        }
+        if kind == 0 { return (.newInt32(Int32(truncatingIfNeeded: idx)), false, false) }
+        var val: JeffJSValue = .undefined
+        var have = false
+        if fastArray, let storage = tobj._fastArrayValues, idx < Int(storage.count), idx < storage.values.count {
+            let v = storage.values[idx]
+            if !v.isUninitialized { val = v.dupValue(); have = true }
+        }
+        if !have {
+            val = getPropertyUint32(obj: target, index: UInt32(truncatingIfNeeded: idx))
+            if val.isException { return (.undefined, true, true) }
+        }
+        if kind == 2 {
+            let pair = newArray()
+            _ = setPropertyUint32(obj: pair, index: 0, value: .newInt32(Int32(truncatingIfNeeded: idx)))
+            _ = setPropertyUint32(obj: pair, index: 1, value: val)
+            return (pair, false, false)
+        }
+        return (val, false, false)
+    }
+
     /// Transition shapes of arguments objects, by argument count (0...8), for
     /// sloppy (with `callee`) and strict functions: captured from the first
     /// object built with that count, then every later one is put on the
@@ -679,6 +827,14 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         iteratorCtor.freeValue()
         asyncIteratorProto.freeValue()
         arrayProtoValues.freeValue()
+        arrayIterNextVal.freeValue()
+        arrayIterNextVal = .JS_UNDEFINED
+        arrayCtorIntrinsic.freeValue()
+        arrayCtorIntrinsic = .JS_UNDEFINED
+        for v in objectToStringCache { v.freeValue() }
+        objectToStringCache = []
+        arraySpeciesGetterVal.freeValue()
+        arraySpeciesGetterVal = .JS_UNDEFINED
         throwTypeError.freeValue()
         evalObj.freeValue()
 
@@ -705,6 +861,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         globalVarObj = .JS_UNDEFINED
 
         // Free shapes
+        funcNameLengthShape = nil
+        arrayIterShape = nil
         arrayShape = nil
         plainObjectRootShape = nil
         argumentsShape = nil
@@ -6392,6 +6550,27 @@ extension JeffJSContext {
         // a shape rebuild on every `[...arr]`.
         let aiProto = classProto[JSClassID.JS_CLASS_ARRAY_ITERATOR.rawValue]
         let iter = aiProto.isObject ? newObjectProto(proto: aiProto) : newObject()
+        if JeffJSConfig.fastIterators, let o = iter.toObject() {
+            ensureArrayIterNext()
+            if let shape = arrayIterShape, shape.isHashed, shape.propCount == 3,
+               o.propValues.count == 0, let old = o.shape, shape.proto === old.proto {
+                shape.refCount += 1
+                o.shape = shape
+                jeffJS_leaveShape(rt, old)
+                o.appendDataValue(obj)
+                o.appendDataValue(.newInt32(0))
+                o.appendDataValue(.newInt32(Int32(kind)))
+                return iter
+            }
+            _ = setProperty(obj: iter, atom: atomIterTarget, value: obj)
+            _ = setProperty(obj: iter, atom: atomIterIndex, value: .newInt32(0))
+            _ = setProperty(obj: iter, atom: atomIterKind, value: .newInt32(Int32(kind)))
+            if arrayIterShape == nil, let sh = o.shape, sh.isHashed, sh.propCount == 3, o.propValues.count == 3 {
+                sh.refCount += 1   // the context keeps it alive
+                arrayIterShape = sh
+            }
+            return iter
+        }
         _ = setPropertyStr(obj: iter, name: "_target", value: obj)
         _ = setPropertyStr(obj: iter, name: "_index", value: .newInt32(0))
         _ = setPropertyStr(obj: iter, name: "_kind", value: .newInt32(Int32(kind)))

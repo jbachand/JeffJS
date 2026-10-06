@@ -493,8 +493,9 @@ struct JeffJSBuiltinJSON {
         }
 
         let numBytes = Array(state.input[startPos..<state.pos])
-        guard let numStr = String(bytes: numBytes, encoding: .utf8),
-              let value = Double(numStr) else {
+        // ASCII only (the scan above): no Foundation decoding (see jeffJS_stderrLine).
+        let numStr = String(decoding: numBytes, as: UTF8.self)
+        guard let value = Double(numStr) else {
             return state.ctx.throwSyntaxError("JSON.parse: invalid number")
         }
 

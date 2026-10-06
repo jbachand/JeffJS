@@ -111,6 +111,10 @@ struct JeffJSBuiltinArray {
         ctx.setPropertyGetSet(obj: arrayCtor,
                               atom: ctx.rt.dupAtom(JeffJSAtomID.JS_ATOM_Symbol_species.rawValue),
                               getter: speciesGetterVal, setter: nil)
+        ctx.arrayCtorIntrinsic.freeValue()
+        ctx.arrayCtorIntrinsic = arrayCtor.dupValue()
+        ctx.arraySpeciesGetterVal.freeValue()
+        ctx.arraySpeciesGetterVal = speciesGetterVal.dupValue()
 
         ctx.setGlobalConstructor(name: "Array", ctor: arrayCtor)
     }
@@ -830,8 +834,8 @@ struct JeffJSBuiltinArray {
         var n: Int64 = 0
 
         // Process this + all arguments
-        let items = [obj] + args
-        for item in items {
+        for itemIndex in -1..<args.count {
+            let item = itemIndex < 0 ? obj : args[itemIndex]
             let spreadable = isConcatSpreadable(ctx: ctx, obj: item)
 
             if spreadable {
@@ -840,6 +844,19 @@ struct JeffJSBuiltinArray {
 
                 if n + itemLen > MAX_SAFE_INTEGER {
                     return ctx.throwTypeError(message: "Array.prototype.concat: array length overflow")
+                }
+                // interp.fastArrayBuiltins: dense array into a dense result
+                // that ends at n — copy the slots (no holes to preserve).
+                if jeffJSFastArrayBuiltins, let io = item.toObject(), io.classID == JeffJSClassID.array.rawValue,
+                   let rObj = result.obj, rObj.classID == JeffJSClassID.array.rawValue,
+                   jeffJS_isFastArray(rObj.asClass), Int64(rObj.asClass.arrayCount) == n,
+                   !(rObj.asClass._fastArrayValues?.checked ?? false), JeffJSContext.arrayAcceptsFastPush(rObj),
+                   let snap = io.arraySnapshot(), Int64(snap.count) == itemLen,
+                   !snap.values.prefix(snap.count).contains(where: { $0.isUninitialized }) {
+                    let ro = rObj.asClass
+                    for k in 0..<snap.count { _ = ro.fastArrayPush(snap.values[k].dupValue()) }
+                    n += itemLen
+                    continue
                 }
 
                 for k in 0..<itemLen {
@@ -2025,12 +2042,27 @@ struct JeffJSBuiltinArray {
     /// Mirrors `JS_ArraySpeciesCreate` in QuickJS.
     private static func arraySpeciesCreate(ctx: JeffJSContext, obj: JeffJSValue, length: Int64) -> JeffJSValue {
         if !ctx.isArray(obj) {
-            return ctx.newArrayWithLength(Int(length))
+            return length == 0 && jeffJSFastArrayBuiltins ? ctx.newArray() : ctx.newArrayWithLength(Int(length))
         }
 
-        let ctorAtom = ctx.rt.findAtom("constructor")
-        let ctor = ctx.getProperty(obj: obj, atom: ctorAtom)
-        ctx.rt.freeAtom(ctorAtom)
+        let ctor: JeffJSValue
+        if jeffJSFastArrayBuiltins {
+            ctor = ctx.getProperty(obj: obj, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue)
+            // The intrinsic %Array% with its original @@species getter:
+            // Construct(%Array%, len) is ArrayCreate(len), no call needed.
+            if ctor.isObject, ctor.bits == ctx.arrayCtorIntrinsic.bits, let co = ctor.toObject() {
+                let si = jeffJS_findOwnPropertyIndex(obj: co, atom: JeffJSAtomID.JS_ATOM_Symbol_species.rawValue)
+                if si >= 0, let e = co.extra(at: si), e.kind == .getset, let g = e.getter,
+                   let sg = ctx.arraySpeciesGetterVal.toObject(), g === sg {
+                    ctor.freeValue()
+                    return length == 0 ? ctx.newArray() : ctx.newArrayWithLength(Int(length))
+                }
+            }
+        } else {
+            let ctorAtom = ctx.rt.findAtom("constructor")
+            ctor = ctx.getProperty(obj: obj, atom: ctorAtom)
+            ctx.rt.freeAtom(ctorAtom)
+        }
         if ctor.isException { return ctor }
         defer { ctor.freeValue() }
 

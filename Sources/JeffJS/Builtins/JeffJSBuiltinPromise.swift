@@ -1167,7 +1167,10 @@ struct JeffJSBuiltinPromise {
         }
 
         // Check if the resolution has a `then` method (thenable check)
-        let thenMethod = ctx.getPropertyStr(obj: resolution, name: "then")
+        // interp.fastObjectBuiltins: predefined atom, no per-resolution hash.
+        let thenMethod = jeffJSFastObjectBuiltins
+            ? ctx.getProperty(obj: resolution, atom: JeffJSAtomID.JS_ATOM_then.rawValue)
+            : ctx.getPropertyStr(obj: resolution, name: "then")
 
         if thenMethod.isException {
             let exception = ctx.getException()

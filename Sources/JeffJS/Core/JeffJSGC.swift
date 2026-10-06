@@ -190,7 +190,15 @@ func freeGCObjectAtZeroRefcount(_ rt: JeffJSRuntime, _ hdr: JeffJSGCObjectHeader
     // collect more zero-ref objects), then release ARC retains in a batch. This
     // prevents use-after-free when cyclic objects reference each other.
     rt.inFreeChain = true
-    var toRelease: [JeffJSGCObjectHeader] = []
+    // interp.fastFreeChain: reuse the runtime's scratch list instead of
+    // allocating an array for every object whose count reaches zero.
+    var toRelease: [JeffJSGCObjectHeader]
+    if JeffJSRuntime.fastFreeChain {
+        toRelease = rt.freeChainScratch
+        rt.freeChainScratch = []
+    } else {
+        toRelease = []
+    }
 
     // Phase 1: Process children (freeObject/freeShape/etc nil out refs)
     freeGCObjectChildren(rt, hdr)
@@ -215,6 +223,10 @@ func freeGCObjectAtZeroRefcount(_ rt: JeffJSRuntime, _ hdr: JeffJSGCObjectHeader
         } else {
             Unmanaged.passUnretained(obj).release()
         }
+    }
+    if JeffJSRuntime.fastFreeChain, toRelease.capacity <= 4096 {
+        toRelease.removeAll(keepingCapacity: true)
+        rt.freeChainScratch = toRelease
     }
 }
 

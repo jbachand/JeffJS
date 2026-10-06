@@ -370,6 +370,9 @@ nonisolated final class JeffJSRuntime {
     var gcPhase: JSGCPhaseEnum
     /// Re-entrancy guard for freeGCObject recursive child freeing.
     var inFreeChain: Bool = false
+    /// interp.fastFreeChain: the free chain's release list, reused.
+    var freeChainScratch: [JeffJSGCObjectHeader] = []
+    static let fastFreeChain = JeffJSConfig.fastFreeChain
     /// Set to true after context init completes. Enables object freeing in freeValue().
     /// During init, objects are context-scoped and freed by context.free().
     var initComplete: Bool = false
@@ -428,6 +431,14 @@ nonisolated final class JeffJSRuntime {
 
     /// Pool of interpreter value buffers: (pointer, capacity) pairs.
     var interpBufPool: [(UnsafeMutablePointer<JeffJSValue>, Int)] = []
+    /// interp.fastCallEntry: the same pool as a fixed unsafe stack of
+    /// `interpBufMinSlots`-slot buffers (a Swift array's popLast/append paid
+    /// uniqueness checks and range replacement on every native→JS call).
+    /// Allocated on first use, freed by drainInterpPools().
+    var interpBufStack: UnsafeMutablePointer<UnsafeMutablePointer<JeffJSValue>>? = nil
+    var interpBufStackCount = 0
+    static let interpBufStackMax = max(1, min(JeffJSConfig.bufPoolMax, 64))
+    static let fastCallEntry = JeffJSConfig.fastCallEntry
 
     @inline(__always)
     func acquireFrame() -> JeffJSStackFrame {
@@ -512,6 +523,17 @@ nonisolated final class JeffJSRuntime {
     func acquireInterpBuf(size: Int, initializedPrefix: Int? = nil) -> (UnsafeMutablePointer<JeffJSValue>, Int) {
         let size = max(size, Self.interpBufMinSlots)
         let clearCount = min(initializedPrefix ?? size, size)
+        if Self.fastCallEntry {
+            if size == Self.interpBufMinSlots, interpBufStackCount > 0, let st = interpBufStack {
+                interpBufStackCount -= 1
+                let ptr = st[interpBufStackCount]
+                for i in 0..<clearCount { ptr[i] = .undefined }
+                return (ptr, size)
+            }
+            let ptr = UnsafeMutablePointer<JeffJSValue>.allocate(capacity: size)
+            ptr.initialize(repeating: .undefined, count: size)
+            return (ptr, size)
+        }
         if let (ptr, cap) = interpBufPool.popLast() {
             if cap >= size {
                 for i in 0..<clearCount { ptr[i] = .undefined }
@@ -529,6 +551,19 @@ nonisolated final class JeffJSRuntime {
 
     @inline(__always)
     func releaseInterpBuf(_ ptr: UnsafeMutablePointer<JeffJSValue>, capacity: Int) {
+        if Self.fastCallEntry {
+            if capacity == Self.interpBufMinSlots, interpBufStackCount < Self.interpBufStackMax {
+                if interpBufStack == nil {
+                    interpBufStack = .allocate(capacity: Self.interpBufStackMax)
+                }
+                interpBufStack![interpBufStackCount] = ptr
+                interpBufStackCount += 1
+            } else {
+                ptr.deinitialize(count: capacity)
+                ptr.deallocate()
+            }
+            return
+        }
         if interpBufPool.count < JeffJSConfig.bufPoolMax && capacity <= Self.interpBufMinSlots {
             interpBufPool.append((ptr, capacity))
         } else {
@@ -539,6 +574,15 @@ nonisolated final class JeffJSRuntime {
 
     /// Drain the interpreter buffer pool (called from free()).
     func drainInterpPools() {
+        if let st = interpBufStack {
+            for i in 0..<interpBufStackCount {
+                st[i].deinitialize(count: Self.interpBufMinSlots)
+                st[i].deallocate()
+            }
+            st.deallocate()
+            interpBufStack = nil
+            interpBufStackCount = 0
+        }
         for (ptr, cap) in interpBufPool {
             ptr.deinitialize(count: cap)
             ptr.deallocate()
@@ -827,6 +871,9 @@ nonisolated final class JeffJSRuntime {
     /// This must be called after all contexts have been freed.
     /// After calling free(), the runtime must not be used.
     func free() {
+        #if JEFFJS_JSPROF
+        jeffJS_profDump(label: "runtime free")
+        #endif
         // Drop the strong active-runtime reference if it points at us
         // (per-object ownerRuntime back-pointers are nil'd in clearGCState).
         if JeffJSGCObjectHeader.activeRuntime === self {
@@ -995,6 +1042,15 @@ nonisolated final class JeffJSRuntime {
         stackLimit = floor + margin
     }
 
+    /// JEFFJS_STACK_DEBUG=1 line for a stack trip. Out of line: see
+    /// `jeffJS_stderrLine` (a `String.Encoding` use in the hot check cost a
+    /// metadata accessor + `___chkstk_darwin` on every call).
+    @inline(never)
+    private func logStackTrip(_ currentSP: UInt) {
+        guard ProcessInfo.processInfo.environment["JEFFJS_STACK_DEBUG"] == "1" else { return }
+        jeffJS_stderrLine("[stack] trip: sp=0x\(String(currentSP, radix: 16)) limit=0x\(String(stackLimit, radix: 16)) top=0x\(String(stackTop, radix: 16)) used=\((stackTop &- currentSP) / 1024)KB budget=\((stackTop &- stackLimit) / 1024)KB")
+    }
+
     func checkStackOverflow(margin: UInt = 0) -> Bool {
         var localVar: UInt = 0
         var currentSP: UInt = 0
@@ -1014,9 +1070,7 @@ nonisolated final class JeffJSRuntime {
         if stackLimit == 0 { return false }
         // Stack grows downward on most architectures
         let over = currentSP < stackLimit + margin
-        if over, ProcessInfo.processInfo.environment["JEFFJS_STACK_DEBUG"] == "1" {
-            FileHandle.standardError.write("[stack] trip: sp=0x\(String(currentSP, radix: 16)) limit=0x\(String(stackLimit, radix: 16)) top=0x\(String(stackTop, radix: 16)) used=\((stackTop &- currentSP) / 1024)KB budget=\((stackTop &- stackLimit) / 1024)KB\n".data(using: .utf8)!)
-        }
+        if over { logStackTrip(currentSP) }
         return over
     }
 
