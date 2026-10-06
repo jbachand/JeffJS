@@ -2267,6 +2267,13 @@ extension JeffJSContext {
     /// trap threw, or the proxy is revoked). The `in` operator needs the third
     /// answer; everything else is happy with the Bool wrapper above.
     func hasPropertyValueEx(obj: JeffJSValue, key: JeffJSValue) -> Int {
+        // interp.fastObjectBuiltins: a string key that already interned its
+        // (named, non-index) atom — every key from Object.keys / for-in —
+        // needs no Swift String round trip and no re-hash.
+        if jeffJSFastObjectBuiltins, key.isString {
+            let a = jeffJS_keyedAtom(key)
+            if a != 0 { return hasPropertyEx(obj: obj, atom: a) }
+        }
         if key.isString, let str = key.stringValue {
             let s = str.toSwiftString()
             // Check if the string represents an array index (e.g. "0", "1", ...)
