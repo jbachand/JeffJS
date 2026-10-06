@@ -7588,7 +7588,7 @@ struct JeffJSInterpreter {
                     // Early exit: same teardown as the epilogue (detach captured
                     // locals, return the frame to its pool).
                     if frame.hasLiveVarRefs {
-                        jeffJS_syncBufToFrame(frame, buf, varBase)
+                        jeffJS_syncForDetach(frame, buf, varBase)
                         for vr in frame.liveVarRefs where !vr.isDetached {
                             vr.value = vr.pvalue.dupValue()
                             vr.isDetached = true
@@ -7736,7 +7736,7 @@ struct JeffJSInterpreter {
                         // Early exit: same teardown as the epilogue (detach
                         // captured locals, return the frame to its pool).
                         if frame.hasLiveVarRefs {
-                            jeffJS_syncBufToFrame(frame, buf, varBase)
+                            jeffJS_syncForDetach(frame, buf, varBase)
                             for vr in frame.liveVarRefs where !vr.isDetached {
                                 vr.value = vr.pvalue.dupValue()
                                 vr.isDetached = true
@@ -8891,7 +8891,7 @@ struct JeffJSInterpreter {
                 for a in tcArgs { a.freeValue() }
                 if tcResult.isException { retVal = .exception; break dispatchLoop }
                 if frame.hasLiveVarRefs {
-                    jeffJS_syncBufToFrame(frame, buf, varBase)
+                    jeffJS_syncForDetach(frame, buf, varBase)
                     for vr in frame.liveVarRefs where !vr.isDetached {
                         vr.value = vr.pvalue.dupValue(); vr.isDetached = true; vr.parentFrame = nil; vr.slot = nil
                     }
@@ -8953,7 +8953,7 @@ struct JeffJSInterpreter {
                 for a in tcmArgs { a.freeValue() }
                 if tcmResult.isException { retVal = .exception; break dispatchLoop }
                 if frame.hasLiveVarRefs {
-                    jeffJS_syncBufToFrame(frame, buf, varBase)
+                    jeffJS_syncForDetach(frame, buf, varBase)
                     for vr in frame.liveVarRefs where !vr.isDetached {
                         vr.value = vr.pvalue.dupValue(); vr.isDetached = true; vr.parentFrame = nil; vr.slot = nil
                     }
@@ -9051,7 +9051,7 @@ struct JeffJSInterpreter {
                     // ── Inline return: restore caller's frame ──
                     // 1. Sync buf → frame and detach live var-refs
                     if frame.hasLiveVarRefs {
-                        jeffJS_syncBufToFrame(frame, buf, varBase)
+                        jeffJS_syncForDetach(frame, buf, varBase)
                         for vr in frame.liveVarRefs where !vr.isDetached {
                             // pvalue prefers frame.buf, which holds padded arg
                             // slots that argBuf (un-padded) does not.
@@ -9097,7 +9097,7 @@ struct JeffJSInterpreter {
                 if rt.inlineStackTop != inlineBase {
                     // ── Inline return undefined: restore caller's frame ──
                     if frame.hasLiveVarRefs {
-                        jeffJS_syncBufToFrame(frame, buf, varBase)
+                        jeffJS_syncForDetach(frame, buf, varBase)
                         for vr in frame.liveVarRefs where !vr.isDetached {
                             // pvalue prefers frame.buf, which holds padded arg
                             // slots that argBuf (un-padded) does not.
@@ -13018,7 +13018,7 @@ struct JeffJSInterpreter {
                 while rt.inlineStackTop != inlineBase {
                     // Run frame epilogue for current (callee) frame
                     if frame.hasLiveVarRefs {
-                        jeffJS_syncBufToFrame(frame, buf, varBase)
+                        jeffJS_syncForDetach(frame, buf, varBase)
                         for vr in frame.liveVarRefs where !vr.isDetached {
                             // pvalue prefers frame.buf, which holds padded arg
                             // slots that argBuf (un-padded) does not.
@@ -13124,7 +13124,7 @@ struct JeffJSInterpreter {
         // Skipped entirely for the common case (no captures): the sync loops
         // and detach walk cost real time at 250k calls/sec.
         if frame.hasLiveVarRefs {
-            jeffJS_syncBufToFrame(frame, buf, varBase)
+            jeffJS_syncForDetach(frame, buf, varBase)
             for vr in frame.liveVarRefs where !vr.isDetached {
                 // pvalue prefers frame.buf (still set here), which holds the
                 // padded arg slots that the un-padded argBuf does not.
@@ -13232,6 +13232,17 @@ private func jeffJS_closeIteratorForUnwind(_ ctx: JeffJSContext, _ iter: JeffJSV
     ctx.iteratorClose(iter: iter, isThrow: true)
     if !rt.currentException.isNull { rt.currentException.freeValue() }
     rt.currentException = pending
+}
+
+/// Before detaching a frame's live var-refs (return / tail call / unwind):
+/// each detach reads `pvalue`, which prefers the frame's interpreter buffer,
+/// so the frame arrays only need building when no buffer is attached.
+/// interp.fastCallEntry; the sync allocated two arrays on every return of a
+/// function whose locals a closure captured (or that built `arguments`).
+@inline(__always)
+private func jeffJS_syncForDetach(_ frame: JeffJSStackFrame, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {
+    if JeffJSRuntime.fastCallEntry, frame.buf != nil { return }
+    jeffJS_syncBufToFrame(frame, buf, varBase)
 }
 
 private func jeffJS_syncBufToFrame(_ frame: JeffJSStackFrame, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {
