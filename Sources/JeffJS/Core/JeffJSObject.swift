@@ -805,7 +805,13 @@ nonisolated class JeffJSGCObjectHeader {
     /// an O(1) swap-remove instead of a linear scan (removeGCObject was 98%
     /// of promise-chain time). Encoding: >= 0 → index in rt.gcObjects;
     /// -1 → not tracked; <= -2 → index (-2 - value) in rt.gcTmpObjects.
-    var gcListIndex: Int = -1
+    final var gcListIndex: Int {
+        @inline(__always) get { Int(_gcListIndex) }
+        @inline(__always) set { _gcListIndex = Int32(truncatingIfNeeded: newValue) }
+    }
+    /// 32-bit storage (perf/watch-object-size): packs next to `gcObjType` and
+    /// `mark`, 8 bytes off every GC object's header.
+    final var _gcListIndex: Int32 = -1
     /// Back-pointer to the owning runtime so the zero-arg freeValue() can
     /// actually free the object when refCount hits 0.
     ///
@@ -1686,80 +1692,217 @@ nonisolated final class JeffJSFastArrayStorage {
 /// Core object representation.  Mirrors QuickJS `JSObject`.
 nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
 
-    // -- Object flags (packed as individual bools to keep things readable) ----
+    // =========================================================================
+    // Layout (perf/watch-object-size, 2026-10-05). 96 bytes per object, was
+    // 320: the watch's 300 MB ceiling made bytes per object the budget.
+    //   header: isa, Swift refcount, refCount, gcObjType, mark, gcListIndex32,
+    //   ownerRuntime                                                  (40 B)
+    //   _flags16, realmIndex, lazyFlags, _classID16, weakrefCount32,
+    //   _propExtraCount32, _shapeU, propValues (ptr + 2 x UInt32),
+    //   aux, _fastArrayValues                                         (56 B)
+    // Everything only functions, exotic objects or rare features use lives
+    // in `aux` (JeffJSObjectAux), allocated on the first non-default write;
+    // plain objects (90 % of a page's heap) never allocate one. Every moved
+    // field keeps its name and type as a computed property, so call sites
+    // are unchanged. The bool flags are bits of `_flags`.
+    // =========================================================================
 
-    var isStdArrayPrototype: Bool       = false
-    var extensible: Bool                = true
-    var freeMark: Bool                  = false
-    var isExotic: Bool                  = false
-    var fastArray: Bool                 = false
-    var isConstructor: Bool             = false
-    var hasImmutablePrototype: Bool     = false
-    var tmpMark: Bool                   = false
-    var isHTMLDDA: Bool                 = false
-    /// The context's global object (freeObject tripwire; never recycled).
-    var isProtectedGlobal: Bool         = false
-    /// A native ECMAScript accessor ("get size", "get __proto__", "get
-    /// [Symbol.species]") whose source text keeps the "get "/"set " prefix,
-    /// as JavaScriptCore prints them; DOM (WebIDL) accessors print the bare
-    /// attribute name (`function cookie()`). Fills existing flag padding.
-    var nativeNameKeepsAccessorPrefix: Bool = false
-    /// A JS-implemented platform function (a host polyfill standing in for a
-    /// WebKit built-in): Function.prototype.toString prints it as native code.
-    /// Set through `JeffJSContext.markPlatformFunction`.
-    var isPlatformFunction: Bool = false
+    /// Object flags, one bit each (see the computed properties below).
+    final var _flags: UInt16 = JeffJSObject.flagExtensible
     /// The realm (JeffJSContext.realmIndex) a function object belongs to: the
     /// context whose code created the closure, or a native function's
     /// `realm`. 0 for everything created by a runtime's ordinary contexts.
     /// Calls switch to the callee's realm when it differs from the caller's
     /// (ES §10.2.1.1 PrepareForOrdinaryCall step 4-6, §10.3.1 [[Call]] of
-    /// built-ins: the callee's realm becomes the current Realm Record). Fills
-    /// existing flag padding.
+    /// built-ins: the callee's realm becomes the current Realm Record).
     var realmIndex: UInt8 = 0
-
-    // -- Class & weak-ref ----------------------------------------------------
-
-    var classID: Int                    = 0
-    var weakrefCount: UInt32            = 0
-
-    // -- Shape / properties --------------------------------------------------
-
-    var shape: JeffJSShape?             = nil {
-        didSet { shapeIdentity = shape.map { UnsafeRawPointer(Unmanaged.passUnretained($0).toOpaque()) } }
-    }
-    /// Unretained identity of `shape` for inline-cache checks: comparing
-    /// this avoids loading (retaining) the shape reference on every access.
-    var shapeIdentity: UnsafeRawPointer? = nil
+    /// Which own properties of this object are deferred (see "Lazy function
+    /// prototype" below). One byte so the property-lookup fast path tests a
+    /// single field (`lazyFlags != 0`).
+    ///   bit 0: `prototype` (plain function)
+    ///   bit 1: `name` + `length` (bytecode function)
+    ///   bit 2: `stack` (Error)
+    var lazyFlags: UInt8 = 0
+    final var _classID: UInt16 = 0
+    var weakrefCount: UInt32 = 0
+    /// `propExtra.count` mirrored in a plain field: the hot `extra(at:)`
+    /// test then reads one Int32 instead of the side box.
+    final var _propExtraCount: Int32 = 0
+    /// The shape, retained manually (+1 held while set): its raw bits are the
+    /// inline-cache identity, so `shapeIdentity` needs no field of its own.
+    final var _shapeU: Unmanaged<JeffJSShape>? = nil
 
     /// Split property storage (see JeffJSProperty). `propValues` holds the data
     /// value for every slot (`.undefined` for accessor/varRef/autoInit slots);
-    /// trivial ContiguousArray → no element ARC, no array bridging, no
-    /// enum-witness per access. `propExtra` is the parallel array (same length),
-    /// nil for plain data slots. Data values keep the existing manual refcount
+    /// trivial storage → no element ARC, no array bridging, no enum-witness
+    /// per access. `propExtra` is the parallel array (same length), nil for
+    /// plain data slots. Data values keep the existing manual refcount
     /// discipline (dup on read, freeValue on overwrite/object-free).
-    /// INVARIANT: propValues.count == propExtra.count.
+    /// INVARIANT: propExtra.isEmpty || propValues.count == propExtra.count.
     /// Access via propEntry(at:)/setPropEntry(at:_:)/appendProp(_:)/dataValue(at:).
     var propValues = JeffJSPropStorage()
-    var propExtra: ContiguousArray<JeffJSPropertyExtra?> = [] {
-        didSet { propExtraCount = propExtra.count }
+
+    /// Side box for the fields most objects never use (nil = all default).
+    final var aux: JeffJSObjectAux? = nil
+
+    // -- Fast array storage (reference-type bypass for COW avoidance) --------
+    // When non-nil, this is the authoritative backing store for the array.
+    // Used by the interpreter's Array.prototype.push fast path to avoid
+    // the COW copy overhead of enum destructuring on every push.
+    // Lazily populated by fastArrayPush(); synced back to payload when
+    // external code reads .array payload via syncArrayPayload().
+    var _fastArrayValues: JeffJSFastArrayStorage?
+
+    @inline(__always) final func ensureAux() -> JeffJSObjectAux {
+        if let a = aux { return a }
+        let a = JeffJSObjectAux()
+        aux = a
+        return a
     }
-    /// `propExtra.count` mirrored in a plain field: the hot `extra(at:)`
-    /// test then reads one Int instead of the array buffer.
-    var propExtraCount: Int = 0
+
+    // -- Flag bits -------------------------------------------------------------
+
+    static let flagStdArrayPrototype: UInt16       = 1 << 0
+    static let flagExtensible: UInt16              = 1 << 1
+    static let flagFreeMark: UInt16                = 1 << 2
+    static let flagExotic: UInt16                  = 1 << 3
+    static let flagFastArray: UInt16               = 1 << 4
+    static let flagConstructor: UInt16             = 1 << 5
+    static let flagImmutablePrototype: UInt16      = 1 << 6
+    static let flagTmpMark: UInt16                 = 1 << 7
+    static let flagHTMLDDA: UInt16                 = 1 << 8
+    static let flagProtectedGlobal: UInt16         = 1 << 9
+    static let flagNativeNameKeepsPrefix: UInt16   = 1 << 10
+    static let flagPlatformFunction: UInt16        = 1 << 11
+
+    @inline(__always) final func _flag(_ m: UInt16) -> Bool { (_flags & m) != 0 }
+    @inline(__always) final func _setFlag(_ m: UInt16, _ v: Bool) {
+        if v { _flags |= m } else { _flags &= ~m }
+    }
+
+    var isStdArrayPrototype: Bool {
+        @inline(__always) get { _flag(JeffJSObject.flagStdArrayPrototype) }
+        @inline(__always) set { _setFlag(JeffJSObject.flagStdArrayPrototype, newValue) }
+    }
+    var extensible: Bool {
+        @inline(__always) get { _flag(JeffJSObject.flagExtensible) }
+        @inline(__always) set { _setFlag(JeffJSObject.flagExtensible, newValue) }
+    }
+    var freeMark: Bool {
+        @inline(__always) get { _flag(JeffJSObject.flagFreeMark) }
+        @inline(__always) set { _setFlag(JeffJSObject.flagFreeMark, newValue) }
+    }
+    var isExotic: Bool {
+        @inline(__always) get { _flag(JeffJSObject.flagExotic) }
+        @inline(__always) set { _setFlag(JeffJSObject.flagExotic, newValue) }
+    }
+    var fastArray: Bool {
+        @inline(__always) get { _flag(JeffJSObject.flagFastArray) }
+        @inline(__always) set { _setFlag(JeffJSObject.flagFastArray, newValue) }
+    }
+    var isConstructor: Bool {
+        @inline(__always) get { _flag(JeffJSObject.flagConstructor) }
+        @inline(__always) set { _setFlag(JeffJSObject.flagConstructor, newValue) }
+    }
+    var hasImmutablePrototype: Bool {
+        @inline(__always) get { _flag(JeffJSObject.flagImmutablePrototype) }
+        @inline(__always) set { _setFlag(JeffJSObject.flagImmutablePrototype, newValue) }
+    }
+    var tmpMark: Bool {
+        @inline(__always) get { _flag(JeffJSObject.flagTmpMark) }
+        @inline(__always) set { _setFlag(JeffJSObject.flagTmpMark, newValue) }
+    }
+    var isHTMLDDA: Bool {
+        @inline(__always) get { _flag(JeffJSObject.flagHTMLDDA) }
+        @inline(__always) set { _setFlag(JeffJSObject.flagHTMLDDA, newValue) }
+    }
+    /// The context's global object (freeObject tripwire; never recycled).
+    var isProtectedGlobal: Bool {
+        @inline(__always) get { _flag(JeffJSObject.flagProtectedGlobal) }
+        @inline(__always) set { _setFlag(JeffJSObject.flagProtectedGlobal, newValue) }
+    }
+    /// A native ECMAScript accessor ("get size", "get __proto__", "get
+    /// [Symbol.species]") whose source text keeps the "get "/"set " prefix,
+    /// as JavaScriptCore prints them; DOM (WebIDL) accessors print the bare
+    /// attribute name (`function cookie()`).
+    var nativeNameKeepsAccessorPrefix: Bool {
+        @inline(__always) get { _flag(JeffJSObject.flagNativeNameKeepsPrefix) }
+        @inline(__always) set { _setFlag(JeffJSObject.flagNativeNameKeepsPrefix, newValue) }
+    }
+    /// A JS-implemented platform function (a host polyfill standing in for a
+    /// WebKit built-in): Function.prototype.toString prints it as native code.
+    /// Set through `JeffJSContext.markPlatformFunction`.
+    var isPlatformFunction: Bool {
+        @inline(__always) get { _flag(JeffJSObject.flagPlatformFunction) }
+        @inline(__always) set { _setFlag(JeffJSObject.flagPlatformFunction, newValue) }
+    }
+
+    // -- Class ------------------------------------------------------------------
+
+    var classID: Int {
+        @inline(__always) get { Int(_classID) }
+        @inline(__always) set { _classID = UInt16(truncatingIfNeeded: newValue) }
+    }
+
+    // -- Shape --------------------------------------------------------------------
+
+    var shape: JeffJSShape? {
+        @inline(__always) get { _shapeU?.takeUnretainedValue() }
+        set {
+            let old = _shapeU
+            _shapeU = newValue.map { Unmanaged.passRetained($0) }
+            old?.release()
+        }
+    }
+    /// Unretained identity of `shape` for inline-cache checks: comparing
+    /// this avoids loading (retaining) the shape reference on every access.
+    var shapeIdentity: UnsafeRawPointer? {
+        @inline(__always) get { _shapeU.map { UnsafeRawPointer($0.toOpaque()) } }
+    }
+
+    // -- Rare-property side table --------------------------------------------
+
+    var propExtra: ContiguousArray<JeffJSPropertyExtra?> {
+        get { aux?.propExtra ?? [] }
+        set {
+            if newValue.isEmpty && aux == nil { _propExtraCount = 0; return }
+            let a = ensureAux()
+            a.propExtra = newValue
+            _propExtraCount = Int32(truncatingIfNeeded: a.propExtra.count)
+        }
+        _modify {
+            let a = ensureAux()
+            yield &a.propExtra
+            _propExtraCount = Int32(truncatingIfNeeded: a.propExtra.count)
+        }
+    }
+    var propExtraCount: Int {
+        @inline(__always) get { Int(_propExtraCount) }
+    }
 
     // -- First weak ref in chain ---------------------------------------------
 
-    var firstWeakRef: AnyObject?        = nil
+    var firstWeakRef: AnyObject? {
+        @inline(__always) get { aux?.firstWeakRef }
+        set { if newValue == nil && aux == nil { return }; ensureAux().firstWeakRef = newValue }
+    }
 
     // -- Payload (union) -----------------------------------------------------
 
-    var payload: JeffJSObjectPayload    = .opaque(nil) {
-        didSet {
-            if case .cFunc(let realm, let cf, _, _, let magic) = payload {
-                cFuncFast = cf; cMagicFast = Int(magic)
+    var payload: JeffJSObjectPayload {
+        @inline(__always) get {
+            if let a = aux { return a.payload }
+            return .opaque(nil)
+        }
+        set {
+            if aux == nil, case .opaque(let o) = newValue, o == nil { return }
+            let a = ensureAux()
+            a.payload = newValue
+            if case .cFunc(let realm, let cf, _, _, let magic) = newValue {
+                a.cFuncFast = cf; a.cMagicFast = Int(magic)
                 if let realm { realmIndex = realm.realmIndex }
             }
-            else if cFuncFast != nil { cFuncFast = nil }
+            else if a.cFuncFast != nil { a.cFuncFast = nil }
         }
     }
 
@@ -1770,48 +1913,54 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
     /// Native-function dispatch fields, mirrored from the `.cFunc` payload so
     /// callFunction never pattern-matches (copies) the payload enum: that copy
     /// retained the realm context, whose refcount lives in a side table.
-    var cFuncFast: JSCFunctionType? = nil
-    var cMagicFast: Int = 0
-    var fbFast: JeffJSFunctionBytecode? = nil {
-        didSet { fbFastU = fbFast.map { Unmanaged.passUnretained($0) } }
+    var cFuncFast: JSCFunctionType? {
+        @inline(__always) get { aux?.cFuncFast }
+        set { if newValue == nil && aux == nil { return }; ensureAux().cFuncFast = newValue }
+    }
+    var cMagicFast: Int {
+        @inline(__always) get { aux?.cMagicFast ?? 0 }
+        set { if newValue == 0 && aux == nil { return }; ensureAux().cMagicFast = newValue }
+    }
+    var fbFast: JeffJSFunctionBytecode? {
+        @inline(__always) get { aux?.fbFast }
+        set {
+            if newValue == nil && aux == nil { return }
+            let a = ensureAux()
+            a.fbFast = newValue
+            a.fbFastU = newValue.map { Unmanaged.passUnretained($0) }
+        }
     }
     /// Unmanaged mirror of `fbFast` for the trace's call path: a plain load,
     /// where reading the strong optional retains and releases per call.
-    var fbFastU: Unmanaged<JeffJSFunctionBytecode>? = nil
-    var varRefsFast: [JeffJSVarRef?]    = [] {
-        didSet {
-            // Mirror as an unmanaged raw buffer for the fast trace: no array
-            // retain per call and no element retain per access. The array
-            // keeps the var-refs alive, so unretained pointers are safe.
-            if let p = varRefsRaw { p.deallocate(); varRefsRaw = nil; varRefsRawCount = 0 }
-            if !varRefsFast.isEmpty {
-                let p = UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>.allocate(capacity: varRefsFast.count)
-                var i = 0
-                for vr in varRefsFast {
-                    if let vr = vr { p[i] = Unmanaged.passUnretained(vr) } else { p[i] = nil }
-                    i += 1
-                }
-                varRefsRaw = p
-                varRefsRawCount = varRefsFast.count
-            }
+    var fbFastU: Unmanaged<JeffJSFunctionBytecode>? {
+        @inline(__always) get { aux?.fbFastU }
+    }
+    var varRefsFast: [JeffJSVarRef?] {
+        @inline(__always) get { aux?.varRefsFast ?? [] }
+        set {
+            if newValue.isEmpty && aux == nil { return }
+            ensureAux().setVarRefs(newValue)
         }
     }
-    var varRefsRaw: UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>? = nil
-    var varRefsRawCount: Int = 0
-
-    // -- Fast array storage (reference-type bypass for COW avoidance) --------
-    // When non-nil, this is the authoritative backing store for the array.
-    // Used by the interpreter's Array.prototype.push fast path to avoid
-    // the COW copy overhead of enum destructuring on every push.
-    // Lazily populated by fastArrayPush(); synced back to payload when
-    // external code reads .array payload via syncArrayPayload().
-    var _fastArrayValues: JeffJSFastArrayStorage?
+    /// Unmanaged raw mirror of `varRefsFast` for the fast trace: no array
+    /// retain per call and no element retain per access. The array keeps the
+    /// var-refs alive, so unretained pointers are safe.
+    var varRefsRaw: UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>? {
+        @inline(__always) get { aux?.varRefsRaw }
+    }
+    var varRefsRawCount: Int {
+        @inline(__always) get { aux?.varRefsRawCount ?? 0 }
+    }
 
     // -- Arrow function lexical `this` capture --------------------------------
     // When an arrow function closure is created, the enclosing function's
     // `this` value is stored here so that `push_this` inside the arrow
     // function returns the lexical `this` instead of the call-site `this`.
-    var arrowThisVal: JeffJSValue? = nil
+    var arrowThisVal: JeffJSValue? {
+        @inline(__always) get { aux?.arrowThisVal }
+        set { if newValue == nil && aux == nil { return }; ensureAux().arrowThisVal = newValue }
+    }
+
 
     // -- Lazy function prototype ----------------------------------------------
     // Plain function closures defer building `F.prototype = { constructor: F }`
@@ -1820,10 +1969,6 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
     /// Which own properties of this object are deferred. Kept as one bitmask
     /// so the property-lookup fast path tests a single byte instead of three
     /// separate fields (`lazyFlags != 0`).
-    ///   bit 0: `prototype` (plain function)
-    ///   bit 1: `name` + `length` (bytecode function)
-    ///   bit 2: `stack` (Error)
-    var lazyFlags: UInt8 = 0
     @inline(__always) static let lazyPrototypeBit: UInt8 = 1
     @inline(__always) static let lazyNameLengthBit: UInt8 = 2
     @inline(__always) static let lazyStackBit: UInt8 = 4
@@ -1873,10 +2018,37 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
     }
 
     // -- Associated storage (moved from objc_setAssociatedObject) ----------
-    var storedProto: JeffJSObject? = nil
-    var storedCFunction: ((JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue)? = nil
-    var storedCFunctionLength: Int = 0
-    var storedPrimitiveValue: JeffJSValue = .undefined
+    /// The prototype mirror. The shape owns the counted reference to the
+    /// prototype (`jeffJS_shapeSetProto`) and every write path keeps the two
+    /// equal, so with a shape the prototype is read from it; only a
+    /// shape-less object (transiently, while being built) keeps its own copy
+    /// in the side box. Was a strong stored field on every object.
+    var storedProto: JeffJSObject? {
+        @inline(__always) get {
+            if let s = _shapeU { return s._withUnsafeGuaranteedRef { $0.proto } }
+            return aux?.storedProto
+        }
+        set {
+            if _shapeU != nil {
+                if let a = aux, a.storedProto != nil { a.storedProto = nil }
+                return
+            }
+            if newValue == nil && aux == nil { return }
+            ensureAux().storedProto = newValue
+        }
+    }
+    var storedCFunction: ((JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue)? {
+        @inline(__always) get { aux?.storedCFunction }
+        set { if newValue == nil && aux == nil { return }; ensureAux().storedCFunction = newValue }
+    }
+    var storedCFunctionLength: Int {
+        @inline(__always) get { aux?.storedCFunctionLength ?? 0 }
+        set { if newValue == 0 && aux == nil { return }; ensureAux().storedCFunctionLength = newValue }
+    }
+    var storedPrimitiveValue: JeffJSValue {
+        @inline(__always) get { aux?.storedPrimitiveValue ?? .undefined }
+        set { if newValue.isUndefined && aux == nil { return }; ensureAux().storedPrimitiveValue = newValue }
+    }
 
     // -- Lifecycle -----------------------------------------------------------
 
@@ -1910,7 +2082,48 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
         }
     }
 
-    deinit { propValues.deallocateStorage() }
+    deinit { propValues.deallocateStorage(); _shapeU?.release() }
+}
+
+/// The fields of a JeffJSObject that only functions, exotic objects and rare
+/// features use (see the layout note on JeffJSObject). One per object that
+/// needs any of them; its lifetime is the object's.
+nonisolated final class JeffJSObjectAux {
+    var payload: JeffJSObjectPayload = .opaque(nil)
+    var cFuncFast: JSCFunctionType? = nil
+    var cMagicFast: Int = 0
+    var fbFast: JeffJSFunctionBytecode? = nil
+    var fbFastU: Unmanaged<JeffJSFunctionBytecode>? = nil
+    var varRefsFast: [JeffJSVarRef?] = []
+    var varRefsRaw: UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>? = nil
+    var varRefsRawCount: Int = 0
+    var arrowThisVal: JeffJSValue? = nil
+    var firstWeakRef: AnyObject? = nil
+    var propExtra: ContiguousArray<JeffJSPropertyExtra?> = []
+    var storedProto: JeffJSObject? = nil
+    var storedCFunction: ((JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue)? = nil
+    var storedCFunctionLength: Int = 0
+    var storedPrimitiveValue: JeffJSValue = .undefined
+
+    init() {}
+
+    /// Set the closure var-refs and rebuild their unmanaged raw mirror.
+    func setVarRefs(_ refs: [JeffJSVarRef?]) {
+        varRefsFast = refs
+        if let p = varRefsRaw { p.deallocate(); varRefsRaw = nil; varRefsRawCount = 0 }
+        if !refs.isEmpty {
+            let p = UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>.allocate(capacity: refs.count)
+            var i = 0
+            for vr in refs {
+                if let vr = vr { p[i] = Unmanaged.passUnretained(vr) } else { p[i] = nil }
+                i += 1
+            }
+            varRefsRaw = p
+            varRefsRawCount = refs.count
+        }
+    }
+
+    deinit { varRefsRaw?.deallocate() }
 }
 
 extension JeffJSObject {
@@ -2248,7 +2461,8 @@ extension JeffJSObject {
     /// plain data slot (the common case), saving one array allocation per
     /// object. INVARIANT: propExtra.isEmpty || propExtra.count == propValues.count.
     @inline(__always) func extra(at i: Int) -> JeffJSPropertyExtra? {
-        i < propExtraCount ? propExtra[i] : nil
+        // propExtraCount > 0 implies the side box exists.
+        i < propExtraCount ? aux.unsafelyUnwrapped.propExtra[i] : nil
     }
 
     /// Store a box at slot `i`, materialising `propExtra` (nil-padded) on

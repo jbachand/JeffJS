@@ -15,8 +15,18 @@ struct JeffJSPropStorage: RandomAccessCollection {
     typealias Element = JeffJSValue
 
     private(set) var ptr: UnsafeMutablePointer<JeffJSValue>? = nil
-    private(set) var count: Int = 0
-    private(set) var capacity: Int = 0
+    /// 32-bit counters (perf/watch-object-size): the struct is 16 bytes, not
+    /// 24, inside every JeffJSObject. An object never has 2^32 slots.
+    private var _count: UInt32 = 0
+    private var _capacity: UInt32 = 0
+    private(set) var count: Int {
+        @inline(__always) get { Int(_count) }
+        @inline(__always) set { _count = UInt32(truncatingIfNeeded: newValue) }
+    }
+    private(set) var capacity: Int {
+        @inline(__always) get { Int(_capacity) }
+        @inline(__always) set { _capacity = UInt32(truncatingIfNeeded: newValue) }
+    }
 
     @inline(__always) init() {}
 
