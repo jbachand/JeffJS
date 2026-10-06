@@ -162,26 +162,26 @@ func jeffJS_recycleArray(_ o: JeffJSObject) -> Bool {
           let st = o._fastArrayValues else { return false }
     o.refCount = 0
     removeGCObject(rt, o)
-    o._fastArrayValues = nil
     // Release the elements; nested zero transitions are deferred and drained
-    // below (see jeffJS_recycleObject).
+    // below (see jeffJS_recycleObject). The emptied store stays on the array
+    // (its `.array` payload is a view of it): small capacities are kept for
+    // the next literal (newArrayFromSlots appends into it).
     let n = min(Int(st.count), st.values.count)
     rt.inFreeChain = true
     var i = 0
     while i < n { st.values[i].freeValue(); i += 1 }
     rt.inFreeChain = false
-    if st.values.capacity <= jeffJSArrayStorageKeepCapacity,
-       rt.arrayStoragePool.count < jeffJSArrayPoolCapacity {
+    if st.values.capacity <= jeffJSArrayStorageKeepCapacity {
         st.values.removeAll(keepingCapacity: true)
-        st.count = 0
-        rt.arrayStoragePool.append(st)
+    } else {
+        st.values = []
     }
+    st.count = 0
     o.propValues[0] = .newInt32(0)     // `length` (a number: nothing to release)
     if let shape = o.shape {           // hashed (isPoolableArray): never freed here
         o.shape = nil
         shape.refCount -= 1
     }
-    o.payload = .array(size: 0, values: [], count: 0)
     o.freeMark = false
     o.tmpMark = false
     o.mark = JeffJSGCMark.white

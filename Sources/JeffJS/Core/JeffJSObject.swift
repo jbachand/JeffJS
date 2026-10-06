@@ -1674,24 +1674,43 @@ enum JeffJSProperty {
 /// the enum's associated values were — no manual refcounting.
 nonisolated final class JeffJSPropertyExtra {
     enum Kind: UInt8 { case getset, varRef, autoInit }
+    // Layout (perf/watch-object-size): 48 bytes, was 96 (an `Any?` alone was
+    // 32). Two reference slots carry whatever the kind needs — getter/setter,
+    // the var-ref of a mapped `arguments` slot, or an autoinit's boxed opaque
+    // — behind the same field names as before.
     var kind: Kind
-    var getter: JeffJSObject?
-    var setter: JeffJSObject?
-    var varRef: JeffJSVarRef?
+    private var _a: AnyObject?
+    private var _b: AnyObject?
     var autoRealmAndId: UInt
-    var autoOpaque: Any?
+
+    private final class OpaqueBox { let value: Any; init(_ v: Any) { value = v } }
+
+    var getter: JeffJSObject? {
+        @inline(__always) get { kind == .getset ? _a.map { unsafeDowncast($0, to: JeffJSObject.self) } : nil }
+        set { _a = newValue }
+    }
+    var setter: JeffJSObject? {
+        @inline(__always) get { kind == .getset ? _b.map { unsafeDowncast($0, to: JeffJSObject.self) } : nil }
+        set { _b = newValue }
+    }
+    var varRef: JeffJSVarRef? {
+        @inline(__always) get { kind == .varRef ? _a.map { unsafeDowncast($0, to: JeffJSVarRef.self) } : nil }
+        set { _a = newValue }
+    }
+    var autoOpaque: Any? {
+        get { kind == .autoInit ? _a.map { unsafeDowncast($0, to: OpaqueBox.self).value } : nil }
+        set { _a = newValue.map { OpaqueBox($0) } }
+    }
 
     init(getter: JeffJSObject?, setter: JeffJSObject?) {
-        self.kind = .getset; self.getter = getter; self.setter = setter
-        self.varRef = nil; self.autoRealmAndId = 0; self.autoOpaque = nil
+        self.kind = .getset; self._a = getter; self._b = setter; self.autoRealmAndId = 0
     }
     init(varRef: JeffJSVarRef) {
-        self.kind = .varRef; self.varRef = varRef
-        self.getter = nil; self.setter = nil; self.autoRealmAndId = 0; self.autoOpaque = nil
+        self.kind = .varRef; self._a = varRef; self._b = nil; self.autoRealmAndId = 0
     }
     init(autoRealmAndId: UInt, opaque: Any?) {
-        self.kind = .autoInit; self.autoRealmAndId = autoRealmAndId; self.autoOpaque = opaque
-        self.getter = nil; self.setter = nil; self.varRef = nil
+        self.kind = .autoInit; self.autoRealmAndId = autoRealmAndId
+        self._a = opaque.map { OpaqueBox($0) }; self._b = nil
     }
 
     /// Reconstruct the enum form (cold paths).
@@ -2012,12 +2031,32 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
 
     // -- Payload (union) -----------------------------------------------------
 
+    /// An array's `.array` payload is a VIEW of its element store
+    /// (`_fastArrayValues`, which every array now has): writing one installs
+    /// a store, reading one wraps the store's buffer (O(1), shared). Arrays
+    /// therefore need no side box (perf/watch-object-size: the box was 192 B
+    /// per array, 80 k arrays on homedepot).
     var payload: JeffJSObjectPayload {
         @inline(__always) get {
-            if let u = _auxU { return u._withUnsafeGuaranteedRef { $0.payload } }
+            if let u = _auxU {
+                let p = u._withUnsafeGuaranteedRef { $0.payload }
+                if case .opaque(let o) = p, o == nil, let st = _fastArrayValues {
+                    return JeffJSObject.arrayPayloadView(st)
+                }
+                return p
+            }
+            if let st = _fastArrayValues { return JeffJSObject.arrayPayloadView(st) }
             return .opaque(nil)
         }
         set {
+            if case .array(_, let values, let count) = newValue {
+                _fastArrayValues = JeffJSFastArrayStorage(values: ContiguousArray(values), count: count)
+                if let u = _auxU {
+                    u._withUnsafeGuaranteedRef { $0.payload = .opaque(nil) }
+                    _flags &= ~JeffJSObject.flagHasCFunc
+                }
+                return
+            }
             if _auxU == nil, case .opaque(let o) = newValue, o == nil { return }
             let a = ensureAux()
             a.payload = newValue
@@ -2260,6 +2299,9 @@ nonisolated final class JeffJSObjectAux {
     private var _cMagicFast: Int32 = 0
     private var _varRefsRawCount: Int32 = 0
     private var _storedCFunctionLength: Int32 = 0
+    /// Slots allocated at `varRefsRaw` (kept across setVarRefs, so a pooled
+    /// closure re-captures without a malloc).
+    private var _varRefsRawCapacity: Int32 = 0
     var cMagicFast: Int {
         get { Int(_cMagicFast) }
         set { _cMagicFast = Int32(truncatingIfNeeded: newValue) }
@@ -2288,17 +2330,21 @@ nonisolated final class JeffJSObjectAux {
     /// Set the closure var-refs and rebuild their unmanaged raw mirror.
     func setVarRefs(_ refs: [JeffJSVarRef?]) {
         varRefsFast = refs
-        if let p = varRefsRaw { p.deallocate(); varRefsRaw = nil; varRefsRawCount = 0 }
-        if !refs.isEmpty {
-            let p = UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>.allocate(capacity: refs.count)
-            var i = 0
-            for vr in refs {
-                if let vr = vr { p[i] = Unmanaged.passUnretained(vr) } else { p[i] = nil }
-                i += 1
-            }
-            varRefsRaw = p
-            varRefsRawCount = refs.count
+        varRefsRawCount = 0
+        if refs.isEmpty { return }   // the mirror buffer stays for reuse
+        if varRefsRaw == nil || Int(_varRefsRawCapacity) < refs.count {
+            varRefsRaw?.deallocate()
+            let cap = max(refs.count, 4)
+            varRefsRaw = UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>.allocate(capacity: cap)
+            _varRefsRawCapacity = Int32(truncatingIfNeeded: cap)
         }
+        let p = varRefsRaw.unsafelyUnwrapped
+        var i = 0
+        for vr in refs {
+            if let vr = vr { p[i] = Unmanaged.passUnretained(vr) } else { p[i] = nil }
+            i += 1
+        }
+        varRefsRawCount = refs.count
     }
 
     deinit { varRefsRaw?.deallocate() }
@@ -2926,16 +2972,15 @@ extension JeffJSObject {
         return storage.push(value)
     }
 
-    /// Sync the ref-type fast array storage back into the `.array` payload.
-    /// Must be called before any code that reads the `.array` enum case
-    /// after a series of fastArrayPush calls.
-    func syncArrayPayload() {
-        guard let storage = _fastArrayValues else { return }
-        payload = .array(
-            size: UInt32(storage.values.count),
-            values: Array(storage.values),
-            count: storage.count
-        )
+    /// Formerly copied the ref-type store back into the `.array` payload;
+    /// the payload is now a view of the store (see `payload`), so there is
+    /// nothing to sync.
+    func syncArrayPayload() {}
+
+    /// The `.array` payload view of an element store.
+    @inline(__always)
+    static func arrayPayloadView(_ st: JeffJSFastArrayStorage) -> JeffJSObjectPayload {
+        .array(size: UInt32(st.values.count), values: Array(st.values), count: st.count)
     }
 }
 

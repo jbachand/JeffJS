@@ -175,4 +175,33 @@ final class ObjectSizeRefLeakTests: XCTestCase {
             v.freeValue()
         }
     }
+
+    /// Arrays keep their elements in the inline element store; the `.array`
+    /// payload is a view of it, so an array has no side box. Recycled arrays
+    /// (literal churn) come back empty.
+    func testArraysHaveNoSideBoxAndStayCorrect() {
+        withContext { ctx in
+            let v = ctx.eval(input: """
+                var out = [];
+                for (var r = 0; r < 2000; r++) { var t = [r, r + 1, r + 2]; t.push(r); }
+                var a = [1, 2, 3]; a.push(4); a[6] = 7; delete a[1];
+                var b = []; var c = Array.from({length: 3}, (_, i) => i * 2);
+                var d = [5, 6]; d.length = 1;
+                out.push(a.length, 1 in a, a[6], JSON.stringify(a), b.length, c.join(','), d.join(','),
+                         [].concat(a, c).length, Object.keys(c).join(','), [3, 1, 2].sort().join(''));
+                [out.join('|'), a, b, c, d]
+                """, filename: "<arrays>", evalFlags: 0)
+            XCTAssertFalse(v.isException)
+            let s = ctx.getPropertyUInt32(obj: v, index: 0)
+            XCTAssertEqual(ctx.toSwiftString(s), "7|false|7|[1,null,3,4,null,null,7]|0|0,2,4|5|10|0,1,2|123")
+            s.freeValue()
+            for i in 1...4 {
+                let e = ctx.getPropertyUInt32(obj: v, index: UInt32(i))
+                XCTAssertNil(e.toObject()?.aux, "array \(i) allocated a side box")
+                if case .array = e.toObject()!.payload {} else { XCTFail("array \(i) has no .array payload view") }
+                e.freeValue()
+            }
+            v.freeValue()
+        }
+    }
 }

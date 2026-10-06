@@ -1189,11 +1189,16 @@ extension JeffJSContext {
     func newArrayFromSlots(_ p: UnsafeMutablePointer<JeffJSValue>, _ count: Int) -> JeffJSValue {
         let arr = newArray()
         if count == 0 { return arr }
-        if let obj = arr.toObject(), obj.fastArray, obj._fastArrayValues == nil,
+        if let obj = arr.toObject(), obj.fastArray,
+           obj._fastArrayValues.map({ $0.count == 0 && $0.values.isEmpty }) ?? true,
            let cached = arrayShape, obj.shape === cached, obj.propValues.count == 1,
            count <= Int(Int32.max) {
             let src = UnsafeBufferPointer(start: p, count: count)
-            if let st = rt.arrayStoragePool.popLast() {
+            if let st = obj._fastArrayValues {
+                // A new array's (empty) element store: fill it in place.
+                st.values.append(contentsOf: src)
+                st.count = UInt32(count)
+            } else if let st = rt.arrayStoragePool.popLast() {
                 st.values.append(contentsOf: src)
                 st.count = UInt32(count)
                 obj._fastArrayValues = st
