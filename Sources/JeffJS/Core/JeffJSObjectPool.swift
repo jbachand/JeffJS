@@ -126,7 +126,8 @@ func jeffJS_recycleFunction(_ o: JeffJSObject) -> Bool {
         shape.refCount -= 1
         if shape.refCount == 0 && !shape.isHashed { freeGCObjectChildren(rt, shape) }
     }
-    o._flags = JeffJSObject.flagExtensible
+    // Keep the slot bit: the side box stays with the parked closure.
+    o._flags = JeffJSObject.flagExtensible | (o._flags & JeffJSObject.flagSlotIsAux)
     o.mark = JeffJSGCMark.white
     o.realmIndex = 0
     o.lazyFlags = 0

@@ -109,7 +109,7 @@ final class ObjectSizeRefLeakTests: XCTestCase {
 
     func testCompactLayouts() {
         // The point of the change: fail loudly if a field sneaks back in.
-        XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSObject.self), 96)
+        XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSObject.self), 80)
         XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSString.self), 48)
         XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSStringRope.self), 64)
         XCTAssertEqual(MemoryLayout<JeffJSPropStorage>.size, 16)
@@ -222,6 +222,27 @@ final class ObjectSizeRefLeakTests: XCTestCase {
             let b = ctx.eval(input: "j[1].t", filename: "<b>", evalFlags: 0)
             XCTAssertTrue(a.stringBase === b.stringBase)
             a.freeValue(); b.freeValue()
+        }
+    }
+
+    /// WeakMap keys keep their count in the side box; freeing a key (with or
+    /// without an array store in the slot) must still drop its records.
+    func testWeakKeysOnBoxedObjectsAreReleased() {
+        withContext { ctx in
+            let v = ctx.eval(input: """
+                var wm = new WeakMap(), ws = new WeakSet(), keep = [];
+                for (var i = 0; i < 3000; i++) {
+                    var k = (i % 3 == 0) ? [i] : (i % 3 == 1) ? {i: i} : function () { return i; };
+                    wm.set(k, {v: i}); ws.add(k);
+                    if (i % 100 == 0) keep.push(k);
+                }
+                var n = 0; for (var j = 0; j < keep.length; j++) if (wm.get(keep[j]).v === j * 100 && ws.has(keep[j])) n++;
+                n
+                """, filename: "<weak>", evalFlags: 0)
+            XCTAssertEqual(v.toInt32(), 30)
+            ctx.rt.runGC(); ctx.rt.runGC()
+            let w = ctx.eval(input: "for (var r = 0; r < 3000; r++) { var t = {r: r}; wm.set(t, r); } wm.get(keep[5]).v", filename: "<weak2>", evalFlags: 0)
+            XCTAssertEqual(w.toInt32(), 500)
         }
     }
 }

@@ -1270,7 +1270,14 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     // One live `WeakMap` entry used to put that probe on the whole heap's
     // teardown path (a 40 x 20 000 plain-object allocate-and-drop loop was 21%
     // slower with one WeakRef in the runtime than without).
-    if let a = aux, a.firstWeakRef != nil { weakrefFree(rt, obj) }
+    if let a = aux, a.firstWeakRef != nil || a.weakrefCount != 0 {
+        // weakrefFree reads the weak-key count from the side box: give the
+        // object its box back for the call (the slot's array store moves
+        // into it and back out).
+        obj.aux = a
+        weakrefFree(rt, obj)
+        _ = obj.takeAux()
+    }
     _ = aux   // the side box (and what it holds) is released here
 }
 
