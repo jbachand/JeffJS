@@ -92,6 +92,7 @@ extension JeffJSEnvironment {
             payloadKinds[k, default: 0] += 1
         }
         var lines: [String] = []
+        lines.append("[hist] instance sizes: object \(class_getInstanceSize(JeffJSObject.self)) aux \(class_getInstanceSize(JeffJSObjectAux.self)) string \(class_getInstanceSize(JeffJSString.self)) rope \(class_getInstanceSize(JeffJSStringRope.self)) shape \(class_getInstanceSize(JeffJSShape.self)) varRef \(class_getInstanceSize(JeffJSVarRef.self)) body \(class_getInstanceSize(JeffJSFunctionBytecodeCompiled.self)) atom \(class_getInstanceSize(JeffJSAtomStruct.self)) lazyInfo \(class_getInstanceSize(JeffJSLazyFunctionInfo.self))")
         lines.append("[hist] gc list: objects=\(byClass.values.reduce(0, +)) varRefs=\(varRefs) other=\(others) shapes=\(shapes.count) (hashed \(hashedShapes))")
         lines.append("[hist] by class: " + byClass.sorted { $0.value > $1.value }.prefix(16).map { "\($0.key):\($0.value)" }.joined(separator: " "))
         lines.append("[hist] payload: " + payloadKinds.sorted { $0.value > $1.value }.prefix(16).map { "\($0.key):\($0.value)" }.joined(separator: " "))
@@ -179,6 +180,7 @@ extension JeffJSHeapDebug {
     public static func functionBodyReport(_ addrs: [UInt]) -> String {
         var n = 0, bc = 0, bcBuf = 0, dbg = 0, ic = 0, icTables = 0, cpool = 0, cvars = 0, vardefs = 0
         var pending = 0, topLevel = 0, withClosures = 0, rc1 = 0, srcSpan = 0
+        var icByCap: [Int: (n: Int, used: Int, top: Int)] = [:]
         for a in addrs {
             guard let p = UnsafeRawPointer(bitPattern: a) else { continue }
             let any = Unmanaged<AnyObject>.fromOpaque(p).takeUnretainedValue()
@@ -190,7 +192,14 @@ extension JeffJSHeapDebug {
                 dbg += c.debugPc2lineBuf.count + c.debugPc2colBuf.count + c.debugExprSpans.count
                 vardefs += c.vardefs.count
             }
-            if let t = fb.ic { ic += t.capacity * MemoryLayout<JeffJSICEntry>.stride; icTables += 1 }
+            if let t = fb.ic {
+                ic += t.capacity * MemoryLayout<JeffJSICEntry>.stride; icTables += 1
+                var used = 0
+                for e in t.entries where e.pc >= 0 { used += 1 }
+                var r = icByCap[t.capacity] ?? (0, 0, 0)
+                r.n += 1; r.used += used; if fb.isTopLevelCode { r.top += 1 }
+                icByCap[t.capacity] = r
+            }
             cpool += fb.cpool.count
             cvars += fb.closureVarsList.count
             if fb.isLazyPending { pending += 1 }
@@ -199,6 +208,7 @@ extension JeffJSHeapDebug {
             if fb.refCount <= 1 { rc1 += 1 }
             if fb.sourceLen > 0 { srcSpan += 1 }
         }
-        return "[bodies] \(n) live: bytecode \(bc / 1024)KB (+ executed copy \(bcBuf / 1024)KB), debug tables \(dbg / 1024)KB, IC \(icTables) tables \(ic / 1024)KB, cpool \(cpool) slots, closureVars \(cvars), vardefs \(vardefs); lazyPending \(pending), topLevel \(topLevel), withLiveClosures \(withClosures), rc<=1 \(rc1), withSourceSpan \(srcSpan)"
+        let icLine = icByCap.sorted { $0.key < $1.key }.map { "cap\($0.key):\($0.value.n) tables, \($0.value.used) used slots, \($0.value.top) top-level" }.joined(separator: "; ")
+        return "[bodies] IC by capacity: \(icLine)\n[bodies] \(n) live: bytecode \(bc / 1024)KB (+ executed copy \(bcBuf / 1024)KB), debug tables \(dbg / 1024)KB, IC \(icTables) tables \(ic / 1024)KB, cpool \(cpool) slots, closureVars \(cvars), vardefs \(vardefs); lazyPending \(pending), topLevel \(topLevel), withLiveClosures \(withClosures), rc<=1 \(rc1), withSourceSpan \(srcSpan)"
     }
 }

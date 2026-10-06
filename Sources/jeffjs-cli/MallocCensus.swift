@@ -496,3 +496,35 @@ func liveInstances(className: String) -> [UInt] {
     munmap(refTargets!, tBytes); refTargets = nil
     return out
 }
+
+// MARK: - Big blocks (CLI only): every malloc block >= minBytes, with a peek at its content.
+nonisolated(unsafe) var bigBlocks: [(UInt, Int)] = []
+nonisolated(unsafe) var bigBlockMin = 0
+func bigRecorder(_ task: task_t, _ ctx: UnsafeMutableRawPointer?, _ type: UInt32, _ ranges: UnsafeMutablePointer<vm_range_t>?, _ count: UInt32) {
+    guard let ranges else { return }
+    for i in 0..<Int(count) where Int(ranges[i].size) >= bigBlockMin && bigBlocks.count < bigBlocks.capacity {
+        bigBlocks.append((UInt(ranges[i].address), Int(ranges[i].size)))
+    }
+}
+@MainActor
+func bigBlockReport(minBytes: Int) -> String {
+    bigBlocks = []; bigBlocks.reserveCapacity(4096); bigBlockMin = minBytes
+    var zonesPtr: UnsafeMutablePointer<vm_address_t>? = nil
+    var zoneCount: UInt32 = 0
+    _ = malloc_get_all_zones(mach_task_self_, nil, &zonesPtr, &zoneCount)
+    for z in 0..<Int(zoneCount) {
+        guard let zp = UnsafeMutablePointer<malloc_zone_t>(bitPattern: UInt(zonesPtr![z])),
+              let en = zp.pointee.introspect?.pointee.enumerator else { continue }
+        _ = en(mach_task_self_, nil, UInt32(MALLOC_PTR_IN_USE_RANGE_TYPE), vm_address_t(UInt(bitPattern: zp)), refReader, bigRecorder)
+    }
+    let found = bigBlocks
+    var lines = ["[big] \(found.count) blocks >= \(minBytes / 1024) KB"]
+    for (a, n) in found.sorted(by: { $0.1 > $1.1 }).prefix(30) {
+        guard let p = UnsafePointer<UInt8>(bitPattern: a) else { continue }
+        var peek = ""
+        for i in 0..<min(n, 96) { let c = p[i]; peek.append(c >= 32 && c < 127 ? Character(UnicodeScalar(c)) : "·") }
+        let words = UnsafePointer<UInt64>(OpaquePointer(p))
+        lines.append(String(format: "[big] %8d KB  w0=%016llx w1=%016llx  ", n / 1024, words[0], words[1]) + peek)
+    }
+    return lines.joined(separator: "\n")
+}

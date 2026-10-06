@@ -209,6 +209,7 @@ let status: Int32 = MainActor.assumeIsolated {
                      g.liveObjects, Double(delta) / 1_048_576, Double(delta) / Double(max(g.liveObjects, 1)), cliFootprintMB()))
         print(env.heapHistogram())
         if args.contains("--roots") { print(env.rootReport()) }
+        if args.contains("--big") { print(bigBlockReport(minBytes: 256 * 1024)) }
         if args.contains("--bodies") {
             print(JeffJSHeapDebug.functionBodyReport(liveInstances(className: "JeffJS.JeffJSFunctionBytecodeCompiled")))
         }

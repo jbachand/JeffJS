@@ -30,6 +30,12 @@ nonisolated final class JeffJSShape: JeffJSGCObjectHeader {
 
     /// True when this shape is inserted into the runtime's shape hash table.
     var isHashed: Bool = false
+    /// An inline cache holds this shape (`JeffJSInlineCache.update*`). A private shape is
+    /// grown in place only while no cache can have seen it: a cached entry keyed by its
+    /// identity ("no own `p`, `p` is on the prototype", or a define_field transition from
+    /// it) would go stale when an own property is appended to the same object.
+    /// (Declared next to isHashed so the two flags share padding.)
+    var icCached = false
 
     /// Computed hash that summarises (proto, property-atoms, flags).
     var hash: UInt32 = 0
@@ -40,14 +46,29 @@ nonisolated final class JeffJSShape: JeffJSGCObjectHeader {
 
     // ---- property storage ----
 
+    // 32-bit counters (perf/watch-object-size): with the two flags they pack
+    // the shape into 112 bytes (was 136 -> a 160-byte malloc block).
+    private var _propSize: Int32 = 0
+    private var _propCount: Int32 = 0
+    private var _deletedPropCount: Int32 = 0
+
     /// Number of allocated slots in `prop`.
-    var propSize: Int = 0
+    var propSize: Int {
+        @inline(__always) get { Int(_propSize) }
+        @inline(__always) set { _propSize = Int32(truncatingIfNeeded: newValue) }
+    }
 
     /// Number of used slots (includes deleted entries).
-    var propCount: Int = 0
+    var propCount: Int {
+        @inline(__always) get { Int(_propCount) }
+        @inline(__always) set { _propCount = Int32(truncatingIfNeeded: newValue) }
+    }
 
     /// Number of slots that represent deleted properties.
-    var deletedPropCount: Int = 0
+    var deletedPropCount: Int {
+        @inline(__always) get { Int(_deletedPropCount) }
+        @inline(__always) set { _deletedPropCount = Int32(truncatingIfNeeded: newValue) }
+    }
 
     // ---- linkage ----
 
@@ -82,12 +103,6 @@ nonisolated final class JeffJSShape: JeffJSGCObjectHeader {
     /// dictionary spent 70% of its time there). Hashed shapes are never
     /// evicted, so the strong reference is safe.
     var parent: JeffJSShape? = nil
-    /// An inline cache holds this shape (`JeffJSInlineCache.update*`). A private shape is
-    /// grown in place only while no cache can have seen it: a cached entry keyed by its
-    /// identity ("no own `p`, `p` is on the prototype", or a define_field transition from
-    /// it) would go stale when an own property is appended to the same object.
-    var icCached = false
-
     // MARK: - Initialisers
 
     init() {

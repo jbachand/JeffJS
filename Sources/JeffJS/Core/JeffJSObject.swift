@@ -382,9 +382,17 @@ nonisolated final class JeffJSLazyFunctionInfo {
     /// when the body was last seen in use — a call that had to go through
     /// callInternal's payload path, a new closure made from it, or a reclaim
     /// scan finding one of its function objects with `fbFast` set.
-    var touch: Int = 0
+    private var _touch: Int32 = 0
+    private var _seenCycle: Int32 = 0
+    var touch: Int {
+        get { Int(_touch) }
+        set { _touch = Int32(truncatingIfNeeded: newValue) }
+    }
     /// The reclaim cycle that last listed this function (dedup, no set).
-    var seenCycle: Int = 0
+    var seenCycle: Int {
+        get { Int(_seenCycle) }
+        set { _seenCycle = Int32(truncatingIfNeeded: newValue) }
+    }
 
     init(seed: JeffJSLazySeed, script: JeffJSLazyScript) {
         self.seed = seed
@@ -395,7 +403,11 @@ nonisolated final class JeffJSLazyFunctionInfo {
 /// Forward reference for `JeffJSFunctionBytecode`.
 nonisolated class JeffJSFunctionBytecode {
     var refCount: Int = 1
-    var bytecodeLen: Int = 0
+    private var _bytecodeLen: Int32 = 0
+    var bytecodeLen: Int {
+        @inline(__always) get { Int(_bytecodeLen) }
+        set { _bytecodeLen = Int32(truncatingIfNeeded: newValue) }
+    }
     var bytecode: [UInt8] = []
 
     /// Stable raw copy of `bytecode`, materialized lazily on first execution
@@ -404,31 +416,33 @@ nonisolated class JeffJSFunctionBytecode {
     /// largest remaining per-opcode cost. Owned by this FB; freed in deinit, so
     /// the pointer is valid for the FB's entire lifetime (the FB is retained for
     /// the duration of any call that executes it).
-    private var _bcBuffer: UnsafeMutableBufferPointer<UInt8>? = nil
+    /// (A bare pointer: its length is `bytecodeLen`/`bytecode.count`; the
+    /// buffer-pointer form was 24 bytes of every body.)
+    private var _bcBuffer: UnsafeMutablePointer<UInt8>? = nil
 
     /// Raw pointer to the function's bytecode. Materializes `_bcBuffer` on first
     /// access. Must only be taken after `bytecode` is finalized (i.e. at execution
     /// time) — never mutate `bytecode` after this is called.
     /// Inlinable fast path for `bytecodePtr`: nil until first materialised.
     @inline(__always) var bcPtrFast: UnsafePointer<UInt8>? {
-        if let b = _bcBuffer, let base = b.baseAddress { return UnsafePointer(base) }
+        if let b = _bcBuffer { return UnsafePointer(b) }
         return nil
     }
 
     var bytecodePtr: UnsafePointer<UInt8> {
-        if let b = _bcBuffer, let base = b.baseAddress {
-            return UnsafePointer(base)
+        if let b = _bcBuffer {
+            return UnsafePointer(b)
         }
         materializeCpoolRaw()   // first execution: constants are final too
         let n = bytecode.count
-        let buf = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: max(n, 1))
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: max(n, 1))
         if n > 0 {
-            _ = buf.initialize(from: bytecode)
+            bytecode.withUnsafeBufferPointer { buf.initialize(from: $0.baseAddress!, count: n) }
         } else {
             buf[0] = 0
         }
         _bcBuffer = buf
-        return UnsafePointer(buf.baseAddress!)
+        return UnsafePointer(buf)
     }
 
     deinit {
@@ -437,9 +451,21 @@ nonisolated class JeffJSFunctionBytecode {
         _traceIndexPCs?.deallocate()
         _traceIndexInfos?.deallocate()
     }
-    var fileName: JeffJSString?
-    var lineNum: Int = 0
-    var colNum: Int = 0
+    /// Set only on bodies loaded from the bytecode cache (cold box).
+    var fileName: JeffJSString? {
+        get { _cold?.fileName }
+        set { if newValue == nil && _cold == nil { return }; coldBox().fileName = newValue }
+    }
+    private var _lineNum: Int32 = 0
+    private var _colNum: Int32 = 0
+    var lineNum: Int {
+        @inline(__always) get { Int(_lineNum) }
+        set { _lineNum = Int32(truncatingIfNeeded: newValue) }
+    }
+    var colNum: Int {
+        @inline(__always) get { Int(_colNum) }
+        set { _colNum = Int32(truncatingIfNeeded: newValue) }
+    }
     var argCount: UInt16 = 0
     var varCount: UInt16 = 0
     /// The value of the function's `length` own property: the number of
@@ -508,7 +534,11 @@ nonisolated class JeffJSFunctionBytecode {
     /// True when compiled in strict mode (JS_MODE_STRICT).
     var isStrictMode: Bool = false
     /// Local var index of a named function expression's self-binding, -1 if none.
-    var selfRefVarIdx: Int = -1
+    private var _selfRefVarIdx: Int32 = -1
+    var selfRefVarIdx: Int {
+        @inline(__always) get { Int(_selfRefVarIdx) }
+        set { _selfRefVarIdx = Int32(truncatingIfNeeded: newValue) }
+    }
     /// Closure-variable metadata (also on the Compiled subclass; mirrored here
     /// so createClosure avoids a downcast per closure creation).
     var closureVarsList: [JeffJSClosureVar] = []
@@ -563,10 +593,16 @@ nonisolated class JeffJSFunctionBytecode {
     /// pool) after the parent script finished = nothing can run it again
     /// (JeffJSContext.releaseTopLevelConstants).
     var liveClosures: Int32 = 0
+    /// Trace index size (see `traceBlock(at:)`); -1: not built. Declared here
+    /// to share liveClosures' 8-byte slot.
+    private var _traceIndexCount: Int32 = -1
 
     /// Direct `eval` call sites of this function (see JeffJSEvalSite), nil
     /// when it has none. Indexed by the `eval`/`apply_eval` site operand.
-    var evalSites: [JeffJSEvalSite]? = nil
+    var evalSites: [JeffJSEvalSite]? {
+        get { _cold?.evalSites }
+        set { if newValue == nil && _cold == nil { return }; coldBox().evalSites = newValue }
+    }
 
     /// Unretained copy of `cpool`'s element bits for the interpreters'
     /// constant loads: reading `cpool[i]` through the class retained and
@@ -574,7 +610,11 @@ nonisolated class JeffJSFunctionBytecode {
     /// string-keyed code). The values stay owned by `cpool`; once built, the
     /// copy is rebuilt on every mutation of `cpool`.
     private(set) var _cpoolRaw: UnsafeMutablePointer<JeffJSValue>? = nil
-    private(set) var cpoolRawCount: Int = 0
+    private var _cpoolRawCount: Int32 = 0
+    private(set) var cpoolRawCount: Int {
+        @inline(__always) get { Int(_cpoolRawCount) }
+        set { _cpoolRawCount = Int32(truncatingIfNeeded: newValue) }
+    }
     private var _cpoolWanted = false
 
     /// Constant `i` (borrowed), or undefined when out of range, for the
@@ -599,13 +639,20 @@ nonisolated class JeffJSFunctionBytecode {
     /// infos; the dictionary keeps the infos alive). Every taken backward
     /// branch asks for its trace block; a Swift dictionary probe (SipHash of
     /// the pc) per iteration was ~4% of a call-heavy loop.
-    private var _traceIndexPCs: UnsafeMutablePointer<Int>? = nil
-    private var _traceIndexInfos: UnsafeMutablePointer<Unmanaged<TraceBlockInfo>>? = nil
-    private var _traceIndexCount: Int = -1   // -1: not built
+    /// (The two arrays live in the cold box; the count stays here so a body
+    /// without trace blocks answers from one field.)
+    private var _traceIndexPCs: UnsafeMutablePointer<Int>? {
+        get { _cold?.traceIndexPCs }
+        set { if newValue == nil && _cold == nil { return }; coldBox().traceIndexPCs = newValue }
+    }
+    private var _traceIndexInfos: UnsafeMutablePointer<Unmanaged<TraceBlockInfo>>? {
+        get { _cold?.traceIndexInfos }
+        set { if newValue == nil && _cold == nil { return }; coldBox().traceIndexInfos = newValue }
+    }
 
     /// Trace block whose loop head is `pc`, if any.
     @inline(__always) func traceBlock(at pc: Int) -> TraceBlockInfo? {
-        let n = _traceIndexCount
+        let n = Int(_traceIndexCount)
         if n == 0 { return nil }
         if n < 0 { return _buildTraceIndex(pc) }
         guard let pcs = _traceIndexPCs, let infos = _traceIndexInfos else { return nil }
@@ -629,7 +676,7 @@ nonisolated class JeffJSFunctionBytecode {
             (pcs + i).initialize(to: kv.key)
             (infos + i).initialize(to: Unmanaged.passUnretained(kv.value))
         }
-        _traceIndexPCs = pcs; _traceIndexInfos = infos; _traceIndexCount = n
+        _traceIndexPCs = pcs; _traceIndexInfos = infos; _traceIndexCount = Int32(truncatingIfNeeded: n)
         return blocks[pc]
     }
 
@@ -658,6 +705,18 @@ nonisolated class JeffJSFunctionBytecode {
     /// body into this object in place (JeffJSCompiler.compileLazy). Kept
     /// after compiling (the recipe to recompile, and the body cache key).
     var lazyInfo: JeffJSLazyFunctionInfo? = nil
+
+    /// Rarely set fields of a body (perf/watch-object-size): the cache
+    /// filename, direct-eval sites, the trace index arrays and, for the
+    /// compiled subclass, debug tables / var defs / cached names. nil for a
+    /// lazy stub.
+    final var _cold: JeffJSFunctionBytecodeCold? = nil
+    @inline(__always) final func coldBox() -> JeffJSFunctionBytecodeCold {
+        if let c = _cold { return c }
+        let c = JeffJSFunctionBytecodeCold()
+        _cold = c
+        return c
+    }
 
     /// A lazily compiled function whose body is not compiled yet.
     @inline(__always) var isLazyPending: Bool { lazyInfo?.isPending ?? false }
@@ -2162,18 +2221,31 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
 nonisolated final class JeffJSObjectAux {
     var payload: JeffJSObjectPayload = .opaque(nil)
     var cFuncFast: JSCFunctionType? = nil
-    var cMagicFast: Int = 0
+    // 32-bit counters packed after the optionals' tag bytes (192-byte box).
+    private var _cMagicFast: Int32 = 0
+    private var _varRefsRawCount: Int32 = 0
+    private var _storedCFunctionLength: Int32 = 0
+    var cMagicFast: Int {
+        get { Int(_cMagicFast) }
+        set { _cMagicFast = Int32(truncatingIfNeeded: newValue) }
+    }
+    var varRefsRawCount: Int {
+        get { Int(_varRefsRawCount) }
+        set { _varRefsRawCount = Int32(truncatingIfNeeded: newValue) }
+    }
+    var storedCFunctionLength: Int {
+        get { Int(_storedCFunctionLength) }
+        set { _storedCFunctionLength = Int32(truncatingIfNeeded: newValue) }
+    }
     var fbFast: JeffJSFunctionBytecode? = nil
     var fbFastU: Unmanaged<JeffJSFunctionBytecode>? = nil
     var varRefsFast: [JeffJSVarRef?] = []
     var varRefsRaw: UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>? = nil
-    var varRefsRawCount: Int = 0
     var arrowThisVal: JeffJSValue? = nil
     var firstWeakRef: AnyObject? = nil
     var propExtra: ContiguousArray<JeffJSPropertyExtra?> = []
     var storedProto: JeffJSObject? = nil
     var storedCFunction: ((JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue)? = nil
-    var storedCFunctionLength: Int = 0
     var storedPrimitiveValue: JeffJSValue = .undefined
 
     init() {}

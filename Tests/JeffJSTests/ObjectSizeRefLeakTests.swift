@@ -113,6 +113,13 @@ final class ObjectSizeRefLeakTests: XCTestCase {
         XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSString.self), 64)
         XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSStringRope.self), 64)
         XCTAssertEqual(MemoryLayout<JeffJSPropStorage>.size, 16)
+        // Each at or under a malloc size class boundary (xzone: 16-byte steps
+        // to 128, then 32): 192, 256, 112, 64, 64.
+        XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSObjectAux.self), 192)
+        XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSFunctionBytecodeCompiled.self), 256)
+        XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSShape.self), 112)
+        XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSAtomStruct.self), 64)
+        XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSLazyFunctionInfo.self), 64)
     }
 
     /// Plain objects never allocate the side box; a prototype read goes

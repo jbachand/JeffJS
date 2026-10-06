@@ -100,17 +100,22 @@ nonisolated class JeffJSAtomStruct {
     var atomType: JSAtomTypeEnum = .JS_ATOM_TYPE_STRING
     /// Reference count. Predefined atoms start at a high refcount.
     var refCount: Int32 = 1
-    /// The interned string data. For integer atoms, this may be empty
-    /// (the integer is encoded in the atom ID itself).
-    var str: String = ""
-    /// Length of the string in UTF-16 code units (for compatibility with QuickJS).
-    var len: Int = 0
+    /// Length of the string in UTF-16 code units (for compatibility with
+    /// QuickJS). 32-bit, packed with the flags (64-byte struct, was 72 -> 80).
+    private var _len: Int32 = 0
+    var len: Int {
+        get { Int(_len) }
+        set { _len = Int32(truncatingIfNeeded: newValue) }
+    }
     /// True if this atom is a small integer index (array index optimization).
     var isIntegerIndex: Bool = false
     /// The array index this atom's spelling denotes, if it is a canonical
     /// decimal index. Computed once here because `atomIsArrayIndex` used to
     /// re-parse the string on every property enumeration.
     var arrayIndexValue: UInt32?
+    /// The interned string data. For integer atoms, this may be empty
+    /// (the integer is encoded in the atom ID itself).
+    var str: String = ""
 
     init() {}
 
