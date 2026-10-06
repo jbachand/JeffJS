@@ -212,3 +212,26 @@ extension JeffJSHeapDebug {
         return "[bodies] IC by capacity: \(icLine)\n[bodies] \(n) live: bytecode \(bc / 1024)KB (+ executed copy \(bcBuf / 1024)KB), debug tables \(dbg / 1024)KB, IC \(icTables) tables \(ic / 1024)KB, cpool \(cpool) slots, closureVars \(cvars), vardefs \(vardefs); lazyPending \(pending), topLevel \(topLevel), withLiveClosures \(withClosures), rc<=1 \(rc1), withSourceSpan \(srcSpan)"
     }
 }
+
+extension JeffJSHeapDebug {
+    /// Duplicate-content analysis over string instances found by a zone walk.
+    public static func stringDuplicateReport(_ addrs: [UInt]) -> String {
+        var byContent: [String: Int] = [:]
+        var total = 0, chars = 0, wide = 0
+        var lenHist: [Int: Int] = [:]
+        for a in addrs {
+            guard let p = UnsafeRawPointer(bitPattern: a) else { continue }
+            let any = Unmanaged<AnyObject>.fromOpaque(p).takeUnretainedValue()
+            guard let s = any as? JeffJSString else { continue }
+            total += 1; chars += s.len; if s.isWideChar { wide += 1 }
+            let b = s.len <= 8 ? 8 : s.len <= 16 ? 16 : s.len <= 32 ? 32 : s.len <= 64 ? 64 : s.len <= 256 ? 256 : 999
+            lenHist[b, default: 0] += 1
+            if s.len <= 64 { byContent[s.toSwiftString(), default: 0] += 1 }
+        }
+        var dupStrings = 0, dupKinds = 0
+        for (_, c) in byContent where c > 1 { dupStrings += c - 1; dupKinds += 1 }
+        let top = byContent.sorted { $0.value > $1.value }.prefix(15).map { "\($0.value)x\"\($0.key.prefix(24))\"" }.joined(separator: " ")
+        let hist = lenHist.sorted { $0.key < $1.key }.map { "≤\($0.key == 999 ? "∞" : String($0.key)):\($0.value)" }.joined(separator: " ")
+        return "[strings] \(total) strings, \(chars) chars, \(wide) wide; lengths \(hist)\n[strings] short (≤64) duplicates: \(dupStrings) redundant copies of \(dupKinds) contents; top: \(top)"
+    }
+}

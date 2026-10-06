@@ -38,6 +38,18 @@ private nonisolated final class JSONParseState {
     var pos: Int
     let end: Int
     var extJSON: Bool  // If true, allow extended JSON (trailing commas, etc.)
+    /// Short string values seen in this parse (perf/watch-object-size): a
+    /// GraphQL / Apollo payload repeats the same `__typename`s, enum values
+    /// and ids thousands of times, and each used to become its own string.
+    /// The parse holds one reference to each; `releaseStrings()` drops them.
+    var strCache: [[UInt16]: JeffJSValue] = [:]
+    static let strCacheMaxLen = 24
+    static let strCacheMaxEntries = 4096
+
+    func releaseStrings() {
+        for (_, v) in strCache { v.freeValue() }
+        strCache.removeAll()
+    }
 
     init(ctx: JeffJSContext, input: [UInt8], extJSON: Bool = false) {
         self.ctx = ctx
@@ -125,6 +137,7 @@ struct JeffJSBuiltinJSON {
         let bytes = jeffJS_utf8Bytes(of: jsStr)
         ctx.freeValue(textStr)
         let state = JSONParseState(ctx: ctx, input: bytes, extJSON: false)
+        defer { state.releaseStrings() }
 
         // Parse the value
         state.skipWhitespace()
@@ -323,6 +336,14 @@ struct JeffJSBuiltinJSON {
 
             if ch == 0x22 { // closing "
                 // Build the JS string directly from the code units
+                if result.count <= JSONParseState.strCacheMaxLen {
+                    if let v = state.strCache[result] { return v.dupValue() }
+                    let v = state.ctx.newStringFromUTF16(result)
+                    if state.strCache.count < JSONParseState.strCacheMaxEntries {
+                        state.strCache[result] = v.dupValue()
+                    }
+                    return v
+                }
                 return state.ctx.newStringFromUTF16(result)
             }
 

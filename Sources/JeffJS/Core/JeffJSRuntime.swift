@@ -439,6 +439,14 @@ nonisolated final class JeffJSRuntime {
     /// allocated a fresh JeffJSString per evaluation, and React's reconciler
     /// runs `typeof x === 'function'` constantly.
     var typeofStrings: [JeffJSString?] = Array(repeating: nil, count: 8)
+    /// Shared immutable JS strings for short, constantly re-created values
+    /// ("", "undefined", "true", tag names ...): JeffJSContext.sharedString.
+    /// Each entry holds one JS reference (the cache's), so a shared string
+    /// is never freed while the runtime lives; bounded by
+    /// `sharedStringsCapacity`. perf/watch-object-size: homedepot kept ~10 k
+    /// separate "" strings and thousands of "div"/"DIV"/"undefined".
+    var sharedStrings: [String: JeffJSString] = [:]
+    static let sharedStringsCapacity = 4096
 
     /// Pool of interpreter value buffers: (pointer, capacity) pairs.
     var interpBufPool: [(UnsafeMutablePointer<JeffJSValue>, Int)] = []

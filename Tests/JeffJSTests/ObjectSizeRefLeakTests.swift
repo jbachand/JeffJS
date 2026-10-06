@@ -204,4 +204,24 @@ final class ObjectSizeRefLeakTests: XCTestCase {
             v.freeValue()
         }
     }
+
+    /// Short strings are shared (JSON.parse within one parse, the conversion
+    /// constants, empty strings, DOM tag names) and stay correct values.
+    func testSharedShortStrings() {
+        withContext { ctx in
+            let v = ctx.eval(input: """
+                var j = JSON.parse('[{"t":"Product","e":""},{"t":"Product","e":""},{"t":"Image","e":"x"}]');
+                var u = String(undefined), n = '' + null, b = String(true), e = String('');
+                [j[0].t === j[1].t, j[0].t, j[2].t, j[1].e.length, u, n, b, e.length, (j[0].t + '!'), j[0].t.length].join('|')
+                """, filename: "<shared>", evalFlags: 0)
+            XCTAssertFalse(v.isException)
+            XCTAssertEqual(ctx.toSwiftString(v), "true|Product|Image|0|undefined|null|true|0|Product!|7")
+            v.freeValue()
+            // The two "Product" values are one string object.
+            let a = ctx.eval(input: "j[0].t", filename: "<a>", evalFlags: 0)
+            let b = ctx.eval(input: "j[1].t", filename: "<b>", evalFlags: 0)
+            XCTAssertTrue(a.stringBase === b.stringBase)
+            a.freeValue(); b.freeValue()
+        }
+    }
 }

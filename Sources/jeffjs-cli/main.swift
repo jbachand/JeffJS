@@ -210,6 +210,7 @@ let status: Int32 = MainActor.assumeIsolated {
         print(env.heapHistogram())
         if args.contains("--roots") { print(env.rootReport()) }
         if args.contains("--big") { print(bigBlockReport(minBytes: 256 * 1024)) }
+        if args.contains("--string-dups") { print(JeffJSHeapDebug.stringDuplicateReport(liveInstances(className: "JeffJS.JeffJSString"))) }
         if args.contains("--bodies") {
             print(JeffJSHeapDebug.functionBodyReport(liveInstances(className: "JeffJS.JeffJSFunctionBytecodeCompiled")))
         }

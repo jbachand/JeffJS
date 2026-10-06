@@ -1134,8 +1134,31 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// - Parameter str: The Swift string.
     /// - Returns: A JS string value.
     func newStringValue(_ str: String) -> JeffJSValue {
+        if str.isEmpty { return sharedString(str) }
         let jsStr = JeffJSString(swiftString: str)
         return JeffJSValue.makeString(jsStr)
+    }
+
+    /// A shared JS string for a short, frequently re-created value (see
+    /// `JeffJSRuntime.sharedStrings`); a fresh one once the table is full
+    /// or for anything longer than 32 UTF-8 bytes. Owned reference.
+    func sharedString(_ s: String) -> JeffJSValue {
+        if let js = rt.sharedStrings[s] { return JeffJSContext.sharedStringRef(js) }
+        guard s.utf8.count <= 32, rt.sharedStrings.count < JeffJSRuntime.sharedStringsCapacity else {
+            return JeffJSValue.makeString(JeffJSString(swiftString: s))
+        }
+        let js = JeffJSString(swiftString: s)   // refCount 1: the table's reference
+        rt.sharedStrings[s] = js
+        return JeffJSContext.sharedStringRef(js)
+    }
+
+    /// One more JS reference to a table-held string. No Swift retain: the
+    /// table keeps the object alive and its count never reaches zero.
+    @inline(__always)
+    static func sharedStringRef(_ js: JeffJSString) -> JeffJSValue {
+        js.refCount += 1
+        let raw = Unmanaged.passUnretained(js).toOpaque()
+        return JeffJSValue(bits: JeffJSValue._stringTag | UInt64(UInt(bitPattern: raw)))
     }
 
     // MARK: - Property Operations (String-keyed)
@@ -2218,13 +2241,13 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return newStringValue(formatDouble(d))
         }
         if val.isBool {
-            return newStringValue(val.toBool() ? "true" : "false")
+            return sharedString(val.toBool() ? "true" : "false")
         }
         if val.isNull {
-            return newStringValue("null")
+            return sharedString("null")
         }
         if val.isUndefined {
-            return newStringValue("undefined")
+            return sharedString("undefined")
         }
         if val.isObject {
             // ES spec 7.1.12 step 1: ToPrimitive(val, "string")

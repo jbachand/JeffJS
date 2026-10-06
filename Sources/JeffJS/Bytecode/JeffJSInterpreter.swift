@@ -512,6 +512,7 @@ extension JeffJSContext {
     /// Creates a new JS string value from a Swift String.
     /// Bridges `ctx.newString(s)` to a proper JeffJSString allocation.
     func newString(_ s: String) -> JeffJSValue {
+        if s.isEmpty { return sharedString(s) }
         let jsStr = JeffJSString(swiftString: s)
         return JeffJSValue.makeString(jsStr)
     }
@@ -2780,9 +2781,9 @@ extension JeffJSContext {
         if val.isString || val.isSymbol { return val.dupValue() }
         if val.isInt { return newString(String(val.toInt32())) }
         if val.isFloat64 { return newString(JeffJSTypeConvert.formatNumber(val.toFloat64())) }
-        if val.isBool { return newString(val.toBool() ? "true" : "false") }
-        if val.isNull { return newString("null") }
-        if val.isUndefined { return newString("undefined") }
+        if val.isBool { return sharedString(val.toBool() ? "true" : "false") }
+        if val.isNull { return sharedString("null") }
+        if val.isUndefined { return sharedString("undefined") }
         if val.isBigInt { return newString(JeffJSBigIntOps.toSwiftString(val)) }
         // For objects, ToPrimitive(hint string) then ToString
         return JeffJSTypeConvert.toString(ctx: self, val: val)
@@ -6591,13 +6592,13 @@ struct JeffJSTypeConvert {
             return ctx.newString(s)
         }
         if val.isBool {
-            return ctx.newString(val.toBool() ? "true" : "false")
+            return ctx.sharedString(val.toBool() ? "true" : "false")
         }
         if val.isNull {
-            return ctx.newString("null")
+            return ctx.sharedString("null")
         }
         if val.isUndefined {
-            return ctx.newString("undefined")
+            return ctx.sharedString("undefined")
         }
         if val.isObject {
             // toPrimitive's result is owned for an object input: convert, then

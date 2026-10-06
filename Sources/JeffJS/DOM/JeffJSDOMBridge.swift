@@ -1216,9 +1216,11 @@ final class JeffJSDOMBridge {
 
         // -- Per-instance read-only properties --
         ctx.setPropertyStr(obj: el, name: "nodeType", value: .newInt32(nodeTypeInt(node)))
-        ctx.setPropertyStr(obj: el, name: "nodeName", value: ctx.newStringValue(nodeNameStr(node)))
-        ctx.setPropertyStr(obj: el, name: "tagName", value: ctx.newStringValue(Self.qualifiedTagName(node)))
-        ctx.setPropertyStr(obj: el, name: "localName", value: ctx.newStringValue(node.tagName ?? ""))
+        // Shared strings: every wrapper of a <div> used to carry its own
+        // "DIV", "DIV" and "div" (perf/watch-object-size).
+        ctx.setPropertyStr(obj: el, name: "nodeName", value: ctx.sharedString(nodeNameStr(node)))
+        ctx.setPropertyStr(obj: el, name: "tagName", value: ctx.sharedString(Self.qualifiedTagName(node)))
+        ctx.setPropertyStr(obj: el, name: "localName", value: ctx.sharedString(node.tagName ?? ""))
         if node.isDocumentType {
             // DocumentType: `name` comes from the shared prototype's reflected
             // `name` accessor (the doctype keeps its name under that key).
