@@ -121,7 +121,8 @@ let status: Int32 = MainActor.assumeIsolated {
     }
     if let dir = pageDir {
         let r = cliRunPage(env: env, dir: dir, bundlesDir: bundlesDir)
-        print("[page] scripts=\(r.ran) errors=\(r.errors) skipped=\(r.skipped) ms=\(Int(r.ms))")
+        let g = env.gcStatistics
+        print("[page] scripts=\(r.ran) errors=\(r.errors) skipped=\(r.skipped) ms=\(Int(r.ms)) gcRuns=\(g.runs) cyclesFreed=\(g.cyclesFreed) live=\(g.liveObjects)")
     }
     for path in paths {
         guard let src = try? String(contentsOfFile: path, encoding: .utf8) else {
