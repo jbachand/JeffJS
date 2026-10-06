@@ -35,7 +35,13 @@ enum JeffJSStringStorage {
 // nonisolated for the same reason as JeffJSGCObjectHeader: strings are freed
 // off the main actor, and JeffJSString has a deinit.
 nonisolated class JeffJSStringBase {
-    var refCount: Int
+    /// 32-bit storage (perf/watch-object-size): with the flags it packs the
+    /// flat string into 48 bytes.
+    final var _rc: Int32
+    final var refCount: Int {
+        @inline(__always) get { Int(_rc) }
+        @inline(__always) set { _rc = Int32(truncatingIfNeeded: newValue) }
+    }
     /// UAF tripwire (zombie mode).
     var freeMark: Bool = false
     /// Representation tag so callers can `unsafeDowncast` instead of running
@@ -44,7 +50,7 @@ nonisolated class JeffJSStringBase {
     static let kindRope: UInt8 = 1
     static let kindBuffer: UInt8 = 2
     let kind: UInt8
-    init(refCount: Int, kind: UInt8) { self.refCount = refCount; self.kind = kind }
+    init(refCount: Int, kind: UInt8) { self._rc = Int32(truncatingIfNeeded: refCount); self.kind = kind }
 }
 
 nonisolated final class JeffJSString: JeffJSStringBase {
@@ -59,20 +65,28 @@ nonisolated final class JeffJSString: JeffJSStringBase {
         }
     }
 
-    // -- Reference counting --------------------------------------------------
-
-
-    /// UAF tripwire: set when the string's JS refcount hit zero in zombie mode
-    /// (JEFFJS_ZOMBIES=1). Any later dup/free on it is an over-release bug.
-
-    // -- Length (max 2^31 - 1) ------------------------------------------------
-
-    private(set) var len: Int
+    // Layout (perf/watch-object-size): 64 bytes, was 112. Swift packs these
+    // into the base class's tail padding in declaration order:
+    //   isWideChar @26, _len @28, _hashAndAtomType @32, cachedAtom @36,
+    //   cachedAtomRuntime @40, storage @48 (9 B) -> 57.
+    // The regex input caches (codeUnits32 & co., 4 bytes per character for a
+    // string's whole life) became a few per-runtime entries
+    // (JeffJSRegexCaches), the unused atom-chain link `hashNext` was dropped
+    // and the length is 32-bit (QuickJS's JSString limit is 2^31 - 1 too).
 
     // -- Encoding flag -------------------------------------------------------
 
     /// `false` = 8-bit (Latin-1), `true` = 16-bit (UTF-16).
     private(set) var isWideChar: Bool
+
+
+    // -- Length (max 2^31 - 1) ------------------------------------------------
+
+    private var _len: UInt32
+    private(set) var len: Int {
+        @inline(__always) get { Int(_len) }
+        @inline(__always) set { _len = UInt32(truncatingIfNeeded: newValue) }
+    }
 
     // -- Hash / atom ---------------------------------------------------------
 
@@ -95,15 +109,6 @@ nonisolated final class JeffJSString: JeffJSStringBase {
         }
     }
 
-    /// Next pointer in the atom hash chain.
-    var hashNext: UInt32
-    /// Regex input caches (js_regexp_execInternal): the code units / code
-    /// points of this string as UInt32, built once instead of per exec.
-    var codeUnits32: [UInt32]? = nil
-    var codePoints32: [UInt32]? = nil
-    /// For a compiled RegExp bytecode string: its capture-group names,
-    /// parsed once (exec used to copy the bytecode and re-parse per match).
-    var regexpGroupNames: [String?]? = nil
     /// Atom interned for this string when it was used as a property key
     /// (JeffJSRuntime.findAtom(jsString:)); holds one atom reference, released
     /// in deinit. 0 = none.
@@ -111,9 +116,39 @@ nonisolated final class JeffJSString: JeffJSStringBase {
     /// `JeffJSRuntime.atomOwnerID` of the runtime `cachedAtom` belongs to.
     var cachedAtomRuntime: UInt32 = 0
 
+    /// Next pointer in the atom hash chain. Unused (atoms are
+    /// JeffJSAtomStruct entries with their own chain); kept for source
+    /// compatibility, no storage.
+    var hashNext: UInt32 {
+        get { 0 }
+        set { }
+    }
     // -- Storage -------------------------------------------------------------
 
-    var storage: JeffJSStringStorage
+    /// The characters, as one 8-byte enum of ContiguousArrays (an enum of
+    /// two Arrays is 9 bytes: no spare bits through Array's bridge storage).
+    /// `storage` presents them as before; Array <-> ContiguousArray share the
+    /// buffer, so the conversion is O(1) both ways.
+    private enum Chars {
+        case c8(ContiguousArray<UInt8>)
+        case c16(ContiguousArray<UInt16>)
+    }
+    private var _chars: Chars
+
+    var storage: JeffJSStringStorage {
+        @inline(__always) get {
+            switch _chars {
+            case .c8(let c): return .str8(Array(c))
+            case .c16(let c): return .str16(Array(c))
+            }
+        }
+        set {
+            switch newValue {
+            case .str8(let a): _chars = .c8(ContiguousArray(a))
+            case .str16(let a): _chars = .c16(ContiguousArray(a))
+            }
+        }
+    }
 
     // -- Convenience accessors -----------------------------------------------
 
@@ -152,11 +187,13 @@ nonisolated final class JeffJSString: JeffJSStringBase {
          atomType: UInt8 = 0,
          hashNext: UInt32 = 0,
          storage: JeffJSStringStorage = .str8([])) {
-        self.len = len
+        self._len = UInt32(truncatingIfNeeded: len)
         self.isWideChar = isWideChar
         self._hashAndAtomType = (hash & 0x3FFF_FFFF) | (UInt32(atomType & 0x3) << 30)
-        self.hashNext = hashNext
-        self.storage = storage
+        switch storage {
+        case .str8(let a): self._chars = .c8(ContiguousArray(a))
+        case .str16(let a): self._chars = .c16(ContiguousArray(a))
+        }
         super.init(refCount: refCount, kind: JeffJSStringBase.kindFlat)
     }
 
@@ -180,12 +217,16 @@ nonisolated final class JeffJSString: JeffJSStringBase {
 nonisolated final class JeffJSStringRope: JeffJSStringBase {
     /// Flattened form, built on first read and kept (reads of a string built
     /// with `+=` used to re-flatten the whole rope on every access).
-    var flat: JeffJSString? = nil
-
-    /// UAF tripwire (zombie mode) — see JeffJSString.freeMark.
-    var len: Int
+    // Layout: isWideChar/depth/_len pack into the base's tail padding
+    // (64 bytes, was 80).
     var isWideChar: Bool
     var depth: UInt8
+    private var _len: UInt32
+    var len: Int {
+        @inline(__always) get { Int(_len) }
+        @inline(__always) set { _len = UInt32(truncatingIfNeeded: newValue) }
+    }
+    var flat: JeffJSString? = nil
 
     var left: JeffJSValue
     var right: JeffJSValue
@@ -196,7 +237,7 @@ nonisolated final class JeffJSStringRope: JeffJSStringBase {
          depth: UInt8 = 0,
          left: JeffJSValue = .undefined,
          right: JeffJSValue = .undefined) {
-        self.len = len
+        self._len = UInt32(truncatingIfNeeded: len)
         self.isWideChar = isWideChar
         self.depth = depth
         self.left = left

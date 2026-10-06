@@ -44,7 +44,14 @@ if let bb = args.first(where: { $0.hasPrefix("--boot-bench") }) {
     exit(code)
 }
 
-guard !paths.isEmpty else {
+// --page=<fixture dir>: a saved page (rn_fixtures layout: index.html, manifest.json,
+// r/<files>): its HTML becomes the document and its scripts run in document
+// order (classic: the fixture file or inline text; module: the app's dumped
+// bundle `<file>.bundle.js` from --bundles=<dir>, else skipped). Network is
+// stubbed (fetch/XHR never settle) so runs are reproducible.
+let pageDir = args.first(where: { $0.hasPrefix("--page=") }).map { String($0.dropFirst(7)) }
+let bundlesDir = args.first(where: { $0.hasPrefix("--bundles=") }).map { String($0.dropFirst(10)) }
+guard !paths.isEmpty || pageDir != nil else {
     FileHandle.standardError.write("usage: jeffjs-cli <script.js>... [--result]\n".data(using: .utf8)!)
     exit(2)
 }
@@ -60,14 +67,24 @@ let repeatCount = args.first(where: { $0.hasPrefix("--repeat=") }).flatMap { Int
 // which mirrors how the conformance runner feeds a group of snippets to a
 // single context.
 let status: Int32 = MainActor.assumeIsolated {
-    let env = JeffJSEnvironment()
-    env.onConsoleMessage = { _, msg in print(msg); fflush(stdout) }
+    var pageURL: (url: URL, ua: String)? = nil
+    if let dir = pageDir,
+       let d = FileManager.default.contents(atPath: dir + "/manifest.json"),
+       let m = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+        pageURL = (URL(string: (m["final_url"] as? String) ?? (m["url"] as? String) ?? "about:blank")!,
+                   (m["user_agent"] as? String) ?? "Mozilla/5.0")
+    }
+    let env = pageURL.map { JeffJSEnvironment(configuration: .init(baseURL: $0.url, userAgent: $0.ua)) } ?? JeffJSEnvironment()
+    let quietConsole = args.contains("--quiet")
+    env.onConsoleMessage = { _, msg in if !quietConsole { print(msg); fflush(stdout) } }
+    let mallocAtStart = cliMallocInUse()
     // Test hooks: force a collection and read the collector's counters.
     env.registerNativeFunction("__gc") { _ in env.runGC(); return nil }
     env.registerNativeFunction("__gcStats") { _ in
         let s = env.gcStatistics
         return "{\"runs\":\(s.runs),\"cyclesFreed\":\(s.cyclesFreed),\"liveObjects\":\(s.liveObjects),\"heapBytes\":\(s.heapBytes),\"threshold\":\(s.threshold)}"
     }
+    env.registerNativeFunction("__mallocInUse") { _ in String(cliMallocInUse()) }
     var status: Int32 = 0
     // --eager: compile every function body up front (lazy compilation off).
     if args.contains("--eager") { env.lazyFunctions = false }
@@ -101,6 +118,11 @@ let status: Int32 = MainActor.assumeIsolated {
             }
         }
         return status
+    }
+    if let dir = pageDir {
+        let r = cliRunPage(env: env, dir: dir, bundlesDir: bundlesDir)
+        let g = env.gcStatistics
+        print("[page] scripts=\(r.ran) errors=\(r.errors) skipped=\(r.skipped) ms=\(Int(r.ms)) gcRuns=\(g.runs) cyclesFreed=\(g.cyclesFreed) live=\(g.liveObjects)")
     }
     for path in paths {
         guard let src = try? String(contentsOfFile: path, encoding: .utf8) else {
@@ -176,6 +198,28 @@ let status: Int32 = MainActor.assumeIsolated {
         print(String(format: "[glue] %d evals %.1f ms (%.3f ms each)", g, (CFAbsoluteTimeGetCurrent() - t0) * 1000,
                      (CFAbsoluteTimeGetCurrent() - t0) * 1000 / Double(max(g, 1))))
     }
+    // --heap-report: collect (3 full GCs), then the live JS heap: GC-list
+    // objects, malloc bytes in use since the environment was created, and
+    // the per-object average (all engine bytes / live JS objects).
+    if args.contains("--heap-report") {
+        for _ in 0..<3 { env.runGC() }
+        let g = env.gcStatistics
+        let delta = cliMallocInUse() - mallocAtStart
+        print(String(format: "[heap] liveObjects=%d mallocDelta=%.1fMB perObject=%.0fB footprint=%.1fMB",
+                     g.liveObjects, Double(delta) / 1_048_576, Double(delta) / Double(max(g.liveObjects, 1)), cliFootprintMB()))
+        print(env.heapHistogram())
+        if args.contains("--roots") { print(env.rootReport()) }
+        if args.contains("--big") { print(bigBlockReport(minBytes: 256 * 1024)) }
+        if args.contains("--string-dups") { print(JeffJSHeapDebug.stringDuplicateReport(liveInstances(className: "JeffJS.JeffJSString"))) }
+        if args.contains("--bodies") {
+            print(JeffJSHeapDebug.functionBodyReport(liveInstances(className: "JeffJS.JeffJSFunctionBytecodeCompiled")))
+        }
+        if args.contains("--mem-census") { print(MallocCensus.report(label: "heap", top: 40)) }
+        if args.contains("--orphans") {
+            print(orphanReport(className: "JeffJS.JeffJSString") { JeffJSHeapDebug.describeString(at: $0) })
+            print(orphanReport(className: "JeffJS.JeffJSObject") { JeffJSHeapDebug.describeObject(at: $0) })
+        }
+    }
     if args.contains("--cache-stats") { print("[cache] " + env.bytecodeCacheDescription) }
     env.flushBytecodeCache()
     // --teardown exercises context/runtime free (the path the test suite runs
@@ -184,6 +228,71 @@ let status: Int32 = MainActor.assumeIsolated {
     return status
 }
 exit(status)
+
+/// Bytes in use in every malloc zone.
+func cliMallocInUse() -> Int {
+    var stats = malloc_statistics_t()
+    malloc_zone_statistics(nil, &stats)
+    return Int(stats.size_in_use)
+}
+
+/// --page: run a saved page's scripts in document order (see the flag).
+@MainActor
+func cliRunPage(env: JeffJSEnvironment, dir: String, bundlesDir: String?) -> (ran: Int, errors: Int, skipped: Int, ms: Double) {
+    guard let html = try? String(contentsOfFile: dir + "/index.html", encoding: .utf8) else { return (0, 0, 0, 0) }
+    // file -> original URL (error messages / filenames as the app sees them)
+    var urlOf: [String: String] = [:]
+    if let d = FileManager.default.contents(atPath: dir + "/manifest.json"),
+       let m = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+       let res = m["resources"] as? [String: [String: Any]] {
+        for (u, v) in res { if let f = v["file"] as? String { urlOf[f] = u } }
+    }
+    env.loadDocumentHTML(html)
+    _ = env.eval("""
+        (function(){
+          var never = function(){ return new Promise(function(){}); };
+          globalThis.fetch = never;
+          if (globalThis.XMLHttpRequest) { XMLHttpRequest.prototype.send = function(){}; }
+          if (globalThis.navigator) { try { navigator.sendBeacon = function(){ return true; }; } catch (e) {} }
+        })();
+        """, filename: "<page-prelude>")
+    var scripts: [DOMNode] = []
+    func walk(_ n: DOMNode) {
+        if n.lowercasedTagName == "script" { scripts.append(n) }
+        for c in n.children { walk(c) }
+    }
+    walk(env.document)
+    var ran = 0, errors = 0, skipped = 0
+    let t0 = CFAbsoluteTimeGetCurrent()
+    let verbose = ProcessInfo.processInfo.environment["JEFFJS_PAGE_VERBOSE"] != nil
+    for s in scripts {
+        let type = (s.attributeValue("type") ?? "").lowercased()
+        let isModule = type == "module"
+        if !(type.isEmpty || type.contains("javascript") || type.contains("ecmascript") || isModule) { skipped += 1; continue }
+        var src: String? = nil
+        var name = "<inline>"
+        if let file = s.attributeValue("src") {
+            name = urlOf[file] ?? file
+            if isModule {
+                let base = (file as NSString).lastPathComponent
+                if let bd = bundlesDir { src = try? String(contentsOfFile: bd + "/" + base + ".bundle.js", encoding: .utf8) }
+            } else {
+                src = try? String(contentsOfFile: dir + "/" + file, encoding: .utf8)
+            }
+        } else if !isModule {
+            src = s.rawTextDescendants
+        }
+        guard let code = src, !code.isEmpty else { skipped += 1; continue }
+        let r = env.eval(code, filename: name)
+        ran += 1
+        if case .exception(let msg) = r {
+            errors += 1
+            if verbose { FileHandle.standardError.write("[page] \(name): \(msg.prefix(200))\n".data(using: .utf8)!) }
+        }
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+    }
+    return (ran, errors, skipped, (CFAbsoluteTimeGetCurrent() - t0) * 1000)
+}
 
 /// Process footprint (what jetsam counts), in MB.
 func cliFootprintMB() -> Double {

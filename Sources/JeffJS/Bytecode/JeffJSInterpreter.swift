@@ -512,6 +512,7 @@ extension JeffJSContext {
     /// Creates a new JS string value from a Swift String.
     /// Bridges `ctx.newString(s)` to a proper JeffJSString allocation.
     func newString(_ s: String) -> JeffJSValue {
+        if s.isEmpty { return sharedString(s) }
         let jsStr = JeffJSString(swiftString: s)
         return JeffJSValue.makeString(jsStr)
     }
@@ -823,6 +824,13 @@ extension JeffJSContext {
 
             let suspended = _asyncSuspended
             let capPromise = _asyncCapPromise
+            // The lazily created capability's resolving functions are owned
+            // here: every suspension stored its own dups in its
+            // AsyncSavedEntry. Dropping them on restore leaked both functions
+            // (and through them the result promise) once per suspending call.
+            let ownResolve = _asyncResolve, ownReject = _asyncReject
+            if !ownResolve.isUninitialized { jeffJS_leakFixFree(ownResolve) }
+            if !ownReject.isUninitialized { jeffJS_leakFixFree(ownReject) }
             // Restore previous async state (for nested async calls)
             _asyncResolve = prevResolve
             _asyncReject = prevReject
@@ -1182,11 +1190,16 @@ extension JeffJSContext {
     func newArrayFromSlots(_ p: UnsafeMutablePointer<JeffJSValue>, _ count: Int) -> JeffJSValue {
         let arr = newArray()
         if count == 0 { return arr }
-        if let obj = arr.toObject(), obj.fastArray, obj._fastArrayValues == nil,
+        if let obj = arr.toObject(), obj.fastArray,
+           obj._fastArrayValues.map({ $0.count == 0 && $0.values.isEmpty }) ?? true,
            let cached = arrayShape, obj.shape === cached, obj.propValues.count == 1,
            count <= Int(Int32.max) {
             let src = UnsafeBufferPointer(start: p, count: count)
-            if let st = rt.arrayStoragePool.popLast() {
+            if let st = obj._fastArrayValues {
+                // A new array's (empty) element store: fill it in place.
+                st.values.append(contentsOf: src)
+                st.count = UInt32(count)
+            } else if let st = rt.arrayStoragePool.popLast() {
                 st.values.append(contentsOf: src)
                 st.count = UInt32(count)
                 obj._fastArrayValues = st
@@ -1237,7 +1250,17 @@ extension JeffJSContext {
         guard let innerFB = closureFB.toFunctionBytecode() else {
             return closureFB.dupValue()
         }
-        let obj = JeffJSObject()
+        // A recycled closure (jeffJS_recycleFunction) comes back reset, with
+        // its side box; it rejoins the GC list here as a fresh one does in init.
+        let recycled = rt.functionPool.popLast()
+        let obj: JeffJSObject
+        if let r = recycled {
+            r.refCount = 1
+            addGCObject(rt, r)
+            obj = r
+        } else {
+            obj = JeffJSObject()
+        }
 
         // Determine the correct classID based on function kind
         if innerFB.isGenerator && innerFB.isAsyncFunc {
@@ -1354,7 +1377,8 @@ extension JeffJSContext {
         // Set proto after shape (proto may already be synced via shape)
         obj.proto = closureProto
 
-        let funcVal = JeffJSValue.makeObject(obj)
+        // A pooled object still holds its original creation retain.
+        let funcVal = recycled != nil ? JeffJSValue.makeObjectRecycled(obj) : JeffJSValue.makeObject(obj)
 
         // For regular (non-arrow, non-generator, non-async) functions,
         // F.prototype = { constructor: F } is built LAZILY on first access
@@ -2340,9 +2364,18 @@ extension JeffJSContext {
     // MARK: - Object/Class Definition Stubs
 
     /// Defines a data property on an object.
+    /// Consumes `val` (the define_field opcode hands over the reference it
+    /// popped, as its transition-IC fast path does). definePropertyValue dups,
+    /// so the popped reference is released here — it was leaked on every IC
+    /// miss: one count per object-literal property the first time each site
+    /// ran (and on every polymorphic miss), which pinned literal values —
+    /// strings and whole object graphs — for good ("a literal's property value
+    /// keeps one count too many", RuntimeTeardownReleaseTests).
     func defineField(obj: JeffJSValue, atom: UInt32, val: JeffJSValue) -> Bool {
-        return definePropertyValue(obj: obj, atom: atom, value: val,
-                                   flags: JS_PROP_C_W_E) >= 0
+        let r = definePropertyValue(obj: obj, atom: atom, value: val,
+                                    flags: JS_PROP_C_W_E)
+        jeffJS_leakFixFree(val)
+        return r >= 0
     }
 
     /// Sets the .name property on a function.
@@ -2748,9 +2781,9 @@ extension JeffJSContext {
         if val.isString || val.isSymbol { return val.dupValue() }
         if val.isInt { return newString(String(val.toInt32())) }
         if val.isFloat64 { return newString(JeffJSTypeConvert.formatNumber(val.toFloat64())) }
-        if val.isBool { return newString(val.toBool() ? "true" : "false") }
-        if val.isNull { return newString("null") }
-        if val.isUndefined { return newString("undefined") }
+        if val.isBool { return sharedString(val.toBool() ? "true" : "false") }
+        if val.isNull { return sharedString("null") }
+        if val.isUndefined { return sharedString("undefined") }
         if val.isBigInt { return newString(JeffJSBigIntOps.toSwiftString(val)) }
         // For objects, ToPrimitive(hint string) then ToString
         return JeffJSTypeConvert.toString(ctx: self, val: val)
@@ -6559,18 +6592,23 @@ struct JeffJSTypeConvert {
             return ctx.newString(s)
         }
         if val.isBool {
-            return ctx.newString(val.toBool() ? "true" : "false")
+            return ctx.sharedString(val.toBool() ? "true" : "false")
         }
         if val.isNull {
-            return ctx.newString("null")
+            return ctx.sharedString("null")
         }
         if val.isUndefined {
-            return ctx.newString("undefined")
+            return ctx.sharedString("undefined")
         }
         if val.isObject {
+            // toPrimitive's result is owned for an object input: convert, then
+            // release it (it was leaked — one string per `"" + obj`, `${obj}`,
+            // `fn + ""`; Akamai's 536 KB self-source per integrity check).
             let prim = toPrimitive(ctx: ctx, val: val, hint: HINT_STRING)
             if prim.isException { return .exception }
-            return toString(ctx: ctx, val: prim)
+            let r = toString(ctx: ctx, val: prim)
+            jeffJS_leakFixFree(prim)
+            return r
         }
         if val.isSymbol {
             _ = ctx.throwTypeError(message: "Cannot convert a symbol to a string")
@@ -6621,13 +6659,15 @@ struct JeffJSTypeConvert {
 
     // MARK: ToPrimitive
 
-    /// ToPrimitive abstract operation.
+    /// ToPrimitive abstract operation. The result is OWNED when `val` is an
+    /// object and borrowed (`val` itself) otherwise.
     static func toPrimitive(ctx: JeffJSContext, val: JeffJSValue, hint: Int) -> JeffJSValue {
         if !val.isObject { return val }
         // Try [Symbol.toPrimitive] first
         let toPrimSym = ctx.getWellKnownSymbol("toPrimitive")
         if toPrimSym != 0 {
             let method = ctx.getProperty(obj: val, atom: toPrimSym)
+            if method.isException { return .exception }
             if !method.isUndefined && !method.isNull {
                 let hintStr: JeffJSValue
                 switch hint {
@@ -6635,9 +6675,13 @@ struct JeffJSTypeConvert {
                 case HINT_NUMBER: hintStr = ctx.newString("number")
                 default: hintStr = ctx.newString("default")
                 }
+                // The method, the hint string and an object result are owned
+                // here (all three were leaked per conversion).
                 let result = ctx.callFunction(method, thisVal: val, args: [hintStr])
+                jeffJS_leakFixFree(method); jeffJS_leakFixFree(hintStr)
                 if result.isException { return .exception }
                 if !result.isObject { return result }
+                jeffJS_leakFixFree(result)
                 _ = ctx.throwTypeError(message: "Cannot convert object to primitive value")
                 return .exception
             }
@@ -6651,11 +6695,13 @@ struct JeffJSTypeConvert {
         }
         for name in methodNames {
             let method = ctx.getPropertyStr(obj: val, name: name)
-            if method.isUndefined || method.isNull { continue }
-            if !method.isFunction { continue }
+            if method.isException { return .exception }
+            if !method.isFunction { jeffJS_leakFixFree(method); continue }
             let result = ctx.callFunction(method, thisVal: val, args: [])
+            jeffJS_leakFixFree(method)
             if result.isException { return .exception }
             if !result.isObject { return result }
+            jeffJS_leakFixFree(result)
         }
         _ = ctx.throwTypeError(message: "Cannot convert object to primitive value")
         return .exception
@@ -6698,11 +6744,13 @@ struct JeffJSOperators {
             ls.freeValue(); rs.freeValue()
             return r
         }
-        // General case: ToPrimitive
+        // General case: ToPrimitive (owned results for object operands).
         let lp = JeffJSTypeConvert.toPrimitive(ctx: ctx, val: lhs, hint: HINT_NONE)
         if lp.isException { return .exception }
+        defer { if lhs.isObject { jeffJS_leakFixFree(lp) } }
         let rp = JeffJSTypeConvert.toPrimitive(ctx: ctx, val: rhs, hint: HINT_NONE)
         if rp.isException { return .exception }
+        defer { if rhs.isObject { jeffJS_leakFixFree(rp) } }
         if lp.isString || rp.isString {
             let ls = JeffJSTypeConvert.toString(ctx: ctx, val: lp)
             if ls.isException { return .exception }
@@ -6811,6 +6859,7 @@ struct JeffJSOperators {
             if other.isObject {
                 let op = JeffJSTypeConvert.toPrimitive(ctx: ctx, val: other, hint: HINT_NONE)
                 if op.isException { return (false, false) }
+                defer { jeffJS_leakFixFree(op) }
                 return jsEq(ctx: ctx, lhs: big, rhs: op)
             }
             return (false, true)
@@ -6839,11 +6888,13 @@ struct JeffJSOperators {
         if lhs.isObject && (rhs.isNumber || rhs.isString || rhs.isSymbol) {
             let lp = JeffJSTypeConvert.toPrimitive(ctx: ctx, val: lhs, hint: HINT_NONE)
             if lp.isException { return (false, false) }
+            defer { jeffJS_leakFixFree(lp) }
             return jsEq(ctx: ctx, lhs: lp, rhs: rhs)
         }
         if rhs.isObject && (lhs.isNumber || lhs.isString || lhs.isSymbol) {
             let rp = JeffJSTypeConvert.toPrimitive(ctx: ctx, val: rhs, hint: HINT_NONE)
             if rp.isException { return (false, false) }
+            defer { jeffJS_leakFixFree(rp) }
             return jsEq(ctx: ctx, lhs: lhs, rhs: rp)
         }
         return (false, true)
@@ -6924,8 +6975,10 @@ struct JeffJSOperators {
         // General case
         let lp = JeffJSTypeConvert.toPrimitive(ctx: ctx, val: lhs, hint: HINT_NUMBER)
         if lp.isException { return (JS_CMP_GE, false) }
+        defer { if lhs.isObject { jeffJS_leakFixFree(lp) } }
         let rp = JeffJSTypeConvert.toPrimitive(ctx: ctx, val: rhs, hint: HINT_NUMBER)
         if rp.isException { return (JS_CMP_GE, false) }
+        defer { if rhs.isObject { jeffJS_leakFixFree(rp) } }
         if lp.isString && rp.isString {
             if let a = lp.stringValue, let b = rp.stringValue {
                 return (jeffJS_stringCompare(a, b) < 0 ? JS_CMP_LT : JS_CMP_GE, true)

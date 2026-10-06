@@ -1094,6 +1094,7 @@ struct JeffJSBuiltinObject {
         // Get all own property names (strings + symbols)
         let names = ctx.getOwnPropertyNames(obj, flags: JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK)
         if names.isException { return names }
+        defer { jeffJS_leakFixFree(names) }   // was leaked (one array + its key strings per call)
 
         let result = ctx.newPlainObject()
         if result.isException { return result }
@@ -1101,10 +1102,11 @@ struct JeffJSBuiltinObject {
         let len = ctx.getArrayLength(names)
         for i in 0..<len {
             let key = ctx.getPropertyByIndex(obj:names, index: UInt32(i))
-            if key.isException { return key }
+            if key.isException { jeffJS_leakFixFree(result); return key }
+            defer { jeffJS_leakFixFree(key) }
 
             let desc = ctx.getOwnPropertyDescriptor(obj, key: key)
-            if desc.isException { return desc }
+            if desc.isException { jeffJS_leakFixFree(result); return desc }
 
             if !desc.isUndefined {
                 let ret = ctx.setProperty(obj: result, key: key, value: desc)
@@ -1340,53 +1342,71 @@ struct JeffJSBuiltinObject {
         let obj = ctx.newPlainObject()
         if obj.isException { return obj }
 
-        // Get iterator
+        // Every value below is owned and released: the iterator, each step's
+        // result, the entry, its key/value and the property key (all of them
+        // leaked before — 7 objects per call with a one-entry array).
         let iter = ctx.getIterator(iterable, isAsync: false)
-        if iter.isException { return iter }
+        if iter.isException { jeffJS_leakFixFree(obj); return iter }
+        defer { jeffJS_leakFixFree(iter) }
 
         while true {
             let next = ctx.iteratorNext(iter: iter)
-            if next.isException { return next }
+            if next.isException { jeffJS_leakFixFree(obj); return next }
 
             let done = ctx.getProperty(obj: next, atom: JSAtomID.done)
-            if done.isException { return done }
+            if done.isException { jeffJS_leakFixFree(next); jeffJS_leakFixFree(obj); return done }
             if ctx.toBoolFree(done) {
+                jeffJS_leakFixFree(next)
                 break
             }
 
             let val = ctx.getProperty(obj: next, atom: JSAtomID.value)
+            jeffJS_leakFixFree(next)
             if val.isException {
                 ctx.iteratorClose(iter: iter, isThrow: true)
+                jeffJS_leakFixFree(obj)
                 return val
             }
 
             // Each element must be an object (array-like [key, value])
             if !val.isObject {
+                jeffJS_leakFixFree(val)
                 ctx.iteratorClose(iter: iter, isThrow: true)
+                jeffJS_leakFixFree(obj)
                 return ctx.throwTypeError("Iterator value is not an entry object")
             }
 
             let key = ctx.getPropertyByIndex(obj:val, index: 0)
             if key.isException {
+                jeffJS_leakFixFree(val)
                 ctx.iteratorClose(iter: iter, isThrow: true)
+                jeffJS_leakFixFree(obj)
                 return key
             }
 
             let entryValue = ctx.getPropertyByIndex(obj:val, index: 1)
+            jeffJS_leakFixFree(val)
             if entryValue.isException {
+                jeffJS_leakFixFree(key)
                 ctx.iteratorClose(iter: iter, isThrow: true)
+                jeffJS_leakFixFree(obj)
                 return entryValue
             }
 
             let propKey = ctx.toPropertyKey(key)
+            jeffJS_leakFixFree(key)
             if propKey.isException {
+                jeffJS_leakFixFree(entryValue)
                 ctx.iteratorClose(iter: iter, isThrow: true)
+                jeffJS_leakFixFree(obj)
                 return propKey
             }
 
             let ret = ctx.setProperty(obj: obj, key: propKey, value: entryValue)
+            jeffJS_leakFixFree(propKey)
             if ret < 0 {
                 ctx.iteratorClose(iter: iter, isThrow: true)
+                jeffJS_leakFixFree(obj)
                 return .exception
             }
         }
@@ -1662,6 +1682,7 @@ struct JeffJSBuiltinObject {
 
         let key = ctx.toPropertyKey(prop)
         if key.isException { return key }
+        defer { jeffJS_leakFixFree(key) }
 
         let desc = ctx.getOwnPropertyDescriptor(obj, key: key)
         if desc.isException { return desc }
@@ -1669,6 +1690,11 @@ struct JeffJSBuiltinObject {
         if desc.isUndefined {
             return .JS_FALSE
         }
+        // The descriptor is a fresh object (and holds the property's value):
+        // dropping it un-freed leaked it and everything its `value` reached
+        // (Babel's _objectWithoutProperties / TS __rest call this per key —
+        // homedepot kept 110 k descriptors and their values alive).
+        defer { jeffJS_leakFixFree(desc) }
 
         let enumerable = ctx.getProperty(obj: desc, atom: JSAtomID.enumerable)
         if enumerable.isException { return enumerable }

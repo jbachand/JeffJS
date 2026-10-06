@@ -956,7 +956,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             o.refCount = 1
             cached.refCount += 1
             o.shape = cached
-            if o.storedProto !== cached.proto { o.storedProto = cached.proto }
+            // (the prototype is read from the shape: nothing to mirror)
             addGCObject(rt, o)
             return JeffJSValue.makeObjectRecycled(o)
         }
@@ -1004,7 +1004,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             o.classID = classID
             cached.refCount += 1
             o.shape = cached
-            if o.storedProto !== cached.proto { o.storedProto = cached.proto }
+            // (the prototype is read from the shape: nothing to mirror)
             // Back onto the GC list it left when it was parked.
             addGCObject(rt, o)
             return JeffJSValue.makeObjectRecycled(o)
@@ -1134,8 +1134,32 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// - Parameter str: The Swift string.
     /// - Returns: A JS string value.
     func newStringValue(_ str: String) -> JeffJSValue {
+        if str.isEmpty { return sharedString(str) }
         let jsStr = JeffJSString(swiftString: str)
         return JeffJSValue.makeString(jsStr)
+    }
+
+    /// A shared JS string for a short, frequently re-created value (see
+    /// `JeffJSRuntime.sharedStrings`); a fresh one once the table is full
+    /// or for anything longer than 32 UTF-8 bytes. Owned reference.
+    func sharedString(_ s: String) -> JeffJSValue {
+        if let js = rt.sharedStrings[s] { return JeffJSContext.sharedStringRef(js) }
+        guard jeffJS_sharedStringsEnabled, s.utf8.count <= 32,
+              rt.sharedStrings.count < JeffJSRuntime.sharedStringsCapacity else {
+            return JeffJSValue.makeString(JeffJSString(swiftString: s))
+        }
+        let js = JeffJSString(swiftString: s)   // refCount 1: the table's reference
+        rt.sharedStrings[s] = js
+        return JeffJSContext.sharedStringRef(js)
+    }
+
+    /// One more JS reference to a table-held string. No Swift retain: the
+    /// table keeps the object alive and its count never reaches zero.
+    @inline(__always)
+    static func sharedStringRef(_ js: JeffJSString) -> JeffJSValue {
+        js.refCount += 1
+        let raw = Unmanaged.passUnretained(js).toOpaque()
+        return JeffJSValue(bits: JeffJSValue._stringTag | UInt64(UInt(bitPattern: raw)))
     }
 
     // MARK: - Property Operations (String-keyed)
@@ -2218,13 +2242,13 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return newStringValue(formatDouble(d))
         }
         if val.isBool {
-            return newStringValue(val.toBool() ? "true" : "false")
+            return sharedString(val.toBool() ? "true" : "false")
         }
         if val.isNull {
-            return newStringValue("null")
+            return sharedString("null")
         }
         if val.isUndefined {
-            return newStringValue("undefined")
+            return sharedString("undefined")
         }
         if val.isObject {
             // ES spec 7.1.12 step 1: ToPrimitive(val, "string")
@@ -2264,15 +2288,21 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // 1. Check for [Symbol.toPrimitive]
         let toPrimAtom = JeffJSAtomID.JS_ATOM_Symbol_toPrimitive.rawValue
         let exoticPrim = getPropertyInternal(obj: val, atom: toPrimAtom, receiver: val)
+        if exoticPrim.isException { return exoticPrim }
         if !exoticPrim.isUndefined && !exoticPrim.isNull {
             if exoticPrim.isFunction {
+                // Method, hint and an object result are owned here (leaked
+                // once per conversion before).
                 let hintVal = newStringValue(preferredType)
                 let result = callFunction(exoticPrim, thisVal: val, args: [hintVal])
+                jeffJS_leakFixFree(exoticPrim); jeffJS_leakFixFree(hintVal)
                 if result.isException { return result }
                 if !result.isObject { return result }
+                jeffJS_leakFixFree(result)
                 return throwTypeError(message: "Cannot convert object to primitive value")
             }
         }
+        jeffJS_leakFixFree(exoticPrim)
 
         // 2. OrdinaryToPrimitive: try two methods depending on the hint
         let methodNames: [String]
@@ -2285,11 +2315,16 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
 
         for name in methodNames {
             let method = getPropertyStr(obj: val, name: name)
+            if method.isException { return method }
             if method.isFunction {
                 let result = callFunction(method, thisVal: val, args: [])
+                jeffJS_leakFixFree(method)
                 if result.isException { return result }
                 if !result.isObject { return result }
                 // Result was an object — try the next method
+                jeffJS_leakFixFree(result)
+            } else {
+                jeffJS_leakFixFree(method)
             }
         }
 
@@ -6463,6 +6498,9 @@ extension JeffJSContext {
     func jsValueToString(_ val: JeffJSValue) -> String? {
         let str = toString(val)
         if str.isException { return nil }
+        // toString's result is owned: it was leaked on every call (the
+        // "undefined" / "" / number strings orphaned on every heavy page).
+        defer { jeffJS_leakFixFree(str) }
         return str.stringValue?.toSwiftString()
     }
 

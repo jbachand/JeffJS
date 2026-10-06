@@ -1009,6 +1009,10 @@ func markObject(_ rt: JeffJSRuntime,
             if let c = r.handler.toGCObjectHeader() { markFunc(rt, c) }
             if let c = r.resultPromise.toGCObjectHeader() { markFunc(rt, c) }
         }
+    case .opaque(let o):
+        // A live Map/Set iterator owns its collection (released by
+        // freeObject or its last next()).
+        if jeffJS_refLeakFix, let it = o as? JSMapIteratorData, let c = it.obj.toGCObjectHeader() { markFunc(rt, c) }
     case .boundFunction(let bf):
         // A bound function owns its target, `this` and arguments (released
         // by freeObject): `obj.cb = obj.m.bind(obj)` is a cycle.
@@ -1112,32 +1116,27 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     // `swift_release` on a tree-teardown profile. Nothing cascades from a plain
     // object's payload, so there is nothing to clear for re-entrancy either,
     // and `JeffJSObject.deinit` releases it a moment later regardless.
-    let plain = obj.classID == jeffJS_plainObjectClassID && obj._fastArrayValues == nil
-    let savedPayload: JeffJSObjectPayload
-    if plain {
-        savedPayload = .opaque(nil)
-    } else {
-        savedPayload = obj.payload
-        obj.payload = .opaque(nil)
+    // perf/watch-object-size: everything but the slots lives in the side box
+    // (JeffJSObjectAux). Detach it whole and MOVE the payload out of it (a
+    // swap, not a copy): the old code copied the payload enum (a retain of
+    // every class it carries), stored .opaque(nil) back (a release) and
+    // destroyed the copy (another release) for every non-plain object freed
+    // (≈ 20 % of the deepmerge bench, ≈ 40 % of closure churn). The box is
+    // released at the end of this function, taking the var-refs, the native
+    // function and everything else it holds with it.
+    let aux = obj.takeAux()
+    var savedPayload: JeffJSObjectPayload = .opaque(nil)
+    var savedExtra: ContiguousArray<JeffJSPropertyExtra?> = []
+    var savedArrowThis: JeffJSValue? = nil   // owned by the closure; released below
+    if let a = aux {
+        swap(&savedPayload, &a.payload)
         // perf/memory-census: one function object fewer runs this bytecode.
         if case .bytecodeFunc(let fb, _, _) = savedPayload, let fb { fb.liveClosures &-= 1 }
-        obj.fbFast = nil
-        if !obj.varRefsFast.isEmpty { obj.varRefsFast = [] }
+        if !a.propExtra.isEmpty { swap(&savedExtra, &a.propExtra) }
+        if let t = a.arrowThisVal { savedArrowThis = t; a.arrowThisVal = nil }
     }
-    // Same shape of saving: `propExtra` is lazily allocated and empty for the
-    // overwhelming majority of objects, and both the copy and the `= []` store
-    // (which fires the `propExtraCount` observer) are pure overhead then.
-    let extraCount = obj.propExtraCount
-    let savedExtra: ContiguousArray<JeffJSPropertyExtra?>
-    if extraCount == 0 {
-        savedExtra = []
-    } else {
-        savedExtra = obj.propExtra
-        obj.propExtra = []
-    }
+    let extraCount = savedExtra.count
     obj.propValues = JeffJSPropStorage()
-    let savedArrowThis = obj.arrowThisVal    // owned by the closure; released below
-    if savedArrowThis != nil { obj.arrowThisVal = nil }
 
     // Release each property value. Data values are manually refcounted;
     // an accessor's getter/setter are too (`defineProperty` dups them, and
@@ -1215,6 +1214,15 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     if case .mapState(let ms) = savedPayload { jeffJS_mapStateFree(ms) }
     // A promise owns its settled value and every reaction still queued on it.
     if case .promiseData(let pd) = savedPayload { jeffJS_promiseDataFree(pd) }
+    // A Map/Set iterator owns a reference to its collection until it is
+    // exhausted (js_map_iterator_create dups it, the final next() releases
+    // it). An iterator dropped early — `for (x of set) break`, `[a] = set`
+    // — leaked the collection and everything in it.
+    if jeffJS_refLeakFix, case .opaque(let o) = savedPayload, let it = o as? JSMapIteratorData, !it.obj.isUndefined {
+        let c = it.obj
+        it.obj = .undefined
+        freeValue(rt, c)
+    }
     // A RegExp owns a counted reference on its pattern string (see
     // "Pattern ownership" in JeffJSBuiltinRegExp.swift).
     if case .regexp(let pattern, _) = savedPayload { js_regexp_releasePattern(pattern) }
@@ -1262,7 +1270,15 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     // One live `WeakMap` entry used to put that probe on the whole heap's
     // teardown path (a 40 x 20 000 plain-object allocate-and-drop loop was 21%
     // slower with one WeakRef in the runtime than without).
-    if obj.firstWeakRef != nil { weakrefFree(rt, obj) }
+    if let a = aux, a.firstWeakRef != nil || a.weakrefCount != 0 {
+        // weakrefFree reads the weak-key count from the side box: give the
+        // object its box back for the call (the slot's array store moves
+        // into it and back out).
+        obj.aux = a
+        weakrefFree(rt, obj)
+        _ = obj.takeAux()
+    }
+    _ = aux   // the side box (and what it holds) is released here
 }
 
 /// Free a Shape: remove from the runtime hash table if necessary, release the
@@ -1488,4 +1504,18 @@ func jsRealloc(_ rt: JeffJSRuntime,
     rt.mallocState.mallocSize += delta
 
     return newPtr
+}
+
+// MARK: - Refcount-leak fixes switch
+
+/// False only under `JEFFJS_GC_LEGACYREFLEAKS=1` (A/B of the 2026-10-05
+/// refcount-leak fixes, see `JeffJSConfig.gcLegacyRefLeaks`). A stored
+/// global with a literal initialiser (no lazy-init guard on reads); set from
+/// the config when a runtime is created.
+nonisolated(unsafe) var jeffJS_refLeakFix: Bool = true
+
+/// Release an owned value that the pre-fix code leaked.
+@inline(__always)
+func jeffJS_leakFixFree(_ v: JeffJSValue) {
+    if jeffJS_refLeakFix { v.freeValue() }
 }

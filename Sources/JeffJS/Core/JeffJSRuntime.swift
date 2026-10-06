@@ -100,17 +100,22 @@ nonisolated class JeffJSAtomStruct {
     var atomType: JSAtomTypeEnum = .JS_ATOM_TYPE_STRING
     /// Reference count. Predefined atoms start at a high refcount.
     var refCount: Int32 = 1
-    /// The interned string data. For integer atoms, this may be empty
-    /// (the integer is encoded in the atom ID itself).
-    var str: String = ""
-    /// Length of the string in UTF-16 code units (for compatibility with QuickJS).
-    var len: Int = 0
+    /// Length of the string in UTF-16 code units (for compatibility with
+    /// QuickJS). 32-bit, packed with the flags (64-byte struct, was 72 -> 80).
+    private var _len: Int32 = 0
+    var len: Int {
+        get { Int(_len) }
+        set { _len = Int32(truncatingIfNeeded: newValue) }
+    }
     /// True if this atom is a small integer index (array index optimization).
     var isIntegerIndex: Bool = false
     /// The array index this atom's spelling denotes, if it is a canonical
     /// decimal index. Computed once here because `atomIsArrayIndex` used to
     /// re-parse the string on every property enumeration.
     var arrayIndexValue: UInt32?
+    /// The interned string data. For integer atoms, this may be empty
+    /// (the integer is encoded in the atom ID itself).
+    var str: String = ""
 
     init() {}
 
@@ -410,7 +415,13 @@ nonisolated final class JeffJSRuntime {
     /// freeObject consults this to catch over-releases of load-bearing objects.
     var protectedGlobals: Set<ObjectIdentifier> = []
     /// Recycled plain objects (JeffJSObjectPool.swift).
+    /// Recent regex inputs' code units and patterns' group names (see
+    /// JeffJSRegexCaches; were fields on every string).
+    let regexCaches = JeffJSRegexCaches()
     var objectPool: [JeffJSObject] = []
+    /// Parked bytecode-function objects with their side boxes
+    /// (jeffJS_recycleFunction); createClosure pops from it.
+    var functionPool: [JeffJSObject] = []
     /// Recycled arrays (JeffJSObjectPool.swift): empty, `length` 0, no
     /// element storage, off the GC list.
     var arrayPool: [JeffJSObject] = []
@@ -428,6 +439,15 @@ nonisolated final class JeffJSRuntime {
     /// allocated a fresh JeffJSString per evaluation, and React's reconciler
     /// runs `typeof x === 'function'` constantly.
     var typeofStrings: [JeffJSString?] = Array(repeating: nil, count: 8)
+    /// Shared immutable JS strings for short, constantly re-created values
+    /// ("", "undefined", "true", tag names ...): JeffJSContext.sharedString.
+    /// Each entry holds one JS reference (the cache's), so a shared string
+    /// is never freed while the runtime lives; bounded by
+    /// `sharedStringsCapacity`. perf/watch-object-size: homedepot kept ~10 k
+    /// separate "" strings and thousands of "div"/"DIV"/"undefined".
+    var sharedStrings: [String: JeffJSString] = [:]
+    static let sharedStringsCapacity = 4096
+
 
     /// Pool of interpreter value buffers: (pointer, capacity) pairs.
     var interpBufPool: [(UnsafeMutablePointer<JeffJSValue>, Int)] = []
@@ -1955,3 +1975,6 @@ func jeffJS_canonicalArrayIndex<S: Sequence>(utf8: S, max: UInt32 = JS_ATOM_MAX_
     if value > UInt64(max) { return nil }
     return UInt32(value)
 }
+
+/// False under JEFFJS_GC_SHAREDSTRINGS=0 (see JeffJSConfig.gcSharedStrings).
+nonisolated(unsafe) var jeffJS_sharedStringsEnabled: Bool = true

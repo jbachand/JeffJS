@@ -388,6 +388,15 @@ public final class JeffJSEnvironment {
         }
     }
 
+    /// Replace the document's tree with `html` parsed as a whole document
+    /// (tooling: jeffjs-cli --page runs a saved page's scripts against its
+    /// real DOM). Scripts in it are not run; the caller evaluates them.
+    public func loadDocumentHTML(_ html: String) {
+        let parsed = HTMLParser.parse(html)
+        for c in document.children { document.removeChild(c) }
+        for c in parsed.children { parsed.removeChild(c); document.appendChild(c) }
+    }
+
     /// Parse and compile `source` as a global script without running it or
     /// consulting the bytecode cache. For parser benchmarks (jeffjs-cli
     /// --parse-only): times in ms, an FNV-1a hash of the serialized bytecode

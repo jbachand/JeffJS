@@ -30,13 +30,31 @@ struct JeffJSVarDef {
 /// Closure variable reference stored in a compiled function.
 /// Mirrors `JSClosureVar` in QuickJS.
 struct JeffJSClosureVar {
+    // 16 bytes (was 24): kind and index are stored narrow behind Int accessors.
     var varName: JSAtom = 0
     var isLocal: Bool = false        // true => captured from parent's locals
     var isArg: Bool = false          // true => captured from parent's args
     var isConst: Bool = false
     var isLexical: Bool = false
-    var varKind: Int = JSVarKindEnum.JS_VAR_NORMAL.rawValue
-    var varIdx: Int = 0              // index in parent (local/arg) or var_ref
+    private var _varKind: UInt8 = UInt8(truncatingIfNeeded: JSVarKindEnum.JS_VAR_NORMAL.rawValue)
+    private var _varIdx: Int32 = 0
+    var varKind: Int {
+        @inline(__always) get { Int(_varKind) }
+        @inline(__always) set { _varKind = UInt8(truncatingIfNeeded: newValue) }
+    }
+    /// index in parent (local/arg) or var_ref
+    var varIdx: Int {
+        @inline(__always) get { Int(_varIdx) }
+        @inline(__always) set { _varIdx = Int32(truncatingIfNeeded: newValue) }
+    }
+
+    init(varName: JSAtom = 0, isLocal: Bool = false, isArg: Bool = false, isConst: Bool = false,
+         isLexical: Bool = false, varKind: Int = JSVarKindEnum.JS_VAR_NORMAL.rawValue, varIdx: Int = 0) {
+        self.varName = varName; self.isLocal = isLocal; self.isArg = isArg; self.isConst = isConst
+        self.isLexical = isLexical
+        self._varKind = UInt8(truncatingIfNeeded: varKind)
+        self._varIdx = Int32(truncatingIfNeeded: varIdx)
+    }
 }
 
 /// One binding visible at a direct `eval` call site, innermost first
@@ -394,15 +412,45 @@ nonisolated class JeffJSFunctionDefCompiler {
 /// The compiled bytecode object produced by createFunction.
 /// This extends the JeffJSFunctionBytecode stub in JeffJSObject.swift with
 /// all fields needed by the interpreter.
+/// The rarely set fields of a function body (see `_cold` on
+/// JeffJSFunctionBytecode and the layout note on the compiled subclass).
+nonisolated final class JeffJSFunctionBytecodeCold {
+    var fileName: JeffJSString? = nil
+    var evalSites: [JeffJSEvalSite]? = nil
+    var traceIndexPCs: UnsafeMutablePointer<Int>? = nil
+    var traceIndexInfos: UnsafeMutablePointer<Unmanaged<TraceBlockInfo>>? = nil
+    var vardefs: [JeffJSBytecodeVarDef] = []
+    var debugSourceLen: Int = 0
+    var debugPc2lineLen: Int = 0
+    var debugPc2lineBuf: [UInt8] = []
+    var debugPc2colLen: Int = 0
+    var debugPc2colBuf: [UInt8] = []
+    var debugExprSpans: [UInt8] = []
+    var pc2lineTable: [(pc: Int32, value: Int32)]? = nil
+    var pc2colTable: [(pc: Int32, value: Int32)]? = nil
+    var cachedDebugFilename: String? = nil
+    var cachedFuncName: String? = nil
+    var debugSourceStr: String? = nil
+}
+
 nonisolated class JeffJSFunctionBytecodeCompiled: JeffJSFunctionBytecode {
     // All fields are inherited from JeffJSFunctionBytecode.
-    // Additional compiler-produced fields:
-    var vardefs: [JeffJSBytecodeVarDef] = []
-    var closureVars: [JeffJSClosureVar] = []
-    var closureVarCountInt: Int = 0
+    // Additional compiler-produced fields. Layout (perf/watch-object-size):
+    // the per-function metadata is packed (32/16/8-bit), and the debug tables,
+    // var defs and cached strings — set only once a body is compiled, read
+    // only for stack traces and the bytecode cache — live in `_debug`, so a
+    // lazily compiled function's stub (most bodies on a page: 13 k of 16 k on
+    // homedepot) carries none of them. Was 512 bytes per body.
     var funcNameAtom: JSAtom = 0
+    var debugFilenameAtom: JSAtom = 0
+    private var _closureVarCountInt: Int32 = 0
+    /// local var index for named function expression self-reference
+    private var _funcNameVarIdx: Int32 = -1
+    private var _cpoolCountValue: Int32 = 0
+    var definedArgCountValue: UInt16 = 0
+    var varRefCountValue: UInt16 = 0
     var jsModeFlags: UInt8 = 0
-    var funcKindValue: Int = 0
+    private var _funcKindValue: UInt8 = 0
     var newTargetAllowedFlag: Bool = false
     var superCallAllowedFlag: Bool = false
     var superAllowedFlag: Bool = false
@@ -410,30 +458,87 @@ nonisolated class JeffJSFunctionBytecodeCompiled: JeffJSFunctionBytecode {
     var hasDebugInfo: Bool = false
     var readOnlyBytecodeFlag: Bool = false
     var isDirectOrIndirectEvalFlag: Bool = false
-    var funcNameVarIdx: Int = -1       // local var index for named function expression self-reference
-    var debugFilenameAtom: JSAtom = 0
-    var debugSourceLen: Int = 0
-    var debugPc2lineLen: Int = 0
-    var debugPc2lineBuf: [UInt8] = []
-    var debugPc2colLen: Int = 0
-    var debugPc2colBuf: [UInt8] = []
+    @inline(__always) private var _debug: JeffJSFunctionBytecodeCold? { _cold }
+    @inline(__always) private func debugBox() -> JeffJSFunctionBytecodeCold { coldBox() }
+
+    var closureVarCountInt: Int {
+        get { Int(_closureVarCountInt) }
+        set { _closureVarCountInt = Int32(truncatingIfNeeded: newValue) }
+    }
+    var funcNameVarIdx: Int {
+        get { Int(_funcNameVarIdx) }
+        set { _funcNameVarIdx = Int32(truncatingIfNeeded: newValue) }
+    }
+    var cpoolCountValue: Int {
+        get { Int(_cpoolCountValue) }
+        set { _cpoolCountValue = Int32(truncatingIfNeeded: newValue) }
+    }
+    var funcKindValue: Int {
+        get { Int(_funcKindValue) }
+        set { _funcKindValue = UInt8(truncatingIfNeeded: newValue) }
+    }
+    /// The compiler's closure-variable list: always the same array as the
+    /// base class's `closureVarsList` (one stored copy).
+    var closureVars: [JeffJSClosureVar] {
+        get { closureVarsList }
+        set { closureVarsList = newValue }
+    }
+    var vardefs: [JeffJSBytecodeVarDef] {
+        get { _debug?.vardefs ?? [] }
+        set { if newValue.isEmpty && _debug == nil { return }; debugBox().vardefs = newValue }
+    }
+    var debugSourceLen: Int {
+        get { _debug?.debugSourceLen ?? 0 }
+        set { if newValue == 0 && _debug == nil { return }; debugBox().debugSourceLen = newValue }
+    }
+    var debugPc2lineLen: Int {
+        get { _debug?.debugPc2lineLen ?? 0 }
+        set { if newValue == 0 && _debug == nil { return }; debugBox().debugPc2lineLen = newValue }
+    }
+    var debugPc2lineBuf: [UInt8] {
+        get { _debug?.debugPc2lineBuf ?? [] }
+        set { if newValue.isEmpty && _debug == nil { return }; debugBox().debugPc2lineBuf = newValue }
+    }
+    var debugPc2colLen: Int {
+        get { _debug?.debugPc2colLen ?? 0 }
+        set { if newValue == 0 && _debug == nil { return }; debugBox().debugPc2colLen = newValue }
+    }
+    var debugPc2colBuf: [UInt8] {
+        get { _debug?.debugPc2colBuf ?? [] }
+        set { if newValue.isEmpty && _debug == nil { return }; debugBox().debugPc2colBuf = newValue }
+    }
     /// Expression spans (JSC "expression info"): SLEB128 triples (pc delta,
     /// start delta, length) giving, for a member access / call / `new`
     /// instruction, the byte range of its source text in `sourceText`.
     /// Decoded only when such an instruction throws (see `exprSpan(atPC:)`).
-    var debugExprSpans: [UInt8] = []
+    var debugExprSpans: [UInt8] {
+        get { _debug?.debugExprSpans ?? [] }
+        set { if newValue.isEmpty && _debug == nil { return }; debugBox().debugExprSpans = newValue }
+    }
     /// Decoded pc->line / pc->column tables, built on first lookup.
-    private var pc2lineTable: [(pc: Int32, value: Int32)]? = nil
-    private var pc2colTable: [(pc: Int32, value: Int32)]? = nil
+    private var pc2lineTable: [(pc: Int32, value: Int32)]? {
+        get { _debug?.pc2lineTable }
+        set { if newValue == nil && _debug == nil { return }; debugBox().pc2lineTable = newValue }
+    }
+    private var pc2colTable: [(pc: Int32, value: Int32)]? {
+        get { _debug?.pc2colTable }
+        set { if newValue == nil && _debug == nil { return }; debugBox().pc2colTable = newValue }
+    }
     /// Filename / function name as Swift strings, resolved once. `atomToString`
     /// allocates a fresh String per call, and an Error stack asks for both on
     /// every frame.
-    var cachedDebugFilename: String? = nil
-    var cachedFuncName: String? = nil
-    var debugSourceStr: String?
-    var definedArgCountValue: UInt16 = 0
-    var varRefCountValue: UInt16 = 0
-    var cpoolCountValue: Int = 0
+    var cachedDebugFilename: String? {
+        get { _debug?.cachedDebugFilename }
+        set { if newValue == nil && _debug == nil { return }; debugBox().cachedDebugFilename = newValue }
+    }
+    var cachedFuncName: String? {
+        get { _debug?.cachedFuncName }
+        set { if newValue == nil && _debug == nil { return }; debugBox().cachedFuncName = newValue }
+    }
+    var debugSourceStr: String? {
+        get { _debug?.debugSourceStr }
+        set { if newValue == nil && _debug == nil { return }; debugBox().debugSourceStr = newValue }
+    }
 
     /// Decode the pc2line buffer to find the source line number for a given PC offset.
     /// Returns the 1-based line number, or 0 if debug info is unavailable.
