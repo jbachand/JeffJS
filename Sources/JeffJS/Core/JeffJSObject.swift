@@ -178,6 +178,7 @@ nonisolated final class JeffJSInlineCache {
                      holderShape: JeffJSShape, propOffset: Int, atom: UInt32 = 0) {
         let idx = pc & Self.mask
         guard idx < capacity else { return }
+        receiverShape.icCached = true   // "no own property here": stale if one is appended in place
         let rs = Unmanaged.passRetained(receiverShape).toOpaque()
         let hp = Unmanaged.passRetained(holder).toOpaque()
         let hs = Unmanaged.passRetained(holderShape).toOpaque()
@@ -213,6 +214,7 @@ nonisolated final class JeffJSInlineCache {
     func updateTransition(_ pc: Int, from: JeffJSShape, to: JeffJSShape) {
         let idx = pc & Self.mask
         guard idx < capacity else { return }
+        from.icCached = true   // stale if `from` grows in place
         let fromPtr = Unmanaged.passRetained(from).toOpaque()
         let toPtr = Unmanaged.passRetained(to).toOpaque()
         releaseEntry(idx)

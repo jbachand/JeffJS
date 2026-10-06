@@ -82,6 +82,11 @@ nonisolated final class JeffJSShape: JeffJSGCObjectHeader {
     /// dictionary spent 70% of its time there). Hashed shapes are never
     /// evicted, so the strong reference is safe.
     var parent: JeffJSShape? = nil
+    /// An inline cache holds this shape (`JeffJSInlineCache.update*`). A private shape is
+    /// grown in place only while no cache can have seen it: a cached entry keyed by its
+    /// identity ("no own `p`, `p` is on the prototype", or a define_field transition from
+    /// it) would go stale when an own property is appended to the same object.
+    var icCached = false
 
     // MARK: - Initialisers
 
@@ -167,6 +172,33 @@ func createShape(_ ctx: JeffJSContext,
 /// runtime shape hash table.
 func cloneShape(_ ctx: JeffJSContext, _ shape: JeffJSShape) -> JeffJSShape {
     return cloneShapeRT(ctx.rt, shape)
+}
+
+/// A private shape's tables under a new identity (for an object whose shape an inline
+/// cache holds): the arrays move, nothing is copied; the old shape is left empty for its
+/// owner to release.
+func jeffJS_moveShapeTables(_ rt: JeffJSRuntime, _ shape: JeffJSShape) -> JeffJSShape {
+    let s = JeffJSShape()
+    if let p = shape.proto { _ = JeffJSValue.borrowedObject(p).dupValue() }   // one count per shape
+    s.proto = shape.proto
+    s.propSize = shape.propSize
+    s.propCount = shape.propCount
+    s.deletedPropCount = shape.deletedPropCount
+    s.hash = shape.hash
+    s.propHashMask = shape.propHashMask
+    s.isHashed = false
+    s.prop = shape.prop
+    s.propHash = shape.propHash
+    s.enumKeyCache = shape.enumKeyCache
+    shape.prop = []
+    shape.propHash = []
+    shape.enumKeyCache = nil
+    shape.propCount = 0
+    shape.propSize = 0
+    shape.deletedPropCount = 0
+    shape.propHashMask = 0
+    addGCObject(rt, s)
+    return s
 }
 
 /// `cloneShape` for callers that only have the runtime (object proto setter).
@@ -268,6 +300,15 @@ func jeffJS_objectAddShapeProperty(_ ctx: JeffJSContext,
                                    flags: UInt32) -> Int {
     guard let shape = obj.shape else { return -1 }
     guard shape.isHashed else {
+        // A private shape grows in place, unless another object is on it (a copy) or an
+        // inline cache knows it (a fresh identity that takes over the tables, no copy).
+        if shape.refCount > 1 || shape.icCached {
+            let rt = ctx.rt
+            let ns = shape.refCount > 1 ? cloneShape(ctx, shape) : jeffJS_moveShapeTables(rt, shape)
+            obj.shape = ns
+            jeffJS_leaveShape(rt, shape)
+            return addShapeProperty(ctx, ns, atom: atom, flags: flags)
+        }
         return addShapeProperty(ctx, shape, atom: atom, flags: flags)
     }
     let rt = ctx.rt
@@ -279,7 +320,8 @@ func jeffJS_objectAddShapeProperty(_ ctx: JeffJSContext,
     }
     let ns = cloneShape(ctx, shape)                       // private copy, refCount 1
     let idx = addShapeProperty(ctx, ns, atom: atom, flags: flags)
-    if rt.shapeHashCount < JeffJSRuntime.maxHashedShapes {
+    let maxProps = JeffJSConfig.shapesMaxHashedProps
+    if rt.shapeHashCount < JeffJSRuntime.maxHashedShapes, maxProps <= 0 || ns.propCount <= maxProps {
         ns.parent = shape
         insertHashedShape(rt, ns)                         // becomes the shared transition
     }

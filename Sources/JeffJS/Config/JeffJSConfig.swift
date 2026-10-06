@@ -218,6 +218,13 @@ enum JeffJSConfig {
     static let shapesEvictThreshold = int("shapes.evictThreshold",     default: 512)
     /// Max shared (hashed) shapes kept alive in the transition table.
     static let shapesMaxHashed     = int("shapes.maxHashed",          default: 16384)
+    /// A transition that would make a hashed shape with more than this many properties
+    /// gives the object a private shape instead (a dictionary-mode object that then grows in
+    /// place). Every hashed transition shape keeps a full copy of its property table, so an
+    /// object built key by key to N properties left N cached shapes and N²/2 slots behind
+    /// (threes.day: +146 MB in 250 ms on the Apple Watch, JSON maps keyed by player id).
+    /// 0 = no limit (the old behaviour, A/B: JEFFJS_SHAPES_MAXHASHEDPROPS=0).
+    static let shapesMaxHashedProps = int("shapes.maxHashedProps",    default: 64)
 
     // MARK: - Strings / Ropes
 
