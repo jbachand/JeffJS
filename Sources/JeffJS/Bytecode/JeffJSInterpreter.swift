@@ -369,6 +369,24 @@ func jeffJS_stringFieldFill(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, 
     fb.getIC().update(pc, shape: shape, propOffset: idx)
 }
 
+/// One stderr line. Kept out of line: `String.Encoding` is a resilient
+/// Foundation type, so a function that names it anywhere (even in a cold
+/// debug branch) sizes a dynamic stack slot for it on every entry — a
+/// metadata accessor call plus `___chkstk_darwin` per call of the
+/// interpreter (~6% of a callback-heavy profile).
+@inline(never)
+func jeffJS_stderrLine(_ s: String) {
+    FileHandle.standardError.write((s + "\n").data(using: .utf8)!)
+}
+
+/// interp.fastIterators (JeffJSConfig), read once.
+nonisolated(unsafe) let jeffJSFastIterators = JeffJSConfig.fastIterators
+/// interp.fastArrayBuiltins (JeffJSConfig), read once.
+nonisolated(unsafe) let jeffJSFastArrayBuiltins = JeffJSConfig.fastArrayBuiltins
+/// interp.fastNativeCalls (JeffJSConfig), read once.
+nonisolated(unsafe) let jeffJSFastNativeCalls = JeffJSConfig.fastNativeCalls
+/// interp.fastObjectBuiltins (JeffJSConfig), read once.
+nonisolated(unsafe) let jeffJSFastObjectBuiltins = JeffJSConfig.fastObjectBuiltins
 nonisolated(unsafe) let jeffJSNoTrace = ProcessInfo.processInfo.environment["JEFFJS_NO_TRACE"] != nil
 
 // JEFFJS_TRACE_LAST=1: keep the last 128 (function, pc, opcode) triples the
@@ -659,7 +677,8 @@ extension JeffJSContext {
         // below (each one copies the payload, retaining FB + varRefs array).
         if let fastFB = obj.fbFast, !fastFB.isGenerator, !fastFB.isAsyncFunc {
             return JeffJSInterpreter.callInternal(ctx: self, funcObj: funcVal,
-                                                  thisVal: thisVal, args: args)
+                                                  thisVal: thisVal, args: args,
+                                                  stackChecked: JeffJSRuntime.fastCallEntry && callDepth > 1)
         }
         // C function path (mirrored fields: no payload copy per call). Checked
         // before the bound-function match below, which copies the payload.
@@ -2320,7 +2339,9 @@ extension JeffJSContext {
 
     /// Appends a value to an array.
     func appendToArray(obj: JeffJSValue, val: JeffJSValue) {
-        let lenVal = getPropertyStr(obj: obj, name: "length")
+        let lenVal = jeffJSFastIterators
+            ? getProperty(obj: obj, atom: JeffJSAtomID.JS_ATOM_length.rawValue)
+            : getPropertyStr(obj: obj, name: "length")
         let len: UInt32
         if lenVal.isInt { len = UInt32(bitPattern: lenVal.toInt32()) }
         else { len = 0 }
@@ -3229,6 +3250,9 @@ private func executeFastTrace(
         let op = unsafeBitCast(UInt16(opByte), to: JeffJSOpcode.self)
         #if JEFFJS_OPPROF
         jeffJS_opProfRecord(Int(opByte))
+        #endif
+        #if JEFFJS_JSPROF
+        if jeffJS_profTick { jeffJS_profSample(ctx, fb, pc) }
         #endif
 
         switch op {
@@ -7042,11 +7066,15 @@ struct JeffJSInterpreter {
         generatorObject: JeffJSValue = .undefined,
         resumeState: GeneratorSavedState? = nil,
         resumeValue: JeffJSValue = .undefined,
-        resumeCompletionType: Int = 0
+        resumeCompletionType: Int = 0,
+        stackChecked: Bool = false
     ) -> JeffJSValue {
         // Guard against stack overflow from deep recursion.
         // Depth lives on the context: static-var read-modify-writes here cost a
         // TLS-backed dynamic exclusivity check per call.
+        #if JEFFJS_JSPROF
+        jeffJS_profEnsureStarted()
+        #endif
         ctx.callDepth += 1
         defer { ctx.callDepth -= 1 }
         if ctx.callDepth > maxCallDepth {
@@ -7056,8 +7084,9 @@ struct JeffJSInterpreter {
         // Entering JS from native: bind the guard to this thread's stack.
         if ctx.callDepth == 1 { ctx.rt.updateStackLimitForCurrentThread() }
         // Native frames are large, so the depth limit alone does not bound stack
-        // use; check the real stack pointer every call.
-        if ctx.rt.checkStackOverflow() {
+        // use; check the real stack pointer every call (unless the caller —
+        // callFunction, interp.fastCallEntry — just did).
+        if !stackChecked, ctx.rt.checkStackOverflow() {
             _ = ctx.throwRangeError(message: "Maximum call stack size exceeded.")
             if JeffJSInterpreter.stackDebug { JeffJSInterpreter.logStackTrip(ctx) }
             return .exception
@@ -7635,6 +7664,9 @@ struct JeffJSInterpreter {
             #endif
             #if JEFFJS_OPPROF
             jeffJS_opProfRecord(bc[pc] == 0 && pc + 1 < bcLen ? 256 + Int(bc[pc + 1]) : Int(bc[pc]))
+            #endif
+            #if JEFFJS_JSPROF
+            if jeffJS_profTick { jeffJS_profSample(ctx, fb, pc) }
             #endif
 
             #if DEBUG
@@ -8309,6 +8341,21 @@ struct JeffJSInterpreter {
                         pc = resumePC
                     }
                     continue dispatchLoop
+                } else if jeffJSFastNativeCalls, calleeSlot >= spBase, let nObj = funcVal.obj,
+                          nObj.realmIndex == ctxRealm, let cf = nObj.cFuncFast {
+                    // Native callee (interp.fastNativeCalls): arguments straight
+                    // from the stack, `this` undefined.
+                    let prevNative = frame.nativeCallee
+                    frame.nativeCallee = nObj.asClass
+                    let r = jeffJS_nativeCallFromSlots(ctx, rt, cf, .undefined, buf + calleeSlot + 1, argc, nObj.cMagicFast)
+                    frame.nativeCallee = prevNative
+                    var ai = 0
+                    while ai < argc { buf[calleeSlot + 1 + ai].freeValue(); ai += 1 }
+                    buf[calleeSlot].freeValue()
+                    sp = calleeSlot
+                    if r.isException { retVal = .exception; break dispatchLoop }
+                    buf[sp] = r; sp += 1
+                    pc += instrSize
                 } else {
                     // Slow path: bound functions, C functions, generators, async,
                     // etc. Now build the args array and pop funcVal + args.
@@ -8374,7 +8421,8 @@ struct JeffJSInterpreter {
                    sp - argc - 2 >= spBase,
                    let fnObj = buf[sp - argc - 1].obj, fnObj === callObj,
                    let target = buf[sp - argc - 2].obj, target.realmIndex == ctxRealm,
-                   let targetFb = target.fbFast, !targetFb.isGenerator, !targetFb.isAsyncFunc {
+                   (target.fbFast.map { !$0.isGenerator && !$0.isAsyncFunc } ?? false)
+                    || (jeffJSFastNativeCalls && target.cFuncFast != nil) {
                     let calleeSlot = sp - argc - 1
                     let thisSlot = calleeSlot - 1
                     let targetVal = buf[thisSlot]
@@ -8426,6 +8474,27 @@ struct JeffJSInterpreter {
                         buf[sp - 3].freeValue()   // the array
                         sp -= 3
                         buf[sp] = .newInt32(Int32(newCount)); sp += 1
+                        pc += 3
+                        continue dispatchLoop
+                    }
+                }
+                // ── Native callee (interp.fastNativeCalls) ──────────────
+                // Arguments straight from the stack, as the fast trace does.
+                if jeffJSFastNativeCalls {
+                    let nCallee = sp - argc - 1
+                    let nThis = nCallee - 1
+                    if nThis >= spBase, let nObj = buf[nCallee].obj, nObj.realmIndex == ctxRealm,
+                       let cf = nObj.cFuncFast {
+                        let prevNative = frame.nativeCallee
+                        frame.nativeCallee = nObj.asClass
+                        let r = jeffJS_nativeCallFromSlots(ctx, rt, cf, buf[nThis], buf + nCallee + 1, argc, nObj.cMagicFast)
+                        frame.nativeCallee = prevNative
+                        var ai = 0
+                        while ai < argc { buf[nCallee + 1 + ai].freeValue(); ai += 1 }
+                        buf[nCallee].freeValue(); buf[nThis].freeValue()
+                        sp = nThis
+                        if r.isException { retVal = .exception; break dispatchLoop }
+                        buf[sp] = r; sp += 1
                         pc += 3
                         continue dispatchLoop
                     }
@@ -9826,6 +9895,17 @@ struct JeffJSInterpreter {
             case .append:
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = buf[sp - 1]
+                // interp.fastIterators: spread into a dense array appends in
+                // place (the value's reference moves into the array).
+                if jeffJSFastIterators, let ao = obj.obj, ao.classID == JeffJSClassID.array.rawValue,
+                   JeffJSContext.arrayAcceptsFastPush(ao) {
+                    let n = ao.asClass.fastArrayPush(val)
+                    if n > 0 {
+                        ao.asClass.setPropEntry(at: 0, .value(.newInt32(Int32(truncatingIfNeeded: n))))
+                        pc += 1
+                        continue dispatchLoop
+                    }
+                }
                 ctx.appendToArray(obj: obj, val: val)
                 pc += 1
 
@@ -10250,7 +10330,7 @@ struct JeffJSInterpreter {
                                 if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
                                 if resumePC == -1 { retVal = .exception; break dispatchLoop }
                                 if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
-                                    FileHandle.standardError.write("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun) op=\(resumePC >= 0 && resumePC < bcLen ? String(describing: unsafeBitCast(UInt16(bc[resumePC]), to: JeffJSOpcode.self)) : "?")\n".data(using: .utf8)!)
+                                    jeffJS_stderrLine("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun) op=\(resumePC >= 0 && resumePC < bcLen ? String(describing: unsafeBitCast(UInt16(bc[resumePC]), to: JeffJSOpcode.self)) : "?")")
                                 }
                                 // A block that keeps deopting (unsupported op in the
                                 // body or in a callee) costs a state handoff per
@@ -10314,7 +10394,7 @@ struct JeffJSInterpreter {
                                 if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
                                 if resumePC == -1 { retVal = .exception; break dispatchLoop }
                                 if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
-                                    FileHandle.standardError.write("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun) op=\(resumePC >= 0 && resumePC < bcLen ? String(describing: unsafeBitCast(UInt16(bc[resumePC]), to: JeffJSOpcode.self)) : "?")\n".data(using: .utf8)!)
+                                    jeffJS_stderrLine("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun) op=\(resumePC >= 0 && resumePC < bcLen ? String(describing: unsafeBitCast(UInt16(bc[resumePC]), to: JeffJSOpcode.self)) : "?")")
                                 }
                                 // A block that keeps deopting (unsupported op in the
                                 // body or in a callee) costs a state handoff per
@@ -10374,7 +10454,7 @@ struct JeffJSInterpreter {
                                 if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
                                 if resumePC == -1 { retVal = .exception; break dispatchLoop }
                                 if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
-                                    FileHandle.standardError.write("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun) op=\(resumePC >= 0 && resumePC < bcLen ? String(describing: unsafeBitCast(UInt16(bc[resumePC]), to: JeffJSOpcode.self)) : "?")\n".data(using: .utf8)!)
+                                    jeffJS_stderrLine("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun) op=\(resumePC >= 0 && resumePC < bcLen ? String(describing: unsafeBitCast(UInt16(bc[resumePC]), to: JeffJSOpcode.self)) : "?")")
                                 }
                                 // A block that keeps deopting (unsupported op in the
                                 // body or in a callee) costs a state handoff per
@@ -10436,7 +10516,7 @@ struct JeffJSInterpreter {
                                 if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
                                 if resumePC == -1 { retVal = .exception; break dispatchLoop }
                                 if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
-                                    FileHandle.standardError.write("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun) op=\(resumePC >= 0 && resumePC < bcLen ? String(describing: unsafeBitCast(UInt16(bc[resumePC]), to: JeffJSOpcode.self)) : "?")\n".data(using: .utf8)!)
+                                    jeffJS_stderrLine("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun) op=\(resumePC >= 0 && resumePC < bcLen ? String(describing: unsafeBitCast(UInt16(bc[resumePC]), to: JeffJSOpcode.self)) : "?")")
                                 }
                                 // A block that keeps deopting (unsupported op in the
                                 // body or in a callee) costs a state handoff per
@@ -10539,7 +10619,7 @@ struct JeffJSInterpreter {
                                 if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
                                 if resumePC == -1 { retVal = .exception; break dispatchLoop }
                                 if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
-                                    FileHandle.standardError.write("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun) op=\(resumePC >= 0 && resumePC < bcLen ? String(describing: unsafeBitCast(UInt16(bc[resumePC]), to: JeffJSOpcode.self)) : "?")\n".data(using: .utf8)!)
+                                    jeffJS_stderrLine("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun) op=\(resumePC >= 0 && resumePC < bcLen ? String(describing: unsafeBitCast(UInt16(bc[resumePC]), to: JeffJSOpcode.self)) : "?")")
                                 }
                                 // A block that keeps deopting (unsupported op in the
                                 // body or in a callee) costs a state handoff per
@@ -10603,7 +10683,7 @@ struct JeffJSInterpreter {
                                 if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
                                 if resumePC == -1 { retVal = .exception; break dispatchLoop }
                                 if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
-                                    FileHandle.standardError.write("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun) op=\(resumePC >= 0 && resumePC < bcLen ? String(describing: unsafeBitCast(UInt16(bc[resumePC]), to: JeffJSOpcode.self)) : "?")\n".data(using: .utf8)!)
+                                    jeffJS_stderrLine("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun) op=\(resumePC >= 0 && resumePC < bcLen ? String(describing: unsafeBitCast(UInt16(bc[resumePC]), to: JeffJSOpcode.self)) : "?")")
                                 }
                                 // A block that keeps deopting (unsupported op in the
                                 // body or in a callee) costs a state handoff per
@@ -10663,7 +10743,7 @@ struct JeffJSInterpreter {
                                 if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
                                 if resumePC == -1 { retVal = .exception; break dispatchLoop }
                                 if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
-                                    FileHandle.standardError.write("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun) op=\(resumePC >= 0 && resumePC < bcLen ? String(describing: unsafeBitCast(UInt16(bc[resumePC]), to: JeffJSOpcode.self)) : "?")\n".data(using: .utf8)!)
+                                    jeffJS_stderrLine("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun) op=\(resumePC >= 0 && resumePC < bcLen ? String(describing: unsafeBitCast(UInt16(bc[resumePC]), to: JeffJSOpcode.self)) : "?")")
                                 }
                                 // A block that keeps deopting (unsupported op in the
                                 // body or in a callee) costs a state handoff per
@@ -10721,7 +10801,7 @@ struct JeffJSInterpreter {
                                 if fb.closureVarCount > 0 { varRefs = mFuncObj.obj?.varRefsFast ?? []; varRefsLoaded = true } else if varRefsLoaded { varRefs = []; varRefsLoaded = false }
                                 if resumePC == -1 { retVal = .exception; break dispatchLoop }
                                 if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
-                                    FileHandle.standardError.write("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun) op=\(resumePC >= 0 && resumePC < bcLen ? String(describing: unsafeBitCast(UInt16(bc[resumePC]), to: JeffJSOpcode.self)) : "?")\n".data(using: .utf8)!)
+                                    jeffJS_stderrLine("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(ObjectIdentifier(fb) != fbIdBefore) ops=\(hot.opsRun) op=\(resumePC >= 0 && resumePC < bcLen ? String(describing: unsafeBitCast(UInt16(bc[resumePC]), to: JeffJSOpcode.self)) : "?")")
                                 }
                                 // A block that keeps deopting (unsupported op in the
                                 // body or in a callee) costs a state handoff per
@@ -10970,6 +11050,26 @@ struct JeffJSInterpreter {
                         print("[FOR-OF-NEXT] iter has next: \(ctx.getPropertyStr(obj: iter, name: "next").isFunction)")
                     }
                 }
+                // interp.fastIterators: the intrinsic array-iterator `next`
+                // steps inline — no call, no {value, done} object.
+                if method.bits == ctx.arrayIterNextVal.bits, let io = iter.toObject() {
+                    let st = ctx.arrayIterStep(io)
+                    if st.exception {
+                        buf[iterSlot] = .undefined; iter.freeValue()
+                        retVal = .exception
+                        break dispatchLoop
+                    }
+                    if st.done {
+                        buf[iterSlot] = .undefined; iter.freeValue()
+                        buf[sp] = .undefined; sp += 1
+                        buf[sp] = .newBool(true); sp += 1
+                    } else {
+                        buf[sp] = st.value; sp += 1
+                        buf[sp] = .newBool(false); sp += 1
+                    }
+                    pc += 2
+                    break
+                }
                 let forOfResult = ctx.callFunction(method, thisVal: iter, args: [])
                 if forOfResult.isException {
                     buf[iterSlot] = .undefined; iter.freeValue()
@@ -10987,7 +11087,9 @@ struct JeffJSInterpreter {
                     break // continue dispatch
                 }
                 // Extract .done and .value from the iterator result
-                let forOfDoneVal = ctx.getPropertyStr(obj: forOfResult, name: "done")
+                let forOfDoneVal = jeffJSFastIterators
+                    ? ctx.getProperty(obj: forOfResult, atom: JeffJSAtomID.JS_ATOM_done.rawValue)
+                    : ctx.getPropertyStr(obj: forOfResult, name: "done")
                 if forOfDoneVal.isException {
                     forOfResult.freeValue()
                     buf[iterSlot] = .undefined; iter.freeValue()
@@ -11007,7 +11109,9 @@ struct JeffJSInterpreter {
                     buf[sp] = .undefined; sp += 1
                     buf[sp] = .newBool(true); sp += 1
                 } else {
-                    let forOfValue = ctx.getPropertyStr(obj: forOfResult, name: "value")
+                    let forOfValue = jeffJSFastIterators
+                        ? ctx.getProperty(obj: forOfResult, atom: JeffJSAtomID.JS_ATOM_value.rawValue)
+                        : ctx.getPropertyStr(obj: forOfResult, name: "value")
                     if forOfValue.isException {
                         forOfDoneVal.freeValue()
                         forOfResult.freeValue()

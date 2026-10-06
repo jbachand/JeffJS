@@ -559,6 +559,26 @@ extension JeffJSContext {
             return newArrayFrom(names)
         }
 
+        // interp.fastObjectBuiltins: symbol keys only (getOwnPropertySymbols)
+        // on an ordinary object — one shape walk, no string/index lists.
+        if jeffJSFastObjectBuiltins, wantSymbols, !wantStrings, jsObj.classID != JSClassID.JS_CLASS_STRING.rawValue,
+           !jeffJS_isTypedArrayClass(jsObj.classID), let shape = jsObj.shape {
+            var symbolKeys: [JeffJSValue] = []
+            for prop in shape.prop {
+                let atom = prop.atom
+                if atom == 0 || (atom & JS_ATOM_TAG_INT) != 0 { continue }
+                if enumOnly && !prop.flags.contains(.enumerable) { continue }
+                guard rt.atomIsSymbol(atom) else { continue }
+                if let symStr = rt.symbolStringForAtom(atom) {
+                    symbolKeys.append(JeffJSValue.mkPtr(tag: .symbol, ptr: symStr.retain()))
+                } else if let entry = rt.atomArray[Int(atom)] {
+                    symbolKeys.append(newStringValue(entry.str))
+                }
+            }
+            if symbolKeys.isEmpty { return newArray() }
+            return newArrayFrom(symbolKeys)
+        }
+
         // Per ES spec §9.1.12, own property keys are returned in this order:
         // 1. Integer indices in ascending numeric order
         // 2. String keys in insertion order
@@ -1511,6 +1531,22 @@ struct JeffJSBuiltinObject {
             return ctx.newString("[object \(tagStr)]")
         }
 
+        if jeffJSFastObjectBuiltins {
+            tag.freeValue()
+            if ctx.isArray(obj) { return ctx.cachedObjectToString(0, "[object Array]") }
+            if ctx.isFunction(obj) { return ctx.cachedObjectToString(1, "[object Function]") }
+            switch ctx.getClassID(obj) {
+            case JeffJSClassID.error.rawValue: return ctx.cachedObjectToString(2, "[object Error]")
+            case JeffJSClassID.boolean.rawValue: return ctx.cachedObjectToString(3, "[object Boolean]")
+            case JeffJSClassID.number.rawValue: return ctx.cachedObjectToString(4, "[object Number]")
+            case JeffJSClassID.string.rawValue: return ctx.cachedObjectToString(5, "[object String]")
+            case JeffJSClassID.date.rawValue: return ctx.cachedObjectToString(6, "[object Date]")
+            case JeffJSClassID.regexp.rawValue: return ctx.cachedObjectToString(7, "[object RegExp]")
+            case JeffJSClassID.arguments.rawValue, JeffJSClassID.mappedArguments.rawValue:
+                return ctx.cachedObjectToString(8, "[object Arguments]")
+            default: return ctx.cachedObjectToString(9, "[object Object]")
+            }
+        }
         // Determine built-in tag
         let builtinTag: String
         if ctx.isArray(obj) {

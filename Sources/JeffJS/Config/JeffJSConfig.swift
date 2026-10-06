@@ -165,6 +165,47 @@ enum JeffJSConfig {
     /// unwrapping (A/B: `JEFFJS_INTERP_AWAITALWAYSSUSPENDS=0`).
     static let awaitAlwaysSuspends = bool("interp.awaitAlwaysSuspends", default: true)
 
+    /// Array iterators share one `next` on %ArrayIteratorPrototype% and keep
+    /// their state in three slots on a cached shape (they used to get two new
+    /// native closures each and string-keyed slots); for-of / spread /
+    /// array destructuring step over them inline (no `next` call, no
+    /// `{value, done}` object), and `append` (spread) pushes in place.
+    /// Watch interpreter speed fix (2026-10-05). A/B: `JEFFJS_INTERP_FASTITERATORS=0`.
+    static let fastIterators       = bool("interp.fastIterators",      default: true)
+
+    /// Array builtins skip work a plain array never needs: ArraySpeciesCreate
+    /// on an array whose constructor is the intrinsic %Array% (and whose
+    /// @@species getter is the original) makes the array directly instead of
+    /// `new Array(n)` through the constructor; `concat` copies dense arrays
+    /// slot to slot. A/B: `JEFFJS_INTERP_FASTARRAYBUILTINS=0`.
+    static let fastArrayBuiltins   = bool("interp.fastArrayBuiltins",  default: true)
+
+    /// Calls of native functions from the main interpreter loop pass their
+    /// arguments straight from the VM stack (a reused argument array, as the
+    /// fast trace does) instead of allocating an array and going through
+    /// `callFunction`; `f.call(thisArg, …)` with a native `f` (e.g.
+    /// `Object.prototype.toString.call(x)`) calls `f` directly.
+    /// A/B: `JEFFJS_INTERP_FASTNATIVECALLS=0`.
+    static let fastNativeCalls     = bool("interp.fastNativeCalls",    default: true)
+
+    /// Cheaper entry into the interpreter from native code (array callbacks,
+    /// promise jobs, timers): interpreter buffers pooled on a fixed unsafe
+    /// stack, one stack-overflow check per native→JS call instead of two, and
+    /// the array builtins' callbacks reuse one argument array per call
+    /// instead of allocating one per element. A/B: `JEFFJS_INTERP_FASTCALLENTRY=0`.
+    static let fastCallEntry       = bool("interp.fastCallEntry",      default: true)
+
+    /// Object builtins without per-call allocation where the answer is fixed:
+    /// `Object.prototype.toString` returns cached "[object Tag]" strings for
+    /// the builtin tags, `Object.getOwnPropertySymbols` walks the shape once
+    /// for symbol keys only. A/B: `JEFFJS_INTERP_FASTOBJECTBUILTINS=0`.
+    static let fastObjectBuiltins  = bool("interp.fastObjectBuiltins", default: true)
+
+    /// Freeing an object whose count reached zero reuses one scratch list per
+    /// runtime for the batch it releases, instead of allocating a Swift array
+    /// per freed object. A/B: `JEFFJS_INTERP_FASTFREECHAIN=0`.
+    static let fastFreeChain       = bool("interp.fastFreeChain",      default: true)
+
     // MARK: - Trace Blocks
 
     static let traceHitThreshold   = int("trace.hitThreshold",         default: 2)
