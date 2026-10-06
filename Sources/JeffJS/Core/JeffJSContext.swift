@@ -956,7 +956,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             o.refCount = 1
             cached.refCount += 1
             o.shape = cached
-            if o.storedProto !== cached.proto { o.storedProto = cached.proto }
+            // (the prototype is read from the shape: nothing to mirror)
             addGCObject(rt, o)
             return JeffJSValue.makeObjectRecycled(o)
         }
@@ -1004,7 +1004,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             o.classID = classID
             cached.refCount += 1
             o.shape = cached
-            if o.storedProto !== cached.proto { o.storedProto = cached.proto }
+            // (the prototype is read from the shape: nothing to mirror)
             // Back onto the GC list it left when it was parked.
             addGCObject(rt, o)
             return JeffJSValue.makeObjectRecycled(o)

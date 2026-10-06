@@ -139,7 +139,7 @@ func jeffJS_icDefine(_ ptr: UnsafeRawPointer, _ entry: JeffJSICEntry, _ val: Jef
             o.shape = next
             jeffJS_leaveShape(rt, old)
             o.propValues.append(val)
-            if !o.propExtra.isEmpty { o.propExtra.append(nil) }
+            if o._propExtraCount != 0 { o.appendNilExtraSlot() }
             return true
         }
     }

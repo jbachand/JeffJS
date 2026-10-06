@@ -31,7 +31,7 @@ func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
         // `isPoolable` already required `firstWeakRef == nil`, and that is now
         // set for every object with a weakref cell, so a pooled object never
         // has one. Kept as a field test rather than a dictionary probe.
-        if o.firstWeakRef != nil { weakrefFree(rt, o) }
+        if o._auxU != nil, o.firstWeakRef != nil { weakrefFree(rt, o) }
         // Release the slots. Nested zero transitions are deferred while
         // inFreeChain is set and drained below, as freeGCObjectAtZeroRefcount
         // does, so deep object chains cannot recurse.
@@ -48,22 +48,25 @@ func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
             shape.refCount -= 1
             if shape.refCount == 0 && !shape.isHashed { freeGCObjectChildren(rt, shape) }
         }
-        o.extensible = true
-        o.freeMark = false
-        o.tmpMark = false
+        o._flags = (o._flags | JeffJSObject.flagExtensible)
+            & ~(JeffJSObject.flagFreeMark | JeffJSObject.flagTmpMark)
         o.mark = JeffJSGCMark.white
         o.weakrefCount = 0
         o.realmIndex = 0
         o.lazyFlags = 0            // clears needsLazyPrototype / NameLength / stack
                                    // (the captured stack lives in payload, reset below)
-        if let capturedThis = o.arrowThisVal {
-            // The closure owns its captured `this` (dup'd at creation); frames borrow it.
-            o.arrowThisVal = nil
-            capturedThis.freeValue()
+        // Side-box fields (perf/watch-object-size): a plain object without a
+        // box has nothing to reset.
+        if o._auxU != nil {
+            if let capturedThis = o.arrowThisVal {
+                // The closure owns its captured `this` (dup'd at creation); frames borrow it.
+                o.arrowThisVal = nil
+                capturedThis.freeValue()
+            }
+            if o.storedCFunction != nil { o.storedCFunction = nil; o.storedCFunctionLength = 0 }
+            if !o.varRefsFast.isEmpty { o.varRefsFast = [] }
+            o.payload = .opaque(nil)
         }
-        if o.storedCFunction != nil { o.storedCFunction = nil; o.storedCFunctionLength = 0 }
-        if !o.varRefsFast.isEmpty { o.varRefsFast = [] }
-        o.payload = .opaque(nil)
         rt.objectPool.append(o)
         if !rt.gcZeroRefCountObjects.isEmpty {
             while let d = rt.gcZeroRefCountObjects.popLast() {
