@@ -2922,7 +2922,9 @@ final class JeffJSDOMBridge {
         // extract the correct DOMNode from its opaque payload.
         let camelToKebab = """
         (function(s, prop, isNumPx) {
-            var kebab = prop.replace(/[A-Z]/g, function(m) { return '-' + m.toLowerCase(); });
+            // CSSOM §6.7.3: `cssFloat` is the camel-case IDL attribute for `float` (React writes
+            // `style.cssFloat = 'right'`; threes.day's score boxes were dropped without it).
+            var kebab = prop === 'cssFloat' ? 'float' : prop.replace(/[A-Z]/g, function(m) { return '-' + m.toLowerCase(); });
             Object.defineProperty(s, prop, {
                 configurable: true, enumerable: true,
                 get: function() { return this.getPropertyValue(kebab) || ''; },
@@ -2936,8 +2938,7 @@ final class JeffJSDOMBridge {
         """
         let definerFn = ctx.eval(input: camelToKebab, filename: "<style-proto-prop>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         if !definerFn.isException && definerFn.isFunction {
-            for prop in Self.cssPropertyNames.split(separator: ",") {
-                let propStr = String(prop)
+            for propStr in Self.cssPropertyNames.split(separator: ",").map(String.init) + ["cssFloat"] {
                 if propStr == "cssText" { continue }
                 let propVal = ctx.newStringValue(propStr)
                 let isNumPx = JeffJSValue.newBool(Self.numPxProps.contains(propStr))
