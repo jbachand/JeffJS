@@ -414,6 +414,9 @@ nonisolated final class JeffJSRuntime {
     /// JeffJSRegexCaches; were fields on every string).
     let regexCaches = JeffJSRegexCaches()
     var objectPool: [JeffJSObject] = []
+    /// Parked bytecode-function objects with their side boxes
+    /// (jeffJS_recycleFunction); createClosure pops from it.
+    var functionPool: [JeffJSObject] = []
     /// Recycled arrays (JeffJSObjectPool.swift): empty, `length` 0, no
     /// element storage, off the GC list.
     var arrayPool: [JeffJSObject] = []

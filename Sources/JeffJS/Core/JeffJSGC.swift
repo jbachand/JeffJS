@@ -1116,32 +1116,27 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     // `swift_release` on a tree-teardown profile. Nothing cascades from a plain
     // object's payload, so there is nothing to clear for re-entrancy either,
     // and `JeffJSObject.deinit` releases it a moment later regardless.
-    let plain = obj.classID == jeffJS_plainObjectClassID && obj._fastArrayValues == nil
-    let savedPayload: JeffJSObjectPayload
-    if plain {
-        savedPayload = .opaque(nil)
-    } else {
-        savedPayload = obj.payload
-        obj.payload = .opaque(nil)
+    // perf/watch-object-size: everything but the slots lives in the side box
+    // (JeffJSObjectAux). Detach it whole and MOVE the payload out of it (a
+    // swap, not a copy): the old code copied the payload enum (a retain of
+    // every class it carries), stored .opaque(nil) back (a release) and
+    // destroyed the copy (another release) for every non-plain object freed
+    // (≈ 20 % of the deepmerge bench, ≈ 40 % of closure churn). The box is
+    // released at the end of this function, taking the var-refs, the native
+    // function and everything else it holds with it.
+    let aux = obj.takeAux()
+    var savedPayload: JeffJSObjectPayload = .opaque(nil)
+    var savedExtra: ContiguousArray<JeffJSPropertyExtra?> = []
+    var savedArrowThis: JeffJSValue? = nil   // owned by the closure; released below
+    if let a = aux {
+        swap(&savedPayload, &a.payload)
         // perf/memory-census: one function object fewer runs this bytecode.
         if case .bytecodeFunc(let fb, _, _) = savedPayload, let fb { fb.liveClosures &-= 1 }
-        obj.fbFast = nil
-        if !obj.varRefsFast.isEmpty { obj.varRefsFast = [] }
+        if !a.propExtra.isEmpty { swap(&savedExtra, &a.propExtra) }
+        if let t = a.arrowThisVal { savedArrowThis = t; a.arrowThisVal = nil }
     }
-    // Same shape of saving: `propExtra` is lazily allocated and empty for the
-    // overwhelming majority of objects, and both the copy and the `= []` store
-    // (which fires the `propExtraCount` observer) are pure overhead then.
-    let extraCount = obj.propExtraCount
-    let savedExtra: ContiguousArray<JeffJSPropertyExtra?>
-    if extraCount == 0 {
-        savedExtra = []
-    } else {
-        savedExtra = obj.propExtra
-        obj.propExtra = []
-    }
+    let extraCount = savedExtra.count
     obj.propValues = JeffJSPropStorage()
-    let savedArrowThis = obj.arrowThisVal    // owned by the closure; released below
-    if savedArrowThis != nil { obj.arrowThisVal = nil }
 
     // Release each property value. Data values are manually refcounted;
     // an accessor's getter/setter are too (`defineProperty` dups them, and
@@ -1275,7 +1270,8 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     // One live `WeakMap` entry used to put that probe on the whole heap's
     // teardown path (a 40 x 20 000 plain-object allocate-and-drop loop was 21%
     // slower with one WeakRef in the runtime than without).
-    if obj.firstWeakRef != nil { weakrefFree(rt, obj) }
+    if let a = aux, a.firstWeakRef != nil { weakrefFree(rt, obj) }
+    _ = aux   // the side box (and what it holds) is released here
 }
 
 /// Free a Shape: remove from the runtime hash table if necessary, release the

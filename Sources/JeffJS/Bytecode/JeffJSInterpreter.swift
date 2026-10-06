@@ -1244,7 +1244,17 @@ extension JeffJSContext {
         guard let innerFB = closureFB.toFunctionBytecode() else {
             return closureFB.dupValue()
         }
-        let obj = JeffJSObject()
+        // A recycled closure (jeffJS_recycleFunction) comes back reset, with
+        // its side box; it rejoins the GC list here as a fresh one does in init.
+        let recycled = rt.functionPool.popLast()
+        let obj: JeffJSObject
+        if let r = recycled {
+            r.refCount = 1
+            addGCObject(rt, r)
+            obj = r
+        } else {
+            obj = JeffJSObject()
+        }
 
         // Determine the correct classID based on function kind
         if innerFB.isGenerator && innerFB.isAsyncFunc {
@@ -1361,7 +1371,8 @@ extension JeffJSContext {
         // Set proto after shape (proto may already be synced via shape)
         obj.proto = closureProto
 
-        let funcVal = JeffJSValue.makeObject(obj)
+        // A pooled object still holds its original creation retain.
+        let funcVal = recycled != nil ? JeffJSValue.makeObjectRecycled(obj) : JeffJSValue.makeObject(obj)
 
         // For regular (non-arrow, non-generator, non-async) functions,
         // F.prototype = { constructor: F } is built LAZILY on first access

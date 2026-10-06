@@ -268,6 +268,10 @@ enum JeffJSConfig {
     /// early-closed Map/Set iterators, the async-function capability.
     /// true = the old leaking behaviour, for A/B (JEFFJS_GC_LEGACYREFLEAKS=1).
     static let gcLegacyRefLeaks    = bool("gc.legacyRefLeaks",         default: false)
+    /// Recycle dying closures with their side box (jeffJS_recycleFunction);
+    /// false = every closure is a fresh object + side box (A/B,
+    /// JEFFJS_GC_FUNCTIONPOOL=0).
+    static let gcFunctionPool      = bool("gc.functionPool",           default: true)
 
     // MARK: - Atoms
 

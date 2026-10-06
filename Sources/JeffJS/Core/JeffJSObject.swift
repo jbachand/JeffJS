@@ -1782,6 +1782,15 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
         _auxU = Unmanaged.passRetained(a)
         return a
     }
+    /// Detach the side box (freeObject): the object reads every boxed field
+    /// as its default from here on; the caller owns the returned box.
+    @inline(__always) final func takeAux() -> JeffJSObjectAux? {
+        guard let u = _auxU else { return nil }
+        _auxU = nil
+        _propExtraCount = 0
+        _flags &= ~(JeffJSObject.flagHasCFunc | JeffJSObject.flagHasArrowThis | JeffJSObject.flagHasVarRefs)
+        return u.takeRetainedValue()
+    }
     /// Read a side-box field without retaining the box.
     @inline(__always) final func auxRead<T>(_ d: T, _ f: (JeffJSObjectAux) -> T) -> T {
         if let u = _auxU { return u._withUnsafeGuaranteedRef(f) }

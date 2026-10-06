@@ -20,6 +20,7 @@ let jeffJSObjectPoolCapacity = 4096
 func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
     return Unmanaged<JeffJSObject>.fromOpaque(ptr)._withUnsafeGuaranteedRef { o -> Bool in
         if o.classID == JeffJSClassID.array.rawValue { return jeffJS_recycleArray(o) }
+        if o.classID == JeffJSClassID.bytecodeFunction.rawValue { return jeffJS_recycleFunction(o) }
         guard !jeffJSObjectPoolDisabled, o.refCount == 1, o.isPoolable,
               let rt = o.ownerRuntime, rt.initComplete,
               rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain,
@@ -76,6 +77,71 @@ func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
         return true
     }
 }
+
+let jeffJSFunctionPoolCapacity = 1024
+
+/// Closures die as fast as they are made (`arr.forEach(function (v) {...})`
+/// in a loop, React's inline handlers). A dying ordinary bytecode function
+/// whose only own properties are data slots (its materialised `name` and
+/// `length`, at most) is reset — payload, var-refs, captured `this`, shape —
+/// and parked WITH its side box, so `createClosure` reuses both allocations
+/// (perf/watch-object-size: a closure is an object + a side box; without the
+/// pool every closure paid two mallocs and two frees). A/B: JEFFJS_NO_POOL=1
+/// (all pools) or JEFFJS_GC_FUNCTIONPOOL=0.
+@inline(never)
+func jeffJS_recycleFunction(_ o: JeffJSObject) -> Bool {
+    let bad: UInt16 = JeffJSObject.flagExotic | JeffJSObject.flagFastArray | JeffJSObject.flagProtectedGlobal
+        | JeffJSObject.flagImmutablePrototype | JeffJSObject.flagHTMLDDA | JeffJSObject.flagStdArrayPrototype
+        | JeffJSObject.flagHasCFunc
+    guard jeffJS_functionPoolEnabled, !jeffJSObjectPoolDisabled, o.refCount == 1,
+          (o._flags & bad) == 0, o._propExtraCount == 0, o.weakrefCount == 0,
+          o._fastArrayValues == nil, let a = o.aux,
+          a.firstWeakRef == nil, a.storedCFunction == nil, a.storedPrimitiveValue.isUndefined,
+          let rt = o.ownerRuntime, rt.initComplete,
+          rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain,
+          rt.functionPool.count < jeffJSFunctionPoolCapacity else { return false }
+    o.refCount = 0
+    removeGCObject(rt, o)
+    // Release what the closure owns; nested zero transitions are deferred
+    // while inFreeChain is set and drained below (see jeffJS_recycleObject).
+    rt.inFreeChain = true
+    let n = o.propValues.count
+    if n > 0 {
+        var i = 0
+        while i < n { o.propValues[i].freeValue(); i += 1 }
+        o.propValues.removeAll(keepingCapacity: true)
+    }
+    var payload: JeffJSObjectPayload = .opaque(nil)
+    swap(&payload, &a.payload)     // a move: no copy of the enum
+    if case .bytecodeFunc(let fb, _, _) = payload, let fb { fb.liveClosures &-= 1 }
+    if let t = a.arrowThisVal { a.arrowThisVal = nil; t.freeValue() }
+    a.cMagicFast = 0
+    a.storedCFunctionLength = 0
+    a.storedProto = nil
+    rt.inFreeChain = false
+    o.fbFast = nil
+    if (o._flags & JeffJSObject.flagHasVarRefs) != 0 { a.setVarRefs([]) }
+    if let shape = o.shape {
+        o.shape = nil
+        shape.refCount -= 1
+        if shape.refCount == 0 && !shape.isHashed { freeGCObjectChildren(rt, shape) }
+    }
+    o._flags = JeffJSObject.flagExtensible
+    o.mark = JeffJSGCMark.white
+    o.realmIndex = 0
+    o.lazyFlags = 0
+    rt.functionPool.append(o)
+    _ = payload   // var-refs array, home object and body released here
+    if !rt.gcZeroRefCountObjects.isEmpty {
+        while let d = rt.gcZeroRefCountObjects.popLast() {
+            if d.refCount == 0 { freeGCObjectAtZeroRefcount(rt, d) }
+        }
+    }
+    return true
+}
+
+/// JEFFJS_GC_FUNCTIONPOOL=0 turns the function-object pool off (A/B).
+nonisolated(unsafe) var jeffJS_functionPoolEnabled: Bool = true
 
 let jeffJSArrayPoolCapacity = 1024
 let jeffJSArrayStorageKeepCapacity = 64
@@ -137,6 +203,8 @@ extension JeffJSRuntime {
         objectPool.removeAll()
         for o in arrayPool { Unmanaged.passUnretained(o).release() }
         arrayPool.removeAll()
+        for o in functionPool { Unmanaged.passUnretained(o).release() }
+        functionPool.removeAll()
         arrayStoragePool.removeAll()
     }
 }

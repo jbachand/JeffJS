@@ -134,4 +134,29 @@ final class ObjectSizeRefLeakTests: XCTestCase {
             v.freeValue()
         }
     }
+
+    /// Recycled closures (jeffJS_recycleFunction) come back with nothing of
+    /// their previous life: captures, name/length, `this`, prototype, props.
+    func testRecycledClosuresAreFresh() {
+        withContext { ctx in
+            let v = ctx.eval(input: """
+                var out = [];
+                function mk(i) { var c = i; var f = function named() { return c; }; return f; }
+                for (var r = 0; r < 3; r++) {
+                    for (var i = 0; i < 300; i++) { var f = mk(i); f.name; f.length; f(); }
+                }
+                var o = { k: 7, m: function () { return (() => this.k)(); } };
+                var g = mk(41);
+                var h = function (a, b) { return a + b; };
+                var arrow = (x) => x * 2;
+                out.push(g(), g.name, g.length, h.name, h.length, h(1, 2), arrow.name, arrow(4), o.m(),
+                         typeof g.prototype, Object.getOwnPropertyNames(arrow).join(','),
+                         Object.keys(g).length, g.hasOwnProperty('x'));
+                out.join('|')
+                """, filename: "<pool>", evalFlags: 0)
+            XCTAssertFalse(v.isException)
+            XCTAssertEqual(ctx.toSwiftString(v), "41|named|0|h|2|3|arrow|8|7|object|length,name|0|false")
+            v.freeValue()
+        }
+    }
 }
