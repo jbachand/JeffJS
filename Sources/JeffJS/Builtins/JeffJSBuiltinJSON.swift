@@ -336,7 +336,7 @@ struct JeffJSBuiltinJSON {
 
             if ch == 0x22 { // closing "
                 // Build the JS string directly from the code units
-                if result.count <= JSONParseState.strCacheMaxLen {
+                if jeffJS_sharedStringsEnabled, result.count <= JSONParseState.strCacheMaxLen {
                     if let v = state.strCache[result] { return v.dupValue() }
                     let v = state.ctx.newStringFromUTF16(result)
                     if state.strCache.count < JSONParseState.strCacheMaxEntries {

@@ -448,6 +448,7 @@ nonisolated final class JeffJSRuntime {
     var sharedStrings: [String: JeffJSString] = [:]
     static let sharedStringsCapacity = 4096
 
+
     /// Pool of interpreter value buffers: (pointer, capacity) pairs.
     var interpBufPool: [(UnsafeMutablePointer<JeffJSValue>, Int)] = []
     /// interp.fastCallEntry: the same pool as a fixed unsafe stack of
@@ -1974,3 +1975,6 @@ func jeffJS_canonicalArrayIndex<S: Sequence>(utf8: S, max: UInt32 = JS_ATOM_MAX_
     if value > UInt64(max) { return nil }
     return UInt32(value)
 }
+
+/// False under JEFFJS_GC_SHAREDSTRINGS=0 (see JeffJSConfig.gcSharedStrings).
+nonisolated(unsafe) var jeffJS_sharedStringsEnabled: Bool = true

@@ -272,6 +272,10 @@ enum JeffJSConfig {
     /// false = every closure is a fresh object + side box (A/B,
     /// JEFFJS_GC_FUNCTIONPOOL=0).
     static let gcFunctionPool      = bool("gc.functionPool",           default: true)
+    /// Share short strings (JeffJSContext.sharedString: "", conversion
+    /// constants, DOM tag names) and dedup short JSON.parse values; false =
+    /// a fresh string every time (A/B, JEFFJS_GC_SHAREDSTRINGS=0).
+    static let gcSharedStrings     = bool("gc.sharedStrings",          default: true)
 
     // MARK: - Atoms
 

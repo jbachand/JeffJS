@@ -1144,7 +1144,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// or for anything longer than 32 UTF-8 bytes. Owned reference.
     func sharedString(_ s: String) -> JeffJSValue {
         if let js = rt.sharedStrings[s] { return JeffJSContext.sharedStringRef(js) }
-        guard s.utf8.count <= 32, rt.sharedStrings.count < JeffJSRuntime.sharedStringsCapacity else {
+        guard jeffJS_sharedStringsEnabled, s.utf8.count <= 32,
+              rt.sharedStrings.count < JeffJSRuntime.sharedStringsCapacity else {
             return JeffJSValue.makeString(JeffJSString(swiftString: s))
         }
         let js = JeffJSString(swiftString: s)   // refCount 1: the table's reference
