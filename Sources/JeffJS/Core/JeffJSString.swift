@@ -57,24 +57,22 @@ nonisolated final class JeffJSString: JeffJSStringBase {
            rt.atomOwnerID == cachedAtomRuntime {
             rt.freeAtom(cachedAtom)
         }
-        if hasRegexCache { jeffJS_stringRegexCacheDrop(self) }
     }
 
     // Layout (perf/watch-object-size): 64 bytes, was 112. Swift packs these
     // into the base class's tail padding in declaration order:
-    //   isWideChar @26, hasRegexCache @27, _len @28, _hashAndAtomType @32,
-    //   cachedAtom @36, cachedAtomRuntime @40, storage @48 (9 B) -> 57.
-    // The regex input caches moved to a side table (`hasRegexCache`), the
-    // unused atom-chain link `hashNext` was dropped and the length is 32-bit
-    // (QuickJS's JSString limit is 2^31 - 1 too).
+    //   isWideChar @26, _len @28, _hashAndAtomType @32, cachedAtom @36,
+    //   cachedAtomRuntime @40, storage @48 (9 B) -> 57.
+    // The regex input caches (codeUnits32 & co., 4 bytes per character for a
+    // string's whole life) became a few per-runtime entries
+    // (JeffJSRegexCaches), the unused atom-chain link `hashNext` was dropped
+    // and the length is 32-bit (QuickJS's JSString limit is 2^31 - 1 too).
 
     // -- Encoding flag -------------------------------------------------------
 
     /// `false` = 8-bit (Latin-1), `true` = 16-bit (UTF-16).
     private(set) var isWideChar: Bool
 
-    /// The string has an entry in the regex-input side table.
-    final var hasRegexCache: Bool = false
 
     // -- Length (max 2^31 - 1) ------------------------------------------------
 
@@ -119,33 +117,6 @@ nonisolated final class JeffJSString: JeffJSStringBase {
         get { 0 }
         set { }
     }
-    /// Regex input caches (js_regexp_execInternal): the code units / code
-    /// points of this string as UInt32, built once instead of per exec.
-    /// In the side table (`hasRegexCache`), not in every string.
-    var codeUnits32: [UInt32]? {
-        get { hasRegexCache ? jeffJS_stringRegexCache(self, create: false)?.codeUnits32 : nil }
-        set {
-            if newValue == nil && !hasRegexCache { return }
-            jeffJS_stringRegexCache(self, create: true)?.codeUnits32 = newValue
-        }
-    }
-    var codePoints32: [UInt32]? {
-        get { hasRegexCache ? jeffJS_stringRegexCache(self, create: false)?.codePoints32 : nil }
-        set {
-            if newValue == nil && !hasRegexCache { return }
-            jeffJS_stringRegexCache(self, create: true)?.codePoints32 = newValue
-        }
-    }
-    /// For a compiled RegExp bytecode string: its capture-group names,
-    /// parsed once (exec used to copy the bytecode and re-parse per match).
-    var regexpGroupNames: [String?]? {
-        get { hasRegexCache ? jeffJS_stringRegexCache(self, create: false)?.regexpGroupNames : nil }
-        set {
-            if newValue == nil && !hasRegexCache { return }
-            jeffJS_stringRegexCache(self, create: true)?.regexpGroupNames = newValue
-        }
-    }
-
     // -- Storage -------------------------------------------------------------
 
     var storage: JeffJSStringStorage
@@ -205,37 +176,6 @@ nonisolated final class JeffJSString: JeffJSStringBase {
     func release() {
         refCount -= 1
     }
-}
-
-/// Regex input caches of one string (see JeffJSString.codeUnits32).
-nonisolated final class JeffJSStringRegexCache {
-    var codeUnits32: [UInt32]? = nil
-    var codePoints32: [UInt32]? = nil
-    var regexpGroupNames: [String?]? = nil
-}
-
-/// Side table of the regex caches, keyed by string identity. Strings die on
-/// whatever thread drops the last reference, so it is locked; only strings
-/// that were regex inputs (or compiled regex bytecode) ever touch it.
-nonisolated(unsafe) private var jeffJS_stringRegexCaches: [ObjectIdentifier: JeffJSStringRegexCache] = [:]
-private let jeffJS_stringRegexCachesLock = NSLock()
-
-func jeffJS_stringRegexCache(_ s: JeffJSString, create: Bool) -> JeffJSStringRegexCache? {
-    jeffJS_stringRegexCachesLock.lock()
-    defer { jeffJS_stringRegexCachesLock.unlock() }
-    let id = ObjectIdentifier(s)
-    if let c = jeffJS_stringRegexCaches[id] { return c }
-    guard create else { return nil }
-    let c = JeffJSStringRegexCache()
-    jeffJS_stringRegexCaches[id] = c
-    s.hasRegexCache = true
-    return c
-}
-
-func jeffJS_stringRegexCacheDrop(_ s: JeffJSString) {
-    jeffJS_stringRegexCachesLock.lock()
-    jeffJS_stringRegexCaches[ObjectIdentifier(s)] = nil
-    jeffJS_stringRegexCachesLock.unlock()
 }
 
 // MARK: - JeffJSStringRope

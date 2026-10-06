@@ -386,15 +386,7 @@ func js_regexp_exec(
     // re-parse it on every match).
     var groupsVal: JeffJSValue = .undefined
     if case .regexp(_, let bytecodeStr) = obj.payload, let bc = bytecodeStr {
-        let groupNames: [String?]
-        if let cached = bc.regexpGroupNames {
-            groupNames = cached
-        } else if case .str8(let bcBuf) = bc.storage {
-            groupNames = lreGetGroupNames(bcBuf.count == bc.len ? bcBuf : Array(bcBuf.prefix(bc.len)))
-            bc.regexpGroupNames = groupNames
-        } else {
-            groupNames = []
-        }
+        let groupNames = ctx.rt.regexCaches.groupNames(of: bc)
         var hasNamedGroup = false
         for name in groupNames { if name != nil { hasNamedGroup = true; break } }
         if hasNamedGroup {
@@ -960,18 +952,7 @@ private func js_regexp_globalMatchFast(
     // ranges index the JS string, and the substrings below are rebuilt from
     // these units — decoded code points truncated astral characters to their
     // low surrogate.
-    let inputCodeUnits: [UInt32]
-    if let c = inputStr.codeUnits32 {
-        inputCodeUnits = c
-    } else {
-        var c = [UInt32](); c.reserveCapacity(inputStr.len)
-        switch inputStr.storage {
-        case .str8(let b): for u in b { c.append(UInt32(u)) }
-        case .str16(let b): for u in b { c.append(UInt32(u)) }
-        }
-        inputStr.codeUnits32 = c
-        inputCodeUnits = c
-    }
+    let inputCodeUnits = ctx.rt.regexCaches.codeUnits(of: inputStr)
 
     // 3. Build the flags for the regex VM.
     var regexpFlags = JeffJSRegExpFlags()
@@ -1829,18 +1810,7 @@ private func js_regexp_execInternal(
     // The VM decodes surrogate pairs itself when the `u`/`v` flag is set
     // (REVirtualMachine.getCharUnicodeFast), so `/./u` still consumes a whole
     // astral character — it just advances `pos` by two units.
-    let inputCodeUnits: [UInt32]
-    if let c = inputStr.codeUnits32 {
-        inputCodeUnits = c
-    } else {
-        var c = [UInt32](); c.reserveCapacity(inputStr.len)
-        switch inputStr.storage {
-        case .str8(let b): for u in b { c.append(UInt32(u)) }
-        case .str16(let b): for u in b { c.append(UInt32(u)) }
-        }
-        inputStr.codeUnits32 = c
-        inputCodeUnits = c
-    }
+    let inputCodeUnits = ctx.rt.regexCaches.codeUnits(of: inputStr)
 
     var regexpFlags = JeffJSRegExpFlags()
     if flags & LRE_FLAG_GLOBAL != 0       { regexpFlags.insert(.global) }
@@ -2233,4 +2203,63 @@ extension JeffJSContext {
         classProto[idx] = proto
         return proto
     }
+}
+
+
+// MARK: - Regex input / group-name caches (perf/watch-object-size)
+
+/// What used to be three fields on every JeffJSString (`codeUnits32`,
+/// `codePoints32`, `regexpGroupNames`): the UInt32 code units of a regex
+/// input — kept for the string's whole life, 4 bytes per character of every
+/// string a regex ever ran over — and a compiled pattern's group names.
+/// Now a few most-recent entries per runtime (single-threaded, no lock).
+/// An entry holds a strong reference to its string, so its identity cannot
+/// be reused while it is cached; a `/g` loop, `replace` or a tokenizer
+/// re-running over the same input still converts it once.
+nonisolated final class JeffJSRegexCaches {
+    private var inputs: [(JeffJSString, [UInt32])] = []
+    private var names: [(JeffJSString, [String?])] = []
+    private static let maxInputs = 2
+    private static let maxNames = 8
+
+    @inline(__always)
+    func codeUnits(of s: JeffJSString) -> [UInt32] {
+        if let e = inputs.first, e.0 === s { return e.1 }
+        return codeUnitsSlow(s)
+    }
+
+    @inline(never)
+    private func codeUnitsSlow(_ s: JeffJSString) -> [UInt32] {
+        if let i = inputs.firstIndex(where: { $0.0 === s }) {
+            let e = inputs.remove(at: i)
+            inputs.insert(e, at: 0)
+            return e.1
+        }
+        var c = [UInt32](); c.reserveCapacity(s.len)
+        switch s.storage {
+        case .str8(let b): for u in b.prefix(s.len) { c.append(UInt32(u)) }
+        case .str16(let b): for u in b.prefix(s.len) { c.append(UInt32(u)) }
+        }
+        inputs.insert((s, c), at: 0)
+        if inputs.count > Self.maxInputs { inputs.removeLast() }
+        return c
+    }
+
+    func groupNames(of bc: JeffJSString) -> [String?] {
+        if let i = names.firstIndex(where: { $0.0 === bc }) {
+            if i != 0 { let e = names.remove(at: i); names.insert(e, at: 0) }
+            return names[0].1
+        }
+        let g: [String?]
+        if case .str8(let bcBuf) = bc.storage {
+            g = lreGetGroupNames(bcBuf.count == bc.len ? bcBuf : Array(bcBuf.prefix(bc.len)))
+        } else {
+            g = []
+        }
+        names.insert((bc, g), at: 0)
+        if names.count > Self.maxNames { names.removeLast() }
+        return g
+    }
+
+    func removeAll() { inputs.removeAll(); names.removeAll() }
 }

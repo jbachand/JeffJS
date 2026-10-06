@@ -1698,7 +1698,8 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
     //   header: isa, Swift refcount, refCount, gcObjType, mark, gcListIndex32,
     //   ownerRuntime                                                  (40 B)
     //   _flags16, realmIndex, lazyFlags, _classID16, weakrefCount32,
-    //   _propExtraCount32, _shapeU, propValues (ptr + 2 x UInt32),
+    //   _propExtraCount32, shape (strong; its bits are the IC identity, so
+    //   shapeIdentity needs no field), propValues (ptr + 2 x UInt32),
     //   aux, _fastArrayValues                                         (56 B)
     // Everything only functions, exotic objects or rare features use lives
     // in `aux` (JeffJSObjectAux), allocated on the first non-default write;
@@ -1730,7 +1731,16 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
     final var _propExtraCount: Int32 = 0
     /// The shape, retained manually (+1 held while set): its raw bits are the
     /// inline-cache identity, so `shapeIdentity` needs no field of its own.
-    final var _shapeU: Unmanaged<JeffJSShape>? = nil
+    /// The shape. A plain strong stored property on purpose: reads borrow it
+    /// with no retain (an Unmanaged copy cost 7-22 % on property/array loops,
+    /// every read became a retain). Its raw bits are the inline-cache
+    /// identity, so `shapeIdentity` needs no field of its own.
+    var shape: JeffJSShape? = nil
+    /// Unretained identity of `shape` for inline-cache checks: the bits of
+    /// the stored reference, read without a retain.
+    var shapeIdentity: UnsafeRawPointer? {
+        @inline(__always) get { unsafeBitCast(shape, to: UnsafeRawPointer?.self) }
+    }
 
     /// Split property storage (see JeffJSProperty). `propValues` holds the data
     /// value for every slot (`.undefined` for accessor/varRef/autoInit slots);
@@ -1869,19 +1879,6 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
 
     // -- Shape --------------------------------------------------------------------
 
-    var shape: JeffJSShape? {
-        @inline(__always) get { _shapeU?.takeUnretainedValue() }
-        set {
-            let old = _shapeU
-            _shapeU = newValue.map { Unmanaged.passRetained($0) }
-            old?.release()
-        }
-    }
-    /// Unretained identity of `shape` for inline-cache checks: comparing
-    /// this avoids loading (retaining) the shape reference on every access.
-    var shapeIdentity: UnsafeRawPointer? {
-        @inline(__always) get { _shapeU.map { UnsafeRawPointer($0.toOpaque()) } }
-    }
 
     // -- Rare-property side table --------------------------------------------
 
@@ -2088,11 +2085,11 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
     /// in the side box. Was a strong stored field on every object.
     var storedProto: JeffJSObject? {
         @inline(__always) get {
-            if let s = _shapeU { return s._withUnsafeGuaranteedRef { $0.proto } }
+            if let s = shape { return s.proto }
             return auxRead(nil) { $0.storedProto }
         }
         set {
-            if _shapeU != nil {
+            if shape != nil {
                 if let u = _auxU, u._withUnsafeGuaranteedRef({ $0.storedProto != nil }) {
                     u._withUnsafeGuaranteedRef { $0.storedProto = nil }
                 }
@@ -2147,7 +2144,7 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
         }
     }
 
-    deinit { propValues.deallocateStorage(); _shapeU?.release(); _auxU?.release() }
+    deinit { propValues.deallocateStorage(); _auxU?.release() }
 }
 
 /// The fields of a JeffJSObject that only functions, exotic objects and rare
@@ -2966,7 +2963,7 @@ struct JeffJSObj {
         get { _with { $0.shape } }
         nonmutating set { _obj.shape = newValue }
     }
-    @inline(__always) var shapeIdentity: UnsafeRawPointer? { _with { $0._shapeU.map { UnsafeRawPointer($0.toOpaque()) } } }
+    @inline(__always) var shapeIdentity: UnsafeRawPointer? { _with { $0.shapeIdentity } }
 
     // Split property storage (zero-ARC handle): index directly on _obj so the
     // ContiguousArray struct is never copied (no buffer retain).

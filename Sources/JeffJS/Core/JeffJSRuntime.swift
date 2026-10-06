@@ -410,6 +410,9 @@ nonisolated final class JeffJSRuntime {
     /// freeObject consults this to catch over-releases of load-bearing objects.
     var protectedGlobals: Set<ObjectIdentifier> = []
     /// Recycled plain objects (JeffJSObjectPool.swift).
+    /// Recent regex inputs' code units and patterns' group names (see
+    /// JeffJSRegexCaches; were fields on every string).
+    let regexCaches = JeffJSRegexCaches()
     var objectPool: [JeffJSObject] = []
     /// Recycled arrays (JeffJSObjectPool.swift): empty, `length` 0, no
     /// element storage, off the GC list.
