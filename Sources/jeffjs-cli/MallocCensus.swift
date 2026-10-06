@@ -405,3 +405,94 @@ func objc_getClassList_contains(_ p: UInt) -> String? {
     }
     return nil
 }
+
+// MARK: - Orphans (CLI only): live instances of a class that no malloc block points at
+// (raw pointer or NaN-boxed JeffJSValue). For refcounted engine objects these are
+// leaks: something counted a reference it never gave back.
+nonisolated(unsafe) var orphanSeen: UnsafeMutablePointer<UInt8>? = nil   // parallel to refTargets
+func orphanTargetIndex(_ k: UInt) -> Int {
+    guard let t = refTargets, k != 0 else { return -1 }
+    var i = refHash(k) & (refTargetCap - 1)
+    while true { let v = t[i]; if v == k { return i }; if v == 0 { return -1 }; i = (i + 1) & (refTargetCap - 1) }
+}
+func orphanRecorder(_ task: task_t, _ ctx: UnsafeMutableRawPointer?, _ type: UInt32, _ ranges: UnsafeMutablePointer<vm_range_t>?, _ count: UInt32) {
+    guard let ranges else { return }
+    for i in 0..<Int(count) {
+        let r = ranges[i]
+        guard r.size >= 16, let p = UnsafePointer<UInt>(bitPattern: UInt(r.address)) else { continue }
+        if refPhase == 0 {
+            if p.pointee == refTargetIsa, let t = refTargets, refTargetCount < refTargetCap / 2 {
+                var j = refHash(UInt(r.address)) & (refTargetCap - 1)
+                while t[j] != 0 { j = (j + 1) & (refTargetCap - 1) }
+                t[j] = UInt(r.address); refTargetCount += 1
+            }
+        } else {
+            let words = Int(r.size) / 8
+            for w in 0..<words {
+                let v = p[w]
+                var k = v
+                if (v >> 48) >= 0xFFFA { k = v & 0x0000_FFFF_FFFF_FFFF }
+                if k == UInt(r.address) { continue }
+                let idx = orphanTargetIndex(k)
+                if idx >= 0 { orphanSeen![idx] = 1 }
+            }
+        }
+    }
+}
+@MainActor
+func orphanReport(className: String, describe: (UnsafeRawPointer) -> String?) -> String {
+    guard let cls = NSClassFromString(className) else { return "[Orphans] no class \(className)" }
+    refTargetIsa = unsafeBitCast(cls, to: UInt.self)
+    refTargetCap = 1 << 22
+    refTargetCount = 0
+    // mmap, not malloc: the zone walk must not see the target table itself.
+    let tBytes = refTargetCap * 8, sBytes = refTargetCap
+    refTargets = mmap(nil, tBytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0)!.bindMemory(to: UInt.self, capacity: refTargetCap)
+    orphanSeen = mmap(nil, sBytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0)!.bindMemory(to: UInt8.self, capacity: refTargetCap)
+    var zonesPtr: UnsafeMutablePointer<vm_address_t>? = nil
+    var zoneCount: UInt32 = 0
+    _ = malloc_get_all_zones(mach_task_self_, nil, &zonesPtr, &zoneCount)
+    for phase in 0...1 {
+        refPhase = phase
+        for z in 0..<Int(zoneCount) {
+            guard let zp = UnsafeMutablePointer<malloc_zone_t>(bitPattern: UInt(zonesPtr![z])),
+                  let en = zp.pointee.introspect?.pointee.enumerator else { continue }
+            _ = en(mach_task_self_, nil, UInt32(MALLOC_PTR_IN_USE_RANGE_TYPE), vm_address_t(UInt(bitPattern: zp)), refReader, orphanRecorder)
+        }
+    }
+    var orphans: [UInt] = []
+    for j in 0..<refTargetCap where refTargets![j] != 0 && orphanSeen![j] == 0 { orphans.append(refTargets![j]) }
+    var lines = ["[Orphans] \(className): \(refTargetCount) instances, \(orphans.count) with no referrer"]
+    var groups: [String: Int] = [:]
+    for a in orphans {
+        if let p = UnsafeRawPointer(bitPattern: a), let d = describe(p) { groups[d, default: 0] += 1 }
+    }
+    for (d, c) in groups.sorted(by: { $0.value > $1.value }).prefix(40) { lines.append("[Orphans]   \(c) x \(d)") }
+    munmap(refTargets!, tBytes); refTargets = nil; munmap(orphanSeen!, sBytes); orphanSeen = nil
+    return lines.joined(separator: "\n")
+}
+
+/// Addresses of every live instance of `className` (zone walk, CLI only).
+@MainActor
+func liveInstances(className: String) -> [UInt] {
+    guard let cls = NSClassFromString(className) else { return [] }
+    refTargetIsa = unsafeBitCast(cls, to: UInt.self)
+    refTargetCap = 1 << 22
+    refTargetCount = 0
+    let tBytes = refTargetCap * 8
+    refTargets = mmap(nil, tBytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0)!.bindMemory(to: UInt.self, capacity: refTargetCap)
+    var zonesPtr: UnsafeMutablePointer<vm_address_t>? = nil
+    var zoneCount: UInt32 = 0
+    _ = malloc_get_all_zones(mach_task_self_, nil, &zonesPtr, &zoneCount)
+    refPhase = 0
+    for z in 0..<Int(zoneCount) {
+        guard let zp = UnsafeMutablePointer<malloc_zone_t>(bitPattern: UInt(zonesPtr![z])),
+              let en = zp.pointee.introspect?.pointee.enumerator else { continue }
+        _ = en(mach_task_self_, nil, UInt32(MALLOC_PTR_IN_USE_RANGE_TYPE), vm_address_t(UInt(bitPattern: zp)), refReader, orphanRecorder)
+    }
+    var out: [UInt] = []
+    out.reserveCapacity(refTargetCount)
+    for j in 0..<refTargetCap where refTargets![j] != 0 { out.append(refTargets![j]) }
+    munmap(refTargets!, tBytes); refTargets = nil
+    return out
+}
