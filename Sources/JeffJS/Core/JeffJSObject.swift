@@ -2038,15 +2038,13 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
     /// per array, 80 k arrays on homedepot).
     var payload: JeffJSObjectPayload {
         @inline(__always) get {
-            if let u = _auxU {
-                let p = u._withUnsafeGuaranteedRef { $0.payload }
-                if case .opaque(let o) = p, o == nil, let st = _fastArrayValues {
-                    return JeffJSObject.arrayPayloadView(st)
-                }
-                return p
+            // Non-array objects (functions, typed arrays, maps...) never have
+            // an element store: one nil test, then the box's payload as is.
+            if _fastArrayValues == nil {
+                if let u = _auxU { return u._withUnsafeGuaranteedRef { $0.payload } }
+                return .opaque(nil)
             }
-            if let st = _fastArrayValues { return JeffJSObject.arrayPayloadView(st) }
-            return .opaque(nil)
+            return arrayPayloadSlow()
         }
         set {
             if case .array(_, let values, let count) = newValue {
@@ -2976,6 +2974,17 @@ extension JeffJSObject {
     /// the payload is now a view of the store (see `payload`), so there is
     /// nothing to sync.
     func syncArrayPayload() {}
+
+    /// `payload` of an object with an element store: the box's payload when
+    /// it holds one (never for an array), else the view of the store.
+    @inline(never)
+    final func arrayPayloadSlow() -> JeffJSObjectPayload {
+        if let u = _auxU {
+            let p = u._withUnsafeGuaranteedRef { $0.payload }
+            if case .opaque(.none) = p {} else { return p }
+        }
+        return JeffJSObject.arrayPayloadView(_fastArrayValues.unsafelyUnwrapped)
+    }
 
     /// The `.array` payload view of an element store.
     @inline(__always)
