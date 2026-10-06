@@ -7807,7 +7807,11 @@ struct JeffJSInterpreter {
             // Wide opcodes use the 0x00 (.invalid) prefix, handled below.
             // DEBUG cross-checks the bitcast against the safe initializer so any
             // future enum-layout drift is caught immediately.
-            #if DEBUG
+            // Debug builds: the validating decode is opt-in
+            // (-DJEFFJS_DEBUG_OPCHECKS). At -Onone the synthesized
+            // init(rawValue:) of this 272-case enum was ~9% of a Debug app's
+            // JS time (the watch simulator is measured with Debug builds).
+            #if DEBUG && JEFFJS_DEBUG_OPCHECKS
             let op = JeffJSOpcode(rawValue: UInt16(bc[pc]))!
             assert(op == unsafeBitCast(UInt16(bc[pc]), to: JeffJSOpcode.self),
                    "JeffJSOpcode layout drift: bitcast decode no longer valid")
@@ -12921,6 +12925,9 @@ struct JeffJSInterpreter {
             }
 
             #if DEBUG
+            // (Only ever reports under traceOps: skipped otherwise — at -Onone
+            // the per-opcode table lookup and compares cost Debug builds.)
+            if traceOps {
             // Stack balance check: verify that the opcode handler changed sp
             // by exactly nPush - nPop. Skip opcodes with variable stack effects
             // (nPop or nPush == -1) and opcodes that break out of the dispatch
@@ -12944,6 +12951,7 @@ struct JeffJSInterpreter {
                         print("[JeffJS-STACK] \(op): expected sp delta \(expectedDelta) but got \(actualDelta) at pc=\(pcBefore)")
                     }
                 }
+            }
             }
             #endif
 
