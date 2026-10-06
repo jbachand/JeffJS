@@ -30,13 +30,31 @@ struct JeffJSVarDef {
 /// Closure variable reference stored in a compiled function.
 /// Mirrors `JSClosureVar` in QuickJS.
 struct JeffJSClosureVar {
+    // 16 bytes (was 24): kind and index are stored narrow behind Int accessors.
     var varName: JSAtom = 0
     var isLocal: Bool = false        // true => captured from parent's locals
     var isArg: Bool = false          // true => captured from parent's args
     var isConst: Bool = false
     var isLexical: Bool = false
-    var varKind: Int = JSVarKindEnum.JS_VAR_NORMAL.rawValue
-    var varIdx: Int = 0              // index in parent (local/arg) or var_ref
+    private var _varKind: UInt8 = UInt8(truncatingIfNeeded: JSVarKindEnum.JS_VAR_NORMAL.rawValue)
+    private var _varIdx: Int32 = 0
+    var varKind: Int {
+        @inline(__always) get { Int(_varKind) }
+        @inline(__always) set { _varKind = UInt8(truncatingIfNeeded: newValue) }
+    }
+    /// index in parent (local/arg) or var_ref
+    var varIdx: Int {
+        @inline(__always) get { Int(_varIdx) }
+        @inline(__always) set { _varIdx = Int32(truncatingIfNeeded: newValue) }
+    }
+
+    init(varName: JSAtom = 0, isLocal: Bool = false, isArg: Bool = false, isConst: Bool = false,
+         isLexical: Bool = false, varKind: Int = JSVarKindEnum.JS_VAR_NORMAL.rawValue, varIdx: Int = 0) {
+        self.varName = varName; self.isLocal = isLocal; self.isArg = isArg; self.isConst = isConst
+        self.isLexical = isLexical
+        self._varKind = UInt8(truncatingIfNeeded: varKind)
+        self._varIdx = Int32(truncatingIfNeeded: varIdx)
+    }
 }
 
 /// One binding visible at a direct `eval` call site, innermost first

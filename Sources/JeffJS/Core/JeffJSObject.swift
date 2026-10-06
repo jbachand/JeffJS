@@ -34,29 +34,64 @@ protocol JeffJSContextRef: JeffJSContextProtocol {
 /// Monomorphic inline cache entry for property access.
 /// Caches the shape identity + property offset for O(1) repeated lookups.
 struct JeffJSICEntry {
+    // Layout (perf/watch-object-size): 40 bytes, was 56. pc/offset are 32-bit
+    // and a transition entry's successor shape and a prototype entry's holder
+    // shape share one slot (an entry is one or the other: `holderPtr` says
+    // which). Every field keeps its name and type, so the readers are unchanged.
     /// Raw pointer to the cached shape (identity comparison, no retain).
     var shapePtr: UnsafeRawPointer? = nil
-    /// Bytecode offset this cache belongs to (for collision validation).
-    var pc: Int = -1
-    /// Property index into the object's prop array.
-    var propOffset: Int = -1
-    /// Cached `.writable` flag of the slot (valid while the shape matches:
-    /// flag changes copy the shape, so identity covers it).
-    var writable: Bool = false
-    /// Property key of a computed-key site (`o[k]` with a string `k`):
-    /// the entry is valid only for this atom. 0 for named sites, whose
-    /// key is fixed by the pc. The retained shapes hold a reference to the
-    /// atom, so it cannot be freed and reused while the entry lives.
-    var atom: UInt32 = 0
-    /// define_field transition target (retained): objects on `shapePtr` at
-    /// this pc move to this shape when the field is added.
-    var nextShapePtr: UnsafeRawPointer? = nil
     /// Prototype-chain entry (depth 1): the property lives on the receiver's
     /// direct prototype `holderPtr` (retained JeffJSObject) at `propOffset`,
     /// valid while the receiver's shape (which fixes its prototype and own
     /// properties) and the holder's shape `holderShapePtr` (retained) match.
     var holderPtr: UnsafeRawPointer? = nil
-    var holderShapePtr: UnsafeRawPointer? = nil
+    /// `nextShapePtr` (transition entries) or `holderShapePtr` (prototype
+    /// entries), retained.
+    private var _secondShape: UnsafeRawPointer? = nil
+    private var _pc: Int32 = -1
+    private var _propOffset: Int32 = -1
+    /// Property key of a computed-key site (`o[k]` with a string `k`):
+    /// the entry is valid only for this atom. 0 for named sites, whose
+    /// key is fixed by the pc. The retained shapes hold a reference to the
+    /// atom, so it cannot be freed and reused while the entry lives.
+    var atom: UInt32 = 0
+    /// Cached `.writable` flag of the slot (valid while the shape matches:
+    /// flag changes copy the shape, so identity covers it).
+    var writable: Bool = false
+
+    /// Bytecode offset this cache belongs to (for collision validation).
+    var pc: Int {
+        @inline(__always) get { Int(_pc) }
+        @inline(__always) set { _pc = Int32(truncatingIfNeeded: newValue) }
+    }
+    /// Property index into the object's prop array.
+    var propOffset: Int {
+        @inline(__always) get { Int(_propOffset) }
+        @inline(__always) set { _propOffset = Int32(truncatingIfNeeded: newValue) }
+    }
+    /// define_field transition target (retained): objects on `shapePtr` at
+    /// this pc move to this shape when the field is added.
+    var nextShapePtr: UnsafeRawPointer? {
+        @inline(__always) get { holderPtr == nil ? _secondShape : nil }
+    }
+    var holderShapePtr: UnsafeRawPointer? {
+        @inline(__always) get { holderPtr != nil ? _secondShape : nil }
+    }
+
+    init() {}
+
+    init(shapePtr: UnsafeRawPointer?, pc: Int, propOffset: Int, writable: Bool,
+         atom: UInt32 = 0, nextShapePtr: UnsafeRawPointer? = nil,
+         holderPtr: UnsafeRawPointer? = nil, holderShapePtr: UnsafeRawPointer? = nil) {
+        precondition(nextShapePtr == nil || holderPtr == nil, "IC entry is a transition or a prototype hit, not both")
+        self.shapePtr = shapePtr
+        self.holderPtr = holderPtr
+        self._secondShape = holderPtr != nil ? holderShapePtr : nextShapePtr
+        self._pc = Int32(truncatingIfNeeded: pc)
+        self._propOffset = Int32(truncatingIfNeeded: propOffset)
+        self.atom = atom
+        self.writable = writable
+    }
 }
 
 /// Read through a prototype-chain IC entry. nil on any mismatch.

@@ -120,6 +120,15 @@ final class ObjectSizeRefLeakTests: XCTestCase {
         XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSShape.self), 112)
         XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSAtomStruct.self), 64)
         XCTAssertLessThanOrEqual(class_getInstanceSize(JeffJSLazyFunctionInfo.self), 64)
+        XCTAssertEqual(MemoryLayout<JeffJSICEntry>.stride, 40)
+        XCTAssertEqual(MemoryLayout<JeffJSClosureVar>.stride, 16)
+        // An entry is a transition or a prototype hit: the shared shape slot
+        // answers only for its kind.
+        let p = UnsafeRawPointer(bitPattern: 0x1000)!, q = UnsafeRawPointer(bitPattern: 0x2000)!
+        let t = JeffJSICEntry(shapePtr: p, pc: 7, propOffset: 3, writable: true, nextShapePtr: q)
+        XCTAssertEqual(t.nextShapePtr, q); XCTAssertNil(t.holderShapePtr); XCTAssertEqual(t.pc, 7); XCTAssertEqual(t.propOffset, 3)
+        let h = JeffJSICEntry(shapePtr: p, pc: 9, propOffset: 1, writable: false, holderPtr: p, holderShapePtr: q)
+        XCTAssertEqual(h.holderShapePtr, q); XCTAssertNil(h.nextShapePtr)
     }
 
     /// Plain objects never allocate the side box; a prototype read goes
