@@ -1440,6 +1440,11 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
 
         // Check if property already exists — if so, update it in place
         if let shape = jsObj.shape, let idx = findShapeProperty(shape, atom) ?? shape.prop.firstIndex(where: { $0.atom == atom && $0.atom != 0 }) {
+            // A host-hidden property stays hidden (and so non-enumerable) when redefined.
+            if idx < shape.prop.count, shape.prop[idx].flags.contains(.hidden) {
+                propFlags.insert(.hidden); propFlags.remove(.enumerable)
+            }
+            if idx < shape.prop.count, shape.prop[idx].flags.contains(.shadowable) { propFlags.insert(.shadowable) }
             // Partial descriptor (Object.defineProperty with only some of
             // value/writable/enumerable/configurable): the attributes the
             // descriptor omits keep their current value. Only callers that
@@ -1850,6 +1855,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         }
 
         // Lazily created own properties count as present
+        if (jsObj.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(jsObj) }
         if jsObj.lazyFlags != 0 {
             if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue { return 1 }
             if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) { return 1 }
@@ -1865,6 +1871,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // to match getPropertyInternal's fallback behavior)
         var proto = jsObj.proto
         while let p = proto {
+            if (p.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(p) }
             if let shape = p.shape, findShapeProperty(shape, atom) != nil {
                 return 1
             }
@@ -1900,6 +1907,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// Materialise any deferred own property of `jsObj` that `atom` names.
     @inline(__always)
     func jeffJS_materializeLazyProps(_ jsObj: JeffJSObject, _ atom: UInt32) {
+        if (jsObj.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(jsObj) }
         if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
             materializeFunctionPrototype(jsObj)
         }
@@ -4948,6 +4956,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                                                      enumerableOnly: false) else { return .exception }
                 return self.newArrayFrom(keys)
             }
+            if (targetObj.lazyFlags & JeffJSObject.lazyHostBit) != 0 { self.materializeHostLazyProps(targetObj) }
             if targetObj.needsLazyNameLength { self.materializeFunctionNameLength(targetObj) }
             if targetObj.needsLazyPrototype { self.materializeFunctionPrototype(targetObj) }
             var intKeys: [(UInt32, JeffJSValue)] = []
@@ -4956,7 +4965,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             if let shape = targetObj.shape {
                 for prop in shape.prop {
                     let atom = prop.atom
-                    if atom == 0 { continue }
+                    if atom == 0 || prop.flags.contains(.hidden) { continue }   // hidden: JeffJSOwnPropertyOrder
                     if self.rt.atomIsArrayIndex(atom) {
                         if let idx = self.rt.atomToUInt32(atom) {
                             intKeys.append((idx, self.newStringValue(String(idx))))
@@ -5371,6 +5380,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // Walk prototype chain (prototype is stored on the shape)
         var proto = jsObj.proto
         while let p = proto {
+            if (p.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(p) }
             let pIdx = jeffJS_findOwnPropertyIndex(obj: p, atom: atom)
             if pIdx >= 0, p.shape != nil, pIdx < p.propValues.count {
                 if let e = p.extra(at: pIdx) {
@@ -5417,6 +5427,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         }
 
         // Deferred own properties.
+        if (jsObj.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(jsObj) }
         if jsObj.lazyFlags != 0 {
         if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
             // `F.prototype = x` replaces the default `{ constructor: F }`
@@ -5625,6 +5636,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // Walk prototype chain for inherited accessor setters (ES spec 9.1.9 step 4)
         var setProto = jsObj.proto
         while let p = setProto {
+            if (p.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(p) }
             let pIdx = jeffJS_findOwnPropertyIndex(obj: p, atom: atom)
             if pIdx >= 0, let pShape = p.shape, pIdx < p.propValues.count {
                 if pShape.prop[pIdx].flags.contains(.getset) {
@@ -5638,6 +5650,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                         if result.isException { return -1 }
                         return 1
                     }
+                    // A host stub accessor (JeffJSOwnPropertyOrder `.shadowable`): the
+                    // assignment defines an own data property on the receiver, as it did
+                    // before the host put the stub on the prototype.
+                    if pShape.prop[pIdx].flags.contains(.shadowable) { break }
                     // Inherited accessor with no setter
                     value.freeValue()
                     if (flags & JS_PROP_THROW) == 0 { return 0 }

@@ -515,7 +515,7 @@ func js_proxy_ownKeys(_ ctx: JeffJSContext,
         // Fall through: return target's own property names.
         var keys: [JeffJSValue] = []
         if let targetObj = pd.target.toObject(), let shape = targetObj.shape {
-            for prop in shape.prop {
+            for prop in shape.prop where !prop.flags.contains(.hidden) {
                 if let name = ctx.rt.atomToString(prop.atom) {
                     keys.append(ctx.newStringValue(name))
                 }
@@ -916,7 +916,7 @@ func js_reflect_ownKeys(_ ctx: JeffJSContext,
 
     var keys: [JeffJSValue] = []
     if let shape = targetObj.shape {
-        for prop in shape.prop {
+        for prop in shape.prop where !prop.flags.contains(.hidden) {
             let atomStr = JeffJSString(swiftString: String(prop.atom))
             keys.append(JeffJSValue.makeString(atomStr))
         }
