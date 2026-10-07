@@ -4908,10 +4908,14 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             }
             guard let (atom, owned) = self.propertyKeyAtom(args[1]) else { return .exception }
             defer { if owned { self.rt.freeAtom(atom) } }
-            guard let targetObj = args[0].toObject() else { return .JS_FALSE }
             // The result is [[Delete]]'s answer: a non-configurable property
-            // stays and Reflect.deleteProperty reports false.
-            return .newBool(jeffJS_deleteProperty(ctx: self, obj: targetObj, atom: atom))
+            // stays and Reflect.deleteProperty reports false; a missing one is
+            // true. Through deleteProperty(obj:) so a Proxy's trap runs (the
+            // shape-level delete used here never reached it, and answered
+            // false for a property that was not there).
+            let ok = self.deleteProperty(obj: args[0], atom: atom, flags: 0)
+            if !ok && !self.rt.currentException.isNull { return .exception }
+            return .newBool(ok)
         }, name: "deleteProperty", length: 2)
         _ = setPropertyStr(obj: reflectObj, name: "deleteProperty", value: reflDeleteProperty)
 
@@ -5071,6 +5075,17 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             // setPropertyInternal answers 1 = written, 0 = refused (no throw
             // without JS_PROP_THROW), -1 = error. Reflect.set reports the
             // refusal as false rather than swallowing it.
+            // A receiver other than the target (a Proxy's `set` trap forwarding
+            // with `Reflect.set(t, k, v, receiver)`): OrdinarySet (ES §10.1.9.2)
+            // writes the receiver's own property through its [[GetOwnProperty]]
+            // and [[DefineOwnProperty]]; the receiver used to be ignored.
+            if args.count >= 4, !(args[3].isObject && args[3].toObject() === args[0].toObject()) {
+                let key = self.proxyTrapKey(atom)
+                defer { key.freeValue() }
+                let r = self.reflectSet(args[0], key: key, atom: atom, value: args[2], receiver: args[3])
+                if r < 0 { return .exception }
+                return .newBool(r > 0)
+            }
             let result = self.setPropertyInternal(obj: args[0], atom: atom,
                                                   value: args[2].dupValue(), flags: 0)
             if result < 0 { return self.rt.currentException.isNull ? .JS_FALSE : .exception }
@@ -5536,6 +5551,13 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                         let ok = result.toBool()
                         result.freeValue()
                         if result.isException { return -1 }
+                        // A falsish answer is a TypeError in strict code (ES §10.5.9
+                        // + PutValue): `'use strict'; proxy.x = 1` with a refusing
+                        // trap failed silently.
+                        if !ok && (flags & JS_PROP_THROW) != 0 {
+                            _ = throwTypeError(message: "Proxy object's 'set' trap returned falsy value for property '\(rt.atomToString(atom) ?? "")'")
+                            return -1
+                        }
                         return ok ? 1 : 0
                     }
                     trap.freeValue()

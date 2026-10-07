@@ -2882,12 +2882,61 @@ extension JeffJSContext {
         guard let root = obj.toObject() else { return JeffJSForInKeyList(keys: []) }   // null / undefined
         root.ensureLazyMaterialized()
         // A proxy enumerates its enumerable own string keys (ownKeys +
-        // getOwnPropertyDescriptor traps). A throwing trap ends the loop.
+        // getOwnPropertyDescriptor traps), then its prototype's keys that no
+        // own property (enumerable or not) shadows — EnumerateObjectProperties
+        // (ES §14.7.5.9) walks [[GetPrototypeOf]]; the proxy's prototype chain
+        // used to be skipped. A throwing trap ends the loop.
         if root.classID == JeffJSClassID.proxy.rawValue {
-            guard let keys = jeffJS_proxyOwnKeys(self, root, strings: true, symbols: false,
-                                                 enumerableOnly: true) else {
+            guard let own = jeffJS_proxyOwnKeys(self, root, strings: true, symbols: false,
+                                                enumerableOnly: false) else {
                 getException().freeValue()
                 return JeffJSForInKeyList(keys: [])
+            }
+            // The prototype's keys first (its own shadowing applied), so a key
+            // the proxy lists but does not report as own keeps its place in the
+            // proxy's order when the prototype has it enumerable — JSC's and
+            // V8's order (`for (k in element.attributes)`: 0,1,2,item,…).
+            var protoKeys: [String] = []
+            var protoVals: [String: JeffJSValue] = [:]
+            let proto = getPrototypeOf(obj)
+            if proto.isException {
+                getException().freeValue()
+            } else if proto.isObject {
+                let up = forInKeyList(obj: proto)
+                for k in up.keys {
+                    let s = toSwiftString(k) ?? ""
+                    if protoVals[s] == nil { protoKeys.append(s); protoVals[s] = k.dupValue() }
+                }
+            }
+            proto.freeValue()
+            var keys: [JeffJSValue] = []
+            var seen = Set<String>()
+            for k in own {
+                let s = toSwiftString(k) ?? ""
+                var isOwn = false, enumerable = false
+                if let (atom, owned) = propertyKeyAtom(k) {
+                    let desc = js_proxy_getOwnPropertyDescriptor(self, root, atom)
+                    if owned { rt.freeAtom(atom) }
+                    if desc.isException {
+                        getException().freeValue()
+                    } else if desc.isObject {
+                        isOwn = true
+                        let e = getPropertyStr(obj: desc, name: "enumerable")
+                        enumerable = e.toBool()
+                        e.freeValue()
+                    }
+                    desc.freeValue()
+                }
+                // An own property (enumerable or not) shadows the prototype's key.
+                if isOwn || protoVals[s] != nil, seen.insert(s).inserted, enumerable || !isOwn {
+                    keys.append(k)
+                } else {
+                    k.freeValue()
+                }
+            }
+            for s in protoKeys {
+                guard let v = protoVals[s] else { continue }
+                if seen.insert(s).inserted { keys.append(v) } else { v.freeValue() }
             }
             return JeffJSForInKeyList(keys: keys)
         }

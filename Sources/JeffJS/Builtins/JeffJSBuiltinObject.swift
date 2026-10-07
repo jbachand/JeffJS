@@ -309,6 +309,11 @@ extension JeffJSContext {
             return .undefined
         }
         defer { if ownedAtom { rt.freeAtom(atom) } }
+        // A Proxy's [[GetOwnProperty]] is its trap (ES §10.5.5), not the proxy
+        // object's own (empty) shape.
+        if isProxyObject(jsObj), case .proxyData(let pd) = jsObj.payload {
+            return proxyGetOwnPropertyDescriptor(pd, key: key, atom: atom)
+        }
         // A function's deferred own properties must exist before they can be
         // described.
         if (jsObj.lazyFlags & JeffJSObject.lazyActiveMask) != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
@@ -427,6 +432,12 @@ extension JeffJSContext {
             atom = rt.findAtom(str)
         } else {
             return throwTypeError(message: "invalid property key")
+        }
+
+        // A Proxy's [[DefineOwnProperty]] is its trap (ES §10.5.6): it used to
+        // define straight onto the proxy object, never reaching the handler.
+        if isProxyObject(jsObj), case .proxyData(let pd) = jsObj.payload {
+            return proxyDefineOwnProperty(obj, pd, key: key, atom: atom, desc: desc, shouldThrow: shouldThrow)
         }
 
         // Check if this is an accessor descriptor (has get or set).
