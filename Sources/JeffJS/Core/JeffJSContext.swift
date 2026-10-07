@@ -3391,7 +3391,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // One UTF-8 copy of the script, shared by every function compiled
         // from it; the parser records a (start, end) span per function so
         // Function.prototype.toString can return the original text.
-        fd.sourceText = JeffJSSourceText(bytes: parseState.buf)
+        fd.sourceText = JeffJSSourceText(span: parseState.buf)
         fd.sourceStart = 0
         fd.sourceEnd = parseState.buf.count
         // Functions compiled lazily re-parse from this shared text.
@@ -3457,7 +3457,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         let fd = JeffJSFunctionDefCompiler()
         fd.filename = rt.findAtom(filename)
         fd.source = input
-        fd.sourceText = JeffJSSourceText(bytes: parseState.buf)
+        fd.sourceText = JeffJSSourceText(span: parseState.buf)
         fd.sourceStart = 0
         fd.sourceEnd = parseState.buf.count
         fd.lazyScript = JeffJSLazyScript(source: fd.sourceText!, filename: filename, isModule: false)
@@ -5730,8 +5730,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// Whether the instruction at `pc` is a tail call (`return f(…)` compiled to
     /// tail_call / tail_call_method by the peephole).
     static func isTailCall(_ fb: JeffJSFunctionBytecode, _ pc: Int) -> Bool {
-        guard pc >= 0, pc < fb.bytecode.count else { return false }
-        let op = UInt16(fb.bytecode[pc])
+        guard pc >= 0, pc < fb.bytecodeLen else { return false }
+        let op = UInt16(fb.bytecodeByte(at: pc))
         return op == JeffJSOpcode.tail_call.rawValue || op == JeffJSOpcode.tail_call_method.rawValue
     }
 

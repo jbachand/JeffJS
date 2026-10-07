@@ -5319,8 +5319,7 @@ extension JeffJSFunctionBytecodeCompiled {
     /// this object runs it. The closure variables are the stub's own (the
     /// compile was bound to them).
     func adoptLazyBody(from c: JeffJSFunctionBytecodeCompiled) {
-        bytecode = c.bytecode
-        bytecodeLen = c.bytecodeLen
+        takeBytecode(from: c)
         resetBytecodeBuffer()
         argCount = c.argCount
         varCount = c.varCount
@@ -5791,8 +5790,8 @@ extension JeffJSCompiler {
         // functions' bytecode objects, which live closures may still run);
         // the recompiled body takes them back (mergeRetainedCpool).
         let retainedCpool = stub.cpool
-        if let store = bodyStore, let blob = store.body(spanKey),
-           let loaded = JeffJSBytecodeDeserializer.deserialize(blob, rt: ctx.rt, ctx: ctx,
+        if let store = bodyStore, let blob = store.bodySpan(spanKey),
+           let loaded = JeffJSBytecodeDeserializer.deserialize(span: blob, rt: ctx.rt, ctx: ctx,
                                                               lazyScript: script, cacheHash: script.cacheHash)
                 as? JeffJSFunctionBytecodeCompiled,
            loaded.lazyInfo?.isPending == false,
@@ -5856,7 +5855,7 @@ extension JeffJSCompiler {
                                     nameAtom: JSAtom) -> JeffJSFunctionDefCompiler? {
         let start = Int(seed.parseStart)
         let line = Int(seed.parseLine)
-        let ps = JeffJSParseState(buf: script.source.bytes, filename: script.filename, ctx: ctx)
+        let ps = JeffJSParseState(span: script.source.bytes, filename: script.filename, ctx: ctx)
         ps.isModule = script.isModule
         ps.allowHTMLComments = !script.isModule
         ps.bufPtr = start

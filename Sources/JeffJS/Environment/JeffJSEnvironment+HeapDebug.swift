@@ -103,7 +103,7 @@ extension JeffJSEnvironment {
                 if let child = v.toPtr() as? JeffJSFunctionBytecode, seenFB.insert(ObjectIdentifier(child)).inserted { fbStack.append(child) }
             }
         }
-        lines.append("[hist] bodies reachable=\(fbs) lazyPending=\(lazyPending) bytecode=\(bcBytes / 1024)KB (executed copy \(bcExec / 1024)KB) cpoolSlots=\(cpoolSlots) closureVars=\(cvars) ic=\(icBytes / 1024)KB entry=\(MemoryLayout<JeffJSICEntry>.stride)B")
+        lines.append("[hist] bodies reachable=\(fbs) lazyPending=\(lazyPending) bytecode=\(bcBytes / 1024)KB (executed \(bcExec / 1024)KB of it) cpoolSlots=\(cpoolSlots) closureVars=\(cvars) ic=\(icBytes / 1024)KB entry=\(MemoryLayout<JeffJSICEntry>.stride)B")
         lines.append("[hist] plain-object values: " + valueKinds.sorted { $0.value > $1.value }.map { "\($0.key):\($0.value)" }.joined(separator: " "))
         for (s, c) in byShape.values.sorted(by: { $0.1 > $1.1 }).prefix(12) {
             let names = s.prop.prefix(s.propCount).map { rt.atomToString($0.atom) ?? "?" }.joined(separator: ",")
@@ -169,7 +169,7 @@ extension JeffJSHeapDebug {
             let any = Unmanaged<AnyObject>.fromOpaque(p).takeUnretainedValue()
             guard let fb = any as? JeffJSFunctionBytecode else { continue }
             n += 1
-            bc += fb.bytecode.count
+            bc += fb.withBytecodeBytes { $0.count }
             if fb.bcPtrFast != nil { bcBuf += fb.bytecodeLen }
             if let c = fb as? JeffJSFunctionBytecodeCompiled {
                 dbg += c.debugPc2lineBuf.count + c.debugPc2colBuf.count + c.debugExprSpans.count
@@ -196,7 +196,7 @@ extension JeffJSHeapDebug {
             if fb.sourceLen > 0 { srcSpan += 1 }
         }
         let icLine = icByCap.sorted { $0.key < $1.key }.map { "cap\($0.key):\($0.value.n) tables, \($0.value.used) used slots, \($0.value.top) top-level" }.joined(separator: "; ")
-        return "[bodies] IC by capacity: \(icLine)\n[bodies] \(n) live: bytecode \(bc / 1024)KB (+ executed copy \(bcBuf / 1024)KB), debug tables \(dbg / 1024)KB, IC \(icTables) tables \(ic / 1024)KB (\(icSlots) slots, \(icUsed) used, \(icSites) sites, map \(icMapBytes / 1024)KB), cpool \(cpool) slots, closureVars \(cvars), vardefs \(vardefs); lazyPending \(pending), topLevel \(topLevel), withLiveClosures \(withClosures), rc<=1 \(rc1), withSourceSpan \(srcSpan)"
+        return "[bodies] IC by capacity: \(icLine)\n[bodies] \(n) live: bytecode \(bc / 1024)KB (executed \(bcBuf / 1024)KB of it), debug tables \(dbg / 1024)KB, IC \(icTables) tables \(ic / 1024)KB (\(icSlots) slots, \(icUsed) used, \(icSites) sites, map \(icMapBytes / 1024)KB), cpool \(cpool) slots, closureVars \(cvars), vardefs \(vardefs); lazyPending \(pending), topLevel \(topLevel), withLiveClosures \(withClosures), rc<=1 \(rc1), withSourceSpan \(srcSpan)"
     }
 }
 

@@ -109,7 +109,9 @@ nonisolated class JeffJSParseState {
     var lastPtr: Int = 0             // byte offset at end of previous token
 
     // -- Source buffer (UTF-8 encoded) --
-    var buf: [UInt8]
+    // A span (perf/bytecode-paging): a lazy compile parses straight out of
+    // the script text, which may be a file mapping (no copy of the script).
+    var buf: JeffJSBytesSpan
     var bufLen: Int
     var bufPtr: Int = 0              // current read position
 
@@ -150,7 +152,7 @@ nonisolated class JeffJSParseState {
     init(source: String, filename: String = "<input>", ctx: JeffJSTokenizerContext? = nil) {
         self.filename = filename
         self.ctx = ctx
-        let data = Array(source.utf8)
+        let data = JeffJSBytesSpan(utf8: source)
         self.buf = data
         self.bufLen = data.count
         if let c = ctx as? JeffJSContext { self.atomRuntime = c.rt }
@@ -159,8 +161,16 @@ nonisolated class JeffJSParseState {
     init(buf: [UInt8], filename: String = "<input>", ctx: JeffJSTokenizerContext? = nil) {
         self.filename = filename
         self.ctx = ctx
-        self.buf = buf
+        self.buf = JeffJSBytesSpan(copying: buf)
         self.bufLen = buf.count
+        if let c = ctx as? JeffJSContext { self.atomRuntime = c.rt }
+    }
+
+    init(span: JeffJSBytesSpan, filename: String = "<input>", ctx: JeffJSTokenizerContext? = nil) {
+        self.filename = filename
+        self.ctx = ctx
+        self.buf = span
+        self.bufLen = span.count
         if let c = ctx as? JeffJSContext { self.atomRuntime = c.rt }
     }
 }

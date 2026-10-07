@@ -418,18 +418,45 @@ nonisolated final class TraceBlockInfo {
 /// 24 bytes each instead of a private copy of their text, and the buffer
 /// lives exactly as long as some function from that script is alive.
 nonisolated final class JeffJSSourceText {
-    let bytes: [UInt8]
+    /// The text (UTF-8). A heap block for a fresh compile; a span of the
+    /// bytecode-cache entry's file mapping once the entry is on disk (cache
+    /// hit, or `adoptMapping` after the store's write landed) — then the
+    /// text is file-backed pages, not heap (perf/bytecode-paging).
+    /// `JEFFJS_COMPILE_MAPPEDSOURCE=0`: always the heap copy.
+    private(set) var bytes: JeffJSBytesSpan
 
-    init(bytes: [UInt8]) { self.bytes = bytes }
-    init(_ s: String) { self.bytes = Array(s.utf8) }
+    init(bytes: [UInt8]) { self.bytes = JeffJSBytesSpan(copying: bytes) }
+    init(span: JeffJSBytesSpan) { self.bytes = span }
+    convenience init(bytes span: JeffJSBytesSpan) { self.init(span: span) }
+    init(_ s: String) { self.bytes = JeffJSBytesSpan(utf8: s) }
 
     var count: Int { return bytes.count }
+
+    /// The text lives in a file mapping.
+    var isMapped: Bool { bytes.isFileBacked }
+
+    /// Re-home the text in `span` (the same bytes in a mapped cache entry).
+    /// Readers that already took `bytes` keep the old storage alive until
+    /// they finish. Refused (false) unless the bytes are identical.
+    @discardableResult
+    func adoptMapping(_ span: JeffJSBytesSpan) -> Bool {
+        guard span.contentEquals(bytes) else { return false }
+        bytes = span
+        return true
+    }
+
+    /// `adoptMapping` without the comparison (the cache's writer compared).
+    func adoptVerifiedMapping(_ span: JeffJSBytesSpan) {
+        bytes = span
+    }
 
     /// Decode the [start, start+len) byte range as a Swift string.
     func slice(start: Int, len: Int) -> String? {
         guard len >= 0, start >= 0, start &+ len <= bytes.count else { return nil }
         if len == 0 { return "" }
-        return String(decoding: bytes[start ..< (start &+ len)], as: UTF8.self)
+        return bytes.withUnsafeBufferPointer {
+            String(decoding: UnsafeBufferPointer(rebasing: $0[start ..< (start &+ len)]), as: UTF8.self)
+        }
     }
 }
 
@@ -559,16 +586,61 @@ nonisolated class JeffJSFunctionBytecode {
         @inline(__always) get { Int(_bytecodeLen) }
         set { _bytecodeLen = Int32(truncatingIfNeeded: newValue) }
     }
-    var bytecode: [UInt8] = []
+    /// The function's bytecode: ONE heap buffer of `bytecodeLen` bytes
+    /// (perf/bytecode-paging; it used to be a `[UInt8]` plus a raw copy of
+    /// it made on first execution — every executed body twice). A compile
+    /// or a cache load stages it in `_bcStaged`; the first `bytecodePtr`
+    /// moves it to `_bcBuffer` (no copy) and builds the constant view, so
+    /// `bcPtrFast` stays nil until then exactly as before. The array view
+    /// below copies and is for cold paths only (serializer, dumps, tests).
+    var bytecode: [UInt8] {
+        get {
+            guard let p = _bcBuffer ?? _bcStaged, bytecodeLen > 0 else { return [] }
+            return Array(UnsafeBufferPointer(start: p, count: bytecodeLen))
+        }
+        set {
+            _bcBuffer?.deallocate(); _bcBuffer = nil
+            _bcStaged?.deallocate(); _bcStaged = nil
+            let n = newValue.count
+            if n > 0 {
+                let p = UnsafeMutablePointer<UInt8>.allocate(capacity: n)
+                newValue.withUnsafeBufferPointer { p.initialize(from: $0.baseAddress!, count: n) }
+                _bcStaged = p
+            }
+            bytecodeLen = n
+            // The table's pc -> slot map belongs to the old bytecode.
+            ic = nil
+        }
+    }
+    /// Move `other`'s bytecode buffer here (no copy); `other` is left empty.
+    func takeBytecode(from other: JeffJSFunctionBytecode) {
+        _bcBuffer?.deallocate(); _bcBuffer = nil
+        _bcStaged?.deallocate(); _bcStaged = nil
+        _bcStaged = other._bcStaged ?? other._bcBuffer
+        other._bcStaged = nil
+        other._bcBuffer = nil
+        bytecodeLen = _bcStaged == nil ? 0 : other.bytecodeLen
+        other.bytecodeLen = 0
+        ic = nil
+        other.ic = nil
+    }
+    /// Byte `pc` of the bytecode (0 past the end), without the array copy.
+    func bytecodeByte(at pc: Int) -> UInt8 {
+        guard pc >= 0, pc < bytecodeLen, let p = _bcBuffer ?? _bcStaged else { return 0 }
+        return p[pc]
+    }
+    /// The bytecode bytes in place (no copy; valid inside `body`).
+    func withBytecodeBytes<R>(_ body: (UnsafeBufferPointer<UInt8>) throws -> R) rethrows -> R {
+        return try body(UnsafeBufferPointer(start: _bcBuffer ?? _bcStaged, count: (_bcBuffer ?? _bcStaged) == nil ? 0 : bytecodeLen))
+    }
+    /// Staged bytecode (set, not executed yet).
+    private var _bcStaged: UnsafeMutablePointer<UInt8>? = nil
 
-    /// Stable raw copy of `bytecode`, materialized lazily on first execution
-    /// (when bytecode is final and immutable). The interpreter reads opcodes and
-    /// operands through this pointer to avoid Swift Array bounds checks — the
-    /// largest remaining per-opcode cost. Owned by this FB; freed in deinit, so
-    /// the pointer is valid for the FB's entire lifetime (the FB is retained for
-    /// the duration of any call that executes it).
-    /// (A bare pointer: its length is `bytecodeLen`/`bytecode.count`; the
-    /// buffer-pointer form was 24 bytes of every body.)
+    /// The bytecode the interpreter reads, materialized on first execution
+    /// (when bytecode is final and immutable): reads go through this pointer
+    /// to avoid Swift Array bounds checks. Owned by this FB; freed in deinit
+    /// or when the bytecode is replaced, so the pointer is valid while the
+    /// FB is (the FB is retained for the duration of any call that executes it).
     private var _bcBuffer: UnsafeMutablePointer<UInt8>? = nil
 
     /// Raw pointer to the function's bytecode. Materializes `_bcBuffer` on first
@@ -585,19 +657,20 @@ nonisolated class JeffJSFunctionBytecode {
             return UnsafePointer(b)
         }
         materializeCpoolRaw()   // first execution: constants are final too
-        let n = bytecode.count
-        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: max(n, 1))
-        if n > 0 {
-            bytecode.withUnsafeBufferPointer { buf.initialize(from: $0.baseAddress!, count: n) }
-        } else {
-            buf[0] = 0
+        if let staged = _bcStaged {
+            _bcStaged = nil
+            _bcBuffer = staged
+            return UnsafePointer(staged)
         }
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 1)
+        buf[0] = 0
         _bcBuffer = buf
         return UnsafePointer(buf)
     }
 
     deinit {
         _bcBuffer?.deallocate()
+        _bcStaged?.deallocate()
         _cpoolRaw?.deallocate()
         _traceIndexPCs?.deallocate()
         _traceIndexInfos?.deallocate()
@@ -878,8 +951,13 @@ nonisolated class JeffJSFunctionBytecode {
     /// Drop the raw copy of `bytecode` materialized by `bytecodePtr` (lazy
     /// compilation replaced the bytecode of this object).
     func resetBytecodeBuffer() {
-        _bcBuffer?.deallocate()
-        _bcBuffer = nil
+        // Setting `bytecode` already gave back the old buffer (and staged the
+        // new one): if nothing was set, stage the current bytes again so the
+        // next execution re-materializes.
+        if let b = _bcBuffer {
+            _bcBuffer = nil
+            if _bcStaged == nil { _bcStaged = b } else { b.deallocate() }
+        }
         // The inline-cache table's pc -> slot map belongs to the old bytecode.
         ic = nil
     }

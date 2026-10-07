@@ -202,6 +202,9 @@ let status: Int32 = MainActor.assumeIsolated {
     // objects, malloc bytes in use since the environment was created, and
     // the per-object average (all engine bytes / live JS objects).
     if args.contains("--heap-report") {
+        // What the app's idle tick does within ~1 s: queued cache writes land
+        // and the live scripts' text moves to the entry mappings.
+        env.flushBytecodeCache()
         for _ in 0..<3 { env.runGC() }
         let g = env.gcStatistics
         let delta = cliMallocInUse() - mallocAtStart

@@ -1920,7 +1920,7 @@ extension JeffJSContext {
         let fd = JeffJSFunctionDefCompiler()
         fd.filename = rt.findAtom("<eval>")
         fd.source = source
-        fd.sourceText = JeffJSSourceText(bytes: parseState.buf)
+        fd.sourceText = JeffJSSourceText(span: parseState.buf)
         fd.sourceStart = 0
         fd.sourceEnd = parseState.buf.count
         fd.isDirectOrIndirectEval = true

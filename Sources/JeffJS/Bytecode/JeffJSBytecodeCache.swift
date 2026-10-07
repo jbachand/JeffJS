@@ -262,6 +262,14 @@ private func readU32LE(_ data: [UInt8], _ pos: Int) -> UInt32 {
     (UInt32(data[pos + 3]) << 24)
 }
 
+/// Read little-endian U32 from a span (mapped entry).
+private func readU32LE(_ data: JeffJSBytesSpan, _ pos: Int) -> UInt32 {
+    UInt32(data[pos]) |
+    (UInt32(data[pos + 1]) << 8) |
+    (UInt32(data[pos + 2]) << 16) |
+    (UInt32(data[pos + 3]) << 24)
+}
+
 /// Write little-endian U32 to byte array.
 private func writeU32LE(_ data: inout [UInt8], _ pos: Int, _ val: UInt32) {
     data[pos]     = UInt8(val & 0xFF)
@@ -322,7 +330,15 @@ struct JeffJSBytecodeSerializer {
     /// body stored next to its script's cache entry (JeffJSLazyBodyStore)
     /// is read back with that script's text.
     static func serialize(_ fb: JeffJSFunctionBytecode, rt: JeffJSRuntime?, includeSource: Bool) -> [UInt8] {
+        return serializeLocated(fb, rt: rt, includeSource: includeSource).bytes
+    }
+
+    /// Also where the script text starts in the blob (nil: not included),
+    /// so the cache can point the live script at the text in the entry file.
+    static func serializeLocated(_ fb: JeffJSFunctionBytecode, rt: JeffJSRuntime?,
+                                 includeSource: Bool) -> (bytes: [UInt8], sourceOffset: Int?) {
         var s = JeffJSBytecodeSerializer(atomTable: AtomTableBuilder())
+        var sourceOffset: Int? = nil
         s.writeFunctionBytecode(fb, rt: rt)
 
         // Append atom table at the end
@@ -343,7 +359,8 @@ struct JeffJSBytecodeSerializer {
         if includeSource, let src = fb.sourceText {
             s.writeU8(1)
             s.writeU32(UInt32(src.bytes.count))
-            s.buf.append(contentsOf: src.bytes)
+            sourceOffset = s.buf.count
+            src.bytes.withUnsafeBufferPointer { s.buf.append(contentsOf: $0) }
         } else {
             s.writeU8(0)
         }
@@ -361,7 +378,7 @@ struct JeffJSBytecodeSerializer {
             s.writeU8(0)
         }
 
-        return s.buf
+        return (s.buf, sourceOffset)
     }
 
     /// The script of the first lazy function written (they share one).
@@ -585,7 +602,8 @@ struct JeffJSBytecodeDeserializer {
     /// The last file name read (shared by the functions of one blob).
     private var fileNameMemo: (text: String, string: JeffJSString)? = nil
 
-    private let data: [UInt8]
+    /// The blob: a span of a mapped cache entry, or a heap copy.
+    private let data: JeffJSBytesSpan
     private var pos: Int = 0
     private var remapper: AtomRemapper?
     /// Script text shared by every function in this blob (trailer, v5+).
@@ -615,6 +633,16 @@ struct JeffJSBytecodeDeserializer {
     /// that script. `cacheHash`: the cache entry the blob came from, for the
     /// script its lazy functions get (their bodies persist next to it).
     static func deserialize(_ data: [UInt8], rt: JeffJSRuntime?, ctx: JeffJSContext?,
+                            lazyScript: JeffJSLazyScript?, cacheHash: UInt64?) -> JeffJSFunctionBytecode? {
+        return deserialize(span: JeffJSBytesSpan(copying: data), rt: rt, ctx: ctx,
+                           lazyScript: lazyScript, cacheHash: cacheHash)
+    }
+
+    /// The blob in place: a span of a mapped cache entry is read without
+    /// copying it, and the script text in its trailer stays in the mapping
+    /// (`JeffJSSourceText` over the span; `JEFFJS_COMPILE_MAPPEDSOURCE=0`
+    /// copies it to the heap as before).
+    static func deserialize(span data: JeffJSBytesSpan, rt: JeffJSRuntime?, ctx: JeffJSContext?,
                             lazyScript: JeffJSLazyScript?, cacheHash: UInt64?) -> JeffJSFunctionBytecode? {
         var d = JeffJSBytecodeDeserializer(data: data)
         d.ctx = ctx
@@ -704,7 +732,11 @@ struct JeffJSBytecodeDeserializer {
             let srcLen = Int(readU32LE(data, p))
             p += 4
             guard p + srcLen <= data.count else { return }
-            sourceText = JeffJSSourceText(bytes: Array(data[p ..< (p + srcLen)]))
+            if JeffJSConfig.compileMappedSource, data.isFileBacked, let span = data.span(offset: p, count: srcLen) {
+                sourceText = JeffJSSourceText(span: span)   // file-backed pages, no copy
+            } else {
+                sourceText = JeffJSSourceText(bytes: Array(data[p ..< (p + srcLen)]))
+            }
             p += srcLen
         } else {
             p += 1
@@ -726,7 +758,7 @@ struct JeffJSBytecodeDeserializer {
     }
 
     /// Skip past a serialized function bytecode (for finding atom table).
-    private func skipFunctionBytecode(data: [UInt8], pos: inout Int) -> Bool {
+    private func skipFunctionBytecode(data: JeffJSBytesSpan, pos: inout Int) -> Bool {
         // Magic(4) + Version(1) + Flags(2) + ext(1) + argCount(2) + varCount(2) +
         // definedArgCount(2) + nameAtom(4) + stackSize(2) + closureVarCount(2) +
         // lineNum(4) + colNum(4) + sourceStart(4) + sourceLen(4)
@@ -791,7 +823,7 @@ struct JeffJSBytecodeDeserializer {
     }
 
     /// Skip a single cpool entry.
-    private func skipCpoolEntry(data: [UInt8], pos: inout Int) -> Bool {
+    private func skipCpoolEntry(data: JeffJSBytesSpan, pos: inout Int) -> Bool {
         guard pos < data.count else { return false }
         let tag = data[pos]
         pos += 1
@@ -1228,9 +1260,19 @@ nonisolated final class JeffJSBytecodeCache {
     struct Entry {
         let desc: String
         let sourceLength: Int
-        let blob: [UInt8]
+        /// The JFBC blob: a span of the entry file's mapping (`mapped`), or a
+        /// heap copy (memory-only entries, `JEFFJS_CACHE_BYTECODEMAPPED=0`).
+        let blob: JeffJSBytesSpan
         /// `useClock` at the last hit or store (LRU order).
         var lastUse: UInt64 = 0
+        var mapped: Bool { blob.isFileBacked }
+
+        init(desc: String, sourceLength: Int, blob: [UInt8]) {
+            self.desc = desc; self.sourceLength = sourceLength; self.blob = JeffJSBytesSpan(copying: blob)
+        }
+        init(desc: String, sourceLength: Int, span: JeffJSBytesSpan) {
+            self.desc = desc; self.sourceLength = sourceLength; self.blob = span
+        }
     }
 
     /// Serialized bytecode keyed by the cache key's hash.
@@ -1246,6 +1288,9 @@ nonisolated final class JeffJSBytecodeCache {
     /// not eval twice) lives on disk only.
     var memoryBudget = JeffJSConfig.bytecodeMemoryBudgetBytes
     private var memoryBytes = 0
+    /// Mapped entries in `cache` (count-capped, `cache.bytecodeMappedEntries`).
+    private var mappedEntries = 0
+    var mappedEntryCap = JeffJSConfig.bytecodeMappedEntries
     private var useClock: UInt64 = 0
 
     /// The disk tier (nil = memory only). Shared by every runtime in the
@@ -1297,6 +1342,7 @@ nonisolated final class JeffJSBytecodeCache {
             + "deser=\(f(deserializeMs))ms ser=\(f(serializeMs))ms read=\(diskReadBytes / 1024)KB "
             + "wrote=\(diskWriteBytes / 1024)KB mem=\(memoryBytes / 1024)KB"
             + " writeMs=\(f(diskWriteMs)) oneShot=\(diskOneShotSkips) capped=\(diskCapSkips)"
+            + " mapped=\(mappedEntries) srcMapped=\(sourcesMapped)/\(sourceBytesMapped / 1024)KB"
             + (rt.map { " " + $0.lazyStats.description } ?? "")
     }
 
@@ -1394,7 +1440,7 @@ nonisolated final class JeffJSBytecodeCache {
     /// blobs written by another one, even when nobody bumped
     /// `compilerVersion`. `BytecodeCacheBudgetTests.testEngineSourceHashIsCurrent`
     /// fails when it is stale; `Scripts/update_bytecode_identity.sh` rewrites it.
-    static let engineSourceHash: UInt64 = 0xb04357a314b4c37a // bytecode-identity
+    static let engineSourceHash: UInt64 = 0x15591810526811f6 // bytecode-identity
 
     /// The engine build identity: `compilerVersion`, the blob and entry
     /// layouts, `engineSourceHash`, and the opcode table the interpreter
@@ -1540,6 +1586,19 @@ nonisolated final class JeffJSBytecodeCache {
 
     /// Same, over a buffer (a memory-mapped file): the blob is the only copy.
     static func openEntry(_ bytes: UnsafeBufferPointer<UInt8>, key: JeffJSBytecodeCacheKey) -> EntryResult {
+        switch openEntryOffset(bytes, key: key) {
+        case .ok(let off): return .ok(Array(UnsafeBufferPointer(rebasing: bytes[off...])))
+        case .refused(let why): return .refused(why)
+        }
+    }
+
+    enum EntryOffsetResult {
+        case ok(Int)
+        case refused(String)
+    }
+
+    /// Validate an entry and return where its JFBC blob starts (no copy).
+    static func openEntryOffset(_ bytes: UnsafeBufferPointer<UInt8>, key: JeffJSBytecodeCacheKey) -> EntryOffsetResult {
         var p = 0
         func get32() -> UInt32? {
             guard p + 4 <= bytes.count else { return nil }
@@ -1566,7 +1625,7 @@ nonisolated final class JeffJSBytecodeCache {
         let desc = String(decoding: UnsafeBufferPointer(rebasing: bytes[p..<(p + Int(descLen))]), as: UTF8.self)
         p += Int(descLen)
         guard desc == key.desc else { return .refused("key mismatch") }
-        return .ok(Array(UnsafeBufferPointer(rebasing: bytes[p...])))
+        return .ok(p)
     }
 
     // MARK: - Lookup
@@ -1574,6 +1633,7 @@ nonisolated final class JeffJSBytecodeCache {
     /// Look up cached bytecode. Checks in-memory first, then disk.
     /// Atom table indices are remapped to the current runtime's atom IDs.
     func lookup(_ key: JeffJSBytecodeCacheKey, ctx: JeffJSContext? = nil) -> JeffJSFunctionBytecode? {
+        adoptWrittenSources()
         // In-memory cache
         if let entry = cache[key.hash] {
             guard entry.desc == key.desc, entry.sourceLength == key.sourceLength else {
@@ -1583,7 +1643,7 @@ nonisolated final class JeffJSBytecodeCache {
                 return nil
             }
             let t0 = CFAbsoluteTimeGetCurrent()
-            guard let fb = JeffJSBytecodeDeserializer.deserialize(entry.blob, rt: rt, ctx: ctx,
+            guard let fb = JeffJSBytecodeDeserializer.deserialize(span: entry.blob, rt: rt, ctx: ctx,
                                                                   lazyScript: nil, cacheHash: key.hash) else {
                 reject("memory deserialize failed", key)
                 removeMemoryEntry(key.hash)
@@ -1593,31 +1653,36 @@ nonisolated final class JeffJSBytecodeCache {
             useClock &+= 1
             cache[key.hash]?.lastUse = useClock
             hitCount += 1
-            debugLog("hit memory key=\(key.desc) srcLen=\(key.sourceLength)")
+            debugLog("hit memory\(entry.mapped ? " (mapped)" : "") key=\(key.desc) srcLen=\(key.sourceLength)")
             return fb
         }
-        // Disk fallback. The file is memory-mapped and the blob is copied out
-        // of it once (it used to be copied three times: Data, [UInt8], blob).
+        // Disk fallback. The entry file is memory-mapped; with
+        // `cache.bytecodeMapped` the blob is deserialized out of the mapping
+        // (no copy) and the memory tier keeps the mapping, else the blob is
+        // copied out of it once.
         let t0 = CFAbsoluteTimeGetCurrent()
         if diskStore != nil { Self.waitIfPending(key.hash) }   // its queued write lands first
-        guard let store = diskStore, let data = store.read(key.hash) else {
+        guard let store = diskStore, let mapping = store.map(key.hash) else {
             missCount += 1
             debugLog("miss key=\(key.desc) srcLen=\(key.sourceLength)")
             return nil
         }
-        let opened: EntryResult = data.withUnsafeBytes { raw in
-            Self.openEntry(raw.bindMemory(to: UInt8.self), key: key)
-        }
-        let blob: [UInt8]
+        let opened: EntryOffsetResult = Self.openEntryOffset(
+            UnsafeBufferPointer(start: mapping.baseAddress.assumingMemoryBound(to: UInt8.self), count: mapping.count), key: key)
+        let blobOffset: Int
         switch opened {
         case .refused(let reason):
             reject("disk \(reason)", key)
             store.remove(key.hash)
             return nil
-        case .ok(let b):
-            blob = b
+        case .ok(let off):
+            blobOffset = off
         }
-        guard let fb = JeffJSBytecodeDeserializer.deserialize(blob, rt: rt, ctx: ctx,
+        let mappedSpan = JeffJSBytesSpan(mapping, offset: blobOffset)
+        let entry: Entry = Self.mappedMode
+            ? Entry(desc: key.desc, sourceLength: key.sourceLength, span: mappedSpan)
+            : Entry(desc: key.desc, sourceLength: key.sourceLength, blob: Array(mappedSpan))
+        guard let fb = JeffJSBytecodeDeserializer.deserialize(span: entry.blob, rt: rt, ctx: ctx,
                                                               lazyScript: nil, cacheHash: key.hash) else {
             // A corrupt entry is deleted, so the next load recompiles and
             // rewrites it instead of failing here forever.
@@ -1627,17 +1692,35 @@ nonisolated final class JeffJSBytecodeCache {
         }
         let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
         deserializeMs += ms
-        diskReadBytes += data.count
-        insertMemoryEntry(key.hash, Entry(desc: key.desc, sourceLength: key.sourceLength, blob: blob))
+        diskReadBytes += mapping.count
+        insertMemoryEntry(key.hash, entry)
         hitCount += 1
         diskHitCount += 1
-        debugLog("hit disk key=\(key.desc) srcLen=\(key.sourceLength) bytes=\(blob.count) ms=\(Int(ms))")
+        debugLog("hit disk\(entry.mapped ? " (mapped)" : "") key=\(key.desc) srcLen=\(key.sourceLength) bytes=\(entry.blob.count) ms=\(Int(ms))")
         return fb
     }
+
+    /// `cache.bytecodeMapped` (env `JEFFJS_CACHE_BYTECODEMAPPED`).
+    static let mappedMode = JeffJSConfig.bytecodeMapped
 
     // MARK: - Memory tier (byte budget, LRU)
 
     private func insertMemoryEntry(_ hash: UInt64, _ entry: Entry) {
+        if entry.mapped {
+            // A mapping costs no heap: kept by count (LRU), whatever its size.
+            guard mappedEntryCap > 0 else { return }
+            removeMemoryEntry(hash)
+            var e = entry
+            useClock &+= 1
+            e.lastUse = useClock
+            cache[hash] = e
+            mappedEntries += 1
+            while mappedEntries > mappedEntryCap,
+                  let victim = cache.filter({ $0.value.mapped }).min(by: { $0.value.lastUse < $1.value.lastUse })?.key {
+                removeMemoryEntry(victim)   // unmapped once no live script uses its text
+            }
+            return
+        }
         // A blob bigger than a quarter of the budget would flush the rest for
         // a script the page is not going to eval again: disk only.
         guard entry.blob.count <= memoryBudget / 4 else { return }
@@ -1647,15 +1730,20 @@ nonisolated final class JeffJSBytecodeCache {
         e.lastUse = useClock
         cache[hash] = e
         memoryBytes += e.blob.count
-        while (memoryBytes > memoryBudget || cache.count > maxEntries),
-              let victim = cache.min(by: { $0.value.lastUse < $1.value.lastUse })?.key {
+        while (memoryBytes > memoryBudget || cache.count - mappedEntries > maxEntries),
+              let victim = cache.filter({ !$0.value.mapped }).min(by: { $0.value.lastUse < $1.value.lastUse })?.key {
             removeMemoryEntry(victim)
         }
     }
 
     private func removeMemoryEntry(_ hash: UInt64) {
-        if let old = cache.removeValue(forKey: hash) { memoryBytes -= old.blob.count }
+        if let old = cache.removeValue(forKey: hash) {
+            if old.mapped { mappedEntries -= 1 } else { memoryBytes -= old.blob.count }
+        }
     }
+
+    /// Mapped entries the memory tier holds (tests, perf summaries).
+    var mappedTierEntries: Int { mappedEntries }
 
     /// Bytes held by the in-memory tier (tests, perf summaries).
     var memoryTierBytes: Int { memoryBytes }
@@ -1672,8 +1760,9 @@ nonisolated final class JeffJSBytecodeCache {
     /// 1 MB before compiling, which skipped exactly the large bundles that
     /// cost the most to recompile.
     func store(_ key: JeffJSBytecodeCacheKey, bytecode fb: JeffJSFunctionBytecode, filename: String? = nil) {
+        adoptWrittenSources()
         let t0 = CFAbsoluteTimeGetCurrent()
-        let serialized = JeffJSBytecodeSerializer.serialize(fb, rt: rt)
+        let (serialized, srcOffsetInBlob) = JeffJSBytecodeSerializer.serializeLocated(fb, rt: rt, includeSource: true)
         serializeMs += (CFAbsoluteTimeGetCurrent() - t0) * 1000
         let cap = JeffJSConfig.bytecodeMaxSize
         if cap > 0, serialized.count > cap {
@@ -1681,47 +1770,137 @@ nonisolated final class JeffJSBytecodeCache {
             debugLog("skip store (\(serialized.count) bytes > cache.bytecodeMaxSize \(cap)) key=\(key.desc)")
             return
         }
-        insertMemoryEntry(key.hash, Entry(desc: key.desc, sourceLength: key.sourceLength, blob: serialized))
+        var keptInMemory = false
         if let store = diskStore {
             let entry = Self.makeEntry(key: key, blob: serialized)
-            if let why = diskWriteRefusal(key: key, filename: filename, bytes: entry.count) {
+            var refusal = diskWriteRefusal(key: key, filename: filename, bytes: entry.count)
+            if refusal == nil, entry.count > store.maxEntryBytes {
+                refusal = "entry \(entry.count / 1024) KB over the disk tier's per-entry cap"
+            }
+            if let why = refusal {
                 diskSkipped.insert(key.hash)
                 debugLog("store: memory only (\(why)) key=\(key.desc)")
-            } else if Self.writeSync {
-                // Legacy (JEFFJS_CACHE_BYTECODEWRITESYNC=1): write on the calling thread.
-                let w0 = CFAbsoluteTimeGetCurrent()
-                if store.write(key.hash, entry) {
-                    diskWriteBytes += entry.count
-                } else {
-                    debugLog("store: disk write skipped or failed (\(entry.count) bytes, budget \(store.budgetBytes)) key=\(key.desc)")
-                }
-                diskWriteMs += (CFAbsoluteTimeGetCurrent() - w0) * 1000
-                diskWritesThisRuntime += 1
+                insertMemoryEntry(key.hash, Entry(desc: key.desc, sourceLength: key.sourceLength, blob: serialized))
+                keptInMemory = true
             } else {
-                // The write happens on a serial background queue: the memory
-                // tier already has the entry, a lookup of a hash still being
-                // written waits for it (`waitIfPending`), and teardown / the CLI
-                // drain the queue (`flushPendingDiskWrites`), so a short-lived
-                // host does not lose it. The store writes a sibling temp file
-                // and renames it: readers see the whole old or new entry.
-                let w0 = CFAbsoluteTimeGetCurrent()
-                let hash = key.hash
-                Self.notePending(hash)
-                Self.pendingWrites.enter()
-                Self.writeQueue.async {
-                    _ = store.write(hash, entry)
-                    Self.donePending(hash)
-                    Self.pendingWrites.leave()
+                // Mapped mode: no heap copy of the blob — the entry is used
+                // from its file once written (a lookup of a pending hash waits
+                // for the write, then maps it), and the live script's text is
+                // re-homed in the file (`adoptWrittenSources`).
+                if !Self.mappedMode {
+                    insertMemoryEntry(key.hash, Entry(desc: key.desc, sourceLength: key.sourceLength, blob: serialized))
+                    keptInMemory = true
                 }
-                diskWriteBytes += entry.count
-                diskWriteMs += (CFAbsoluteTimeGetCurrent() - w0) * 1000
-                diskWritesThisRuntime += 1
+                var swap: (JeffJSSourceText, JeffJSBytesSpan, Int)? = nil
+                if JeffJSConfig.compileMappedSource, let src = fb.sourceText, !src.isMapped,
+                   let off = srcOffsetInBlob, src.count > 0 {
+                    swap = (src, src.bytes, entry.count - serialized.count + off)
+                    pendingSourceSwaps += 1
+                    rt?.lazyBodiesPending = true   // the idle tick adopts the mapping
+                }
+                if Self.writeSync {
+                    // Legacy (JEFFJS_CACHE_BYTECODEWRITESYNC=1): write on the calling thread.
+                    let w0 = CFAbsoluteTimeGetCurrent()
+                    if store.write(key.hash, entry) {
+                        diskWriteBytes += entry.count
+                        if let swap { Self.mapWrittenSource(store: store, hash: key.hash, box: swapBox, swap) }
+                    } else {
+                        debugLog("store: disk write skipped or failed (\(entry.count) bytes, budget \(store.budgetBytes)) key=\(key.desc)")
+                        if swap != nil { swapBox.add(nil) }
+                    }
+                    diskWriteMs += (CFAbsoluteTimeGetCurrent() - w0) * 1000
+                    diskWritesThisRuntime += 1
+                } else {
+                    // The write happens on a serial background queue: a lookup
+                    // of a hash still being written waits for it
+                    // (`waitIfPending`), and teardown / the CLI drain the queue
+                    // (`flushPendingDiskWrites`), so a short-lived host does
+                    // not lose it. The store writes a sibling temp file and
+                    // renames it: readers see the whole old or new entry.
+                    let w0 = CFAbsoluteTimeGetCurrent()
+                    let hash = key.hash
+                    let box = swapBox
+                    Self.notePending(hash)
+                    Self.pendingWrites.enter()
+                    Self.writeQueue.async {
+                        let ok = store.write(hash, entry)
+                        if let swap {
+                            if ok { Self.mapWrittenSource(store: store, hash: hash, box: box, swap) } else { box.add(nil) }
+                        }
+                        Self.donePending(hash)
+                        Self.pendingWrites.leave()
+                    }
+                    diskWriteBytes += entry.count
+                    diskWriteMs += (CFAbsoluteTimeGetCurrent() - w0) * 1000
+                    diskWritesThisRuntime += 1
+                }
             }
             diskBytesThisRuntime += entry.count
+        } else {
+            insertMemoryEntry(key.hash, Entry(desc: key.desc, sourceLength: key.sourceLength, blob: serialized))
+            keptInMemory = true
         }
         storeCount += 1
-        debugLog("store key=\(key.desc) srcLen=\(key.sourceLength) bytes=\(serialized.count)")
+        debugLog("store key=\(key.desc) srcLen=\(key.sourceLength) bytes=\(serialized.count)\(keptInMemory ? "" : " (disk only, mapped on use)")")
     }
+
+    // MARK: - Script text re-homed in the entry file (perf/bytecode-paging)
+    //
+    // A fresh compile's script text is a heap block (`JeffJSSourceText`), kept
+    // for lazy compilation and `toString`. Its cache entry holds the same
+    // bytes: once the write lands, the writer maps the file, checks the text
+    // there is byte-identical (a concurrent writer of the same key writes the
+    // same bytes; anything else is refused), and queues (text, mapped span);
+    // the JS thread swaps them at its next cache call or idle tick. The heap
+    // block is freed when the last parse that copied the old span finishes.
+
+    /// Swaps whose write finished, per cache (the writer queue holds the box,
+    /// not the cache: a runtime freed before its writes land is fine).
+    final class SourceSwapBox: @unchecked Sendable {
+        let lock = NSLock()
+        var ready: [(text: JeffJSSourceText, expected: JeffJSBytesSpan, mapped: JeffJSBytesSpan?)?] = []
+        func add(_ s: (text: JeffJSSourceText, expected: JeffJSBytesSpan, mapped: JeffJSBytesSpan?)?) {
+            lock.lock(); ready.append(s); lock.unlock()
+        }
+        func take() -> [(text: JeffJSSourceText, expected: JeffJSBytesSpan, mapped: JeffJSBytesSpan?)?] {
+            lock.lock(); defer { lock.unlock() }
+            let r = ready; ready.removeAll(); return r
+        }
+    }
+    private let swapBox = SourceSwapBox()
+    /// Swaps this cache queued and has not adopted yet (JS thread).
+    private var pendingSourceSwaps = 0
+    /// Script texts moved from the heap to entry mappings, and their bytes.
+    private(set) var sourcesMapped = 0
+    private(set) var sourceBytesMapped = 0
+
+    /// Writer side (any thread): map the entry just written and queue the swap.
+    private static func mapWrittenSource(store: JeffJSBytecodeDiskStore, hash: UInt64, box: SourceSwapBox,
+                                         _ swap: (JeffJSSourceText, JeffJSBytesSpan, Int)) {
+        let (text, heapSpan, offset) = swap
+        guard let m = store.map(hash), offset >= 0, offset + heapSpan.count <= m.count else {
+            box.add((text, heapSpan, nil)); return
+        }
+        let mapped = JeffJSBytesSpan(m, offset: offset, count: heapSpan.count)
+        box.add((text, heapSpan, mapped.contentEquals(heapSpan) ? mapped : nil))
+    }
+
+    /// JS thread: adopt the mappings of texts whose entries landed.
+    func adoptWrittenSources() {
+        guard pendingSourceSwaps > 0 else { return }
+        for item in swapBox.take() {
+            pendingSourceSwaps = max(0, pendingSourceSwaps - 1)
+            // Unchanged since the store (same storage) and verified equal.
+            guard let (text, expected, mapped) = item, let mapped, text.bytes.owner === expected.owner,
+                  text.bytes.base == expected.base, text.bytes.count == mapped.count else { continue }
+            text.adoptVerifiedMapping(mapped)
+            sourcesMapped += 1
+            sourceBytesMapped += mapped.count
+        }
+    }
+
+    /// Swaps still outstanding (tests).
+    var pendingSourceSwapCount: Int { pendingSourceSwaps }
 
     // MARK: - Disk write policy (perf/memory-census)
     //
@@ -1813,13 +1992,15 @@ nonisolated final class JeffJSBytecodeCache {
     /// or the host at a quiet moment).
     func flushLazyBodies() {
         Self.flushPendingDiskWrites()
+        adoptWrittenSources()
         for s in bodyStores.values { s.flush() }
         rt?.lazyBodiesPending = false
     }
 
     /// From the idle tick: write pending bodies once the oldest waited 1 s.
     func flushLazyBodiesIfDue() {
-        var pending = false
+        adoptWrittenSources()
+        var pending = pendingSourceSwaps > 0
         let now = CFAbsoluteTimeGetCurrent()
         for s in bodyStores.values where s.hasPending {
             if now - s.pendingSince >= 1 { s.flush() } else { pending = true }
@@ -1974,6 +2155,28 @@ nonisolated final class JeffJSBytecodeDiskStore: @unchecked Sendable {
         directory.appendingPathComponent("\(hash)-bodies.jfbc")
     }
 
+    /// The entry file mapped read-only (perf/bytecode-paging): the cache
+    /// reads its blob in place; a hit re-stamps the file as most recently used.
+    func map(_ hash: UInt64) -> JeffJSFileMapping? {
+        let u = url(for: hash)
+        return u.withUnsafeFileSystemRepresentation { path -> JeffJSFileMapping? in
+            guard let path, let m = JeffJSFileMapping(path: String(cString: path)) else { return nil }
+            _ = utimes(path, nil)
+            return m
+        }
+    }
+
+    /// The sidecar mapped read-only (append-only file: a mapping keeps
+    /// seeing exactly the bytes it was made over).
+    func mapSidecar(_ hash: UInt64) -> JeffJSFileMapping? {
+        let u = sidecarURL(for: hash)
+        return u.withUnsafeFileSystemRepresentation { path -> JeffJSFileMapping? in
+            guard let path, let m = JeffJSFileMapping(path: String(cString: path)) else { return nil }
+            _ = utimes(path, nil)
+            return m
+        }
+    }
+
     func readSidecar(_ hash: UInt64) -> Data? {
         let u = sidecarURL(for: hash)
         guard let data = try? Data(contentsOf: u, options: .mappedIfSafe) else { return nil }
@@ -2105,7 +2308,8 @@ nonisolated final class JeffJSLazyBodyStore {
 
     let hash: UInt64
     private let disk: JeffJSBytecodeDiskStore
-    private var mapped: Data? = nil
+    /// The sidecar's mapping: bodies are deserialized out of it in place.
+    private var mapped: JeffJSFileMapping? = nil
     private var index: [UInt64: Range<Int>] = [:]
     private var loaded = false
     /// Bodies compiled here and not written yet.
@@ -2143,7 +2347,8 @@ nonisolated final class JeffJSLazyBodyStore {
 
     private func load() {
         loaded = true
-        guard let data = disk.readSidecar(hash) else { return }
+        guard let m = disk.mapSidecar(hash) else { return }
+        let data = UnsafeRawBufferPointer(start: m.baseAddress, count: m.count)
         let n = data.count
         func u32(_ p: Int) -> UInt32 {
             return UInt32(data[p]) | UInt32(data[p + 1]) << 8 | UInt32(data[p + 2]) << 16 | UInt32(data[p + 3]) << 24
@@ -2157,23 +2362,27 @@ nonisolated final class JeffJSLazyBodyStore {
             let sum = u64(p + 12)
             p += 20
             guard len >= 0, p + len <= n else { break }   // a record cut short by a crash
-            let checksum: UInt64 = data.withUnsafeBytes { raw in
-                Self.fnv(UnsafeRawBufferPointer(rebasing: raw[p ..< (p + len)]))
-            }
+            let checksum = Self.fnv(UnsafeRawBufferPointer(rebasing: data[p ..< (p + len)]))
             if checksum == sum {
                 if index[key] == nil { index[key] = p ..< (p + len) }
                 known.insert(key)
             }
             p += len
         }
-        mapped = data
+        mapped = m
+    }
+
+    /// The stored body for the function spanning `key`, if any (a span of
+    /// the sidecar's mapping: no copy).
+    func bodySpan(_ key: UInt64) -> JeffJSBytesSpan? {
+        if !loaded { load() }
+        guard let r = index[key], let m = mapped else { return nil }
+        return JeffJSBytesSpan(m, offset: r.lowerBound, count: r.count)
     }
 
     /// The stored body for the function spanning `key`, if any.
     func body(_ key: UInt64) -> [UInt8]? {
-        if !loaded { load() }
-        guard let r = index[key], let m = mapped else { return nil }
-        return [UInt8](m[r])
+        return bodySpan(key).map { Array($0) }
     }
 
     /// Remember a body compiled in this runtime; written in batches.
