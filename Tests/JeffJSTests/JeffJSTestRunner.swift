@@ -338,6 +338,7 @@ struct JeffJSTestRunner {
             ("AkamaiSensor", { $0.testAkamaiSensor() }),
             ("HomedepotAkamai", { $0.testHomedepotAkamai() }),
             ("OwnPropertyOrder", { $0.testOwnPropertyOrder() }),
+            ("TypedArraySet", { $0.testTypedArraySet() }),
             ("ProgramCompletion", { $0.testProgramCompletion() }),
             ("Redeclaration", { $0.testRedeclaration() }),
             ("DOMParserInsertion", { $0.testDOMParserInsertion() }),

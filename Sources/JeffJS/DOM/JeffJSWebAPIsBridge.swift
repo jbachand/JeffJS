@@ -185,21 +185,48 @@ final class JeffJSWebAPIsBridge {
     private func registerCrypto(on ctx: JeffJSContext, global: JeffJSValue) {
         let crypto = ctx.newObject()
 
-        // crypto.getRandomValues(typedArray) → fills with random bytes, returns same array
-        ctx.setPropertyFunc(obj: crypto, name: "getRandomValues", fn: { ctx, _, args in
-            guard args.count > 0 else { return JeffJSValue.undefined }
-            let typedArray = args[0]
-            let lengthVal = ctx.getPropertyStr(obj: typedArray, name: "length")
-            let length = Int(ctx.toInt32(lengthVal) ?? 0)
-            lengthVal.freeValue()
-            guard length > 0 else { return typedArray.dupValue() }
-
-            var bytes = [UInt8](repeating: 0, count: length)
-            _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-            for i in 0..<length {
-                _ = ctx.setPropertyUint32(obj: typedArray, index: UInt32(i), value: .newInt32(Int32(bytes[i])))
+        // crypto.getRandomValues(array) — WebCrypto §10.1.2: an integer typed array
+        // (Int8/Uint8/Uint8Clamped/Int16/Uint16/Int32/Uint32/BigInt64/BigUint64) has
+        // *all of its bytes* overwritten with random values; any other argument is a
+        // TypeMismatchError, more than 65 536 bytes a QuotaExceededError. It used to
+        // draw one random byte per element, so a Uint32Array got values 0-255.
+        ctx.setPropertyFunc(obj: crypto, name: "getRandomValues", fn: { [weak self] ctx, _, args in
+            let typeMismatch = "The type of an object was incompatible with the expected type of the parameter associated to the object."
+            guard args.count > 0 else {
+                return ctx.throwTypeError(message: "Not enough arguments")
             }
-            return typedArray.dupValue()
+            let array = args[0]
+            guard let obj = array.toObject(), case .typedArray(let ta) = obj.payload else {
+                return self?.throwCryptoDOMException(ctx: ctx, name: "TypeMismatchError", message: typeMismatch)
+                    ?? ctx.throwTypeError(message: typeMismatch)
+            }
+            let bytesPerElement: Int
+            switch JeffJSClassID(rawValue: ta.classID) {
+            case .uint8cArray, .int8Array, .uint8Array: bytesPerElement = 1
+            case .int16Array, .uint16Array: bytesPerElement = 2
+            case .int32Array, .uint32Array: bytesPerElement = 4
+            case .bigInt64Array, .bigUint64Array: bytesPerElement = 8
+            default:
+                return self?.throwCryptoDOMException(ctx: ctx, name: "TypeMismatchError", message: typeMismatch)
+                    ?? ctx.throwTypeError(message: typeMismatch)
+            }
+            guard let bufObj = ta.buffer, case .arrayBuffer(let ab) = bufObj.payload, !ab.detached else {
+                return array.dupValue()
+            }
+            let byteLength = ta.length * bytesPerElement
+            if byteLength > 65536 {
+                return self?.throwCryptoDOMException(ctx: ctx, name: "QuotaExceededError", message: "The quota has been exceeded.")
+                    ?? ctx.throwRangeError(message: "The quota has been exceeded.")
+            }
+            let start = ta.byteOffset
+            guard byteLength > 0, start >= 0, start + byteLength <= ab.data.count else { return array.dupValue() }
+            var random = [UInt8](repeating: 0, count: byteLength)
+            guard SecRandomCopyBytes(kSecRandomDefault, byteLength, &random) == errSecSuccess else {
+                return self?.throwCryptoDOMException(ctx: ctx, name: "OperationError", message: "The operation failed for an operation-specific reason")
+                    ?? ctx.throwTypeError(message: "getRandomValues failed")
+            }
+            ab.data.replaceSubrange(start..<(start + byteLength), with: random)
+            return array.dupValue()
         }, length: 1)
 
         // crypto.randomUUID()
@@ -211,6 +238,24 @@ final class JeffJSWebAPIsBridge {
 
         // After crypto is on the global: the JS wrapper below looks it up there.
         registerSubtleCrypto(on: ctx)
+    }
+
+    /// Throws `new DOMException(message, name)` (the page's DOMException), else a TypeError.
+    private func throwCryptoDOMException(ctx: JeffJSContext, name: String, message: String) -> JeffJSValue {
+        let global = ctx.getGlobalObject()
+        let ctor = ctx.getPropertyStr(obj: global, name: "DOMException")
+        global.freeValue()
+        defer { ctor.freeValue() }
+        if ctor.isFunction {
+            let msg = ctx.newStringValue(message)
+            let nm = ctx.newStringValue(name)
+            let err = ctx.callConstructor(ctor, args: [msg, nm])
+            msg.freeValue()
+            nm.freeValue()
+            if err.isException { return err }
+            return ctx.throwValue(err)
+        }
+        return ctx.throwTypeError(message: message)
     }
 
     // MARK: - crypto.subtle

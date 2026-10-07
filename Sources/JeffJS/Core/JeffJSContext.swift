@@ -5601,29 +5601,42 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
            jsObj.classID <= JeffJSClassID.float64Array.rawValue {
             if case .typedArray(let ta) = jsObj.payload {
                 if rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom) {
+                    guard let info = typedArrayInfo(forClassID: ta.classID) else { return 0 }
+                    // ES §10.4.5.16 TypedArraySetElement: the value is converted first —
+                    // ToBigInt for BigInt arrays (a Number store is a TypeError), else
+                    // ToNumber (strings, booleans, null, objects' valueOf: `u8[0] = '5'`
+                    // used to store 0) — and only then is the index checked against a
+                    // possibly detached buffer.
+                    var toStore = value
+                    var owned = false
+                    if info.isBigInt {
+                        let b = toBigIntValue(value)
+                        if b.isException { value.freeValue(); return -1 }
+                        value.freeValue()
+                        toStore = b
+                        owned = true
+                    } else if !value.isInt && !value.isFloat64 {
+                        let (d, ok) = JeffJSTypeConvert.toNumber(ctx: self, val: value)
+                        value.freeValue()
+                        if !ok { return -1 }
+                        toStore = .newFloat64(d)
+                    }
                     guard let bufObj = ta.buffer,
                           case .arrayBuffer(let ab) = bufObj.payload,
                           !ab.detached else {
                         // Detached buffer — silently ignore write per spec
+                        if owned { toStore.freeValue() }
                         return 0
                     }
-                    if idx < ta.length, let info = typedArrayInfo(forClassID: ta.classID) {
-                        var toStore = value
-                        if info.isBigInt {
-                            // ES 10.4.5.16: BigInt arrays run ToBigInt, so a
-                            // Number store is a TypeError.
-                            let b = toBigIntValue(value)
-                            if b.isException { value.freeValue(); return -1 }
-                            value.freeValue()
-                            toStore = b
-                        }
+                    if idx < ta.length {
                         info.writeElement(&ab.data,
                                           offset: ta.byteOffset + Int(idx) * info.bytesPerElement,
                                           value: toStore)
-                        if info.isBigInt { toStore.freeValue() }
+                        if owned { toStore.freeValue() }
                         return 1
                     }
                     // Out of bounds — silently ignore per spec
+                    if owned { toStore.freeValue() }
                     return 0
                 }
             }

@@ -253,6 +253,20 @@ private func getArrayBuffer(_ thisVal: JeffJSValue) -> JeffJSArrayBuffer? {
 }
 
 /// Validate a typed array is not detached and return its buffer data.
+/// The element conversion of TypedArraySetElement (ES §10.4.5.16): ToBigInt for a
+/// BigInt array, else ToNumber — strings, booleans, null and objects (valueOf) are
+/// converted, not stored as 0. Returns an owned value, nil when the conversion threw.
+/// `value` is borrowed.
+func typedArrayCoerceElement(_ ctx: JeffJSContext, _ info: TypedArrayElementInfo, _ value: JeffJSValue) -> JeffJSValue? {
+    if info.isBigInt {
+        let b = ctx.toBigIntValue(value)
+        return b.isException ? nil : b
+    }
+    if value.isInt || value.isFloat64 { return value }
+    let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: value)
+    return ok ? .newFloat64(d) : nil
+}
+
 private func validateTypedArray(_ thisVal: JeffJSValue) -> (JeffJSTypedArray, JeffJSArrayBuffer)? {
     guard let obj = thisVal.toObject() else { return nil }
     if case .typedArray(let ta) = obj.payload {
@@ -626,7 +640,11 @@ func jsTypedArray_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
         // Copy elements from source into the buffer
         for i in 0..<srcLen {
             let elem = ctx.getPropertyUint32(obj: srcVal, index: UInt32(i))
-            info.writeElement(&ab.data, offset: i * info.bytesPerElement, value: elem)
+            if elem.isException { return .exception }
+            guard let v = typedArrayCoerceElement(ctx, info, elem) else { elem.freeValue(); return .exception }
+            info.writeElement(&ab.data, offset: i * info.bytesPerElement, value: v)
+            v.freeValue()
+            elem.freeValue()
         }
 
         typedArrayAdoptNewBuffer(ta, bufObj)
@@ -701,28 +719,64 @@ func jsTypedArray_set(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Jef
         return ctx.throwTypeError("not a typed array")
     }
     guard let info = typedArrayInfo(forClassID: ta.classID) else { return .undefined }
+    // ES2024 §23.2.3.26 steps 4-6: targetOffset = ToIntegerOrInfinity(offset); < 0 → RangeError.
     var targetOffset = 0
     if argv.count >= 2, !argv[1].isUndefined {
-        targetOffset = argv[1].isInt ? Int(argv[1].toInt32()) : jeffJS_intArg(argv[1].toNumber())
-    }
-    if targetOffset < 0 { return ctx.throwTypeError("Invalid offset") }
-
-    if argv.count >= 1, let srcObj = argv[0].toObject() {
-        if case .typedArray(let srcTA) = srcObj.payload,
-           let srcBuf = srcTA.buffer,
-           case .arrayBuffer(let srcAB) = srcBuf.payload,
-           let srcInfo = typedArrayInfo(forClassID: srcTA.classID) {
-            // Copy from another typed array.
-            if targetOffset + srcTA.length > ta.length {
-                return ctx.throwTypeError("Source too large")
-            }
-            var data = ab.data
-            for i in 0..<srcTA.length {
-                let val = srcInfo.readElement(srcAB.data, offset: srcTA.byteOffset + i * srcInfo.bytesPerElement)
-                info.writeElement(&data, offset: ta.byteOffset + (targetOffset + i) * info.bytesPerElement, value: val)
-            }
-            ab.data = data
+        if argv[1].isInt {
+            targetOffset = Int(argv[1].toInt32())
+        } else {
+            let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: argv[1])
+            if !ok { return .exception }
+            if d.isInfinite && d > 0 { return ctx.throwRangeError(message: "offset is out of bounds") }
+            targetOffset = jeffJS_intArg(d)
         }
+    }
+    if targetOffset < 0 { return ctx.throwRangeError(message: "offset is out of bounds") }
+
+    let source: JeffJSValue = argv.count >= 1 ? argv[0] : .undefined
+    if let srcObj = source.toObject(), case .typedArray(let srcTA) = srcObj.payload {
+        // SetTypedArrayFromTypedArray (§23.2.3.26.1).
+        guard let srcBuf = srcTA.buffer, case .arrayBuffer(let srcAB) = srcBuf.payload,
+              let srcInfo = typedArrayInfo(forClassID: srcTA.classID) else { return .undefined }
+        if targetOffset + srcTA.length > ta.length {
+            return ctx.throwRangeError(message: "source is too large")
+        }
+        // Reads come from the source's bytes before any write (the spec clones a
+        // same-buffer source first), so overlapping views copy correctly.
+        var data = ab.data
+        for i in 0..<srcTA.length {
+            let val = srcInfo.readElement(srcAB.data, offset: srcTA.byteOffset + i * srcInfo.bytesPerElement)
+            info.writeElement(&data, offset: ta.byteOffset + (targetOffset + i) * info.bytesPerElement, value: val)
+        }
+        ab.data = data
+        return .undefined
+    }
+
+    // SetTypedArrayFromArrayLike (§23.2.3.26.2): any other source — an Array, an
+    // array-like, a primitive (ToObject) — is read by Get(src, k) and written with
+    // the typed array's own [[Set]] (TypedArraySetElement: ToNumber / ToBigInt,
+    // then the valid-index check). This path used to be missing: `u8.set([1, 2], 0)`
+    // wrote nothing (protobuf encoders produced all-zero tags and lengths).
+    let src = ctx.toObject(source)
+    if src.isException { return src }
+    defer { src.freeValue() }
+    let lenVal = ctx.getPropertyStr(obj: src, name: "length")
+    if lenVal.isException { return lenVal }
+    let (lenNum, lenOK) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lenVal)
+    lenVal.freeValue()
+    if !lenOK { return .exception }
+    let srcLength: Int = (lenNum.isNaN || lenNum <= 0) ? 0 : (lenNum >= 9007199254740991 ? 9007199254740991 : Int(lenNum))
+    if srcLength > ta.length - targetOffset {
+        return ctx.throwRangeError(message: "source is too large")
+    }
+    var k = 0
+    while k < srcLength {
+        let value = ctx.getPropertyUint32(obj: src, index: UInt32(k))
+        if value.isException { return value }
+        if ctx.setPropertyUint32(obj: thisVal, index: UInt32(targetOffset + k), value: value) < 0 {
+            return .exception
+        }
+        k += 1
     }
     return .undefined
 }
@@ -799,7 +853,11 @@ func jsTypedArray_fill(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Je
         return ctx.throwTypeError("not a typed array")
     }
     guard let info = typedArrayInfo(forClassID: ta.classID) else { return thisVal.dupValue() }
-    let fillVal = argv.count >= 1 ? argv[0] : JeffJSValue.undefined
+    // §23.2.3.10 step 4-5: the value is converted once, before start/end.
+    guard let fillVal = typedArrayCoerceElement(ctx, info, argv.count >= 1 ? argv[0] : JeffJSValue.undefined) else {
+        return .exception
+    }
+    defer { fillVal.freeValue() }
     let len = ta.length
     var start = argv.count >= 2 ? (argv[1].isInt ? Int(argv[1].toInt32()) : jeffJS_intArg(argv[1].toNumber())) : 0
     var end = argv.count >= 3 && !argv[2].isUndefined ? (argv[2].isInt ? Int(argv[2].toInt32()) : jeffJS_intArg(argv[2].toNumber())) : len
@@ -1342,7 +1400,9 @@ func jsTypedArray_from(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 
     var data = ab.data
     for i in 0..<count {
-        info.writeElement(&data, offset: i * info.bytesPerElement, value: elements[i])
+        guard let v = typedArrayCoerceElement(ctx, info, elements[i]) else { return .exception }
+        info.writeElement(&data, offset: i * info.bytesPerElement, value: v)
+        v.freeValue()
     }
     ab.data = data
 
@@ -1377,7 +1437,9 @@ func jsTypedArray_of(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 
     var data = ab.data
     for i in 0..<count {
-        info.writeElement(&data, offset: i * info.bytesPerElement, value: argv[i])
+        guard let v = typedArrayCoerceElement(ctx, info, argv[i]) else { return .exception }
+        info.writeElement(&data, offset: i * info.bytesPerElement, value: v)
+        v.freeValue()
     }
     ab.data = data
 
