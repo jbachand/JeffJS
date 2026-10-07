@@ -85,6 +85,50 @@ final class RuntimeTeardownReleaseTests: XCTestCase {
         }
     }
 
+    /// Date's installer took four Swift retains on the constructor (`makeObject` — the
+    /// object's free gives one back), and every getter / setter call took one more on the
+    /// accessor function: Date, and each accessor that ever ran, outlived the runtime —
+    /// and pinned it through `ownerRuntime` (the watch creates a runtime per page).
+    func testFreeReleasesDateAndCalledAccessors() throws {
+        try XCTSkipIf(ProcessInfo.processInfo.environment["JEFFJS_ZOMBIES"] == "1", "zombie mode keeps every freed object allocated on purpose")
+        weak var dateCtor: JeffJSObject?
+        weak var dateProto: JeffJSObject?
+        weak var getter: JeffJSObject?
+        weak var setter: JeffJSObject?
+        weak var weakRuntime: JeffJSRuntime?
+        do {
+            let rt = JeffJSRuntime()
+            let ctx = rt.newContext()
+            let v = ctx.eval(input: """
+                var acc = { _v: 0, get v() { return this._v; }, set v(x) { this._v = x; } };
+                acc.v = 2; var inherited = Object.create(acc); inherited.v = 3;
+                var d = new Date(0); d.getTime() + acc.v + inherited.v + new Date(5).valueOf();
+                [Date, Date.prototype, Object.getOwnPropertyDescriptor(acc, 'v').get, Object.getOwnPropertyDescriptor(acc, 'v').set]
+                """, filename: "<teardown-date>", evalFlags: 0)
+            XCTAssertFalse(v.isException)
+            for (i, name) in ["0", "1", "2", "3"].enumerated() {
+                let e = ctx.getPropertyStr(obj: v, name: name)
+                switch i {
+                case 0: dateCtor = e.toObject()
+                case 1: dateProto = e.toObject()
+                case 2: getter = e.toObject()
+                default: setter = e.toObject()
+                }
+                e.freeValue()
+            }
+            v.freeValue()
+            XCTAssertNotNil(dateCtor); XCTAssertNotNil(dateProto); XCTAssertNotNil(getter); XCTAssertNotNil(setter)
+            weakRuntime = rt
+            ctx.free()
+            rt.free()
+        }
+        XCTAssertNil(dateCtor, "Date outlived its runtime")
+        XCTAssertNil(dateProto, "Date.prototype outlived its runtime")
+        XCTAssertNil(getter, "a getter that ran outlived its runtime")
+        XCTAssertNil(setter, "a setter that ran outlived its runtime")
+        XCTAssertNil(weakRuntime, "a fresh runtime outlived its free()")
+    }
+
     /// A lazily compiled function's body is parsed and thrown away (only its free
     /// names are kept); the string literals the parser put in its constant pool —
     /// and in the pools of the definitions nested in it — own one reference each,

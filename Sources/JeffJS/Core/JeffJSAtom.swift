@@ -647,7 +647,7 @@ enum JSPredefinedAtom: UInt32 {
     case getOwnPropertyDescriptors     = 147  // "getOwnPropertyDescriptors"
     case is_                            = 148  // "is"
     case from                           = 149  // "from"
-    case of_                            = 150  // "of" (Array.of)
+    case reserved150                    = 150  // was `of_`, a second "of" (alias of .of; see "Duplicate names")
     case concat                         = 151  // "concat"
     case copyWithin                     = 152  // "copyWithin"
     case every                          = 153  // "every"
@@ -680,7 +680,7 @@ enum JSPredefinedAtom: UInt32 {
     case toReversed                     = 180  // "toReversed"
     case toSorted                       = 181  // "toSorted"
     case toSpliced                      = 182  // "toSpliced"
-    case arrayWith                      = 183  // "with" (Array.prototype.with)
+    case reserved183                    = 183  // was `arrayWith`, a second "with" (alias of .with_; see "Duplicate names")
     case group                          = 184  // "group"
     case groupToMap                     = 185  // "groupToMap"
 
@@ -828,7 +828,7 @@ enum JSPredefinedAtom: UInt32 {
     case toUTCString                    = 316  // "toUTCString"
     case getYear                        = 317  // "getYear"
     case setYear                        = 318  // "setYear"
-    case toGMTStringAlias               = 319  // "toGMTString" (alias)
+    case reserved319                    = 319  // was `toGMTStringAlias`, a second "toGMTString" (alias of .toGMTString; see "Duplicate names")
 
     // -----------------------------------------------------------------------
     // MARK: RegExp
@@ -865,8 +865,8 @@ enum JSPredefinedAtom: UInt32 {
     // -----------------------------------------------------------------------
     // MARK: Generator / Iterator
     // -----------------------------------------------------------------------
-    case return__                       = 340  // "return"
-    case throw__                        = 341  // "throw"
+    case reserved340                    = 340  // was `return__`, a second "return" (alias of .return_; see "Duplicate names")
+    case reserved341                    = 341  // was `throw__`, a second "throw" (alias of .throw_; see "Duplicate names")
 
     // -----------------------------------------------------------------------
     // MARK: Promise
@@ -888,7 +888,7 @@ enum JSPredefinedAtom: UInt32 {
     case byteOffset                     = 352  // "byteOffset"
     case BYTES_PER_ELEMENT              = 353  // "BYTES_PER_ELEMENT"
     case subarray                       = 354  // "subarray"
-    case set_                           = 355  // "set"
+    case reserved355                    = 355  // was `set_`, a second "set" (alias of .set; see "Duplicate names")
     case getInt8                        = 356  // "getInt8"
     case getUint8                       = 357  // "getUint8"
     case getInt16                       = 358  // "getInt16"
@@ -1011,7 +1011,7 @@ enum JSPredefinedAtom: UInt32 {
     // MARK: Miscellaneous property names
     // -----------------------------------------------------------------------
     case toStringTag                    = 457  // "toStringTag"
-    case symbolFor                      = 458  // "for" (Symbol.for)
+    case reserved458                    = 458  // was `symbolFor`, a second "for" (alias of .for_; see "Duplicate names")
     case keyFor                         = 459  // "keyFor"
     case asIntN                         = 460  // "asIntN"
     case asUintN                        = 461  // "asUintN"
@@ -1019,7 +1019,7 @@ enum JSPredefinedAtom: UInt32 {
     case unregister                     = 463  // "unregister"
     case target                         = 464  // "target"
     case handler                        = 465  // "handler"
-    case proxy_                         = 466  // "proxy"
+    case reserved466                    = 466  // was `proxy_`, a second "proxy" (alias of .proxy; see "Duplicate names")
     case enumerate                      = 467  // "enumerate"
     case species                        = 468  // "species"
 
@@ -1076,7 +1076,7 @@ enum JSPredefinedAtom: UInt32 {
     case ending                         = 496  // "ending"
     case arrayBuffer                    = 497  // "arrayBuffer"
     case text                           = 498  // "text"
-    case writable_                      = 499  // "writable"
+    case reserved499                    = 499  // was `writable_`, a second "writable" (alias of .writable; see "Duplicate names")
     case readable                       = 500  // "readable"
     case close                          = 501  // "close"
     case abort                          = 502  // "abort"
@@ -1090,6 +1090,37 @@ enum JSPredefinedAtom: UInt32 {
     case unicodeSets                    = 506  // "unicodeSets"
 
     case END                            = 507  // sentinel
+
+    // -----------------------------------------------------------------------
+    // MARK: Duplicate names
+    // -----------------------------------------------------------------------
+    // Nine slots used to repeat a name an earlier slot already had ("of", "with",
+    // "toGMTString", "return", "throw", "set", "for", "proxy", "writable"). The table
+    // is interned in id order and each later entry was linked at the head of its hash
+    // chain, so `rt.findAtom("set")` — every property key the parser, the bytecode
+    // cache and the native string paths intern — answered the *second* id (355), while
+    // `JSPredefinedAtom.set` named the first (68): a native read of `desc[set]` or of a
+    // Proxy handler's `set` trap through the enum never saw what JS had written.
+    // Each repeated slot is now a reserved placeholder (`reservedNNN`, its own unique
+    // string, nothing interns to it; the ids after it keep their numbers, so nothing
+    // else moves), and the old case names are aliases of the one canonical atom.
+    // `PredefinedAtomTableTests` / the "EngineMisc" conformance group assert every name
+    // interns to its enum id.
+    static let of_: JSPredefinedAtom = .of
+    static let arrayWith: JSPredefinedAtom = .with_
+    static let toGMTStringAlias: JSPredefinedAtom = .toGMTString
+    static let return__: JSPredefinedAtom = .return_
+    static let throw__: JSPredefinedAtom = .throw_
+    static let set_: JSPredefinedAtom = .set
+    static let symbolFor: JSPredefinedAtom = .for_
+    static let proxy_: JSPredefinedAtom = .proxy
+    static let writable_: JSPredefinedAtom = .writable
+
+    /// The placeholder slots above (no name interns to them).
+    static let reservedSlots: Set<JSPredefinedAtom> = [
+        .reserved150, .reserved183, .reserved319, .reserved340, .reserved341,
+        .reserved355, .reserved458, .reserved466, .reserved499,
+    ]
 
     // MARK: - String mapping
 
@@ -1245,7 +1276,7 @@ enum JSPredefinedAtom: UInt32 {
         case .getOwnPropertyDescriptors:   return "getOwnPropertyDescriptors"
         case .is_:                          return "is"
         case .from:                         return "from"
-        case .of_:                          return "of"
+        case .reserved150:                  return "<reserved:150>"
         case .concat:                       return "concat"
         case .copyWithin:                   return "copyWithin"
         case .every:                        return "every"
@@ -1278,7 +1309,7 @@ enum JSPredefinedAtom: UInt32 {
         case .toReversed:                   return "toReversed"
         case .toSorted:                     return "toSorted"
         case .toSpliced:                    return "toSpliced"
-        case .arrayWith:                    return "with"
+        case .reserved183:                  return "<reserved:183>"
         case .group:                        return "group"
         case .groupToMap:                   return "groupToMap"
         case .charAt:                       return "charAt"
@@ -1414,7 +1445,7 @@ enum JSPredefinedAtom: UInt32 {
         case .toUTCString:                  return "toUTCString"
         case .getYear:                      return "getYear"
         case .setYear:                      return "setYear"
-        case .toGMTStringAlias:             return "toGMTString"
+        case .reserved319:                  return "<reserved:319>"
         case .exec:                         return "exec"
         case .test:                         return "test"
         case .compile_:                     return "compile"
@@ -1435,8 +1466,8 @@ enum JSPredefinedAtom: UInt32 {
         case .add:                          return "add"
         case .clear:                        return "clear"
         case .deref:                        return "deref"
-        case .return__:                     return "return"
-        case .throw__:                      return "throw"
+        case .reserved340:                  return "<reserved:340>"
+        case .reserved341:                  return "<reserved:341>"
         case .all:                          return "all"
         case .allSettled:                   return "allSettled"
         case .any:                          return "any"
@@ -1450,7 +1481,7 @@ enum JSPredefinedAtom: UInt32 {
         case .byteOffset:                   return "byteOffset"
         case .BYTES_PER_ELEMENT:            return "BYTES_PER_ELEMENT"
         case .subarray:                     return "subarray"
-        case .set_:                         return "set"
+        case .reserved355:                  return "<reserved:355>"
         case .getInt8:                      return "getInt8"
         case .getUint8:                     return "getUint8"
         case .getInt16:                     return "getInt16"
@@ -1553,7 +1584,7 @@ enum JSPredefinedAtom: UInt32 {
         case .hasOwn:                       return "hasOwn"
         case .structuredClone:              return "structuredClone"
         case .toStringTag:                  return "toStringTag"
-        case .symbolFor:                    return "for"
+        case .reserved458:                  return "<reserved:458>"
         case .keyFor:                       return "keyFor"
         case .asIntN:                       return "asIntN"
         case .asUintN:                      return "asUintN"
@@ -1561,7 +1592,7 @@ enum JSPredefinedAtom: UInt32 {
         case .unregister:                   return "unregister"
         case .target:                       return "target"
         case .handler:                      return "handler"
-        case .proxy_:                       return "proxy"
+        case .reserved466:                  return "<reserved:466>"
         case .enumerate:                    return "enumerate"
         case .species:                      return "species"
         case .iterator:                     return "iterator"
@@ -1594,7 +1625,7 @@ enum JSPredefinedAtom: UInt32 {
         case .ending:                       return "ending"
         case .arrayBuffer:                  return "arrayBuffer"
         case .text:                         return "text"
-        case .writable_:                    return "writable"
+        case .reserved499:                  return "<reserved:499>"
         case .readable:                     return "readable"
         case .close:                        return "close"
         case .abort:                        return "abort"

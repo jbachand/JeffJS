@@ -5408,7 +5408,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                     // The slot's reference is borrowed: a getter that
                     // redefines or deletes its own property frees it mid-call
                     // (QuickJS dups the getter here for the same reason).
-                    let getterVal = JeffJSValue.makeObject(getterObj)
+                    // Borrowed: callRetainingFunction holds a count for the call
+                    // (`makeObject` took a Swift retain nothing gave back).
+                    let getterVal = JeffJSValue.borrowedObject(getterObj)
                     return callRetainingFunction(getterVal, this: receiver, args: [])
                 }
                 // Mapped arguments: the slot aliases a live parameter.
@@ -5465,7 +5467,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                     if e.kind == .getset, let getterObj = e.getter {
                         // Borrowed from the prototype's slot: see the own-
                         // property branch above.
-                        let getterVal = JeffJSValue.makeObject(getterObj)
+                        let getterVal = JeffJSValue.borrowedObject(getterObj)
                         return callRetainingFunction(getterVal, this: receiver, args: [])
                     }
                     return .JS_UNDEFINED
@@ -5478,13 +5480,50 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         return .JS_UNDEFINED
     }
 
+    /// [[Set]] on a Proxy whose handler has no `set` trap: `target.[[Set]](P, V, proxy)`.
+    /// Consumes `value`; 1 written, 0 refused (a TypeError with JS_PROP_THROW), -1 exception.
+    ///
+    /// When the target is an ordinary object and the handler has neither a
+    /// `getOwnPropertyDescriptor` nor a `defineProperty` trap, the receiver's
+    /// [[GetOwnProperty]] / [[DefineOwnProperty]] reach the target unchanged, so OrdinarySet
+    /// is the target's own write except for the `this` of a setter it finds (the proxy).
+    /// Otherwise (a target that is itself a proxy, receiver traps) the reference OrdinarySet,
+    /// `reflectSet`, runs with the proxy as the receiver.
+    private func proxySetWithoutTrap(_ pd: JeffJSProxyData, proxy: JeffJSValue, atom: UInt32,
+                                     value: JeffJSValue, flags: Int) -> Int {
+        if let t = pd.target.toObject(), !isProxyObject(t) {
+            let gopd = proxyTrapMethod(pd, "getOwnPropertyDescriptor")
+            if gopd.isException { value.freeValue(); return -1 }
+            let dp = gopd.isUndefined ? proxyTrapMethod(pd, "defineProperty") : JeffJSValue.undefined
+            if dp.isException { gopd.freeValue(); value.freeValue(); return -1 }
+            let receiverTraps = !gopd.isUndefined || !dp.isUndefined
+            gopd.freeValue(); dp.freeValue()
+            if !receiverTraps {
+                return setPropertyInternal(obj: pd.target, atom: atom, value: value, flags: flags, setterThis: proxy)
+            }
+        }
+        let key = proxyTrapKey(atom)
+        let r = reflectSet(pd.target, key: key, atom: atom, value: value, receiver: proxy)
+        key.freeValue()
+        value.freeValue()
+        if r == 0 && (flags & JS_PROP_THROW) != 0 {
+            _ = throwTypeError(message: "Attempted to assign to readonly property.")
+            return -1
+        }
+        return r
+    }
+
     /// Internal property set implementation.
     /// Mirrors `JS_SetPropertyInternal()` from QuickJS.
+    /// - setterThis: the `this` of a setter the write finds (the Receiver of ES
+    ///   §10.1.9.2 OrdinarySet), when it is not `obj`: a Proxy without a `set` trap
+    ///   forwards `proxy.k = v` to its target with the proxy as the receiver.
     private func setPropertyInternal(
         obj: JeffJSValue,
         atom: UInt32,
         value: JeffJSValue,
-        flags: Int
+        flags: Int,
+        setterThis: JeffJSValue? = nil
     ) -> Int {
         guard let jsObj = obj.toObject() else {
             // Writing through a null/undefined base always throws, in sloppy
@@ -5577,8 +5616,11 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                     trap.freeValue()
                     _ = handlerObj // suppress warning
                 }
-                // No trap: fall through to target
-                return setPropertyInternal(obj: pd.target, atom: atom, value: value, flags: flags)
+                // No trap: target.[[Set]](P, V, Receiver) (ES §10.5.9 step 6), the
+                // proxy being the receiver. It was a plain write on the target: a setter
+                // on the target's chain ran with `this` = target, and the proxy's own
+                // getOwnPropertyDescriptor / defineProperty traps were never reached.
+                return proxySetWithoutTrap(pd, proxy: obj, atom: atom, value: value, flags: flags)
             }
         }
 
@@ -5693,7 +5735,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             if exFlags.isGetSet {
                 // Accessor property — call the setter
                 if let e = jsObj.extra(at: exIdx), e.kind == .getset, let setterObj = e.setter {
-                    let setterVal = JeffJSValue.makeObject(setterObj)
+                    // Borrowed (callRetainingFunction holds a count for the call).
+                    // `makeObject` took a Swift retain nothing gave back: every
+                    // accessor whose setter ever ran outlived its runtime.
+                    let setterVal = JeffJSValue.borrowedObject(setterObj)
                     // `setPropertyInternal` consumes `value`, and a callee
                     // borrows its arguments (Round 9) — so the setter branch
                     // owes both a release of the argument and a release of the
@@ -5702,7 +5747,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                     // `__proto__` setter — left one permanent reference on the
                     // object assigned. The setter itself is borrowed from the
                     // slot, which it may redefine while it runs: call retained.
-                    let result = callRetainingFunction(setterVal, this: obj, args: [value])
+                    let result = callRetainingFunction(setterVal, this: setterThis ?? obj, args: [value])
                     value.freeValue()
                     result.freeValue()
                     if result.isException { return -1 }
@@ -5741,9 +5786,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 if pShape.prop[pIdx].flags.contains(.getset) {
                     // Inherited accessor — call its setter
                     if let e = p.extra(at: pIdx), e.kind == .getset, let setterObj = e.setter {
-                        let setterVal = JeffJSValue.makeObject(setterObj)
+                        let setterVal = JeffJSValue.borrowedObject(setterObj)
                         // Same ownership as the own-accessor branch above.
-                        let result = callRetainingFunction(setterVal, this: obj, args: [value])
+                        let result = callRetainingFunction(setterVal, this: setterThis ?? obj, args: [value])
                         value.freeValue()
                         result.freeValue()
                         if result.isException { return -1 }

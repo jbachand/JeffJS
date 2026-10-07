@@ -3140,7 +3140,11 @@ extension JeffJSObject {
             vr.store(value)   // releases the replaced value when the slot owns it
             return true
         }
+        // The replaced data value is released, as documented (it was dropped: every
+        // native write over a held string / object leaked that value's count).
+        let old = extra(at: idx) == nil ? propValues[idx] : .undefined
         propValues[idx] = value; setExtraSlot(idx, nil)
+        old.freeValue()
         return true
     }
 

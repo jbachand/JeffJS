@@ -1432,8 +1432,16 @@ func jeffJS_initDate(ctx: JeffJSContext, globalObj: JeffJSObject) {
         magic: 0
     )
 
-    // Date.prototype on constructor
-    let dateProtoVal = JeffJSValue.makeObject(dateProto)
+    // One `makeObject` per object. `makeObject` takes the Swift retain that the object's
+    // free gives back (once); the installer called it four times on the constructor (two
+    // throwaway receivers for `length` / `name`, two stored references), so three
+    // retains were never returned: the constructor object outlived each runtime and
+    // pinned it through `ownerRuntime` (the watch makes one per page). Every other use
+    // here is the borrowed value (RuntimeTeardownReleaseTests.testFreeReleasesDateAndCalledAccessors).
+    let dateProtoVal = JeffJSValue.makeObject(dateProto)   // the creation count
+    let dateCtorVal = JeffJSValue.makeObject(dateCtor)     // the creation count
+
+    // Date.prototype on constructor: takes the prototype's creation count.
     jeffJS_addProperty(ctx: ctx, obj: dateCtor,
                        atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
                        flags: [])
@@ -1441,15 +1449,15 @@ func jeffJS_initDate(ctx: JeffJSContext, globalObj: JeffJSObject) {
         atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
         value: dateProtoVal)
 
-    // Date.prototype.constructor = Date. Its own count: the global below takes
-    // the creation count (both shared one, so replacing `Date` and
-    // `Date.prototype.constructor` freed a constructor still referenced).
+    // Date.prototype.constructor = Date: its own count (the global below takes the
+    // creation count; both sharing one freed a constructor still referenced once
+    // `Date` and `Date.prototype.constructor` were replaced).
     jeffJS_addProperty(ctx: ctx, obj: dateProto,
                        atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
                        flags: [.writable, .configurable])
     dateProto.setOwnPropertyValue(
         atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
-        value: JeffJSValue.makeObject(dateCtor).dupValue())
+        value: dateCtorVal.dupValue())
 
     // Static methods
     jeffJS_defineBuiltinFunc(ctx: ctx, obj: dateCtor, name: "now", length: 0, func: jsDate_now)
@@ -1458,16 +1466,15 @@ func jeffJS_initDate(ctx: JeffJSContext, globalObj: JeffJSObject) {
 
     // Date.name / Date.length (ES §21.4.2: length 7). akamai navigation fix: they
     // were missing (`String(Date)` printed "function () {").
-    ctx.definePropertyValue(obj: .makeObject(dateCtor), atom: JeffJSAtomID.JS_ATOM_length.rawValue,
+    ctx.definePropertyValue(obj: dateCtorVal, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
                             value: JeffJSValue.newInt32(7), flags: JS_PROP_CONFIGURABLE)
     let dateName = ctx.newStringValue("Date")
-    ctx.definePropertyValue(obj: .makeObject(dateCtor), atom: JeffJSAtomID.JS_ATOM_name.rawValue,
+    ctx.definePropertyValue(obj: dateCtorVal, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
                             value: dateName, flags: JS_PROP_CONFIGURABLE)
     dateName.freeValue()   // definePropertyValue dups
 
-    // Install on global. Its own reference: `Date.prototype.constructor`
-    // holds the creation one (jeffJS_setPropertyStr dups and then frees what
-    // it is given), so `delete Date` after reassigning the constructor freed
-    // Date under live bindings.
-    jeffJS_setPropertyStr(ctx: ctx, obj: globalObj, name: "Date", value: JeffJSValue.makeObject(dateCtor).dupValue())
+    // Install on global: takes the creation count (jeffJS_setPropertyStr consumes
+    // what it is given). It used to be given a second dup, leaving one count no
+    // reference owned, so `Date` could never be freed.
+    jeffJS_setPropertyStr(ctx: ctx, obj: globalObj, name: "Date", value: dateCtorVal)
 }

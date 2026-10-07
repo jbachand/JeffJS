@@ -316,12 +316,10 @@ func js_regexp_exec(
     let isSticky = (flags & LRE_FLAG_STICKY) != 0
     let hasIndices = (flags & LRE_FLAG_INDICES) != 0
 
-    // Read lastIndex.
-    var lastIndex: Int = 0
-    if isGlobal || isSticky {
-        lastIndex = js_regexp_getLastIndex(obj)
-        if lastIndex < 0 { lastIndex = 0 }
-    }
+    // Read lastIndex: always (ToLength may run a `valueOf`), used only when
+    // global or sticky.
+    guard let readLastIndex = js_regexp_getLastIndex(ctx, obj) else { return .exception }
+    let lastIndex = (isGlobal || isSticky) ? readLastIndex : 0
 
     let captureCount = js_regexp_getCaptureCount(obj)
 
@@ -340,7 +338,7 @@ func js_regexp_exec(
     guard let captures = matchResult else {
         // No match.
         if isGlobal || isSticky {
-            js_regexp_setLastIndex(obj, value: 0)
+            if !js_regexp_setLastIndex(ctx, obj, value: 0) { return .exception }
         }
         return .null
     }
@@ -449,11 +447,15 @@ func js_regexp_exec(
     }
 
     // Update lastIndex.
+    let resultVal = JeffJSValue.makeObject(resultArray)
     if isGlobal || isSticky {
-        js_regexp_setLastIndex(obj, value: matchEnd)
+        if !js_regexp_setLastIndex(ctx, obj, value: matchEnd) {
+            resultVal.freeValue()
+            return .exception
+        }
     }
 
-    return JeffJSValue.makeObject(resultArray)
+    return resultVal
 }
 
 // MARK: - RegExpExec (ES §22.2.7.1)
@@ -662,7 +664,7 @@ func js_regexp_compile(
     let oldPattern = js_regexp_getPattern(obj)
     obj.payload = JeffJSObjectPayload.regexp(pattern: patternStr, bytecode: compiled)
     js_regexp_releasePattern(oldPattern)
-    js_regexp_setLastIndex(obj, value: 0)
+    if !js_regexp_setLastIndex(ctx, obj, value: 0) { return .exception }
 
     return this.dupValue()
 }
@@ -908,7 +910,7 @@ func js_regexp_Symbol_match(
     // overridden, or as fallback).
     let isUnicode = (flags & LRE_FLAG_UNICODE) != 0 || (flags & LRE_FLAG_UNICODE_SETS) != 0
 
-    js_regexp_setLastIndex(obj, value: 0)
+    if !js_regexp_setLastIndex(ctx, obj, value: 0) { return .exception }
 
     var matches: [JeffJSValue] = []
     var safetyLimit = 1_000_000  // prevent infinite loop on pathological patterns
@@ -933,9 +935,11 @@ func js_regexp_Symbol_match(
 
             // If match[0] is empty string, advance lastIndex to avoid infinite loop.
             if let ms = matchStr.stringValue, ms.len == 0 {
-                var li = js_regexp_getLastIndex(obj)
-                li = js_regexp_advanceIndex(inputStr, index: li, unicode: isUnicode)
-                js_regexp_setLastIndex(obj, value: li)
+                guard let li = js_regexp_getLastIndex(ctx, obj),
+                      js_regexp_setLastIndex(ctx, obj, value: js_regexp_advanceIndex(inputStr, index: li, unicode: isUnicode)) else {
+                    for m in matches { m.freeValue() }
+                    return .exception
+                }
             }
         } else {
             break
@@ -1031,7 +1035,7 @@ private func js_regexp_globalMatchFast(
     // 5. Update lastIndex on the RegExp object.
     //    After a global match that exhausts all matches, lastIndex is set to 0.
     //    (Per spec, String.prototype.match with /g sets lastIndex to 0 at the end.)
-    js_regexp_setLastIndex(obj, value: 0)
+    if !js_regexp_setLastIndex(ctx, obj, value: 0) { return .exception }
 
     if matchRanges.isEmpty {
         return .null
@@ -1119,6 +1123,9 @@ func js_regexp_Symbol_matchAll(
     // Ensure the flags string includes 'g' (matchAll always uses global).
     var copyFlags = flags | LRE_FLAG_GLOBAL
 
+    // The original's lastIndex, for the copy.
+    guard let origLastIndex = js_regexp_getLastIndex(ctx, obj) else { return .exception }
+
     let regexpCopy = jeffJS_createObject(ctx: ctx, proto: nil,
                                           classID: UInt16(JSClassID.JS_CLASS_REGEXP.rawValue))
     regexpCopy.payload = .regexp(
@@ -1127,7 +1134,6 @@ func js_regexp_Symbol_matchAll(
     )
 
     // Set lastIndex from the original.
-    let origLastIndex = js_regexp_getLastIndex(obj)
     jeffJS_appendOwnProperty(ctx, regexpCopy,
                              atom: JeffJSAtomID.JS_ATOM_lastIndex.rawValue,
                              flags: [.writable],
@@ -1200,7 +1206,7 @@ func js_regexp_Symbol_replace(
     }
 
     if isGlobal {
-        js_regexp_setLastIndex(obj, value: 0)
+        if !js_regexp_setLastIndex(ctx, obj, value: 0) { return .exception }
     }
     let userExec = js_regexp_userExecFunction(ctx: ctx, this: this)
     if let u = userExec, u.isException { return .exception }
@@ -1316,9 +1322,10 @@ func js_regexp_Symbol_replace(
 
         // For global, check if match was empty to avoid infinite loop.
         if isGlobal && matchLen == 0 {
-            var li = js_regexp_getLastIndex(obj)
-            li = js_regexp_advanceIndex(inputStr, index: li, unicode: isUnicode)
-            js_regexp_setLastIndex(obj, value: li)
+            guard let li = js_regexp_getLastIndex(ctx, obj),
+                  js_regexp_setLastIndex(ctx, obj, value: js_regexp_advanceIndex(inputStr, index: li, unicode: isUnicode)) else {
+                return .exception
+            }
         }
 
         if !isGlobal {
@@ -1357,9 +1364,10 @@ func js_regexp_Symbol_search(
     if let u = userExec, u.isException { return .exception }
     defer { userExec?.freeValue() }
 
-    // Save lastIndex.
-    let savedLastIndex = js_regexp_getLastIndex(obj)
-    js_regexp_setLastIndex(obj, value: 0)
+    // Save lastIndex; set it to 0 only when it is not 0 already (ES §22.2.6.12
+    // steps 4-5: a frozen regexp whose lastIndex is 0 can still be searched).
+    guard let savedLastIndex = js_regexp_getLastIndex(ctx, obj) else { return .exception }
+    if savedLastIndex != 0, !js_regexp_setLastIndex(ctx, obj, value: 0) { return .exception }
 
     let result: JeffJSValue
     if let u = userExec {
@@ -1370,10 +1378,17 @@ func js_regexp_Symbol_search(
         result = js_regexp_exec(ctx: ctx, this: this, argv: argv)
     }
 
-    // Restore lastIndex.
-    js_regexp_setLastIndex(obj, value: savedLastIndex)
-
     if result.isException {
+        return .exception
+    }
+
+    // Restore lastIndex (steps 7-8: only when it changed).
+    guard let nowLastIndex = js_regexp_getLastIndex(ctx, obj) else {
+        result.freeValue()
+        return .exception
+    }
+    if nowLastIndex != savedLastIndex, !js_regexp_setLastIndex(ctx, obj, value: savedLastIndex) {
+        result.freeValue()
         return .exception
     }
     if result.isNull {
@@ -1745,11 +1760,11 @@ func js_regexp_string_iterator_next(
     if let resObj = result.toObject() {
         let matchStr = resObj.getArrayElement(0)
         if let ms = matchStr.stringValue, ms.len == 0 {
-            var li = js_regexp_getLastIndex(data.iteratingRegExp)
-            li = js_regexp_advanceIndex(
-                data.iteratedString, index: li, unicode: data.isUnicode
-            )
-            js_regexp_setLastIndex(data.iteratingRegExp, value: li)
+            guard let li = js_regexp_getLastIndex(ctx, data.iteratingRegExp),
+                  js_regexp_setLastIndex(ctx, data.iteratingRegExp,
+                                         value: js_regexp_advanceIndex(data.iteratedString, index: li, unicode: data.isUnicode)) else {
+                return .exception
+            }
         }
     }
 
@@ -1832,39 +1847,56 @@ private func js_regexp_compile(
     return bc
 }
 
-/// Get the `lastIndex` property value from a RegExp object.
-///
-/// QuickJS stores lastIndex as the FIRST property of every RegExp for
-/// fast-path access (property index 0).
-///
-/// Mirrors QuickJS fast-path `lastIndex` access.
-private func js_regexp_getLastIndex(_ obj: JeffJSObject) -> Int {
-    // Try the fast path: first property.
-    if !obj.propValues.isEmpty {
-        if case .value(let v) = obj.propEntry(at: 0) {
-            if v.isInt {
-                return Int(v.toInt32())
-            } else if v.isFloat64 {
-                // `Int(d)` trapped on `re.lastIndex = Infinity` / 1e20.
-                return jeffJS_intArg(v.toFloat64())
-            }
-        }
-    }
-    return 0
+/// Whether slot 0 of a RegExp is its own `lastIndex` data property (every RegExp
+/// instance gets it first, non-configurable, so it stays there), and writable.
+@inline(__always)
+private func js_regexp_lastIndexSlot(_ obj: JeffJSObject, writable: Bool) -> Bool {
+    guard obj.propValues.count > 0, let sh = obj.shape, !sh.prop.isEmpty,
+          sh.prop[0].atom == JeffJSAtomID.JS_ATOM_lastIndex.rawValue,
+          !sh.prop[0].flags.isGetSet, obj.extra(at: 0) == nil else { return false }
+    return !writable || sh.prop[0].flags.contains(.writable)
 }
 
-/// Set the `lastIndex` property on a RegExp object.
+/// `ToLength(? Get(R, "lastIndex"))` (ES §22.2.7.2 RegExpBuiltinExec step 2). nil when
+/// reading or converting it threw (a `valueOf` on an object `lastIndex`).
 ///
-/// Uses the fast path (property index 0).
-private func js_regexp_setLastIndex(_ obj: JeffJSObject, value: Int) {
+/// The fast path reads slot 0 (QuickJS keeps lastIndex as the first property); a value
+/// that is not a number goes through ToNumber — `re.lastIndex = "1"` was read as 0.
+private func js_regexp_getLastIndex(_ ctx: JeffJSContext, _ obj: JeffJSObject) -> Int? {
+    if js_regexp_lastIndexSlot(obj, writable: false) {
+        let v = obj.propValues[0]
+        // `Int(d)` trapped on `re.lastIndex = Infinity` / 1e20.
+        if v.isInt { return max(0, Int(v.toInt32())) }
+        if v.isFloat64 { return max(0, jeffJS_intArg(v.toFloat64())) }
+    }
+    let v = ctx.getProperty(obj: .borrowedObject(obj), atom: JeffJSAtomID.JS_ATOM_lastIndex.rawValue)
+    if v.isException { return nil }
+    let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: v)
+    v.freeValue()
+    if !ok { return nil }
+    return max(0, jeffJS_intArg(d))
+}
+
+/// `? Set(R, "lastIndex", value, true)`. false with a TypeError pending when the
+/// property is read-only (`Object.freeze(/a/g).exec("a")`).
+///
+/// The fast path writes slot 0 like any own data-property write: the replaced value
+/// is released. It used to store over slot 0 without releasing it (a string or object
+/// a page had assigned to `lastIndex` leaked on the next global/sticky exec), without
+/// checking that the property was writable, and appended a slot with no shape entry
+/// when the object had none.
+@discardableResult
+private func js_regexp_setLastIndex(_ ctx: JeffJSContext, _ obj: JeffJSObject, value: Int) -> Bool {
     // `Int32(value)` trapped past 2^31 (a lastIndex advanced from 2^53).
     let v = value >= Int(Int32.min) && value <= Int(Int32.max)
         ? JeffJSValue.newInt32(Int32(value)) : JeffJSValue.newFloat64(Double(value))
-    if !obj.propValues.isEmpty {
-        obj.setPropEntry(at: 0, .value(v))
-    } else {
-        obj.appendProp(.value(v))
+    if js_regexp_lastIndexSlot(obj, writable: true) {
+        let old = obj.propValues[0]
+        obj.propValues[0] = v
+        old.freeValue()
+        return true
     }
+    return ctx.setProperty(obj: .borrowedObject(obj), atom: JeffJSAtomID.JS_ATOM_lastIndex.rawValue, value: v) >= 0
 }
 
 /// Advance a string index by one code point, handling surrogate pairs

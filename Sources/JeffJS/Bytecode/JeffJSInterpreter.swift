@@ -2128,8 +2128,27 @@ extension JeffJSContext {
         return true
     }
 
-    /// Defines a global function.
+    /// Defines a global function: CreateGlobalFunctionBinding (ES §9.1.1.4.18) with the
+    /// CanDeclareGlobalFunction check (§9.1.1.4.16) of GlobalDeclarationInstantiation
+    /// (§16.1.7). Over a configurable (or absent) property it is the full definition it
+    /// always was; over a **non-configurable** one it may only replace the value (the
+    /// property keeps its attributes), and only when that property is a writable,
+    /// enumerable data property — otherwise a TypeError (`function NaN(){}`, a function
+    /// over a non-configurable accessor). It used to replace any property outright,
+    /// attributes and all (`definePropertyValue` never refuses).
     func defineGlobalFunc(atom: UInt32, val: JeffJSValue, flags: Int) -> Bool {
+        if let g = globalObj.toObject(), let shape = g.shape {
+            let idx = jeffJS_findOwnPropertyIndex(obj: g, atom: atom)
+            if idx >= 0, idx < shape.prop.count, !shape.prop[idx].flags.contains(.configurable) {
+                let f = shape.prop[idx].flags
+                guard !f.isGetSet, f.contains(.writable), f.contains(.enumerable) else {
+                    _ = throwTypeError(message: "Can't declare global function '\(rt.atomToString(atom) ?? "")': property is not configurable")
+                    return false
+                }
+                return defineProperty(obj: globalObj, atom: atom, value: val,
+                                      flags: JS_PROP_DEFINE_PROPERTY | JS_PROP_HAS_VALUE | JS_PROP_THROW) >= 0
+            }
+        }
         return definePropertyValue(obj: globalObj, atom: atom, value: val,
                                    flags: flags | JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) >= 0
     }

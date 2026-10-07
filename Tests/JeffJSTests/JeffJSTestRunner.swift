@@ -362,6 +362,7 @@ struct JeffJSTestRunner {
             ("LazyPayload", { $0.testLazyPayload() }),
             ("IntrinsicAttributes", { $0.testIntrinsicAttributes() }),
             ("DefineOverExisting", { $0.testDefineOverExisting() }),
+            ("EngineMisc", { $0.testEngineMisc() }),
         ]
     }
 

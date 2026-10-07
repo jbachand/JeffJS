@@ -455,11 +455,16 @@ func js_proxy_set(_ ctx: JeffJSContext,
 
     let trap = getTrap(ctx, pd.handler, JSPredefinedAtom.set.rawValue)
     if trap.isUndefined {
-        // Fall through to target.
-        if let targetObj = pd.target.toObject() {
-            targetObj.setOwnPropertyValue(atom: atom, value: value.dupValue())
-        }
-        return .JS_TRUE
+        // No trap: target.[[Set]](P, V, Receiver) (ES §10.5.9 step 6) — an ordinary
+        // [[Set]] that walks the target's prototype chain (setters run with `this` =
+        // receiver) and defines on the receiver. It wrote the target's own slot directly
+        // (`setOwnPropertyValue`, which also does nothing for a key the target lacks).
+        // (The interpreter's path is JeffJSContext.setPropertyInternal → proxySetWithoutTrap.)
+        let key = ctx.proxyTrapKey(atom)
+        let r = ctx.reflectSet(pd.target, key: key, atom: atom, value: value, receiver: receiver)
+        key.freeValue()
+        if r < 0 { return .exception }
+        return r > 0 ? .JS_TRUE : .JS_FALSE
     }
 
     // Call trap(target, key, value, receiver).

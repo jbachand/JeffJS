@@ -1797,13 +1797,11 @@ struct JeffJSBuiltinObject {
         let desc = ctx.newPlainObject()
         if desc.isException { return desc }
         defer { desc.freeValue() }   // a throwaway; the property keeps its own refs
-        // By name, not by `JSAtomID.get`/`JSAtomID.set`: the predefined table
-        // has *two* atoms spelled "set" (`set` = 68 and `set_` = 355), and
-        // `definePropertyFromDescriptor` reads the descriptor through
-        // `rt.findAtom("set")`, which resolves to the other one. The setter
-        // written under atom 68 was therefore invisible and
-        // `__defineSetter__` quietly installed a `{ writable: false }` data
-        // property instead of an accessor.
+        // By name. (The predefined table used to have two atoms spelled "set",
+        // 68 and 355, and `rt.findAtom("set")` answered 355: a setter written
+        // under `JSAtomID.set` was invisible and `__defineSetter__` installed a
+        // `{ writable: false }` data property. The table has one "set" now —
+        // JSPredefinedAtom "Duplicate names".)
         _ = ctx.setPropertyStr(obj: desc, name: "get", value: getter.dupValue())
         _ = ctx.setPropertyStr(obj: desc, name: "enumerable", value: .JS_TRUE)
         _ = ctx.setPropertyStr(obj: desc, name: "configurable", value: .JS_TRUE)
