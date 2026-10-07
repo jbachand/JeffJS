@@ -2617,10 +2617,7 @@ func jeffJS_findOwnPropertyIndex(obj: JeffJSObject, atom: UInt32) -> Int {
     guard let idx = findShapeProperty(shape, atom) else {
         // Safety net for paths that look up own properties without a
         // chokepoint: a lazy payload stub builds its top level, then retries.
-        if (obj.lazyFlags & JeffJSObject.lazyPayloadBit) != 0 {
-            jeffJS_lazyMaterialize(obj)
-            return jeffJS_findOwnPropertyIndex(obj: obj, atom: atom)
-        }
+        if (obj.lazyFlags & JeffJSObject.lazyPayloadBit) != 0 { return jeffJS_findOwnPropertyIndexLazy(obj, atom) }
         return -1
     }
     // Soft-recover shape/prop desync: pad missing value slots so the caller
@@ -2630,6 +2627,14 @@ func jeffJS_findOwnPropertyIndex(obj: JeffJSObject, atom: UInt32) -> Int {
             obj.appendDataValue(.undefined)
         }
     }
+    return idx
+}
+
+/// `jeffJS_findOwnPropertyIndex` on a lazy payload stub (out of line).
+@inline(never)
+func jeffJS_findOwnPropertyIndexLazy(_ obj: JeffJSObject, _ atom: UInt32) -> Int {
+    jeffJS_lazyMaterialize(obj)
+    guard let shape = obj.shape, let idx = findShapeProperty(shape, atom), idx < obj.propValues.count else { return -1 }
     return idx
 }
 

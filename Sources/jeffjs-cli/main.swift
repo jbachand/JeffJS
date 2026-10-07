@@ -206,6 +206,9 @@ let status: Int32 = MainActor.assumeIsolated {
     // objects, malloc bytes in use since the environment was created, and
     // the per-object average (all engine bytes / live JS objects).
     if args.contains("--heap-report") {
+        // --lazy-evict: what a memory-pressure pass gives back first (lazy
+        // JSON payload objects still exactly what their spans say).
+        if args.contains("--lazy-evict") { print("[lazy] evicted=\(env.evictLazyPayloads())") }
         for _ in 0..<3 { env.runGC() }
         let g = env.gcStatistics
         let delta = cliMallocInUse() - mallocAtStart

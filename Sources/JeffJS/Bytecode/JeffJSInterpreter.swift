@@ -8071,7 +8071,7 @@ struct JeffJSInterpreter {
             // -----------------------------------------------------------------
 
             case .with_get_var, .with_put_var, .with_delete_var,
-                 .with_make_ref, .with_get_ref, .with_get_ref_undef:
+                 .with_make_ref, .with_get_ref, .with_get_ref_undef, .lazy_literal:
                 // Wide opcodes: they only ever arrive through the 0x00 prefix
                 // (handled in `.invalid`), never as a raw dispatch value.
                 _ = ctx.throwInternalError(message: "wide opcode dispatched directly at pc=\(pc)")
@@ -8366,12 +8366,6 @@ struct JeffJSInterpreter {
                 let a = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let b = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 buf[sp] = a; sp += 1; buf[sp] = b; sp += 1
                 pc += 1
-
-            case .lazy_literal:
-                // Wide opcode: only ever arrives through the 0x00 prefix.
-                _ = ctx.throwInternalError(message: "wide opcode dispatched directly at pc=\(pc)")
-                retVal = .exception
-                break dispatchLoop
 
             case .private_in:
                 // Wide opcode: normally dispatched through the 0x00 prefix

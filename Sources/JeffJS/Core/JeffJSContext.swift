@@ -5206,8 +5206,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return .JS_UNDEFINED
         }
 
-        // A lazy payload stub builds its top level first (JeffJSLazyPayload.swift).
-        jsObj.ensureLazyMaterialized()
+        // Deferred own properties first: a lazy payload stub builds its top
+        // level (JeffJSLazyPayload.swift) before the exotic fast paths below;
+        // a function's `prototype` / `name` / `length` and an error's `stack`.
+        if (jsObj.lazyFlags & JeffJSObject.lazyActiveMask) != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
 
         // Proxy intercept: if this object is a proxy, dispatch to handler.get trap
         if jsObj.classID == JeffJSClassID.proxy.rawValue || jsObj.classID == JSClassID.JS_CLASS_PROXY.rawValue {
@@ -5306,10 +5308,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             }
         }
 
-        // Lazily materialize `F.prototype = { constructor: F }` for plain
-        // function closures (creation deferred at closure time — most
-        // closures never have their prototype read).
-        if (jsObj.lazyFlags & JeffJSObject.lazyActiveMask) != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
+        // (Deferred own properties were materialized at the top.)
 
         // Check own properties via shape-based lookup (index form avoids
         // copying JeffJSProperty enums across the call boundary).
@@ -5416,9 +5415,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return -1
         }
 
-        // Deferred own properties.
-        jsObj.ensureLazyMaterialized()
+        // Deferred own properties (a lazy payload stub builds its top level).
         if (jsObj.lazyFlags & JeffJSObject.lazyActiveMask) != 0 {
+        jsObj.ensureLazyMaterialized()
         if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
             // `F.prototype = x` replaces the default `{ constructor: F }`
             // object outright, so don't build it first: that pair's
@@ -6230,12 +6229,8 @@ extension JeffJSObject {
     var proto: JeffJSObject? {
         get { return _proto }
         set {
-            // A lazy payload stub never serves as a prototype unmaterialized:
-            // prototype-chain walks read shapes directly.
-            newValue?.ensureLazyMaterialized()
-            ensureLazyMaterialized()
             _proto = newValue
-            guard let s = shape else {
+            guard var s = shape else {
                 // No shape means nowhere to keep the count. Every creation
                 // path assigns the shape first; this is the belt-and-braces
                 // case (a hand-built object handed to `setPrototypeOf`).
@@ -6249,6 +6244,16 @@ extension JeffJSObject {
                 return
             }
             if s.proto === newValue { return }
+            // A lazy payload stub never serves as a prototype unmaterialized
+            // (prototype-chain walks read shapes directly), and a stub whose
+            // prototype changes builds its top level first.
+            if let nv = newValue, (nv.lazyFlags & JeffJSObject.lazyPayloadBit) != 0 { jeffJS_lazyMaterialize(nv) }
+            if (lazyFlags & JeffJSObject.lazyPayloadBit) != 0 {
+                jeffJS_lazyMaterialize(self)
+                guard let s2 = shape else { return }
+                s = s2
+                if s.proto === newValue { return }
+            }
             // A shared shape (hashed, or several owners) describes every object
             // with that prototype, so this object needs its own copy first.
             if s.isHashed || s.refCount > 1,

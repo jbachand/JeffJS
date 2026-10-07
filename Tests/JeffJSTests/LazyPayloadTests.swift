@@ -18,6 +18,12 @@ final class LazyPayloadTests: XCTestCase {
         var lpText = JSON.stringify({ items: lpItems(3000), meta: { count: 3000 } });
         """
 
+    /// The payload counts below assume the default 16 KB thresholds (a stress
+    /// run with tiny thresholds makes the setup code's literals lazy too).
+    private static var defaultThresholds: Bool {
+        jeffJS_jsonLazyThreshold == 16384 && jeffJS_lazyLiteralMinBytes == 16384
+    }
+
     private func evalBool(_ ctx: JeffJSContext, _ js: String, _ what: String,
                           file: StaticString = #filePath, line: UInt = #line) {
         let r = ctx.eval(input: js, filename: "<lazy-test>", evalFlags: 0)
@@ -42,6 +48,7 @@ final class LazyPayloadTests: XCTestCase {
     /// of objects, not 12 000.
     func testParseCostsWhatIsRead() throws {
         try XCTSkipUnless(jeffJS_jsonLazyEnabled, "JEFFJS_JSON_LAZY=0")
+        try XCTSkipUnless(Self.defaultThresholds, "counts assume the default thresholds")
         let rt = JeffJSRuntime()
         let ctx = rt.newContext()
         defer { ctx.free(); rt.free() }
@@ -106,6 +113,7 @@ final class LazyPayloadTests: XCTestCase {
     /// A large pure-data literal compiles to a lazy payload equal to the parse.
     func testLargeLiteralIsLazy() throws {
         try XCTSkipUnless(jeffJS_lazyLiteralsEnabled, "JEFFJS_COMPILE_LAZYLITERALS=0")
+        try XCTSkipUnless(Self.defaultThresholds, "counts assume the default thresholds")
         let rt = JeffJSRuntime()
         let ctx = rt.newContext()
         defer { ctx.free(); rt.free() }

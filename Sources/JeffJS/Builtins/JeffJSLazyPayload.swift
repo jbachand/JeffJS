@@ -92,8 +92,13 @@ nonisolated final class JeffJSLazyPayloadBuffer {
     weak var ctx: JeffJSContext?
     /// Slot in `JeffJSLazyPayloadState.buffers`.
     var index: Int = -1
-    /// Records (stubs and materialized objects) that point at this buffer.
+    /// Records that point at this buffer: every unmaterialized stub, and the
+    /// root (kept after it materializes: eviction walks down from it).
     var liveRecords: Int = 0
+    /// The payload's root object (unretained; cleared when it is freed) and
+    /// its span start. Eviction starts there.
+    var root: Unmanaged<JeffJSObject>? = nil
+    var rootStart: Int = 0
     /// Short string values already built from this buffer (≤ 24 bytes,
     /// no escapes): one string per spelling, as the eager parse dedups.
     /// Holds one reference each; released with the buffer.
@@ -180,11 +185,27 @@ nonisolated final class JeffJSLazyPayloadState {
         guard let r = records.removeValue(forKey: key) else { return }
         let bi = Int(r >> 32)
         guard bi < buffers.count, let b = buffers[bi] else { return }
+        if let root = b.root, root.toOpaque() == Unmanaged.passUnretained(o).toOpaque() { b.root = nil }
         b.liveRecords -= 1
         if b.liveRecords <= 0 {
             buffers[bi] = nil
             freeSlots.append(bi)
             b.releaseStrings()
+        }
+    }
+
+    /// A non-root object finished materializing: it is an ordinary object
+    /// now and needs no record (eviction re-derives its span from its
+    /// parent's). Records are the frontier, not the whole read set.
+    func dropMaterialized(_ o: JeffJSObject, _ b: JeffJSLazyPayloadBuffer) {
+        if let root = b.root, root.toOpaque() == Unmanaged.passUnretained(o).toOpaque() { return }
+        forget(o)
+        // A Dictionary keeps its high-water capacity: a 20 000-element array's
+        // stubs, once read, would leave 32 K empty buckets behind.
+        if records.capacity > 4096, records.count * 8 < records.capacity {
+            var shrunk = [UInt: UInt64](minimumCapacity: records.count * 2)
+            for (k, v) in records { shrunk[k] = v }
+            records = shrunk
         }
     }
 
@@ -692,7 +713,10 @@ extension JeffJSContext {
         if literal { st.literalPayloads += 1 }
         st.payloadBytes += v.end - start
         let isArray = source.withBytes { $0[start] == 0x5B }
-        return newLazyStub(b, start: start, array: isArray)
+        let v = newLazyStub(b, start: start, array: isArray)
+        if let o = v.toObject() { b.root = Unmanaged.passUnretained(o) }
+        b.rootStart = start
+        return v
     }
 
     /// JSON.parse's lazy path: nil = take the eager parser (too small,
@@ -713,7 +737,18 @@ extension JeffJSContext {
             rt.lazyPayload.fallbacks += 1
             return nil
         }
-        return newLazyPayloadRoot(source: JeffJSByteArraySource(bytes), start: start, validation: v, literal: false)
+        // The buffer lives as long as the payload: no transcoding slack
+        // (jeffJS_utf8Bytes reserves 1.5x for a UTF-16 string).
+        var kept = bytes
+        if bytes.capacity - bytes.count > bytes.count / 16 {
+            kept = [UInt8](unsafeUninitializedCapacity: bytes.count) { buf, n in
+                bytes.withUnsafeBufferPointer { src in
+                    if let d = buf.baseAddress, let s = src.baseAddress { d.update(from: s, count: src.count) }
+                }
+                n = bytes.count
+            }
+        }
+        return newLazyPayloadRoot(source: JeffJSByteArraySource(kept), start: start, validation: v, literal: false)
     }
 }
 
@@ -735,6 +770,7 @@ func jeffJS_lazyMaterialize(_ o: JeffJSObject) {
             jeffJS_lazyMaterializeArray(ctx, rt, o, b, p, start)
         }
     }
+    rt.lazyPayload.dropMaterialized(o, b)
 }
 
 /// The value at i (validated); advances i past it. Owned.
@@ -847,126 +883,146 @@ private func jeffJS_lazyMaterializeArray(_ ctx: JeffJSContext, _ rt: JeffJSRunti
 
 extension JeffJSRuntime {
     /// Revert every pristine object materialized from a lazy payload back to
-    /// a stub (bottom-up: children before parents). Call with no JS on the
-    /// stack. Returns the number of objects reverted.
+    /// a stub, walking down from each live root (children first). Call with
+    /// no JS on the stack. Returns the number of objects reverted.
     @discardableResult
     func evictLazyPayloads() -> Int {
         guard inlineStackTop == 0, gcPhase == .JS_GC_PHASE_NONE, !inFreeChain else { return 0 }
         let st = lazyPayload
-        guard !st.records.isEmpty else { return 0 }
-        // Materialized records, deepest spans first (a child's span starts
-        // after its parent's): one pass reverts whole untouched subtrees.
-        var cands: [(UInt64, UInt)] = []
-        for (k, r) in st.records {
-            let o = Unmanaged<JeffJSObject>.fromOpaque(UnsafeRawPointer(bitPattern: k)!).takeUnretainedValue()
-            if !o.isLazyPayloadStub { cands.append((r, k)) }
-        }
-        cands.sort { $0.0 > $1.0 }
         var n = 0
-        for (_, k) in cands {
-            let o = Unmanaged<JeffJSObject>.fromOpaque(UnsafeRawPointer(bitPattern: k)!).takeUnretainedValue()
-            if jeffJS_lazyRevertIfPristine(self, o) { n += 1 }
+        for b in st.buffers {
+            guard let b, let r = b.root else { continue }
+            let root = r.takeUnretainedValue()
+            if root.isLazyPayloadStub { continue }
+            _ = JSONEvict(rt: self, b: b).tree(root, b.rootStart, depth: 0, count: &n)
         }
         st.evicted += n
         return n
     }
 }
 
-/// True (and `o` is a stub again) when `o` is exactly what its span
-/// materializes to.
-private func jeffJS_lazyRevertIfPristine(_ rt: JeffJSRuntime, _ o: JeffJSObject) -> Bool {
-    guard !o.isLazyPayloadStub, o.extensible, o._propExtraCount == 0, o._auxU == nil || o.classID == JSClassID.JS_CLASS_ARRAY.rawValue,
-          let (b, start) = rt.lazyPayload.record(o), let ctx = b.ctx,
-          let shape = o.shape, shape.deletedPropCount == 0 else { return false }
-    let isArray = o.classID == JSClassID.JS_CLASS_ARRAY.rawValue
-    let pristine: Bool = b.source.withBytes { p in
-        if isArray {
-            guard p[start] == 0x5B, o.fastArray, let st = o._fastArrayValues, !st.checked, st.attrs == nil,
-                  let cached = ctx.arrayShape, shape === cached, o.propValues.count == 1,
-                  o.firstWeakRef == nil, o.storedPrimitiveValue.isUndefined else { return false }
-            if let a = o.aux, a.rare != nil && (a.weakrefCount != 0) { return false }
+/// One payload's eviction walk.
+private struct JSONEvict {
+    let rt: JeffJSRuntime
+    let b: JeffJSLazyPayloadBuffer
+
+    /// True when `o` is a stub (already, or reverted here). Reverts the
+    /// subtree bottom-up; `count` gets the objects reverted.
+    func tree(_ o: JeffJSObject, _ start: Int, depth: Int, count: inout Int) -> Bool {
+        if o.isLazyPayloadStub { return true }
+        guard depth < 256, let ctx = b.ctx, let children = structure(o, start, ctx) else { return false }
+        var allStubs = true
+        for (c, s) in children {
+            if !tree(c, s, depth: depth + 1, count: &count) { allStubs = false; continue }
+            // Its parent may let it go only if nothing else holds it.
+            if c.refCount != 1 || c._auxU != nil { allStubs = false }
+        }
+        guard allStubs else { return false }
+        revert(o, start, ctx)
+        count += 1
+        return true
+    }
+
+    /// The (object, span) of every container-valued slot when `o` holds
+    /// exactly what its span says apart from those children (same keys in
+    /// the same order with default flags, equal primitives, default
+    /// prototype, extensible, no side box), else nil.
+    func structure(_ o: JeffJSObject, _ start: Int, _ ctx: JeffJSContext) -> [(JeffJSObject, Int)]? {
+        guard o.extensible, o._propExtraCount == 0, o._auxU == nil, let shape = o.shape,
+              shape.deletedPropCount == 0 else { return nil }
+        let isArray = o.classID == JSClassID.JS_CLASS_ARRAY.rawValue
+        var children: [(JeffJSObject, Int)] = []
+        let ok: Bool = b.source.withBytes { p in
+            if isArray {
+                guard p[start] == 0x5B, o.fastArray, let st = o._fastArrayValues, !st.checked, st.attrs == nil,
+                      let cached = ctx.arrayShape, shape === cached, o.propValues.count == 1 else { return false }
+                var i = start + 1
+                var k = 0
+                lzSkipWS(p, &i)
+                if p[i] != 0x5D {
+                    while true {
+                        lzSkipWS(p, &i)
+                        guard k < Int(st.count), k < st.values.count,
+                              lzSameValue(rt, b, p, &i, st.values[k], &children) else { return false }
+                        k += 1
+                        lzSkipWS(p, &i)
+                        if p[i] == 0x2C { i += 1; continue }
+                        break
+                    }
+                }
+                guard k == Int(st.count) else { return false }
+                let len = o.propValues[0]
+                return len.isInt && Int(len.toInt32()) == k
+            }
+            guard p[start] == 0x7B, o.classID == JSClassID.JS_CLASS_OBJECT.rawValue,
+                  let proto = ctx.classProto[JSClassID.JS_CLASS_OBJECT.rawValue].toObject(),
+                  shape.proto === proto else { return false }
+            // Expected (key, value-span) list with duplicate keys folded.
+            var keys: [UInt32] = []
+            var spans: [Int] = []
             var i = start + 1
-            var k = 0
             lzSkipWS(p, &i)
-            if p[i] != 0x5D {
+            if p[i] != 0x7D {
                 while true {
                     lzSkipWS(p, &i)
-                    guard k < Int(st.count), k < st.values.count,
-                          lzSameValue(rt, b, p, &i, st.values[k]) else { return false }
-                    k += 1
+                    let qs = i
+                    lzSkipString(p, &i)
+                    let atom = jeffJS_lazyKeyAtom(rt, p, qs, i)
+                    lzSkipWS(p, &i); i += 1; lzSkipWS(p, &i)
+                    let vs = i
+                    lzSkipAny(b, p, &i)
+                    if let at = keys.firstIndex(of: atom) { spans[at] = vs; rt.freeAtom(atom) }
+                    else { keys.append(atom); spans.append(vs) }
                     lzSkipWS(p, &i)
                     if p[i] == 0x2C { i += 1; continue }
                     break
                 }
             }
-            guard k == Int(st.count) else { return false }
-            let len = o.propValues[0]
-            return len.isInt && Int(len.toInt32()) == k
-        }
-        guard p[start] == 0x7B, o.classID == JSClassID.JS_CLASS_OBJECT.rawValue,
-              let proto = ctx.classProto[JSClassID.JS_CLASS_OBJECT.rawValue].toObject(),
-              shape.proto === proto else { return false }
-        // Expected (key, value-span) list with duplicate keys folded.
-        var keys: [UInt32] = []
-        var spans: [Int] = []
-        var i = start + 1
-        lzSkipWS(p, &i)
-        var ok = true
-        if p[i] != 0x7D {
-            while true {
-                lzSkipWS(p, &i)
-                let qs = i
-                lzSkipString(p, &i)
-                let atom = jeffJS_lazyKeyAtom(rt, p, qs, i)
-                lzSkipWS(p, &i); i += 1; lzSkipWS(p, &i)
-                let vs = i
-                lzSkipAny(b, p, &i)
-                if let at = keys.firstIndex(of: atom) { spans[at] = vs; rt.freeAtom(atom) }
-                else { keys.append(atom); spans.append(vs) }
-                lzSkipWS(p, &i)
-                if p[i] == 0x2C { i += 1; continue }
-                break
+            defer { for a in keys { rt.freeAtom(a) } }
+            guard keys.count == shape.propCount, keys.count == o.propValues.count else { return false }
+            for k in 0..<keys.count {
+                let sp = shape.prop[k]
+                guard sp.atom == keys[k], sp.flags.rawValue == JeffJSPropertyFlags.cWE.rawValue else { return false }
+                var vi = spans[k]
+                guard lzSameValue(rt, b, p, &vi, o.propValues[k], &children) else { return false }
             }
+            return true
         }
-        defer { for a in keys { rt.freeAtom(a) } }
-        guard keys.count == shape.propCount, keys.count == o.propValues.count else { return false }
-        for k in 0..<keys.count {
-            let sp = shape.prop[k]
-            guard sp.atom == keys[k], sp.flags.rawValue == JeffJSPropertyFlags.cWE.rawValue else { ok = false; break }
-            var vi = spans[k]
-            guard lzSameValue(rt, b, p, &vi, o.propValues[k]) else { ok = false; break }
+        return ok ? children : nil
+    }
+
+    /// Back to a stub: the slots (and the child stubs they hold) go, the
+    /// sentinel shape and the record come back.
+    func revert(_ o: JeffJSObject, _ start: Int, _ ctx: JeffJSContext) {
+        let isArray = o.classID == JSClassID.JS_CLASS_ARRAY.rawValue
+        let sentinel = ctx.lazySentinelShape(array: isArray)
+        rt.inFreeChain = true
+        let n = o.propValues.count
+        var vals: [JeffJSValue] = []
+        vals.reserveCapacity(n)
+        for k in 0..<n { vals.append(o.propValues[k]) }
+        o.propValues.removeAll(keepingCapacity: false)
+        var elems: ContiguousArray<JeffJSValue> = []
+        if isArray, let st = o._fastArrayValues {
+            elems = st.values
+            let cnt = Int(st.count)
+            if elems.count > cnt { elems.removeLast(elems.count - cnt) }
+            o._fastArrayValues = nil
+            o.fastArray = false
         }
-        return ok
+        let old = o.shape!
+        sentinel.refCount += 1
+        o.shape = sentinel
+        jeffJS_leaveShape(rt, old)
+        o.lazyFlags |= JeffJSObject.lazyPayloadBit
+        if (o.lazyFlags & JeffJSObject.lazyOriginBit) == 0 { rt.lazyPayload.addRecord(o, b, start: start) }
+        for v in vals { v.freeValue() }
+        for v in elems { v.freeValue() }
+        rt.inFreeChain = false
+        while let d = rt.gcZeroRefCountObjects.popLast() {
+            if d.refCount == 0 { freeGCObjectAtZeroRefcount(rt, d) }
+        }
     }
-    guard pristine else { return false }
-    // Revert: slots (and the child stubs they hold) go, the sentinel comes back.
-    let sentinel = ctx.lazySentinelShape(array: isArray)
-    rt.inFreeChain = true
-    let n = o.propValues.count
-    var vals: [JeffJSValue] = []
-    vals.reserveCapacity(n)
-    for k in 0..<n { vals.append(o.propValues[k]) }
-    o.propValues.removeAll(keepingCapacity: false)
-    var elems: ContiguousArray<JeffJSValue> = []
-    if isArray, let st = o._fastArrayValues {
-        elems = st.values
-        let cnt = Int(st.count)
-        if elems.count > cnt { elems.removeLast(elems.count - cnt) }
-        o._fastArrayValues = nil
-        o.fastArray = false
-    }
-    let old = o.shape!
-    sentinel.refCount += 1
-    o.shape = sentinel
-    jeffJS_leaveShape(rt, old)
-    o.lazyFlags |= JeffJSObject.lazyPayloadBit
-    for v in vals { v.freeValue() }
-    for v in elems { v.freeValue() }
-    rt.inFreeChain = false
-    while let d = rt.gcZeroRefCountObjects.popLast() {
-        if d.refCount == 0 { freeGCObjectAtZeroRefcount(rt, d) }
-    }
-    return true
 }
 
 /// Past any value at i.
@@ -981,17 +1037,23 @@ private func lzSkipAny(_ b: JeffJSLazyPayloadBuffer, _ p: UnsafeBufferPointer<UI
     }
 }
 
-/// Is `v` what the value at i materializes to (a container: an untouched
-/// stub of that span that only its parent holds)? Advances i.
+/// Is `v` what the value at i materializes to? A container only has to be
+/// an object (collected into `children` with its span for the caller to
+/// check). Advances i.
 private func lzSameValue(_ rt: JeffJSRuntime, _ b: JeffJSLazyPayloadBuffer, _ p: UnsafeBufferPointer<UInt8>,
-                         _ i: inout Int, _ v: JeffJSValue) -> Bool {
+                         _ i: inout Int, _ v: JeffJSValue, _ children: inout [(JeffJSObject, Int)]) -> Bool {
     let c = p[i]
     switch c {
     case 0x7B, 0x5B:
         let s = i
         lzSkipContainer(b, p, &i)
-        guard let co = v.toObject(), co.isLazyPayloadStub, co.refCount == 1, co._auxU == nil,
-              let (cb, cs) = rt.lazyPayload.record(co), cb === b, cs == s else { return false }
+        guard let co = v.toObject(), co.classID == (c == 0x5B ? JSClassID.JS_CLASS_ARRAY.rawValue
+                                                              : JSClassID.JS_CLASS_OBJECT.rawValue) else { return false }
+        if co.isLazyPayloadStub {
+            // A stub must be this span's.
+            guard let (cb, cs) = rt.lazyPayload.record(co), cb === b, cs == s else { return false }
+        }
+        children.append((co, s))
         return true
     case 0x22:
         let qs = i

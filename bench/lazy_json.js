@@ -66,7 +66,15 @@ report("json_partial", t0, t1, t2, base);
 var t3 = now(); var s2 = JSON.stringify(y); var t4 = now();
 var full = stats();
 console.log("json_full\tstringify_ms\t" + (t4 - t3) + "\tobjects\t" + (full.objects - base.objects) + "\tmalloc_MB\t" + ((full.malloc - base.malloc) / 1048576).toFixed(2) + "\tsame\t" + (s2 === text));
-s2 = null; y = null;
+s2 = null;
+// Memory pressure: pristine objects revert to their spans (lazy only).
+if (typeof __lazyEvict === "function") {
+  var te = now(); var nEv = +__lazyEvict(); var te2 = now();
+  var ev = stats();
+  var tr = now(); firstRender(y); var tr2 = now();
+  console.log("json_evicted\tevict_ms\t" + (te2 - te) + "\treverted\t" + nEv + "\tobjects\t" + (ev.objects - base.objects) + "\tmalloc_MB\t" + ((ev.malloc - base.malloc) / 1048576).toFixed(2) + "\treread_ms\t" + (tr2 - tr));
+}
+y = null;
 // 2. Inline-script literal (`var ytInitialData = {…}`), through indirect eval.
 base = stats();
 t0 = now();
