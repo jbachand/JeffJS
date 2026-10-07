@@ -1997,6 +1997,10 @@ extension JeffJSIntlBridge {
       var allCtors = ctors.concat([Locale]);
       for (var ci = 0; ci < allCtors.length; ci++) {
         var C = allCtors[ci], tagName = 'Intl.' + C.name;
+        // A builtin constructor's `prototype` is { writable: false, enumerable:
+        // false, configurable: false } (ECMA-402 §11.2.1 & co.); a function
+        // declaration's is writable.
+        try { Object.defineProperty(C, 'prototype', { writable: false }); } catch (e) {}
         markNative(C, true);
         nativeMembers(C);
         nativeMembers(C.prototype);

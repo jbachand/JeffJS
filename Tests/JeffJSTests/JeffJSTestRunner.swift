@@ -358,6 +358,7 @@ struct JeffJSTestRunner {
             ("Realms", { $0.testRealms() }),
             ("RealmsDOM", { $0.testRealmsDOM() }),
             ("LazyPayload", { $0.testLazyPayload() }),
+            ("IntrinsicAttributes", { $0.testIntrinsicAttributes() }),
         ]
     }
 

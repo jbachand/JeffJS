@@ -24,14 +24,12 @@ extension JeffJSContext {
         }
     }
 
-    /// Wire constructor.prototype and prototype.constructor.
-    /// Per ES spec, `constructor` on prototypes is writable+configurable but NOT enumerable.
+    /// Wire constructor.prototype and prototype.constructor with the spec's
+    /// attributes (defineIntrinsicPrototypeLink). Consumes `proto`, like the
+    /// setPropertyStr it replaced; `proto.constructor` takes a new count.
     func setConstructorProto(ctor: JeffJSValue, proto: JeffJSValue) {
-        _ = setPropertyStr(obj: ctor, name: "prototype", value: proto)
-        let atom = rt.findAtom("constructor")
-        _ = definePropertyValue(obj: proto, atom: atom, value: ctor,
-                                flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
-        rt.freeAtom(atom)
+        defineIntrinsicPrototypeLink(ctor: ctor, proto: proto)
+        proto.freeValue()
     }
 
     /// Define a property by name (convenience wrapper around atom-based definePropertyValue).

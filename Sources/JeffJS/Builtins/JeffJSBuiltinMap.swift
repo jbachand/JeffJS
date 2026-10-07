@@ -1464,8 +1464,11 @@ struct JeffJSBuiltinMap {
                                (JSClassID.JS_CLASS_SET_ITERATOR.rawValue, "Set Iterator")] {
                 let proto = ctx.newObjectProto(proto: iterProtoVal)
                 installFuncs(ctx: ctx, obj: proto, funcs: js_map_iterator_proto_funcs)
-                _ = ctx.setProperty(obj: proto, atom: JeffJSAtomID.JS_ATOM_Symbol_toStringTag.rawValue,
-                                    value: ctx.newStringValue(tag))
+                // { configurable } only (ES §24.1.5.2.2, §24.2.6.2.2).
+                let tagV = ctx.newStringValue(tag)
+                _ = ctx.definePropertyValue(obj: proto, atom: JeffJSAtomID.JS_ATOM_Symbol_toStringTag.rawValue,
+                                            value: tagV, flags: JS_PROP_CONFIGURABLE)
+                tagV.freeValue()   // definePropertyValue dups
                 if cid < ctx.classProto.count { ctx.classProto[cid] = proto }
             }
         }

@@ -128,8 +128,11 @@ struct JeffJSBuiltinIterator {
         let iterSymbolIter = ctx.newCFunction({ ctx, this, args in
             return this.dupValue()
         }, name: "[Symbol.iterator]", length: 0)
+        // Writable, configurable, not enumerable (ES §27.1.4.13); a [[Set]] made it enumerable.
         let symIterAtom = JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue
-        ctx.setProperty(obj: iterProto, atom: symIterAtom, value: iterSymbolIter)
+        _ = ctx.definePropertyValue(obj: iterProto, atom: symIterAtom, value: iterSymbolIter,
+                                    flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+        iterSymbolIter.freeValue()   // definePropertyValue dups
         ctx.iteratorProto = iterProto.dupValue()
         // The builtin iterator prototypes were created as plain objects: give
         // them %IteratorPrototype% as [[Prototype]] so `[...arr.values()]`,
@@ -176,8 +179,8 @@ struct JeffJSBuiltinIterator {
         ctx.setPropertyFunc(obj: iterCtor, name: "from", fn: iteratorFrom, length: 1)
         ctx.setPropertyFunc(obj: iterCtor, name: "concat", fn: iteratorConcat, length: 0)
         // Iterator.prototype: { [[Writable]]: false, [[Enumerable]]: false, [[Configurable]]: false }
-        _ = ctx.definePropertyValue(obj: iterCtor, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
-                                    value: iterProto, flags: 0)
+        // (its `constructor` is the accessor below, not a data back-link).
+        ctx.defineIntrinsicPrototype(ctor: iterCtor, proto: iterProto)
         ctx.iteratorCtor = iterCtor.dupValue()
 
         // Iterator.prototype[@@toStringTag] and .constructor are accessors
@@ -237,9 +240,9 @@ struct JeffJSBuiltinIterator {
         addProtoFunc(ctx, genProto, "return", generatorReturn, 1)
         addProtoFunc(ctx, genProto, "throw",  generatorThrow,  1)
 
-        // Generator.prototype[Symbol.toStringTag] = "Generator"
-        ctx.setPropertyStr(obj: genProto, name: "toStringTag",
-                           value: ctx.newStringValue("Generator"))
+        // Generator.prototype[Symbol.toStringTag] = "Generator" comes from
+        // addIntrinsicToStringTags (JS_CLASS_GENERATOR); a [[Set]] of the
+        // *string* key "toStringTag" stood here (and on the four below).
 
         // Set Generator prototype on the class proto table
         let genClassID = JSClassID.JS_CLASS_GENERATOR.rawValue
@@ -252,9 +255,11 @@ struct JeffJSBuiltinIterator {
         // ---------------------------------------------------------------
         let genFuncProto = ctx.newObjectProto(proto: ctx.functionProto)
 
-        ctx.setPropertyStr(obj: genFuncProto, name: "prototype", value: genProto.dupValue())
-        ctx.setPropertyStr(obj: genFuncProto, name: "toStringTag",
-                           value: ctx.newStringValue("GeneratorFunction"))
+        // %GeneratorFunction.prototype.prototype% = %GeneratorPrototype% and back
+        // (`constructor`): both { writable: false, enumerable: false,
+        // configurable: true } (ES §27.3.3.2, §27.5.1.1).
+        linkConfigurableOnly(ctx, genFuncProto, "prototype", genProto)
+        linkConfigurableOnly(ctx, genProto, "constructor", genFuncProto)
 
         let genFuncClassID = JSClassID.JS_CLASS_GENERATOR_FUNCTION.rawValue
         if genFuncClassID < ctx.classProto.count {
@@ -271,7 +276,9 @@ struct JeffJSBuiltinIterator {
             return this.dupValue()
         }, name: "[Symbol.asyncIterator]", length: 0)
         let symAsyncIterAtom = JeffJSAtomID.JS_ATOM_Symbol_asyncIterator.rawValue
-        ctx.setProperty(obj: asyncIterProto, atom: symAsyncIterAtom, value: asyncIterSymbol)
+        _ = ctx.definePropertyValue(obj: asyncIterProto, atom: symAsyncIterAtom, value: asyncIterSymbol,
+                                    flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)   // ES §27.1.6.1
+        asyncIterSymbol.freeValue()   // definePropertyValue dups
 
         ctx.asyncIteratorProto = asyncIterProto.dupValue()
 
@@ -284,8 +291,6 @@ struct JeffJSBuiltinIterator {
         addProtoFunc(ctx, asyncGenProto, "return", asyncGeneratorReturn, 1)
         addProtoFunc(ctx, asyncGenProto, "throw",  asyncGeneratorThrow,  1)
 
-        ctx.setPropertyStr(obj: asyncGenProto, name: "toStringTag",
-                           value: ctx.newStringValue("AsyncGenerator"))
 
         let asyncGenClassID = JSClassID.JS_CLASS_ASYNC_GENERATOR.rawValue
         if asyncGenClassID < ctx.classProto.count {
@@ -297,10 +302,9 @@ struct JeffJSBuiltinIterator {
         // ---------------------------------------------------------------
         let asyncGenFuncProto = ctx.newObjectProto(proto: ctx.functionProto)
 
-        ctx.setPropertyStr(obj: asyncGenFuncProto, name: "prototype",
-                           value: asyncGenProto.dupValue())
-        ctx.setPropertyStr(obj: asyncGenFuncProto, name: "toStringTag",
-                           value: ctx.newStringValue("AsyncGeneratorFunction"))
+        // ES §27.4.3.2, §27.6.1.1: as for the generator pair above.
+        linkConfigurableOnly(ctx, asyncGenFuncProto, "prototype", asyncGenProto)
+        linkConfigurableOnly(ctx, asyncGenProto, "constructor", asyncGenFuncProto)
 
         let asyncGenFuncClassID = JSClassID.JS_CLASS_ASYNC_GENERATOR_FUNCTION.rawValue
         if asyncGenFuncClassID < ctx.classProto.count {
@@ -312,13 +316,61 @@ struct JeffJSBuiltinIterator {
         // ---------------------------------------------------------------
         let asyncFuncProto = ctx.newObjectProto(proto: ctx.functionProto)
 
-        ctx.setPropertyStr(obj: asyncFuncProto, name: "toStringTag",
-                           value: ctx.newStringValue("AsyncFunction"))
-
         let asyncFuncClassID = JSClassID.JS_CLASS_ASYNC_FUNCTION.rawValue
         if asyncFuncClassID < ctx.classProto.count {
             ctx.classProto[asyncFuncClassID] = asyncFuncProto.dupValue()
         }
+
+        // ---------------------------------------------------------------
+        // 9. %GeneratorFunction%, %AsyncGeneratorFunction%, %AsyncFunction%
+        //    (ES §27.3.1, §27.4.1, §27.7.1). Not globals: reached as
+        //    `Object.getPrototypeOf(function*(){}).constructor`, which was
+        //    `Function` (inherited) — `new (that)("yield 1")` built a plain
+        //    function. CreateDynamicFunction of their kind; [[Prototype]] is
+        //    %Function%. `X.prototype` is { all false } and
+        //    `X.prototype.constructor` { configurable } only (§27.3.3.1,
+        //    §27.4.3.1, §27.7.3.1).
+        // ---------------------------------------------------------------
+        let kinds: [(JeffJSValue, String, String)] = [
+            (genFuncProto, "GeneratorFunction", "function*"),
+            (asyncGenFuncProto, "AsyncGeneratorFunction", "async function*"),
+            (asyncFuncProto, "AsyncFunction", "async function"),
+        ]
+        for (proto, name, keyword) in kinds {
+            let ctor = ctx.newCFunction({ ctx, _, args in
+                dynamicFunction(ctx: ctx, keyword: keyword, args: args)
+            }, name: name, length: 1)
+            if let o = ctor.toObject() { o.isConstructor = true }
+            if ctx.functionCtor.isObject { _ = ctx.setPrototypeOf(obj: ctor, proto: ctx.functionCtor) }
+            ctx.defineIntrinsicPrototype(ctor: ctor, proto: proto)
+            linkConfigurableOnly(ctx, proto, "constructor", ctor)
+            ctor.freeValue()   // the back-link holds it
+        }
+    }
+
+    /// `obj[name] = value` as { writable: false, enumerable: false,
+    /// configurable: true }; does not consume `value`.
+    private static func linkConfigurableOnly(_ ctx: JeffJSContext, _ obj: JeffJSValue,
+                                             _ name: String, _ value: JeffJSValue) {
+        _ = ctx.definePropertyValue(obj, name: name, value: value, flags: JS_PROP_CONFIGURABLE)
+    }
+
+    /// CreateDynamicFunction (ES §20.2.1.1.1) for the generator and async
+    /// kinds, the way the Function constructor builds its source: the last
+    /// argument is the body, the others the parameters.
+    static func dynamicFunction(ctx: JeffJSContext, keyword: String, args: [JeffJSValue]) -> JeffJSValue {
+        var params: [String] = []
+        var body = ""
+        if let last = args.last {
+            for a in args.dropLast() {
+                guard let p = ctx.toSwiftString(a) else { return .exception }
+                params.append(p)
+            }
+            guard let b = ctx.toSwiftString(last) else { return .exception }
+            body = b
+        }
+        let source = "(\(keyword) anonymous(\(params.joined(separator: ","))\n) {\n\(body)\n})"
+        return ctx.eval(input: source, filename: "<Function>", evalFlags: JS_EVAL_TYPE_GLOBAL)
     }
 
     // MARK: - Helper: add a method to a prototype object

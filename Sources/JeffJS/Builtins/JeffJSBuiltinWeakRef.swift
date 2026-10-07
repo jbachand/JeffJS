@@ -844,8 +844,8 @@ func js_initWeakRefAndFinalizationRegistry(ctx: JeffJSContext) {
         return js_weakref_constructor(ctx: ctx, newTarget: thisVal, this: thisVal, argv: args)
     }, name: "WeakRef", length: 1)
 
-    // Set prototype linkage.
-    _ = ctx.setPropertyStr(obj: weakRefCtor, name: "prototype", value: weakRefProto.dupValue())
+    // WeakRef.prototype / WeakRef.prototype.constructor (ES §26.1.2.1, §26.1.3.1).
+    ctx.defineIntrinsicPrototypeLink(ctor: weakRefCtor, proto: weakRefProto)
 
     // 3. Install WeakRef on the global object.
     _ = ctx.setPropertyStr(obj: ctx.globalObj, name: "WeakRef", value: weakRefCtor)
@@ -879,8 +879,8 @@ func js_initWeakRefAndFinalizationRegistry(ctx: JeffJSContext) {
         return js_finrec_constructor(ctx: ctx, newTarget: thisVal, this: thisVal, argv: args)
     }, name: "FinalizationRegistry", length: 1)
 
-    // Set prototype linkage.
-    _ = ctx.setPropertyStr(obj: finRegCtor, name: "prototype", value: finRegProto.dupValue())
+    // FinalizationRegistry.prototype / .prototype.constructor (ES §26.2.2.1, §26.2.3.1).
+    ctx.defineIntrinsicPrototypeLink(ctor: finRegCtor, proto: finRegProto)
 
     // 6. Install FinalizationRegistry on the global object.
     _ = ctx.setPropertyStr(obj: ctx.globalObj, name: "FinalizationRegistry", value: finRegCtor)

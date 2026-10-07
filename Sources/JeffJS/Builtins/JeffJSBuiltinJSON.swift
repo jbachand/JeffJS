@@ -107,9 +107,8 @@ struct JeffJSBuiltinJSON {
         }
         ctx.setPropertyStr(obj: jsonObj, name: "stringify", value: stringifyFunc)
 
-        // Set @@toStringTag to "JSON"
-        ctx.setPropertyStr(obj: jsonObj, name: "@@toStringTag",
-                           value: ctx.newStringValue("JSON"))
+        // JSON[@@toStringTag] comes from addIntrinsicToStringTags (a [[Set]]
+        // of the *string* key "@@toStringTag" stood here).
 
         ctx.setPropertyStr(obj: ctx.globalObject, name: "JSON", value: jsonObj)
     }

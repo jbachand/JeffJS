@@ -778,6 +778,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             // it runs once during init instead of on every function call.
             ensureMathFixup()
 
+            // Phase 5b: spec members no intrinsic routine defined (@@species
+            // getters, Array.prototype[@@unscopables], Symbol.prototype[@@toPrimitive]).
+            addIntrinsicWellKnownMembers()
+
             // Phase 6: Symbol.toStringTag on every builtin prototype /
             // namespace object (needs all intrinsics to exist first).
             addIntrinsicToStringTags()
@@ -2540,7 +2544,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         }
         // Set Function.prototype so that `Function.prototype.apply.call(...)` works.
         // React DOM's printWarning uses this pattern extensively.
-        _ = setPropertyStr(obj: functionCtor, name: "prototype", value: functionProto.dupValue())
+        defineIntrinsicPrototype(ctor: functionCtor, proto: functionProto)
         _ = setPropertyStr(obj: globalObj, name: "Function", value: functionCtor.dupValue())
 
         // --- Error and NativeError constructors ---
@@ -2620,8 +2624,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // link takes one (the links were uncounted: a page that replaced
         // RegExp and RegExp.prototype.constructor — core-js does — freed the
         // constructor `regexpCtor` still pointed at).
-        _ = setPropertyStr(obj: regexpCtor, name: "prototype", value: regexpProto.dupValue())
-        _ = setPropertyStr(obj: regexpProto, name: "constructor", value: regexpCtor.dupValue())
+        defineIntrinsicPrototypeLink(ctor: regexpCtor, proto: regexpProto)
 
         _ = setPropertyStr(obj: globalObj, name: "RegExp", value: regexpCtor.dupValue())
 
@@ -2697,11 +2700,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         let proxyCtor = JeffJSValue.makeObject(proxyCtorObj)
 
         // Set name and length on the Proxy constructor
-        let proxyNameAtom = rt.findAtom("Proxy")
-        _ = setPropertyInternal(obj: proxyCtor, atom: proxyNameAtom, value: newStringValue("Proxy"), flags: JS_PROP_CONFIGURABLE)
-        rt.freeAtom(proxyNameAtom)
-        let proxyLenAtom = JeffJSAtomID.JS_ATOM_length.rawValue
-        _ = setPropertyInternal(obj: proxyCtor, atom: proxyLenAtom, value: .newInt32(2), flags: JS_PROP_CONFIGURABLE)
+        // Proxy.length is { configurable } only (ES §10.2.9). (The name went
+        // under a property *called* "Proxy" — `Proxy.Proxy === "Proxy"`; the
+        // real `name` is defined below.)
+        _ = definePropertyValue(obj: proxyCtor, atom: JeffJSAtomID.JS_ATOM_length.rawValue, value: .newInt32(2), flags: JS_PROP_CONFIGURABLE)
 
         // Proxy.revocable(target, handler) -- static method
         let revocableFunc = newCFunction({ [weak self] ctx, thisVal, args in
@@ -2833,8 +2835,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return self.newMapOrSetObject(classID: JSClassID.JS_CLASS_MAP.rawValue, isWeak: false)
         }, name: "Map", length: 0)
         // Wire Map.prototype <-> Map constructor
-        _ = setPropertyStr(obj: mapCtor, name: "prototype", value: mapProto.dupValue())
-        _ = setPropertyStr(obj: mapProto, name: "constructor", value: mapCtor.dupValue())
+        defineIntrinsicPrototypeLink(ctor: mapCtor, proto: mapProto)
         _ = setPropertyStr(obj: globalObj, name: "Map", value: mapCtor)
 
         // Set
@@ -2845,8 +2846,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return self.newMapOrSetObject(classID: JSClassID.JS_CLASS_SET.rawValue, isWeak: false)
         }, name: "Set", length: 0)
         // Wire Set.prototype <-> Set constructor
-        _ = setPropertyStr(obj: setCtor, name: "prototype", value: setProto.dupValue())
-        _ = setPropertyStr(obj: setProto, name: "constructor", value: setCtor.dupValue())
+        defineIntrinsicPrototypeLink(ctor: setCtor, proto: setProto)
         _ = setPropertyStr(obj: globalObj, name: "Set", value: setCtor)
 
         // WeakMap
@@ -2857,8 +2857,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return self.newMapOrSetObject(classID: JSClassID.JS_CLASS_WEAKMAP.rawValue, isWeak: true)
         }, name: "WeakMap", length: 0)
         // Wire WeakMap.prototype <-> WeakMap constructor
-        _ = setPropertyStr(obj: weakMapCtor, name: "prototype", value: weakMapProto.dupValue())
-        _ = setPropertyStr(obj: weakMapProto, name: "constructor", value: weakMapCtor.dupValue())
+        defineIntrinsicPrototypeLink(ctor: weakMapCtor, proto: weakMapProto)
         _ = setPropertyStr(obj: globalObj, name: "WeakMap", value: weakMapCtor)
 
         // WeakSet
@@ -2869,8 +2868,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return self.newMapOrSetObject(classID: JSClassID.JS_CLASS_WEAKSET.rawValue, isWeak: true)
         }, name: "WeakSet", length: 0)
         // Wire WeakSet.prototype <-> WeakSet constructor
-        _ = setPropertyStr(obj: weakSetCtor, name: "prototype", value: weakSetProto.dupValue())
-        _ = setPropertyStr(obj: weakSetProto, name: "constructor", value: weakSetCtor.dupValue())
+        defineIntrinsicPrototypeLink(ctor: weakSetCtor, proto: weakSetProto)
         _ = setPropertyStr(obj: globalObj, name: "WeakSet", value: weakSetCtor)
 
         // Iterator helpers
@@ -2908,7 +2906,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             guard let self = self else { return .exception }
             return jsArrayBuffer_constructor(self, thisVal, args)
         }, name: "ArrayBuffer", length: 1)
-        _ = setPropertyStr(obj: abCtor, name: "prototype", value: abProto.dupValue())
+        defineIntrinsicPrototype(ctor: abCtor, proto: abProto)
         _ = definePropertyValue(obj: abProto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
                                 value: abCtor.dupValue(), flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
 
@@ -2964,7 +2962,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             guard let self = self else { return .exception }
             return jsSharedArrayBuffer_constructor(self, thisVal, args)
         }, name: "SharedArrayBuffer", length: 1)
-        _ = setPropertyStr(obj: sabCtor, name: "prototype", value: sabProto.dupValue())
+        defineIntrinsicPrototype(ctor: sabCtor, proto: sabProto)
         _ = definePropertyValue(obj: sabProto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
                                 value: sabCtor.dupValue(), flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
 
@@ -2996,7 +2994,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             guard let self = self else { return .exception }
             return jsDataView_constructor(self, thisVal, args)
         }, name: "DataView", length: 1)
-        _ = setPropertyStr(obj: dvCtor, name: "prototype", value: dvProto.dupValue())
+        defineIntrinsicPrototype(ctor: dvCtor, proto: dvProto)
         _ = definePropertyValue(obj: dvProto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
                                 value: dvCtor.dupValue(), flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
 
@@ -3065,10 +3063,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return ctx.throwTypeError(message: "cannot be called")
         }, name: "TypedArray", length: 0)
         if let ctorObj = taCtor.toObject() { ctorObj.isConstructor = true }
-        _ = definePropertyValue(obj: taCtor, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
-                                value: taProto, flags: 0)
-        _ = definePropertyValue(obj: taProto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
-                                value: taCtor, flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+        defineIntrinsicPrototypeLink(ctor: taCtor, proto: taProto)
 
         // TypedArray.from / TypedArray.of dispatch on `this`: the concrete
         // constructor (or a subclass of one) they are called on.
@@ -3191,18 +3186,17 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             // Float32Array.__proto__ === %TypedArray%
             setPrototypeOf(ctor, proto: taCtor)
             if let ctorObj = ctor.toObject() { ctorClassIDs[ObjectIdentifier(ctorObj)] = jeffClassID }
-            _ = setPropertyStr(obj: ctor, name: "prototype", value: proto.dupValue())
+            defineIntrinsicPrototype(ctor: ctor, proto: proto)
             _ = definePropertyValue(obj: proto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
                                     value: ctor.dupValue(), flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
 
-            // BYTES_PER_ELEMENT on the constructor and its prototype
+            // BYTES_PER_ELEMENT on the constructor and its prototype: all
+            // attributes false (ES §23.2.6.1, §23.2.7.1).
             if let info = typedArrayInfo(forClassID: capturedJeffClassID) {
-                _ = setPropertyStr(obj: ctor, name: "BYTES_PER_ELEMENT",
-                                   value: .newInt32(Int32(info.bytesPerElement)))
-                if let protoObj = proto.toObject() {
-                    jeffJS_setPropertyStr(ctx: self, obj: protoObj, name: "BYTES_PER_ELEMENT",
-                                          value: .newInt32(Int32(info.bytesPerElement)))
-                }
+                defineIntrinsicConstant(ctor, name: "BYTES_PER_ELEMENT",
+                                        value: .newInt32(Int32(info.bytesPerElement)))
+                defineIntrinsicConstant(proto, name: "BYTES_PER_ELEMENT",
+                                        value: .newInt32(Int32(info.bytesPerElement)))
             }
 
             _ = setPropertyStr(obj: globalObj, name: name, value: ctor)
@@ -3929,8 +3923,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return errObj
         }, name: "Error", length: 1)
         // Set Error.prototype on constructor and Error.prototype.constructor = Error
-        _ = setPropertyStr(obj: errorCtor, name: "prototype", value: errorProto.dupValue())
-        _ = setPropertyStr(obj: errorProto, name: "constructor", value: errorCtor.dupValue())
+        defineIntrinsicPrototypeLink(ctor: errorCtor, proto: errorProto)
         _ = setPropertyStr(obj: globalObj, name: "Error", value: errorCtor)
 
         // Native error types
@@ -3952,8 +3945,13 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             if let errorProtoObj = errorProto.toObject(), let nativeProtoObj = nativeProto.toObject() {
                 nativeProtoObj.proto = errorProtoObj
             }
-            _ = setPropertyStr(obj: nativeProto, name: "name", value: newStringValue(name))
-            _ = setPropertyStr(obj: nativeProto, name: "message", value: newStringValue(""))
+            // name / message: writable, configurable, not enumerable (ES §20.5.6.3.2-3).
+            let nameV = newStringValue(name), msgV = newStringValue("")
+            _ = definePropertyValue(obj: nativeProto, atom: JeffJSAtomID.JS_ATOM_name.rawValue,
+                                    value: nameV, flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+            _ = definePropertyValue(obj: nativeProto, atom: JeffJSAtomID.JS_ATOM_message.rawValue,
+                                    value: msgV, flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+            nameV.freeValue(); msgV.freeValue()   // definePropertyValue dups
             nativeErrorProto[errorEnum.rawValue] = nativeProto
 
             let capturedName = name
@@ -3995,8 +3993,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 ctorObj.proto = errorCtorObj
             }
             // Set NativeError.prototype on constructor and NativeError.prototype.constructor = NativeError
-            _ = setPropertyStr(obj: ctor, name: "prototype", value: nativeProto.dupValue())
-            _ = setPropertyStr(obj: nativeProto, name: "constructor", value: ctor.dupValue())
+            defineIntrinsicPrototypeLink(ctor: ctor, proto: nativeProto)
             _ = setPropertyStr(obj: globalObj, name: name, value: ctor)
         }
     }
@@ -4137,15 +4134,17 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         let mathObj = newObject()
         _ = setPropertyStr(obj: globalObj, name: "Math", value: mathObj)
 
-        // Math constants
-        _ = setPropertyStr(obj: mathObj, name: "E", value: .newFloat64(exp(1.0)))
-        _ = setPropertyStr(obj: mathObj, name: "LN10", value: .newFloat64(log(10.0)))
-        _ = setPropertyStr(obj: mathObj, name: "LN2", value: .newFloat64(log(2.0)))
-        _ = setPropertyStr(obj: mathObj, name: "LOG10E", value: .newFloat64(1.0 / log(10.0)))
-        _ = setPropertyStr(obj: mathObj, name: "LOG2E", value: .newFloat64(1.0 / log(2.0)))
-        _ = setPropertyStr(obj: mathObj, name: "PI", value: .newFloat64(Double.pi))
-        _ = setPropertyStr(obj: mathObj, name: "SQRT1_2", value: .newFloat64(sqrt(0.5)))
-        _ = setPropertyStr(obj: mathObj, name: "SQRT2", value: .newFloat64(sqrt(2.0)))
+        // Math constants: { writable: false, enumerable: false, configurable: false }
+        // (ES §21.3.1). They were [[Set]], so `Math.PI = 3` stuck.
+        defineIntrinsicConstant(mathObj, name: "E", value: .newFloat64(exp(1.0)))
+        defineIntrinsicConstant(mathObj, name: "LN10", value: .newFloat64(log(10.0)))
+        defineIntrinsicConstant(mathObj, name: "LN2", value: .newFloat64(log(2.0)))
+        // log10(e) correctly rounded; 1 / ln(10) is one ulp high (0.43429448190325176).
+        defineIntrinsicConstant(mathObj, name: "LOG10E", value: .newFloat64(0.4342944819032518))
+        defineIntrinsicConstant(mathObj, name: "LOG2E", value: .newFloat64(1.0 / log(2.0)))
+        defineIntrinsicConstant(mathObj, name: "PI", value: .newFloat64(Double.pi))
+        defineIntrinsicConstant(mathObj, name: "SQRT1_2", value: .newFloat64(sqrt(0.5)))
+        defineIntrinsicConstant(mathObj, name: "SQRT2", value: .newFloat64(sqrt(2.0)))
 
         // Math functions
         let mathAbs = newCFunction({ [weak self] ctx, thisVal, args in
@@ -4541,9 +4540,12 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // Set name and length on the Symbol constructor (the name went under a
         // property *called* "Symbol", so `Symbol.name` read undefined; akamai
         // navigation fix).
-        _ = setPropertyInternal(obj: symbolCtor, atom: JeffJSAtomID.JS_ATOM_name.rawValue, value: newStringValue("Symbol"), flags: JS_PROP_CONFIGURABLE)
-        let symLenAtom = JeffJSAtomID.JS_ATOM_length.rawValue
-        _ = setPropertyInternal(obj: symbolCtor, atom: symLenAtom, value: .newInt32(0), flags: JS_PROP_CONFIGURABLE)
+        // `length` / `name` are { configurable } only (ES §10.2.9-10); a
+        // [[Set]] made them writable.
+        let symNameV = newStringValue("Symbol")
+        _ = definePropertyValue(obj: symbolCtor, atom: JeffJSAtomID.JS_ATOM_name.rawValue, value: symNameV, flags: JS_PROP_CONFIGURABLE)
+        symNameV.freeValue()   // definePropertyValue dups
+        _ = definePropertyValue(obj: symbolCtor, atom: JeffJSAtomID.JS_ATOM_length.rawValue, value: .newInt32(0), flags: JS_PROP_CONFIGURABLE)
 
         // Symbol.for(key) -- global symbol registry lookup/create
         let symbolFor = newCFunction({ ctx, thisVal, args in
@@ -4575,7 +4577,11 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 rt.bindSymbolAtom(symStr, atom: wks.atomID)
             }
             let symVal = JeffJSValue.mkPtr(tag: .symbol, ptr: symStr)
-            _ = setPropertyStr(obj: symbolCtor, name: wks.name, value: symVal)
+            // Symbol.iterator & co. are { writable: false, enumerable: false,
+            // configurable: false } (ES §20.4.2). The count taken above moves
+            // into the property (definePropertyValue dups, so release ours).
+            defineIntrinsicConstant(symbolCtor, name: wks.name, value: symVal)
+            symVal.freeValue()
         }
 
         // `Symbol.prototype` and `Symbol.prototype.constructor`. Without the
@@ -4677,8 +4683,11 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         bigIntCtorObj.shape = jeffJS_rootShape(self, proto: fProtoObj)
         bigIntCtorObj.proto = fProtoObj
         let bigIntCtor = JeffJSValue.makeObject(bigIntCtorObj)
-        _ = setPropertyStr(obj: bigIntCtor, name: "name", value: newStringValue("BigInt"))
-        _ = setPropertyStr(obj: bigIntCtor, name: "length", value: .newInt32(1))
+        // `name` / `length`: { configurable } only (ES §10.2.9-10).
+        let bigIntNameV = newStringValue("BigInt")
+        _ = definePropertyValue(obj: bigIntCtor, atom: JeffJSAtomID.JS_ATOM_name.rawValue, value: bigIntNameV, flags: JS_PROP_CONFIGURABLE)
+        bigIntNameV.freeValue()   // definePropertyValue dups
+        _ = definePropertyValue(obj: bigIntCtor, atom: JeffJSAtomID.JS_ATOM_length.rawValue, value: .newInt32(1), flags: JS_PROP_CONFIGURABLE)
 
         if let protoObj = bigIntProto.toObject() {
             jeffJS_defineBuiltinFunc(ctx: self, obj: protoObj, name: "toString", length: 0) { ctx, this, args in
@@ -4707,8 +4716,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         _ = setPropertyStr(obj: bigIntCtor, name: "asUintN", value: asUintNFn)
 
         // BigInt.prototype / .constructor
-        _ = setPropertyStr(obj: bigIntCtor, name: "prototype", value: bigIntProto.dupValue())
-        _ = setPropertyStr(obj: bigIntProto, name: "constructor", value: bigIntCtor.dupValue())
+        defineIntrinsicPrototypeLink(ctor: bigIntCtor, proto: bigIntProto)
 
         _ = setPropertyStr(obj: globalObj, name: "BigInt", value: bigIntCtor)
     }
@@ -6682,15 +6690,47 @@ extension JeffJSContext {
         }
     }
 
+    // MARK: Intrinsic prototype links
+
+    /// `C.prototype = proto` with the attributes the spec fixes for every
+    /// builtin constructor: { [[Writable]]: false, [[Enumerable]]: false,
+    /// [[Configurable]]: false } (ES §20–§28, each "C.prototype" entry; WebIDL
+    /// §3.7.1 for interface objects). It was written with setPropertyStr — a
+    /// writable, configurable (and before the non-enumerable sweep, enumerable)
+    /// property —, so a page could replace `Object.prototype` outright.
+    ///
+    /// Does not consume `proto` (definePropertyValue dups). An internal
+    /// definition: it also replaces a link an earlier setup phase installed,
+    /// non-configurable or not (phase 2 overlays re-link several builtins).
+    func defineIntrinsicPrototype(ctor: JeffJSValue, proto: JeffJSValue) {
+        _ = definePropertyValue(obj: ctor, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
+                                value: proto, flags: 0)
+    }
+
+    /// Both halves of a builtin constructor's link: `C.prototype` as in
+    /// `defineIntrinsicPrototype` and `C.prototype.constructor = C`, which is
+    /// { writable: true, enumerable: false, configurable: true } (ES §17).
+    /// Consumes neither value: each property takes its own count.
+    func defineIntrinsicPrototypeLink(ctor: JeffJSValue, proto: JeffJSValue) {
+        defineIntrinsicPrototype(ctor: ctor, proto: proto)
+        _ = definePropertyValue(obj: proto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
+                                value: ctor, flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+    }
+
+    /// A data property whose attributes are all false (ES: Math.PI, the
+    /// well-known `Symbol.*`, `Number.MAX_VALUE`, BYTES_PER_ELEMENT, …).
+    /// Does not consume `value`.
+    func defineIntrinsicConstant(_ obj: JeffJSValue, name: String, value: JeffJSValue) {
+        _ = definePropertyValue(obj, name: name, value: value, flags: 0)
+    }
+
+    /// Consumes `proto` (one count moves into `ctor.prototype`, as the
+    /// setPropertyStr it replaced did); `proto.constructor` takes a new count.
     func newConstructorFunc(name: String, fn: @escaping JeffJSNativeFunc, length: Int, proto: JeffJSValue) -> JeffJSValue {
         let ctor = newCFunction(fn, name: name, length: length)
         if let obj = ctor.toObject() { obj.isConstructor = true }
-        _ = setPropertyStr(obj: ctor, name: "prototype", value: proto)
-        // Per ES spec, prototype.constructor is writable+configurable but NOT enumerable
-        let atom = rt.findAtom("constructor")
-        _ = definePropertyValue(obj: proto, atom: atom, value: ctor,
-                                flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
-        rt.freeAtom(atom)
+        defineIntrinsicPrototypeLink(ctor: ctor, proto: proto)
+        proto.freeValue()
         return ctor
     }
 

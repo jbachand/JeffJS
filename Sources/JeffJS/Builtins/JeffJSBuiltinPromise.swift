@@ -166,9 +166,8 @@ struct JeffJSBuiltinPromise {
         }
         ctx.setPropertyStr(obj: promiseProto, name: "finally", value: finallyFunc)
 
-        // Set @@toStringTag
-        ctx.setPropertyStr(obj: promiseProto, name: "@@toStringTag",
-                           value: ctx.newStringValue("Promise"))
+        // Promise.prototype[@@toStringTag] comes from addIntrinsicToStringTags
+        // (a [[Set]] of the *string* key "@@toStringTag" stood here).
 
         // Create the Promise constructor function
         let promiseCtor = ctx.newCFunction(name: "Promise", length: 1) { c, this, args in
@@ -180,13 +179,10 @@ struct JeffJSBuiltinPromise {
         // = Promise (ES §27.2.5.1: writable, configurable, not enumerable). It
         // was missing, so `p.constructor` was Object and PromiseResolve's
         // `x.constructor === C` test failed: `Promise.resolve(p) !== p`.
-        ctx.setPropertyStr(obj: promiseCtor, name: "prototype", value: promiseProto)
-        do {
-            let atom = ctx.rt.findAtom("constructor")
-            _ = ctx.definePropertyValue(obj: promiseProto, atom: atom, value: promiseCtor,
-                                        flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)   // dups
-            ctx.rt.freeAtom(atom)
-        }
+        // Both dup: the creation count of promiseProto moves into the link,
+        // as the setPropertyStr that stood here consumed it.
+        ctx.defineIntrinsicPrototypeLink(ctor: promiseCtor, proto: promiseProto)
+        promiseProto.freeValue()
 
         // Static methods
         let resolveMethod = ctx.newCFunction(name: "resolve", length: 1) { c, this, args in
