@@ -319,6 +319,26 @@ struct JeffJSBytecodeSerializer {
 
     private var buf: [UInt8] = []
     private var atomTable: AtomTableBuilder
+    /// Leave out everything that depends on where code sits in the text
+    /// (lines, columns, source spans, debug tables, the text, the file name):
+    /// two scripts that differ only in whitespace / comments serialize to the
+    /// same bytes (`positionFreeBytes`; jeffjs-cli --bc-hash-code, the
+    /// unminifier's semantic check).
+    private var positionFree = false
+
+    /// The serialization with every position-dependent field zeroed or left
+    /// out. Not loadable; for identity checks only.
+    static func positionFreeBytes(_ fb: JeffJSFunctionBytecode, rt: JeffJSRuntime?) -> [UInt8] {
+        var s = JeffJSBytecodeSerializer(atomTable: AtomTableBuilder())
+        s.positionFree = true
+        s.writeFunctionBytecode(fb, rt: rt)
+        let atoms = s.atomTable.atomEntries
+        s.writeU32(UInt32(atoms.count))
+        for entry in atoms {
+            if let str = entry { s.writeU8(ATOM_ENTRY_STRING); s.writeString(str) } else { s.writeU8(ATOM_ENTRY_NULL) }
+        }
+        return s.buf
+    }
 
     /// Serialize a compiled function bytecode to bytes.
     /// Requires the runtime to resolve atom IDs to strings.
@@ -433,6 +453,7 @@ struct JeffJSBytecodeSerializer {
         if let c = compiled, c.debugPc2lineLen > 0 || c.debugPc2colLen > 0 { ext |= EXT_DEBUG }
         if let c = compiled, !c.debugExprSpans.isEmpty { ext |= EXT_SPANS }
         if fb.isTopLevelCode { ext |= EXT_TOPLEVEL }
+        if positionFree { ext &= ~(EXT_DEBUG | EXT_SPANS) }
         writeU8(ext)
         writeU16(fb.argCount)
         writeU16(fb.varCount)
@@ -441,12 +462,12 @@ struct JeffJSBytecodeSerializer {
         writeU32((rt != nil) ? atomTable.intern(fb.nameAtom, rt: rt!) : fb.nameAtom)
         writeU16(fb.stackSize)
         writeU16(fb.closureVarCount)
-        writeU32(UInt32(fb.lineNum))
-        writeU32(UInt32(fb.colNum))
+        writeU32(positionFree ? 0 : UInt32(fb.lineNum))
+        writeU32(positionFree ? 0 : UInt32(fb.colNum))
         // Source span for Function.prototype.toString; the text itself is
         // written once for the whole tree, after the atom table.
-        writeU32(UInt32(bitPattern: fb.sourceStart))
-        writeU32(UInt32(bitPattern: fb.sourceLen))
+        writeU32(positionFree ? 0 : UInt32(bitPattern: fb.sourceStart))
+        writeU32(positionFree ? 0 : UInt32(bitPattern: fb.sourceLen))
 
         // Bytecode bytes — rewrite atom operands to table indices
         if let rt {
@@ -458,7 +479,7 @@ struct JeffJSBytecodeSerializer {
         }
 
         // Filename (optional string)
-        if let fn = fb.fileName {
+        if !positionFree, let fn = fb.fileName {
             writeU8(1)
             let str: String
             if !fn.isWideChar, case .str8(let data) = fn.storage {
@@ -523,8 +544,8 @@ struct JeffJSBytecodeSerializer {
             writeU8(seed.funcKind)
             writeU8(seed.jsMode)
             writeU16(seed.flags)
-            writeU32(UInt32(bitPattern: seed.parseStart))
-            writeU32(UInt32(bitPattern: seed.parseLine))
+            writeU32(positionFree ? 0 : UInt32(bitPattern: seed.parseStart))
+            writeU32(positionFree ? 0 : UInt32(bitPattern: seed.parseLine))
             writeU32((rt != nil) ? atomTable.intern(seed.funcName, rt: rt!) : seed.funcName)
         }
         if ext & EXT_DEBUG != 0, let c = compiled {

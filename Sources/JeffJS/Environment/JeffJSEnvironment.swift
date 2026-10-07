@@ -403,10 +403,15 @@ public final class JeffJSEnvironment {
     /// consulting the bytecode cache. For parser benchmarks (jeffjs-cli
     /// --parse-only): times in ms, an FNV-1a hash of the serialized bytecode
     /// when `hashBytecode` is set, and the SyntaxError text on failure.
-    public func compileOnly(_ source: String, filename: String = "<eval>", hashBytecode: Bool = false)
+    /// `positionFree`: hash the bytecode without lines, columns, source spans,
+    /// debug tables, text and file name — equal for two scripts that differ
+    /// only in whitespace and comments (with `lazyFunctions` off, so every
+    /// body is compiled).
+    public func compileOnly(_ source: String, filename: String = "<eval>", hashBytecode: Bool = false,
+                            positionFree: Bool = false)
         -> (parseMs: Double, compileMs: Double, bytecodeHash: UInt64?, error: String?)
     {
-        return context.compileOnlyForBench(input: source, filename: filename, hash: hashBytecode)
+        return context.compileOnlyForBench(input: source, filename: filename, hash: hashBytecode, positionFree: positionFree)
     }
 
     /// Boot benchmark hook (jeffjs-cli --boot-bench): run a precompiled

@@ -9,6 +9,8 @@ import Foundation
 import JeffJS
 
 let args = CommandLine.arguments.dropFirst()
+// --unminify / --unminify-stack (Unminify.swift) take space-separated values.
+if let code = cliUnminifyMain(Array(args)) { exit(code) }
 let paths = args.filter { !$0.hasPrefix("--") }
 
 // --boot-bench[=N] [--jfbc=path]: engine boot cost, best of N (default 10):
@@ -59,8 +61,12 @@ let showResult = args.contains("--result")
 // --parse-only: parse + compile each file without running it (no bytecode
 // cache), best of --repeat=N (default 5), times on stdout. --bc-hash also
 // prints an FNV-1a hash of the serialized bytecode (compiler identity check).
-let parseOnly = args.contains("--parse-only") || args.contains("--bc-hash")
-let bcHash = args.contains("--bc-hash")
+// --bc-hash-code: the same hash without anything position-dependent (lines,
+// columns, spans, text, file name), every body compiled (--eager implied):
+// equal for scripts that differ only in whitespace / comments.
+let bcHashCode = args.contains("--bc-hash-code")
+let parseOnly = args.contains("--parse-only") || args.contains("--bc-hash") || bcHashCode
+let bcHash = args.contains("--bc-hash") || bcHashCode
 let repeatCount = args.first(where: { $0.hasPrefix("--repeat=") }).flatMap { Int($0.dropFirst(9)) } ?? (bcHash ? 1 : 5)
 
 // Several files are evaluated in order in ONE environment (shared globals),
@@ -91,7 +97,7 @@ let status: Int32 = MainActor.assumeIsolated {
     env.registerNativeFunction("__lazyEvict") { _ in String(env.evictLazyPayloads()) }
     var status: Int32 = 0
     // --eager: compile every function body up front (lazy compilation off).
-    if args.contains("--eager") { env.lazyFunctions = false }
+    if args.contains("--eager") || bcHashCode { env.lazyFunctions = false }
     let lazyStats = args.contains("--lazy-stats")
     defer { if lazyStats { FileHandle.standardError.write((env.lazyCompileSummary + "\n").data(using: .utf8)!) } }
     if parseOnly {
@@ -103,7 +109,7 @@ let status: Int32 = MainActor.assumeIsolated {
             var bestParse = Double.infinity, bestCompile = Double.infinity, bestTotal = Double.infinity
             var hash: UInt64? = nil
             for _ in 0..<max(1, repeatCount) {
-                let r = env.compileOnly(src, filename: path, hashBytecode: bcHash)
+                let r = env.compileOnly(src, filename: path, hashBytecode: bcHash, positionFree: bcHashCode)
                 if let e = r.error {
                     print("\(path)\tERROR\t\(e)")
                     status = 1

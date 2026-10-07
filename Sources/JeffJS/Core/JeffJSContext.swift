@@ -3554,7 +3554,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// the parse and compile times in ms, the FNV-1a hash of the serialized
     /// bytecode when `hash` is set (an identity check for compiler changes),
     /// and the SyntaxError text on failure.
-    func compileOnlyForBench(input: String, filename: String, hash: Bool)
+    func compileOnlyForBench(input: String, filename: String, hash: Bool, positionFree: Bool = false)
         -> (parseMs: Double, compileMs: Double, bytecodeHash: UInt64?, error: String?)
     {
         JeffJSGCObjectHeader.activeRuntime = rt
@@ -3581,7 +3581,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         var h: UInt64? = nil
         if hash {
             var x: UInt64 = 0xcbf29ce484222325
-            for b in JeffJSBytecodeSerializer.serialize(fb, rt: rt) {
+            for b in (positionFree ? JeffJSBytecodeSerializer.positionFreeBytes(fb, rt: rt)
+                                   : JeffJSBytecodeSerializer.serialize(fb, rt: rt)) {
                 x = (x ^ UInt64(b)) &* 0x100000001b3
             }
             h = x
