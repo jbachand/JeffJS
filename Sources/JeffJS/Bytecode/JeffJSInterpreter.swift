@@ -197,7 +197,7 @@ func jeffJS_keyedCacheExcluded(_ o: JeffJSObj) -> Bool {
 @inline(__always)
 func jeffJS_keyedICGet(_ ents: UnsafeMutablePointer<JeffJSICEntry>?, _ pc: Int, _ jsObj: JeffJSObj, _ atom: UInt32) -> JeffJSValue? {
     guard let ents = ents else { return nil }
-    let entry = ents[pc & JeffJSInlineCache.mask]
+    let entry = ents[jeffJS_icSlot(ents, pc)]
     guard entry.pc == pc, entry.atom == atom, let sid = jsObj.shapeIdentity, entry.shapePtr == sid else { return nil }
     if entry.holderPtr != nil { return jeffJS_icProtoHit(entry) }
     if entry.propOffset >= 0, entry.propOffset < jsObj.propCount, jsObj.extra(at: entry.propOffset) == nil {
@@ -235,7 +235,7 @@ func jeffJS_keyedGetMiss(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ p
 func jeffJS_keyedICPut(_ ents: UnsafeMutablePointer<JeffJSICEntry>?, _ pc: Int, _ jsObj: JeffJSObj, _ atom: UInt32,
                        _ val: JeffJSValue) -> Bool {
     guard let ents = ents else { return false }
-    let entry = ents[pc & JeffJSInlineCache.mask]
+    let entry = ents[jeffJS_icSlot(ents, pc)]
     guard entry.pc == pc, entry.atom == atom, entry.holderPtr == nil,
           entry.propOffset >= 0, entry.propOffset < jsObj.propCount else { return false }
     return jeffJS_icWrite(jsObj._ptr, entry, val)
@@ -350,7 +350,7 @@ func jeffJS_stringFieldGet(_ ctx: JeffJSContext, _ ents: UnsafeMutablePointer<Je
     }
     guard let ents = ents, let pp = ctx.stringProtoRaw else { return nil }
     let proto = JeffJSObj(pp)
-    let entry = ents[pc & JeffJSInlineCache.mask]
+    let entry = ents[jeffJS_icSlot(ents, pc)]
     guard entry.pc == pc, entry.atom == 0, entry.holderPtr == nil,
           let sid = proto.shapeIdentity, entry.shapePtr == sid,
           entry.propOffset >= 0, entry.propOffset < proto.propCount,
@@ -4186,7 +4186,7 @@ private func executeFastTrace(
             guard sp >= state.spBase + 2, let ents = fb.icEntries else { resume = pc; break traceLoop }
             let obj = buf[sp - 2]
             guard let jsObj = obj.obj else { resume = pc; break traceLoop }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             guard entry.pc == pc, jeffJS_icDefine(jsObj._ptr, entry, buf[sp - 1], rt) else { resume = pc; break traceLoop }
             sp -= 1   // the value ref moved into the new slot
             pc += 5
@@ -4208,7 +4208,7 @@ private func executeFastTrace(
                 }
                 resume = pc; break traceLoop
             }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
             if let hv = icHit {
@@ -4231,7 +4231,7 @@ private func executeFastTrace(
                 }
                 resume = pc; break traceLoop
             }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
             if icHit == nil, jsObj.classID == JeffJSClassID.array.rawValue,
@@ -4255,7 +4255,7 @@ private func executeFastTrace(
             let val = buf[sp - 1]
             let obj = buf[sp - 2]
             guard let jsObj = obj.obj else { resume = pc; break traceLoop }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             if entry.pc == pc, jeffJS_icWrite(jsObj._ptr, entry, val) {
                 obj.freeValueFast()   // the popped receiver ref (QuickJS: JS_FreeValue(sp[-2]))
                 sp -= 2
@@ -4268,7 +4268,7 @@ private func executeFastTrace(
             guard let ents = fb.icEntries else { resume = pc; break traceLoop }
             let obj = buf[varBase + Int(bc[pc + 1])]
             guard let jsObj = obj.obj else { resume = pc; break traceLoop }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
             if let hv = icHit {
@@ -4290,7 +4290,7 @@ private func executeFastTrace(
                 }
                 resume = pc; break traceLoop
             }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
             if let hv = icHit {
@@ -4314,7 +4314,7 @@ private func executeFastTrace(
                 }
                 resume = pc; break traceLoop
             }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             if entry.pc == pc, entry.shapePtr == sid, entry.holderPtr == nil,
                entry.propOffset >= 0, entry.propOffset < jsObj.propCount,
                jsObj.extra(at: entry.propOffset) == nil {
@@ -4329,7 +4329,7 @@ private func executeFastTrace(
             guard let ents = fb.icEntries, let gObj = ctx.globalObj.obj, let gShape = gObj.shape else {
                 resume = pc; break traceLoop // deopt: no IC table yet
             }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             if entry.pc == pc,
                entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
@@ -4344,7 +4344,7 @@ private func executeFastTrace(
             guard let ents = fb.icEntries, let gObj = ctx.globalObj.obj, let gShape = gObj.shape else {
                 resume = pc; break traceLoop // deopt
             }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             if entry.pc == pc,
                entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
@@ -5530,7 +5530,7 @@ private func executeFastTraceLean(
             guard sp >= varBase + 2, let ents = icEntries else { ctx.interruptCounter = interrupt; return pc }
             let obj = buf[sp - 2]
             guard let jsObj = obj.obj else { ctx.interruptCounter = interrupt; return pc }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             guard entry.pc == pc, jeffJS_icDefine(jsObj._ptr, entry, buf[sp - 1], ctx.rt) else { ctx.interruptCounter = interrupt; return pc }
             sp -= 1   // the value ref moved into the new slot
             pc += 5
@@ -5549,7 +5549,7 @@ private func executeFastTraceLean(
             guard let ents = icEntries else { ctx.interruptCounter = interrupt; return pc }
             let obj = buf[sp - 1]
             guard let jsObj = obj.obj else { ctx.interruptCounter = interrupt; return pc }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
             if let hv = icHit {
@@ -5567,7 +5567,7 @@ private func executeFastTraceLean(
             guard let ents = icEntries else { ctx.interruptCounter = interrupt; return pc }
             let obj = buf[sp - 1]
             guard let jsObj = obj.obj else { ctx.interruptCounter = interrupt; return pc }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
             if let hv = icHit {
@@ -5585,7 +5585,7 @@ private func executeFastTraceLean(
             let val = buf[sp - 1]
             let obj = buf[sp - 2]
             guard let jsObj = obj.obj else { ctx.interruptCounter = interrupt; return pc }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             if entry.pc == pc, jeffJS_icWrite(jsObj._ptr, entry, val) {
                 obj.freeValueFast()   // the popped receiver ref (QuickJS: JS_FreeValue(sp[-2]))
                 sp -= 2
@@ -5598,7 +5598,7 @@ private func executeFastTraceLean(
             guard let ents = icEntries else { ctx.interruptCounter = interrupt; return pc }
             let obj = buf[varBase + Int(bc[pc + 1])]
             guard let jsObj = obj.obj else { ctx.interruptCounter = interrupt; return pc }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
             if let hv = icHit {
@@ -5615,7 +5615,7 @@ private func executeFastTraceLean(
             guard let ents = icEntries else { ctx.interruptCounter = interrupt; return pc }
             let obj = buf[0]
             guard let jsObj = obj.obj else { ctx.interruptCounter = interrupt; return pc }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
             if let hv = icHit {
@@ -5632,7 +5632,7 @@ private func executeFastTraceLean(
             guard let ents = icEntries else { ctx.interruptCounter = interrupt; return pc }
             let obj = buf[sp - 1]
             guard let jsObj = obj.obj, let sid = jsObj.shapeIdentity else { ctx.interruptCounter = interrupt; return pc }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             if entry.pc == pc, entry.shapePtr == sid, entry.holderPtr == nil,
                entry.propOffset >= 0, entry.propOffset < jsObj.propCount,
                jsObj.extra(at: entry.propOffset) == nil {
@@ -5647,7 +5647,7 @@ private func executeFastTraceLean(
             guard let ents = icEntries, let gObj = ctx.globalObj.obj, let gShape = gObj.shape else {
                 ctx.interruptCounter = interrupt; return pc // deopt: no IC table yet
             }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             if entry.pc == pc,
                entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
@@ -5662,7 +5662,7 @@ private func executeFastTraceLean(
             guard let ents = icEntries, let gObj = ctx.globalObj.obj, let gShape = gObj.shape else {
                 ctx.interruptCounter = interrupt; return pc // deopt
             }
-            let entry = ents[pc & JeffJSInlineCache.mask]
+            let entry = ents[jeffJS_icSlot(ents, pc)]
             if entry.pc == pc,
                entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
@@ -9565,7 +9565,7 @@ struct JeffJSInterpreter {
                 // Inline cache fast path: shape-matched direct property read
                 if let jsObj = obj.obj, jsObj.shapeIdentity != nil {
                     if let ents = fb.icEntries {
-                        let entry = ents[pc & JeffJSInlineCache.mask]
+                        let entry = ents[jeffJS_icSlot(ents, pc)]
                         var icHit: JeffJSValue? = nil
                         if entry.pc == pc, entry.shapePtr == jsObj.shapeIdentity {
                             if entry.holderPtr != nil {
@@ -9730,7 +9730,7 @@ struct JeffJSInterpreter {
                 // Inline cache fast path
                 if let jsObj = obj.obj, jsObj.shapeIdentity != nil {
                     if let ents = fb.icEntries {
-                        let entry = ents[pc & JeffJSInlineCache.mask]
+                        let entry = ents[jeffJS_icSlot(ents, pc)]
                         var icHit: JeffJSValue? = nil
                         if entry.pc == pc, entry.shapePtr == jsObj.shapeIdentity {
                             if entry.holderPtr != nil {
@@ -9788,7 +9788,7 @@ struct JeffJSInterpreter {
                 // Inline cache fast path: shape-matched direct property write
                 if let jsObj = obj.obj, jsObj.shapeIdentity != nil {
                     if let ents = fb.icEntries {
-                        let entry = ents[pc & JeffJSInlineCache.mask]
+                        let entry = ents[jeffJS_icSlot(ents, pc)]
                         if entry.pc == pc,
                            entry.shapePtr == jsObj.shapeIdentity,
                            entry.propOffset >= 0, entry.propOffset < jsObj.propCount {
@@ -10049,7 +10049,7 @@ struct JeffJSInterpreter {
                 // transition-table search and defineProperty. This is the
                 // object-literal fast path (`{a: .., b: ..}`).
                 if let jsObj = obj.obj, let ents = fb.icEntries {
-                    let entry = ents[pc & JeffJSInlineCache.mask]
+                    let entry = ents[jeffJS_icSlot(ents, pc)]
                     if entry.pc == pc, jeffJS_icDefine(jsObj._ptr, entry, val, rt) {
                         pc += 5
                         continue dispatchLoop
@@ -12546,7 +12546,7 @@ struct JeffJSInterpreter {
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 // IC fast path: own "length" data slot (arrays keep it at slot 0).
                 if let jsObj = obj.obj, let sid = jsObj.shapeIdentity, let ents = fb.icEntries {
-                    let entry = ents[pc & JeffJSInlineCache.mask]
+                    let entry = ents[jeffJS_icSlot(ents, pc)]
                     if entry.pc == pc, entry.shapePtr == sid, entry.holderPtr == nil,
                        entry.propOffset >= 0, entry.propOffset < jsObj.propCount,
                        jsObj.extra(at: entry.propOffset) == nil {
@@ -12665,7 +12665,7 @@ struct JeffJSInterpreter {
                 // Inline cache fast path
                 if let jsObj = obj.obj, jsObj.shapeIdentity != nil {
                     if let ents = fb.icEntries {
-                        let entry = ents[pc & JeffJSInlineCache.mask]
+                        let entry = ents[jeffJS_icSlot(ents, pc)]
                         var icHit: JeffJSValue? = nil
                         if entry.pc == pc, entry.shapePtr == jsObj.shapeIdentity {
                             if entry.holderPtr != nil {
@@ -12714,7 +12714,7 @@ struct JeffJSInterpreter {
                 // Inline cache fast path
                 if let jsObj = obj.obj, jsObj.shapeIdentity != nil {
                     if let ents = fb.icEntries {
-                        let entry = ents[pc & JeffJSInlineCache.mask]
+                        let entry = ents[jeffJS_icSlot(ents, pc)]
                         var icHit: JeffJSValue? = nil
                         if entry.pc == pc, entry.shapePtr == jsObj.shapeIdentity {
                             if entry.holderPtr != nil {

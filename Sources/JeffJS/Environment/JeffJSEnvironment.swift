@@ -496,6 +496,11 @@ public final class JeffJSEnvironment {
     /// compiled on a first call (count, source KB, ms).
     public var lazyCompileSummary: String { runtime.lazyStats.description }
     /// Live inline-cache tables and their bytes, process-wide (all runtimes).
+    /// Inline-cache stores that found no slot (0 expected; see
+    /// `JeffJSInlineCache.unmappedStores`).
+    public static var inlineCacheUnmappedStores: Int {
+        JeffJSInlineCache.unmappedStores.load(ordering: .relaxed)
+    }
     public static var inlineCacheStats: (tables: Int, bytes: Int) {
         JeffJSInlineCache.liveStats
     }

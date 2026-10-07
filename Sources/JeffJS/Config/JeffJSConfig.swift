@@ -164,6 +164,11 @@ enum JeffJSConfig {
     /// power of two ≥ the function's bytecode length (`JeffJSInlineCache`,
     /// IC table size fix 2026-09-29). A/B: `JEFFJS_INTERP_ICTABLEFIXED=1`.
     static let icTableFixed        = bool("interp.icTableFixed",       default: false)
+    /// Inline-cache tables have one slot per IC site of the function (an
+    /// ordinal from the bytecode walk, `JeffJSInlineCache`) instead of one per
+    /// bytecode offset (~95 % empty). A/B: `JEFFJS_INTERP_ICORDINALTABLES=0`
+    /// = the bytecode-offset tables sized to the bytecode.
+    static let icOrdinalTables     = bool("interp.icOrdinalTables",    default: true)
 
     /// `await` inside an async function / async generator always suspends and
     /// resumes from a job (ES §27.7.5.3). false = the old synchronous
