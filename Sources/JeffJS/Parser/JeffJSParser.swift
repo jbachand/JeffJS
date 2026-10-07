@@ -2421,7 +2421,11 @@ nonisolated final class JeffJSParser {
         emitIfTrue(loopLabel)
         emitLabel(breakLabel)
 
-        expectSemicolon()
+        // ASI (ES §12.10.1 rule 1, third bullet): a semicolon is inserted after the
+        // `)` of a do-while even with no line break — `do x(); while (c) return l`
+        // (QuickJS: `if (s->token.val == ';') next_token(s)`). Minified graphql-js
+        // in foxnews's fennec.js failed with "Unexpected keyword 'return'".
+        if tok == 0x3B { next() }
     }
 
     // MARK: For Statement

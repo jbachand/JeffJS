@@ -175,6 +175,17 @@ extension JeffJSTestRunner {
         evalCheckBool(ctx, "var e={a1:1,b:2},c=7,n=0; var r=(d=function(){for(var i in e)/\\d/.test(i)&&n++;return n},c); r === 7 && d() === 1", expect: true)
         evalCheckBool(ctx, "var q=(z=function(){if(1)/x\\/y/.test('x/y');return 2},3); q === 3 && z() === 2", expect: true)
         evalCheckBool(ctx, "var f=(a,b=(1,2))=>a+b; f(1) === 3", expect: true)
+        // ASI after do-while's `)` with no line break (ES §12.10.1)
+        evalCheckBool(ctx, "function dw(){var l=[],i=0;do l.push(i++);while(i<3)return l} var k=0; do k++; while(k<2) k+=10; dw().join() === '0,1,2' && k === 12", expect: true)
+        // Element.removeAttributeNode (DOM §4.9), in a document environment.
+        var ranOK = false, ranDetail = ""
+        let ranCheck: @MainActor () -> Void = {
+            let e = JeffJSEnvironment()
+            let r = e.eval("var de=document.createElement('div'); de.setAttribute('data-x','1'); var at={name:'data-x'}; var rr=de.removeAttributeNode(at); var nf=false; try { de.removeAttributeNode(at); } catch (x) { nf = x.name === 'NotFoundError'; } String(rr === at && !de.hasAttribute('data-x') && nf)", filename: "<removeAttributeNode>")
+            if case .success(let v) = r { ranOK = v == "true"; ranDetail = v ?? "undefined" } else { ranDetail = "\(r)" }
+        }
+        if Thread.isMainThread { MainActor.assumeIsolated { ranCheck() } } else { DispatchQueue.main.sync { MainActor.assumeIsolated { ranCheck() } } }
+        assert(ranOK, "FoxnewsEngine: removeAttributeNode -> \(ranDetail)")
         evalCheckBool(ctx, "var ok=false; try { new Date(NaN).toISOString(); } catch (e) { ok = e instanceof RangeError; } ok", expect: true)
     }
 }
