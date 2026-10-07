@@ -11,6 +11,7 @@
 //   __nativeFetch.decodeBytes(arrayBuffer, charset?)                  -> String
 //   __nativeFetch.encodeUTF8(string)                                  -> ArrayBuffer
 //   __nativeFetch.setEnforceCORS(bool) / setOrigin(url) / getOrigin()
+//   __nativeFetch.sendBeacon(url, { body })                          -> Bool (Beacon §3.2)
 //
 // The callback is invoked as:
 //   callback(requestID, payloadJSON | null, errorText | null,
@@ -36,6 +37,7 @@
 //     mode: "cors" (default) | "no-cors" | "same-origin",
 //     cache: "default" | "no-store" | "reload" | "no-cache" | "force-cache" | "only-if-cached",
 //     redirect: "follow" (default) | "manual" | "error",
+//     keepalive: Bool,           // survives cancelAll()/teardown; 64 KiB of bodies in flight
 //     signalId: String,          // pair with __nativeFetch.abortSignal(id)
 //     responseType: String }     // XHR hint, echoed back untouched
 //
@@ -103,6 +105,7 @@ struct JeffJSFetchSpec {
     var cookieHeader: String? = nil           // from the bridge's cookie store
     var referrer: String? = nil               // init.referrer: nil = about:client, "" = none, else a URL
     var referrerPolicy: String = ""           // init.referrerPolicy ("" = the document's)
+    var keepalive: Bool = false               // init.keepalive: outlives the document (Fetch §4.6 quota)
 }
 
 /// The network result, before it is turned into JS values.
@@ -239,6 +242,12 @@ final class JeffJSFetchBridge {
     /// Number of in-flight fetch requests.
     var activeCount: Int { activeTasks.count }
 
+    /// Fetch §4.6 "fetch" step 12.2: bytes of keepalive request bodies in flight for this
+    /// document (fetch group); a keepalive request that would take it past 64 KiB is a
+    /// network error (`sendBeacon` returns false).
+    static let keepaliveQuotaBytes = 65_536
+    private(set) var keepaliveInflightBytes = 0
+
     /// The document's referrer policy (`Referrer-Policy` header / `<meta
     /// name="referrer">`, set by the host); `.empty` = strict-origin-when-cross-origin.
     var referrerPolicy: JeffJSReferrerPolicy = .empty
@@ -364,6 +373,23 @@ final class JeffJSFetchBridge {
             ctx.newStringValue(self?.documentOrigin ?? "")
         }, length: 0)
 
+        // sendBeacon(url, { body }) -> Bool (W3C Beacon §3.2 steps 6-9): POST, credentials
+        // "include", keepalive, mode `cors` only for a non-CORS-safelisted Content-Type; the
+        // response is never exposed. false = over the keepalive quota.
+        ctx.setPropertyFunc(obj: fetchObj, name: "sendBeacon", fn: { [weak self] ctx, _, args in
+            guard let self else { return .newBool(false) }
+            let url = ctx.toSwiftString(args.count > 0 ? args[0] : .undefined) ?? ""
+            let opts = args.count > 1 ? args[1] : JeffJSValue.undefined
+            var spec = self.buildSpec(ctx: ctx, url: url, opts: opts)
+            spec.method = "POST"
+            spec.credentials = "include"
+            spec.keepalive = true
+            spec.cache = "no-cache"
+            spec.headers = []
+            spec.mode = spec.bodyContentType.map(Self.isSafelistedContentType) == false ? "cors" : "no-cors"
+            return .newBool(self.startKeepalive(spec: spec, requestID: nil, label: "sendBeacon"))
+        }, length: 2)
+
         // setPropertyStr consumes `fetchObj` (see JeffJSContext.setPropertyStr).
         _ = ctx.setPropertyStr(obj: global, name: "__nativeFetch", value: fetchObj)
     }
@@ -379,6 +405,23 @@ final class JeffJSFetchBridge {
         var spec = buildSpec(ctx: ctx, url: url, opts: opts)
         if let sig = spec.signalID { requestSignals[requestID] = sig }
         spec.cookieHeader = cookieHeaderForRequest(spec: spec)
+
+        if spec.keepalive {
+            if !startKeepalive(spec: spec, requestID: requestID, label: label) {
+                // Over the quota: a network error (Fetch §4.6 step 12.2.3), delivered as a task.
+                Task { [weak self] in
+                    await MainActor.run {
+                        guard let self, let cb = self.storedCallbacks[requestID], let ctx = self.ctx else { return }
+                        defer { self.releaseCallback(for: requestID); self.requestSignals.removeValue(forKey: requestID) }
+                        JeffJSGCObjectHeader.activeRuntime = ctx.rt
+                        self.deliverError(ctx: ctx, cb: cb, idArg: .newFloat64(Double(requestID)), name: "TypeError",
+                                          message: "Failed to fetch: keepalive request bodies in flight exceed 65536 bytes",
+                                          label: "\(label)(\(requestID)) keepalive quota")
+                    }
+                }
+            }
+            return requestID
+        }
 
         let task = Task { [weak self] in
             guard let self else { return }
@@ -425,6 +468,54 @@ final class JeffJSFetchBridge {
         }
         activeTasks[requestID] = task
         return requestID
+    }
+
+    /// A keepalive request (`fetch(…, { keepalive: true })`, `sendBeacon`): reserves its body
+    /// against the 64 KiB quota (false = over it, nothing sent) and runs **outside**
+    /// `activeTasks`, holding the bridge strongly, so navigation teardown (`cancelAll`) does
+    /// not cancel it; its callback (if any) is delivered only while the document is alive.
+    private func startKeepalive(spec: JeffJSFetchSpec, requestID: Int?, label: String) -> Bool {
+        let size = spec.body?.count ?? 0
+        guard keepaliveInflightBytes + size <= Self.keepaliveQuotaBytes else { return false }
+        keepaliveInflightBytes += size
+        Task { [self] in
+            let result = await self.performFetch(spec: spec)
+            await MainActor.run {
+                self.keepaliveInflightBytes = max(0, self.keepaliveInflightBytes - size)
+                guard let requestID else { return }
+                defer {
+                    self.releaseCallback(for: requestID)
+                    self.requestSignals.removeValue(forKey: requestID)
+                }
+                guard let cb = self.storedCallbacks[requestID], let ctx = self.ctx else { return }
+                JeffJSGCObjectHeader.activeRuntime = ctx.rt
+                let idArg = JeffJSValue.newFloat64(Double(requestID))
+                switch result {
+                case .success(let res):
+                    let payloadJSON = ctx.newStringValue(self.legacyJSON(for: res))
+                    let payloadObj = self.buildPayloadObject(ctx: ctx, result: res)
+                    self.invokeCallback(ctx: ctx, cb: cb, args: [idArg, payloadJSON, .null, payloadObj, .null],
+                                        label: "\(label)(\(requestID)) keepalive")
+                    payloadJSON.freeValue()
+                    payloadObj.freeValue()
+                    self.drainJobs(ctx: ctx, label: "\(label)(\(requestID)) keepalive")
+                case .failure(let error):
+                    let failure = error as? JeffJSFetchFailure
+                    self.deliverError(ctx: ctx, cb: cb, idArg: idArg, name: failure?.name ?? "TypeError",
+                                      message: failure?.message ?? error.localizedDescription,
+                                      label: "\(label)(\(requestID)) keepalive error")
+                }
+            }
+        }
+        return true
+    }
+
+    /// Fetch §2.2.2 CORS-safelisted `Content-Type` value.
+    static func isSafelistedContentType(_ value: String) -> Bool {
+        guard value.utf8.count <= 128 else { return false }
+        let unsafe: Set<UInt8> = [0x22, 0x28, 0x29, 0x3A, 0x3C, 0x3E, 0x3F, 0x40, 0x5B, 0x5C, 0x5D, 0x7B, 0x7D, 0x7F]
+        if value.utf8.contains(where: { ($0 < 0x20 && $0 != 0x09) || unsafe.contains($0) }) { return false }
+        return simpleContentTypes.contains(JeffJSFetchText.mimeType(fromContentType: value))
     }
 
     private func deliverError(ctx: JeffJSContext, cb: JeffJSValue, idArg: JeffJSValue,
@@ -544,6 +635,11 @@ final class JeffJSFetchBridge {
         if let s = str("signalId") ?? str("signalID") { spec.signalID = s }
         if let rt = str("responseType") { spec.responseType = rt }
         if let rp = str("referrerPolicy") { spec.referrerPolicy = rp }
+        do {
+            let ka = ctx.getPropertyStr(obj: opts, name: "keepalive")
+            defer { ka.freeValue() }
+            spec.keepalive = !ka.isUndefined && !ka.isNull && ctx.toBool(ka)
+        }
         do {   // `referrer: ""` means no referrer, so it is not read through str()
             let v = ctx.getPropertyStr(obj: opts, name: "referrer")
             defer { v.freeValue() }
@@ -618,6 +714,7 @@ final class JeffJSFetchBridge {
         if let v = obj["signalId"] { spec.signalID = String(describing: v) }
         if let v = obj["referrer"] as? String { spec.referrer = v }
         if let v = obj["referrerPolicy"] as? String { spec.referrerPolicy = v }
+        if let v = obj["keepalive"] as? Bool { spec.keepalive = v }
     }
 
     private func cookieHeaderForRequest(spec: JeffJSFetchSpec) -> String? {
