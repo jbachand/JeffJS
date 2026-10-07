@@ -38,6 +38,9 @@ final class TinyHTTPServer: @unchecked Sendable {
     private var counters: [String: Int] = [:]
 
     func count(_ key: String) -> Int { lock.lock(); defer { lock.unlock() }; return counters[key] ?? 0 }
+    private var beacons: [Request] = []
+    /// Requests to `/beacon*` in arrival order (sendBeacon tests).
+    var receivedBeacons: [Request] { lock.lock(); defer { lock.unlock() }; return beacons }
     private func bump(_ key: String) { lock.lock(); counters[key, default: 0] += 1; lock.unlock() }
 
     init?() {
@@ -244,6 +247,11 @@ final class TinyHTTPServer: @unchecked Sendable {
                 ("Content-Type", "text/plain"),
                 ("Access-Control-Allow-Origin", "*")
             ], body: Array("origin=\(origin)".utf8))
+
+        case "/beacon", "/beacon-slow":
+            lock.lock(); beacons.append(req); lock.unlock()
+            if req.path == "/beacon-slow" { Thread.sleep(forTimeInterval: 1.5) }
+            return Response(status: 204, reason: "No Content", headers: [("Set-Cookie", "after=1; Path=/")], body: [])
 
         case "/slow":
             Thread.sleep(forTimeInterval: 1.5)
@@ -594,6 +602,91 @@ final class FetchBridgeTests: XCTestCase {
           .catch(function(e){ globalThis.__out = 'ERR ' + e; });
         """)
         XCTAssertEqual(out, "origin=\(base)")
+    }
+
+    // MARK: sendBeacon (W3C Beacon §3.2)
+
+    @MainActor
+    private func waitForBeacons(_ n: Int, timeout: TimeInterval = 10) async -> [TinyHTTPServer.Request] {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let got = server.receivedBeacons
+            if got.count >= n { return got }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return server.receivedBeacons
+    }
+
+    /// POST, the body's Content-Type, credentials "include" (a cross-origin cookie from the
+    /// page's jar), `Origin`, no-cors for a safelisted type, nothing exposed.
+    @MainActor
+    func testSendBeaconPostsBodyWithCredentials() async throws {
+        try skipIfNoServer()
+        let env = makeEnvironment()
+        env.cookieJar?.store(setCookieLines: ["sid=abc123; Path=/"], for: URL(string: crossOrigin + "/")!)
+        let out = await runJS(env, """
+        var p = new URLSearchParams(); p.append('a', '1'); p.append('b', 'two words');
+        globalThis.__out = [navigator.sendBeacon('\(crossOrigin)/beacon?k=text', 'hi \\u2713'),
+                            navigator.sendBeacon('\(crossOrigin)/beacon?k=usp', p),
+                            navigator.sendBeacon('\(crossOrigin)/beacon?k=none'),
+                            navigator.sendBeacon.length].join(',');
+        """)
+        XCTAssertEqual(out, "true,true,true,1")
+        let got = await waitForBeacons(3)
+        XCTAssertEqual(got.count, 3)
+        guard let text = got.first(where: { $0.query["k"] == "text" }),
+              let usp = got.first(where: { $0.query["k"] == "usp" }),
+              let none = got.first(where: { $0.query["k"] == "none" }) else { return XCTFail("missing beacons \(got.map(\.query))") }
+        XCTAssertEqual(text.method, "POST")
+        XCTAssertEqual(text.headers["content-type"], "text/plain;charset=UTF-8")
+        XCTAssertEqual(String(decoding: text.body, as: UTF8.self), "hi \u{2713}")
+        XCTAssertTrue((text.headers["cookie"] ?? "").contains("sid=abc123"), "credentials include: \(text.headers)")
+        XCTAssertEqual(text.headers["origin"], base)
+        XCTAssertEqual(usp.headers["content-type"], "application/x-www-form-urlencoded;charset=UTF-8")
+        XCTAssertEqual(String(decoding: usp.body, as: UTF8.self), "a=1&b=two+words")
+        XCTAssertNil(none.headers["content-type"])
+        XCTAssertTrue(none.body.isEmpty)
+    }
+
+    /// TypeErrors for bad URLs / schemes / no arguments; false past the 64 KiB keepalive quota
+    /// (one body over it, or one that does not fit next to a body still in flight).
+    @MainActor
+    func testSendBeaconErrorsAndKeepaliveQuota() async throws {
+        try skipIfNoServer()
+        let env = makeEnvironment()
+        let out = await runJS(env, """
+        function t(f) { try { return String(f()); } catch (e) { return e.name; } }
+        function s(n) { var x = ''; while (x.length < n) x += 'abcdefghij'; return x.slice(0, n); }
+        globalThis.__out = [t(function() { return navigator.sendBeacon(); }),
+                            t(function() { return navigator.sendBeacon('ftp://example.com/'); }),
+                            t(function() { return navigator.sendBeacon('http://[::1'); }),
+                            t(function() { return navigator.sendBeacon('\(base)/beacon?k=over', s(65537)); }),
+                            t(function() { return navigator.sendBeacon('\(base)/beacon-slow?k=a', s(40000)); }),
+                            t(function() { return navigator.sendBeacon('\(base)/beacon?k=b', s(30000)); }),
+                            t(function() { return navigator.sendBeacon('\(base)/beacon?k=c', s(20000)); })].join(',');
+        """)
+        XCTAssertEqual(out, "TypeError,TypeError,TypeError,false,true,false,true")
+        let got = await waitForBeacons(2)
+        XCTAssertEqual(Set(got.compactMap { $0.query["k"] }), ["a", "c"])
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline, env.fetchBridge?.keepaliveInflightBytes != 0 { try? await Task.sleep(nanoseconds: 20_000_000) }
+        XCTAssertEqual(env.fetchBridge?.keepaliveInflightBytes, 0, "the quota is given back when the requests finish")
+    }
+
+    /// A beacon is not cancelled by the navigation teardown (`cancelAll`), unlike a fetch.
+    @MainActor
+    func testSendBeaconSurvivesCancelAll() async throws {
+        try skipIfNoServer()
+        let env = makeEnvironment()
+        let out = await runJS(env, """
+        fetch('\(base)/beacon-slow?k=fetch').catch(function() {});
+        globalThis.__out = String(navigator.sendBeacon('\(base)/beacon-slow?k=beacon', 'bye'));
+        """)
+        XCTAssertEqual(out, "true")
+        env.fetchBridge?.cancelAll()
+        let got = await waitForBeacons(1)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(server.receivedBeacons.compactMap { $0.query["k"] }, ["beacon"], "got \(got.map(\.query))")
     }
 
     // MARK: credentials

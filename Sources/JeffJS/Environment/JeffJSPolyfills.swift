@@ -245,8 +245,23 @@ public enum JeffJSPolyfills {
           if (typeof window.navigator.cookieEnabled === 'undefined') window.navigator.cookieEnabled = true;
           if (typeof window.navigator.onLine === 'undefined') window.navigator.onLine = true;
           if (typeof window.navigator.webdriver === 'undefined') window.navigator.webdriver = false;
+          // W3C Beacon §3.2 over the fetch bridge's keepalive POST (`__nativeFetch.sendBeacon`:
+          // body extraction, credentials include, cors only for a non-safelisted type, 64 KiB
+          // in-flight quota). Without the bridge nothing can be sent: false.
           if (typeof window.navigator.sendBeacon !== 'function') {
-            window.navigator.sendBeacon = function(url, data) { return true; };
+            window.navigator.sendBeacon = function sendBeacon(url) {
+              if (arguments.length < 1) throw new TypeError('Not enough arguments');
+              var data = arguments.length > 1 ? arguments[1] : null, parsed;
+              var base = (typeof document !== 'undefined' && document && document.baseURI) || location.href;
+              try { parsed = new URL(String(url), base); } catch (e) { throw new TypeError('This URL is invalid'); }
+              if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new TypeError('Beacons can only be sent over HTTP(S)');
+              if (typeof ReadableStream === 'function' && data instanceof ReadableStream) throw new TypeError('Beacons cannot send ReadableStream body');
+              var nf = typeof __nativeFetch !== 'undefined' ? __nativeFetch : null;
+              if (!nf || typeof nf.sendBeacon !== 'function') return false;
+              var body = data === null || data === undefined ? undefined
+                : (typeof data === 'object' || typeof data === 'function') ? data : String(data);
+              return !!nf.sendBeacon(parsed.href, { body: body });
+            };
           }
           if (typeof window.navigator.vibrate !== 'function') {
             window.navigator.vibrate = function() { return true; };
