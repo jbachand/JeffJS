@@ -106,6 +106,22 @@ func jeffJS_icProtoHit(_ entry: JeffJSICEntry) -> JeffJSValue? {
     }
 }
 
+/// Slot of the inline-cache entry for the instruction at `pc`, read from the
+/// table's pc -> slot map (IC-site ordinal tables, perf/bytecode-paging).
+///
+/// The map sits in the same allocation as the entries, *below* them and
+/// reversed: the slot of `pc` is the UInt16 at `ents - 2 - 2*pc`. So every
+/// site keeps the one pointer it already had (`fb.icEntries`, the traces'
+/// `icEntries` argument) and pays one extra L1 load: no length or second
+/// pointer to fetch first. Slot 0 is a never-hit entry (pc -1): an offset
+/// that is not an IC site maps there. `pc` must be an offset inside the
+/// bytecode the table was built for — the invariant the 2026-09-29 audit
+/// established for every site (`entry.pc == pc` still guards each hit).
+@inline(__always)
+func jeffJS_icSlot(_ ents: UnsafeMutablePointer<JeffJSICEntry>, _ pc: Int) -> Int {
+    return Int(UnsafeRawPointer(ents).load(fromByteOffset: -2 &- (pc &<< 1), as: UInt16.self))
+}
+
 /// Reference-type IC table so interpreter can update entries in-place without COW copies.
 ///
 /// Each cached shape is *retained* (Unmanaged.passRetained) for as long as its
@@ -113,27 +129,40 @@ func jeffJS_icProtoHit(_ entry: JeffJSICEntry) -> JeffJSValue? {
 /// new shape allocation and the pointer-identity check false-hits, reading
 /// property slots through the wrong layout (observed as flaky engine crashes).
 ///
-/// Sizing (IC table size fix, 2026-09-29): every site indexes the table with
-/// `pc & mask` (512 slots), and every site's `pc` is the offset of an
-/// instruction of the function that owns the table — the trace's inline calls
-/// switch `fb`/`bc`/`icEntries` together, and the fused `this[<const>]` read
-/// uses its `get_array_el`'s own pc (checked `< bcLen`). So a table only needs
-/// the slots `[0, bytecodeLen)`: it is `forBytecodeLength(len)` = the next power
-/// of two ≥ len (8 … 512) entries, not a fixed 512 × 56 B = 28 KB (a 12-byte
-/// arrow function kept 28 KB; 3 000 small functions = 83 MB). A function of
-/// ≤ 512 bytes maps every pc to its own slot exactly as before (no collision
-/// that the fixed table did not have); longer ones keep 512 slots. The hot
-/// path is unchanged (`pc & JeffJSInlineCache.mask`). Stores check the bound
-/// (`pc < capacity`; a miss path), so a future site that broke the invariant
-/// would lose its cache instead of writing past the table.
-/// `JEFFJS_INTERP_ICTABLEFIXED=1` (`interp.icTableFixed`) = fixed 512 slots (A/B).
+/// Layout (IC-site ordinal tables, perf/bytecode-paging): one entry per IC
+/// site of the function, numbered in bytecode order when the table is built
+/// from the final bytecode (the sites are the instructions in
+/// `isSiteOpcode`: named, keyed, global and `length` reads/writes), plus the
+/// never-hit slot 0, and a pc -> slot map (UInt16 per bytecode byte, see
+/// `jeffJS_icSlot`). The bytecode-offset-indexed tables before it (8 … 512
+/// slots by `pc & 511`, 2026-09-29) were ~95 % empty: a site every ~8 bytes
+/// of bytecode, a 40-byte slot for every byte.
+/// `JEFFJS_INTERP_ICORDINALTABLES=0` (`interp.icOrdinalTables`) = the
+/// bytecode-offset tables sized to the bytecode (next power of two ≥ its
+/// length, 8 … 512), `JEFFJS_INTERP_ICTABLEFIXED=1` = fixed 512 slots; both
+/// through the same map (slot = 1 + (pc & (slots - 1))), so the hot path is
+/// one code path in every mode. A function with more than `maxOrdinalSlots`
+/// sites folds them (slot = 1 + ordinal % maxOrdinalSlots; collisions are
+/// misses, as `pc & 511` folded long functions before).
 nonisolated final class JeffJSInlineCache {
     static let size = 512
     static let mask = size - 1
     static let minCapacity = 8
+    /// Most entry slots an ordinal table gets (a function with more sites
+    /// shares slots between them).
+    static let maxOrdinalSlots = 2048
+    /// All slots, the never-hit slot 0 first.
     var entries: UnsafeMutableBufferPointer<JeffJSICEntry>
-    /// Slots in `entries` (a power of two, ≤ `size`).
+    /// Slots the sites use (`entries.count - 1`).
     let capacity: Int
+    /// Bytecode bytes the pc -> slot map covers (the function's length).
+    let mapLength: Int
+    /// IC sites found in the bytecode (ordinal tables; 0 otherwise).
+    let siteCount: Int
+    /// true: one slot per site; false: bytecode-offset slots.
+    let isOrdinal: Bool
+    private let block: UnsafeMutableRawPointer
+    private let blockBytes: Int
 
     /// Live tables / their bytes, process-wide (stats: `jeffjs-cli --settle`).
     static let liveTables = Atomic<Int>(0)
@@ -141,8 +170,14 @@ nonisolated final class JeffJSInlineCache {
     static var liveStats: (tables: Int, bytes: Int) {
         (liveTables.load(ordering: .relaxed), liveBytes.load(ordering: .relaxed))
     }
+    /// Cache stores that found no slot for their pc (an offset that is not
+    /// an IC site; expected 0 — a nonzero count names a site missing from
+    /// `isSiteOpcode`). Tests read it.
+    static let unmappedStores = Atomic<Int>(0)
+    static var unmappedStoreCount: Int { unmappedStores.load(ordering: .relaxed) }
 
-    /// Slots a table of a function with `len` bytes of bytecode needs.
+    /// Slots a bytecode-offset table of a function with `len` bytes of
+    /// bytecode needs (the pre-ordinal layout).
     @inline(__always)
     static func capacity(forBytecodeLength len: Int) -> Int {
         if JeffJSConfig.icTableFixed || len >= size { return size }
@@ -151,19 +186,91 @@ nonisolated final class JeffJSInlineCache {
         return c
     }
 
-    init(capacity requested: Int = JeffJSInlineCache.size) {
-        let cap = max(1, min(Self.size, requested))
-        capacity = cap
-        let ptr = UnsafeMutablePointer<JeffJSICEntry>.allocate(capacity: cap)
-        ptr.initialize(repeating: JeffJSICEntry(), count: cap)
-        entries = UnsafeMutableBufferPointer(start: ptr, count: cap)
-        Self.liveTables.wrappingAdd(1, ordering: .relaxed)
-        Self.liveBytes.wrappingAdd(cap * MemoryLayout<JeffJSICEntry>.stride, ordering: .relaxed)
+    /// Opcodes whose handlers read or write an inline-cache entry keyed by
+    /// their own pc (main loop, fast and lean traces, keyed / string /
+    /// global helpers). The fused `this[<const>]` read uses its
+    /// `get_array_el`'s pc.
+    static let isSiteOpcode: [Bool] = {
+        var t = [Bool](repeating: false, count: 512)
+        let ops: [JeffJSOpcode] = [.get_field, .get_field2, .put_field, .define_field,
+                                   .get_loc8_get_field, .get_arg0_get_field, .get_length,
+                                   .get_var, .get_var_undef, .put_var,
+                                   .get_array_el, .get_array_el2, .put_array_el]
+        for op in ops where Int(op.rawValue) < t.count { t[Int(op.rawValue)] = true }
+        return t
+    }()
+
+    /// The pc -> ordinal walk over final bytecode: (site count, and for each
+    /// site its pc, in order). Decodes like the interpreter (wide opcodes
+    /// are a 0x00 prefix + the low byte).
+    static func sitePCs(_ bc: UnsafePointer<UInt8>, _ len: Int) -> [Int32] {
+        var out: [Int32] = []
+        var pc = 0
+        while pc < len {
+            let b0 = bc[pc]
+            let raw: Int, width: Int
+            if b0 != 0 { raw = Int(b0); width = 1 } else {
+                guard pc + 1 < len else { break }
+                raw = 256 + Int(bc[pc + 1]); width = 2
+            }
+            guard raw < jeffJSOpcodeInfo.count else { pc += 1; continue }
+            if raw < isSiteOpcode.count && isSiteOpcode[raw] { out.append(Int32(truncatingIfNeeded: pc)) }
+            pc += max(Int(jeffJSOpcodeInfo[raw].size) + (width - 1), 1)
+        }
+        return out
     }
+
+    private init(slots: Int, mapLength: Int, siteCount: Int, isOrdinal: Bool) {
+        let cap = max(1, min(slots, Int(UInt16.max) - 1))
+        capacity = cap
+        self.mapLength = max(0, mapLength)
+        self.siteCount = siteCount
+        self.isOrdinal = isOrdinal
+        let stride = MemoryLayout<JeffJSICEntry>.stride
+        let mapBytes = (self.mapLength * 2 + 15) & ~15
+        blockBytes = mapBytes + (cap + 1) * stride
+        block = UnsafeMutableRawPointer.allocate(byteCount: blockBytes, alignment: 16)
+        block.initializeMemory(as: UInt8.self, repeating: 0, count: mapBytes)
+        let ptr = (block + mapBytes).bindMemory(to: JeffJSICEntry.self, capacity: cap + 1)
+        ptr.initialize(repeating: JeffJSICEntry(), count: cap + 1)
+        entries = UnsafeMutableBufferPointer(start: ptr, count: cap + 1)
+        Self.liveTables.wrappingAdd(1, ordering: .relaxed)
+        Self.liveBytes.wrappingAdd(blockBytes, ordering: .relaxed)
+    }
+
+    @inline(__always) private func setSlot(_ pc: Int, _ slot: Int) {
+        UnsafeMutableRawPointer(entries.baseAddress!)
+            .storeBytes(of: UInt16(truncatingIfNeeded: slot), toByteOffset: -2 - 2 * pc, as: UInt16.self)
+    }
+
+    /// A bytecode-offset table of `requested` slots covering pcs
+    /// `0 ..< requested` (tests; `capacity(forBytecodeLength:)` sizes).
+    convenience init(capacity requested: Int = JeffJSInlineCache.size) {
+        let cap = max(1, min(Self.size, requested))
+        self.init(slots: cap, mapLength: cap, siteCount: 0, isOrdinal: false)
+        for pc in 0 ..< cap { setSlot(pc, 1 + (pc & (cap - 1))) }
+    }
+
+    /// The table for a function's final bytecode, in the configured layout.
+    convenience init(bytecode bc: UnsafePointer<UInt8>, length len: Int) {
+        if JeffJSConfig.icOrdinalTables && !JeffJSConfig.icTableFixed {
+            let sites = Self.sitePCs(bc, len)
+            let slots = max(1, min(sites.count, Self.maxOrdinalSlots))
+            self.init(slots: slots, mapLength: len, siteCount: sites.count, isOrdinal: true)
+            for (i, pc) in sites.enumerated() { setSlot(Int(pc), 1 + (i % slots)) }
+        } else {
+            let cap = Self.capacity(forBytecodeLength: len)
+            self.init(slots: cap, mapLength: len, siteCount: 0, isOrdinal: false)
+            for pc in 0 ..< len { setSlot(pc, 1 + (pc & (cap - 1))) }
+        }
+    }
+
+    /// Bytes of the table (map + entries).
+    var byteSize: Int { blockBytes }
 
     deinit {
         Self.liveTables.wrappingSubtract(1, ordering: .relaxed)
-        Self.liveBytes.wrappingSubtract(capacity * MemoryLayout<JeffJSICEntry>.stride, ordering: .relaxed)
+        Self.liveBytes.wrappingSubtract(blockBytes, ordering: .relaxed)
         for entry in entries {
             if let old = entry.shapePtr {
                 Unmanaged<JeffJSShape>.fromOpaque(old).release()
@@ -178,15 +285,28 @@ nonisolated final class JeffJSInlineCache {
                 Unmanaged<JeffJSShape>.fromOpaque(old).release()
             }
         }
-        entries.baseAddress?.deinitialize(count: capacity)
-        entries.baseAddress?.deallocate()
+        entries.baseAddress?.deinitialize(count: entries.count)
+        block.deallocate()
+    }
+
+    /// Slot of `pc` (0 = none), checked against the map's extent.
+    @inline(__always)
+    func slot(_ pc: Int) -> Int {
+        guard pc >= 0, pc < mapLength else { return 0 }
+        return jeffJS_icSlot(entries.baseAddress!, pc)
     }
 
     @inline(__always)
     func lookup(_ pc: Int) -> JeffJSICEntry {
-        let idx = pc & Self.mask
-        guard idx < capacity else { return JeffJSICEntry() }
-        return entries[idx]
+        return entries[slot(pc)]
+    }
+
+    /// Slot a store at `pc` writes, nil (counted) when the pc has none.
+    @inline(__always)
+    private func storeSlot(_ pc: Int) -> Int? {
+        let idx = slot(pc)
+        if idx == 0 { Self.unmappedStores.wrappingAdd(1, ordering: .relaxed); return nil }
+        return idx
     }
 
     /// Release everything the entry at `idx` retains.
@@ -211,8 +331,7 @@ nonisolated final class JeffJSInlineCache {
     @inline(__always)
     func updateProto(_ pc: Int, receiverShape: JeffJSShape, holder: JeffJSObject,
                      holderShape: JeffJSShape, propOffset: Int, atom: UInt32 = 0) {
-        let idx = pc & Self.mask
-        guard idx < capacity, !receiverShape.isLazySentinel, !holderShape.isLazySentinel else { return }
+        guard let idx = storeSlot(pc), !receiverShape.isLazySentinel, !holderShape.isLazySentinel else { return }
         receiverShape.icCached = true   // "no own property here": stale if one is appended in place
         holderShape.icCached = true     // the holder's slot: stale if deleted / re-flagged in place
         let rs = Unmanaged.passRetained(receiverShape).toOpaque()
@@ -227,8 +346,7 @@ nonisolated final class JeffJSInlineCache {
 
     @inline(__always)
     func update(_ pc: Int, shape: JeffJSShape, propOffset: Int, atom: UInt32 = 0) {
-        let idx = pc & Self.mask
-        guard idx < capacity, !shape.isLazySentinel else { return }
+        guard let idx = storeSlot(pc), !shape.isLazySentinel else { return }
         // Retain the new shape before releasing the old one (handles re-caching
         // the same shape without a transient zero refcount).
         shape.icCached = true   // own slot: stale if deleted / re-flagged in place (prepareShapeUpdate)
@@ -249,8 +367,7 @@ nonisolated final class JeffJSInlineCache {
     /// (both retained for the entry's lifetime).
     @inline(__always)
     func updateTransition(_ pc: Int, from: JeffJSShape, to: JeffJSShape) {
-        let idx = pc & Self.mask
-        guard idx < capacity, !from.isLazySentinel else { return }
+        guard let idx = storeSlot(pc), !from.isLazySentinel else { return }
         from.icCached = true   // stale if `from` grows in place
         let fromPtr = Unmanaged.passRetained(from).toOpaque()
         let toPtr = Unmanaged.passRetained(to).toOpaque()
@@ -304,18 +421,45 @@ nonisolated final class TraceBlockInfo {
 /// 24 bytes each instead of a private copy of their text, and the buffer
 /// lives exactly as long as some function from that script is alive.
 nonisolated final class JeffJSSourceText {
-    let bytes: [UInt8]
+    /// The text (UTF-8). A heap block for a fresh compile; a span of the
+    /// bytecode-cache entry's file mapping once the entry is on disk (cache
+    /// hit, or `adoptMapping` after the store's write landed) — then the
+    /// text is file-backed pages, not heap (perf/bytecode-paging).
+    /// `JEFFJS_COMPILE_MAPPEDSOURCE=0`: always the heap copy.
+    private(set) var bytes: JeffJSBytesSpan
 
-    init(bytes: [UInt8]) { self.bytes = bytes }
-    init(_ s: String) { self.bytes = Array(s.utf8) }
+    init(bytes: [UInt8]) { self.bytes = JeffJSBytesSpan(copying: bytes) }
+    init(span: JeffJSBytesSpan) { self.bytes = span }
+    convenience init(bytes span: JeffJSBytesSpan) { self.init(span: span) }
+    init(_ s: String) { self.bytes = JeffJSBytesSpan(utf8: s) }
 
     var count: Int { return bytes.count }
+
+    /// The text lives in a file mapping.
+    var isMapped: Bool { bytes.isFileBacked }
+
+    /// Re-home the text in `span` (the same bytes in a mapped cache entry).
+    /// Readers that already took `bytes` keep the old storage alive until
+    /// they finish. Refused (false) unless the bytes are identical.
+    @discardableResult
+    func adoptMapping(_ span: JeffJSBytesSpan) -> Bool {
+        guard span.contentEquals(bytes) else { return false }
+        bytes = span
+        return true
+    }
+
+    /// `adoptMapping` without the comparison (the cache's writer compared).
+    func adoptVerifiedMapping(_ span: JeffJSBytesSpan) {
+        bytes = span
+    }
 
     /// Decode the [start, start+len) byte range as a Swift string.
     func slice(start: Int, len: Int) -> String? {
         guard len >= 0, start >= 0, start &+ len <= bytes.count else { return nil }
         if len == 0 { return "" }
-        return String(decoding: bytes[start ..< (start &+ len)], as: UTF8.self)
+        return bytes.withUnsafeBufferPointer {
+            String(decoding: UnsafeBufferPointer(rebasing: $0[start ..< (start &+ len)]), as: UTF8.self)
+        }
     }
 }
 
@@ -445,16 +589,61 @@ nonisolated class JeffJSFunctionBytecode {
         @inline(__always) get { Int(_bytecodeLen) }
         set { _bytecodeLen = Int32(truncatingIfNeeded: newValue) }
     }
-    var bytecode: [UInt8] = []
+    /// The function's bytecode: ONE heap buffer of `bytecodeLen` bytes
+    /// (perf/bytecode-paging; it used to be a `[UInt8]` plus a raw copy of
+    /// it made on first execution — every executed body twice). A compile
+    /// or a cache load stages it in `_bcStaged`; the first `bytecodePtr`
+    /// moves it to `_bcBuffer` (no copy) and builds the constant view, so
+    /// `bcPtrFast` stays nil until then exactly as before. The array view
+    /// below copies and is for cold paths only (serializer, dumps, tests).
+    var bytecode: [UInt8] {
+        get {
+            guard let p = _bcBuffer ?? _bcStaged, bytecodeLen > 0 else { return [] }
+            return Array(UnsafeBufferPointer(start: p, count: bytecodeLen))
+        }
+        set {
+            _bcBuffer?.deallocate(); _bcBuffer = nil
+            _bcStaged?.deallocate(); _bcStaged = nil
+            let n = newValue.count
+            if n > 0 {
+                let p = UnsafeMutablePointer<UInt8>.allocate(capacity: n)
+                newValue.withUnsafeBufferPointer { p.initialize(from: $0.baseAddress!, count: n) }
+                _bcStaged = p
+            }
+            bytecodeLen = n
+            // The table's pc -> slot map belongs to the old bytecode.
+            ic = nil
+        }
+    }
+    /// Move `other`'s bytecode buffer here (no copy); `other` is left empty.
+    func takeBytecode(from other: JeffJSFunctionBytecode) {
+        _bcBuffer?.deallocate(); _bcBuffer = nil
+        _bcStaged?.deallocate(); _bcStaged = nil
+        _bcStaged = other._bcStaged ?? other._bcBuffer
+        other._bcStaged = nil
+        other._bcBuffer = nil
+        bytecodeLen = _bcStaged == nil ? 0 : other.bytecodeLen
+        other.bytecodeLen = 0
+        ic = nil
+        other.ic = nil
+    }
+    /// Byte `pc` of the bytecode (0 past the end), without the array copy.
+    func bytecodeByte(at pc: Int) -> UInt8 {
+        guard pc >= 0, pc < bytecodeLen, let p = _bcBuffer ?? _bcStaged else { return 0 }
+        return p[pc]
+    }
+    /// The bytecode bytes in place (no copy; valid inside `body`).
+    func withBytecodeBytes<R>(_ body: (UnsafeBufferPointer<UInt8>) throws -> R) rethrows -> R {
+        return try body(UnsafeBufferPointer(start: _bcBuffer ?? _bcStaged, count: (_bcBuffer ?? _bcStaged) == nil ? 0 : bytecodeLen))
+    }
+    /// Staged bytecode (set, not executed yet).
+    private var _bcStaged: UnsafeMutablePointer<UInt8>? = nil
 
-    /// Stable raw copy of `bytecode`, materialized lazily on first execution
-    /// (when bytecode is final and immutable). The interpreter reads opcodes and
-    /// operands through this pointer to avoid Swift Array bounds checks — the
-    /// largest remaining per-opcode cost. Owned by this FB; freed in deinit, so
-    /// the pointer is valid for the FB's entire lifetime (the FB is retained for
-    /// the duration of any call that executes it).
-    /// (A bare pointer: its length is `bytecodeLen`/`bytecode.count`; the
-    /// buffer-pointer form was 24 bytes of every body.)
+    /// The bytecode the interpreter reads, materialized on first execution
+    /// (when bytecode is final and immutable): reads go through this pointer
+    /// to avoid Swift Array bounds checks. Owned by this FB; freed in deinit
+    /// or when the bytecode is replaced, so the pointer is valid while the
+    /// FB is (the FB is retained for the duration of any call that executes it).
     private var _bcBuffer: UnsafeMutablePointer<UInt8>? = nil
 
     /// Raw pointer to the function's bytecode. Materializes `_bcBuffer` on first
@@ -471,19 +660,20 @@ nonisolated class JeffJSFunctionBytecode {
             return UnsafePointer(b)
         }
         materializeCpoolRaw()   // first execution: constants are final too
-        let n = bytecode.count
-        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: max(n, 1))
-        if n > 0 {
-            bytecode.withUnsafeBufferPointer { buf.initialize(from: $0.baseAddress!, count: n) }
-        } else {
-            buf[0] = 0
+        if let staged = _bcStaged {
+            _bcStaged = nil
+            _bcBuffer = staged
+            return UnsafePointer(staged)
         }
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 1)
+        buf[0] = 0
         _bcBuffer = buf
         return UnsafePointer(buf)
     }
 
     deinit {
         _bcBuffer?.deallocate()
+        _bcStaged?.deallocate()
         _cpoolRaw?.deallocate()
         _traceIndexPCs?.deallocate()
         _traceIndexInfos?.deallocate()
@@ -595,7 +785,10 @@ nonisolated class JeffJSFunctionBytecode {
     @inline(__always)
     func getIC() -> JeffJSInlineCache {
         if let ic = ic { return ic }
-        let newIC = JeffJSInlineCache(capacity: JeffJSInlineCache.capacity(forBytecodeLength: bytecodeLen))
+        // Built from the final bytecode (the pc -> slot map covers it):
+        // the table must be dropped whenever the bytecode is replaced
+        // (`resetBytecodeBuffer`).
+        let newIC = JeffJSInlineCache(bytecode: bytecodePtr, length: bytecodeLen)
         ic = newIC
         return newIC
     }
@@ -761,8 +954,15 @@ nonisolated class JeffJSFunctionBytecode {
     /// Drop the raw copy of `bytecode` materialized by `bytecodePtr` (lazy
     /// compilation replaced the bytecode of this object).
     func resetBytecodeBuffer() {
-        _bcBuffer?.deallocate()
-        _bcBuffer = nil
+        // Setting `bytecode` already gave back the old buffer (and staged the
+        // new one): if nothing was set, stage the current bytes again so the
+        // next execution re-materializes.
+        if let b = _bcBuffer {
+            _bcBuffer = nil
+            if _bcStaged == nil { _bcStaged = b } else { b.deallocate() }
+        }
+        // The inline-cache table's pc -> slot map belongs to the old bytecode.
+        ic = nil
     }
 
     /// The function's own source text, exactly as written (QuickJS
@@ -887,6 +1087,25 @@ nonisolated final class ListNode {
 
 // MARK: - JeffJSGCObjectHeader
 
+/// Threads currently compiling in a private runtime (JeffJSPrecompiler);
+/// written only under the precompiler's lock. 0: every object belongs to
+/// `activeRuntime`, as before.
+nonisolated(unsafe) var jeffJS_threadOwnersActive: Int = 0
+
+/// The runtime objects created on this thread belong to (a background
+/// compile's), or nil.
+@inline(never)
+func jeffJS_threadOwnerRuntime() -> JeffJSRuntime? {
+    guard let p = pthread_getspecific(jeffJS_threadOwnerKey) else { return nil }
+    return Unmanaged<JeffJSRuntime>.fromOpaque(p).takeUnretainedValue()
+}
+
+nonisolated(unsafe) let jeffJS_threadOwnerKey: pthread_key_t = {
+    var k = pthread_key_t()
+    pthread_key_create(&k, nil)
+    return k
+}()
+
 /// Base class for every GC-managed object.
 // nonisolated: GC objects are created and freed on whatever thread runs the
 // engine. Without this they inherit the host's default actor isolation (React
@@ -934,7 +1153,13 @@ nonisolated class JeffJSGCObjectHeader {
         self.refCount = refCount
         self.gcObjType = gcObjType
         self.mark = mark
-        self.ownerRuntime = JeffJSGCObjectHeader.activeRuntime
+        // A background precompile (JeffJSPrecompiler) creates its objects on
+        // its own thread in its own runtime: only while one runs does the
+        // owner come from the creating thread (one predictable branch here
+        // otherwise).
+        self.ownerRuntime = jeffJS_threadOwnersActive != 0
+            ? (jeffJS_threadOwnerRuntime() ?? JeffJSGCObjectHeader.activeRuntime)
+            : JeffJSGCObjectHeader.activeRuntime
     }
 
     /// The runtime's GC lists hold *unretained* pointers (see

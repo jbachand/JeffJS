@@ -221,28 +221,65 @@ final class BytecodeCacheBudgetTests: XCTestCase {
         XCTAssertEqual(rt2.bytecodeCache.diskHitCount, 1)
     }
 
-    /// The memory tier never holds more than its budget.
+    /// The heap memory tier (entries that never reach the disk: no disk
+    /// tier here) never holds more than its budget.
     func testMemoryTierIsByteBudgeted() throws {
-        let store = try XCTUnwrap(JeffJSBytecodeDiskStore(root: tempRoot(), name: "m", budgetBytes: 1 << 26))
-        let (rt, ctx) = runtime(with: store)
+        let rt = JeffJSRuntime()
+        rt.bytecodeCache.diskStore = nil
+        let ctx = rt.newContext()
         rt.bytecodeCache.memoryBudget = 64 * 1024
         for i in 0..<200 {
-            var src = "var s\(i) = [\n"
-            for j in 0..<200 { src += "\"m\(i)x\(j)\",\n" }
-            src += "]; s\(i).length"
-            _ = ctx.eval(input: src, filename: "mem-\(i).js", evalFlags: 0)
+            _ = ctx.eval(input: memScript(i), filename: "mem-\(i).js", evalFlags: 0)
         }
         XCTAssertLessThanOrEqual(rt.bytecodeCache.memoryTierBytes, 64 * 1024)
         XCTAssertGreaterThan(rt.bytecodeCache.memoryTierBytes, 0)
-        // The newest script is still a memory hit; the first was evicted to disk.
-        let hits = rt.bytecodeCache.hitCount, disk = rt.bytecodeCache.diskHitCount
-        var last = "var s199 = [\n"
-        for j in 0..<200 { last += "\"m199x\(j)\",\n" }
-        last += "]; s199.length"
-        XCTAssertEqual(describe(ctx, ctx.eval(input: last, filename: "mem-199.js", evalFlags: 0)), "200")
+        // The newest script is still a memory hit; the first was evicted.
+        let hits = rt.bytecodeCache.hitCount
+        XCTAssertEqual(describe(ctx, ctx.eval(input: memScript(199), filename: "mem-199.js", evalFlags: 0)), "200")
         XCTAssertEqual(rt.bytecodeCache.hitCount, hits + 1)
-        XCTAssertEqual(rt.bytecodeCache.diskHitCount, disk, "memory hit")
         XCTAssertEqual(rt.bytecodeCache.storeCount, 200)
+        let misses = rt.bytecodeCache.missCount
+        _ = ctx.eval(input: memScript(0), filename: "mem-0.js", evalFlags: 0)
+        XCTAssertEqual(rt.bytecodeCache.missCount, misses + 1, "evicted")
+    }
+
+    private func memScript(_ i: Int) -> String {
+        var src = "var s\(i) = [\n"
+        for j in 0..<200 { src += "\"m\(i)x\(j)\",\n" }
+        return src + "]; s\(i).length"
+    }
+
+    /// perf/bytecode-paging: entries that reach the disk are used from their
+    /// file mapping. The heap tier holds none of them, a lookup maps the
+    /// file once (disk hit) and keeps the mapping (memory hits after), the
+    /// mappings are count-capped, and with `JEFFJS_CACHE_BYTECODEMAPPED=0`
+    /// the old heap copies come back.
+    func testDiskBackedEntriesAreMappedNotCopied() throws {
+        let store = try XCTUnwrap(JeffJSBytecodeDiskStore(root: tempRoot(), name: "mp", budgetBytes: 1 << 26))
+        let (rt, ctx) = runtime(with: store)
+        rt.bytecodeCache.memoryBudget = 64 * 1024
+        rt.bytecodeCache.mappedEntryCap = 8
+        for i in 0..<40 {
+            _ = ctx.eval(input: memScript(i), filename: "mapped-\(i).js", evalFlags: 0)
+        }
+        XCTAssertEqual(rt.bytecodeCache.storeCount, 40)
+        guard JeffJSBytecodeCache.mappedMode else {
+            XCTAssertGreaterThan(rt.bytecodeCache.memoryTierBytes, 0)
+            return
+        }
+        XCTAssertEqual(rt.bytecodeCache.memoryTierBytes, 0, "no heap copies of disk-backed entries")
+        // First lookup of a stored entry: waits for its write, maps it.
+        let disk0 = rt.bytecodeCache.diskHitCount, hits0 = rt.bytecodeCache.hitCount
+        XCTAssertEqual(describe(ctx, ctx.eval(input: memScript(39), filename: "mapped-39.js", evalFlags: 0)), "200")
+        XCTAssertEqual(rt.bytecodeCache.diskHitCount, disk0 + 1)
+        // Second: the kept mapping (no disk read).
+        XCTAssertEqual(describe(ctx, ctx.eval(input: memScript(39), filename: "mapped-39.js", evalFlags: 0)), "200")
+        XCTAssertEqual(rt.bytecodeCache.diskHitCount, disk0 + 1)
+        XCTAssertEqual(rt.bytecodeCache.hitCount, hits0 + 2)
+        XCTAssertEqual(rt.bytecodeCache.mappedTierEntries, 1)
+        for i in 0..<20 { _ = ctx.eval(input: memScript(i), filename: "mapped-\(i).js", evalFlags: 0) }
+        XCTAssertLessThanOrEqual(rt.bytecodeCache.mappedTierEntries, 8, "count cap")
+        XCTAssertEqual(rt.bytecodeCache.memoryTierBytes, 0)
     }
 
     // MARK: - Cost: disk hit vs recompile

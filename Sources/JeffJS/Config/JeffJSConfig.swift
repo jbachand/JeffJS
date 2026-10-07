@@ -95,6 +95,20 @@ enum JeffJSConfig {
     /// Bytes of serialized blobs each runtime keeps in memory (LRU). A blob
     /// over a quarter of it is disk-only.
     static let bytecodeMemoryBudgetBytes = int("cache.bytecodeMemoryBudgetBytes", default: platformBudget(iOS: 16, watch: 2))
+    /// Cache entries on disk are used in place: a hit maps the entry file
+    /// read-only and deserializes out of the mapping (no heap copy of the
+    /// blob), the in-memory tier keeps mappings (count-capped LRU,
+    /// `cache.bytecodeMappedEntries`) instead of blob copies, and a fresh
+    /// compile is not copied into the memory tier when its disk write is
+    /// accepted (a lookup waits for the write and maps it). Only entries
+    /// that never reach the disk (one-shot texts, no disk tier) still use
+    /// the `bytecodeMemoryBudgetBytes` heap tier. perf/bytecode-paging.
+    /// `JEFFJS_CACHE_BYTECODEMAPPED=0` = the in-heap copies.
+    static let bytecodeMapped      = bool("cache.bytecodeMapped",      default: true)
+    /// Mappings the memory tier keeps for reuse (LRU by count; a mapping
+    /// costs address space and page tables, no heap; a mapping a live
+    /// script still uses stays mapped whatever this says).
+    static let bytecodeMappedEntries = int("cache.bytecodeMappedEntries", default: platformBudget(iOS: 64, watch: 16) / (1024 * 1024))
 
     /// A default in MB for the platform the engine runs on, in bytes.
     private static func platformBudget(iOS: Int, watch: Int) -> Int {
@@ -117,6 +131,18 @@ enum JeffJSConfig {
     /// (its closure variables and source span) instead of its bytecode.
     /// `JEFFJS_COMPILE_LAZYFUNCTIONS=0` compiles everything eagerly.
     static let lazyFunctions       = bool("compile.lazyFunctions",     default: true)
+    /// Script text kept for lazy compilation / `Function.prototype.toString`
+    /// lives in the bytecode-cache entry's file mapping instead of the heap:
+    /// on a cache hit the deserializer uses the entry's text in place, and
+    /// after a fresh compile's entry lands on disk the heap text is swapped
+    /// for the mapped one (`JeffJSSourceText.adoptMapping`). Lazy compiles
+    /// parse straight out of the mapping. perf/bytecode-paging.
+    /// `JEFFJS_COMPILE_MAPPEDSOURCE=0` = the heap copy.
+    static let compileMappedSource = bool("compile.mappedSource",      default: true)
+    /// `JeffJSPrecompiler.precompileScript` compiles a script on the calling
+    /// (background) thread into the disk tier, so the JS thread maps it
+    /// instead of compiling. `JEFFJS_COMPILE_OFFTHREADPRECOMPILE=0` = no-op.
+    static let compileOffThreadPrecompile = bool("compile.offThreadPrecompile", default: true)
     /// Functions whose source is shorter than this are compiled eagerly (a
     /// tiny body costs about as much as its stub).
     static let lazyMinSourceBytes  = int("compile.lazyMinSourceBytes", default: 0)
@@ -181,6 +207,11 @@ enum JeffJSConfig {
     /// power of two ≥ the function's bytecode length (`JeffJSInlineCache`,
     /// IC table size fix 2026-09-29). A/B: `JEFFJS_INTERP_ICTABLEFIXED=1`.
     static let icTableFixed        = bool("interp.icTableFixed",       default: false)
+    /// Inline-cache tables have one slot per IC site of the function (an
+    /// ordinal from the bytecode walk, `JeffJSInlineCache`) instead of one per
+    /// bytecode offset (~95 % empty). A/B: `JEFFJS_INTERP_ICORDINALTABLES=0`
+    /// = the bytecode-offset tables sized to the bytecode.
+    static let icOrdinalTables     = bool("interp.icOrdinalTables",    default: true)
 
     /// `await` inside an async function / async generator always suspends and
     /// resumes from a job (ES §27.7.5.3). false = the old synchronous

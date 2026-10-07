@@ -689,6 +689,9 @@ nonisolated final class JeffJSRuntime {
     /// Some lazily compiled body waits to be written (JeffJSLazyBodyStore);
     /// the idle tick flushes it.
     var lazyBodiesPending = false
+    /// A JeffJSPrecompiler runtime: compiles on a background thread, never
+    /// runs code, never sets `JeffJSGCObjectHeader.activeRuntime`.
+    var isBackgroundCompiler = false
     /// `compile.lazyDropAfterMs` (0 = off) and when the idle reclaim last ran.
     var lazyDropAfterMs: Int = JeffJSConfig.lazyDropAfterMs
     var lazyLastReclaim: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
