@@ -1203,3 +1203,63 @@ Page runs (CLI, network stubbed, so no GraphQL responses): homedepot-plp's 158 K
 MB (the page heap is code-built descriptors); homedepot-cart: no change (its one 22 KB literal is read). Both pages
 are bimodal run to run (±4 k objects, both modes). Instructions retired: watch_deepmerge +0.1 %, watch_iter +0.4 %,
 watch_callbacks +0.3 %, kernels +0.1 %, realworld −2.5 %.
+
+### perf/watch-cpu — homedepot's module evaluation on the watch (2026-10-07)
+
+**Where the time is.** homedepot's category landing (`LandingPage.*.js`, 3.09 M chars), PLP (`browse-mobile/Page.*.js`)
+and PIP (`fusion-gm-pip-mobile/Page.*.js`) each block main for one long task, and it is *execution*, not compile: the
+app's precompiler compiles the 3 MB module off the JS thread on arrival (≈ 0.42 s on the watch simulator, cold and
+warm), the eval maps the disk entry (`hit disk (mapped)`, 10–13 ms), and lazy body compiles during the run are 57 ms
+(3 147 bodies, `-bodies.jfbc` hits). 94 % of the task (JS profiler, `-DJEFFJS_JSPROF`) is THD's datasources
+`extend()` = the `deepmerge` npm package with `clone: true` run at module evaluation (`Component.dataModel =
+extend(A, B, …)`): `U5e`/`Ufe` (mergeObject), its two `forEach` callbacks, `J5e` (getOwnPropertySymbols + filter),
+`poe` (keys + concat), `isMergeableObject` (`Object.prototype.toString.call`, `$$typeof`), `t in e` in a try. The home
+page's GuestHomepageContainer is the same code (66 % of its JS) plus the Akamai sensor (20 %). Native profile of that
+code: ~35 % Swift retain/release, closures + object lifecycle 23 %, native→JS callback entry, native-call argument
+arrays; JeffJS ran `bench/watch_deepmerge.js` at 11.0 G instructions per merge pass vs QuickJS 4.3 G.
+
+**Changes** (each A/B switch is `JEFFJS_INTERP_<NAME>=0`):
+
+| switch | change |
+|---|---|
+| traceCallIntrinsic | the fast trace runs `f.call(t, …)` as a direct call of `f` (stack rewrite, as the main loop already did) |
+| leanCallEntry | callFunction → callInternal without strong object/body refs; no `frame.argBuf` for plain frames (a retain + release + uniqueness check per native→JS call); array iteration builtins reuse one `[el, i, arr]` array |
+| leanNativeArgs | native calls from the VM stack: one reused argument array per count (1–4), written in place; `[]` for none |
+| fastTypeof | `typeof` picks its cached string by index (it built a Swift String per evaluation); also runs in the trace |
+| atomKeyStrings | the cached string of a string atom carries the atom (Object.keys / for-in keys hit keyed ICs and the `in` / hasOwnProperty fast paths); `in` / hasOwnProperty intern through `findAtom(jsString:)` |
+| fastOwnProperty | `propertyIsEnumerable` reads the enumerable bit off the shape (10.9k → 2.0k instructions) |
+| unretainedProtoWalk | [[Get]] / [[HasProperty]] / [[Set]] prototype walks without a retain/release per level |
+| fastStringEquals | string equality by atom (both interned) or one memcmp |
+| fastSymbolRefcount | symbol dup/free with one cast (it was a dynamic `as?` chain) |
+| fastClosure | closure root shape cached on the context; parent live var-ref found with a plain loop |
+| fastSpecies | ArraySpeciesCreate / IsConcatSpreadable on plain arrays read straight off the shapes; Object.keys and newArrayFrom fill the pooled element store (Object.keys 4.6k → 2.6k) |
+| recycleVarRefs | a returning frame's live var-refs that no closure holds any more are parked and reused, not detached |
+| fastArrayLiteral | `[]` (`object; array_from 0`) makes the array directly (no sentinel object) |
+| leanClosurePayload | closure var-refs live only in varRefsFast (+ raw mirror); a recycled closure keeps that array's storage |
+| fastPropertyAdd | `o[k] = v` adding a data property goes straight to the shape transition; a keyed write that added its key does not overwrite the site's IC |
+
+Behaviour-identical refactors without a switch: the main loop reads closure variables through the function's raw
+var-ref mirror (no array retain per inline call/return, no element retain per get/put_var_ref) and createClosure takes
+the parent's var-refs the same way; `releaseFrameU` in callInternal; the callInternal epilogue sets
+`ctx.currentFrame = baseFrame.prevFrame` (both arms of the old identity test were that); `nativeCallee` is a raw
+pointer; the `.call` / `push` intrinsic identity checks compare raw pointers; hot main-loop ops (get_loc/get_arg/dup/
+drop/put_loc) use the inline object refcount paths. `jeffjs-cli --page` with `JEFFJS_PAGE_TIMES=1` prints each
+script's eval time; `-DJEFFJS_OPPROF` also prints main-loop opcodes and trace deopts by opcode.
+
+**Results.** Instructions retired / cycles (CLI, Mac): watch_deepmerge 45.8 → 37.8 G / 12.7 → 10.0 G (−17 % / −21 %),
+watch_callbacks 51.7 → 41.0 G (−21 %), watch_iter 46.0 → 45.9 G (cycles −10 %), watch_heap 2.17 → 1.87 G,
+kernels 54.9 → 54.4 G, realworld 194.5 → 184.0 G (cycles −8 %, results identical), lazy_json 7.42 → 7.20 G.
+homedepot pages in the CLI: landing 360 → 295 G instructions / 89 → 69 G cycles, PLP 164 → 133 G.
+Release watch simulator, governor off, longest task (cold / warm visit): landing 30.4 / 29.6 → 23.5 / 22.8 s,
+PLP 12.2 / 12.0 → 8.9 / 8.9 s, PIP 11.0 / 11.2 → 8.0 / 7.9 s, home 4.7 / 4.7 → 3.5 / 3.5 s (home script time
+15.4–16.5 → 14.7–16.0 s, network-bound); process peaks fell too (PLP 564–630 → 369–387 MB, PIP 563–597 → 316–370 MB).
+Conformance 4441/0, probes 562/0, zombie scans clean, teardown leaves no engine objects (the 161–181 orphan number
+strings after the PLP page are there on the base build too).
+
+**Left.** The targets (landing ≤ 10 s, PLP/PIP ≤ 5 s) need roughly another 2×: on this code JeffJS is still ~2.1×
+QuickJS per merge pass (9.0 G vs 4.3 G). What remains is spread over the interpreter (dispatch ~30 %, a JS→JS call +
+return ~460 vs 276 instructions, a native call ~750 vs 310, closure create + free ~3.4k vs 2.1k, native→JS callback
+~1.3k vs 0.4k) and Swift ARC in object/closure lifecycle; the next levers are structural (closures and var-refs
+without Swift objects, one native-call ABI over the VM stack instead of `[JeffJSValue]`, `fb` unretained in the main
+loop). Site-side: deepmerge with `clone: true` re-clones every data model at module evaluation; `extend()` over
+frozen DSL nodes without cloning would remove most of the work.

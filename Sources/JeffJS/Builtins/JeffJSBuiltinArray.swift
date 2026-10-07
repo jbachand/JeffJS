@@ -1155,7 +1155,8 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
+        var cbArgs = ctx.rt.takeCallbackArgs3(obj)
+        defer { ctx.rt.giveBackCallbackArgs3(&cbArgs) }
 
         var cursor = ElementCursor(obj: obj, len: len)
         while let e = cursor.next(ctx) {
@@ -1184,7 +1185,8 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
+        var cbArgs = ctx.rt.takeCallbackArgs3(obj)
+        defer { ctx.rt.giveBackCallbackArgs3(&cbArgs) }
 
         let result = arraySpeciesCreate(ctx: ctx, obj: obj, length: len)
         if result.isException { return result }
@@ -1248,7 +1250,8 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
+        var cbArgs = ctx.rt.takeCallbackArgs3(obj)
+        defer { ctx.rt.giveBackCallbackArgs3(&cbArgs) }
 
         let result = arraySpeciesCreate(ctx: ctx, obj: obj, length: 0)
         if result.isException { return result }
@@ -1303,7 +1306,8 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
+        var cbArgs = ctx.rt.takeCallbackArgs3(obj)
+        defer { ctx.rt.giveBackCallbackArgs3(&cbArgs) }
 
         var cursor = ElementCursor(obj: obj, len: len)
         while let e = cursor.next(ctx) {
@@ -1334,7 +1338,8 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
+        var cbArgs = ctx.rt.takeCallbackArgs3(obj)
+        defer { ctx.rt.giveBackCallbackArgs3(&cbArgs) }
 
         var cursor = ElementCursor(obj: obj, len: len)
         while let e = cursor.next(ctx) {
@@ -1365,7 +1370,8 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
+        var cbArgs = ctx.rt.takeCallbackArgs3(obj)
+        defer { ctx.rt.giveBackCallbackArgs3(&cbArgs) }
 
         // find visits holes as undefined rather than skipping them.
         var cursor = ElementCursor(obj: obj, len: len, visitHoles: true)
@@ -1398,7 +1404,8 @@ struct JeffJSBuiltinArray {
         }
 
         let thisArg = args.count > 1 ? args[1] : .undefined
-        var cbArgs: [JeffJSValue] = [.undefined, .undefined, obj]
+        var cbArgs = ctx.rt.takeCallbackArgs3(obj)
+        defer { ctx.rt.giveBackCallbackArgs3(&cbArgs) }
 
         var cursor = ElementCursor(obj: obj, len: len, visitHoles: true)
         while let e = cursor.next(ctx) {
@@ -2028,6 +2035,13 @@ struct JeffJSBuiltinArray {
         if !obj.isObject {
             return false
         }
+        // interp.fastSpecies: a plain array (own `length` only, prototype
+        // %Array.prototype%) is spreadable unless %Array.prototype% or
+        // %Object.prototype% defines @@isConcatSpreadable.
+        if jeffJSFastSpecies, let o = obj.obj, let cs = ctx.arrayShape, o.shapeIdentity == UnsafeRawPointer(Unmanaged.passUnretained(cs).toOpaque()),
+           jeffJS_noProtoConcatSpreadable(ctx) {
+            return true
+        }
 
         // Symbol atoms are not reachable by spelling: use the predefined id.
         let spreadableAtom = JeffJSAtomID.JS_ATOM_Symbol_isConcatSpreadable.rawValue
@@ -2044,6 +2058,14 @@ struct JeffJSBuiltinArray {
     /// Create an array using species constructor if available.
     /// Mirrors `JS_ArraySpeciesCreate` in QuickJS.
     private static func arraySpeciesCreate(ctx: JeffJSContext, obj: JeffJSValue, length: Int64) -> JeffJSValue {
+        // interp.fastSpecies: a plain array (on the context's array shape: own
+        // `length` only, prototype %Array.prototype%) whose prototype's
+        // `constructor` is still the intrinsic %Array% with its original
+        // @@species getter creates a plain array, read straight off the two
+        // shapes (no generic [[Get]] of `constructor`).
+        if jeffJSFastSpecies, length == 0, jeffJS_isPlainArrayWithDefaultSpecies(ctx, obj) {
+            return ctx.newArray()
+        }
         if !ctx.isArray(obj) {
             return length == 0 && jeffJSFastArrayBuiltins ? ctx.newArray() : ctx.newArrayWithLength(Int(length))
         }
@@ -2226,4 +2248,62 @@ protocol JeffJSContextArrayOps {
     // Errors
     func throwTypeError(message: String) -> JeffJSValue
     func throwRangeError(message: String) -> JeffJSValue
+}
+
+
+// MARK: - interp.fastSpecies helpers (watch CPU fix, 2026-10-07)
+
+/// True when `v` is a plain array on the context's array shape (own `length`
+/// only, prototype %Array.prototype%), %Array.prototype%.constructor is the
+/// intrinsic %Array% data property, and %Array%[@@species] is its original
+/// accessor: ArraySpeciesCreate(v, n) is then ArrayCreate(n).
+@inline(__always)
+func jeffJS_isPlainArrayWithDefaultSpecies(_ ctx: JeffJSContext, _ v: JeffJSValue) -> Bool {
+    guard let o = v.obj, let cs = ctx.arrayShape,
+          o.shapeIdentity == UnsafeRawPointer(Unmanaged.passUnretained(cs).toOpaque()),
+          let ap = cs.proto else { return false }
+    let ci = jeffJS_findOwnPropertyIndex(obj: ap, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue)
+    guard ci >= 0, ap.extra(at: ci) == nil, ap.propValues[ci].bits == ctx.arrayCtorIntrinsic.bits,
+          let co = ctx.arrayCtorIntrinsic.toObject() else { return false }
+    let si = jeffJS_findOwnPropertyIndex(obj: co, atom: JeffJSAtomID.JS_ATOM_Symbol_species.rawValue)
+    guard si >= 0, let e = co.extra(at: si), e.kind == .getset, let g = e.getter,
+          let sg = ctx.arraySpeciesGetterVal.toObject(), g === sg else { return false }
+    return true
+}
+
+/// Neither %Array.prototype% nor %Object.prototype% (the chain of a plain
+/// array) has an @@isConcatSpreadable property.
+@inline(__always)
+func jeffJS_noProtoConcatSpreadable(_ ctx: JeffJSContext) -> Bool {
+    let atom = JeffJSAtomID.JS_ATOM_Symbol_isConcatSpreadable.rawValue
+    guard let ap = ctx.arrayShape?.proto, let aps = ap.shape else { return false }
+    if findShapeProperty(aps, atom) != nil { return false }
+    guard let op = aps.proto else { return true }
+    if op.protoRaw != nil { return false }   // not the chain end: take the generic path
+    guard let ops = op.shape else { return false }
+    return findShapeProperty(ops, atom) == nil
+}
+
+
+// MARK: - interp.leanCallEntry: reused callback argument arrays (watch CPU fix, 2026-10-07)
+
+extension JeffJSRuntime {
+    /// `[element, index, array]` for an iteration builtin's callbacks: the
+    /// runtime's spare 3-slot array when it is free (a nested builtin finds
+    /// it taken and allocates), instead of one allocation per builtin call.
+    @inline(__always)
+    func takeCallbackArgs3(_ obj: JeffJSValue) -> [JeffJSValue] {
+        if jeffJSLeanCallEntry, spareCallbackArgs3.count == 3 {
+            var a: [JeffJSValue] = []
+            swap(&a, &spareCallbackArgs3)
+            a.withUnsafeMutableBufferPointer { b in b[0] = .undefined; b[1] = .undefined; b[2] = obj }
+            return a
+        }
+        return [.undefined, .undefined, obj]
+    }
+
+    @inline(__always)
+    func giveBackCallbackArgs3(_ a: inout [JeffJSValue]) {
+        if jeffJSLeanCallEntry, a.count == 3, spareCallbackArgs3.isEmpty { swap(&a, &spareCallbackArgs3) }
+    }
 }

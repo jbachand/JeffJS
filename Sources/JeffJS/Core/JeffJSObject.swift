@@ -1790,7 +1790,14 @@ nonisolated final class JeffJSStackFrame {
     /// any — JavaScriptCore lists it in `Error.stack` as `name@[native code]`
     /// above the caller (`toString@[native code]`, `map@[native code]`).
     /// Set around native dispatch; unowned: the callee is live on the stack.
-    unowned(unsafe) var nativeCallee: JeffJSObject? = nil
+    /// Stored as a raw pointer: the interpreter saves and restores it around
+    /// every native call, and an `unowned(unsafe)` reference still cost a
+    /// retain/release pair per save (watch CPU fix, 2026-10-07).
+    var nativeCalleePtr: UnsafeMutableRawPointer? = nil
+    var nativeCallee: JeffJSObject? {
+        @inline(__always) get { nativeCalleePtr.map { Unmanaged<JeffJSObject>.fromOpaque($0).takeUnretainedValue() } }
+        @inline(__always) set { nativeCalleePtr = newValue.map { Unmanaged.passUnretained($0).toOpaque() } }
+    }
     var argBuf: [JeffJSValue]         = []
     var argCount: Int                 = 0
     var varBuf: [JeffJSValue]         = []
@@ -2500,6 +2507,20 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
         }
     }
 
+    /// The prototype as an unretained pointer (interp.unretainedProtoWalk):
+    /// the shape owns the counted reference, so a chain walk that does not
+    /// run user code between steps needs no retain/release per level.
+    var protoRaw: UnsafeRawPointer? {
+        @inline(__always) get {
+            if let sp = unsafeBitCast(shape, to: UnsafeRawPointer?.self) {
+                return Unmanaged<JeffJSShape>.fromOpaque(sp)._withUnsafeGuaranteedRef {
+                    unsafeBitCast($0.proto, to: UnsafeRawPointer?.self)
+                }
+            }
+            return unsafeBitCast(storedProto, to: UnsafeRawPointer?.self)
+        }
+    }
+
     // -- Associated storage (moved from objc_setAssociatedObject) ----------
     /// The prototype mirror. The shape owns the counted reference to the
     /// prototype (`jeffJS_shapeSetProto`) and every write path keeps the two
@@ -2689,6 +2710,12 @@ nonisolated final class JeffJSObjectAux: JeffJSSideSlot {
             i += 1
         }
         varRefsRawCount = refs.count
+    }
+
+    /// Release the var-refs but keep the array's storage (a parked closure).
+    func clearVarRefsKeepingCapacity() {
+        varRefsRawCount = 0
+        varRefsFast.removeAll(keepingCapacity: true)
     }
 
     deinit { varRefsRaw?.deallocate() }

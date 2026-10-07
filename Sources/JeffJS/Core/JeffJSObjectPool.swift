@@ -124,7 +124,11 @@ func jeffJS_recycleFunction(_ o: JeffJSObject) -> Bool {
     a.storedProto = nil
     rt.inFreeChain = false
     o.fbFast = nil
-    if (o._flags & JeffJSObject.flagHasVarRefs) != 0 { a.setVarRefs([]) }
+    if (o._flags & JeffJSObject.flagHasVarRefs) != 0 {
+        // interp.leanClosurePayload: keep the array's storage for the next
+        // closure built on this object (createClosure fills it in place).
+        if jeffJSLeanClosurePayload { a.clearVarRefsKeepingCapacity() } else { a.setVarRefs([]) }
+    }
     if let shape = o.shape {
         o.shape = nil
         shape.refCount -= 1
@@ -211,5 +215,43 @@ extension JeffJSRuntime {
         for o in functionPool { Unmanaged.passUnretained(o).release() }
         functionPool.removeAll()
         arrayStoragePool.removeAll()
+        varRefPool.removeAll()   // parked var-refs hold the runtime (ownerRuntime)
+    }
+}
+
+let jeffJSVarRefPoolCapacity = 1024
+
+/// interp.recycleVarRefs: detach the live var-refs of a frame that is going
+/// away — or, for one that nothing but the frame holds any more (every
+/// closure that captured it has died: `arr.forEach(function (k) { … })`,
+/// a callback passed and dropped), skip the copy and park it for
+/// createClosure. A detached copy of a value nobody can read cost a dup, a
+/// GC-list insertion and, at deallocation, the list removal, the value's
+/// release and a free. Callers sync the frame first when they need to
+/// (jeffJS_syncForDetach).
+@inline(never)
+func jeffJS_detachFrameVarRefs(_ frame: JeffJSStackFrame, _ rt: JeffJSRuntime) {
+    if !jeffJSRecycleVarRefs {
+        for vr in frame.liveVarRefs where !vr.isDetached {
+            vr.value = vr.pvalue.dupValue()
+            vr.isDetached = true
+            vr.parentFrame = nil; vr.slot = nil
+        }
+        return
+    }
+    frame.liveVarRefs.withUnsafeMutableBufferPointer { b in
+        for i in 0..<b.count {
+            if b[i].isDetached { continue }
+            if isKnownUniquelyReferenced(&b[i]), rt.varRefPool.count < jeffJSVarRefPoolCapacity {
+                let vr = b[i]
+                vr.parentFrame = nil; vr.slot = nil
+                rt.varRefPool.append(vr)
+            } else {
+                let vr = b[i]
+                vr.value = vr.pvalue.dupValue()
+                vr.isDetached = true
+                vr.parentFrame = nil; vr.slot = nil
+            }
+        }
     }
 }

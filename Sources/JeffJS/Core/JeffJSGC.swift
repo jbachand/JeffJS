@@ -1011,11 +1011,13 @@ func freeGCObjectChildren(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
     case .functionBytecode:
         let obj = unsafeBitCast(header, to: JeffJSObject.self)
         if let at = obj.arrowThisVal { obj.arrowThisVal = nil; freeValue(rt, at) }
-        if case .bytecodeFunc(let fb, let varRefs, _) = obj.payload, let fb = fb {
+        if case .bytecodeFunc(let fb, let payloadVarRefs, _) = obj.payload, let fb = fb {
             for cpVal in fb.cpool {
                 freeValue(rt, cpVal)
             }
             fb.cpool.removeAll()
+            // interp.leanClosurePayload: the list may live in varRefsFast only.
+            let varRefs = payloadVarRefs.isEmpty ? obj.varRefsFast : payloadVarRefs
             for vr in varRefs {
                 if let vr = vr {
                     vr.refCount -= 1

@@ -195,6 +195,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// interp.fastFunctionName: transition shape of a plain function object
     /// whose only own properties are `length` then `name` (pinned).
     var funcNameLengthShape: JeffJSShape? = nil
+    /// interp.fastClosure: root shape of plain bytecode closures over
+    /// %Function.prototype% (hashed; the context holds one count).
+    var closureRootShape: JeffJSShape? = nil
 
     /// interp.fastArrayBuiltins: the intrinsic %Array% and its original
     /// `get [Symbol.species]` (references held by the context; identity only).
@@ -335,10 +338,19 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// Array.prototype.push — cached object pointer for interpreter fast-path identity check.
     /// Set during JeffJSBuiltinArray.addIntrinsic(). Used by call_method to skip the full
     /// callFunction dispatch when pushing a single element onto a dense array.
-    var arrayProtoPushObj: JeffJSObject?
+    var arrayProtoPushObj: JeffJSObject? {
+        didSet { arrayProtoPushPtr = arrayProtoPushObj.map { Unmanaged.passUnretained($0).toOpaque() } }
+    }
+    /// Identity of `arrayProtoPushObj` for the interpreter's call checks (a
+    /// pointer compare; reading the strong reference cost a retain/release).
+    var arrayProtoPushPtr: UnsafeMutableRawPointer? = nil
     /// Function.prototype.call — identity for the call_method intrinsic that
     /// turns `f.call(thisArg, ...)` into a direct call of `f`.
-    var funcProtoCallObj: JeffJSObject?
+    var funcProtoCallObj: JeffJSObject? {
+        didSet { funcProtoCallPtr = funcProtoCallObj.map { Unmanaged.passUnretained($0).toOpaque() } }
+    }
+    /// Identity of `funcProtoCallObj` (see arrayProtoPushPtr).
+    var funcProtoCallPtr: UnsafeMutableRawPointer? = nil
     /// Borrowed value form of `arrayProtoPushObj` (owned by Array.prototype)
     /// for pushing `arr.push` onto the stack without an inline cache.
     var arrayProtoPushVal: JeffJSValue = .undefined
@@ -882,9 +894,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // shape never reaches zero — the runtime's teardown keeps a shape with
         // owners outside the dead group — and pins the runtime (ownerRuntime).
         for sh in [funcNameLengthShape, arrayIterShape, arrayShape, plainObjectRootShape,
-                   iterResultShape, regexpMatchShape, lazyObjectSentinel, lazyArraySentinel] {
+                   iterResultShape, regexpMatchShape, lazyObjectSentinel, lazyArraySentinel, closureRootShape] {
             if let sh { jeffJS_leaveShape(rt, sh) }
         }
+        closureRootShape = nil
         lazyObjectSentinel = nil
         lazyArraySentinel = nil
         for i in argumentsShapes.indices {
@@ -1897,6 +1910,17 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return 1
         }
 
+        if jeffJSUnretainedProtoWalk {
+            var cur = jsObj.protoRaw
+            while let pr = cur {
+                unowned(unsafe) let p = Unmanaged<JeffJSObject>.fromOpaque(pr).takeUnretainedValue()
+                if (p.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(p) }
+                if let shape = p.shape, findShapeProperty(shape, atom) != nil { return 1 }
+                if isProxyObject(p) { return proxyOnChainHas(p, atom: atom) }
+                cur = p.protoRaw
+            }
+            return 0
+        }
         // Walk the prototype chain (check both shape.proto and obj.proto
         // to match getPropertyInternal's fallback behavior)
         var proto = jsObj.proto
@@ -5464,6 +5488,32 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             }
         }
 
+        // interp.unretainedProtoWalk: the chain is held by the shapes (each
+        // shape owns its prototype's reference), so the walk needs no
+        // retain/release per level; same lookups as the walk below.
+        if jeffJSUnretainedProtoWalk {
+            var cur = jsObj.protoRaw
+            while let pr = cur {
+                unowned(unsafe) let p = Unmanaged<JeffJSObject>.fromOpaque(pr).takeUnretainedValue()
+                if (p.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(p) }
+                let pIdx = jeffJS_findOwnPropertyIndex(obj: p, atom: atom)
+                if pIdx < 0 {
+                    if isProxyObject(p) { return proxyOnChainGet(p, atom: atom, receiver: receiver) }
+                } else if p.shape != nil, pIdx < p.propValues.count {
+                    if let e = p.extra(at: pIdx) {
+                        if e.kind == .getset, let getterObj = e.getter {
+                            let getterVal = JeffJSValue.borrowedObject(getterObj)
+                            return callRetainingFunction(getterVal, this: receiver, args: [])
+                        }
+                        return .JS_UNDEFINED
+                    }
+                    return p.propValues[pIdx].dupValue()
+                }
+                cur = p.protoRaw
+            }
+            return .JS_UNDEFINED
+        }
+
         // Walk prototype chain (prototype is stored on the shape)
         var proto = jsObj.proto
         while let p = proto {
@@ -5560,6 +5610,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// - setterThis: the `this` of a setter the write finds (the Receiver of ES
     ///   §10.1.9.2 OrdinarySet), when it is not `obj`: a Proxy without a `set` trap
     ///   forwards `proxy.k = v` to its target with the proxy as the receiver.
+    /// `[.writable, .enumerable, .configurable]` built once (an OptionSet
+    /// array literal in a hot path allocated per evaluation).
+    static let cweFlags: JeffJSPropertyFlags = [.writable, .enumerable, .configurable]
+
     private func setPropertyInternal(
         obj: JeffJSValue,
         atom: UInt32,
@@ -5820,6 +5874,37 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         }
 
         // Walk prototype chain for inherited accessor setters (ES spec 9.1.9 step 4)
+        // interp.unretainedProtoWalk: same walk without a retain/release per level.
+        if jeffJSUnretainedProtoWalk {
+            var cur = jsObj.protoRaw
+            while let pr = cur {
+                unowned(unsafe) let p = Unmanaged<JeffJSObject>.fromOpaque(pr).takeUnretainedValue()
+                if (p.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(p) }
+                let pIdx = jeffJS_findOwnPropertyIndex(obj: p, atom: atom)
+                if pIdx < 0, isProxyObject(p) {
+                    return proxyOnChainSet(p, atom: atom, value: value, receiver: setterThis ?? obj, flags: flags)
+                }
+                if pIdx >= 0, let pShape = p.shape, pIdx < p.propValues.count {
+                    if pShape.prop[pIdx].flags.contains(.getset) {
+                        if let e = p.extra(at: pIdx), e.kind == .getset, let setterObj = e.setter {
+                            let setterVal = JeffJSValue.borrowedObject(setterObj)
+                            let result = callRetainingFunction(setterVal, this: setterThis ?? obj, args: [value])
+                            value.freeValue()
+                            result.freeValue()
+                            if result.isException { return -1 }
+                            return 1
+                        }
+                        if pShape.prop[pIdx].flags.contains(.shadowable) { break }
+                        value.freeValue()
+                        if (flags & JS_PROP_THROW) == 0 { return 0 }
+                        _ = throwTypeError(message: "Cannot set property which has only a getter")
+                        return -1
+                    }
+                    break
+                }
+                cur = p.protoRaw
+            }
+        } else {
         var setProto = jsObj.proto
         while let p = setProto {
             if (p.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(p) }
@@ -5860,6 +5945,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             }
             setProto = p.proto
         }
+        }
 
         // Check extensibility
         if !jsObj.extensible {
@@ -5870,8 +5956,16 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         }
 
         // Create new property via shape system
-        let propFlags: JeffJSPropertyFlags = [.writable, .enumerable, .configurable]
-        if jeffJS_addProperty(ctx: self, obj: jsObj, atom: atom, flags: propFlags) != nil {
+        // interp.fastPropertyAdd: an ordinary data property straight onto the
+        // shape (the own lookup above already missed) and its value appended
+        // in place — no JeffJSProperty enum built, returned and copied.
+        if jeffJSFastPropertyAdd, jsObj.shape != nil, jsObj.propValues.count == jsObj.shape!.prop.count {
+            jeffJS_objectAddShapeProperty(self, jsObj, atom: atom, flags: JeffJSPropertyFlags.cWE.rawValue)
+            jsObj.appendDataValue(value)
+            if let shape = jsObj.shape, shape.prop.count != jsObj.propValues.count {
+                while jsObj.propValues.count < shape.prop.count { jsObj.appendDataValue(.undefined) }
+            }
+        } else if jeffJS_addProperty(ctx: self, obj: jsObj, atom: atom, flags: Self.cweFlags) != nil {
             // Set the value in the slot just added (the last one)
             let last = jsObj.propValues.count - 1
             jsObj.propValues[last] = value; jsObj.setExtraSlot(last, nil)

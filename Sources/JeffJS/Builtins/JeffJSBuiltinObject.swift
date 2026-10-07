@@ -166,7 +166,7 @@ extension JeffJSContext {
         if key.isInt, key.toInt32() >= 0 {
             atom = rt.newAtomUInt32(UInt32(key.toInt32()))
         } else if key.isString, let s = key.stringValue {
-            atom = rt.findAtom(s.toSwiftString())
+            atom = jeffJSAtomKeyStrings ? rt.findAtom(jsString: s) : rt.findAtom(s.toSwiftString())
         } else if key.isSymbol, let symStr = key.toPtr() as? JeffJSString {
             // A symbol's own (immortal) atom — NOT the atom of its
             // description, or `({a: 1}).hasOwnProperty(Symbol('a'))` is true.
@@ -196,6 +196,25 @@ extension JeffJSContext {
             if alt != atom, hasOwnPropertyAtom(jsObj, alt) { return 1 }
         }
         return 0
+    }
+
+    /// interp.fastOwnProperty: `[[GetOwnProperty]](key).[[Enumerable]]` for
+    /// a string key with a named (non-index) atom on an ordinary object:
+    /// true/false from the shape, nil = take the general path (proxies,
+    /// exotic / array-like classes, index keys, host-hidden or lazily
+    /// created properties, accessors on exotic objects).
+    func ownPropertyEnumerableFast(_ jsObj: JeffJSObject, key: JeffJSValue) -> Bool? {
+        let atom = jeffJS_keyedAtom(key)
+        guard atom != 0, key.isString else { return nil }
+        let cid = jsObj.classID
+        guard cid == JeffJSClassID.object.rawValue || cid == JeffJSClassID.bytecodeFunction.rawValue
+                || cid == JeffJSClassID.array.rawValue,
+              !jsObj.isExotic, jsObj.lazyFlags == 0 else { return nil }
+        guard let shape = jsObj.shape else { return nil }
+        guard let idx = findShapeProperty(shape, atom) else { return false }
+        let flags = shape.prop[idx].flags
+        if flags.contains(.hidden) { return nil }
+        return flags.contains(.enumerable)
     }
 
     /// Own-property existence for one already-resolved atom.
@@ -580,6 +599,14 @@ extension JeffJSContext {
            jsObj.classID != JSClassID.JS_CLASS_STRING.rawValue,
            !jeffJS_isTypedArrayClass(jsObj.classID), jsObj.arraySnapshot() == nil {
             let cached = shapeEnumKeys(shape).keys
+            if jeffJSFastSpecies {
+                // The cached keys straight into the new array's element store.
+                if cached.isEmpty { return newArray() }
+                return cached.withUnsafeBufferPointer { b in
+                    for i in 0..<b.count { _ = b[i].dupValue() }
+                    return newArrayFromSlots(UnsafeMutablePointer(mutating: b.baseAddress!), b.count)
+                }
+            }
             var names: [JeffJSValue] = []
             names.reserveCapacity(cached.count)
             for k in cached { names.append(k.dupValue()) }
@@ -1713,6 +1740,11 @@ struct JeffJSBuiltinObject {
     /// object's own property.
     static func propertyIsEnumerable(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let prop = args.count > 0 ? args[0] : .undefined
+        // interp.fastOwnProperty: a named string key on an ordinary object
+        // reads the enumerable bit off its shape slot (no descriptor object).
+        if jeffJSFastOwnProperty, let jo = this.toObject(), let r = ctx.ownPropertyEnumerableFast(jo, key: prop) {
+            return r ? .JS_TRUE : .JS_FALSE
+        }
 
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
