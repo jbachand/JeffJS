@@ -214,6 +214,7 @@ nonisolated final class JeffJSInlineCache {
         let idx = pc & Self.mask
         guard idx < capacity else { return }
         receiverShape.icCached = true   // "no own property here": stale if one is appended in place
+        holderShape.icCached = true     // the holder's slot: stale if deleted / re-flagged in place
         let rs = Unmanaged.passRetained(receiverShape).toOpaque()
         let hp = Unmanaged.passRetained(holder).toOpaque()
         let hs = Unmanaged.passRetained(holderShape).toOpaque()
@@ -230,6 +231,7 @@ nonisolated final class JeffJSInlineCache {
         guard idx < capacity else { return }
         // Retain the new shape before releasing the old one (handles re-caching
         // the same shape without a transient zero refcount).
+        shape.icCached = true   // own slot: stale if deleted / re-flagged in place (prepareShapeUpdate)
         let newPtr = Unmanaged.passRetained(shape).toOpaque()
         releaseEntry(idx)
         let writable = propOffset >= 0 && propOffset < shape.prop.count

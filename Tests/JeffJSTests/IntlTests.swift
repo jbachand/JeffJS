@@ -337,6 +337,12 @@ final class IntlTests: XCTestCase {
         new Date(Date.UTC(2026,8,20,18,5,9)).toLocaleTimeString('en-US',{timeZone:'UTC',hour12:false})
         """, "18:05:09")
         expect(env, "new Date(NaN).toLocaleDateString('en-US')", "Invalid Date")
+        // ToDateTimeOptions: `timeZoneName` alone keeps the default date; resolvedOptions
+        // reports the hour cycle when there is an hour (JSC values, foxnews/nfl fix).
+        expect(env, "new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',timeZoneName:'short'}).format(new Date(Date.UTC(2026,9,6,12)))",
+               "10/6/2026, EDT")
+        expect(env, "(function(){var o=new Intl.DateTimeFormat('en-US',{hour:'numeric'}).resolvedOptions();return o.hourCycle+','+o.hour12})()",
+               "h12,true")
         expect(env, "'a'.localeCompare('b') + ',' + 'b'.localeCompare('a') + ',' + 'a'.localeCompare('a')",
                "-1,1,0")
         expect(env, "'résumé'.localeCompare('resume','en',{sensitivity:'base'})", "0")

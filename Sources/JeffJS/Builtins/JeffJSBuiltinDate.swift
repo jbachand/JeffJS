@@ -1144,7 +1144,9 @@ func jsDate_toTimeString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [
 /// toISOString()
 func jsDate_toISOString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
-    if t.isNaN { return ctx.throwTypeError("Invalid time value") }
+    // ES §21.4.4.36 step 3: a RangeError (JSC's text "Invalid Date"); it was a
+    // TypeError, which `catch (e) { if (e instanceof RangeError) … }` missed.
+    if t.isNaN { return ctx.throwRangeError(message: "Invalid Date") }
     let y = Int(yearFromTime(t))
     let m = Int(monthFromTime(t)) + 1
     let d = Int(dateFromTime(t))
@@ -1463,6 +1465,9 @@ func jeffJS_initDate(ctx: JeffJSContext, globalObj: JeffJSObject) {
                             value: dateName, flags: JS_PROP_CONFIGURABLE)
     dateName.freeValue()   // definePropertyValue dups
 
-    // Install on global
-    jeffJS_setPropertyStr(ctx: ctx, obj: globalObj, name: "Date", value: .makeObject(dateCtor))
+    // Install on global. Its own reference: `Date.prototype.constructor`
+    // holds the creation one (jeffJS_setPropertyStr dups and then frees what
+    // it is given), so `delete Date` after reassigning the constructor freed
+    // Date under live bindings.
+    jeffJS_setPropertyStr(ctx: ctx, obj: globalObj, name: "Date", value: JeffJSValue.makeObject(dateCtor).dupValue())
 }

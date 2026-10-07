@@ -880,11 +880,33 @@ extension JeffJSIntlBridge {
                         message: "Value \(hv) out of range for Intl.DateTimeFormat options property hour"))
                 }
                 template += hv == "2-digit" ? hourChar + hourChar : hourChar
+                if hourCycle == nil {
+                    // ECMA-402 §11.1.2 step 42-45: with an hour field, resolvedOptions()
+                    // reports the hour cycle (explicit hour12, else the locale's) and
+                    // hour12 — it was missing (JSC: "h12" / true for en-US).
+                    let cyc: String
+                    if let h12 = hour12 { cyc = h12 ? "h12" : "h23" } else {
+                        let j = DateFormatter.dateFormat(fromTemplate: "j", options: 0, locale: loc) ?? "h"
+                        cyc = j.contains("H") ? "h23" : j.contains("k") ? "h24" : j.contains("K") ? "h11" : "h12"
+                    }
+                    echo.append(("hourCycle", cyc))
+                    echo.append(("hour12", cyc == "h12" || cyc == "h11" ? "true" : "false"))
+                } else if let h12 = hour12 { echo.append(("hour12", h12 ? "true" : "false")) }
                 echo.append(("hour", hv))
-                if let h12 = hour12 { echo.append(("hour12", h12 ? "true" : "false")) }
             }
             if let e = comp("minute", ["numeric": "m", "2-digit": "mm"], numeric) { return .failed(e) }
             if let e = comp("second", ["numeric": "s", "2-digit": "ss"], numeric) { return .failed(e) }
+            // ToDateTimeOptions "any"/"date" (ECMA-402 §11.1.2): `era` and `timeZoneName`
+            // alone still get the default numeric year/month/day (JSC:
+            // `{timeZoneName:"short"}` → "10/6/2026, EDT"; it was "EDT").
+            let needDefaults = !["weekday", "year", "month", "day", "dayPeriod", "hour", "minute", "second",
+                                 "fractionalSecondDigits"].contains { optString(ctx, options, $0) != nil }
+            if needDefaults {
+                template += "yMd"
+                echo.append(("year", "numeric"))
+                echo.append(("month", "numeric"))
+                echo.append(("day", "numeric"))
+            }
             if let e = comp("timeZoneName",
                             ["short": "z", "long": "zzzz", "shortOffset": "O", "longOffset": "OOOO",
                              "shortGeneric": "v", "longGeneric": "vvvv"],
@@ -1647,7 +1669,7 @@ extension JeffJSIntlBridge {
       }
       function toTime(d) {
         var t = (d === undefined) ? Date.now() : Number(d);
-        if (!isFinite(t)) { throw new RangeError('Invalid time value'); }
+        if (!isFinite(t)) { throw new RangeError('date value is not finite in DateTimeFormat format()'); }
         return t;
       }
 

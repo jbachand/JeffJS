@@ -33,7 +33,9 @@ nonisolated final class JeffJSShape: JeffJSGCObjectHeader {
     /// An inline cache holds this shape (`JeffJSInlineCache.update*`). A private shape is
     /// grown in place only while no cache can have seen it: a cached entry keyed by its
     /// identity ("no own `p`, `p` is on the prototype", or a define_field transition from
-    /// it) would go stale when an own property is appended to the same object.
+    /// it) would go stale when an own property is appended to the same object. Likewise a
+    /// delete / flag change (`prepareShapeUpdate`) moves an icCached private shape's tables
+    /// to a fresh identity: an own-slot or holder entry would otherwise still match.
     /// (Declared next to isHashed so the two flags share padding.)
     var icCached = false
 
@@ -687,6 +689,17 @@ func prepareShapeUpdateRT(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     if shape.isHashed || shape.refCount > 1 {
         let newShape = cloneShapeRT(rt, shape)   // refCount 1, unhashed
         obj.shape = newShape
+        jeffJS_leaveShape(rt, shape)
+    } else if shape.icCached {
+        // A private shape an inline cache has keyed: an in-place delete or
+        // flag change would keep its identity, so a cached own slot / holder
+        // slot / `writable` bit would go on matching a property that is gone
+        // or changed (core-js deletes and redefines String.prototype.replace:
+        // `"x".replace` then read the deleted slot's undefined). Give the
+        // object a fresh identity that takes over the tables, as an in-place
+        // append does (`jeffJS_objectAddShapeProperty`).
+        let ns = jeffJS_moveShapeTables(rt, shape)
+        obj.shape = ns
         jeffJS_leaveShape(rt, shape)
     }
     // The caller is about to edit the property table in place.

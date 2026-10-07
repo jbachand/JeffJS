@@ -4671,6 +4671,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             guard let self = self else { return .exception }
             return js_regexp_exec(ctx: self, this: thisVal, argv: Array(args))
         }, name: "exec", length: 1)
+        // Marked so RegExpExec can tell the intrinsic from a page's `exec`.
+        if let o = execFn.toObject(), case .cFunc(let realm, let cf, let len, let cproto, _) = o.payload {
+            o.payload = .cFunc(realm: realm, cFunction: cf, length: len, cproto: cproto, magic: JEFFJS_REGEXP_EXEC_MAGIC)
+        }
         _ = setPropertyStr(obj: proto, name: "exec", value: execFn)
 
         // test
