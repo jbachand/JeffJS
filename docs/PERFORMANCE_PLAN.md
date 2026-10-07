@@ -1172,3 +1172,34 @@ new cases, each with a collection after every step. Zombie touches: threes
 failed twice to compile because another agent was editing app files.) bench/realworld.js geomean 0.995x
 (best of seven, worst kernel `tree-walk` 1.022x, which is inside the noise
 floor above).
+
+### perf/lazy-payload — lazy JSON payloads (2026-10-07)
+
+`JSON.parse` of an object/array text of ≥ `json.lazyThresholdBytes` (16 KB) and a pure-data object/array literal
+of ≥ `compile.lazyLiteralMinBytes` (16 KB; its source span is valid JSON, no `__proto__` key, not an assignment
+pattern) return a *lazy payload* (`Builtins/JeffJSLazyPayload.swift`): one allocation-free validation pass (the eager
+parser's exact grammar; malformed text, `__proto__` keys and revivers take the eager parser) plus a skip table of the
+containers ≥ 256 B, then a stub object (class Object/Array, the realm's lazy sentinel shape that no inline cache ever
+records, `lazyFlags` bit 3, a (buffer, start) record). Any own-property operation materializes the stub's top level
+into the ordinary hashed transition shape and slots (children become stubs over their spans: identity is stable);
+after that it is an ordinary object. Records exist only for the frontier (unmaterialized stubs) and each payload root.
+Eviction (`JeffJSRuntime.evictLazyPayloads`, run by the memory-pressure lazy reclaim; `json.lazyEvictOnIdle`) walks
+down from each root and reverts, children first, every object that is still exactly what its span says. Literals
+compile to the wide opcode `lazy_literal(cpool, sourceOffset)`, sharing the script's `JeffJSSourceText` (the text
+constant is the fallback for bytecode-cache loads). Bytes come from a `LazyBytesSource` (mappable).
+Switches: `JEFFJS_JSON_LAZY=0`, `JEFFJS_COMPILE_LAZYLITERALS=0`; `JEFFJS_LAZYDEBUG=1` logs literal sites.
+`jeffjs-cli --heap-report` prints a `[lazy]` line; `--lazy-evict` evicts first; natives `__lazyStats`, `__lazyEvict`.
+
+| bench/lazy_json.js (2.84 MB ytInitialData-shaped) | eager | lazy |
+|---|---|---|
+| JSON.parse | 66–76 ms | 9–10 ms |
+| first render (header + 24 items): live objects / malloc | 58 918 / 9.9 MB | 1 361 / 3.1 MB |
+| full read (stringify): objects / malloc | 58 918 / 20.8 MB | 58 920 / 23.9 MB (+ the pinned UTF-8 text) |
+| after `__lazyEvict` (58 911 reverted in 67–71 ms) | — | 11 / 3.3 MB, re-read 1 ms |
+| inline literal: compile+run, then first render | 139–150 ms, 58 911 objects / 12.5 MB | 87–92 ms, 1 352 / 3.0 MB |
+
+Page runs (CLI, network stubbed, so no GraphQL responses): homedepot-plp's 158 KB `__APOLLO_STATE__` + 22 KB
+`__EXPERIENCE_PROPS__` literals go lazy, 27 objects materialized: live objects 132 749 → 131 823, malloc 64.8 → 64.5
+MB (the page heap is code-built descriptors); homedepot-cart: no change (its one 22 KB literal is read). Both pages
+are bimodal run to run (±4 k objects, both modes). Instructions retired: watch_deepmerge +0.1 %, watch_iter +0.4 %,
+watch_callbacks +0.3 %, kernels +0.1 %, realworld −2.5 %.
