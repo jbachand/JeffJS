@@ -503,7 +503,7 @@ public final class JeffJSEnvironment {
     /// Inline-cache stores that found no slot (0 expected; see
     /// `JeffJSInlineCache.unmappedStores`).
     public static var inlineCacheUnmappedStores: Int {
-        JeffJSInlineCache.unmappedStores.load(ordering: .relaxed)
+        JeffJSInlineCache.unmappedStoreCount
     }
     public static var inlineCacheStats: (tables: Int, bytes: Int) {
         JeffJSInlineCache.liveStats

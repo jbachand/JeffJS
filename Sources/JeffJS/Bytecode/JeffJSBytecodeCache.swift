@@ -1440,7 +1440,7 @@ nonisolated final class JeffJSBytecodeCache {
     /// blobs written by another one, even when nobody bumped
     /// `compilerVersion`. `BytecodeCacheBudgetTests.testEngineSourceHashIsCurrent`
     /// fails when it is stale; `Scripts/update_bytecode_identity.sh` rewrites it.
-    static let engineSourceHash: UInt64 = 0xdf82ccea14795e48 // bytecode-identity
+    static let engineSourceHash: UInt64 = 0xbdb96f044ce46e0c // bytecode-identity
 
     /// The engine build identity: `compilerVersion`, the blob and entry
     /// layouts, `engineSourceHash`, and the opcode table the interpreter
@@ -1856,7 +1856,7 @@ nonisolated final class JeffJSBytecodeCache {
 
     /// Swaps whose write finished, per cache (the writer queue holds the box,
     /// not the cache: a runtime freed before its writes land is fine).
-    final class SourceSwapBox: @unchecked Sendable {
+    nonisolated final class SourceSwapBox: @unchecked Sendable {
         let lock = NSLock()
         var ready: [(text: JeffJSSourceText, expected: JeffJSBytesSpan, mapped: JeffJSBytesSpan?)?] = []
         func add(_ s: (text: JeffJSSourceText, expected: JeffJSBytesSpan, mapped: JeffJSBytesSpan?)?) {

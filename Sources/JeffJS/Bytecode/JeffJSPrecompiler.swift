@@ -30,7 +30,7 @@
 
 import Foundation
 
-public enum JeffJSPrecompiler {
+nonisolated public enum JeffJSPrecompiler {
 
     public enum Outcome: Equatable, Sendable {
         /// Compiled and written (entry bytes).

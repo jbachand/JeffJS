@@ -174,6 +174,7 @@ nonisolated final class JeffJSInlineCache {
     /// an IC site; expected 0 — a nonzero count names a site missing from
     /// `isSiteOpcode`). Tests read it.
     static let unmappedStores = Atomic<Int>(0)
+    static var unmappedStoreCount: Int { unmappedStores.load(ordering: .relaxed) }
 
     /// Slots a bytecode-offset table of a function with `len` bytes of
     /// bytecode needs (the pre-ordinal layout).

@@ -32,7 +32,7 @@ public protocol JeffJSMappedBytes: AnyObject {
 }
 
 /// A read-only memory mapping of a whole file.
-public final class JeffJSFileMapping: JeffJSMappedBytes, @unchecked Sendable {
+nonisolated public final class JeffJSFileMapping: JeffJSMappedBytes, @unchecked Sendable {
     public let baseAddress: UnsafeRawPointer
     public let count: Int
     public var isFileBacked: Bool { true }
@@ -71,7 +71,7 @@ public final class JeffJSFileMapping: JeffJSMappedBytes, @unchecked Sendable {
 }
 
 /// One heap block (bytes that have no file behind them yet).
-public final class JeffJSHeapBytes: JeffJSMappedBytes, @unchecked Sendable {
+nonisolated public final class JeffJSHeapBytes: JeffJSMappedBytes, @unchecked Sendable {
     public let baseAddress: UnsafeRawPointer
     public let count: Int
     public var isFileBacked: Bool { false }
@@ -108,7 +108,7 @@ public final class JeffJSHeapBytes: JeffJSMappedBytes, @unchecked Sendable {
 /// (owner, offset, count) into immutable bytes; keeps the owner alive.
 /// Indexable like the `[UInt8]` it replaces (reads past the end give 0, the
 /// QuickJS buffer terminator, instead of trapping).
-public struct JeffJSBytesSpan: RandomAccessCollection {
+nonisolated public struct JeffJSBytesSpan: RandomAccessCollection {
     public let owner: JeffJSMappedBytes?
     public let base: UnsafePointer<UInt8>?
     public let count: Int
