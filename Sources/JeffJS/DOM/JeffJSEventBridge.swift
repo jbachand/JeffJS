@@ -218,6 +218,12 @@ final class JeffJSEventBridge {
       var def = function (o, k, v) {
         Object.defineProperty(o, k, { value: v, writable: true, configurable: true, enumerable: false });
       };
+      // WebIDL class string (`Object.prototype.toString.call(new MouseEvent('x'))` is
+      // "[object MouseEvent]" in WebKit; google's /search challenge reads it — google on
+      // JeffJS, 2026-10-06). Non-writable, non-enumerable, configurable, as WebIDL defines it.
+      var tag = function (P, name) {
+        try { Object.defineProperty(P, Symbol.toStringTag, { value: name, writable: false, enumerable: false, configurable: true }); } catch (e) {}
+      };
       var now = function () {
         var p = g.performance;
         return (p && typeof p.now === 'function') ? p.now() : Date.now();
@@ -271,6 +277,7 @@ final class JeffJSEventBridge {
         // `Event.__jeffjsReal` keeps it (and the passive/composedPath logic
         // that lives in its native methods) instead of installing its own.
         Object.defineProperty(E, '__jeffjsReal', { value: true });
+        tag(E.prototype, 'Event');
         g.Event = E;
         out.event = E.prototype;
       }
@@ -290,6 +297,7 @@ final class JeffJSEventBridge {
           this.initEvent(type, bubbles, cancelable);
           this.detail = detail === undefined ? null : detail;
         });
+        tag(C.prototype, 'CustomEvent');
         g.CustomEvent = C;
       }
 
@@ -313,6 +321,7 @@ final class JeffJSEventBridge {
           Object.defineProperty(C, 'name', { value: name, configurable: true });
           C.prototype = Object.create(Parent.prototype);
           def(C.prototype, 'constructor', C);
+          tag(C.prototype, name);
           g[name] = C;
           return C;
         };
@@ -583,11 +592,15 @@ final class JeffJSEventBridge {
     // MARK: - addEventListener
 
     func addEventListener(ctx: JeffJSContext, target: JeffJSValue, type: JeffJSValue, listener: JeffJSValue, options: JeffJSValue) {
-        guard listener.isObject else { return }
         let typeStr = ctx.toSwiftString(type) ?? ""
 
+        // DOM §2.7.3: the options are flattened *before* a null callback is dropped
+        // ("add an event listener" step 2), so the classic passive-support probe
+        // `addEventListener('test', null, {get passive(){…}})` sees its getter run
+        // (WebKit does; google's challenge VM reads it — google on JeffJS, 2026-10-06).
         let (capture, once, passiveOption, signal) = parseListenerOptions(ctx: ctx, options: options)
         defer { signal?.freeValue() }
+        guard listener.isObject else { return }
 
         if let signal, isAborted(ctx: ctx, signal) { return }
 
@@ -617,10 +630,11 @@ final class JeffJSEventBridge {
     // MARK: - removeEventListener
 
     func removeEventListener(ctx: JeffJSContext, target: JeffJSValue, type: JeffJSValue, listener: JeffJSValue, options: JeffJSValue) {
-        guard listener.isObject else { return }
         let typeStr = ctx.toSwiftString(type) ?? ""
-        let (capture, _, _, signal) = parseListenerOptions(ctx: ctx, options: options)
-        signal?.freeValue()
+        // DOM §2.7.3 "flatten options": removeEventListener reads only `capture`, and
+        // before a null callback is dropped (WebKit; passive/once/signal getters do not run).
+        let capture = options.isObject ? readBool(ctx, options, "capture") : ctx.toBool(options)
+        guard listener.isObject else { return }
         let targetKey = eventTargetKey(ctx: ctx, value: target)
         if let rec = listenerStore.find(targetKey: targetKey, type: typeStr, listener: listener, capture: capture) {
             listenerStore.remove(rec, targetKey: targetKey, type: typeStr)

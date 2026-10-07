@@ -23,6 +23,14 @@ import Foundation
 extension JeffJSTestRunner {
 
     static let browserFingerprintCases: [(String, String)] = [
+        // google on JeffJS (2026-10-06): google's /search challenge VM reads the class string
+        // of the builtin prototypes and Function.prototype's callability / key order.
+        ("Function.prototype is a callable, non-constructible function (ES §20.2.3)",
+         #"typeof Function.prototype === 'function' && Function.prototype() === undefined && Function.prototype(1, 2) === undefined && Object.prototype.toString.call(Function.prototype) === '[object Function]' && (function(){ try { new Function.prototype(); return false; } catch (e) { return e instanceof TypeError; } })() && Function.prototype.toString.call(Function.prototype) === 'function () {\n    [native code]\n}'"#),
+        ("Error / NativeError / Date prototypes are ordinary objects (ES §20.5.3, §20.5.6.3, §21.4.4)",
+         #"Object.prototype.toString.call(Error.prototype) === '[object Object]' && Object.prototype.toString.call(TypeError.prototype) === '[object Object]' && Object.prototype.toString.call(RangeError.prototype) === '[object Object]' && Object.prototype.toString.call(Date.prototype) === '[object Object]' && Object.prototype.toString.call(new TypeError('x')) === '[object Error]' && Object.prototype.toString.call(new Date(0)) === '[object Date]' && (function(){ try { Date.prototype.getTime(); return false; } catch (e) { return e instanceof TypeError; } })() && Error.prototype.toString() === 'Error' && new RangeError('m') instanceof Error"#),
+        ("Function.prototype / Error.prototype own keys in JSC's order",
+         #"Object.getOwnPropertyNames(Function.prototype).join() === 'length,name,toString,apply,call,bind,arguments,caller,constructor' && Object.getOwnPropertyNames(Error.prototype).join() === 'toString,name,message,constructor' && Object.keys(Function.prototype).length === 0"#),
         // device profile agent (2026-09-30): Akamai's homedepot challenge does
         // `this["dR"]^=this["qR"]` at a column where the expression span's end
         // offset had a low byte of 0x43 (get_field): the compound assignment

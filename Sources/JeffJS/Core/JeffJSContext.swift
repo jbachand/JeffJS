@@ -2442,8 +2442,15 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         classProto[JSClassID.JS_CLASS_OBJECT.rawValue] = objectProtoVal
 
         // --- Function.prototype ---
+        // ES §20.2.3: Function.prototype is itself a built-in function object that accepts
+        // any arguments and returns undefined (`typeof Function.prototype === "function"`,
+        // `Object.prototype.toString` → "[object Function]", not a constructor). It was a
+        // plain object here ("object" / "[object Object]" — a classic engine fingerprint;
+        // google on JeffJS, 2026-10-06).
         let funcProto = JeffJSObject()
-        funcProto.classID = JSClassID.JS_CLASS_OBJECT.rawValue
+        funcProto.classID = JSClassID.JS_CLASS_C_FUNCTION.rawValue
+        funcProto.payload = .cFunc(realm: self, cFunction: .generic({ _, _, _ in .JS_UNDEFINED }),
+                                   length: 0, cproto: UInt8(JS_CFUNC_GENERIC), magic: 0)
         funcProto.extensible = true
         funcProto.shape = createShape(self, proto: objectProto, hashSize: JS_PROP_INITIAL_HASH_SIZE, propSize: JS_PROP_INITIAL_SIZE)
         funcProto.clearProps()
@@ -3811,7 +3818,11 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// Adds Error and NativeError constructors.
     private func addErrorConstructors() {
         // Error prototype
-        let errorProto = newObjectClass(classID: JSClassID.JS_CLASS_ERROR.rawValue)
+        // ES §20.5.3: Error.prototype is an *ordinary* object (no [[ErrorData]]), so
+        // `Object.prototype.toString.call(Error.prototype)` is "[object Object]" (JSC too;
+        // it was "[object Error]" — google's /search challenge VM reads the class of the
+        // prototypes it builds its own errors on; google on JeffJS, 2026-10-06).
+        let errorProto = newObjectClass(classID: JSClassID.JS_CLASS_OBJECT.rawValue)
         classProto[JSClassID.JS_CLASS_ERROR.rawValue] = errorProto
 
         // Error.prototype.__proto__ = Object.prototype
@@ -3820,12 +3831,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             errorProtoObj.proto = objProtoObj
         }
 
-        // Error.prototype.name = "Error"
-        _ = setPropertyStr(obj: errorProto, name: "name", value: newStringValue("Error"))
-        // Error.prototype.message = ""
-        _ = setPropertyStr(obj: errorProto, name: "message", value: newStringValue(""))
-
-        // Error.prototype.toString
+        // Error.prototype.toString (first: JSC's own-key order is toString, name, message,
+        // constructor — google on JeffJS, 2026-10-06)
         let errToStringFunc = newCFunction({ [weak self] ctx, thisVal, args in
             guard let self = self else { return .exception }
             let name = self.getPropertyStr(obj: thisVal, name: "name")
@@ -3840,6 +3847,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return self.newStringValue("\(nameStr): \(msgStr)")
         }, name: "toString", length: 0)
         _ = setPropertyStr(obj: errorProto, name: "toString", value: errToStringFunc)
+        // Error.prototype.name = "Error"
+        _ = setPropertyStr(obj: errorProto, name: "name", value: newStringValue("Error"))
+        // Error.prototype.message = ""
+        _ = setPropertyStr(obj: errorProto, name: "message", value: newStringValue(""))
 
         // Error constructor
         let errorCtor = newCFunction({ [weak self] ctx, thisVal, args in
@@ -3874,7 +3885,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         ]
 
         for (errorEnum, name) in nativeErrorNames {
-            let nativeProto = newObjectClass(classID: JSClassID.JS_CLASS_ERROR.rawValue)
+            // ES §20.5.6.3: a NativeError prototype is an ordinary object too.
+            let nativeProto = newObjectClass(classID: JSClassID.JS_CLASS_OBJECT.rawValue)
             // NativeError.prototype.__proto__ = Error.prototype
             if let errorProtoObj = errorProto.toObject(), let nativeProtoObj = nativeProto.toObject() {
                 nativeProtoObj.proto = errorProtoObj

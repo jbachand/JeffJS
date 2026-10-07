@@ -87,19 +87,27 @@ struct JeffJSBuiltinFunction {
         _ = ctx.deleteProperty(obj: fp, atom: junk)
         ctx.rt.freeAtom(junk)
 
+        // JavaScriptCore's own-key order (pages fingerprint
+        // `Object.getOwnPropertyNames(Function.prototype)`): length, name, toString, apply,
+        // call, bind, arguments, caller, constructor (google on JeffJS, 2026-10-06; was
+        // call, apply, bind, toString, length, name, constructor, arguments, caller).
+        var methods: [(JSAtom, JeffJSValue)] = []
+        for n in ["toString", "apply", "call", "bind"] {
+            let atom = ctx.rt.findAtom(n)
+            let v = ctx.getPropertyStr(obj: fp, name: n)
+            if v.isObject { _ = ctx.deleteProperty(obj: fp, atom: atom); methods.append((atom, v)) }
+            else { v.freeValue(); ctx.rt.freeAtom(atom) }
+        }
         ctx.definePropertyValue(obj: fp, atom: JeffJSAtomID.JS_ATOM_length.rawValue,
                                 value: JeffJSValue.newInt32(0), flags: JS_PROP_CONFIGURABLE)
         let emptyName = ctx.newStringValue("")
         ctx.definePropertyValue(obj: fp, atom: JeffJSAtomID.JS_ATOM_name.rawValue, value: emptyName, flags: JS_PROP_CONFIGURABLE)
         emptyName.freeValue()
-
-        let fnCtor = ctx.getPropertyStr(obj: ctx.globalObj, name: "Function")
-        if fnCtor.isObject {
-            let ctorAtom = ctx.rt.findAtom("constructor")
-            ctx.definePropertyValue(obj: fp, atom: ctorAtom, value: fnCtor, flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
-            ctx.rt.freeAtom(ctorAtom)
+        for (atom, v) in methods {
+            ctx.definePropertyValue(obj: fp, atom: atom, value: v, flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+            v.freeValue()
+            ctx.rt.freeAtom(atom)
         }
-        fnCtor.freeValue()
 
         let hasInstanceFn = ctx.newCFunction({ c, thisVal, args in
             hasInstance(ctx: c, this: thisVal, args: args)
@@ -118,6 +126,14 @@ struct JeffJSBuiltinFunction {
             }, name: name, length: 1)
             ctx.setPropertyGetSet(obj: fp, name: name, getter: getter, setter: setter)
         }
+
+        let fnCtor = ctx.getPropertyStr(obj: ctx.globalObj, name: "Function")
+        if fnCtor.isObject {
+            let ctorAtom = ctx.rt.findAtom("constructor")
+            ctx.definePropertyValue(obj: fp, atom: ctorAtom, value: fnCtor, flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+            ctx.rt.freeAtom(ctorAtom)
+        }
+        fnCtor.freeValue()
     }
 
     // MARK: - Function.prototype.caller / .arguments (JSC's legacy accessors)
@@ -481,8 +497,12 @@ struct JeffJSBuiltinFunction {
             // "x" (`function cookie()`), an ECMAScript builtin accessor keeps
             // it (`function get size()`, `function get __proto__()`) — both
             // from a WKWebView capture; pages fingerprint them.
-            let name = nativeCodeName(getFunctionName(obj: obj),
-                                      keepAccessorPrefix: obj.nativeNameKeepsAccessorPrefix)
+            // An empty-named native prints `function () {` (JSC: Function.prototype itself,
+            // which is a C function since 2026-10-06), never "anonymous".
+            let rawName = getFunctionName(obj: obj)
+            let ownName = obj.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_name.rawValue)
+            let emptyName = ownName.isString && (ownName.stringValue?.toSwiftString().isEmpty ?? false)
+            let name = emptyName ? "" : nativeCodeName(rawName, keepAccessorPrefix: obj.nativeNameKeepsAccessorPrefix)
             let result = "function \(name)() {\n    [native code]\n}"
             return JeffJSValue.makeString(JeffJSString(swiftString: result))
 

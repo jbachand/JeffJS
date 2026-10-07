@@ -1311,8 +1311,10 @@ func jsDate_toPrimitive(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [J
 func jeffJS_initDate(ctx: JeffJSContext, globalObj: JeffJSObject) {
     // Date.prototype inherits from Object.prototype per the spec.
     let objectProto = ctx.classProto[JSClassID.JS_CLASS_OBJECT.rawValue].toObject()
-    let dateProto = jeffJS_createObject(ctx: ctx, proto: objectProto, classID: UInt16(JeffJSClassID.date.rawValue))
-    dateProto.payload = JeffJSObjectPayload.objectData(JeffJSValue.newFloat64(Double.nan))
+    // ES §21.4.4: Date.prototype is an ordinary object, not a Date instance (no
+    // [[DateValue]]): `Date.prototype.getTime()` throws, `Object.prototype.toString`
+    // gives "[object Object]" (JSC too; it was a NaN Date — google on JeffJS, 2026-10-06).
+    let dateProto = jeffJS_createObject(ctx: ctx, proto: objectProto, classID: UInt16(JeffJSClassID.object.rawValue))
 
     // Prototype methods, in JavaScriptCore's order (DatePrototype.cpp; pages
     // fingerprint `Object.getOwnPropertyNames(Date.prototype)`), Annex B
