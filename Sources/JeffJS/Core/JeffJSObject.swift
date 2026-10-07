@@ -1084,6 +1084,25 @@ nonisolated final class ListNode {
 
 // MARK: - JeffJSGCObjectHeader
 
+/// Threads currently compiling in a private runtime (JeffJSPrecompiler);
+/// written only under the precompiler's lock. 0: every object belongs to
+/// `activeRuntime`, as before.
+nonisolated(unsafe) var jeffJS_threadOwnersActive: Int = 0
+
+/// The runtime objects created on this thread belong to (a background
+/// compile's), or nil.
+@inline(never)
+func jeffJS_threadOwnerRuntime() -> JeffJSRuntime? {
+    guard let p = pthread_getspecific(jeffJS_threadOwnerKey) else { return nil }
+    return Unmanaged<JeffJSRuntime>.fromOpaque(p).takeUnretainedValue()
+}
+
+nonisolated(unsafe) let jeffJS_threadOwnerKey: pthread_key_t = {
+    var k = pthread_key_t()
+    pthread_key_create(&k, nil)
+    return k
+}()
+
 /// Base class for every GC-managed object.
 // nonisolated: GC objects are created and freed on whatever thread runs the
 // engine. Without this they inherit the host's default actor isolation (React
@@ -1131,7 +1150,13 @@ nonisolated class JeffJSGCObjectHeader {
         self.refCount = refCount
         self.gcObjType = gcObjType
         self.mark = mark
-        self.ownerRuntime = JeffJSGCObjectHeader.activeRuntime
+        // A background precompile (JeffJSPrecompiler) creates its objects on
+        // its own thread in its own runtime: only while one runs does the
+        // owner come from the creating thread (one predictable branch here
+        // otherwise).
+        self.ownerRuntime = jeffJS_threadOwnersActive != 0
+            ? (jeffJS_threadOwnerRuntime() ?? JeffJSGCObjectHeader.activeRuntime)
+            : JeffJSGCObjectHeader.activeRuntime
     }
 
     /// The runtime's GC lists hold *unretained* pointers (see

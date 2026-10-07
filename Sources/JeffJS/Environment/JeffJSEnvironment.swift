@@ -496,6 +496,10 @@ public final class JeffJSEnvironment {
     /// compiled on a first call (count, source KB, ms).
     public var lazyCompileSummary: String { runtime.lazyStats.description }
     /// Live inline-cache tables and their bytes, process-wide (all runtimes).
+    /// Time JS-thread cache lookups waited for an in-flight background
+    /// precompile (JeffJSPrecompiler), ms, process-wide.
+    public static var precompileWaitMs: Double { JeffJSBytecodeCache.precompileWaitMs }
+
     /// Inline-cache stores that found no slot (0 expected; see
     /// `JeffJSInlineCache.unmappedStores`).
     public static var inlineCacheUnmappedStores: Int {

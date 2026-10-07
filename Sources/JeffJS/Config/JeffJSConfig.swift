@@ -139,6 +139,10 @@ enum JeffJSConfig {
     /// parse straight out of the mapping. perf/bytecode-paging.
     /// `JEFFJS_COMPILE_MAPPEDSOURCE=0` = the heap copy.
     static let compileMappedSource = bool("compile.mappedSource",      default: true)
+    /// `JeffJSPrecompiler.precompileScript` compiles a script on the calling
+    /// (background) thread into the disk tier, so the JS thread maps it
+    /// instead of compiling. `JEFFJS_COMPILE_OFFTHREADPRECOMPILE=0` = no-op.
+    static let compileOffThreadPrecompile = bool("compile.offThreadPrecompile", default: true)
     /// Functions whose source is shorter than this are compiled eagerly (a
     /// tiny body costs about as much as its stub).
     static let lazyMinSourceBytes  = int("compile.lazyMinSourceBytes", default: 0)

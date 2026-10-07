@@ -1440,7 +1440,7 @@ nonisolated final class JeffJSBytecodeCache {
     /// blobs written by another one, even when nobody bumped
     /// `compilerVersion`. `BytecodeCacheBudgetTests.testEngineSourceHashIsCurrent`
     /// fails when it is stale; `Scripts/update_bytecode_identity.sh` rewrites it.
-    static let engineSourceHash: UInt64 = 0x15591810526811f6 // bytecode-identity
+    static let engineSourceHash: UInt64 = 0xdf82ccea14795e48 // bytecode-identity
 
     /// The engine build identity: `compilerVersion`, the blob and entry
     /// layouts, `engineSourceHash`, and the opcode table the interpreter
@@ -1961,10 +1961,40 @@ nonisolated final class JeffJSBytecodeCache {
     private static func notePending(_ h: UInt64) { policyLock.lock(); pendingHashes.insert(h); policyLock.unlock() }
     private static func donePending(_ h: UInt64) { policyLock.lock(); pendingHashes.remove(h); policyLock.unlock() }
 
-    /// A disk lookup of an entry whose write is still queued waits for it.
+    /// A disk lookup of an entry whose write is still queued, or that a
+    /// background precompile (JeffJSPrecompiler) is producing, waits for it.
     static func waitIfPending(_ h: UInt64) {
-        policyLock.lock(); let pending = pendingHashes.contains(h); policyLock.unlock()
+        policyLock.lock()
+        let pending = pendingHashes.contains(h)
+        let precompile = precompiling[h]
+        policyLock.unlock()
         if pending { writeQueue.sync {} }
+        if let g = precompile {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            g.wait()
+            policyLock.lock(); precompileWaitMs += (CFAbsoluteTimeGetCurrent() - t0) * 1000; policyLock.unlock()
+        }
+    }
+
+    nonisolated(unsafe) private static var precompiling: [UInt64: DispatchGroup] = [:]
+    /// Time JS-thread lookups spent waiting for an in-flight precompile.
+    nonisolated(unsafe) private(set) static var precompileWaitMs: Double = 0
+
+    /// Claim `h` for a background precompile (false: one is running).
+    static func beginPrecompile(_ h: UInt64) -> Bool {
+        policyLock.lock(); defer { policyLock.unlock() }
+        if precompiling[h] != nil { return false }
+        let g = DispatchGroup()
+        g.enter()
+        precompiling[h] = g
+        return true
+    }
+
+    static func endPrecompile(_ h: UInt64) {
+        policyLock.lock()
+        let g = precompiling.removeValue(forKey: h)
+        policyLock.unlock()
+        g?.leave()
     }
 
     /// Blocks until every queued disk write has landed (runtime teardown, CLI exit).

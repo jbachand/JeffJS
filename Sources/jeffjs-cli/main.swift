@@ -224,7 +224,12 @@ let status: Int32 = MainActor.assumeIsolated {
             print(orphanReport(className: "JeffJS.JeffJSObject") { JeffJSHeapDebug.describeObject(at: $0) })
         }
     }
-    if args.contains("--cache-stats") { print("[cache] " + env.bytecodeCacheDescription) }
+    if args.contains("--cache-stats") {
+        print("[cache] " + env.bytecodeCacheDescription)
+        let p = JeffJSPrecompiler.stats
+        print(String(format: "[precompile] compiled=%d ms=%.0f srcKB=%d jsThreadWaitMs=%.0f",
+                     p.compiled, p.ms, p.sourceBytes / 1024, JeffJSEnvironment.precompileWaitMs))
+    }
     env.flushBytecodeCache()
     // --teardown exercises context/runtime free (the path the test suite runs
     // between groups); the CLI otherwise leaves it to process exit.
@@ -301,10 +306,12 @@ func cliRunPage(env: JeffJSEnvironment, dir: String, bundlesDir: String?) -> (ra
     var ran = 0, errors = 0, skipped = 0
     let t0 = CFAbsoluteTimeGetCurrent()
     let verbose = ProcessInfo.processInfo.environment["JEFFJS_PAGE_VERBOSE"] != nil
+    // The scripts' final text and name, in document order (nil: skipped).
+    var items: [(code: String, name: String)?] = []
     for s in scripts {
         let type = (s.attributeValue("type") ?? "").lowercased()
         let isModule = type == "module"
-        if !(type.isEmpty || type.contains("javascript") || type.contains("ecmascript") || isModule) { skipped += 1; continue }
+        if !(type.isEmpty || type.contains("javascript") || type.contains("ecmascript") || isModule) { items.append(nil); continue }
         var src: String? = nil
         var name = "<inline>"
         if let file = s.attributeValue("src") {
@@ -318,7 +325,24 @@ func cliRunPage(env: JeffJSEnvironment, dir: String, bundlesDir: String?) -> (ra
         } else if !isModule {
             src = s.rawTextDescendants
         }
-        guard let code = src, !code.isEmpty else { skipped += 1; continue }
+        guard let code = src, !code.isEmpty else { items.append(nil); continue }
+        items.append((code, name))
+    }
+    // --precompile: the app's off-main compile on arrival (JeffJSPrecompiler):
+    // a background thread compiles every script (the exact text and name the
+    // eval below gets) into the disk tier in document order while this
+    // thread runs them; a script whose precompile is in flight waits for it,
+    // then maps it.
+    if CommandLine.arguments.contains("--precompile") {
+        let jobs = items.compactMap { $0 }
+        let th = Thread {
+            for job in jobs { _ = JeffJSPrecompiler.precompileScript(job.code, filename: job.name) }
+        }
+        th.stackSize = 16 << 20
+        th.start()
+    }
+    for item in items {
+        guard let (code, name) = item else { skipped += 1; continue }
         let r = env.eval(code, filename: name)
         ran += 1
         if case .exception(let msg) = r {

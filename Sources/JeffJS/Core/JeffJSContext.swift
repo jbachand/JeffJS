@@ -627,7 +627,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     ///   - addIntrinsics: Whether to add standard intrinsics (default: true).
     init(rt: JeffJSRuntime, addIntrinsics: Bool = true, realmIndex: UInt8 = 0) {
         // Set the active runtime so all objects created during init get the back-pointer
-        JeffJSGCObjectHeader.activeRuntime = rt
+        // (a background compile runtime never touches the process-wide pointer:
+        // its thread's objects get their owner from JeffJSPrecompiler's override).
+        if !rt.isBackgroundCompiler { JeffJSGCObjectHeader.activeRuntime = rt }
         self.rt = rt
         self.realmIndex = realmIndex
         self.header = JeffJSGCObjectHeader()
@@ -3338,20 +3340,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // ---- Bytecode cache lookup ----
         // Cache stores SERIALIZED bytecode (not live objects). On cache hit,
         // deserialization creates fresh cpool values in the current context.
-        let cacheSkipReason: String? = {
-            guard JeffJSConfig.bytecodeEnabled else { return "cache.bytecodeEnabled=false" }
-            guard !isModule else { return "module" }
-            // Exclude small dynamic scripts (eval, onclick, diagnostics)
-            if let p = JeffJSConfig.bytecodeExcludePrefixes.first(where: { filename.hasPrefix($0) }) {
-                return "excluded prefix \(p)"
-            }
-            // If legacy include-prefixes are set, require a match
-            if !JeffJSConfig.bytecodePrefixes.isEmpty,
-               !JeffJSConfig.bytecodePrefixes.contains(where: { filename.hasPrefix($0) }) {
-                return "no include-prefix match"
-            }
-            return nil  // cache everything not excluded
-        }()
+        let cacheSkipReason = Self.bytecodeCacheSkipReason(filename: filename, isModule: isModule)
         let cacheEnabled = cacheSkipReason == nil
         // The key covers the source AND everything else about this compile:
         // eval flags (module/strict/backtrace-barrier/async/compile-only), the
@@ -3373,50 +3362,14 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         }
 
         // ---- Cache MISS — full pipeline: Tokenize → Parse → Compile ----
-        let isStrict = (evalFlags & JS_EVAL_FLAG_STRICT) != 0
         let compileStart = CFAbsoluteTimeGetCurrent()
-
-        // Step 1+2: Tokenize and parse
-        let parseState = JeffJSParseState(
-            source: input,
-            filename: filename,
-            ctx: self
-        )
-        parseState.isModule = isModule
-        parseState.allowHTMLComments = !isModule
-
-        let fd = JeffJSFunctionDefCompiler()
-        fd.filename = rt.findAtom(filename)
-        fd.source = input
-        // One UTF-8 copy of the script, shared by every function compiled
-        // from it; the parser records a (start, end) span per function so
-        // Function.prototype.toString can return the original text.
-        fd.sourceText = JeffJSSourceText(span: parseState.buf)
-        fd.sourceStart = 0
-        fd.sourceEnd = parseState.buf.count
-        // Functions compiled lazily re-parse from this shared text.
-        let lazyScript = JeffJSLazyScript(source: fd.sourceText!, filename: filename, isModule: isModule)
-        lazyScript.cacheHash = cacheKey?.hash
-        fd.lazyScript = lazyScript
-        if isStrict || isModule {
-            fd.jsMode = JS_MODE_STRICT
-        }
-
-        let parser = JeffJSParser(s: parseState, fd: fd)
-        parser.parseProgram()
-
-        if parser.failed || fd.byteCode.error {
+        let fb: JeffJSFunctionBytecode
+        switch compileProgram(input: input, filename: filename, evalFlags: evalFlags, cacheHash: cacheKey?.hash) {
+        case .compiled(let f): fb = f
+        case .empty: return .JS_UNDEFINED
+        case .syntaxError(let parseState):
             return throwParseSyntaxError(parseState, fallback: "Parse error in \(filename)")
-        }
-
-        let bcSize = fd.byteCode.len
-        if bcSize == 0 {
-            return .JS_UNDEFINED
-        }
-
-        // Step 3: Compile (recursively compiles child functions, resolves
-        // variables/labels, and produces final bytecode).
-        guard let fb = JeffJSCompiler.createFunction(ctx: self, fd: fd) else {
+        case .failed:
             // A pass that already threw (an undeclared private name is a
             // SyntaxError) keeps its own error.
             if !rt.currentException.isNull && !rt.currentException.isUndefined {
@@ -3440,6 +3393,87 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         }
 
         return executeBytecode(fb)
+    }
+
+    /// Why an eval under `filename` is not looked up in / stored to the
+    /// bytecode cache (nil: it is). Shared with JeffJSPrecompiler.
+    static func bytecodeCacheSkipReason(filename: String, isModule: Bool) -> String? {
+        guard JeffJSConfig.bytecodeEnabled else { return "cache.bytecodeEnabled=false" }
+        guard !isModule else { return "module" }
+        // Exclude small dynamic scripts (eval, onclick, diagnostics)
+        if let p = JeffJSConfig.bytecodeExcludePrefixes.first(where: { filename.hasPrefix($0) }) {
+            return "excluded prefix \(p)"
+        }
+        // If legacy include-prefixes are set, require a match
+        if !JeffJSConfig.bytecodePrefixes.isEmpty,
+           !JeffJSConfig.bytecodePrefixes.contains(where: { filename.hasPrefix($0) }) {
+            return "no include-prefix match"
+        }
+        return nil  // cache everything not excluded
+    }
+
+    enum CompileProgramResult {
+        case compiled(JeffJSFunctionBytecode)
+        case empty
+        case syntaxError(JeffJSParseState)
+        case failed
+    }
+
+    /// Tokenize → parse → compile a script exactly as the eval pipeline does
+    /// on a cache miss (also the background precompiler's compile, so a
+    /// precompiled entry is the blob the eval would have stored).
+    func compileProgram(input: String, filename: String, evalFlags: Int, cacheHash: UInt64?) -> CompileProgramResult {
+        let isModule = (evalFlags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE
+        let isStrict = (evalFlags & JS_EVAL_FLAG_STRICT) != 0
+
+        // Step 1+2: Tokenize and parse
+        let parseState = JeffJSParseState(
+            source: input,
+            filename: filename,
+            ctx: self
+        )
+        parseState.isModule = isModule
+        parseState.allowHTMLComments = !isModule
+
+        let fd = JeffJSFunctionDefCompiler()
+        fd.filename = rt.findAtom(filename)
+        fd.source = input
+        // One UTF-8 copy of the script, shared by every function compiled
+        // from it; the parser records a (start, end) span per function so
+        // Function.prototype.toString can return the original text.
+        fd.sourceText = JeffJSSourceText(span: parseState.buf)
+        fd.sourceStart = 0
+        fd.sourceEnd = parseState.buf.count
+        // Functions compiled lazily re-parse from this shared text.
+        let lazyScript = JeffJSLazyScript(source: fd.sourceText!, filename: filename, isModule: isModule)
+        lazyScript.cacheHash = cacheHash
+        fd.lazyScript = lazyScript
+        if isStrict || isModule {
+            fd.jsMode = JS_MODE_STRICT
+        }
+
+        let parser = JeffJSParser(s: parseState, fd: fd)
+        parser.parseProgram()
+
+        if parser.failed || fd.byteCode.error {
+            return .syntaxError(parseState)
+        }
+
+        let bcSize = fd.byteCode.len
+        if bcSize == 0 {
+            return .empty
+        }
+
+        // Step 3: Compile (recursively compiles child functions, resolves
+        // variables/labels, and produces final bytecode).
+        guard let fb = JeffJSCompiler.createFunction(ctx: self, fd: fd) else { return .failed }
+        return .compiled(fb)
+    }
+
+    /// Give back what a compiled, never-run script holds (its constants and
+    /// nested bodies): the background precompiler's tree after serializing.
+    func releaseUnrunProgram(_ fb: JeffJSFunctionBytecode) {
+        releaseTopLevelConstants(fb)
     }
 
     /// Parse + compile `input` as a global script without running it and
