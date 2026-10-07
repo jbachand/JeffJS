@@ -1047,12 +1047,23 @@ nonisolated final class JeffJSRuntime {
                 }
             }
         }
-        gcFreeDeadObjects(self, dead)
+        // A body's constant pool owns one count on each of its constants, and
+        // the collector does not see that edge (markChildren: the pool is not a
+        // GC node). Give those counts back *before* the group free, while every
+        // object is still allocated: a tagged template's strings array
+        // (`fn\`a${x}\``, JeffJSParser: `cpool[i] = newTemplateObject`) is a
+        // listed object, so it is in the dead group itself — released after the
+        // group free, its pool reference touched a deallocated object (iframe-realm
+        // pages crashed on navigation in -O builds: SIGSEGV in freeValueHeap under
+        // freeRemainingHeap; JEFFJS_ZOMBIES=1 reported [ZOMBIE-FREE] classID=2).
+        // A constant this drops to zero is deferred (REMOVE_CYCLES) and freed by
+        // the group free with the rest. Nested bodies are released below.
         for fb in bodies.values where !fb.cpool.isEmpty {
             let pool = fb.cpool
             fb.cpool = []
             for v in pool where !v.isFunctionBytecode { v.freeValue() }
         }
+        gcFreeDeadObjects(self, dead)
         for fb in bodies.values where fb.refCount > 0 {
             fb.refCount = 0
             Unmanaged.passUnretained(fb).release()   // the creation reference

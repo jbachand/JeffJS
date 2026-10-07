@@ -367,10 +367,12 @@ public final class JeffJSEnvironment {
         bridge.register(on: realm)
         domBridge?.joinRealmRegistry()
         bridge.joinRealmRegistry()
+        childRealmsJoined = true
         childRealms.append((realm, bridge, events))
         return realm.getGlobalObject()
     }
     private var childRealms: [(JeffJSContext, JeffJSDOMBridge, JeffJSEventBridge)] = []
+    private var childRealmsJoined = false
 
     public func eval(_ source: String, filename: String = "<eval>") -> JeffJSEvalResult {
         let result = context.eval(input: source, filename: filename, evalFlags: JS_EVAL_TYPE_GLOBAL)
@@ -698,6 +700,16 @@ public final class JeffJSEnvironment {
     /// Tear down all bridges, cancel timers, and free the runtime.
     public func teardown() {
         teardownGCDTimers()
+        // Child realms first (as a host frees its iframe realms): same runtime,
+        // freed before the main context and the runtime.
+        for (realm, bridge, events) in childRealms {
+            events.teardown()
+            bridge.resetBridge()
+            bridge.leaveRealmRegistry()
+            realm.free()
+        }
+        childRealms.removeAll()
+        if childRealmsJoined { domBridge?.leaveRealmRegistry() }
         fetchBridge?.cancelAll()
         webSocketBridge?.closeAll()
         videoBridge?.teardown()

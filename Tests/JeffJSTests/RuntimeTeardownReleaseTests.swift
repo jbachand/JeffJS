@@ -114,3 +114,135 @@ final class RuntimeTeardownReleaseTests: XCTestCase {
         XCTAssertNil(innerLiteral, "a literal of a definition nested in a dropped lazy body leaked")
     }
 }
+
+// MARK: - Realms (iframe realms: JeffJSRuntime.newRealm) — teardown with a second realm
+
+extension RuntimeTeardownReleaseTests {
+
+    /// Script run in each realm: closures, classes, tagged templates (a template
+    /// object in the constant pool), regexps, generators, a few thousand objects.
+    static let realmHeapScript = """
+        var realmKeep = { list: [], fns: [], tag: function (s) { return s; } };
+        function mk(i) { var o = { i: i, s: 'v' + i, a: [i, i + 1], self: null }; o.self = o; return o; }
+        for (var i = 0; i < 3000; i++) realmKeep.list.push(mk(i));
+        class K { constructor(x) { this.x = x; } get y() { return this.x * 2; } static z() { return 1; } }
+        for (var i = 0; i < 200; i++) realmKeep.list.push(new K(i));
+        for (var i = 0; i < 50; i++) (function (j) { realmKeep.fns.push(function () { return j + realmKeep.list.length; }); })(i);
+        realmKeep.tpl = realmKeep.tag`a${1}b${2}c`;
+        realmKeep.tplFn = function () { return realmKeep.tag`x${3}y`; };
+        realmKeep.tplFn();
+        realmKeep.re = /ab+c/g;
+        realmKeep.gen = (function* () { yield 1; yield 2; })();
+        realmKeep.gen.next();
+        realmKeep.map = new Map([[realmKeep, realmKeep.list[0]]]);
+        realmKeep.p = Promise.resolve(realmKeep);
+        realmKeep.p.then(function (v) { v.resolved = true; });
+        Object.prototype.__realmMark = realmKeep;
+        Array.prototype.__realmFn = realmKeep.fns[0];
+        """
+
+    /// The iframe-realm teardown (the app's JSScriptEngine.teardown): a page's main
+    /// context and a frame realm of the same runtime, their objects referencing each
+    /// other, freed realm first, then the main context, then the runtime. -O app
+    /// builds crashed in freeRemainingHeap with this (2026-10-06).
+    func testFreeWithRealmCrossReferences() throws {
+        for round in 0..<3 {
+            let rt = JeffJSRuntime()
+            let ctx = rt.newContext()
+            guard let realm = rt.newRealm() else { return XCTFail("no realm") }
+            for c in [ctx, realm] {
+                let r = c.eval(input: Self.realmHeapScript, filename: "<realm-heap>", evalFlags: 0)
+                XCTAssertFalse(r.isException, "round \(round)")
+                r.freeValue()
+            }
+            let wg = realm.getGlobalObject()
+            let g = ctx.getGlobalObject()
+            _ = ctx.setPropertyStr(obj: g, name: "w", value: wg.dupValue())
+            _ = realm.setPropertyStr(obj: wg, name: "parentWin", value: g.dupValue())
+            g.freeValue(); wg.freeValue()
+            let r2 = ctx.eval(input: """
+                var fromW = [];
+                for (var i = 0; i < 1000; i++) fromW.push(w.eval('({ k: ' + i + ', arr: new Array(3), f: function () { return parentWin; } })'));
+                w.mainRef = { fromMain: realmKeep, f: function () { return w; } };
+                w.mainFns = realmKeep.fns;
+                realmKeep.wList = w.realmKeep.list;
+                realmKeep.wCtor = new w.Function('a', 'return a + 1');
+                realmKeep.wArr = w.Array.from([1, 2, 3]);
+                realmKeep.wTpl = w.eval('realmKeep.tplFn')();
+                w.eval('(function (f) { return f(); })')(function () { return [] instanceof Array; });
+                1
+                """, filename: "<realm-cross>", evalFlags: 0)
+            XCTAssertFalse(r2.isException, "round \(round)")
+            r2.freeValue()
+            _ = rt.executePendingJobs()
+            // The app frees the frame realms first, then the page's context, then the runtime.
+            realm.free()
+            ctx.free()
+            rt.free()
+        }
+    }
+}
+
+extension RuntimeTeardownReleaseTests {
+    /// The same heap in a single context (no realm).
+    func testFreeRealmHeapScriptSingleContext() throws {
+        for round in 0..<3 {
+            let rt = JeffJSRuntime()
+            let ctx = rt.newContext()
+            let r = ctx.eval(input: Self.realmHeapScript, filename: "<realm-heap>", evalFlags: 0)
+            XCTAssertFalse(r.isException, "round \(round)")
+            r.freeValue()
+            _ = rt.executePendingJobs()
+            ctx.free()
+            rt.free()
+        }
+    }
+}
+
+extension RuntimeTeardownReleaseTests {
+    /// A page with an iframe realm over a nested document (the app's
+    /// JeffJSFrameRealms: DOM + event bridges per realm, one wrapper per node per
+    /// realm, nodes moved between the documents, listeners, the polyfills run in
+    /// both realms), torn down like a navigation: frame realm, page, runtime.
+    @MainActor
+    func testFreeWithDOMRealm() throws {
+        for round in 0..<3 {
+            let e = JeffJSEnvironment()
+            let child = DOMNode.document()
+            let html = DOMNode.element(tag: "html")
+            html.appendChild(DOMNode.element(tag: "head"))
+            html.appendChild(DOMNode.element(tag: "body"))
+            child.appendChild(html)
+            guard let wg = e.makeChildRealm(document: child) else { return XCTFail("no realm") }
+            let ctx = e.context
+            let g = ctx.getGlobalObject()
+            _ = ctx.setPropertyStr(obj: g, name: "w", value: wg)
+            g.freeValue()
+            for js in [Self.realmHeapScript, "w.eval(\(Self.jsLiteral(Self.realmHeapScript)))", """
+                var frameNodes = [];
+                for (var i = 0; i < 300; i++) {
+                    var d = w.document.createElement('div'); d.id = 'f' + i; d.textContent = 'x' + i;
+                    d.addEventListener('click', function () { return realmKeep; });
+                    w.document.body.appendChild(d); frameNodes.push(d);
+                    var p = document.createElement('p'); p.className = 'c' + i;
+                    p.addEventListener('click', w.eval('(function () { return realmKeep; })'));
+                    if (i % 3 === 0) w.document.body.appendChild(p); else document.body.appendChild(p);
+                    p.dataset.k = 'v' + i; p.classList.add('z');
+                }
+                w.eval('document.body.querySelectorAll("div").length') + document.querySelectorAll('p').length
+                """] {
+                switch e.eval(js, filename: "<dom-realm>") {
+                case .success: break
+                case .exception(let m): XCTFail("round \(round): \(m)")
+                }
+            }
+            e.teardown()
+        }
+    }
+
+    static func jsLiteral(_ s: String) -> String {
+        let data = try! JSONSerialization.data(withJSONObject: [s])
+        let json = String(decoding: data, as: UTF8.self)
+        return String(json.dropFirst().dropLast())
+    }
+}
