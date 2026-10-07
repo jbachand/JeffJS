@@ -290,3 +290,160 @@ extension RuntimeTeardownReleaseTests {
         return String(json.dropFirst().dropLast())
     }
 }
+
+// MARK: - Every builtin kind, then nothing left (refcount leftovers, 2026-10-07)
+
+/// Live instances of a class in the malloc zones (a zone walk, as jeffjs-cli's
+/// --teardown-report counts them): what a freed runtime left behind, whether or
+/// not anything still points at it.
+private func liveInstanceReader(_ task: task_t, _ address: vm_address_t, _ size: vm_size_t,
+                                _ out: UnsafeMutablePointer<UnsafeMutableRawPointer?>?) -> kern_return_t {
+    out?.pointee = UnsafeMutableRawPointer(bitPattern: UInt(address)); return KERN_SUCCESS
+}
+private func liveInstanceRecorder(_ task: task_t, _ ctx: UnsafeMutableRawPointer?, _ type: UInt32,
+                                  _ ranges: UnsafeMutablePointer<vm_range_t>?, _ n: UInt32) {
+    guard let ranges else { return }
+    for i in 0 ..< Int(n) where ranges[i].size >= 16 {
+        if let p = UnsafePointer<UInt>(bitPattern: UInt(ranges[i].address)), p.pointee == LiveInstanceCounter.isa {
+            LiveInstanceCounter.count += 1
+        }
+    }
+}
+
+private enum LiveInstanceCounter {
+    nonisolated(unsafe) static var isa: UInt = 0
+    nonisolated(unsafe) static var count = 0
+
+    static func count(_ className: String) -> Int {
+        guard let cls = NSClassFromString(className) else { return -1 }
+        isa = unsafeBitCast(cls, to: UInt.self)
+        count = 0
+        var zones: UnsafeMutablePointer<vm_address_t>? = nil
+        var zoneCount: UInt32 = 0
+        guard malloc_get_all_zones(mach_task_self_, nil, &zones, &zoneCount) == KERN_SUCCESS, let zones else { return -1 }
+        for z in 0 ..< Int(zoneCount) {
+            guard let zp = UnsafeMutablePointer<malloc_zone_t>(bitPattern: UInt(zones[z])),
+                  let en = zp.pointee.introspect?.pointee.enumerator else { continue }
+            _ = en(mach_task_self_, nil, UInt32(MALLOC_PTR_IN_USE_RANGE_TYPE), vm_address_t(UInt(bitPattern: zp)),
+                   liveInstanceReader, liveInstanceRecorder)
+        }
+        return count
+    }
+
+    static let classes = ["JeffJSString", "JeffJSStringRope", "JeffJSObject", "JeffJSObjectAux",
+                          "JeffJSFunctionBytecodeCompiled", "JeffJSShape", "JeffJSVarRef",
+                          "JeffJSContext", "JeffJSRuntime"]
+
+    static func snapshot() -> [String: Int] {
+        var out: [String: Int] = [:]
+        for c in classes { out[c] = count("JeffJS." + c) }
+        return out
+    }
+}
+
+extension RuntimeTeardownReleaseTests {
+
+    /// Every kind of builtin and the paths the 2026-10-07 leftovers fixer fixed:
+    /// global functions (define_func) with materialised prototypes whose closures
+    /// die before the runtime (orphan bodies), accessors, errors with causes and
+    /// read stacks, engine-thrown errors, AggregateError, iterators run to the end,
+    /// Map/Set/WeakMap/WeakRef, Proxy (also on a prototype chain), Reflect,
+    /// symbols, boxed primitives, typed arrays, RegExp matchAll/replaceAll,
+    /// promises, generators, async functions, getOwnPropertyDescriptor/hasOwn,
+    /// toStringTag reads, JSON, Date.
+    static let everyKindScript = #"""
+        var keep = [];
+        function GF(x) { this.x = x; } GF.prototype.m = function () { return this.x; };
+        keep.push(new GF(1).m());
+        function GF2() {} var gfProto = GF2.prototype; GF2 = null;
+        (function () { for (var i = 0; i < 20; i++) { var f = function (y) { return y + i; }; f.prototype.k = i; keep.push(f(1)); } })();
+        var acc = { _v: 0, get v() { return this._v; }, set v(x) { this._v = x; } }; acc.v = 3; keep.push(acc.v);
+        Object.defineProperty(acc, 'w', { get: function () { return 1; }, configurable: true }); delete acc.w;
+        var cause = { c: 1 };
+        var e1 = new Error('m1', { cause: cause }); keep.push(e1.cause === cause, e1.stack.length > 0);
+        var e2 = new TypeError('m2', { cause: 'str' }); keep.push(e2.message);
+        var ag = new AggregateError([new Error('a'), 2], 'agg', { cause: cause }); keep.push(ag.errors.length);
+        try { null.x; } catch (e) { keep.push(e.message, e.stack); }
+        try { undefinedFunction(); } catch (e) { keep.push(String(e)); }
+        try { (void 0)(); } catch (e) { keep.push(e.message); }
+        for (var x of [1, 2, 3]) keep.push(x);
+        keep.push([...new Set([1, 2])].length, Array.from(new Map([[1, 2]]).entries()).length, [...'ab'].length);
+        var wm = new WeakMap(); var wk = {}; wm.set(wk, 1); var wr = new WeakRef(wk); keep.push(wr.deref() === wk);
+        var p = new Proxy({ a: 1 }, { get: function (t, k, r) { return k === 'z' ? 7 : Reflect.get(t, k, r); },
+                                     set: function (t, k, v) { t[k] = v; return true; } });
+        p.q = 2; keep.push(p.a, p.z, p.q);
+        var child = Object.create(p); child.r = 3; keep.push(child.a, 'a' in child);
+        keep.push(Reflect.ownKeys({ a: 1, [Symbol.iterator]: 2 }).length, Reflect.getPrototypeOf([]) === Array.prototype);
+        var sym = Symbol('s'); var so = {}; so[sym] = 1; keep.push(Object.getOwnPropertySymbols(so).length, Symbol.for('k').description);
+        keep.push(new String('boxed' + 1).length, Object(sym).description, Object('x').length);
+        String.prototype.__selfThis = function () { return this; }; keep.push(typeof 'q'.__selfThis());
+        var ta = new Uint8Array([1, 2, 3]); keep.push(ta.subarray(1).length, new DataView(ta.buffer).getUint8(0));
+        keep.push([...'aXbX'.matchAll(/X/g)].length, 'aXbX'.replaceAll(/X/g, '-'), /(\d+)/.exec('a12')[1]);
+        Promise.resolve(1).then(function (v) { keep.push(v); });
+        Promise.any([Promise.reject(1)]).catch(function (e) { keep.push(e.errors.length); });
+        function* gen() { yield 1; yield 2; } keep.push([...gen()].length);
+        (async function () { await null; keep.push('async'); })();
+        var od = { qq: 1 }; keep.push(Object.getOwnPropertyDescriptor(od, 'qq').value, Object.hasOwn(od, 'qq'), od.hasOwnProperty('qq'));
+        keep.push(Object.prototype.toString.call(Promise.prototype), Object.prototype.toString.call(new Map()));
+        keep.push(JSON.stringify({ a: [1, { b: 2 }] }), JSON.parse('{"c":[3]}').c[0], new Date(0).toISOString());
+        keep.push(Object.getOwnPropertyNames(globalThis).length > 10);
+        for (var k in { a: 1, b: 2 }) keep.push(k);
+        (0, eval)('var __evalVar = 1; function __evalFn() {}');
+        keep.length
+        """#
+
+    private func assertNothingLeft(_ before: [String: Int], _ label: String, file: StaticString = #filePath, line: UInt = #line) {
+        let after = LiveInstanceCounter.snapshot()
+        for c in LiveInstanceCounter.classes {
+            XCTAssertEqual(after[c, default: 0] - before[c, default: 0], 0,
+                           "\(label): \(c) instances left after teardown", file: file, line: line)
+        }
+    }
+
+    /// A bare runtime + context: after free, not one engine instance is left.
+    func testFreshRuntimeLeavesNothingBehind() throws {
+        try XCTSkipIf(ProcessInfo.processInfo.environment["JEFFJS_ZOMBIES"] == "1", "zombie mode keeps every freed object allocated on purpose")
+        // One run first: the process-wide lazily built tables are allocated once.
+        for round in 0 ..< 2 {
+            let before = LiveInstanceCounter.snapshot()
+            do {
+                let rt = JeffJSRuntime()
+                let ctx = rt.newContext()
+                let v = ctx.eval(input: Self.everyKindScript, filename: "<every-kind>", evalFlags: 0)
+                XCTAssertFalse(v.isException, "round \(round): the script threw")
+                v.freeValue()
+                _ = rt.executePendingJobs()
+                ctx.free()
+                rt.free()
+            }
+            if round == 1 { assertNothingLeft(before, "bare runtime") }
+        }
+    }
+
+    /// The full environment (DOM, events, Intl, web APIs, polyfills): after its
+    /// teardown, nothing is left — the runtime the watch makes per page included.
+    @MainActor
+    func testFreshEnvironmentLeavesNothingBehind() throws {
+        try XCTSkipIf(ProcessInfo.processInfo.environment["JEFFJS_ZOMBIES"] == "1", "zombie mode keeps every freed object allocated on purpose")
+        for round in 0 ..< 2 {
+            let before = LiveInstanceCounter.snapshot()
+            do {
+                let env = JeffJSEnvironment()
+                let intl = """
+                    var nf = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
+                    var dtf = new Intl.DateTimeFormat('en-US');
+                    [nf.format(1234.5), nf.formatToParts(1).length, dtf.format(new Date(0)).length,
+                     new Intl.Collator().compare('a', 'b'), Object.prototype.toString.call(nf)].join()
+                    """
+                for js in [Self.everyKindScript, intl] {
+                    switch env.eval(js, filename: "<every-kind-env>") {
+                    case .success: break
+                    case .exception(let m): XCTFail("round \(round): \(m)")
+                    }
+                }
+                env.teardown()
+            }
+            if round == 1 { assertNothingLeft(before, "environment") }
+        }
+    }
+}

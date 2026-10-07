@@ -252,7 +252,11 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             let kv = o.propValues[2]
             kind = kv.isInt ? Int(kv.toInt32()) : 1
         } else {
-            let selfVal = JeffJSValue.makeObject(o)
+            // Borrowed receivers throughout (`makeObject` takes a Swift retain only
+            // the object's free gives back, once): the done step took one on every
+            // array iterator that ran to the end, so each such iterator outlived its
+            // runtime and pinned it (RuntimeTeardownReleaseTests).
+            let selfVal = JeffJSValue.borrowedObject(o)
             target = getProperty(obj: selfVal, atom: atomIterTarget)   // owned
             let iv = getProperty(obj: selfVal, atom: atomIterIndex)
             let kv = getProperty(obj: selfVal, atom: atomIterKind)
@@ -282,7 +286,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             lv.freeValue()
         }
         if idx >= len {
-            let selfVal = JeffJSValue.makeObject(o)
+            let selfVal = JeffJSValue.borrowedObject(o)
             if fast {
                 let old = o.propValues[0]
                 o.propValues[0] = .undefined
@@ -295,7 +299,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         if fast {
             o.propValues[1] = .newInt32(Int32(truncatingIfNeeded: idx + 1))
         } else {
-            _ = setProperty(obj: JeffJSValue.makeObject(o), atom: atomIterIndex,
+            _ = setProperty(obj: JeffJSValue.borrowedObject(o), atom: atomIterIndex,
                             value: .newInt32(Int32(truncatingIfNeeded: idx + 1)))
         }
         if kind == 0 { return (.newInt32(Int32(truncatingIfNeeded: idx)), false, false) }
@@ -723,7 +727,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             //  10. Global functions (parseInt, eval, URI encoding, etc.)
             JeffJSBuiltinObject.addIntrinsic(ctx: self)
             JeffJSBuiltinFunction.addIntrinsic(ctx: self)
-            JeffJSBuiltinError.addIntrinsic(ctx: self)
+            // Error / NativeError / AggregateError are addErrorConstructors' (phase 1).
+            // JeffJSBuiltinError.addIntrinsic built a second, unreachable set (ten
+            // constructors and prototypes nothing installed, with their name strings)
+            // in every context: never called now (RuntimeTeardownReleaseTests).
             JeffJSBuiltinArray.addIntrinsic(ctx: self)
             JeffJSBuiltinNumber.addIntrinsic(ctx: self)
             JeffJSBuiltinBoolean.addIntrinsic(ctx: self)
@@ -908,6 +915,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     func eval(input: String, filename: String, evalFlags: Int) -> JeffJSValue {
         rt.enterJSThread(); defer { rt.exitJSThread() }   // one JS thread per runtime (JeffJSThreadCheck.swift)
         let result = evalInternal(input: input, filename: filename, line: 0, evalFlags: evalFlags)
+        // Bodies whose last closure died during the script (JeffJSRuntime.drainOrphanBodies).
+        if callDepth == 0, !rt.orphanBodiesPending.isEmpty { rt.drainOrphanBodies() }
         // Safe point for GC — parsing and compilation are complete
         if rt.mallocState.mallocSize >= rt.mallocGCThreshold {
             runGC(rt)
@@ -1670,7 +1679,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 if trap.isObject, let trapObj = trap.toObject(), trapObj.isCallable {
                     let propName: JeffJSValue
                     if rt.atomIsSymbol(atom), let sym = rt.symbolStringForAtom(atom) {
-                        propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+                        propName = JeffJSValue.borrowedSymbol(sym).dupValue()
                     } else if let name = rt.atomToString(atom) {
                         propName = newStringValue(name)
                     } else {
@@ -1738,8 +1747,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             case .value(let val):
                 val.freeValue()
             case .getset(let getter, let setter):
-                if let g = getter { JeffJSValue.makeObject(g).freeValue() }
-                if let s = setter { JeffJSValue.makeObject(s).freeValue() }
+                // Borrowed: the slot's count is what is released (`makeObject` added
+                // a Swift retain that only a release to zero gives back).
+                if let g = getter { JeffJSValue.borrowedObject(g).freeValue() }
+                if let s = setter { JeffJSValue.borrowedObject(s).freeValue() }
             default:
                 break
             }
@@ -1805,7 +1816,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                             // A symbol key reaches the trap as the Symbol (it was its
                             // description string: Object.prototype.toString through a
                             // Proxy with a get trap read "Symbol.toStringTag").
-                            propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+                            propName = JeffJSValue.borrowedSymbol(sym).dupValue()
                         } else if let name = rt.atomToString(atom) {
                             propName = newStringValue(name)
                         } else {
@@ -1894,6 +1905,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             if let shape = p.shape, findShapeProperty(shape, atom) != nil {
                 return 1
             }
+            // OrdinaryHasProperty (ES §10.1.7.1 step 4): a Proxy on the chain
+            // answers through its [[HasProperty]] (its `has` trap or its target).
+            if isProxyObject(p) { return proxyOnChainHas(p, atom: atom) }
             proto = p.proto
         }
 
@@ -2021,16 +2035,19 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         let r = throwErrorInternal(errorType: .JS_SYNTAX_ERROR, message: info.text)
         let err = rt.currentException
         guard let obj = err.toObject() else { return r }
-        _ = definePropertyValue(obj: err, atom: rt.findAtom("line"), value: .newInt32(Int32(clamping: info.line)),
+        let lineAtom = rt.findAtom("line"), columnAtom = rt.findAtom("column")
+        _ = definePropertyValue(obj: err, atom: lineAtom, value: .newInt32(Int32(clamping: info.line)),
                                 flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
-        _ = definePropertyValue(obj: err, atom: rt.findAtom("column"), value: .newInt32(Int32(clamping: info.column)),
+        _ = definePropertyValue(obj: err, atom: columnAtom, value: .newInt32(Int32(clamping: info.column)),
                                 flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+        rt.freeAtom(lineAtom); rt.freeAtom(columnAtom)
         if let pending = obj.pendingStack, pending.frames.isEmpty,
            !info.filename.isEmpty, !info.filename.hasPrefix("<") {
             obj.setPendingStack(nil)
+            let stackV = newStringValue("global code@\(info.filename):\(info.line):\(info.column)")
             _ = definePropertyValue(obj: err, atom: JeffJSAtomID.JS_ATOM_stack.rawValue,
-                                    value: newStringValue("global code@\(info.filename):\(info.line):\(info.column)"),
-                                    flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+                                    value: stackV, flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+            stackV.freeValue()   // definePropertyValue dups (every script SyntaxError leaked it)
         }
         return r
     }
@@ -3315,7 +3332,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 return args[0].dupValue()
             }
             guard let code = args[0].stringValue?.toSwiftString() else { return .JS_UNDEFINED }
-            return self.eval(input: code, filename: "<eval>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+            // Indirect eval (ES §19.2.1.1 PerformEval, direct = false): global scope,
+            // but eval code — its `var`s and functions are configurable.
+            return self.eval(input: code, filename: "<eval>", evalFlags: JS_EVAL_TYPE_INDIRECT)
         }, name: "eval", length: 1)
         _ = setPropertyStr(obj: globalObj, name: "eval", value: evalObj.dupValue())
 
@@ -3460,6 +3479,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
 
         let fd = JeffJSFunctionDefCompiler()
         fd.filename = rt.findAtom(filename)
+        // Indirect eval code (global scope): CreateGlobalVar/FunctionBinding with
+        // D = true (define_var / define_func read the flag).
+        if (evalFlags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_INDIRECT { fd.isDirectOrIndirectEval = true }
         fd.source = input
         // One UTF-8 copy of the script, shared by every function compiled
         // from it; the parser records a (start, end) span per function so
@@ -3479,6 +3501,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         parser.parseProgram()
 
         if parser.failed || fd.byteCode.error {
+            // The literals the parser put in the constant pools own a count each;
+            // nothing will run them (a script with a SyntaxError leaked them all).
+            JeffJSCompiler.releaseDroppedConstants(fd)
             return .syntaxError(parseState)
         }
 
@@ -3541,36 +3566,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     }
 
     /// Frees the constants of a top-level function that has run (see
-    /// executeBytecode): every non-function constant, and every nested function
-    /// bytecode that nothing can run any more (no function object runs it —
-    /// `liveClosures == 0` — and no other constant pool shares it), recursively.
-    /// A nested body that a live closure still runs is kept with its whole pool.
-    private func releaseTopLevelConstants(_ fb: JeffJSFunctionBytecode, depth: Int = 0) {
-        var released = false
-        var pool = fb.cpool
-        for i in 0..<pool.count {
-            let v = pool[i]
-            if v.isFunctionBytecode {
-                guard !jeffJSKeepNestedBodies, depth < 64, let child = v.toFunctionBytecode(),
-                      child.refCount == 1, child.liveClosures == 0 else { continue }
-                releaseTopLevelConstants(child, depth: depth + 1)
-                // What is left in the child's pool are nested bodies still in
-                // use: they keep the child's reference (never released).
-                child.cpool = []
-                v.freeValue()   // refCount 1 -> 0: frees the (now empty) pool, drops the retain
-                pool[i] = .undefined
-                released = true
-                continue
-            }
-            if v.hasRefCount {
-                v.freeValue()
-                pool[i] = .undefined
-                released = true
-            }
-        }
-        if released {
-            fb.cpool = pool
-        }
+    /// executeBytecode): JeffJSRuntime.releaseRunBodyConstants.
+    private func releaseTopLevelConstants(_ fb: JeffJSFunctionBytecode) {
+        rt.releaseRunBodyConstants(fb)
     }
 
     /// Execute a compiled function bytecode on the global object.
@@ -3812,6 +3810,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             msgStr = toSwiftString(m) ?? ""
             _ = definePropertyValue(obj: errObj, atom: JeffJSAtomID.JS_ATOM_message.rawValue,
                                     value: m, flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+            m.freeValue()   // definePropertyValue dups (every `new Error(msg)` leaked its message)
         }
         if options.isObject {
             let causeAtom = JeffJSAtomID.JS_ATOM_cause.rawValue
@@ -3822,6 +3821,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 if cause.isException { return nil }
                 _ = definePropertyValue(obj: errObj, atom: causeAtom, value: cause,
                                         flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+                // `getProperty` handed us a count and the definition took its own:
+                // the cause kept one count too many and outlived both objects.
+                cause.freeValue()
             }
         }
         return msgStr
@@ -3869,9 +3871,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         if idx < nativeErrorProto.count, let o = errObj.toObject(), let p = nativeErrorProto[idx].toObject() {
             o.proto = p
         }
+        let list = newArrayFrom(errors.map { $0.dupValue() })
         _ = definePropertyValue(obj: errObj, atom: JeffJSAtomID.JS_ATOM_errors.rawValue,
-                                value: newArrayFrom(errors.map { $0.dupValue() }),
-                                flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+                                value: list, flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+        list.freeValue()   // definePropertyValue dups
         attachPendingStack(errObj, errorName: "AggregateError", message: "", fromConstructor: true)
         return errObj
     }
@@ -3987,9 +3990,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                         errObj.freeValue()
                         return .exception
                     }
+                    let arr = self.newArrayFrom(list)
                     _ = self.definePropertyValue(obj: errObj, atom: JeffJSAtomID.JS_ATOM_errors.rawValue,
-                                                 value: self.newArrayFrom(list),
-                                                 flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+                                                 value: arr, flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+                    arr.freeValue()   // definePropertyValue dups (the errors array leaked)
                 }
                 self.attachPendingStack(errObj, errorName: capturedName, message: msgStr, fromConstructor: true)
                 return errObj
@@ -4573,16 +4577,19 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // so the atom is marked symbol-typed (kept out of for-in/Object.keys).
         for wks in js_well_known_symbols {
             // Shared by every realm of the runtime (ES §6.1.5.1).
-            let symStr: JeffJSString
+            let symVal: JeffJSValue
             if let existing = rt.symbolStringForAtom(wks.atomID) {
-                symStr = existing
+                // A later realm: one more count, no Swift retain (the string already
+                // holds the one a counted string keeps; `mkPtr` took one per realm
+                // that nothing gave back).
                 existing.refCount += 1
+                symVal = JeffJSValue.borrowedSymbol(existing)
             } else {
-                symStr = JeffJSString(swiftString: wks.description)
+                let symStr = JeffJSString(swiftString: wks.description)
                 symStr.atomType = JSAtomType.symbol.rawValue
                 rt.bindSymbolAtom(symStr, atom: wks.atomID)
+                symVal = JeffJSValue.mkPtr(tag: .symbol, ptr: symStr)   // the creation count's retain
             }
-            let symVal = JeffJSValue.mkPtr(tag: .symbol, ptr: symStr)
             // Symbol.iterator & co. are { writable: false, enumerable: false,
             // configurable: false } (ES §20.4.2). The count taken above moves
             // into the property (definePropertyValue dups, so release ours).
@@ -4970,7 +4977,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             }
             guard let targetObj = args[0].toObject() else { return .null }
             if let p = targetObj.proto {
-                return JeffJSValue.makeObject(p).dupValue()
+                return JeffJSValue.borrowedObject(p).dupValue()   // makeObject's Swift retain was never given back
             }
             return .null
         }, name: "getPrototypeOf", length: 1)
@@ -5043,7 +5050,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                         if isSymbol {
                             // Real symbol values, not their descriptions.
                             if let symStr = self.rt.symbolStringForAtom(atom) {
-                                symbolKeys.append(JeffJSValue.mkPtr(tag: .symbol, ptr: symStr.retain()))
+                                symbolKeys.append(JeffJSValue.borrowedSymbol(symStr).dupValue())
                             } else {
                                 symbolKeys.append(self.newStringValue(entry.str))
                             }
@@ -5317,7 +5324,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                             // A symbol key reaches the trap as the Symbol (it was its
                             // description string: Object.prototype.toString through a
                             // Proxy with a get trap read "Symbol.toStringTag").
-                            propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+                            propName = JeffJSValue.borrowedSymbol(sym).dupValue()
                         } else if let name = rt.atomToString(atom) {
                             propName = newStringValue(name)
                         } else {
@@ -5462,7 +5469,13 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         while let p = proto {
             if (p.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(p) }
             let pIdx = jeffJS_findOwnPropertyIndex(obj: p, atom: atom)
-            if pIdx >= 0, p.shape != nil, pIdx < p.propValues.count {
+            if pIdx < 0 {
+                // OrdinaryGet (ES §10.1.8.1 step 3.c): a Proxy on the chain answers
+                // through its own [[Get]] with the original receiver (it was read as
+                // an empty ordinary object and skipped). Its shape is empty, so the
+                // test sits on the miss path only.
+                if isProxyObject(p) { return proxyOnChainGet(p, atom: atom, receiver: receiver) }
+            } else if p.shape != nil, pIdx < p.propValues.count {
                 if let e = p.extra(at: pIdx) {
                     if e.kind == .getset, let getterObj = e.getter {
                         // Borrowed from the prototype's slot: see the own-
@@ -5478,6 +5491,35 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         }
 
         return .JS_UNDEFINED
+    }
+
+    /// A Proxy met on an ordinary object's prototype chain (OrdinaryGet / OrdinarySet /
+    /// OrdinaryHasProperty, ES §10.1.8.1 3.c, §10.1.9.2 2.b, §10.1.7.1 4): its own
+    /// internal method answers, with the original receiver. Out of line, so the
+    /// hot ordinary walks keep their frames.
+    @inline(never)
+    private func proxyOnChainGet(_ p: JeffJSObject, atom: UInt32, receiver: JeffJSValue) -> JeffJSValue {
+        return getPropertyInternal(obj: .borrowedObject(p), atom: atom, receiver: receiver)
+    }
+
+    @inline(never)
+    private func proxyOnChainHas(_ p: JeffJSObject, atom: UInt32) -> Int {
+        return hasPropertyEx(obj: .borrowedObject(p), atom: atom)
+    }
+
+    /// Consumes `value`: 1 written, 0 refused (TypeError with JS_PROP_THROW), -1 exception.
+    @inline(never)
+    private func proxyOnChainSet(_ p: JeffJSObject, atom: UInt32, value: JeffJSValue,
+                                 receiver: JeffJSValue, flags: Int) -> Int {
+        let key = proxyTrapKey(atom)
+        let r = reflectSet(.borrowedObject(p), key: key, atom: atom, value: value, receiver: receiver)
+        key.freeValue()
+        value.freeValue()   // reflectSet borrows; this path consumes
+        if r == 0 && (flags & JS_PROP_THROW) != 0 {
+            _ = throwTypeError(message: "Attempted to assign to readonly property.")
+            return -1
+        }
+        return r
     }
 
     /// [[Set]] on a Proxy whose handler has no `set` trap: `target.[[Set]](P, V, proxy)`.
@@ -5549,11 +5591,11 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         jsObj.ensureLazyMaterialized()
         if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
             // `F.prototype = x` replaces the default `{ constructor: F }`
-            // object outright, so don't build it first: that pair's
-            // `constructor` slot deliberately holds an uncounted reference to
-            // F (it is how the cycle is broken), and releasing the discarded
-            // prototype would then over-release F. Define the property
-            // directly with the attributes the default would have had.
+            // object outright, so don't build it just to drop it (its
+            // `constructor` slot is a counted reference to F —
+            // materializeFunctionPrototype — so building it would be correct,
+            // only wasted). Define the property directly with the attributes
+            // the default would have had.
             jsObj.needsLazyPrototype = false
             let r = definePropertyValue(obj: obj, atom: atom, value: value,
                                         flags: JS_PROP_WRITABLE)
@@ -5591,7 +5633,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                             // A symbol key reaches the trap as the Symbol (it was its
                             // description string: Object.prototype.toString through a
                             // Proxy with a get trap read "Symbol.toStringTag").
-                            propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+                            propName = JeffJSValue.borrowedSymbol(sym).dupValue()
                         } else if let name = rt.atomToString(atom) {
                             propName = newStringValue(name)
                         } else {
@@ -5782,6 +5824,15 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         while let p = setProto {
             if (p.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(p) }
             let pIdx = jeffJS_findOwnPropertyIndex(obj: p, atom: atom)
+            // OrdinarySet (ES §10.1.9.2 step 2.b): a Proxy on the chain is asked
+            // through its own [[Set]] with the original receiver — its `set` trap
+            // (with `obj` as the receiver), or the target's [[Set]] when it has none.
+            // The walk read the proxy's (empty) own shape and went past it, so
+            // `Object.create(proxy).x = 1` never reached the trap. (Miss path only:
+            // a proxy's own shape is empty.)
+            if pIdx < 0, isProxyObject(p) {
+                return proxyOnChainSet(p, atom: atom, value: value, receiver: setterThis ?? obj, flags: flags)
+            }
             if pIdx >= 0, let pShape = p.shape, pIdx < p.propValues.count {
                 if pShape.prop[pIdx].flags.contains(.getset) {
                     // Inherited accessor — call its setter
@@ -5966,10 +6017,14 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         jsObj.setPendingStack(nil)
         let str = formatStackTrace(errorName: pending.errorName, message: pending.message,
                                    frames: pending.frames, natives: pending.natives)
-        let errVal = JeffJSValue.mkPtr(tag: .object, ptr: jsObj)
+        // Borrowed receiver (`mkPtr` took a Swift retain nothing gave back: every
+        // error whose `stack` was read outlived its runtime and pinned it), and the
+        // string's creation count is ours to drop (definePropertyValue dups).
+        let errVal = JeffJSValue.borrowedObject(jsObj)
+        let stackV = newStringValue(str)
         _ = definePropertyValue(obj: errVal, atom: JeffJSAtomID.JS_ATOM_stack.rawValue,
-                                value: newStringValue(str),
-                                flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+                                value: stackV, flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+        stackV.freeValue()
     }
 
     /// Render captured frames the way JavaScriptCore does (Safari, WKWebView):

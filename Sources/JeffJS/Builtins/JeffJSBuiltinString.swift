@@ -1022,8 +1022,10 @@ struct JeffJSBuiltinString {
                 let flagsVal = ctx.getPropertyStr(obj: regexp, name: "flags")
                 if flagsVal.isException { return .exception }
                 let flagsStr = ctx.toString(flagsVal)
+                flagsVal.freeValue()   // both owned (the flags string leaked per call)
                 if flagsStr.isException { return .exception }
                 let flagsUnits = ctx.toUTF16Array(flagsStr)
+                flagsStr.freeValue()
                 if !flagsUnits.contains(0x67 /* 'g' */) {
                     return ctx.throwTypeError("String.prototype.matchAll called with a non-global RegExp argument")
                 }
@@ -1160,8 +1162,10 @@ struct JeffJSBuiltinString {
             let flagsVal = ctx.getPropertyStr(obj: searchValue, name: "flags")
             if flagsVal.isException { return .exception }
             let flagsStr = ctx.toString(flagsVal)
+            flagsVal.freeValue()   // both owned (the flags string leaked per call)
             if flagsStr.isException { return .exception }
             let flagsUnits = ctx.toUTF16Array(flagsStr)
+            flagsStr.freeValue()
             if !flagsUnits.contains(0x67 /* 'g' */) {
                 return ctx.throwTypeError("String.prototype.replaceAll called with a non-global RegExp argument")
             }
@@ -1832,10 +1836,12 @@ struct JeffJSBuiltinString {
         }, name: "next", length: 0)
         _ = ctx.definePropertyValue(obj: proto, atom: ctx.rt.findAtom("next"), value: nextFn,
                                     flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+        nextFn.freeValue()   // definePropertyValue dups
+        let tag = ctx.newStringValue("String Iterator")
         _ = ctx.definePropertyValue(obj: proto,
                                     atom: JeffJSAtomID.JS_ATOM_Symbol_toStringTag.rawValue,
-                                    value: ctx.newStringValue("String Iterator"),
-                                    flags: JS_PROP_CONFIGURABLE)
+                                    value: tag, flags: JS_PROP_CONFIGURABLE)
+        tag.freeValue()   // definePropertyValue dups
     }
 
     // MARK: - Legacy HTML Methods (Annex B)

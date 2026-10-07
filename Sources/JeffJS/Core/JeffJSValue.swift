@@ -710,6 +710,18 @@ struct JeffJSValue {
         return JeffJSValue(bits: _stringTag | UInt64(UInt(bitPattern: raw)))
     }
 
+    /// A **borrowed** symbol value for a symbol's description string that a holder
+    /// keeps a counted reference on (a symbol atom's `symbolAtomStrings` entry): no
+    /// Swift retain, no count. `.dupValue()` it to hand the symbol out — never
+    /// `mkPtr(tag: .symbol, ptr: s.retain())`, whose Swift retain is given back only
+    /// by the release that takes the count to zero (every
+    /// `Object.getOwnPropertySymbols` / Proxy trap key leaked one).
+    @inline(__always)
+    static func borrowedSymbol(_ s: JeffJSString) -> JeffJSValue {
+        let raw = Unmanaged.passUnretained(s).toOpaque()
+        return JeffJSValue(bits: _symbolTag | UInt64(UInt(bitPattern: raw)))
+    }
+
     /// Value for an object taken from the recycle pool: it still carries the
     /// Swift retain of its original makeObject, so no new retain here.
     @inline(__always)

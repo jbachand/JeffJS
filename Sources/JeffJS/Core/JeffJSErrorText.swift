@@ -157,7 +157,9 @@ extension JeffJSContext {
                 message = pending.baseMessage + " (evaluating '\(text)')"
             }
         }
-        let errVal = JeffJSValue.mkPtr(tag: .object, ptr: err)
+        // Borrowed: `mkPtr` took a Swift retain nothing gave back (every engine
+        // error completed with its source text outlived the runtime and pinned it).
+        let errVal = JeffJSValue.borrowedObject(err)
         _ = setPropertyStr(obj: errVal, name: "message", value: newStringValue(message))
     }
 

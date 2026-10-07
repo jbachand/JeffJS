@@ -942,6 +942,7 @@ nonisolated final class JeffJSRuntime {
         // runtime (a whole page's JS heap per navigation; homedepot ~230 k
         // objects / 300 k strings). RuntimeTeardownReleaseTests.
         if JeffJSConfig.gcTeardownFreesHeap { freeRemainingHeap(also: initDead) }
+        orphanBodiesPending.removeAll()
         // The registry's own retains (objects freed above, or earlier, go now).
         for u in initObjects { u.release() }
         initObjects = []
@@ -949,13 +950,23 @@ nonisolated final class JeffJSRuntime {
         // Normally they go with the runtime object; dropped here as well so a
         // runtime something still points at (a leaked object's ownerRuntime)
         // does not keep thousands of strings alive.
+        // The tables' counts are given back (dropCachedString): dropping only the
+        // Swift references left each cached string at count 1 with the Swift retain
+        // its JS references took — ~500 builtin-name strings outlived every runtime.
+        for js in atomJSStrings.values { dropCachedString(js) }
         atomJSStrings.removeAll()
+        for js in sharedStrings.values { dropCachedString(js) }
         sharedStrings.removeAll()
         lazyPayload.removeAll()
+        // A symbol's description string is an ordinary counted string (one Swift
+        // retain while its count is above zero); the table holds one count.
+        for s in symbolAtomStrings.values {
+            JeffJSValue.borrowedSymbol(s).freeValue()
+        }
         symbolAtomStrings.removeAll()
         symbolAtoms.removeAll()
-        for i in intKeyStrings.indices { intKeyStrings[i] = nil }
-        for i in typeofStrings.indices { typeofStrings[i] = nil }
+        for i in intKeyStrings.indices { if let js = intKeyStrings[i] { dropCachedString(js) }; intKeyStrings[i] = nil }
+        for i in typeofStrings.indices { if let js = typeofStrings[i] { dropCachedString(js) }; typeofStrings[i] = nil }
 
         // Free global symbol registry values
         for (_, val) in globalSymbolRegistry {
@@ -997,6 +1008,92 @@ nonisolated final class JeffJSRuntime {
         gcZeroRefCountList = ListHead()
         tmpObjList = ListHead()
         weakrefList = ListHead()
+    }
+
+    /// Frees the constants of a body that will never run again (a top-level script
+    /// or eval that has run, a never-run precompiled tree, an orphan body whose last
+    /// closure died): every non-function constant, and every nested function body
+    /// that nothing can run any more (no function object runs it — `liveClosures ==
+    /// 0` — and no other constant pool shares it), recursively. A nested body that a
+    /// live closure still runs keeps the pool's count, which becomes its closures'
+    /// (`orphanOwned`): released by drainOrphanBodies once they are all gone. It used
+    /// to be kept for good (no owner could ever give it back). A suspended generator
+    /// or async activation owns its function object (GeneratorSavedState.funcObj,
+    /// AsyncSavedEntry), so its body's `liveClosures` stays above zero meanwhile.
+    func releaseRunBodyConstants(_ fb: JeffJSFunctionBytecode, depth: Int = 0) {
+        var released = false
+        var pool = fb.cpool
+        for i in 0..<pool.count {
+            let v = pool[i]
+            if v.isFunctionBytecode {
+                guard !jeffJSKeepNestedBodies, depth < 64, let child = v.toFunctionBytecode(),
+                      child.refCount == 1 else { continue }
+                if child.liveClosures != 0 {
+                    child.orphanOwned = true
+                    continue
+                }
+                releaseRunBodyConstants(child, depth: depth + 1)
+                // What is left in the child's pool are nested bodies still in use:
+                // their counts are their closures' now (orphanOwned) or kept.
+                child.cpool = []
+                v.freeValue()   // refCount 1 -> 0: frees the (now empty) pool, drops the retain
+                pool[i] = .undefined
+                released = true
+                continue
+            }
+            if v.hasRefCount {
+                v.freeValue()
+                pool[i] = .undefined
+                released = true
+            }
+        }
+        if released {
+            fb.cpool = pool
+        }
+    }
+
+    /// Called by the function-object free paths when the last closure of an
+    /// `orphanOwned` body was freed (they test the flag inline; this is out of
+    /// line so the hot free path stays a load and a compare).
+    @inline(never)
+    func queueOrphanBody(_ fb: JeffJSFunctionBytecode) {
+        orphanBodiesPending.append(fb)
+    }
+
+    /// Releases the queued orphan bodies that still have no closure: their
+    /// constants (as releaseRunBodyConstants) and the body itself. Only between
+    /// tasks (nothing is running: an eval's end at call depth 0, the idle tick).
+    func drainOrphanBodies() {
+        guard !orphanBodiesPending.isEmpty, gcPhase == .JS_GC_PHASE_NONE, !inFreeChain else { return }
+        // Nothing may be running in any realm (a function object freed by its own
+        // running code queues its body; the body runs on until the call returns).
+        for i in 0 ..< nextRealmIndex {
+            if let c = realmTable[i]?.takeUnretainedValue(), c.callDepth > 0 || c.currentFrame != nil { return }
+        }
+        while let fb = orphanBodiesPending.popLast() {
+            guard fb.orphanOwned, fb.liveClosures == 0, fb.refCount == 1 else { continue }
+            fb.orphanOwned = false
+            releaseRunBodyConstants(fb)
+            fb.cpool = []
+            let raw = Unmanaged.passUnretained(fb).toOpaque()
+            JeffJSValue(bits: JeffJSValue._fbTag | UInt64(UInt(bitPattern: raw))).freeValue()   // 1 -> 0
+        }
+    }
+
+    /// Gives back the count a string cache (`sharedStrings`, `atomJSStrings`,
+    /// `typeofStrings`, `intKeyStrings`) holds on `js`, before the table drops its
+    /// Swift reference. The cached string's JS references carry no Swift retain
+    /// (`JeffJSContext.sharedStringRef`): the table's reference is what keeps it
+    /// allocated. With no other count left it goes with the table; a string still
+    /// referenced from JS takes the one Swift retain a counted string holds while its
+    /// count is above zero (released by the free that takes it to zero).
+    func dropCachedString(_ js: JeffJSString) {
+        if js.refCount <= 1 {
+            js.refCount = 0
+        } else {
+            js.refCount -= 1
+            _ = Unmanaged.passRetained(js)
+        }
     }
 
     /// Teardown: frees every object still listed as one dead group
@@ -1048,6 +1145,10 @@ nonisolated final class JeffJSRuntime {
                bodies.updateValue(fb, forKey: ObjectIdentifier(fb)) == nil {
                 pending.append(fb)
             }
+        }
+        // Orphan bodies whose closures are gone but which no safe point drained yet.
+        for fb in orphanBodiesPending where fb.refCount > 0 && fb.orphanOwned {
+            if bodies.updateValue(fb, forKey: ObjectIdentifier(fb)) == nil { pending.append(fb) }
         }
         while let fb = pending.popLast() {
             for v in fb.cpool {
@@ -1601,21 +1702,26 @@ nonisolated final class JeffJSRuntime {
         guard let entry = atomArray[Int(atom)] else { return }
 
         entry.refCount -= 1
-        if entry.refCount <= 0 {
-            // Predefined atoms (< JS_ATOM_END) are never freed
-            if atom >= JeffJSAtomID.JS_ATOM_END.rawValue {
-                removeAtomFromHash(atom)
-                if let js = atomJSStrings.removeValue(forKey: atom) { js.refCount -= 1 }
-                atomArray[Int(atom)] = nil
-                // Add to free list by storing free list head in hashNext
-                let freeEntry = JeffJSAtomStruct()
-                freeEntry.hashNext = UInt32(atomFreeIndex)
-                atomArray[Int(atom)] = freeEntry
-                atomFreeIndex = Int(atom)
-            } else {
-                // Predefined atom — reset refcount to 1 (never truly freed)
-                entry.refCount = 1
-            }
+        if entry.refCount <= 0 { freeAtomAtZero(atom, entry) }
+    }
+
+    /// The last reference of `atom` went away (out of line: freeAtom is hot and
+    /// small).
+    @inline(never)
+    private func freeAtomAtZero(_ atom: UInt32, _ entry: JeffJSAtomStruct) {
+        // Predefined atoms (< JS_ATOM_END) are never freed
+        if atom >= JeffJSAtomID.JS_ATOM_END.rawValue {
+            removeAtomFromHash(atom)
+            if let js = atomJSStrings.removeValue(forKey: atom) { dropCachedString(js) }
+            atomArray[Int(atom)] = nil
+            // Add to free list by storing free list head in hashNext
+            let freeEntry = JeffJSAtomStruct()
+            freeEntry.hashNext = UInt32(atomFreeIndex)
+            atomArray[Int(atom)] = freeEntry
+            atomFreeIndex = Int(atom)
+        } else {
+            // Predefined atom — reset refcount to 1 (never truly freed)
+            entry.refCount = 1
         }
     }
 
@@ -1744,6 +1850,11 @@ nonisolated final class JeffJSRuntime {
     /// Reverse map, so `Object.getOwnPropertySymbols` / `Reflect.ownKeys` can
     /// rebuild the symbol value from an atom found in a shape.
     var symbolAtomStrings: [UInt32: JeffJSString] = [:]
+
+    /// Bodies whose closures all died while they were `orphanOwned` (queued by the
+    /// function-object free paths, released at a safe point: drainOrphanBodies).
+    /// Declared last: the hot fields above keep their offsets.
+    var orphanBodiesPending: [JeffJSFunctionBytecode] = []
 
     /// The atom for a symbol, allocating one on first use as a property key.
     /// Symbol atoms are immortal (they are only ever a handful per program and

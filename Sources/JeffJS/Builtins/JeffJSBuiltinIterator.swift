@@ -218,10 +218,11 @@ struct JeffJSBuiltinIterator {
         let helperProto = ctx.newObjectProto(proto: iterProto)
         ctx.setPropertyFunc(obj: helperProto, name: "next", fn: helperNext, length: 0)
         ctx.setPropertyFunc(obj: helperProto, name: "return", fn: helperReturn, length: 0)
+        let helperTag = ctx.newStringValue("Iterator Helper")
         _ = ctx.definePropertyValue(obj: helperProto,
                                     atom: JeffJSAtomID.JS_ATOM_Symbol_toStringTag.rawValue,
-                                    value: ctx.newStringValue("Iterator Helper"),
-                                    flags: JS_PROP_CONFIGURABLE)
+                                    value: helperTag, flags: JS_PROP_CONFIGURABLE)
+        helperTag.freeValue()   // definePropertyValue dups
         ctx.classProto[helperClass] = helperProto
         let wrapProto = ctx.newObjectProto(proto: iterProto)
         ctx.setPropertyFunc(obj: wrapProto, name: "next", fn: wrapNext, length: 0)

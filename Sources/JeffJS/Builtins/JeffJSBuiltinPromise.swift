@@ -1002,7 +1002,10 @@ struct JeffJSBuiltinPromise {
             let resolution = args.count >= 1 ? args[0] : JeffJSValue.undefined
 
             guard let promObj = data.promiseObj else { return JeffJSValue.undefined }
-            let promVal = JeffJSValue.mkPtr(tag: .object, ptr: promObj)
+            // Borrowed (the function's capture slot holds the count): `mkPtr` took a
+            // Swift retain per settlement that nothing gave back — every promise
+            // settled through its resolving functions outlived the runtime.
+            let promVal = JeffJSValue.borrowedObject(promObj)
 
             // Cannot resolve a promise with itself
             if resolution.isObject, let resObj = resolution.toObject(), resObj === promObj {
@@ -1022,7 +1025,10 @@ struct JeffJSBuiltinPromise {
             let reason = args.count >= 1 ? args[0] : JeffJSValue.undefined
 
             guard let promObj = data.promiseObj else { return JeffJSValue.undefined }
-            let promVal = JeffJSValue.mkPtr(tag: .object, ptr: promObj)
+            // Borrowed (the function's capture slot holds the count): `mkPtr` took a
+            // Swift retain per settlement that nothing gave back — every promise
+            // settled through its resolving functions outlived the runtime.
+            let promVal = JeffJSValue.borrowedObject(promObj)
 
             JeffJSBuiltinPromise.rejectPromise(ctx: c, promise: promVal, reason: reason)
             return JeffJSValue.undefined

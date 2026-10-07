@@ -291,9 +291,12 @@ struct JeffJSBuiltinError {
                     jeffJS_addProperty(ctx: ctx, obj: errObj,
                                        atom: JeffJSAtomID.JS_ATOM_cause.rawValue,
                                        flags: [.writable, .configurable])
+                    // `getOwnPropertyValue` is borrowed: the slot needs its own count
+                    // (storing the borrowed value released `cause` once too often
+                    // when the error died).
                     errObj.setOwnPropertyValue(
                         atom: JeffJSAtomID.JS_ATOM_cause.rawValue,
-                        value: causeVal)
+                        value: causeVal.dupValue())
                 }
             }
         }
@@ -317,10 +320,10 @@ struct JeffJSBuiltinError {
         } else {
             errorName = nativeErrorNames[magic]
         }
-        buildBacktrace(ctx: ctx, obj: JeffJSValue.makeObject(errObj),
-                       filename: errorName, lineNum: 0, flags: 0)
-
-        return JeffJSValue.makeObject(errObj)
+        // One `makeObject` (the Swift retain the object's free gives back once).
+        let errVal = JeffJSValue.makeObject(errObj)
+        buildBacktrace(ctx: ctx, obj: errVal, filename: errorName, lineNum: 0, flags: 0)
+        return errVal
     }
 
     // MARK: - Error.prototype.toString

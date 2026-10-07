@@ -114,7 +114,10 @@ func jeffJS_recycleFunction(_ o: JeffJSObject) -> Bool {
     }
     var payload: JeffJSObjectPayload = .opaque(nil)
     swap(&payload, &a.payload)     // a move: no copy of the enum
-    if case .bytecodeFunc(let fb, _, _) = payload, let fb { fb.liveClosures &-= 1 }
+    if case .bytecodeFunc(let fb, _, _) = payload, let fb {
+        fb.liveClosures &-= 1
+        if fb.orphanOwned, fb.liveClosures == 0 { rt.queueOrphanBody(fb) }
+    }
     if let t = a.arrowThisVal { a.arrowThisVal = nil; t.freeValue() }
     a.cMagicFast = 0
     a.storedCFunctionLength = 0

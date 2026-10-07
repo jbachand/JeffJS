@@ -1708,6 +1708,8 @@ nonisolated final class JSRegExpStringIteratorData {
     /// string die with the iterator; they leaked once per matchAll().
     deinit {
         if JeffJSGCObjectHeader.activeRuntime != nil {
+            // The copy was never handed out as a value (jeffJS_createObject takes no
+            // Swift retain): this `makeObject` takes the one its free gives back.
             JeffJSValue.makeObject(iteratingRegExp).freeValue()
             iteratedValue.freeValue()
         }
@@ -2399,19 +2401,25 @@ extension JeffJSContext {
             return js_regexp_string_iterator_next(ctx: ctx, this: this, argv: args)
         }, name: "next", length: 0)
         let nextAtom = rt.findAtom("next")
+        // definePropertyValue dups: each value's creation count is released here
+        // (the two functions and the tag string outlived every runtime).
         _ = definePropertyValue(obj: proto, atom: nextAtom,
                                 value: nextFn,
                                 flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+        nextFn.freeValue()
+        rt.freeAtom(nextAtom)
         let selfIterFn = newCFunction({ _, this, _ in this.dupValue() },
                                       name: "[Symbol.iterator]", length: 0)
         _ = definePropertyValue(obj: proto,
                                 atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue,
                                 value: selfIterFn,
                                 flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
+        selfIterFn.freeValue()
+        let tag = newStringValue("RegExp String Iterator")
         _ = definePropertyValue(obj: proto,
                                 atom: JeffJSAtomID.JS_ATOM_Symbol_toStringTag.rawValue,
-                                value: newStringValue("RegExp String Iterator"),
-                                flags: JS_PROP_CONFIGURABLE)
+                                value: tag, flags: JS_PROP_CONFIGURABLE)
+        tag.freeValue()
         classProto[idx] = proto
         return proto
     }

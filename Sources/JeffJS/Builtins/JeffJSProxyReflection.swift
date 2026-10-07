@@ -36,7 +36,7 @@ extension JeffJSContext {
     /// The property key a trap receives (a String or the Symbol itself), owned.
     func proxyTrapKey(_ atom: UInt32) -> JeffJSValue {
         if rt.atomIsSymbol(atom), let sym = rt.symbolStringForAtom(atom) {
-            return JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+            return JeffJSValue.borrowedSymbol(sym).dupValue()
         }
         if let name = rt.atomToString(atom) { return newStringValue(name) }
         return .undefined

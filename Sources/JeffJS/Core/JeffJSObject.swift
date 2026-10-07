@@ -749,6 +749,15 @@ nonisolated class JeffJSFunctionBytecode {
     /// A script's (or eval's) top-level code: `Error.stack` names its frame
     /// `global code` / `eval code`, as JavaScriptCore does.
     var isTopLevelCode: Bool = false
+    /// The count this body holds is its closures' collectively: the constant pool
+    /// that owned it was given back while closures still ran it (its script
+    /// finished — JeffJSRuntime.releaseRunBodyConstants). When the last of them is
+    /// freed (`liveClosures` reaches 0) the body is queued and released at the next
+    /// safe point (JeffJSRuntime.drainOrphanBodies). Such bodies used to keep that
+    /// count forever: every function a script made whose closures died before the
+    /// runtime did leaked its bytecode and constant pool, and pinned the runtime
+    /// through its inline caches' shapes.
+    var orphanOwned: Bool = false
     /// The name an anonymous function literal got from its binding
     /// (`var U = function(){}` → "U", ES SetFunctionName via `set_name`),
     /// recorded the first time `set_name` runs on one of its closures.
@@ -821,7 +830,7 @@ nonisolated class JeffJSFunctionBytecode {
     /// payload is made — createClosure, the class/method closure path,
     /// executeBytecode — and uncounted in freeObject). 0 + a refCount of 1 (its parent's constant
     /// pool) after the parent script finished = nothing can run it again
-    /// (JeffJSContext.releaseTopLevelConstants).
+    /// (JeffJSRuntime.releaseRunBodyConstants; a body whose closures outlive that pool is `orphanOwned`).
     var liveClosures: Int32 = 0
     /// Trace index size (see `traceBlock(at:)`); -1: not built. Declared here
     /// to share liveClosures' 8-byte slot.
@@ -2971,8 +2980,10 @@ func jeffJS_deleteProperty(ctx: JeffJSContext,
         case .value(let val):
             val.freeValue()
         case .getset(let getter, let setter):
-            if let g = getter { JeffJSValue.makeObject(g).freeValue() }
-            if let s = setter { JeffJSValue.makeObject(s).freeValue() }
+            // Borrowed (see JeffJSContext.deleteProperty): makeObject's Swift retain
+            // was never given back when the accessor stayed alive.
+            if let g = getter { JeffJSValue.borrowedObject(g).freeValue() }
+            if let s = setter { JeffJSValue.borrowedObject(s).freeValue() }
         default:
             break
         }

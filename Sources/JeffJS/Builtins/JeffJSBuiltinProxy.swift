@@ -338,7 +338,7 @@ func js_proxy_getOwnPropertyDescriptor(_ ctx: JeffJSContext,
     // Call trap(target, key).
     let propName: JeffJSValue
     if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
-        propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+        propName = JeffJSValue.borrowedSymbol(sym).dupValue()
     } else if let name = ctx.rt.atomToString(atom) {
         propName = ctx.newStringValue(name)
     } else {
@@ -374,7 +374,7 @@ func js_proxy_defineProperty(_ ctx: JeffJSContext,
     // Call trap(target, key, descriptor).
     let propName: JeffJSValue
     if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
-        propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+        propName = JeffJSValue.borrowedSymbol(sym).dupValue()
     } else if let name = ctx.rt.atomToString(atom) {
         propName = ctx.newStringValue(name)
     } else {
@@ -404,7 +404,7 @@ func js_proxy_has(_ ctx: JeffJSContext,
     // Call trap(target, key).
     let propName: JeffJSValue
     if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
-        propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+        propName = JeffJSValue.borrowedSymbol(sym).dupValue()
     } else if let name = ctx.rt.atomToString(atom) {
         propName = ctx.newStringValue(name)
     } else {
@@ -434,7 +434,7 @@ func js_proxy_get(_ ctx: JeffJSContext,
     // Call trap(target, key, receiver).
     let propName: JeffJSValue
     if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
-        propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+        propName = JeffJSValue.borrowedSymbol(sym).dupValue()
     } else if let name = ctx.rt.atomToString(atom) {
         propName = ctx.newStringValue(name)
     } else {
@@ -470,7 +470,7 @@ func js_proxy_set(_ ctx: JeffJSContext,
     // Call trap(target, key, value, receiver).
     let propName: JeffJSValue
     if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
-        propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+        propName = JeffJSValue.borrowedSymbol(sym).dupValue()
     } else if let name = ctx.rt.atomToString(atom) {
         propName = ctx.newStringValue(name)
     } else {
@@ -499,7 +499,7 @@ func js_proxy_deleteProperty(_ ctx: JeffJSContext,
     // Call trap(target, property).
     let propName: JeffJSValue
     if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
-        propName = JeffJSValue.mkPtr(tag: .symbol, ptr: sym.retain())
+        propName = JeffJSValue.borrowedSymbol(sym).dupValue()
     } else if let name = ctx.rt.atomToString(atom) {
         propName = ctx.newStringValue(name)
     } else {
@@ -851,6 +851,7 @@ func js_reflect_getOwnPropertyDescriptor(_ ctx: JeffJSContext,
     }
     let key = ctx.toPropertyKey(argv[1])
     if key.isException { return key }
+    defer { key.freeValue() }   // toPropertyKey dups
     return ctx.getOwnPropertyDescriptor(argv[0], key: key)
 }
 
@@ -868,7 +869,7 @@ func js_reflect_getPrototypeOf(_ ctx: JeffJSContext,
         return .null
     }
     if let proto = shape.proto {
-        return JeffJSValue.makeObject(proto).dupValue()
+        return JeffJSValue.borrowedObject(proto).dupValue()   // makeObject's Swift retain was never given back
     }
     return .null
 }

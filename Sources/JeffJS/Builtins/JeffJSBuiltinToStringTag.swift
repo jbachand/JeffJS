@@ -79,9 +79,9 @@ extension JeffJSContext {
         guard obj.isObject, let jsObj = obj.toObject() else { return }
         let atom = JeffJSAtomID.JS_ATOM_Symbol_toStringTag.rawValue
         if let shape = jsObj.shape, shape.prop.contains(where: { $0.atom == atom }) { return }
-        _ = definePropertyValue(obj: obj, atom: atom,
-                                value: newStringValue(tag),
-                                flags: JS_PROP_CONFIGURABLE)
+        let tagV = newStringValue(tag)
+        _ = definePropertyValue(obj: obj, atom: atom, value: tagV, flags: JS_PROP_CONFIGURABLE)
+        tagV.freeValue()   // definePropertyValue dups (every tag string outlived the runtime)
     }
 
     /// Install every builtin `Symbol.toStringTag`. Called once, at the end of

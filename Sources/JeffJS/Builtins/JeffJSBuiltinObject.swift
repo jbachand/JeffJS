@@ -598,7 +598,7 @@ extension JeffJSContext {
                 if enumOnly && !prop.flags.contains(.enumerable) { continue }
                 guard rt.atomIsSymbol(atom) else { continue }
                 if let symStr = rt.symbolStringForAtom(atom) {
-                    symbolKeys.append(JeffJSValue.mkPtr(tag: .symbol, ptr: symStr.retain()))
+                    symbolKeys.append(JeffJSValue.borrowedSymbol(symStr).dupValue())
                 } else if let entry = rt.atomArray[Int(atom)] {
                     symbolKeys.append(newStringValue(entry.str))
                 }
@@ -699,7 +699,7 @@ extension JeffJSContext {
                             // Object.getOwnPropertySymbols must yield keys that
                             // can be fed straight back into obj[key].
                             if let symStr = rt.symbolStringForAtom(atom) {
-                                symbolKeys.append(JeffJSValue.mkPtr(tag: .symbol, ptr: symStr.retain()))
+                                symbolKeys.append(JeffJSValue.borrowedSymbol(symStr).dupValue())
                             } else {
                                 symbolKeys.append(newStringValue(entry.str))
                             }
@@ -1111,6 +1111,7 @@ struct JeffJSBuiltinObject {
 
         let key = ctx.toPropertyKey(prop)
         if key.isException { return key }
+        defer { key.freeValue() }   // toPropertyKey dups (every call leaked its key)
 
         return ctx.getOwnPropertyDescriptor(obj, key: key)
     }
@@ -1458,6 +1459,7 @@ struct JeffJSBuiltinObject {
 
         let key = ctx.toPropertyKey(prop)
         if key.isException { return key }
+        defer { key.freeValue() }   // toPropertyKey dups (every call leaked its key)
 
         let has = ctx.hasOwnProperty(o, key: key)
         if has < 0 { return .exception }
@@ -1522,6 +1524,7 @@ struct JeffJSBuiltinObject {
                 ctx.iteratorClose(iter: iter, isThrow: true)
                 return propKey
             }
+            defer { propKey.freeValue() }   // toPropertyKey dups; the key helpers borrow it
 
             // Get or create the group array
             var group = ctx.getProperty(obj: groups, key: propKey)
@@ -1580,6 +1583,7 @@ struct JeffJSBuiltinObject {
             // jsValueToString is Optional — interpolating it directly produced
             // "[object Optional(\"Module\")]".
             let tagStr = ctx.jsValueToString(tag) ?? "Object"
+            tag.freeValue()   // owned (every tagged object's toString leaked its tag)
             return ctx.newString("[object \(tagStr)]")
         }
 
@@ -1627,6 +1631,7 @@ struct JeffJSBuiltinObject {
             }
         }
 
+        tag.freeValue()
         return ctx.newString("[object \(builtinTag)]")
     }
 
@@ -1660,6 +1665,7 @@ struct JeffJSBuiltinObject {
 
         let key = ctx.toPropertyKey(prop)
         if key.isException { return key }
+        defer { key.freeValue() }   // toPropertyKey dups (every call leaked its key)
 
         let has = ctx.hasOwnProperty(obj, key: key)
         if has < 0 { return .exception }

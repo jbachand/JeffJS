@@ -1500,13 +1500,22 @@ extension JeffJSContext {
     // MARK: - Atom Helpers
 
     /// Converts an atom to a JS string value.
+    ///
+    /// The three runtime string caches below (`atomJSStrings`, `typeofStrings`,
+    /// `intKeyStrings`) work like `sharedStrings`: the table keeps the object (its
+    /// Swift reference) and one JS count, and hands out counted references with no
+    /// Swift retain (`sharedStringRef`). They used `makeString(js.retain())`, whose
+    /// Swift retain is only given back by the release that takes the count to zero —
+    /// which the table's own count never allowed: every hit leaked a retain, and
+    /// every cached string (~500 builtin names in a fresh environment) outlived the
+    /// runtime (JeffJSRuntime.dropCachedString gives the table's count back).
     func atomToString(_ atom: UInt32) -> JeffJSValue {
         if (atom & JS_ATOM_TAG_INT) != 0 { return intKeyString(Int(atom & ~JS_ATOM_TAG_INT)) }
-        if let cached = rt.atomJSStrings[atom] { return JeffJSValue.makeString(cached.retain()) }
+        if let cached = rt.atomJSStrings[atom] { return JeffJSContext.sharedStringRef(cached) }
         guard let str = rt.atomToString(atom) else { return .undefined }
         let js = JeffJSString(swiftString: str)   // refCount 1: the cache's reference
         rt.atomJSStrings[atom] = js
-        return JeffJSValue.makeString(js.retain())
+        return JeffJSContext.sharedStringRef(js)
     }
 
     /// Shared JS string for a `typeof` result. Falls back to a fresh string
@@ -1524,19 +1533,19 @@ extension JeffJSContext {
         case "bigint": idx = 7
         default: return newString(t)
         }
-        if let cached = rt.typeofStrings[idx] { return JeffJSValue.makeString(cached.retain()) }
+        if let cached = rt.typeofStrings[idx] { return JeffJSContext.sharedStringRef(cached) }
         let js = JeffJSString(swiftString: t)   // refCount 1: the cache's reference
         rt.typeofStrings[idx] = js
-        return JeffJSValue.makeString(js.retain())
+        return JeffJSContext.sharedStringRef(js)
     }
 
     /// Cached string for a small integer key (array indices in for-in / keys).
     func intKeyString(_ i: Int) -> JeffJSValue {
         if i >= 0 && i < rt.intKeyStrings.count {
-            if let c = rt.intKeyStrings[i] { return JeffJSValue.makeString(c.retain()) }
-            let js = JeffJSString(swiftString: String(i))
+            if let c = rt.intKeyStrings[i] { return JeffJSContext.sharedStringRef(c) }
+            let js = JeffJSString(swiftString: String(i))   // refCount 1: the cache's reference
             rt.intKeyStrings[i] = js
-            return JeffJSValue.makeString(js.retain())
+            return JeffJSContext.sharedStringRef(js)
         }
         return newStringValue(String(i))
     }
@@ -1895,8 +1904,8 @@ extension JeffJSContext {
         guard let arg0 = args.first else { return .undefined }
         guard arg0.isString, let str = arg0.stringValue else { return arg0.dupValue() }
         guard let sites = callerFB.evalSites, site < sites.count else {
-            // Bytecode without call-site records: global semantics.
-            return eval(input: str.toSwiftString(), filename: "<eval>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+            // Bytecode without call-site records: global semantics (eval code).
+            return eval(input: str.toSwiftString(), filename: "<eval>", evalFlags: JS_EVAL_TYPE_INDIRECT)
         }
         // JSC lists the eval itself above the caller (`eval@[native code]`).
         let prevNative = frame.nativeCallee
@@ -1929,6 +1938,7 @@ extension JeffJSContext {
         let parser = JeffJSParser(s: parseState, fd: fd)
         parser.parseProgram()
         if parser.failed || fd.byteCode.error {
+            JeffJSCompiler.releaseDroppedConstants(fd)   // the parsed literals' counts
             return throwParseSyntaxError(parseState, fallback: "Parse error in eval code")
         }
         if fd.byteCode.len == 0 { return .undefined }
@@ -2100,7 +2110,11 @@ extension JeffJSContext {
                 }
             }
         }
-        return setProperty(obj: globalObj, atom: atom, value: val) >= 0
+        // JS_PROP_THROW: strict (a refused write throws); otherwise a refused write
+        // is silently ignored (it always threw: `var NaN = 5` in a sloppy script
+        // was a TypeError).
+        return setPropertyChecked(obj: globalObj, atom: atom, value: val,
+                                  strict: (flags & JS_PROP_THROW) != 0) >= 0
     }
 
     /// Defines a new global variable (CreateGlobalVarBinding).  An existing
@@ -2135,7 +2149,8 @@ extension JeffJSContext {
     /// property keeps its attributes), and only when that property is a writable,
     /// enumerable data property — otherwise a TypeError (`function NaN(){}`, a function
     /// over a non-configurable accessor). It used to replace any property outright,
-    /// attributes and all (`definePropertyValue` never refuses).
+    /// attributes and all (`definePropertyValue` never refuses). `flags`: enumerable,
+    /// plus configurable for eval code (the define_func site); writable is added here.
     func defineGlobalFunc(atom: UInt32, val: JeffJSValue, flags: Int) -> Bool {
         if let g = globalObj.toObject(), let shape = g.shape {
             let idx = jeffJS_findOwnPropertyIndex(obj: g, atom: atom)
@@ -2150,7 +2165,7 @@ extension JeffJSContext {
             }
         }
         return definePropertyValue(obj: globalObj, atom: atom, value: val,
-                                   flags: flags | JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) >= 0
+                                   flags: flags | JS_PROP_WRITABLE) >= 0
     }
 
     /// Deletes a global variable.
@@ -9535,7 +9550,10 @@ struct JeffJSInterpreter {
                     retVal = .exception
                     break dispatchLoop
                 }
-                let ok = ctx.putGlobalVar(atom: atom, val: val, flags: 0)
+                // PutValue → Set(globalObj, N, V, Throw = strict) (ES §6.2.5.6 /
+                // §9.1.1.4.5 SetMutableBinding): a refused write (`var NaN = 5`, a
+                // read-only global) is silent in sloppy code, a TypeError in strict.
+                let ok = ctx.putGlobalVar(atom: atom, val: val, flags: fb.isStrictMode ? JS_PROP_THROW : 0)
                 if !ok {
                     retVal = .exception
                     break dispatchLoop
@@ -9600,7 +9618,12 @@ struct JeffJSInterpreter {
 
             case .define_var:
                 let atom = readU32(bc, pc + 1)
-                let defFlags = Int(readU8(bc, pc + 5))
+                // CreateGlobalVarBinding (ES §9.1.1.4.17): { writable, enumerable,
+                // configurable: D } with D true only for eval code (§19.2.1.3 step
+                // 16.b.i.2 / §16.1.7 step 17: a script's `var` is non-deletable). The
+                // operand (C|W, from the parser and every cached blob) is not used.
+                let defFlags = JS_PROP_WRITABLE | JS_PROP_ENUMERABLE
+                    | (fb.isDirectOrIndirectEval ? JS_PROP_CONFIGURABLE : 0)
                 let ok = ctx.defineGlobalVar(atom: atom, flags: defFlags)
                 if !ok {
                     retVal = .exception
@@ -9620,9 +9643,15 @@ struct JeffJSInterpreter {
 
             case .define_func:
                 let atom = readU32(bc, pc + 1)
-                let defFlags = Int(readU8(bc, pc + 5))
+                // CreateGlobalFunctionBinding (ES §9.1.1.4.18): { writable, enumerable,
+                // configurable: D }, D as for `var` above (the operand is 0).
+                let defFlags = JS_PROP_ENUMERABLE | (fb.isDirectOrIndirectEval ? JS_PROP_CONFIGURABLE : 0)
                 let funcVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                // The popped closure owns one count (fclosure); the definition dups.
+                // It was never released, so every global function declaration
+                // outlived its last reference by one count.
                 let ok = ctx.defineGlobalFunc(atom: atom, val: funcVal, flags: defFlags)
+                funcVal.freeValue()
                 if !ok {
                     retVal = .exception
                     break dispatchLoop

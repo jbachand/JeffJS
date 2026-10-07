@@ -244,52 +244,13 @@ func freeValueRT(_ rt: JeffJSRuntime, _ v: JeffJSValue) {
         return
     }
 
-    // Handle strings (not GC-tracked, have their own refCount).
-    // Do NOT use v.stringValue — that flattens ropes. Check the raw pointer type directly.
-    if v.isString {
-        if let ref = v.toPtr() {
-            if let s = ref as? JeffJSString {
-                guard s.refCount > 0 else { return }
-                s.refCount -= 1
-                if s.refCount == 0 {
-                    // Release the Unmanaged retain from makeString
-                    Unmanaged.passUnretained(s).release()
-                }
-            } else if let r = ref as? JeffJSStringRope {
-                guard r.refCount > 0 else { return }
-                r.refCount -= 1
-                if r.refCount == 0 {
-                    // Free the rope's children first
-                    r.left.freeValue()
-                    r.right.freeValue()
-                    Unmanaged.passUnretained(r).release()
-                }
-            } else if let b = ref as? JeffJSStringBuffer {
-                guard b.refCount > 0 else { return }
-                b.refCount -= 1
-                if b.refCount == 0 {
-                    Unmanaged.passUnretained(b).release()
-                }
-            }
-        }
-        return
-    }
-
-    // Handle function bytecodes (not GC-tracked, have their own refCount).
-    if v.isFunctionBytecode {
-        if let fb = v.toFunctionBytecode() {
-            guard fb.refCount > 0 else { return }
-            fb.refCount -= 1
-            if fb.refCount == 0 {
-                // Free cpool values
-                for cpVal in fb.cpool {
-                    cpVal.freeValue()
-                }
-                Unmanaged.passUnretained(fb).release()
-            }
-        }
-        return
-    }
+    // Strings, symbols and function bytecode (not GC-tracked, their own counts):
+    // JeffJSValue.freeValue's paths (zombie tracking included). This had its own
+    // copies for strings and bytecode and none for symbols, so a symbol stored in a
+    // property was never released when its object was freed here — the well-known
+    // symbols (`Symbol.iterator`, ...) outlived every runtime, as did every symbol
+    // value an object held when it died.
+    v.freeValue()
 }
 
 // MARK: - Main GC entry point
@@ -759,6 +720,8 @@ nonisolated(unsafe) let jeffJS_idleGCInterval = Double(JeffJSConfig.gcIdleInterv
 
 @inline(__always)
 func jeffJS_idleGCTick(_ rt: JeffJSRuntime) {
+    // Function bodies whose last closure died (JeffJSRuntime.drainOrphanBodies).
+    if !rt.orphanBodiesPending.isEmpty { rt.drainOrphanBodies() }
     // Lazily compiled bodies waiting to be written to the bytecode cache.
     if rt.lazyBodiesPending { rt.bytecodeCache.flushLazyBodiesIfDue() }
     if rt.lazyDropAfterMs > 0 || rt.lazyDropOnMemoryPressure { rt.lazyReclaimTick() }
@@ -1095,6 +1058,20 @@ func freeGCObject(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
     }
 }
 
+/// A primitive wrapper's count on its primitive (see freeObject): `primitiveValue`,
+/// or the [[ObjectData]] payload when that is all it has. Out of line: only
+/// wrapper objects come here.
+@inline(never)
+func jeffJS_releaseWrapperPrimitive(_ rt: JeffJSRuntime, _ aux: JeffJSObjectAux?, _ payload: JeffJSObjectPayload) {
+    if let a = aux, !a.storedPrimitiveValue.isUndefined {
+        let pv = a.storedPrimitiveValue
+        a.storedPrimitiveValue = .undefined
+        freeValue(rt, pv)
+    } else if case .objectData(let v) = payload {
+        freeValue(rt, v)
+    }
+}
+
 /// Free a JSObject: release every property value, release the shape, then
 /// let ARC reclaim the Swift object.
 func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
@@ -1135,7 +1112,10 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     if let a = aux {
         swap(&savedPayload, &a.payload)
         // perf/memory-census: one function object fewer runs this bytecode.
-        if case .bytecodeFunc(let fb, _, _) = savedPayload, let fb { fb.liveClosures &-= 1 }
+        if case .bytecodeFunc(let fb, _, _) = savedPayload, let fb {
+            fb.liveClosures &-= 1
+            if fb.orphanOwned, fb.liveClosures == 0 { rt.queueOrphanBody(fb) }
+        }
         if !a.propExtra.isEmpty { swap(&savedExtra, &a.propExtra) }
         if let t = a.arrowThisVal { savedArrowThis = t; a.arrowThisVal = nil }
     }
@@ -1216,6 +1196,20 @@ func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     // A Map/Set/WeakMap/WeakSet owns a counted reference to every key and
     // value it stores (see `jeffJS_mapStateFree`).
     if case .mapState(let ms) = savedPayload { jeffJS_mapStateFree(ms) }
+    // A primitive wrapper (`new String(s)`, a boxed sloppy `this`, Object(sym))
+    // owns one count on its primitive: `primitiveValue` (ToObject dups it; the
+    // String constructor's [[StringData]] payload shares that reference). Neither
+    // was released, so every boxed string or symbol outlived its wrapper (and
+    // String.prototype's "" outlived the runtime). A wrapper with only the
+    // payload (Symbol.prototype's) owns that one.
+    // Gated on the wrapper class ids (Number 4, String 5, Boolean 6, Symbol 7,
+    // BigInt 33): a payload pattern match on every freed object costs an enum
+    // copy + destroy (closure churn measurably slower).
+    let wcid = obj.classID
+    if (wcid >= JSClassID.JS_CLASS_NUMBER.rawValue && wcid <= JSClassID.JS_CLASS_SYMBOL.rawValue)
+        || wcid == JSClassID.JS_CLASS_BIG_INT.rawValue {
+        jeffJS_releaseWrapperPrimitive(rt, aux, savedPayload)
+    }
     // A promise owns its settled value and every reaction still queued on it.
     if case .promiseData(let pd) = savedPayload { jeffJS_promiseDataFree(pd) }
     // A Map/Set iterator owns a reference to its collection until it is
