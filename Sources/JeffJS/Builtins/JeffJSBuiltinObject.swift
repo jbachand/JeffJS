@@ -448,8 +448,20 @@ extension JeffJSContext {
         let getterVal = getPropertyStr(obj: desc, name: "get")
         let setterVal = getPropertyStr(obj: desc, name: "set")
         defer { getterVal.freeValue(); setterVal.freeValue() }
-        let hasGetter = !getterVal.isUndefined
-        let hasSetter = !setterVal.isUndefined
+        // ToPropertyDescriptor (ES §6.2.6.5): a field is present when the
+        // descriptor *has* it — `{ get: undefined }` is an accessor descriptor
+        // that clears the getter (and turns a data property into an accessor).
+        // Presence was read off the value, so an explicit undefined was dropped.
+        let hasGetter = !getterVal.isUndefined || descriptorHas(desc, "get")
+        let hasSetter = !setterVal.isUndefined || descriptorHas(desc, "set")
+        if (hasGetter && !getterVal.isUndefined && !isCallable(getterVal)) ||
+           (hasSetter && !setterVal.isUndefined && !isCallable(setterVal)) {
+            return throwTypeError(message: hasGetter && !getterVal.isUndefined && !isCallable(getterVal)
+                                  ? "Getter must be a function." : "Setter must be a function.")
+        }
+        if (hasGetter || hasSetter), descriptorHas(desc, "value") || descriptorHas(desc, "writable") {
+            return throwTypeError(message: "Invalid property.  A property cannot both have accessors and be writable or have a value")
+        }
 
         if hasGetter || hasSetter {
             // Accessor descriptor: { get, set, configurable, enumerable }

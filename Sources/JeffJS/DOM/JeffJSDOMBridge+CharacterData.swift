@@ -247,8 +247,11 @@ extension JeffJSDOMBridge {
     // MARK: - Helpers
 
     /// Deletes an own member a host put on the prototype (a stub value or
-    /// accessor) before the engine's is defined: adding a shape property for a
-    /// name the object already owns would leave the old one found first.
+    /// accessor) before the engine's is defined, so the engine's member starts
+    /// fresh: without the stub's engine-private flags (hidden / shadowable) and
+    /// at the end of the key order. (Defining over it would now replace it in
+    /// place — setPropertyGetSet / setPropertyFunc go through
+    /// defineOrReplaceOwnProperty — but keep its position and flags.)
     func dropOwn(_ ctx: JeffJSContext, _ proto: JeffJSValue, _ name: String) {
         let atom = ctx.rt.findAtom(name)
         _ = ctx.deleteProperty(obj: proto, atom: atom)

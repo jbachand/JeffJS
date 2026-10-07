@@ -657,18 +657,17 @@ private func jeffJS_mathRandomNext() -> Double {
 /// Define a double-valued non-writable, non-enumerable, non-configurable property.
 private func jeffJS_definePropertyValueDouble(ctx: JeffJSContext, obj: JeffJSObject,
                                               atom: UInt32, value: Double) {
-    let flags: JeffJSPropertyFlags = []  // not writable, not enumerable, not configurable
-    jeffJS_addProperty(ctx: ctx, obj: obj, atom: atom, flags: flags)
-    obj.setOwnPropertyValue(atom: atom, value: .newFloat64(value))
+    // not writable, not enumerable, not configurable
+    ctx.defineOrReplaceOwnProperty(.borrowedObject(obj), atom: atom, value: .newFloat64(value),
+                                   flags: 0, intrinsic: true)
 }
 
 /// Define a string-valued non-writable, non-enumerable, configurable property.
 private func jeffJS_definePropertyValueStr(ctx: JeffJSContext, obj: JeffJSObject,
                                            atom: UInt32, value: String) {
-    let flags: JeffJSPropertyFlags = [.configurable]
-    jeffJS_addProperty(ctx: ctx, obj: obj, atom: atom, flags: flags)
-    let str = JeffJSString(swiftString: value)
-    obj.setOwnPropertyValue(atom: atom, value: .makeString(str))
+    ctx.defineOrReplaceOwnPropertyFree(.borrowedObject(obj), atom: atom,
+                                       value: .makeString(JeffJSString(swiftString: value)),
+                                       flags: JS_PROP_CONFIGURABLE, intrinsic: true)
 }
 
 /// Define a built-in native function property on an object.
@@ -680,14 +679,12 @@ func jeffJS_defineBuiltinFunc(ctx: JeffJSContext, obj: JeffJSObject,
     // Create the function value through the context's proper API.
     let funcVal = ctx.newCFunction(cfunc, name: name, length: length)
 
-    // Look up the atom for the property name and install via the shape system.
+    // Define (or replace in place) { writable, configurable }. It used to append a
+    // slot and write the object's *last* slot, which for a name the object already
+    // owned (jeffJS_addProperty appends nothing then) clobbered another property.
     let atom = ctx.rt.findAtom(name)
-    let flags: JeffJSPropertyFlags = [.writable, .configurable]
-    jeffJS_addProperty(ctx: ctx, obj: obj, atom: atom, flags: flags)
-    // Set the value in the slot that jeffJS_addProperty just appended.
-    if !obj.propValues.isEmpty {
-        obj.setPropEntry(at: obj.propValues.count - 1, .value(funcVal))
-    }
+    ctx.defineOrReplaceOwnPropertyFree(.borrowedObject(obj), atom: atom, value: funcVal,
+                                       flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, intrinsic: true)
     ctx.rt.freeAtom(atom)
 }
 

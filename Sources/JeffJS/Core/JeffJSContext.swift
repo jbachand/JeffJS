@@ -1625,7 +1625,13 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     }
 
     /// Convenience wrapper over defineProperty.
-    /// Mirrors `JS_DefinePropertyValue()` from QuickJS.
+    /// Mirrors `JS_DefinePropertyValue()` from QuickJS, except that it never
+    /// refuses: `flags` is the whole new descriptor, written over an existing
+    /// property in place whatever its `configurable` (the interpreter's own
+    /// definitions — global functions over `var` bindings, class elements —
+    /// and engine setup rely on that). Host code that wants
+    /// Object.defineProperty's rejection of a non-configurable property uses
+    /// `defineOrReplaceOwnProperty` (JeffJSDefineOwnProperty.swift).
     @discardableResult
     func definePropertyValue(
         obj: JeffJSValue,
@@ -5769,11 +5775,18 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
 
         // Create new property via shape system
         let propFlags: JeffJSPropertyFlags = [.writable, .enumerable, .configurable]
-        jeffJS_addProperty(ctx: self, obj: jsObj, atom: atom, flags: propFlags)
-        // Set the value in the last slot (just added)
-        if !jsObj.propValues.isEmpty {
+        if jeffJS_addProperty(ctx: self, obj: jsObj, atom: atom, flags: propFlags) != nil {
+            // Set the value in the slot just added (the last one)
             let last = jsObj.propValues.count - 1
             jsObj.propValues[last] = value; jsObj.setExtraSlot(last, nil)
+        } else {
+            // The own-property walk above missed an existing `atom` (nothing was
+            // appended): CreateDataProperty over it in place, never the last slot,
+            // which belongs to another property.
+            let r = definePropertyValue(obj: obj, atom: atom, value: value, flags: JS_PROP_C_W_E | (flags & JS_PROP_THROW))
+            value.freeValue()   // consumed here; defineProperty dups
+            if r < 0 { return -1 }
+            return 1
         }
 
         // For arrays: keep the "length" property in sync after adding an
@@ -6500,12 +6513,19 @@ extension JeffJSContext {
 
     // -- Function registration --
 
+    /// { value: fn, writable: true, enumerable: false, configurable: true },
+    /// through `defineOrReplaceOwnProperty`: an existing own `name` is
+    /// replaced in place (a host stub accessor becomes the method, keeping its
+    /// key position); a non-configurable one is left alone.
     func setPropertyFunc(obj: JeffJSValue, name: String, fn: @escaping JeffJSNativeFunc, length: Int) {
         let funcObj = newCFunction(fn, name: name, length: length)
         // Use non-enumerable so methods don't appear in for-in iteration.
         // DOM elements and prototype objects should not pollute property enumeration.
-        setNonEnumerableProperty(obj: obj, name: name, value: funcObj)
-        // definePropertyValue took its own reference; drop the creation one.
+        let atom = rt.findAtom(name)
+        defineOrReplaceOwnProperty(obj, atom: atom, value: funcObj,
+                                   flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+        rt.freeAtom(atom)
+        // The property took its own reference; drop the creation one.
         // (Leaking it pinned every per-object native method forever: a
         // classList object's twelve methods outlived the element.)
         funcObj.freeValue()
@@ -6725,8 +6745,8 @@ extension JeffJSContext {
     /// definition: it also replaces a link an earlier setup phase installed,
     /// non-configurable or not (phase 2 overlays re-link several builtins).
     func defineIntrinsicPrototype(ctor: JeffJSValue, proto: JeffJSValue) {
-        _ = definePropertyValue(obj: ctor, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
-                                value: proto, flags: 0)
+        defineOrReplaceOwnProperty(ctor, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
+                                   value: proto, flags: 0, intrinsic: true)
     }
 
     /// Both halves of a builtin constructor's link: `C.prototype` as in
@@ -6735,15 +6755,18 @@ extension JeffJSContext {
     /// Consumes neither value: each property takes its own count.
     func defineIntrinsicPrototypeLink(ctor: JeffJSValue, proto: JeffJSValue) {
         defineIntrinsicPrototype(ctor: ctor, proto: proto)
-        _ = definePropertyValue(obj: proto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
-                                value: ctor, flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+        defineOrReplaceOwnProperty(proto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
+                                   value: ctor, flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE,
+                                   intrinsic: true)
     }
 
     /// A data property whose attributes are all false (ES: Math.PI, the
     /// well-known `Symbol.*`, `Number.MAX_VALUE`, BYTES_PER_ELEMENT, …).
     /// Does not consume `value`.
     func defineIntrinsicConstant(_ obj: JeffJSValue, name: String, value: JeffJSValue) {
-        _ = definePropertyValue(obj, name: name, value: value, flags: 0)
+        let atom = rt.findAtom(name)
+        defineOrReplaceOwnProperty(obj, atom: atom, value: value, flags: 0, intrinsic: true)
+        rt.freeAtom(atom)
     }
 
     /// Consumes `proto` (one count moves into `ctor.prototype`, as the
@@ -6767,15 +6790,19 @@ extension JeffJSContext {
     /// Atom-keyed overload: well-known symbol accessors (`get [Symbol.species]`)
     /// must pass the predefined JS_ATOM_Symbol_* id — symbol atoms are not
     /// reachable by spelling.
+    ///
+    /// { get, set, enumerable: true, configurable: true }, defined like
+    /// `Object.defineProperty` does (`defineOrReplaceOwnProperty`): a name the
+    /// object already owns is replaced in place — same slot, same key position,
+    /// the old value or getter/setter released —, a non-configurable one is
+    /// left alone. Consumes `getter`, `setter` and `atom`. (It used to append a
+    /// second shape entry for an existing name.)
     func setPropertyGetSet(obj: JeffJSValue, atom: UInt32, getter: JeffJSValue?, setter: JeffJSValue?) {
-        defer { rt.freeAtom(atom) }
-        if let p = obj.toObject(), p.shape != nil {
-            let idx = jeffJS_objectAddShapeProperty(self, p, atom: atom, flags: UInt32(JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_GETSET))
-            while p.propValues.count <= idx {
-                p.appendDataValue(JeffJSValue.undefined)
-            }
-            p.setPropEntry(at: idx, .getset(getter: getter?.toObject(), setter: setter?.toObject()))
-        }
+        defineOrReplaceOwnProperty(obj, atom: atom, getter: getter, setter: setter,
+                                   flags: JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_GETSET)
+        getter?.freeValue()
+        setter?.freeValue()
+        rt.freeAtom(atom)
     }
 
     // -- Iterator helpers --

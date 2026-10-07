@@ -1737,16 +1737,15 @@ func jeffJS_addGetterProperty(
     nameVal.freeValue()
     getterObj.nativeNameKeepsAccessorPrefix = true
 
+    // { get, set: undefined, configurable }, defined or replaced in place (it used to
+    // write the prototype's last slot, another property's, when `name` existed). The
+    // getter was built by hand: `makeObject` takes the ARC retain its creation count
+    // needs; the property dups, the creation count is dropped.
     let atom = ctx.rt.findAtom(name)
-    jeffJS_addProperty(ctx: ctx, obj: proto, atom: atom, flags: [.configurable, .getset])
-    let propIdx = proto.propValues.count - 1
-    // The accessor slot is a counted edge (freeObject releases it), so the
-    // getter needs the ARC retain `makeObject` would have taken; this one is
-    // built by hand.
-    _ = Unmanaged.passRetained(getterObj)
-    if propIdx >= 0 {
-        proto.setPropEntry(at: propIdx, .getset(getter: getterObj, setter: nil))
-    }
+    let gv = JeffJSValue.makeObject(getterObj)
+    ctx.defineOrReplaceOwnProperty(.borrowedObject(proto), atom: atom, getter: gv, setter: nil,
+                                   flags: JS_PROP_CONFIGURABLE | JS_PROP_GETSET, intrinsic: true)
+    gv.freeValue()
     ctx.rt.freeAtom(atom)
 }
 

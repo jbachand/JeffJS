@@ -361,6 +361,7 @@ struct JeffJSTestRunner {
             ("RealmsDOM", { $0.testRealmsDOM() }),
             ("LazyPayload", { $0.testLazyPayload() }),
             ("IntrinsicAttributes", { $0.testIntrinsicAttributes() }),
+            ("DefineOverExisting", { $0.testDefineOverExisting() }),
         ]
     }
 

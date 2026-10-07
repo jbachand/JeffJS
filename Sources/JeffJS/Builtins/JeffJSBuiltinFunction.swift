@@ -821,10 +821,10 @@ struct JeffJSBuiltinFunction {
         methodObj.setOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_length.rawValue,
                                       value: .newInt32(Int32(length)))
 
-        // Add the method to the prototype
-        jeffJS_addProperty(ctx: ctx, obj: proto, atom: name,
-                           flags: [.writable, .configurable])
-        proto.setOwnPropertyValue(atom: name, value: JeffJSValue.makeObject(methodObj))
+        // Add (or replace in place) the method on the prototype
+        ctx.defineOrReplaceOwnPropertyFree(.borrowedObject(proto), atom: name,
+                                           value: JeffJSValue.makeObject(methodObj),
+                                           flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, intrinsic: true)
     }
 
     /// Add a method with magic parameter to a prototype object.
@@ -850,9 +850,9 @@ struct JeffJSBuiltinFunction {
         methodObj.setOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_length.rawValue,
                                       value: .newInt32(Int32(length)))
 
-        jeffJS_addProperty(ctx: ctx, obj: proto, atom: name,
-                           flags: [.writable, .configurable])
-        proto.setOwnPropertyValue(atom: name, value: JeffJSValue.makeObject(methodObj))
+        ctx.defineOrReplaceOwnPropertyFree(.borrowedObject(proto), atom: name,
+                                           value: JeffJSValue.makeObject(methodObj),
+                                           flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE, intrinsic: true)
     }
 
     /// Add a getter property to a prototype object.
@@ -871,17 +871,13 @@ struct JeffJSBuiltinFunction {
             magic: 0
         )
 
-        jeffJS_addProperty(ctx: ctx, obj: proto, atom: name,
-                           flags: [.configurable, .getset])
-        // For a getter-only property, we store it as a getset with no setter
-        // The accessor slot is a counted edge (freeObject releases it), so the
-        // getter needs the ARC retain `makeObject` would have taken; this one is
-        // built by hand.
-        _ = Unmanaged.passRetained(getterObj)
-        let propIdx = proto.propValues.count - 1
-        if propIdx >= 0 {
-            proto.setPropEntry(at: propIdx, .getset(getter: getterObj, setter: nil))
-        }
+        // A getter-only accessor, defined or replaced in place (it used to write the
+        // prototype's last slot). `makeObject` takes the ARC retain the hand-built
+        // getter's creation count needs; the property dups, that count is dropped.
+        let gv = JeffJSValue.makeObject(getterObj)
+        ctx.defineOrReplaceOwnProperty(.borrowedObject(proto), atom: name, getter: gv, setter: nil,
+                                       flags: JS_PROP_CONFIGURABLE | JS_PROP_GETSET, intrinsic: true)
+        gv.freeValue()
     }
 
     /// Helper for creating new JeffJSValue with .newBool.

@@ -76,7 +76,9 @@ extension JeffJSContext {
     /// Marks the own accessor `atom` of `obj` `.shadowable` (see the flag).
     @discardableResult
     func setOwnPropertyShadowable(_ obj: JeffJSValue, atom: UInt32) -> Bool {
-        guard let jsObj = obj.toObject(), let shape = jsObj.shape, let idx = findShapeProperty(shape, atom) else { return false }
+        guard let jsObj = obj.toObject() else { return false }
+        if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
+        guard let shape = jsObj.shape, let idx = findShapeProperty(shape, atom) else { return false }
         if shape.prop[idx].flags.contains(.shadowable) { return true }
         prepareShapeUpdate(self, jsObj)
         guard let s = jsObj.shape, idx < s.prop.count, s.prop[idx].atom == atom else { return false }
