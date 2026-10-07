@@ -490,6 +490,11 @@ enum JeffJSOpcode: UInt16, CaseIterable {
     case dup1                    // duplicate top and second element   (never emitted; parked in the wide range)
     case init_this               // super(...) result -> frame this (derived class constructors; wide range)
     case private_in              // `#x in obj`: obj key(private symbol | private method) -> bool
+    /// lazy_literal(u32 cpool index of the literal's JSON text, u32 byte
+    /// offset of the literal in the script source): a fresh lazy payload
+    /// for a large pure-data object/array literal (JeffJSLazyPayload.swift;
+    /// wide range).
+    case lazy_literal
 }
 
 // MARK: - Opcode Info Table
@@ -1265,6 +1270,8 @@ let jeffJSOpcodeInfo: [OpcodeInfo] = [
     // init_this: pop the parent constructor's result, bind it as `this`, push it back
     OpcodeInfo(name: "init_this",        size: 1, nPop: 1,  nPush: 1,  format: .none),
     OpcodeInfo(name: "private_in",       size: 1, nPop: 2,  nPush: 1,  format: .none),
+    // lazy_literal: size=9: 1 opcode + u32 cpool index + u32 source offset
+    OpcodeInfo(name: "lazy_literal",     size: 9, nPop: 0,  nPush: 1,  format: .const_),
 ]
 
 // MARK: - Opcode Lookup Helpers

@@ -352,6 +352,7 @@ struct JeffJSTestRunner {
             ("DOMNodeInterface", { $0.testDOMNodeInterface() }),
             ("Realms", { $0.testRealms() }),
             ("RealmsDOM", { $0.testRealmsDOM() }),
+            ("LazyPayload", { $0.testLazyPayload() }),
         ]
     }
 

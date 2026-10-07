@@ -446,6 +446,8 @@ nonisolated final class JeffJSRuntime {
     /// `sharedStringsCapacity`. perf/watch-object-size: homedepot kept ~10 k
     /// separate "" strings and thousands of "div"/"DIV"/"undefined".
     var sharedStrings: [String: JeffJSString] = [:]
+    /// Lazy JSON payloads: buffers and object records (JeffJSLazyPayload.swift).
+    let lazyPayload = JeffJSLazyPayloadState()
     /// Objects built while a context installs its intrinsics (`initComplete`
     /// false: prototypes, constructors, every builtin function, the global
     /// object). They are kept off the GC list on purpose (JeffJSObject.init), so
@@ -943,6 +945,7 @@ nonisolated final class JeffJSRuntime {
         // does not keep thousands of strings alive.
         atomJSStrings.removeAll()
         sharedStrings.removeAll()
+        lazyPayload.removeAll()
         symbolAtomStrings.removeAll()
         symbolAtoms.removeAll()
         for i in intKeyStrings.indices { intKeyStrings[i] = nil }

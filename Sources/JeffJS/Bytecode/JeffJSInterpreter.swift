@@ -2523,6 +2523,7 @@ extension JeffJSContext {
         // arrays, proxies and other exotic sources go through
         // [[OwnPropertyKeys]]; a plain object is one shape walk.
         if source.isNull || source.isUndefined { return true }
+        source.toObject()?.ensureLazyMaterialized()
 
         // Collect excluded property atoms
         var excludedAtoms = Set<UInt32>()
@@ -2537,7 +2538,7 @@ extension JeffJSContext {
             | JS_PROP_HAS_ENUMERABLE | JS_PROP_THROW
 
         if let srcObj = source.toObject(), srcObj.classID == JSClassID.JS_CLASS_OBJECT.rawValue,
-           srcObj._fastArrayValues == nil, srcObj.lazyFlags == 0, let shape = srcObj.shape {
+           srcObj._fastArrayValues == nil, (srcObj.lazyFlags & JeffJSObject.lazyActiveMask) == 0, let shape = srcObj.shape {
             // A getter can reshape the source, so the key list is snapshotted
             // first and plain data slots are dup'd up front.
             var pending: [(atom: UInt32, value: JeffJSValue?)] = []
@@ -2879,6 +2880,7 @@ extension JeffJSContext {
             return JeffJSForInKeyList(keys: keys)
         }
         guard let root = obj.toObject() else { return JeffJSForInKeyList(keys: []) }   // null / undefined
+        root.ensureLazyMaterialized()
         // A proxy enumerates its enumerable own string keys (ownKeys +
         // getOwnPropertyDescriptor traps). A throwing trap ends the loop.
         if root.classID == JeffJSClassID.proxy.rawValue {
@@ -7977,6 +7979,15 @@ struct JeffJSInterpreter {
                             }
                             pc += 2
                             continue dispatchLoop
+                        case .lazy_literal:
+                            // A large pure-data literal: a lazy payload over
+                            // its source span (JeffJSLazyPayload.swift).
+                            let v = ctx.lazyLiteralValue(fb: fb, cpoolIndex: Int(readU32(bc, pc + 2)),
+                                                         sourceOffset: Int(readU32(bc, pc + 6)))
+                            if v.isException { retVal = .exception; break dispatchLoop }
+                            buf[sp] = v; sp += 1
+                            pc += 2 + 8
+                            continue dispatchLoop
                         case .private_in:
                             // obj key -> bool
                             let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
@@ -8355,6 +8366,12 @@ struct JeffJSInterpreter {
                 let a = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); let b = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 buf[sp] = a; sp += 1; buf[sp] = b; sp += 1
                 pc += 1
+
+            case .lazy_literal:
+                // Wide opcode: only ever arrives through the 0x00 prefix.
+                _ = ctx.throwInternalError(message: "wide opcode dispatched directly at pc=\(pc)")
+                retVal = .exception
+                break dispatchLoop
 
             case .private_in:
                 // Wide opcode: normally dispatched through the 0x00 prefix

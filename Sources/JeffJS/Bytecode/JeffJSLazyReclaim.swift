@@ -178,6 +178,9 @@ extension JeffJSRuntime {
     @discardableResult
     func reclaimLazyBodiesNow(aggressive: Bool) -> (marked: Int, dropped: Int, bytes: Int) {
         guard inlineStackTop == 0 else { return (0, 0, 0) }
+        // Memory pressure also reverts untouched lazy JSON payload objects to
+        // their spans (JeffJSLazyPayload.swift); they rebuild on next read.
+        if aggressive { evictLazyPayloads() }
         if lazyReclaimCycle != nil {
             // Its stamps stay valid; only the phase parity must be restored.
             lazyReclaimCycle = nil

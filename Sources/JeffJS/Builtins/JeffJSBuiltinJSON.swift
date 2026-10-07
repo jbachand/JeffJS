@@ -136,6 +136,14 @@ struct JeffJSBuiltinJSON {
         // used as-is; other content is transcoded without a Swift String).
         let bytes = jeffJS_utf8Bytes(of: jsStr)
         ctx.freeValue(textStr)
+
+        // Large object/array texts without a reviver: a lazy payload
+        // (JeffJSLazyPayload.swift), built level by level as it is read.
+        // Malformed text, a `__proto__` key and a reviver take the eager
+        // parser below.
+        let hasReviver = args.count >= 2 && ctx.isFunction(args[1])
+        if !hasReviver, let lazy = ctx.lazyJSONParse(bytes: bytes) { return lazy }
+
         let state = JSONParseState(ctx: ctx, input: bytes, extJSON: false)
         defer { state.releaseStrings() }
 
@@ -521,7 +529,9 @@ struct JeffJSBuiltinJSON {
         }
 
         // If the number has no decimal or exponent and fits in Int32, use int
+        // (`-0` stays negative zero: ES §25.5.1, Object.is(JSON.parse("-0"), -0)).
         if !hasDecimal && !hasExponent {
+            if value == 0 && state.input[startPos] == 0x2D { return JeffJSValue.newFloat64(-0.0) }
             if value >= Double(Int32.min) && value <= Double(Int32.max) && value == value.rounded(.towardZero) {
                 return JeffJSValue.newInt32(Int32(value))
             }
@@ -582,8 +592,18 @@ struct JeffJSBuiltinJSON {
                 return value
             }
 
-            // Set property on the object
-            _ = state.ctx.setProperty(obj: obj, atom: keyAtom, value: value)
+            // Set property on the object. JSON.parse creates own data
+            // properties (ES §25.5.1 InternalizeJSONProperty /
+            // CreateDataProperty): a `__proto__` key is an ordinary own
+            // property, not the Object.prototype setter.
+            if keyAtom == JSPredefinedAtom.__proto__.rawValue {
+                _ = state.ctx.definePropertyValue(obj: obj, atom: keyAtom, value: value,
+                                                  flags: JS_PROP_C_W_E | JS_PROP_HAS_CONFIGURABLE
+                                                      | JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE)
+                value.freeValue()
+            } else {
+                _ = state.ctx.setProperty(obj: obj, atom: keyAtom, value: value)
+            }
             state.ctx.rt.freeAtom(keyAtom)
 
             state.skipWhitespace()
@@ -1219,6 +1239,7 @@ extension JeffJSContext {
             for k in keys { if let s = toSwiftString(k) { names.append(s) }; k.freeValue() }
             return names
         }
+        obj.toObject()?.ensureLazyMaterialized()
         guard let jsObj = obj.toObject(), let shape = jsObj.shape else { return [] }
         // Per ES spec §9.1.12: integer indices first (ascending), then string keys (insertion order).
         var intKeys: [(UInt32, String)] = []

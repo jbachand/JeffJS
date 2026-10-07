@@ -85,6 +85,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
 
     /// Shape for newly created plain arrays (class Array).
     var arrayShape: JeffJSShape?
+    /// Lazy payload stub shapes (JeffJSLazyPayload.swift), one count held.
+    var lazyObjectSentinel: JeffJSShape?
+    var lazyArraySentinel: JeffJSShape?
     /// Cached hashed root shape for plain `{}` objects (JS_CLASS_OBJECT with
     /// the default prototype) so `object` literals skip the transition-table
     /// walk. Revalidated on use (`isHashed`, same proto).
@@ -866,9 +869,11 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // shape never reaches zero — the runtime's teardown keeps a shape with
         // owners outside the dead group — and pins the runtime (ownerRuntime).
         for sh in [funcNameLengthShape, arrayIterShape, arrayShape, plainObjectRootShape,
-                   iterResultShape, regexpMatchShape] {
+                   iterResultShape, regexpMatchShape, lazyObjectSentinel, lazyArraySentinel] {
             if let sh { jeffJS_leaveShape(rt, sh) }
         }
+        lazyObjectSentinel = nil
+        lazyArraySentinel = nil
         for i in argumentsShapes.indices {
             if let sh = argumentsShapes[i] { jeffJS_leaveShape(rt, sh); argumentsShapes[i] = nil }
         }
@@ -1389,7 +1394,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         guard let jsObj = obj.toObject() else { return -1 }
         // A deferred own property must exist before it can be redefined,
         // otherwise the materialiser would later overwrite the new descriptor.
-        if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
+        if (jsObj.lazyFlags & JeffJSObject.lazyActiveMask) != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
 
         // Array exotic [[DefineOwnProperty]]: elements live in the fast
         // storage (with their attribute bits), and `length` shrinks the
@@ -1630,6 +1635,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// - Returns: True on success, false on error or non-configurable.
     func deleteProperty(obj: JeffJSValue, atom: UInt32, flags: Int = 0) -> Bool {
         guard let jsObj = obj.toObject() else { return false }
+        jsObj.ensureLazyMaterialized()
 
         // Proxy intercept: dispatch to handler.deleteProperty, matching the
         // `has`/`get`/`set` traps. Without this `delete proxy.x` silently hit
@@ -1669,7 +1675,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             }
         }
 
-        if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
+        if (jsObj.lazyFlags & JeffJSObject.lazyActiveMask) != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
         // `delete a[i]` on a fast array punches a hole in the element storage
         // (length is unchanged, `i in a` becomes false) — the element is not a
         // shape property, so the code below would silently do nothing.
@@ -1760,6 +1766,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// answered `false` and a throwing trap was swallowed outright.
     func hasPropertyEx(obj: JeffJSValue, atom: UInt32) -> Int {
         guard let jsObj = obj.toObject() else { return 0 }
+        jsObj.ensureLazyMaterialized()
 
         // Proxy intercept: if this object is a proxy, dispatch to handler.has trap
         if jsObj.classID == JeffJSClassID.proxy.rawValue || jsObj.classID == JSClassID.JS_CLASS_PROXY.rawValue {
@@ -1850,7 +1857,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         }
 
         // Lazily created own properties count as present
-        if jsObj.lazyFlags != 0 {
+        if (jsObj.lazyFlags & JeffJSObject.lazyActiveMask) != 0 {
             if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue { return 1 }
             if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) { return 1 }
             if jsObj.pendingStack != nil, atom == JeffJSAtomID.JS_ATOM_stack.rawValue { return 1 }
@@ -1885,7 +1892,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// - Returns: The property descriptor, or nil if not found.
     func getOwnProperty(obj: JeffJSValue, atom: UInt32) -> JeffJSProperty? {
         guard let jsObj = obj.toObject() else { return nil }
-        if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
+        if (jsObj.lazyFlags & JeffJSObject.lazyActiveMask) != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
         let (_, prop) = jeffJS_findOwnProperty(obj: jsObj, atom: atom)
         return prop
     }
@@ -1900,6 +1907,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// Materialise any deferred own property of `jsObj` that `atom` names.
     @inline(__always)
     func jeffJS_materializeLazyProps(_ jsObj: JeffJSObject, _ atom: UInt32) {
+        jsObj.ensureLazyMaterialized()
         if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
             materializeFunctionPrototype(jsObj)
         }
@@ -4936,6 +4944,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                                                      enumerableOnly: false) else { return .exception }
                 return self.newArrayFrom(keys)
             }
+            targetObj.ensureLazyMaterialized()
             if targetObj.needsLazyNameLength { self.materializeFunctionNameLength(targetObj) }
             if targetObj.needsLazyPrototype { self.materializeFunctionPrototype(targetObj) }
             var intKeys: [(UInt32, JeffJSValue)] = []
@@ -5197,6 +5206,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return .JS_UNDEFINED
         }
 
+        // A lazy payload stub builds its top level first (JeffJSLazyPayload.swift).
+        jsObj.ensureLazyMaterialized()
+
         // Proxy intercept: if this object is a proxy, dispatch to handler.get trap
         if jsObj.classID == JeffJSClassID.proxy.rawValue || jsObj.classID == JSClassID.JS_CLASS_PROXY.rawValue {
             if case .proxyData(let pd) = jsObj.payload {
@@ -5297,7 +5309,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // Lazily materialize `F.prototype = { constructor: F }` for plain
         // function closures (creation deferred at closure time — most
         // closures never have their prototype read).
-        if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
+        if (jsObj.lazyFlags & JeffJSObject.lazyActiveMask) != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
 
         // Check own properties via shape-based lookup (index form avoids
         // copying JeffJSProperty enums across the call boundary).
@@ -5405,7 +5417,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         }
 
         // Deferred own properties.
-        if jsObj.lazyFlags != 0 {
+        jsObj.ensureLazyMaterialized()
+        if (jsObj.lazyFlags & JeffJSObject.lazyActiveMask) != 0 {
         if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
             // `F.prototype = x` replaces the default `{ constructor: F }`
             // object outright, so don't build it first: that pair's
@@ -6217,6 +6230,10 @@ extension JeffJSObject {
     var proto: JeffJSObject? {
         get { return _proto }
         set {
+            // A lazy payload stub never serves as a prototype unmaterialized:
+            // prototype-chain walks read shapes directly.
+            newValue?.ensureLazyMaterialized()
+            ensureLazyMaterialized()
             _proto = newValue
             guard let s = shape else {
                 // No shape means nowhere to keep the count. Every creation
