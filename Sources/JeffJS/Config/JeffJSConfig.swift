@@ -276,6 +276,108 @@ enum JeffJSConfig {
     /// closure-heavy loop). A/B: `JEFFJS_INTERP_FASTFUNCTIONNAME=0`.
     static let fastFunctionName    = bool("interp.fastFunctionName",   default: true)
 
+    /// The fast trace runs `f.call(thisArg, …)` as a direct call of `f` (the
+    /// stack rewritten to a method call; bytecode `f` inline, native `f`
+    /// dispatched once) instead of a native call of Function.prototype.call
+    /// that re-entered callFunction with a sliced argument array (deepmerge's
+    /// `Object.hasOwnProperty.call` / `propertyIsEnumerable.call` /
+    /// `Object.prototype.toString.call`: ~2.9k → ~1k instructions). Watch CPU
+    /// fix (2026-10-07). A/B: `JEFFJS_INTERP_TRACECALLINTRINSIC=0`.
+    static let traceCallIntrinsic  = bool("interp.traceCallIntrinsic", default: true)
+
+    /// Native→JS calls of plain bytecode functions (array callbacks, promise
+    /// jobs, timers, `Function.prototype.call/apply`) skip work the
+    /// activation never needs: no materialised argument array on the frame
+    /// (a retain, a release and a uniqueness check per call), and
+    /// callFunction reaches callInternal without strong object / body
+    /// references. Watch CPU fix (2026-10-07). A/B: `JEFFJS_INTERP_LEANCALLENTRY=0`.
+    static let leanCallEntry       = bool("interp.leanCallEntry",      default: true)
+
+    /// Native calls from the VM stack pass their arguments in one reused
+    /// array per argument count, written in place (no append / removeAll /
+    /// memmove per call), and a shared empty array for no arguments.
+    /// Watch CPU fix (2026-10-07). A/B: `JEFFJS_INTERP_LEANNATIVEARGS=0`.
+    static let leanNativeArgs      = bool("interp.leanNativeArgs",     default: true)
+
+    /// `typeof` picks its cached result string by an index computed from the
+    /// value (it built a Swift String and matched it against eight literals
+    /// per evaluation). Watch CPU fix (2026-10-07). A/B: `JEFFJS_INTERP_FASTTYPEOF=0`.
+    static let fastTypeof          = bool("interp.fastTypeof",         default: true)
+
+    /// The runtime's cached JS string for a string atom (what Object.keys,
+    /// for-in and getOwnPropertyNames hand out) carries that atom as its
+    /// property key, and string keys are interned through the string
+    /// (`findAtom(jsString:)`, cached) by `in` and hasOwnProperty, so a key
+    /// read from Object.keys hits the keyed inline caches and the own-property
+    /// fast paths instead of re-hashing a Swift String per use (deepmerge's
+    /// `t in e`, `hasOwnProperty.call(e, t)`, `n[a] = …`).
+    /// Watch CPU fix (2026-10-07). A/B: `JEFFJS_INTERP_ATOMKEYSTRINGS=0`.
+    static let atomKeyStrings      = bool("interp.atomKeyStrings",     default: true)
+
+    /// `Object.prototype.propertyIsEnumerable` on an ordinary object with a
+    /// named key reads the enumerable bit off the shape instead of building
+    /// a descriptor object (~11k → ~1k instructions).
+    /// Watch CPU fix (2026-10-07). A/B: `JEFFJS_INTERP_FASTOWNPROPERTY=0`.
+    static let fastOwnProperty     = bool("interp.fastOwnProperty",    default: true)
+
+    /// Prototype-chain walks of [[Get]] and [[HasProperty]] read each
+    /// prototype as an unretained pointer (the shapes own the references)
+    /// instead of a retain/release pair per level.
+    /// Watch CPU fix (2026-10-07). A/B: `JEFFJS_INTERP_UNRETAINEDPROTOWALK=0`.
+    static let unretainedProtoWalk = bool("interp.unretainedProtoWalk", default: true)
+
+    /// String `===` / `==` compares interned keys by atom and everything else
+    /// with one memcmp (it copied both storage enums and compared the arrays
+    /// element by element). Watch CPU fix (2026-10-07).
+    /// A/B: `JEFFJS_INTERP_FASTSTRINGEQUALS=0`.
+    static let fastStringEquals    = bool("interp.fastStringEquals",   default: true)
+
+    /// Symbol values are counted like strings (one cast to the shared string
+    /// base) instead of a dynamic `as?` chain per dup/free (`e.$$typeof ===
+    /// REACT_ELEMENT_TYPE` paid two). Watch CPU fix (2026-10-07).
+    /// A/B: `JEFFJS_INTERP_FASTSYMBOLREFCOUNT=0`.
+    static let fastSymbolRefcount  = bool("interp.fastSymbolRefcount", default: true)
+
+    /// Closure creation keeps the root shape of plain closures on the context
+    /// (no hashed-shape lookup per closure) and finds a parent slot's live
+    /// var-ref with a plain loop (no per-element retain).
+    /// Watch CPU fix (2026-10-07). A/B: `JEFFJS_INTERP_FASTCLOSURE=0`.
+    static let fastClosure         = bool("interp.fastClosure",        default: true)
+
+    /// Plain arrays (own `length` only, prototype %Array.prototype%) skip the
+    /// generic lookups ArraySpeciesCreate and IsConcatSpreadable make when the
+    /// intrinsics are untouched (read off the shapes directly), and builtins
+    /// that return a new array fill its pooled element store in place.
+    /// Watch CPU fix (2026-10-07). A/B: `JEFFJS_INTERP_FASTSPECIES=0`.
+    static let fastSpecies         = bool("interp.fastSpecies",        default: true)
+
+    /// A frame's live var-refs that no closure holds any more when the frame
+    /// returns (the closure was a callback that already died) are parked
+    /// for the next closure instead of being detached into a copy nobody
+    /// can read (dup + GC-list insert + later removal and free).
+    /// Watch CPU fix (2026-10-07). A/B: `JEFFJS_INTERP_RECYCLEVARREFS=0`.
+    static let recycleVarRefs      = bool("interp.recycleVarRefs",     default: true)
+
+    /// An empty array literal (`object; array_from 0`: the object is a
+    /// sentinel array_from drops) creates the array directly instead of a
+    /// throwaway plain object plus the array. Watch CPU fix (2026-10-07).
+    /// A/B: `JEFFJS_INTERP_FASTARRAYLITERAL=0`.
+    static let fastArrayLiteral    = bool("interp.fastArrayLiteral",   default: true)
+
+    /// A closure's var-refs live only in its varRefsFast array (and the raw
+    /// mirror), not also in the payload enum, and a recycled closure keeps
+    /// that array's storage for the next closure built on it.
+    /// Watch CPU fix (2026-10-07). A/B: `JEFFJS_INTERP_LEANCLOSUREPAYLOAD=0`.
+    static let leanClosurePayload  = bool("interp.leanClosurePayload", default: true)
+
+    /// Adding an ordinary data property by assignment (`o[k] = v` on a key
+    /// the object lacks) goes straight to the shape transition and appends
+    /// the value (no property enum built and copied, no redundant own
+    /// lookup), and a keyed write that added its property does not
+    /// overwrite the site's inline-cache entry with the post-add shape.
+    /// Watch CPU fix (2026-10-07). A/B: `JEFFJS_INTERP_FASTPROPERTYADD=0`.
+    static let fastPropertyAdd     = bool("interp.fastPropertyAdd",    default: true)
+
     // MARK: - Trace Blocks
 
     static let traceHitThreshold   = int("trace.hitThreshold",         default: 2)

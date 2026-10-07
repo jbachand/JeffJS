@@ -504,6 +504,12 @@ struct JeffJSValue {
             let sb = unsafeBitCast(ptr, to: JeffJSStringBase.self)
             if sb.freeMark { JeffJSZombieDebug.reportString("DUP", "string rc=\(sb.refCount)", sb) }
             sb.refCount += 1
+        case Self._symbolTag where jeffJSFastSymbolRefcount:
+            // Every symbol payload is a JeffJSStringBase (flat / rope /
+            // buffer): one cast, no dynamic `as?` chain (interp.fastSymbolRefcount).
+            let sb = unsafeBitCast(ptr, to: JeffJSStringBase.self)
+            if sb.freeMark { JeffJSZombieDebug.reportString("DUP", "symbol rc=\(sb.refCount)", sb) }
+            sb.refCount += 1
         case Self._symbolTag:
             let ref = Unmanaged<AnyObject>.fromOpaque(ptr).takeUnretainedValue()
             if let s = ref as? JeffJSString {
@@ -601,6 +607,24 @@ struct JeffJSValue {
         case Self._stringTag:
             let sb = unsafeBitCast(ptr, to: JeffJSStringBase.self)
             if sb.freeMark { JeffJSZombieDebug.reportString("FREE", "string rc=\(sb.refCount)", sb) }
+            guard sb.refCount > 0 else { return }
+            sb.refCount -= 1
+            if sb.refCount == 0 {
+                if sb.kind == JeffJSStringBase.kindRope {
+                    let r = unsafeDowncast(sb, to: JeffJSStringRope.self)
+                    r.left.freeValue()
+                    r.right.freeValue()
+                }
+                if jeffJSZombiesEnabled {
+                    sb.freeMark = true
+                    JeffJSZombieDebug.stringKeepAlive.append(sb)
+                } else {
+                    Unmanaged.passUnretained(sb).release()
+                }
+            }
+        case Self._symbolTag where jeffJSFastSymbolRefcount:
+            let sb = unsafeBitCast(ptr, to: JeffJSStringBase.self)
+            if sb.freeMark { JeffJSZombieDebug.reportString("FREE", "symbol rc=\(sb.refCount)", sb) }
             guard sb.refCount > 0 else { return }
             sb.refCount -= 1
             if sb.refCount == 0 {

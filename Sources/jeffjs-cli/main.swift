@@ -314,6 +314,8 @@ func cliRunPage(env: JeffJSEnvironment, dir: String, bundlesDir: String?) -> (ra
     var ran = 0, errors = 0, skipped = 0
     let t0 = CFAbsoluteTimeGetCurrent()
     let verbose = ProcessInfo.processInfo.environment["JEFFJS_PAGE_VERBOSE"] != nil
+    // JEFFJS_PAGE_TIMES=1: wall time of every script's eval on stderr.
+    let times = ProcessInfo.processInfo.environment["JEFFJS_PAGE_TIMES"] != nil
     // The scripts' final text and name, in document order (nil: skipped).
     var items: [(code: String, name: String)?] = []
     for s in scripts {
@@ -351,7 +353,12 @@ func cliRunPage(env: JeffJSEnvironment, dir: String, bundlesDir: String?) -> (ra
     }
     for item in items {
         guard let (code, name) = item else { skipped += 1; continue }
+        let ts = CFAbsoluteTimeGetCurrent()
         let r = env.eval(code, filename: name)
+        if times {
+            FileHandle.standardError.write(String(format: "[page-time] %8.1f ms  %7d chars  %@\n",
+                (CFAbsoluteTimeGetCurrent() - ts) * 1000, code.utf16.count, String(name.suffix(90))).data(using: .utf8)!)
+        }
         ran += 1
         if case .exception(let msg) = r {
             errors += 1

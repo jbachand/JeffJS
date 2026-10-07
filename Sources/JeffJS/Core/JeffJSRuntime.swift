@@ -425,6 +425,10 @@ nonisolated final class JeffJSRuntime {
     /// Parked bytecode-function objects with their side boxes
     /// (jeffJS_recycleFunction); createClosure pops from it.
     var functionPool: [JeffJSObject] = []
+    /// interp.recycleVarRefs: live var-refs no closure held any more when
+    /// their frame went away (jeffJS_detachFrameVarRefs); createClosure
+    /// reuses them.
+    var varRefPool: [JeffJSVarRef] = []
     /// Recycled arrays (JeffJSObjectPool.swift): empty, `length` 0, no
     /// element storage, off the GC list.
     var arrayPool: [JeffJSObject] = []
@@ -433,6 +437,15 @@ nonisolated final class JeffJSRuntime {
     /// Spare argument array for native calls from the trace interpreter
     /// (`jeffJS_nativeCallFromSlots`): empty, capacity kept.
     var spareNativeArgs: [JeffJSValue] = []
+    /// interp.leanNativeArgs: one argument array per count (1–4), taken and
+    /// given back around each native call from the VM stack.
+    var nativeArgs1: [JeffJSValue] = []
+    var nativeArgs2: [JeffJSValue] = []
+    var nativeArgs3: [JeffJSValue] = []
+    var nativeArgs4: [JeffJSValue] = []
+    /// Spare `[element, index, array]` array for the array iteration
+    /// builtins' callbacks (takeCallbackArgs3); its values are borrowed bits.
+    var spareCallbackArgs3: [JeffJSValue] = []
     /// JS strings for atoms / small integer keys handed out by property
     /// enumeration (for-in, Object.keys): one string per atom instead of one
     /// per key per loop. Entries hold one JS reference (dropped in freeAtom).
