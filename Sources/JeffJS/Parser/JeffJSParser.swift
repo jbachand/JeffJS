@@ -2421,7 +2421,11 @@ nonisolated final class JeffJSParser {
         emitIfTrue(loopLabel)
         emitLabel(breakLabel)
 
-        expectSemicolon()
+        // ASI (ES §12.10.1 rule 1, third bullet): a semicolon is inserted after the
+        // `)` of a do-while even with no line break — `do x(); while (c) return l`
+        // (QuickJS: `if (s->token.val == ';') next_token(s)`). Minified graphql-js
+        // in foxnews's fennec.js failed with "Unexpected keyword 'return'".
+        if tok == 0x3B { next() }
     }
 
     // MARK: For Statement
@@ -6393,6 +6397,18 @@ nonisolated final class JeffJSParser {
     /// Source offsets of the `(` opened so far in the current lookahead.
     private var scanOpenParens: [Int] = []
 
+    /// One token of a lookahead. A lexing error (a regex the lookahead lexed as
+    /// a division after `)`: `(d=function(){for(x in e)/\d/.test(x)},c)`) leaves
+    /// the buffer where it was and the token empty, and every skip loop below
+    /// spun on it forever (foxnews: taboola's OvaMediaPlayer.js hung the main
+    /// thread). It ends the lookahead (EOF) instead; the error it reported is
+    /// dropped (the real parse lexes that spot in the right goal and reports
+    /// its own errors).
+    @inline(__always)
+    private func scanNextToken() {
+        if !s.nextToken() { s.token.type = JSTokenType.TOK_EOF.rawValue }
+    }
+
     /// Advance the arrow lookahead by one token, noting parens that close
     /// without a following `=>`.
     @inline(__always)
@@ -6403,7 +6419,7 @@ nonisolated final class JeffJSParser {
         case 0x29: closed = scanOpenParens.popLast() ?? -1
         default: break
         }
-        _ = s.nextToken()
+        scanNextToken()
         if closed >= 0 && s.token.type != JSTokenType.TOK_ARROW.rawValue {
             nonArrowParens.insert(closed)
         }
@@ -6420,6 +6436,8 @@ nonisolated final class JeffJSParser {
 
     private func scanFullArrowFromParenUncached() -> [(atom: JSAtom, isRest: Bool)]? {
         // Save full tokenizer state
+        let savedErrorMessage = s.lastErrorMessage, savedError = s.lastError
+        s.speculationDepth += 1
         let savedBufPtr   = s.bufPtr
         let savedLineNum  = s.lineNum
         let savedToken    = s.token
@@ -6443,6 +6461,9 @@ nonisolated final class JeffJSParser {
             s.lastPtr             = savedLastPtr
             s.lastLineNum         = savedLastLine
             s.templateNestLevel   = savedTmplNest
+            s.lastErrorMessage    = savedErrorMessage
+            s.lastError           = savedError
+            s.speculationDepth   -= 1
         }
 
         scanAdvance() // consume '(' in the lookahead
@@ -6648,6 +6669,8 @@ nonisolated final class JeffJSParser {
         // already rejected is not an ident-only arrow list either.
         if nonArrowParens.contains(s.lastPtr - 1) { return nil }
         // Save full tokenizer state
+        let savedErrorMessage = s.lastErrorMessage, savedError = s.lastError
+        s.speculationDepth += 1
         let savedBufPtr   = s.bufPtr
         let savedLineNum  = s.lineNum
         let savedToken    = s.token
@@ -6658,6 +6681,9 @@ nonisolated final class JeffJSParser {
 
         defer {
             // Restore tokenizer state unconditionally
+            s.lastErrorMessage    = savedErrorMessage
+            s.lastError           = savedError
+            s.speculationDepth   -= 1
             s.bufPtr              = savedBufPtr
             s.lineNum             = savedLineNum
             s.token               = savedToken
@@ -6680,13 +6706,13 @@ nonisolated final class JeffJSParser {
 
             // Rest parameter: '...' IDENT
             if curTok == JSTokenType.TOK_ELLIPSIS.rawValue {
-                _ = s.nextToken()
+                scanNextToken()
                 if s.token.type != JSTokenType.TOK_IDENT.rawValue { return nil }
                 params.append((atom: s.token.identAtom, isRest: true))
-                _ = s.nextToken()
+                scanNextToken()
                 // Must be followed by ')'
                 if s.token.type != 0x29 { return nil }
-                _ = s.nextToken()
+                scanNextToken()
                 // Must be followed by '=>'
                 return s.token.type == JSTokenType.TOK_ARROW.rawValue ? params : nil
             }
@@ -6696,12 +6722,12 @@ nonisolated final class JeffJSParser {
             let atom = s.token.identAtom
             params.append((atom: atom, isRest: false))
 
-            _ = s.nextToken()
+            scanNextToken()
 
             // Optional default value: '=' <expr>
             // We don't need to evaluate it, just skip balanced tokens up to ',' or ')'
             if s.token.type == 0x3D { // '='
-                _ = s.nextToken()
+                scanNextToken()
                 // Skip the default expression: balanced parens/brackets/braces until ',' or ')'
                 var depth = 0
                 while s.token.type != JSTokenType.TOK_EOF.rawValue {
@@ -6712,17 +6738,17 @@ nonisolated final class JeffJSParser {
                         depth -= 1
                     }
                     if depth == 0 && t == 0x2C { break } // ','
-                    _ = s.nextToken()
+                    scanNextToken()
                 }
             }
 
             let afterParam = s.token.type
             if afterParam == 0x2C { // ','
-                _ = s.nextToken()
+                scanNextToken()
                 continue
             }
             if afterParam == 0x29 { // ')'
-                _ = s.nextToken()
+                scanNextToken()
                 return s.token.type == JSTokenType.TOK_ARROW.rawValue ? params : nil
             }
             // Anything else means not an arrow param list

@@ -1483,6 +1483,28 @@ final class JeffJSDOMBridge {
             return JeffJSValue.undefined
         }, length: 1)
 
+        // removeAttributeNode(attr) -> attr (DOM §4.9): remove the attribute the Attr
+        // names from this element, NotFoundError when this element has none by
+        // that name. React 19 clears a singleton's (`<html>`/`<head>`/`<body>`)
+        // attributes with it after a hydration mismatch (nfl.com): it was undefined.
+        ctx.setPropertyFunc(obj: el, name: "removeAttributeNode", fn: { [weak self] ctx, thisVal, args in
+            guard let self, let targetNode = self.extractNode(from: thisVal) else { return .undefined }
+            guard let attr = args.first, attr.isObject else {
+                return ctx.throwTypeError(message: "Argument 1 ('attr') to Element.removeAttributeNode must be an instance of Attr")
+            }
+            let nameVal = ctx.getPropertyStr(obj: attr, name: "name")
+            let name = ctx.toSwiftString(nameVal) ?? ""
+            nameVal.freeValue()
+            guard !name.isEmpty, self.pageAttribute(targetNode, name.lowercased()) != nil
+                    || targetNode.attributes[name] != nil else {
+                return self.throwDOMException(ctx: ctx, name: "NotFoundError",
+                                              message: "The object can not be found here.")
+            }
+            self.removeAttributeValue(targetNode, name: name)
+            self.notifyMutation(for: targetNode)
+            return attr.dupValue()
+        }, length: 1)
+
         // hasAttribute(name) -> bool
         ctx.setPropertyFunc(obj: el, name: "hasAttribute", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.JS_FALSE }

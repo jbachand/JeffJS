@@ -119,6 +119,17 @@ nonisolated class JeffJSParseState {
     var lcCacheEnd: Int = 0
     var lcCacheLine: Int = 1
     var lcCacheLineStart: Int = 0
+    /// Line-start offsets, built once on the first backward `getLineCol` query
+    /// (speculative lookaheads report errors, then the tokenizer rewinds: every
+    /// later query used to rescan from byte 0).
+    var lineStartIndex: [Int]? = nil
+    /// The last syntax error reported (offset, message): a lookahead that
+    /// re-lexes the same spot reports it again; the repeat is a no-op.
+    var lastReportedErrorOffset: Int = -1
+    var lastReportedErrorText: String = ""
+    /// > 0 while the parser runs a lookahead (arrow parameter scans): lexing
+    /// errors there are not this script's errors and are neither recorded nor printed.
+    var speculationDepth: Int = 0
 
     // -- Parser flags --
     var curFunc: JeffJSFunctionDef?
@@ -308,19 +319,21 @@ func jeffJS_isIdentNext(_ c: UInt32) -> Bool {
     return false
 }
 
-/// Simplified Unicode letter check using Character properties.
-/// A full implementation would use the Unicode ID_Start / ID_Continue tables.
+/// IdentifierStartChar beyond ASCII (ES §12.7): Unicode `ID_Start`, which is
+/// the letter categories plus Nl and Other_ID_Start (℘ U+2118, ℮ U+212E,
+/// ゛ U+309B, ゜ U+309C). It was `Character.isLetter`, so cnn.com's inline
+/// script failed with "Invalid character '℘'".
 private func jeffJS_isUnicodeLetter(_ c: UInt32) -> Bool {
     guard let scalar = Unicode.Scalar(c) else { return false }
-    let ch = Character(scalar)
-    return ch.isLetter
+    return scalar.properties.isIDStart
 }
 
-/// Simplified Unicode identifier-continuation check.
+/// IdentifierPartChar beyond ASCII: Unicode `ID_Continue` (adds Mn, Mc, Nd,
+/// Pc and Other_ID_Continue — combining marks were rejected before) plus
+/// ZWNJ / ZWJ.
 private func jeffJS_isUnicodeIdentPart(_ c: UInt32) -> Bool {
     guard let scalar = Unicode.Scalar(c) else { return false }
-    let ch = Character(scalar)
-    return ch.isLetter || ch.isNumber ||
+    return scalar.properties.isIDContinue ||
            c == 0x200C || c == 0x200D  // ZWNJ, ZWJ
 }
 
@@ -463,7 +476,11 @@ extension JeffJSParseState {
     /// shows ~50 chars before and after the error position.
     private func getSourceSnippet(at offset: Int) -> (snippet: String, caretCol: Int)? {
         guard let line = getSourceLine(at: offset) else { return nil }
-        let (_, col) = getLineCol(offset)
+        // The line may be a window of a longer one (getSourceLine): the column
+        // within the text we have.
+        var ws = min(offset, bufLen)
+        while ws > 0 && min(offset, bufLen) - ws < 4096 && buf[ws - 1] != 0x0A && buf[ws - 1] != 0x0D { ws -= 1 }
+        let col = min(offset, bufLen) - ws + 1
 
         // Short line — return as-is
         if line.count <= 120 {
@@ -486,14 +503,17 @@ extension JeffJSParseState {
 
     private func getSourceLine(at offset: Int) -> String? {
         let clampedOffset = min(offset, bufLen)
-        // Find start of line
+        // Find start of line — at most 4 KB each way: the snippet shows ±50
+        // characters of a long line, and a minified one-line file made every
+        // report O(file size).
+        let window = 4096
         var start = clampedOffset
-        while start > 0 && buf[start - 1] != 0x0A && buf[start - 1] != 0x0D {
+        while start > 0 && clampedOffset - start < window && buf[start - 1] != 0x0A && buf[start - 1] != 0x0D {
             start -= 1
         }
         // Find end of line
         var end = clampedOffset
-        while end < bufLen && buf[end] != 0x0A && buf[end] != 0x0D {
+        while end < bufLen && end - clampedOffset < window && buf[end] != 0x0A && buf[end] != 0x0D {
             end += 1
         }
         guard end > start else { return nil }
@@ -512,6 +532,13 @@ extension JeffJSParseState {
 
     /// Report a syntax error at a specific offset.
     func syntaxErrorAt(_ offset: Int, _ msg: String, detail: String? = nil) {
+        // foxnews fix (2026-10-06): the arrow-parameter lookahead re-lexed one spot of
+        // a 300 KB one-line player script ~14 000 times per load (`unexpected
+        // character '\\'`); each report rescanned the buffer and printed a line.
+        if speculationDepth > 0 { return }
+        if offset == lastReportedErrorOffset, msg == lastReportedErrorText { return }
+        lastReportedErrorOffset = offset
+        lastReportedErrorText = msg
         let (line, col) = getLineCol(offset)
         var full = "\(filename):\(line):\(col): \(msg)"
         if let d = detail { full += " [\(d)]" }
@@ -550,6 +577,30 @@ extension JeffJSParseState {
         var lineStart = 0
         let end = min(offset, bufLen)
         var i = 0
+        if end < lcCacheEnd {
+            // Backward query: binary search a line-start index built once.
+            if lineStartIndex == nil {
+                var starts = [0]
+                var j = 0
+                while j < bufLen {
+                    if buf[j] == 0x0A { starts.append(j + 1) }
+                    else if buf[j] == 0x0D {
+                        if j + 1 < bufLen && buf[j + 1] == 0x0A { j += 1 }
+                        starts.append(j + 1)
+                    }
+                    j += 1
+                }
+                lineStartIndex = starts
+            }
+            if let starts = lineStartIndex {
+                var lo = 0, hi = starts.count - 1
+                while lo < hi {   // last start <= end
+                    let mid = (lo + hi + 1) / 2
+                    if starts[mid] <= end { lo = mid } else { hi = mid - 1 }
+                }
+                return (lo + 1, offset - starts[lo] + 1)
+            }
+        }
         if end >= lcCacheEnd {
             line = lcCacheLine; lineStart = lcCacheLineStart; i = lcCacheEnd
         }

@@ -1440,7 +1440,10 @@ struct JeffJSBuiltinMap {
             if let obj = ctorNew.toObject() { obj.isConstructor = true }
             let protoForCtor = ctx.classProto[classID]
             if protoForCtor.isObject {
-                _ = ctx.setPropertyStr(obj: ctorNew, name: "prototype", value: protoForCtor.dupValue())
+                // `prototype` is { writable: false, enumerable: false, configurable: false }
+                // (ES §24.1.2.1, §24.2.2.1, §24.3.2.1, §24.4.2.1); definePropertyValue dups.
+                _ = ctx.definePropertyValue(obj: ctorNew, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
+                                            value: protoForCtor, flags: 0)
                 _ = ctx.setPropertyStr(obj: protoForCtor, name: "constructor", value: ctorNew.dupValue())
             }
             _ = ctx.setPropertyStr(obj: ctx.globalObj, name: name, value: ctorNew)
@@ -1482,6 +1485,7 @@ struct JeffJSBuiltinMap {
             if mapCtor.isObject {
                 ctx.setPropertyFunc(obj: mapCtor, name: "groupBy", fn: js_map_groupBy, length: 2)
             }
+            mapCtor.freeValue()   // getPropertyStr dups
 
             // Explicit registration for Map.prototype.delete (JS keyword name).
             // The installFuncs table-driven path may fail to stick for keyword-

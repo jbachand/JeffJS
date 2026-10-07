@@ -456,6 +456,45 @@ func js_regexp_exec(
     return JeffJSValue.makeObject(resultArray)
 }
 
+// MARK: - RegExpExec (ES §22.2.7.1)
+
+/// `magic` of the intrinsic RegExp.prototype.exec (a `.generic` native never
+/// reads its magic): RegExpExec tells it apart from a page's own `exec`.
+let JEFFJS_REGEXP_EXEC_MAGIC: Int16 = 0x7E5E
+
+/// The `exec` RegExpExec must call instead of the builtin one: `R.exec` when
+/// it is callable and not the intrinsic (own or inherited), else nil (the
+/// caller keeps its native path). `.exception` when the read threw. The
+/// symbol methods used to run the builtin matcher whatever `exec` was, so
+/// core-js's fix-regexp-well-known-symbol-logic judged @@match / @@replace /
+/// @@search broken and replaced String.prototype.match / replace / search
+/// with JS wrappers on every page that ships it.
+func js_regexp_userExecFunction(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue? {
+    guard this.isObject else { return nil }
+    let ex = ctx.getProperty(obj: this, atom: JeffJSAtomID.JS_ATOM_exec.rawValue)
+    if ex.isException { return .exception }
+    if let o = ex.toObject(), o.isCallable {
+        if case .cFunc(_, _, _, _, let m) = o.payload, m == JEFFJS_REGEXP_EXEC_MAGIC {
+            ex.freeValue()
+            return nil
+        }
+        return ex
+    }
+    ex.freeValue()
+    return nil
+}
+
+/// RegExpExec with a resolved `exec` (see js_regexp_userExecFunction): calls
+/// it and requires an object or null (step 2.b); nil `userExec` = builtin.
+func js_regexp_execVia(ctx: JeffJSContext, this: JeffJSValue, input: JeffJSValue,
+                       userExec: JeffJSValue?) -> JeffJSValue {
+    guard let fn = userExec else { return js_regexp_exec(ctx: ctx, this: this, argv: [input]) }
+    let r = ctx.callFunction(fn, thisVal: this, args: [input])
+    if r.isException || r.isNull || r.isObject { return r }
+    r.freeValue()
+    return ctx.throwTypeError("exec result must be an object or null")
+}
+
 // MARK: - RegExp.prototype.test
 
 /// `RegExp.prototype.test(string)` -- shorthand for `exec !== null`.
@@ -466,7 +505,18 @@ func js_regexp_test(
     this: JeffJSValue,
     argv: [JeffJSValue]
 ) -> JeffJSValue {
-    let result = js_regexp_exec(ctx: ctx, this: this, argv: argv)
+    let userExec = js_regexp_userExecFunction(ctx: ctx, this: this)
+    if let u = userExec, u.isException { return .exception }
+    defer { userExec?.freeValue() }
+    let result: JeffJSValue
+    if let u = userExec {
+        let input = argv.first.map { ctx.toString($0) } ?? ctx.newStringValue("undefined")
+        if input.isException { return .exception }
+        result = js_regexp_execVia(ctx: ctx, this: this, input: input, userExec: u)
+        input.freeValue()
+    } else {
+        result = js_regexp_exec(ctx: ctx, this: this, argv: argv)
+    }
     if result.isException {
         return .exception
     }
@@ -830,10 +880,13 @@ func js_regexp_Symbol_match(
 
     let flags = js_regexp_getFlags(obj)
     let isGlobal = (flags & LRE_FLAG_GLOBAL) != 0
+    let userExec = js_regexp_userExecFunction(ctx: ctx, this: this)
+    if let u = userExec, u.isException { return .exception }
+    defer { userExec?.freeValue() }
 
     if !isGlobal {
-        // Non-global: single exec.
-        return js_regexp_exec(ctx: ctx, this: this, argv: [input.value])
+        // Non-global: single RegExpExec.
+        return js_regexp_execVia(ctx: ctx, this: this, input: input.value, userExec: userExec)
     }
 
     // Fast path: for standard RegExp with /g flag, bypass the full exec()
@@ -843,7 +896,7 @@ func js_regexp_Symbol_match(
     // - input string -> [UInt32] conversion
     // - REVirtualMachine instantiation
     // - full JS result object creation (index, input, groups properties)
-    if js_isStandardRegexp(obj) {
+    if userExec == nil, js_isStandardRegexp(obj) {
         let fastResult = js_regexp_globalMatchFast(ctx: ctx, obj: obj, inputStr: inputStr, flags: flags)
         if !fastResult.isException {
             return fastResult
@@ -863,7 +916,7 @@ func js_regexp_Symbol_match(
     while safetyLimit > 0 {
         safetyLimit -= 1
         // exec borrows its argument; the match array is ours.
-        let result = js_regexp_exec(ctx: ctx, this: this, argv: [input.value])
+        let result = js_regexp_execVia(ctx: ctx, this: this, input: input.value, userExec: userExec)
         if result.isException {
             for m in matches { m.freeValue() }
             return .exception
@@ -1149,6 +1202,9 @@ func js_regexp_Symbol_replace(
     if isGlobal {
         js_regexp_setLastIndex(obj, value: 0)
     }
+    let userExec = js_regexp_userExecFunction(ctx: ctx, this: this)
+    if let u = userExec, u.isException { return .exception }
+    defer { userExec?.freeValue() }
 
     let buf = JeffJSStringBuffer()
     var lastMatchEnd = 0
@@ -1162,7 +1218,7 @@ func js_regexp_Symbol_replace(
 
         // exec borrows its argument; the match array is ours (it leaked once
         // per match: every regex String.prototype.replace grew the heap).
-        let result = js_regexp_exec(ctx: ctx, this: this, argv: [input.value])
+        let result = js_regexp_execVia(ctx: ctx, this: this, input: input.value, userExec: userExec)
         if result.isException {
             buf.free()
             return .exception
@@ -1297,11 +1353,22 @@ func js_regexp_Symbol_search(
         return ctx.throwTypeError("[Symbol.search] called on non-object")
     }
 
+    let userExec = js_regexp_userExecFunction(ctx: ctx, this: this)
+    if let u = userExec, u.isException { return .exception }
+    defer { userExec?.freeValue() }
+
     // Save lastIndex.
     let savedLastIndex = js_regexp_getLastIndex(obj)
     js_regexp_setLastIndex(obj, value: 0)
 
-    let result = js_regexp_exec(ctx: ctx, this: this, argv: argv)
+    let result: JeffJSValue
+    if let u = userExec {
+        let input = argv.first.map { ctx.toString($0) } ?? ctx.newStringValue("undefined")
+        result = input.isException ? .exception : js_regexp_execVia(ctx: ctx, this: this, input: input, userExec: u)
+        input.freeValue()
+    } else {
+        result = js_regexp_exec(ctx: ctx, this: this, argv: argv)
+    }
 
     // Restore lastIndex.
     js_regexp_setLastIndex(obj, value: savedLastIndex)
@@ -1355,6 +1422,27 @@ func js_regexp_Symbol_split(
         limit = (d.isNaN || d.isInfinite || d < 0) ? 0 : (d > Double(UInt32.max) ? UInt32.max : UInt32(d))
     } else {
         limit = UInt32.max
+    }
+
+    // Not a plain RegExp (another class, a page `exec`, or a constructor /
+    // @@species that is not %RegExp%): the spec's splitter loop through
+    // RegExpExec (core-js probes exactly this and otherwise replaces
+    // String.prototype.split with a JS wrapper).
+    do {
+        var generic = obj.classID != JSClassID.JS_CLASS_REGEXP.rawValue
+        if !generic {
+            let u = js_regexp_userExecFunction(ctx: ctx, this: this)
+            if let u = u { u.freeValue(); if u.isException { return .exception } ; generic = true }
+        }
+        if !generic {
+            let c = ctx.getProperty(obj: this, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue)
+            if c.isException { return .exception }
+            generic = !(c.isUndefined || c.bits == ctx.regexpCtor.bits)
+            c.freeValue()
+        }
+        if generic {
+            return js_regexp_split_generic(ctx: ctx, rx: this, input: input.value, inputStr: inputStr, limit: limit)
+        }
     }
 
     if limit == 0 {
@@ -1470,6 +1558,98 @@ func js_regexp_Symbol_split(
                            value: .newInt32(Int32(results.count)))
 
     return arrVal
+}
+
+/// RegExp.prototype[@@split] steps 4-25 (ES §22.2.6.14) for a receiver that is
+/// not a plain RegExp: SpeciesConstructor, `flags` read through Get, a sticky
+/// splitter built with Construct, and RegExpExec at each position.
+private func js_regexp_split_generic(ctx: JeffJSContext, rx: JeffJSValue, input: JeffJSValue,
+                                     inputStr: JeffJSString, limit: UInt32) -> JeffJSValue {
+    // C = SpeciesConstructor(rx, %RegExp%)
+    var ctor = ctx.regexpCtor.dupValue()
+    let c = ctx.getProperty(obj: rx, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue)
+    if c.isException { ctor.freeValue(); return .exception }
+    if !c.isUndefined {
+        guard c.isObject else { c.freeValue(); ctor.freeValue(); return ctx.throwTypeError("object.constructor is not an object") }
+        let sp = ctx.getProperty(obj: c, atom: JeffJSAtomID.JS_ATOM_Symbol_species.rawValue)
+        c.freeValue()
+        if sp.isException { ctor.freeValue(); return .exception }
+        if !(sp.isUndefined || sp.isNull) {
+            guard ctx.isConstructor(sp) else { sp.freeValue(); ctor.freeValue(); return ctx.throwTypeError("object.constructor[Symbol.species] is not a constructor") }
+            ctor.freeValue(); ctor = sp
+        }
+    }
+    defer { ctor.freeValue() }
+    let flagsVal = ctx.getProperty(obj: rx, atom: JeffJSAtomID.JS_ATOM_flags.rawValue)
+    if flagsVal.isException { return .exception }
+    let flagsStrVal = ctx.toString(flagsVal)
+    flagsVal.freeValue()
+    if flagsStrVal.isException { return .exception }
+    let flags = flagsStrVal.stringValue?.toSwiftString() ?? ""
+    flagsStrVal.freeValue()
+    let unicodeMatching = flags.contains("u") || flags.contains("v")
+    let newFlags = ctx.newStringValue(flags.contains("y") ? flags : flags + "y")
+    let splitter = ctx.callConstructor(ctor, args: [rx, newFlags])
+    newFlags.freeValue()
+    if splitter.isException { return .exception }
+    defer { splitter.freeValue() }
+
+    var results: [JeffJSValue] = []
+    func finish() -> JeffJSValue {
+        let arrVal = ctx.newArray()
+        if let arr = arrVal.toObject() {
+            arr.payload = .array(size: UInt32(results.count), values: results, count: UInt32(results.count))
+            arr.fastArray = true
+        }
+        _ = ctx.setPropertyStr(obj: arrVal, name: "length", value: .newInt32(Int32(results.count)))
+        return arrVal
+    }
+    func fail() -> JeffJSValue { for r in results { r.freeValue() }; return .exception }
+    if limit == 0 { return finish() }
+    let userExec = js_regexp_userExecFunction(ctx: ctx, this: splitter)
+    if let u = userExec, u.isException { return .exception }
+    defer { userExec?.freeValue() }
+    let size = inputStr.len
+    if size == 0 {
+        let z = js_regexp_execVia(ctx: ctx, this: splitter, input: input, userExec: userExec)
+        if z.isException { return .exception }
+        let matched = !z.isNull
+        z.freeValue()
+        if !matched { results.append(input.dupValue()) }
+        return finish()
+    }
+    let lastIndexAtom = JeffJSAtomID.JS_ATOM_lastIndex.rawValue
+    var p = 0, q = 0
+    while q < size {
+        if ctx.setProperty(obj: splitter, atom: lastIndexAtom, value: .newInt32(Int32(q))) < 0 { return fail() }
+        let z = js_regexp_execVia(ctx: ctx, this: splitter, input: input, userExec: userExec)
+        if z.isException { return fail() }
+        if z.isNull { q = js_regexp_advanceIndex(inputStr, index: q, unicode: unicodeMatching); continue }
+        let liVal = ctx.getProperty(obj: splitter, atom: lastIndexAtom)
+        if liVal.isException { z.freeValue(); return fail() }
+        let e = Int(min(max(ctx.toLength(liVal), 0), Int64(size)))
+        liVal.freeValue()
+        if e == p { z.freeValue(); q = js_regexp_advanceIndex(inputStr, index: q, unicode: unicodeMatching); continue }
+        if let sub = jeffJS_subString(str: inputStr, start: p, end: q) { results.append(JeffJSValue.makeString(sub)) }
+        if UInt32(results.count) >= limit { z.freeValue(); return finish() }
+        p = e
+        let lenVal = ctx.getProperty(obj: z, atom: JeffJSAtomID.JS_ATOM_length.rawValue)
+        if lenVal.isException { z.freeValue(); return fail() }
+        let nCaps = max(Int(ctx.toLength(lenVal)) - 1, 0)
+        lenVal.freeValue()
+        if nCaps > 0 {
+            for i in 1 ... nCaps {
+                let cap = ctx.getPropertyUint32(obj: z, index: UInt32(i))
+                if cap.isException { z.freeValue(); return fail() }
+                results.append(cap)
+                if UInt32(results.count) >= limit { z.freeValue(); return finish() }
+            }
+        }
+        z.freeValue()
+        q = p
+    }
+    if let tail = jeffJS_subString(str: inputStr, start: p, end: size) { results.append(JeffJSValue.makeString(tail)) }
+    return finish()
 }
 
 /// `get RegExp[@@species]` -- returns the constructor.
