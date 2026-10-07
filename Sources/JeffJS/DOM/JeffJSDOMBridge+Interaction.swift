@@ -340,7 +340,7 @@ extension JeffJSDOMBridge {
         attributeChanged(node, name: key, oldValue: old, newValue: nil)
     }
 
-    private func attributeChanged(_ node: DOMNode, name: String, oldValue: String?, newValue: String?) {
+    func attributeChanged(_ node: DOMNode, name: String, oldValue: String?, newValue: String?) {
         queueAttributeRecord(target: node, name: name, oldValue: oldValue)
         // HTML §4.13.6: attributeChangedCallback reactions; DOM §4.2.2.4: a
         // slottable's `slot` / a slot's `name` changes the tree's assignment.

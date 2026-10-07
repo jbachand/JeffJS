@@ -57,6 +57,16 @@ extension JeffJSTestRunner {
         ("the google.com loader shape: await Promise.all(new Set([...])) in an async executor",
          "var p1 = Promise.resolve(1); var h = new Set(); h.add(p1); h.add(Promise.resolve(2)); new Promise(async function(res){ try { await Promise.all(h); res('chunk2'); } catch (e) { res('REJ ' + e); } }).then(function(v){ globalThis.__pi = v; });",
          "chunk2"),
+        // Promise.prototype.constructor === Promise (ES §27.2.5.1); it was
+        // missing, so PromiseResolve's `x.constructor === C` failed.
+        ("Promise.prototype.constructor and Promise.resolve(p) === p",
+         "var pp = Promise.resolve(5); var d = Object.getOwnPropertyDescriptor(Promise.prototype, 'constructor'); globalThis.__pi = String(Promise.prototype.constructor === Promise && pp.constructor === Promise && Promise.resolve(pp) === pp && d.writable && d.configurable && !d.enumerable);",
+         "true"),
+        // WeakMap / WeakSet constructors take an iterable (ES §24.3.1.1,
+        // §24.4.1.1); the placeholder constructors ignored it.
+        ("new WeakMap(iterable) / new WeakSet(iterable)",
+         "var k = {}, j = {}, it = false, n = {}; n[Symbol.iterator] = function () { return { next: function () { return { done: it = true }; } }; }; new WeakMap(n); var e1 = 'none', e2 = 'none'; try { new WeakMap([[1, 2]]); } catch (e) { e1 = e.constructor.name; } try { new WeakSet([1]); } catch (e) { e2 = e.constructor.name; } globalThis.__pi = [new WeakMap([[k, 7], [j, 8]]).get(j), new WeakSet([k]).has(k), it, e1, e2, WeakMap.prototype.constructor === WeakMap].join();",
+         "8,true,true,TypeError,TypeError,true"),
     ]
 
     mutating func testPromiseIterables() {

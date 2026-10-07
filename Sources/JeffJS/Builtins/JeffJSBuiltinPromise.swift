@@ -176,8 +176,17 @@ struct JeffJSBuiltinPromise {
                 ctx: c, newTarget: this, this: this, args: args)
         }
 
-        // Constructor.prototype = prototype
+        // Constructor.prototype = prototype, and Promise.prototype.constructor
+        // = Promise (ES §27.2.5.1: writable, configurable, not enumerable). It
+        // was missing, so `p.constructor` was Object and PromiseResolve's
+        // `x.constructor === C` test failed: `Promise.resolve(p) !== p`.
         ctx.setPropertyStr(obj: promiseCtor, name: "prototype", value: promiseProto)
+        do {
+            let atom = ctx.rt.findAtom("constructor")
+            _ = ctx.definePropertyValue(obj: promiseProto, atom: atom, value: promiseCtor,
+                                        flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)   // dups
+            ctx.rt.freeAtom(atom)
+        }
 
         // Static methods
         let resolveMethod = ctx.newCFunction(name: "resolve", length: 1) { c, this, args in

@@ -380,7 +380,13 @@ func js_map_constructor(_ ctx: JeffJSContext,
 /// (a Map entry that is not an object).
 private func js_map_addIterableElement(_ ctx: JeffJSContext, _ s: JeffJSMapState,
                                        _ elem: JeffJSValue, isSet: Bool, isWeak: Bool) -> Bool {
+    // The adder is WeakSet.prototype.add / WeakMap.prototype.set, which throw
+    // a TypeError for a key that cannot be held weakly (ES §24.3.3.5, §24.4.3.1).
     if isSet {
+        if isWeak && !elem.isObject {
+            _ = ctx.throwTypeError("WeakSet value must be an object")
+            return false
+        }
         let key = isWeak ? elem : normalizeKey(elem)
         if mapStateFind(s, key: key) < 0 {
             _ = mapStateInsert(s, key: key.dupValue(), value: .undefined)
@@ -395,6 +401,11 @@ private func js_map_addIterableElement(_ ctx: JeffJSContext, _ s: JeffJSMapState
     if pairKey.isException { return false }
     let pairVal = ctx.getPropertyUint32(obj: elem, index: 1)
     if pairVal.isException { pairKey.freeValue(); return false }
+    if isWeak && !pairKey.isObject {
+        pairKey.freeValue(); pairVal.freeValue()
+        _ = ctx.throwTypeError("WeakMap key must be an object")
+        return false
+    }
     let key = isWeak ? pairKey : normalizeKey(pairKey)
     let existing = mapStateFind(s, key: key)
     if existing >= 0 {
@@ -483,6 +494,10 @@ private func js_map_forEach_iterable(_ ctx: JeffJSContext,
         }
 
         if isSet {
+            if isWeak && !elem.isObject {
+                _ = ctx.throwTypeError("WeakSet value must be an object")
+                return false
+            }
             let key = isWeak ? elem : normalizeKey(elem)
             let existing = mapStateFind(s, key: key)
             if existing < 0 {
@@ -502,6 +517,10 @@ private func js_map_forEach_iterable(_ ctx: JeffJSContext,
                 pairKey = ctx.getPropertyUint32(obj: elem, index: 0)
                 pairVal = ctx.getPropertyUint32(obj: elem, index: 1)
                 if pairKey.isUndefined && pairVal.isUndefined { continue }
+            }
+            if isWeak && !pairKey.isObject {
+                _ = ctx.throwTypeError("WeakMap key must be an object")
+                return false
             }
             let key = isWeak ? pairKey : normalizeKey(pairKey)
             let val = pairVal
@@ -1398,30 +1417,34 @@ let js_map_iterator_proto_funcs: [JSMapFuncEntry] = [
 struct JeffJSBuiltinMap {
 
     static func addIntrinsic(ctx: JeffJSContext) {
-        // Replace the placeholder Map constructor (from addIntrinsicMapSet) with
-        // one that delegates to js_map_constructor so iterable arguments work.
-        let mapCtorNew = ctx.newCFunction({ c, thisVal, args in
-            return js_map_constructor(c, thisVal, args, Int(MAGIC_MAP))
-        }, name: "Map", length: 0)
-        if let obj = mapCtorNew.toObject() { obj.isConstructor = true }
-        let mapProtoForCtor = ctx.classProto[JSClassID.JS_CLASS_MAP.rawValue]
-        _ = ctx.setPropertyStr(obj: mapCtorNew, name: "prototype", value: mapProtoForCtor)
-        if mapProtoForCtor.isObject {
-            _ = ctx.setPropertyStr(obj: mapProtoForCtor, name: "constructor", value: mapCtorNew)
+        // Replace the placeholder constructors (from addIntrinsicMapSet) with
+        // ones that delegate to js_map_constructor, so iterable arguments work
+        // (ES §24.1.1.1, §24.2.2.1, §24.3.1.1, §24.4.1.1: AddEntriesFromIterable
+        // / the adder loop). WeakMap/WeakSet kept the placeholder, which
+        // ignored its argument: `new WeakMap([[k, v]]).get(k)` was undefined,
+        // and core-js, seeing no iteration, wrapped both constructors.
+        //
+        // Counts: classProto owns the prototype (`ctor.prototype` takes a dup);
+        // `proto.constructor` takes a dup of the constructor and the global the
+        // creation count. Without the dups, two references shared one count
+        // and replacing the global + `prototype.constructor` freed a
+        // constructor that was still referenced (target.com SIGSEGV).
+        for (magic, classID, name) in [(MAGIC_MAP, JSClassID.JS_CLASS_MAP.rawValue, "Map"),
+                                       (MAGIC_SET, JSClassID.JS_CLASS_SET.rawValue, "Set"),
+                                       (MAGIC_WEAKMAP, JSClassID.JS_CLASS_WEAKMAP.rawValue, "WeakMap"),
+                                       (MAGIC_WEAKSET, JSClassID.JS_CLASS_WEAKSET.rawValue, "WeakSet")] {
+            let m = Int(magic)
+            let ctorNew = ctx.newCFunction({ c, thisVal, args in
+                return js_map_constructor(c, thisVal, args, m)
+            }, name: name, length: 0)
+            if let obj = ctorNew.toObject() { obj.isConstructor = true }
+            let protoForCtor = ctx.classProto[classID]
+            if protoForCtor.isObject {
+                _ = ctx.setPropertyStr(obj: ctorNew, name: "prototype", value: protoForCtor.dupValue())
+                _ = ctx.setPropertyStr(obj: protoForCtor, name: "constructor", value: ctorNew.dupValue())
+            }
+            _ = ctx.setPropertyStr(obj: ctx.globalObj, name: name, value: ctorNew)
         }
-        _ = ctx.setPropertyStr(obj: ctx.globalObj, name: "Map", value: mapCtorNew)
-
-        // Replace the placeholder Set constructor with one that handles iterables.
-        let setCtorNew = ctx.newCFunction({ c, thisVal, args in
-            return js_map_constructor(c, thisVal, args, Int(MAGIC_SET))
-        }, name: "Set", length: 0)
-        if let obj = setCtorNew.toObject() { obj.isConstructor = true }
-        let setProtoForCtor = ctx.classProto[JSClassID.JS_CLASS_SET.rawValue]
-        _ = ctx.setPropertyStr(obj: setCtorNew, name: "prototype", value: setProtoForCtor)
-        if setProtoForCtor.isObject {
-            _ = ctx.setPropertyStr(obj: setProtoForCtor, name: "constructor", value: setCtorNew)
-        }
-        _ = ctx.setPropertyStr(obj: ctx.globalObj, name: "Set", value: setCtorNew)
 
         // Map.prototype methods
         // Iterator prototypes: inherit from %IteratorPrototype% (reached via

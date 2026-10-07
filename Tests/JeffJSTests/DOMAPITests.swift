@@ -238,6 +238,35 @@ final class DOMAPITests: XCTestCase {
         """), "false|true|false|x|true")
     }
 
+    /// DOM §4.9 namespaced attribute methods. React sets an SVG <use>'s
+    /// `xlink:href` with setAttributeNS; the method was missing on JeffJS and
+    /// the TypeError aborted target.com's commit (the whole tree unmounted).
+    @MainActor
+    func testNamespacedAttributeMethods() {
+        let env = makeEnvironment()
+        XCTAssertEqual(evalString(env, """
+        (function() {
+          var XL = 'http://www.w3.org/1999/xlink', SVG = 'http://www.w3.org/2000/svg';
+          var use = document.createElementNS(SVG, 'use');
+          use.setAttributeNS(XL, 'xlink:href', '#icon');
+          var r = [use.getAttribute('xlink:href'), use.getAttributeNS(XL, 'href'), use.hasAttributeNS(XL, 'href'),
+                   use.getAttributeNS(null, 'href'), use.getAttributeNames().join(',')];
+          use.setAttributeNS(null, 'viewBox', '0 0 1 1');
+          r.push(use.getAttribute('viewBox'), use.getAttributeNS('', 'viewBox'));
+          use.removeAttributeNS(XL, 'href');
+          r.push(use.hasAttribute('xlink:href'), use.getAttributeNS(XL, 'href'));
+          var errs = [];
+          try { use.setAttributeNS(null, 'a:b', 'x'); } catch (e) { errs.push(e.name); }
+          try { use.setAttributeNS(SVG, 'xmlns', 'x'); } catch (e) { errs.push(e.name); }
+          try { use.setAttributeNS(null, 'a b', 'x'); } catch (e) { errs.push(e.name); }
+          var div = document.createElement('div');
+          div.setAttributeNS(null, 'dataX', '1');   // no case folding, unlike setAttribute
+          r.push(errs.join('+'), div.getAttributeNames().join(','));
+          return r.join('|');
+        })()
+        """), "#icon|#icon|true||xlink:href|0 0 1 1|0 0 1 1|false||NamespaceError+NamespaceError+InvalidCharacterError|dataX")
+    }
+
     @MainActor
     func testCompareDocumentPosition() {
         let env = makeEnvironment()

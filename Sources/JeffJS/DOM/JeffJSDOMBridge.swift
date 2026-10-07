@@ -1696,6 +1696,72 @@ final class JeffJSDOMBridge {
             return .newBool(shouldSet)
         }, length: 2)
 
+        // Namespaced attribute methods (DOM §4.9). Attributes are stored by
+        // qualified name (the parser keeps `xlink:href` as written), so
+        // setAttributeNS stores `prefix:localName` without case folding and
+        // the readers look the qualified name up from (namespace, localName).
+        // They were missing: React sets an SVG <use>'s `xlink:href` with
+        // setAttributeNS, the TypeError aborted its commit and target.com's
+        // whole tree was unmounted.
+        ctx.setPropertyFunc(obj: el, name: "setAttributeNS", fn: { [weak self] ctx, thisVal, args in
+            guard let self, let targetNode = self.extractNode(from: thisVal) else { return .undefined }
+            let ns = self.namespaceArgument(ctx: ctx, args: args, index: 0)
+            let qualifiedName = args.count > 1 ? (ctx.toSwiftString(args[1]) ?? "") : "undefined"
+            let value = args.count > 2 ? (ctx.toSwiftString(args[2]) ?? "") : "undefined"
+            // "validate and extract" (DOM §1.4 / §4.9).
+            guard !qualifiedName.isEmpty, !qualifiedName.contains(where: { $0.isWhitespace || $0 == "<" || $0 == ">" || $0 == "\"" || $0 == "/" || $0 == "=" }),
+                  qualifiedName.split(separator: ":", omittingEmptySubsequences: false).count <= 2,
+                  !qualifiedName.hasPrefix(":"), !qualifiedName.hasSuffix(":") else {
+                return self.throwDOMException(ctx: ctx, name: "InvalidCharacterError",
+                    message: "Failed to execute 'setAttributeNS' on 'Element': '\(qualifiedName)' is not a valid qualified name.")
+            }
+            let parts = qualifiedName.split(separator: ":", maxSplits: 1).map(String.init)
+            let prefix: String? = parts.count == 2 ? parts[0] : nil
+            let nsError = (prefix != nil && ns == nil)
+                || (prefix == "xml" && ns != Self.xmlNamespace)
+                || ((qualifiedName == "xmlns" || prefix == "xmlns") && ns != Self.xmlnsNamespace)
+                || (ns == Self.xmlnsNamespace && qualifiedName != "xmlns" && prefix != "xmlns")
+            if nsError {
+                return self.throwDOMException(ctx: ctx, name: "NamespaceError",
+                    message: "Failed to execute 'setAttributeNS' on 'Element': '\(qualifiedName)' is not valid in namespace '\(ns ?? "null")'.")
+            }
+            let localName = parts.count == 2 ? parts[1] : parts[0]
+            let key = self.attributeKeyNS(targetNode, ns, localName) ?? (ns == nil ? localName : qualifiedName)
+            let old = targetNode.attributes[key]
+            targetNode.setAttributePreservingCase(name: key, value: value)
+            self.attributeChanged(targetNode, name: key, oldValue: old, newValue: value)
+            self.notifyMutation(for: targetNode)
+            return .undefined
+        }, length: 3)
+
+        ctx.setPropertyFunc(obj: el, name: "getAttributeNS", fn: { [weak self] ctx, thisVal, args in
+            guard let self, let targetNode = self.extractNode(from: thisVal) else { return .null }
+            let ns = self.namespaceArgument(ctx: ctx, args: args, index: 0)
+            let localName = args.count > 1 ? (ctx.toSwiftString(args[1]) ?? "") : "undefined"
+            guard let key = self.attributeKeyNS(targetNode, ns, localName),
+                  let value = targetNode.attributes[key] else { return .null }
+            return ctx.newStringValue(value)
+        }, length: 2)
+
+        ctx.setPropertyFunc(obj: el, name: "hasAttributeNS", fn: { [weak self] ctx, thisVal, args in
+            guard let self, let targetNode = self.extractNode(from: thisVal) else { return .newBool(false) }
+            let ns = self.namespaceArgument(ctx: ctx, args: args, index: 0)
+            let localName = args.count > 1 ? (ctx.toSwiftString(args[1]) ?? "") : "undefined"
+            return .newBool(self.attributeKeyNS(targetNode, ns, localName) != nil)
+        }, length: 2)
+
+        ctx.setPropertyFunc(obj: el, name: "removeAttributeNS", fn: { [weak self] ctx, thisVal, args in
+            guard let self, let targetNode = self.extractNode(from: thisVal) else { return .undefined }
+            let ns = self.namespaceArgument(ctx: ctx, args: args, index: 0)
+            let localName = args.count > 1 ? (ctx.toSwiftString(args[1]) ?? "") : "undefined"
+            guard let key = self.attributeKeyNS(targetNode, ns, localName),
+                  let old = targetNode.attributes[key] else { return .undefined }
+            targetNode.removeAttributePreservingCase(name: key)
+            self.attributeChanged(targetNode, name: key, oldValue: old, newValue: nil)
+            self.notifyMutation(for: targetNode)
+            return .undefined
+        }, length: 2)
+
         // compareDocumentPosition(other) -> bitmask (DISCONNECTED 1, PRECEDING 2,
         // FOLLOWING 4, CONTAINS 8, CONTAINED_BY 16)
         ctx.setPropertyFunc(obj: el, name: "compareDocumentPosition", fn: { [weak self] ctx, thisVal, args in
@@ -3397,6 +3463,40 @@ final class JeffJSDOMBridge {
     }
 
     /// Extracts a Swift string from args at the given index.
+    static let xmlNamespace = "http://www.w3.org/XML/1998/namespace"
+    static let xmlnsNamespace = "http://www.w3.org/2000/xmlns/"
+    static let xlinkNamespace = "http://www.w3.org/1999/xlink"
+
+    /// A namespace argument: null, undefined and "" are the null namespace.
+    func namespaceArgument(ctx: JeffJSContext, args: [JeffJSValue], index: Int) -> String? {
+        guard index < args.count, !args[index].isNull, !args[index].isUndefined,
+              let s = ctx.toSwiftString(args[index]), !s.isEmpty else { return nil }
+        return s
+    }
+
+    /// The stored (qualified-name) key of the attribute (namespace, localName),
+    /// or nil. Storage is by qualified name, so a namespace is matched through
+    /// its conventional prefix (xlink:, xml:, xmlns:) and, for any other
+    /// namespace, through any prefixed name with that local name.
+    func attributeKeyNS(_ node: DOMNode, _ ns: String?, _ localName: String) -> String? {
+        let attrs = node.attributes
+        switch ns {
+        case nil:
+            return attrs[localName] != nil ? localName : nil
+        case Self.xlinkNamespace?:
+            return attrs["xlink:" + localName] != nil ? "xlink:" + localName : nil
+        case Self.xmlNamespace?:
+            return attrs["xml:" + localName] != nil ? "xml:" + localName : nil
+        case Self.xmlnsNamespace?:
+            let k = localName == "xmlns" ? "xmlns" : "xmlns:" + localName
+            return attrs[k] != nil ? k : nil
+        default:
+            let suffix = ":" + localName
+            return node.orderedAttributeNames.first { $0.hasSuffix(suffix) && !$0.hasPrefix("xlink:")
+                && !$0.hasPrefix("xml:") && !$0.hasPrefix("xmlns:") }
+        }
+    }
+
     func extractString(ctx: JeffJSContext, args: [JeffJSValue], index: Int) -> String? {
         guard index < args.count else { return nil }
         let val = args[index]

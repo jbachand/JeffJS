@@ -142,6 +142,48 @@ extension JeffJSTestRunner {
                 /1/.exec(12).input === "12" && /a/.exec({ toString() { return "zaz"; } }).index === 1
             """)
 
+        // Builtin constructor links: `ctor.prototype`, `prototype.constructor`
+        // and the global binding shared counts (Map/Set/WeakMap/WeakSet/RegExp
+        // placeholders and their replacements, Date), so a page that replaced
+        // the global and `prototype.constructor` — core-js's collection
+        // polyfills, which then call the saved native constructor — freed it
+        // while still referenced (target.com: SIGSEGV in `new s` after
+        // `To("WeakSet", …)`). Own runtime: the case rewrites the globals.
+        let rtCtors = JeffJSRuntime()
+        let ctxCtors = rtCtors.newContext()
+        evalNoFreedTouches(ctxCtors, "builtin constructors outlive their global + prototype.constructor links", """
+            var gopd = Object.getOwnPropertyDescriptor, defp = Object.defineProperty;
+            var names = Object.getOwnPropertyNames(globalThis), keep = {}, count = 0;
+            for (var i = 0; i < names.length; i++) {
+                var n = names[i], d = gopd(globalThis, n);
+                if (!d || !("value" in d) || typeof d.value !== "function") continue;
+                var C = d.value, P = C.prototype; keep[n] = C; count++;
+                if (P && typeof P === "object" && P.constructor === C)
+                    try { defp(P, "constructor", { value: function () {}, writable: true, configurable: true }); } catch (e) {}
+                try { defp(globalThis, n, { value: function () {}, writable: true, configurable: true }); } catch (e) {}
+            }
+            var ok = count > 50;
+            for (var k in keep) ok = ok && typeof keep[k] === "function" && typeof keep[k].name === "string";
+            var k1 = {}, k2 = {};
+            ok && new keep.WeakMap([[k1, 1]]).get(k1) === 1 && new keep.WeakSet([k2]).has(k2) &&
+                new keep.Map([[1, 2]]).get(1) === 2 && new keep.Set([3]).has(3) &&
+                new keep.RegExp("a+").test("caa") && new keep.Date(0).getTime() === 0
+            """)
+        evalNoFreedTouches(ctxCtors, "core-js collection wrapper keeps the native constructor", """
+            function wrap(name) {
+                var s = keep[name] || globalThis[name], c = s.prototype;
+                var f = function () { var r = new s(); return r; };
+                f.prototype = c; c.constructor = f;
+                defp(globalThis, name, { value: f, writable: true, configurable: true });   // `Object` is a stub by now
+                return f;
+            }
+            var W = wrap("WeakSet"), M = wrap("WeakMap"), o = {}, ok = true;
+            for (var i = 0; i < 5; i++) { var ws = new W(); ws.add(o); var wm = new M(); wm.set(o, i);
+                ok = ok && ws.has(o) && wm.get(o) === i; }
+            ok
+            """)
+        _ = rtCtors
+
         _ = rt
         testDeadPrototypeShapes()
     }

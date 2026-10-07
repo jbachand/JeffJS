@@ -1437,13 +1437,15 @@ func jeffJS_initDate(ctx: JeffJSContext, globalObj: JeffJSObject) {
         atom: JeffJSAtomID.JS_ATOM_prototype.rawValue,
         value: dateProtoVal)
 
-    // Date.prototype.constructor = Date
+    // Date.prototype.constructor = Date. Its own count: the global below takes
+    // the creation count (both shared one, so replacing `Date` and
+    // `Date.prototype.constructor` freed a constructor still referenced).
     jeffJS_addProperty(ctx: ctx, obj: dateProto,
                        atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
                        flags: [.writable, .configurable])
     dateProto.setOwnPropertyValue(
         atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
-        value: JeffJSValue.makeObject(dateCtor))
+        value: JeffJSValue.makeObject(dateCtor).dupValue())
 
     // Static methods
     jeffJS_defineBuiltinFunc(ctx: ctx, obj: dateCtor, name: "now", length: 0, func: jsDate_now)

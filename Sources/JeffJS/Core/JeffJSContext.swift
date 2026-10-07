@@ -2590,9 +2590,13 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                                          argv: [pattern, flags])
         }, name: "RegExp", length: 2)
 
-        // Wire RegExp.prototype <-> RegExp constructor
-        _ = setPropertyStr(obj: regexpCtor, name: "prototype", value: regexpProto)
-        _ = setPropertyStr(obj: regexpProto, name: "constructor", value: regexpCtor)
+        // Wire RegExp.prototype <-> RegExp constructor. setPropertyStr consumes
+        // its value: classProto and `regexpCtor` keep their own counts, so each
+        // link takes one (the links were uncounted: a page that replaced
+        // RegExp and RegExp.prototype.constructor — core-js does — freed the
+        // constructor `regexpCtor` still pointed at).
+        _ = setPropertyStr(obj: regexpCtor, name: "prototype", value: regexpProto.dupValue())
+        _ = setPropertyStr(obj: regexpProto, name: "constructor", value: regexpCtor.dupValue())
 
         _ = setPropertyStr(obj: globalObj, name: "RegExp", value: regexpCtor.dupValue())
 
@@ -2788,6 +2792,13 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
 
     /// Adds Map, Set, WeakMap, and WeakSet.
     /// Mirrors `JS_AddIntrinsicMapSet()` from QuickJS.
+    ///
+    /// Counts: `classProto` owns each prototype, so `ctor.prototype` takes a
+    /// dup; the constructor is referenced by `proto.constructor` (a dup) and
+    /// the global (the creation count). These links were uncounted — one
+    /// count for two (three) references — so a page that replaced the global
+    /// and `prototype.constructor` (core-js's collection polyfills, target.com)
+    /// freed a constructor its closures still called: SIGSEGV.
     func addIntrinsicMapSet() {
         // Map
         let mapProto = newObjectClass(classID: JSClassID.JS_CLASS_OBJECT.rawValue)
@@ -2797,8 +2808,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return self.newMapOrSetObject(classID: JSClassID.JS_CLASS_MAP.rawValue, isWeak: false)
         }, name: "Map", length: 0)
         // Wire Map.prototype <-> Map constructor
-        _ = setPropertyStr(obj: mapCtor, name: "prototype", value: mapProto)
-        _ = setPropertyStr(obj: mapProto, name: "constructor", value: mapCtor)
+        _ = setPropertyStr(obj: mapCtor, name: "prototype", value: mapProto.dupValue())
+        _ = setPropertyStr(obj: mapProto, name: "constructor", value: mapCtor.dupValue())
         _ = setPropertyStr(obj: globalObj, name: "Map", value: mapCtor)
 
         // Set
@@ -2809,8 +2820,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return self.newMapOrSetObject(classID: JSClassID.JS_CLASS_SET.rawValue, isWeak: false)
         }, name: "Set", length: 0)
         // Wire Set.prototype <-> Set constructor
-        _ = setPropertyStr(obj: setCtor, name: "prototype", value: setProto)
-        _ = setPropertyStr(obj: setProto, name: "constructor", value: setCtor)
+        _ = setPropertyStr(obj: setCtor, name: "prototype", value: setProto.dupValue())
+        _ = setPropertyStr(obj: setProto, name: "constructor", value: setCtor.dupValue())
         _ = setPropertyStr(obj: globalObj, name: "Set", value: setCtor)
 
         // WeakMap
@@ -2821,8 +2832,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return self.newMapOrSetObject(classID: JSClassID.JS_CLASS_WEAKMAP.rawValue, isWeak: true)
         }, name: "WeakMap", length: 0)
         // Wire WeakMap.prototype <-> WeakMap constructor
-        _ = setPropertyStr(obj: weakMapCtor, name: "prototype", value: weakMapProto)
-        _ = setPropertyStr(obj: weakMapProto, name: "constructor", value: weakMapCtor)
+        _ = setPropertyStr(obj: weakMapCtor, name: "prototype", value: weakMapProto.dupValue())
+        _ = setPropertyStr(obj: weakMapProto, name: "constructor", value: weakMapCtor.dupValue())
         _ = setPropertyStr(obj: globalObj, name: "WeakMap", value: weakMapCtor)
 
         // WeakSet
@@ -2833,8 +2844,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return self.newMapOrSetObject(classID: JSClassID.JS_CLASS_WEAKSET.rawValue, isWeak: true)
         }, name: "WeakSet", length: 0)
         // Wire WeakSet.prototype <-> WeakSet constructor
-        _ = setPropertyStr(obj: weakSetCtor, name: "prototype", value: weakSetProto)
-        _ = setPropertyStr(obj: weakSetProto, name: "constructor", value: weakSetCtor)
+        _ = setPropertyStr(obj: weakSetCtor, name: "prototype", value: weakSetProto.dupValue())
+        _ = setPropertyStr(obj: weakSetProto, name: "constructor", value: weakSetCtor.dupValue())
         _ = setPropertyStr(obj: globalObj, name: "WeakSet", value: weakSetCtor)
 
         // Iterator helpers
