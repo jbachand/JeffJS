@@ -1864,12 +1864,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         }
 
         // Lazily created own properties count as present
-<<<<<<< HEAD
-        if (jsObj.lazyFlags & JeffJSObject.lazyActiveMask) != 0 {
-=======
         if (jsObj.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(jsObj) }
-        if jsObj.lazyFlags != 0 {
->>>>>>> d5836c1
+        if (jsObj.lazyFlags & JeffJSObject.lazyActiveMask) != 0 {
             if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue { return 1 }
             if jsObj.needsLazyNameLength, jeffJS_isLazyFuncPropAtom(atom) { return 1 }
             if jsObj.pendingStack != nil, atom == JeffJSAtomID.JS_ATOM_stack.rawValue { return 1 }
@@ -1920,11 +1916,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// Materialise any deferred own property of `jsObj` that `atom` names.
     @inline(__always)
     func jeffJS_materializeLazyProps(_ jsObj: JeffJSObject, _ atom: UInt32) {
-<<<<<<< HEAD
-        jsObj.ensureLazyMaterialized()
-=======
         if (jsObj.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(jsObj) }
->>>>>>> d5836c1
+        jsObj.ensureLazyMaterialized()
         if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
             materializeFunctionPrototype(jsObj)
         }
@@ -5009,11 +5002,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                                                      enumerableOnly: false) else { return .exception }
                 return self.newArrayFrom(keys)
             }
-<<<<<<< HEAD
-            targetObj.ensureLazyMaterialized()
-=======
             if (targetObj.lazyFlags & JeffJSObject.lazyHostBit) != 0 { self.materializeHostLazyProps(targetObj) }
->>>>>>> d5836c1
+            targetObj.ensureLazyMaterialized()
             if targetObj.needsLazyNameLength { self.materializeFunctionNameLength(targetObj) }
             if targetObj.needsLazyPrototype { self.materializeFunctionPrototype(targetObj) }
             var intKeys: [(UInt32, JeffJSValue)] = []
@@ -5485,15 +5475,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             return -1
         }
 
-<<<<<<< HEAD
+        if (jsObj.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(jsObj) }
         // Deferred own properties (a lazy payload stub builds its top level).
         if (jsObj.lazyFlags & JeffJSObject.lazyActiveMask) != 0 {
         jsObj.ensureLazyMaterialized()
-=======
-        // Deferred own properties.
-        if (jsObj.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(jsObj) }
-        if jsObj.lazyFlags != 0 {
->>>>>>> d5836c1
         if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
             // `F.prototype = x` replaces the default `{ constructor: F }`
             // object outright, so don't build it first: that pair's
