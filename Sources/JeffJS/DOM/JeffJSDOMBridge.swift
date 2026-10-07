@@ -81,6 +81,12 @@ final class JeffJSDOMBridge {
     var unknownElementInterfacePrototype: JeffJSValue?
     var textInterfacePrototype: JeffJSValue?
     var commentInterfacePrototype: JeffJSValue?
+    /// The engine's own Text / Comment wrapper prototypes and their common
+    /// CharacterData prototype (`JeffJSDOMBridge+CharacterData.swift`), used
+    /// while the host has handed over none.
+    var engineCharacterDataBase: JeffJSValue?
+    var engineTextPrototype: JeffJSValue?
+    var engineCommentPrototype: JeffJSValue?
 
     /// `ShadowRoot.prototype` (chains to the element prototype): shadow root
     /// wrappers get it in `wrapElement` (`JeffJSDOMBridge+Shadow.swift`).
@@ -277,6 +283,9 @@ final class JeffJSDOMBridge {
         unknownElementInterfacePrototype?.freeValue(); unknownElementInterfacePrototype = nil
         textInterfacePrototype?.freeValue(); textInterfacePrototype = nil
         commentInterfacePrototype?.freeValue(); commentInterfacePrototype = nil
+        engineTextPrototype?.freeValue(); engineTextPrototype = nil
+        engineCommentPrototype?.freeValue(); engineCommentPrototype = nil
+        engineCharacterDataBase?.freeValue(); engineCharacterDataBase = nil
         shadowRootPrototype?.freeValue()
         shadowRootPrototype = nil
         customElementHook?.freeValue()
@@ -1272,16 +1281,25 @@ final class JeffJSDOMBridge {
     }
 
     /// The interface prototype of `node`'s wrapper (nil = the shared element prototype).
+    /// Text and Comment nodes (not a doctype) get the host's interface prototype,
+    /// else the engine's own, which carry the CharacterData members (DOM §4.10).
     func interfacePrototype(for node: DOMNode) -> JeffJSValue? {
-        if interfacePrototypesByTag.isEmpty && textInterfacePrototype == nil { return nil }
+        switch node.nodeType {
+        case .text, .comment:
+            if node.isDocumentType { return nil }
+            let text = node.nodeType == .text
+            if let p = text ? textInterfacePrototype : commentInterfacePrototype { return p }
+            guard let shared = elementPrototype, let ctx = jsContext else { return nil }
+            return engineCharacterDataPrototype(text: text, shared: shared, ctx: ctx)
+        default: break
+        }
+        if interfacePrototypesByTag.isEmpty { return nil }
         switch node.nodeType {
         case .element:
             guard node.isHTMLNamespace, !node.isShadowRoot, let tag = node.tagName?.lowercased() else { return nil }
             if let p = interfacePrototypesByTag[tag] { return p }
             if tag.contains("-") { return nil }          // valid custom element name: HTMLElement
             return unknownElementInterfacePrototype
-        case .text: return textInterfacePrototype
-        case .comment: return commentInterfacePrototype
         default: return nil
         }
     }
@@ -1310,11 +1328,19 @@ final class JeffJSDOMBridge {
             self.textInterfacePrototype = protoOK(args[2]) ? args[2].dupValue() : nil
             self.commentInterfacePrototype?.freeValue()
             self.commentInterfacePrototype = protoOK(args[3]) ? args[3].dupValue() : nil
-            // Re-home the wrappers made before (they still have the shared prototype).
+            // DOM §4.10 / §4.11: the CharacterData and Text members live on these
+            // interface prototypes (over any stub the host left there).
+            self.installCharacterDataMembers(text: self.textInterfacePrototype, comment: self.commentInterfacePrototype,
+                                             shared: shared, ctx: ctx)
+            // Re-home the wrappers made before (they still have the shared prototype,
+            // or the engine's own Text / Comment prototype).
             let sharedObj = shared.toObject()
+            let engineText = self.engineTextPrototype?.toObject(), engineComment = self.engineCommentPrototype?.toObject()
             for (id, w) in self.elementCache {
-                guard let o = w.toObject(), o.proto === sharedObj, let node = self.nodeRegistry[id],
-                      let p = self.interfacePrototype(for: node) else { continue }
+                guard let o = w.toObject(), let op = o.proto,
+                      op === sharedObj || (engineText != nil && op === engineText) || (engineComment != nil && op === engineComment),
+                      let node = self.nodeRegistry[id], let p = self.interfacePrototype(for: node),
+                      p.toObject() !== op else { continue }
                 _ = ctx.setPrototypeOf(w, proto: p)
             }
             return .newBool(true)
