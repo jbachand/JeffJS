@@ -144,4 +144,22 @@ final class PrecompilerTests: XCTestCase {
         XCTAssertNil(jeffJS_threadOwnerRuntime())
         rt.runGC()
     }
+
+    /// The worker-thread path hosts use (`enqueue`): the entry appears in
+    /// the shared disk tier and a runtime on it maps it.
+    func testEnqueueWritesTheSharedTier() throws {
+        guard let store = JeffJSBytecodeDiskStore.shared else { throw XCTSkip("no disk tier") }
+        let file = "https://example.test/enqueue-\(UUID().uuidString).js"
+        let src = "function e1(a) { return a * 7 } e1(6)"
+        JeffJSPrecompiler.enqueue(src, filename: file)
+        let url = store.url(for: JeffJSBytecodeCache.key(source: src, filename: file, evalFlags: 0).hash)
+        let deadline = Date().addingTimeInterval(20)
+        while !FileManager.default.fileExists(atPath: url.path) && Date() < deadline { usleep(10_000) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        let rt = JeffJSRuntime(); rt.bytecodeCache.diskStore = store
+        let ctx = rt.newContext()
+        XCTAssertEqual(describe(ctx, ctx.eval(input: src, filename: file, evalFlags: 0)), "42")
+        XCTAssertEqual(rt.bytecodeCache.diskHitCount, 1)
+        store.remove(JeffJSBytecodeCache.key(source: src, filename: file, evalFlags: 0).hash)
+    }
 }

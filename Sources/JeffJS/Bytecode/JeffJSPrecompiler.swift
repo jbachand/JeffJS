@@ -56,6 +56,40 @@ public enum JeffJSPrecompiler {
         return (_compiled, _compileMs, _sourceBytes)
     }
 
+    // MARK: - Worker thread
+
+    /// Jobs for the worker, FIFO (document order as the host enqueues them).
+    nonisolated(unsafe) private static var queue: [(source: String, filename: String, evalFlags: Int)] = []
+    nonisolated(unsafe) private static var workerRunning = false
+    private static let queueLock = NSLock()
+
+    /// Queue `source` for a precompile on the engine's worker thread (16 MB
+    /// stack: the parser recurses; Swift concurrency's pool threads have
+    /// 512 KB). Returns at once; the worker exits when the queue is empty.
+    /// Call it from wherever the host has the final text (any thread).
+    public static func enqueue(_ source: String, filename: String, evalFlags: Int = 0) {
+        guard JeffJSConfig.compileOffThreadPrecompile, JeffJSBytecodeDiskStore.shared != nil else { return }
+        queueLock.lock()
+        queue.append((source, filename, evalFlags))
+        let start = !workerRunning
+        if start { workerRunning = true }
+        queueLock.unlock()
+        guard start else { return }
+        let th = Thread {
+            while true {
+                queueLock.lock()
+                if queue.isEmpty { workerRunning = false; queueLock.unlock(); return }
+                let job = queue.removeFirst()
+                queueLock.unlock()
+                _ = precompileScript(job.source, filename: job.filename, evalFlags: job.evalFlags)
+            }
+        }
+        th.name = "jeffjs.precompile"
+        th.stackSize = 16 << 20
+        th.qualityOfService = .userInitiated   // the JS thread may wait on it
+        th.start()
+    }
+
     /// Compile `source` as a classic script (`evalFlags` as the eval will
     /// use, 0 = global) under `filename` into the disk tier, on the calling
     /// thread. Never call it on a thread that is running JS.
