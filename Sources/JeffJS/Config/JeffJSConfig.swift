@@ -288,6 +288,26 @@ enum JeffJSConfig {
     static let defaultStackSize    = int("stack.defaultSize",          default: 1024 * 1024)
     static let bufPoolMax          = int("stack.bufPoolMax",           default: 32)
 
+    /// Interpreter value buffers come from one segmented bump stack per
+    /// runtime (perf/task-spikes) instead of a pooled 8 192-slot (64 KB)
+    /// buffer per non-inline activation. Activations nest, so their buffers
+    /// are claimed and given back in LIFO order: a claim is a pointer bump in
+    /// the current segment, a release a pointer move back. While little of the
+    /// stack is in use a claim keeps the old headroom (`bufBigSlots`) for the
+    /// inline callees carved out of it; past `bufBigLimitSlots` used slots it
+    /// shrinks to `bufMidSlots`, past `bufMidLimitSlots` to the frame itself.
+    /// A native↔JS recursion 3 000 levels deep (a stack-depth probe through
+    /// `f.call`) held 3 000 × 64 KB = 190 MB; it now holds ~2 MB + its frames.
+    /// A/B: `JEFFJS_INTERP_SEGMENTEDSTACK=0` (the pooled 64 KB buffers).
+    static let segmentedStack      = bool("interp.segmentedStack",     default: true)
+    /// Slots per segment (8 bytes each); a claim larger than this gets a
+    /// segment of its own.
+    static let stackSegmentSlots   = int("interp.stackSegmentSlots",   default: 65536)
+    static let bufBigSlots         = int("interp.bufBigSlots",         default: 8192)
+    static let bufBigLimitSlots    = int("interp.bufBigLimitSlots",    default: 131072)
+    static let bufMidSlots         = int("interp.bufMidSlots",         default: 1024)
+    static let bufMidLimitSlots    = int("interp.bufMidLimitSlots",    default: 262144)
+
     // MARK: - GC
 
     static let gcMallocThreshold   = int("gc.mallocThreshold",        default: 256 * 1024)
@@ -327,6 +347,27 @@ enum JeffJSConfig {
     /// early-closed Map/Set iterators, the async-function capability.
     /// true = the old leaking behaviour, for A/B (JEFFJS_GC_LEGACYREFLEAKS=1).
     static let gcLegacyRefLeaks    = bool("gc.legacyRefLeaks",         default: false)
+    /// Allocation trigger (perf/task-spikes, JeffJSAllocationTrigger.swift):
+    /// bytes allocated outside the object count — string payloads of 512+
+    /// code units, interpreter stack segments, ArrayBuffer stores — since the
+    /// last collection. Past this many (or half the live heap estimate, if
+    /// larger) the next object allocation collects: the object-count trigger
+    /// never fired on a task that held its memory in a few hundred big strings.
+    /// 0 = off. The watch sets it lower (`JEFFJS_GC_BYTESSINCEGCTHRESHOLD`).
+    static let gcBytesSinceGCThreshold = int("gc.bytesSinceGCThreshold", default: 64 * 1024 * 1024)
+    /// Every this many such bytes the host's memory hook (the interrupt
+    /// handler, `JeffJSRuntime.setInterruptHandler`, unless a dedicated
+    /// `memoryHook` is set) is called synchronously from the allocation, so a
+    /// burst inside one task — even inside one native call — is seen at the
+    /// allocation instead of at the host's next sample. When it asks for
+    /// termination, the next interrupt check comes at the next loop back-edge.
+    /// 0 = off (`JEFFJS_GC_BYTESSINCEHOOKTHRESHOLD`).
+    static let gcBytesSinceHookThreshold = int("gc.bytesSinceHookThreshold", default: 0)
+    /// `Function.prototype.toString` of a function with 16 KB+ of source
+    /// returns a shared string from a small per-runtime cache instead of a
+    /// fresh copy per call (JeffJSFunctionSourceCache).
+    /// A/B: `JEFFJS_STRINGS_FUNCTIONSOURCECACHE=0`.
+    static let functionSourceCache = bool("strings.functionSourceCache", default: true)
     /// Recycle dying closures with their side box (jeffJS_recycleFunction);
     /// false = every closure is a fresh object + side box (A/B,
     /// JEFFJS_GC_FUNCTIONPOOL=0).

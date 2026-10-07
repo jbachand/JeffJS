@@ -642,6 +642,7 @@ extension JeffJSContext {
             // task ended by an interrupt must not make this one's exceptions
             // uncatchable (eval resets it the same way).
             interruptTerminated = false
+            rt.memoryStopRequested = false
             jeffJS_idleGCTick(rt)
             jeffJS_heapCensusTick(rt)
         }
@@ -3209,8 +3210,16 @@ extension JeffJSContext {
 
     // MARK: - Interrupt Check
 
-    /// Checks if execution should be interrupted.
+    /// Checks if execution should be interrupted. Cold (every
+    /// `interrupt.counterInit` back-edges): kept out of the interpreter loops.
+    @inline(never)
     func checkInterrupt() -> Bool {
+        // The host's memory hook asked to stop from an allocation
+        // (JeffJSAllocationTrigger.swift): this check ends the script.
+        if rt.memoryStopRequested {
+            interruptTerminated = true
+            return true
+        }
         if let handler = rt.interruptHandler {
             if handler(rt) {
                 // Interrupts are UNCATCHABLE termination: mark the context so
@@ -13152,6 +13161,15 @@ struct JeffJSInterpreter {
                 while sp > spBase {
                     sp -= 1
                     buf[sp].freeValue()
+                }
+                // Leaving from an inline frame: the base frame's claim on the
+                // value stack and any inline frames' own claims above it are
+                // never given back by the epilogue (it releases only the
+                // current frame's buffer). Releasing the base claim drops
+                // everything above it (JeffJSRuntime.releaseInterpBufSlow).
+                if frame !== baseFrame, rt.vsEnabled, let entryBuf = baseFrame.buf {
+                    rt.releaseInterpBufSlow(entryBuf, capacity: 0)
+                    bufOwned = false
                 }
                 break exceptionRetry
             }

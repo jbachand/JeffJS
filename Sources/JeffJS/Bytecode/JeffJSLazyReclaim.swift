@@ -180,7 +180,13 @@ extension JeffJSRuntime {
         guard inlineStackTop == 0 else { return (0, 0, 0) }
         // Memory pressure also reverts untouched lazy JSON payload objects to
         // their spans (JeffJSLazyPayload.swift); they rebuild on next read.
-        if aggressive { evictLazyPayloads() }
+        if aggressive {
+            evictLazyPayloads()
+            // Function.prototype.toString results and the spare stack segment
+            // (perf/task-spikes).
+            dropFunctionSourceCache()
+            trimInterpStack()
+        }
         if lazyReclaimCycle != nil {
             // Its stamps stay valid; only the phase parity must be restored.
             lazyReclaimCycle = nil

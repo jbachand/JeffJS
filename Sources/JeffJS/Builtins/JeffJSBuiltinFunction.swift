@@ -481,8 +481,10 @@ struct JeffJSBuiltinFunction {
             // function it compiled (QuickJS `JSFunctionDef.source`), so return
             // the original text verbatim: `function f(){ ... }`, `x=>x`,
             // `get x(){ ... }`, `class A { ... }`, `async *g(){ ... }`.
-            if let src = functionBytecode?.sourceSpanText {
-                return JeffJSValue.makeString(JeffJSString(swiftString: src))
+            if let fb = functionBytecode, fb.sourceLen >= 0, let text = fb.sourceText {
+                if let s = ctx.rt.functionSourceString(text, start: Int(fb.sourceStart), len: Int(fb.sourceLen)) {
+                    return s
+                }
             }
 
             // No recorded source (stripped or synthesized bytecode) — QuickJS

@@ -195,6 +195,8 @@ nonisolated final class JeffJSString: JeffJSStringBase {
         case .str16(let a): self._chars = .c16(ContiguousArray(a))
         }
         super.init(refCount: refCount, kind: JeffJSStringBase.kindFlat)
+        // Big payloads count toward the allocation trigger (JeffJSAllocationTrigger.swift).
+        if len >= 512 { jeffJS_noteStringAllocation(len: len, wide: isWideChar) }
     }
 
     // -- Retain / Release ----------------------------------------------------

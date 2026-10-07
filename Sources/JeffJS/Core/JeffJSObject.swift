@@ -461,6 +461,39 @@ nonisolated final class JeffJSSourceText {
             String(decoding: UnsafeBufferPointer(rebasing: $0[start ..< (start &+ len)]), as: UTF8.self)
         }
     }
+
+    /// The span as a JS string, decoded straight from the UTF-8 bytes (no
+    /// Swift String, no scalar array: `JeffJSString(swiftString:)` on a
+    /// non-Latin-1 text went through 4 bytes per character on top of the
+    /// copy). Same repair of invalid UTF-8 as `String(decoding:as:)`.
+    func sliceJSString(start: Int, len: Int) -> JeffJSString? {
+        guard len >= 0, start >= 0, start &+ len <= bytes.count else { return nil }
+        return bytes.withUnsafeBufferPointer {
+            jeffJS_stringFromUTF8(UnsafeBufferPointer(rebasing: $0[start ..< (start &+ len)]))
+        }
+    }
+}
+
+/// A JS string from UTF-8 bytes: Latin-1 storage when every code point fits
+/// (ASCII is a straight copy), UTF-16 otherwise.
+func jeffJS_stringFromUTF8(_ u: UnsafeBufferPointer<UInt8>) -> JeffJSString {
+    var acc: UInt8 = 0
+    for b in u { acc |= b }
+    if acc < 0x80 {
+        return JeffJSString(refCount: 1, len: u.count, isWideChar: false, storage: .str8(Array(u)))
+    }
+    var units = [UInt16]()
+    units.reserveCapacity(u.count)
+    var maxUnit: UInt16 = 0
+    _ = transcode(u.makeIterator(), from: UTF8.self, to: UTF16.self, stoppingOnError: false) { unit in
+        units.append(unit)
+        if unit > maxUnit { maxUnit = unit }
+    }
+    if maxUnit <= 0xFF {
+        let narrow = units.map { UInt8(truncatingIfNeeded: $0) }
+        return JeffJSString(refCount: 1, len: narrow.count, isWideChar: false, storage: .str8(narrow))
+    }
+    return JeffJSString(refCount: 1, len: units.count, isWideChar: true, storage: .str16(units))
 }
 
 /// How to re-parse one lazily compiled function (recorded by the parser
@@ -1362,6 +1395,8 @@ nonisolated final class JeffJSArrayBuffer {
     init(byteLength: Int = 0) {
         self.byteLength = byteLength
         self.data = [UInt8](repeating: 0, count: byteLength)
+        // Allocation trigger (JeffJSAllocationTrigger.swift).
+        if byteLength >= 512 { jeffJS_noteBufferAllocation(byteLength) }
     }
 }
 

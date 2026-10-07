@@ -3377,6 +3377,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // Each top-level eval starts with a clean interrupt-termination state;
         // a stale flag from an aborted prior eval must not poison this one.
         interruptTerminated = false
+        rt.memoryStopRequested = false
         let isModule = (evalFlags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE
 
         // ---- Bytecode cache lookup ----

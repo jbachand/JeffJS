@@ -326,6 +326,7 @@ struct JeffJSTestRunner {
             ("ClassStaticElements", { $0.testClassStaticElements() }),
             ("PromiseIterables", { $0.testPromiseIterables() }),
             ("StringConcat", { $0.testStringConcat() }),
+            ("TaskSpikes", { $0.testTaskSpikes() }),
             ("ParameterOwnership", { $0.testParameterOwnership() }),
             ("IndexArguments", { $0.testIndexArguments() }),
             ("LazyCompile", { $0.testLazyCompile() }),

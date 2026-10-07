@@ -273,6 +273,7 @@ func runGC(_ rt: JeffJSRuntime) {
         rt.gcLastEnd = end
         rt.gcLastDuration = end - gcStart
         rt.gcLiveAfterLast = rt.mallocState.mallocSize
+        rt.allocationTriggerCollected()
     }
 
     // Objects whose refcount hit zero while a free chain was unwinding must be

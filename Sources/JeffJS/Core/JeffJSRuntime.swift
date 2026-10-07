@@ -533,11 +533,6 @@ nonisolated final class JeffJSRuntime {
         frameFreeCount += 1
     }
 
-    /// Acquire an interpreter value buffer. Only `initializedPrefix` slots are
-    /// guaranteed to be .undefined (args+vars region); the value-stack region
-    /// is always written before it is read, so clearing it per call is wasted
-    /// work. Pass `initializedPrefix: size` for fully-cleared buffers.
-    @inline(__always)
     /// Unsafe stack of saved caller states for inline calls (see
     /// JeffJSInterpreter.InlineCallFrame). Shared by all activations of
     /// callInternal on this runtime; each activation uses the region above
@@ -555,7 +550,170 @@ nonisolated final class JeffJSRuntime {
     /// a whole call chain (8192 slots = 64 KB), not a single frame.
     static let interpBufMinSlots = 8192
 
+    // MARK: Segmented value stack (perf/task-spikes, JeffJSConfig.segmentedStack)
+
+    static let segmentedStack = JeffJSConfig.segmentedStack
+    // Instance copies: a static let is a lazy global (a once-check per read),
+    // and these are read on every native→JS call.
+    let vsEnabled = JeffJSRuntime.segmentedStack
+    let vsSegmentSlots = max(1024, JeffJSConfig.stackSegmentSlots)
+    let vsBigSlots = max(64, JeffJSConfig.bufBigSlots)
+    let vsBigLimit = JeffJSConfig.bufBigLimitSlots
+    let vsMidSlots = max(0, JeffJSConfig.bufMidSlots)
+    let vsMidLimit = JeffJSConfig.bufMidLimitSlots
+    /// Current segment as three pointers: claims are contiguous from
+    /// `vsBasePtr`, `vsTopPtr` is the first free slot, `vsLimitPtr` the end.
+    /// Before the first claim (and with the switch off) all three point at an
+    /// empty sentinel, so the fast paths below fail into the slow ones.
+    /// (The interior slot of a 2-slot allocation: no other buffer can end there.)
+    static let vsSentinel = UnsafeMutablePointer<JeffJSValue>.allocate(capacity: 2) + 1
+    var vsBasePtr: UnsafeMutablePointer<JeffJSValue> = JeffJSRuntime.vsSentinel
+    var vsTopPtr: UnsafeMutablePointer<JeffJSValue> = JeffJSRuntime.vsSentinel
+    var vsLimitPtr: UnsafeMutablePointer<JeffJSValue> = JeffJSRuntime.vsSentinel
+    /// Slots in use in the segments below the current one.
+    var vsBelowUsed: Int = 0
+    /// Segments below the current one (base, capacity, top when it was left).
+    var vsLower: [(base: UnsafeMutablePointer<JeffJSValue>, cap: Int, top: Int)] = []
+    /// Emptied standard-size segments kept for the next overflows (a
+    /// recursion oscillating across a segment boundary would otherwise
+    /// allocate and free one per crossing), at most `vsMaxSpares`; given back
+    /// at memory pressure (`trimInterpStack`) and teardown. Pages that are not
+    /// touched again stay virtual.
+    var vsSpares: [UnsafeMutablePointer<JeffJSValue>] = []
+    static let vsMaxSpares = 4
+    /// High-water mark of slots in use, sampled when a segment is entered
+    /// (the fast path does not track it), and segments allocated over the
+    /// runtime's life: for tests and the heap report.
+    var vsPeakUsed: Int = 0
+    var vsSegmentsAllocated: Int = 0
+
+    var interpStackUsedSlots: Int { vsBelowUsed + (vsTopPtr - vsBasePtr) }
+    /// Bytes of value-stack segments allocated right now (current, lower, spare).
+    var interpStackSegmentBytes: Int {
+        guard vsBasePtr != Self.vsSentinel else { return 0 }
+        var slots = (vsLimitPtr - vsBasePtr) + vsLower.reduce(0) { $0 + $1.cap }
+        slots += vsSpares.count * vsSegmentSlots
+        return slots * MemoryLayout<JeffJSValue>.stride
+    }
+
+    /// Acquire an interpreter value buffer. Only `initializedPrefix` slots are
+    /// guaranteed to be .undefined (args+vars region); the value-stack region
+    /// is always written before it is read, so clearing it per call is wasted
+    /// work. Pass `initializedPrefix: size` for fully-cleared buffers.
+    ///
+    /// Segmented stack: the claim is the frame plus inline-call headroom
+    /// (`bufBigSlots`) while the stack is shallow, less as it deepens
+    /// (`bufMidSlots`, then none); claims and releases are LIFO, as activations nest.
+    @inline(__always)
     func acquireInterpBuf(size: Int, initializedPrefix: Int? = nil) -> (UnsafeMutablePointer<JeffJSValue>, Int) {
+        let top = vsTopPtr
+        let used = vsBelowUsed &+ (top - vsBasePtr)
+        let minClaim = used < vsBigLimit ? vsBigSlots : (used < vsMidLimit ? vsMidSlots : 0)
+        let claim = size > minClaim ? size : minClaim
+        if vsEnabled, claim <= vsLimitPtr - top {
+            vsTopPtr = top + claim
+            let clearCount = min(initializedPrefix ?? claim, claim)
+            var i = 0
+            while i < clearCount { top[i] = .undefined; i &+= 1 }
+            return (top, claim)
+        }
+        return acquireInterpBufSlow(size: size, claim: claim, initializedPrefix: initializedPrefix)
+    }
+
+    @inline(__always)
+    func releaseInterpBuf(_ ptr: UnsafeMutablePointer<JeffJSValue>, capacity: Int) {
+        // The top claim, not the segment's first one (emptying a segment
+        // goes back to the one below it: slow path).
+        if ptr + capacity == vsTopPtr, ptr != vsBasePtr {
+            vsTopPtr = ptr
+            return
+        }
+        releaseInterpBufSlow(ptr, capacity: capacity)
+    }
+
+    @inline(never)
+    func acquireInterpBufSlow(size: Int, claim: Int, initializedPrefix: Int?) -> (UnsafeMutablePointer<JeffJSValue>, Int) {
+        guard vsEnabled else { return acquireInterpBufPooled(size: size, initializedPrefix: initializedPrefix) }
+        // The claim does not fit in the current segment: move to a new one.
+        if vsBasePtr != Self.vsSentinel {
+            let top = vsTopPtr - vsBasePtr
+            vsLower.append((vsBasePtr, vsLimitPtr - vsBasePtr, top))
+            vsBelowUsed &+= top
+        }
+        let base: UnsafeMutablePointer<JeffJSValue>
+        let cap: Int
+        if claim <= vsSegmentSlots {
+            cap = vsSegmentSlots
+            if let sp = vsSpares.popLast() { base = sp } else {
+                // Not initialised: every claim clears its args+vars prefix and
+                // the value-stack region is written before it is read (as with
+                // a pooled buffer's stale slots). Untouched pages stay virtual.
+                base = .allocate(capacity: cap)
+                vsSegmentsAllocated &+= 1
+                // The host hook sees deep stacks; a collection would not free them.
+                noteAllocation(cap * MemoryLayout<JeffJSValue>.stride, collectable: false)
+            }
+        } else {
+            cap = claim
+            base = .allocate(capacity: cap)
+            vsSegmentsAllocated &+= 1
+            noteAllocation(cap * MemoryLayout<JeffJSValue>.stride, collectable: false)
+        }
+        vsBasePtr = base; vsTopPtr = base + claim; vsLimitPtr = base + cap
+        let used = vsBelowUsed &+ claim
+        if used > vsPeakUsed { vsPeakUsed = used }
+        let clearCount = min(initializedPrefix ?? claim, claim)
+        var i = 0
+        while i < clearCount { base[i] = .undefined; i &+= 1 }
+        return (base, claim)
+    }
+
+    /// Not the top claim, or the first claim of its segment. With the
+    /// segmented stack: the segment's first claim (go back to the segment
+    /// below once it is empty), or an activation that left abruptly
+    /// (uncatchable interrupt) from an inline frame, so the claims above its
+    /// own buffer were never given back — everything above `ptr` goes.
+    @inline(never)
+    func releaseInterpBufSlow(_ ptr: UnsafeMutablePointer<JeffJSValue>, capacity: Int) {
+        guard vsEnabled else { releaseInterpBufPooled(ptr, capacity: capacity); return }
+        while vsBasePtr != Self.vsSentinel {
+            if ptr >= vsBasePtr && ptr < vsLimitPtr {
+                if ptr < vsTopPtr { vsTopPtr = ptr }
+                if vsTopPtr == vsBasePtr, !vsLower.isEmpty { vsPopSegment() }
+                return
+            }
+            if vsLower.isEmpty { return }   // not ours (cannot happen): leave it
+            vsTopPtr = vsBasePtr
+            vsPopSegment()
+        }
+    }
+
+    /// Leave the (empty) current segment for the one below it.
+    func vsPopSegment() {
+        guard let lower = vsLower.popLast() else { return }
+        let base = vsBasePtr
+        if vsLimitPtr - base == vsSegmentSlots, vsSpares.count < Self.vsMaxSpares { vsSpares.append(base) } else { base.deallocate() }
+        vsBasePtr = lower.base; vsTopPtr = lower.base + lower.top; vsLimitPtr = lower.base + lower.cap
+        vsBelowUsed &-= lower.top
+    }
+
+    func drainInterpStack() {
+        if vsBasePtr != Self.vsSentinel { vsBasePtr.deallocate() }
+        for l in vsLower { l.base.deallocate() }
+        for sp in vsSpares { sp.deallocate() }
+        vsBasePtr = Self.vsSentinel; vsTopPtr = Self.vsSentinel; vsLimitPtr = Self.vsSentinel
+        vsBelowUsed = 0; vsLower.removeAll(); vsSpares.removeAll()
+    }
+
+    /// Give back the spare segments (memory pressure); the live stack is
+    /// untouched.
+    func trimInterpStack() {
+        for sp in vsSpares { sp.deallocate() }
+        vsSpares.removeAll()
+    }
+
+    /// The pooled 8 192-slot buffers (JEFFJS_INTERP_SEGMENTEDSTACK=0).
+    func acquireInterpBufPooled(size: Int, initializedPrefix: Int?) -> (UnsafeMutablePointer<JeffJSValue>, Int) {
         let size = max(size, Self.interpBufMinSlots)
         let clearCount = min(initializedPrefix ?? size, size)
         if Self.fastCallEntry {
@@ -584,8 +742,7 @@ nonisolated final class JeffJSRuntime {
         return (ptr, size)
     }
 
-    @inline(__always)
-    func releaseInterpBuf(_ ptr: UnsafeMutablePointer<JeffJSValue>, capacity: Int) {
+    func releaseInterpBufPooled(_ ptr: UnsafeMutablePointer<JeffJSValue>, capacity: Int) {
         if Self.fastCallEntry {
             if capacity == Self.interpBufMinSlots, interpBufStackCount < Self.interpBufStackMax {
                 if interpBufStack == nil {
@@ -609,6 +766,7 @@ nonisolated final class JeffJSRuntime {
 
     /// Drain the interpreter buffer pool (called from free()).
     func drainInterpPools() {
+        drainInterpStack()
         if let st = interpBufStack {
             for i in 0..<interpBufStackCount {
                 st[i].deinitialize(count: Self.interpBufMinSlots)
@@ -663,6 +821,23 @@ nonisolated final class JeffJSRuntime {
     /// Multiplier on the idle-collection interval, doubled by every idle
     /// collection that reclaimed little (see `jeffJS_idleGCTickSlow`).
     var gcIdleBackoff: Int = 1
+    /// Allocation trigger (JeffJSAllocationTrigger.swift).
+    var allocBytesSinceGC: Int = 0
+    var allocBytesSinceHook: Int = 0
+    var allocGCThreshold = JeffJSConfig.gcBytesSinceGCThreshold
+    var allocHookThreshold = JeffJSConfig.gcBytesSinceHookThreshold
+    /// The memory hook asked to stop: the next interrupt check ends the
+    /// running script (cleared at the next task boundary).
+    var memoryStopRequested = false
+    /// A collection was requested by the allocation trigger (cleared by runGC).
+    var allocGCRequested = false
+    /// Collections and host-hook calls the allocation trigger made (diagnostics).
+    var allocGCRuns: Int = 0
+    var allocHookCalls: Int = 0
+    /// Host hook for allocation bursts; nil = the interrupt handler.
+    var memoryHook: ((JeffJSRuntime) -> Bool)?
+    /// `Function.prototype.toString` results of big functions (JeffJSAllocationTrigger.swift).
+    let functionSourceCache = JeffJSFunctionSourceCache()
     /// JEFFJS_GC_VERIFYROOTS: the thread that last mutated the GC list, and the
     /// recent thread changes (JeffJSThreadCheck.swift).
     var gcListThread: UInt = 0
@@ -957,6 +1132,7 @@ nonisolated final class JeffJSRuntime {
         atomJSStrings.removeAll()
         for js in sharedStrings.values { dropCachedString(js) }
         sharedStrings.removeAll()
+        dropFunctionSourceCache()
         lazyPayload.removeAll()
         // A symbol's description string is an ordinary counted string (one Swift
         // retain while its count is above zero); the table holds one count.
