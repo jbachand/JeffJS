@@ -5759,7 +5759,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             let filename = (fbc?.debugFilenameAtom ?? 0) != 0
                 ? (rt.atomToString(fbc!.debugFilenameAtom) ?? "")
                 : (fbBase.fileName?.toSwiftString() ?? "")
-            let url = JeffJSContext.stackSourceURL(filename)
+            let url = JeffJSContext.stackFrameURL(JeffJSContext.stackSourceURL(filename))   // JSC strips here too
             let pc = fbBase.bytecodeLen > 0 ? max(0, min(rawPC, fbBase.bytecodeLen - 1)) : 0
             var line = (fbc?.debugPc2lineBuf.isEmpty ?? true) ? 0 : fbc!.lineForPC(pc)
             var col = (fbc?.debugPc2colBuf.isEmpty ?? true) ? 0 : fbc!.colForPC(pc)
@@ -5829,7 +5829,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                     funcName = inferred
                 }
             }
-            let sourceURL = JeffJSContext.stackSourceURL(filename)
+            let sourceURL = JeffJSContext.stackFrameURL(JeffJSContext.stackSourceURL(filename))
             if sourceURL.isEmpty {
                 lines.append("\(funcName)@")
                 continue
@@ -5849,6 +5849,19 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// that has none (JSC prints `name@` then). This engine names unnamed
     /// sources `<eval>`, `<input>`, `<inline>`, `<anonymous>`, ... — those are
     /// placeholders, not URLs.
+    /// The URL a frame line of `Error.stack` prints: JavaScriptCore's
+    /// `StackFrame::sourceURLStripped` — the script URL without its query and
+    /// fragment (`…/OVkR?v=…&t=…` prints `…/OVkR:1:420270` in WebKit). Akamai's
+    /// SBSD script reads its own frames' text. The error's own `sourceURL`
+    /// property is stripped the same way (WKWebView capture, 2026-10-06).
+    static func stackFrameURL(_ url: String) -> String {
+        guard url.contains("://") else { return url }
+        var end = url.endIndex
+        if let q = url.firstIndex(of: "?") { end = q }
+        if let h = url.firstIndex(of: "#"), h < end { end = h }
+        return end == url.endIndex ? url : String(url[..<end])
+    }
+
     static func stackSourceURL(_ filename: String) -> String {
         if filename.isEmpty || (filename.hasPrefix("<") && filename.hasSuffix(">")) { return "" }
         return filename

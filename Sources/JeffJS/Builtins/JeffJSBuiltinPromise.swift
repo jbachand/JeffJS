@@ -783,92 +783,97 @@ struct JeffJSBuiltinPromise {
         return resultPromise
     }
 
-    /// Promise.prototype.catch(onRejected)
-    /// Equivalent to .then(undefined, onRejected).
+    /// Invoke(V, "then", args) (ES §7.3.20): `then` is read from the receiver and
+    /// called through property access, so a page's override of `then` (on the
+    /// instance or on Promise.prototype) sees the call. `catch` and `finally`
+    /// must go through it (§27.2.5.1 / §27.2.5.3); JavaScriptCore does, and
+    /// Akamai's SBSD sensor observes it (`.catch` → `.then(undefined, f)`).
+    static func invokeThen(ctx: JeffJSContext, _ receiver: JeffJSValue,
+                           _ args: [JeffJSValue]) -> JeffJSValue {
+        let thenFn = ctx.getProperty(obj: receiver, atom: JeffJSAtomID.JS_ATOM_then.rawValue)
+        if thenFn.isException { return thenFn }
+        defer { ctx.freeValue(thenFn) }
+        guard ctx.isFunction(thenFn) else {
+            return ctx.throwTypeError("\(receiver.isObject ? "Object" : "Value") is not a function")
+        }
+        return ctx.callFunction(func_: thenFn, this: receiver, args: args)
+    }
+
+    /// Promise.prototype.catch(onRejected) (ES §27.2.5.1):
+    /// Return ? Invoke(promise, "then", « undefined, onRejected »).
     static func catch_(ctx: JeffJSContext, this: JeffJSValue,
                        args: [JeffJSValue]) -> JeffJSValue {
         let onRejected = args.count >= 1 ? args[0] : JeffJSValue.undefined
-        return then(ctx: ctx, this: this, args: [JeffJSValue.undefined, onRejected])
+        return invokeThen(ctx: ctx, this, [JeffJSValue.undefined, onRejected])
     }
 
-    /// Promise.prototype.finally(onFinally)
-    /// Registers a handler that is called when the promise settles (regardless of outcome).
+    /// Promise.prototype.finally(onFinally) (ES §27.2.5.3). The reactions call
+    /// onFinally, then adopt its result with PromiseResolve(C, result) and chain
+    /// a thunk that returns the original value / rethrows the original reason
+    /// (it used to throw a TypeError built from the reason's text).
     static func finally_(ctx: JeffJSContext, this: JeffJSValue,
                          args: [JeffJSValue]) -> JeffJSValue {
+        guard this.isObject else {
+            return ctx.throwTypeError("Promise.prototype.finally called on non-object")
+        }
         let onFinallyArg = args.count >= 1 ? args[0] : JeffJSValue.undefined
 
         if !ctx.isFunction(onFinallyArg) {
-            // If onFinally is not callable, pass through
-            return then(ctx: ctx, this: this,
-                        args: [onFinallyArg, onFinallyArg])
+            return invokeThen(ctx: ctx, this, [onFinallyArg, onFinallyArg])
         }
         // The callback is borrowed from the caller, which releases it after
         // this call; the two reactions below outlive it, so they share one
         // retained reference released when the last reaction is dropped.
         let onFinallyRef = JeffJSRetainedValue(onFinallyArg)
 
-        // Get the constructor
+        // C = SpeciesConstructor(promise, %Promise%) (the `constructor` read is
+        // the observable step; a non-constructor falls back to %Promise%).
         let ctor = ctx.getPropertyStr(obj: this, name: "constructor")
+        if ctor.isException { return ctor }
         let ctorToUse = ctor.isUndefined ? ctx.getPropertyStr(
             obj: ctx.globalObject, name: "Promise") : ctor
+        let ctorRef = JeffJSRetainedValue(ctorToUse)
+        if !ctor.isUndefined { ctx.freeValue(ctor) } else { ctx.freeValue(ctorToUse) }
 
-        // Create then-finally callback: value => { onFinally(); return value; }
-        let thenFinally = ctx.newCFunction(name: "thenFinally", length: 1) { c, _, innerArgs in
+        // thenFinally: value => PromiseResolve(C, onFinally()).then(() => value)
+        let thenFinally = ctx.newCFunction(name: "", length: 1) { c, _, innerArgs in
             let value = innerArgs.count >= 1 ? innerArgs[0] : JeffJSValue.undefined
-            let onFinally = onFinallyRef.value
-            let callResult = c.callFunction(func_: onFinally, this: .undefined, args: [])
+            let callResult = c.callFunction(func_: onFinallyRef.value, this: .undefined, args: [])
             if callResult.isException { return callResult }
-
-            // Return Promise.resolve(callResult).then(() => value). The call
-            // result is released after Promise.resolve borrowed it (it was
-            // released first, so a promise returned by onFinally was freed
-            // before it was adopted).
-            let resolved = JeffJSBuiltinPromise.resolve(ctx: c, this: ctorToUse, args: [callResult])
+            let resolved = JeffJSBuiltinPromise.resolve(ctx: c, this: ctorRef.value, args: [callResult])
             c.freeValue(callResult)
             if resolved.isException { return resolved }
-
-            let returnValue = value.dupValue()
-            let valueThunk = c.newCFunction(name: "", length: 0) { c2, _, _ in
-                return returnValue
+            let returnValue = JeffJSRetainedValue(value)
+            let valueThunk = c.newCFunction(name: "", length: 0) { _, _, _ in
+                return returnValue.value.dupValue()
             }
-            let finalResult = JeffJSBuiltinPromise.then(
-                ctx: c, this: resolved, args: [valueThunk])
+            let finalResult = JeffJSBuiltinPromise.invokeThen(ctx: c, resolved, [valueThunk])
             c.freeValue(valueThunk)
             c.freeValue(resolved)
             return finalResult
         }
 
-        // Create catch-finally callback: reason => { onFinally(); throw reason; }
-        let catchFinally = ctx.newCFunction(name: "catchFinally", length: 1) { c, _, innerArgs in
+        // catchFinally: reason => PromiseResolve(C, onFinally()).then(() => { throw reason })
+        let catchFinally = ctx.newCFunction(name: "", length: 1) { c, _, innerArgs in
             let reason = innerArgs.count >= 1 ? innerArgs[0] : JeffJSValue.undefined
-            let onFinally = onFinallyRef.value
-            let callResult = c.callFunction(func_: onFinally, this: .undefined, args: [])
+            let callResult = c.callFunction(func_: onFinallyRef.value, this: .undefined, args: [])
             if callResult.isException { return callResult }
-
-            let resolved = JeffJSBuiltinPromise.resolve(ctx: c, this: ctorToUse, args: [callResult])
-            c.freeValue(callResult)   // after Promise.resolve borrowed it (see thenFinally)
+            let resolved = JeffJSBuiltinPromise.resolve(ctx: c, this: ctorRef.value, args: [callResult])
+            c.freeValue(callResult)
             if resolved.isException { return resolved }
-
-            let thrownReason = reason.dupValue()
-            let reasonThunk = c.newCFunction(name: "", length: 0) { c2, _, _ in
-                return c2.throwTypeError(
-                    thrownReason.isString
-                    ? (thrownReason.stringValue?.toSwiftString() ?? "rejected")
-                    : "rejected")
+            let thrownReason = JeffJSRetainedValue(reason)
+            let thrower = c.newCFunction(name: "", length: 0) { c2, _, _ in
+                return c2.throwValue(thrownReason.value.dupValue())
             }
-            let finalResult = JeffJSBuiltinPromise.then(
-                ctx: c, this: resolved, args: [reasonThunk])
-            c.freeValue(reasonThunk)
+            let finalResult = JeffJSBuiltinPromise.invokeThen(ctx: c, resolved, [thrower])
+            c.freeValue(thrower)
             c.freeValue(resolved)
             return finalResult
         }
 
-        let result = then(ctx: ctx, this: this, args: [thenFinally, catchFinally])
-
+        let result = invokeThen(ctx: ctx, this, [thenFinally, catchFinally])
         ctx.freeValue(thenFinally)
         ctx.freeValue(catchFinally)
-        ctx.freeValue(ctor)
-
         return result
     }
 

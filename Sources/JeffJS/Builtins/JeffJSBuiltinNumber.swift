@@ -512,7 +512,7 @@ struct JeffJSBuiltinNumber {
             if r.isException { return .exception }
             radix = ctx.extractInt(r)
             if radix < 2 || radix > 36 {
-                return ctx.throwRangeError("toString() radix must be between 2 and 36")
+                return ctx.throwRangeError("toString() radix argument must be between 2 and 36")
             }
         }
         let d = extractDouble(numVal)
@@ -573,7 +573,7 @@ struct JeffJSBuiltinNumber {
         // 2-4: f = ToIntegerOrInfinity(fractionDigits); RangeError before the finiteness check.
         guard let f = integerOrInfinityArg(ctx: ctx, args, 0) else { return .exception }
         if !f.isFinite || f < 0 || f > 100 {
-            return ctx.throwRangeError("toFixed() digits argument must be between 0 and 100")
+            return ctx.throwRangeError("toFixed() argument must be between 0 and 100")
         }
         // 5, 8: non-finite and |x| >= 1e21 use Number::toString.
         if !d.isFinite || Swift.abs(d) >= 1e21 {
@@ -981,7 +981,7 @@ struct JeffJSBuiltinBigInt {
             if r.isException { return .exception }
             radix = ctx.extractInt(r)
             if radix < 2 || radix > 36 {
-                return ctx.throwRangeError(message: "toString() radix must be between 2 and 36")
+                return ctx.throwRangeError(message: "toString() radix argument must be between 2 and 36")
             }
         }
         return JeffJSBigIntOps.toStringValue(ctx: ctx, bigVal, radix: radix)
