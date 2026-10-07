@@ -549,6 +549,7 @@ nonisolated final class JeffJSLazyScript {
         self.source = source
         self.filename = filename
         self.isModule = isModule
+        JeffJSScriptSources.register(filename: filename, text: source)
     }
 
     /// Byte offsets where lines start, by the rule JeffJSParseState.getLineCol

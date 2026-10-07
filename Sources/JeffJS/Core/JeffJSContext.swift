@@ -3391,8 +3391,24 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         }
 
         // ---- JeffJS Native Pipeline: Tokenize → Parse → Compile → Execute ----
+        // Test aid: JEFFJS_TEST_UNMINIFY_EVAL=1 runs every global / module
+        // script through JeffJSUnminifier first (the conformance suite and
+        // the probes then check that formatted code runs identically; only
+        // Function.prototype.toString text and line:col positions differ).
+        if Self.testUnminifyEval {
+            let type = evalFlags & JS_EVAL_TYPE_MASK
+            if type == JS_EVAL_TYPE_GLOBAL || type == JS_EVAL_TYPE_MODULE {
+                let formatted = JeffJSUnminifier.format(input)
+                if formatted.ok {
+                    return nativeEvalPipeline(input: formatted.text, filename: filename, evalFlags: evalFlags)
+                }
+            }
+        }
         return nativeEvalPipeline(input: input, filename: filename, evalFlags: evalFlags)
     }
+
+    nonisolated(unsafe) static let testUnminifyEval =
+        ProcessInfo.processInfo.environment["JEFFJS_TEST_UNMINIFY_EVAL"] == "1"
 
     /// The actual native evaluation pipeline, separated for crash isolation.
     /// Checks the bytecode cache first — if the same source was compiled before,
@@ -3581,8 +3597,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         var h: UInt64? = nil
         if hash {
             var x: UInt64 = 0xcbf29ce484222325
-            for b in (positionFree ? JeffJSBytecodeSerializer.positionFreeBytes(fb, rt: rt)
-                                   : JeffJSBytecodeSerializer.serialize(fb, rt: rt)) {
+            let bytes = positionFree ? JeffJSBytecodeSerializer.positionFreeBytes(fb, rt: rt)
+                                     : JeffJSBytecodeSerializer.serialize(fb, rt: rt)
+            if let dump = ProcessInfo.processInfo.environment["JEFFJS_BCDUMP_TMP"] { try? Data(bytes).write(to: URL(fileURLWithPath: dump + "." + (filename as NSString).lastPathComponent)) }
+            for b in bytes {
                 x = (x ^ UInt64(b)) &* 0x100000001b3
             }
             h = x
@@ -6201,6 +6219,41 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         if let q = url.firstIndex(of: "?") { end = q }
         if let h = url.firstIndex(of: "#"), h < end { end = h }
         return end == url.endIndex ? url : String(url[..<end])
+    }
+
+    /// `url:line:col` of the innermost frame of script code that has a URL
+    /// (for a native: its JS caller), as `Error.stack` frames print it; nil
+    /// when no such frame is on the stack. The app's console prefixes
+    /// console.warn / console.error with it (JSC's console does the same).
+    func currentScriptLocation() -> String? {
+        var frame = currentFrame
+        var depth = 0
+        while let f = frame, depth < 64 {
+            depth += 1
+            if let obj = f.curFunc.toObject(), case .bytecodeFunc(let bytecodeOpt, _, _) = obj.payload,
+               let fbBase = bytecodeOpt {
+                let fbc = fbBase as? JeffJSFunctionBytecodeCompiled
+                let filename: String
+                if let c = fbc?.cachedDebugFilename { filename = c }
+                else {
+                    filename = (fbc?.debugFilenameAtom ?? 0) != 0
+                        ? (rt.atomToString(fbc!.debugFilenameAtom) ?? "")
+                        : (fbBase.fileName?.toSwiftString() ?? "")
+                    fbc?.cachedDebugFilename = filename
+                }
+                let url = Self.stackFrameURL(Self.stackSourceURL(filename))
+                if !url.isEmpty {
+                    let pc = fbBase.bytecodeLen > 0 ? max(0, min(f.curPC, fbBase.bytecodeLen - 1)) : 0
+                    var line = (fbc?.debugPc2lineBuf.isEmpty ?? true) ? 0 : fbc!.lineForPC(pc)
+                    var col = (fbc?.debugPc2colBuf.isEmpty ?? true) ? 0 : fbc!.colForPC(pc)
+                    if line <= 0 { line = fbBase.lineNum }
+                    if col <= 0 { col = fbBase.colNum }
+                    return line > 0 && col > 0 ? "\(url):\(line):\(col)" : url
+                }
+            }
+            frame = f.prevFrame
+        }
+        return nil
     }
 
     static func stackSourceURL(_ filename: String) -> String {

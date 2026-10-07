@@ -39,6 +39,9 @@ private nonisolated final class JeffJSConsoleState {
     var countMap: [String: Int] = [:]
     var timerMap: [String: Double] = [:]    // label -> start time (seconds)
     var groupDepth: Int = 0
+    /// console.warn / console.error messages start with `[url:line:col] `
+    /// (setConsoleCallerLocation).
+    var callerLocation = false
 }
 
 // MARK: - JeffJSStdLib
@@ -72,6 +75,36 @@ struct JeffJSStdLib {
         } else {
             print("[console.\(level)] \(message)")
         }
+    }
+
+    /// Prefix console.warn / console.error messages with `[url:line:col] `,
+    /// like JavaScriptCore's console: the location of the first Error
+    /// argument's throw site (its stack's top frame; an `error` message then
+    /// also gets the stack on the following lines), else of the calling
+    /// script code. Off by default; the app's console turns it on for its
+    /// unminified-excerpt view.
+    static func setConsoleCallerLocation(ctx: JeffJSContext, enabled: Bool) {
+        getState(ctx: ctx).console.callerLocation = enabled
+    }
+
+    /// The `[url:line:col] ` prefix (and, for errors, the stack suffix) of a
+    /// warn / error message when callerLocation is on.
+    private static func callerLocationDecoration(ctx: JeffJSContext, args: [JeffJSValue], level: String)
+        -> (prefix: String, suffix: String)
+    {
+        guard getState(ctx: ctx).console.callerLocation else { return ("", "") }
+        for arg in args {
+            guard arg.isObject, let o = arg.toObject(), o.classID == JSClassID.JS_CLASS_ERROR.rawValue else { continue }
+            let sv = ctx.getPropertyStr(obj: arg, name: "stack")
+            defer { sv.freeValue() }
+            if sv.isString, let stack = sv.stringValue?.toSwiftString(), !stack.isEmpty,
+               let loc = JeffJSStackLocation.parse(stack) {
+                return ("[\(loc.url):\(loc.line):\(loc.column)] ", level == "error" ? "\n" + stack : "")
+            }
+            break
+        }
+        if let loc = ctx.currentScriptLocation() { return ("[\(loc)] ", "") }
+        return ("", "")
     }
 
     /// Remove console callback (call when context is freed).
@@ -261,7 +294,8 @@ struct JeffJSStdLib {
                             args: [JeffJSValue]) -> JeffJSValue {
         let prefix = groupPrefix(ctx: ctx)
         let msg = formatConsoleArgs(ctx: ctx, args: args)
-        emitConsole(ctx: ctx, level: "warn", message: "\(prefix)\(msg)")
+        let loc = callerLocationDecoration(ctx: ctx, args: args, level: "warn")
+        emitConsole(ctx: ctx, level: "warn", message: "\(prefix)\(loc.prefix)\(msg)\(loc.suffix)")
         return .undefined
     }
 
@@ -270,7 +304,8 @@ struct JeffJSStdLib {
                              args: [JeffJSValue]) -> JeffJSValue {
         let prefix = groupPrefix(ctx: ctx)
         let msg = formatConsoleArgs(ctx: ctx, args: args)
-        emitConsole(ctx: ctx, level: "error", message: "\(prefix)\(msg)")
+        let loc = callerLocationDecoration(ctx: ctx, args: args, level: "error")
+        emitConsole(ctx: ctx, level: "error", message: "\(prefix)\(loc.prefix)\(msg)\(loc.suffix)")
         return .undefined
     }
 

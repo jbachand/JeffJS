@@ -119,7 +119,15 @@ nonisolated public struct JeffJSUnminified: Sendable {
         guard !runOrig.isEmpty else { return o }
         let k = Self.lastIndex(runOrig, notAbove: o)
         if k < 0 { return Int(runOut[0]) }
-        return max(0, Int(runOut[k]) + (o - Int(runOrig[k])))
+        var f = max(0, Int(runOut[k]) + (o - Int(runOrig[k])))
+        // A position in whitespace (engines report some throws at the gap
+        // before the expression) moves to the next token.
+        if let moved = text.utf8.withContiguousStorageIfAvailable({ u -> Int in
+            var p = min(f, u.count)
+            while p < u.count, u[p] == 0x20 || u[p] == 0x0A || u[p] == 0x0D || u[p] == 0x09 { p += 1 }
+            return p < u.count ? p : f
+        }) { f = moved }
+        return f
     }
 
     /// Original byte offset of a formatted byte offset (inverse of
@@ -185,18 +193,18 @@ nonisolated public struct JeffJSUnminified: Sendable {
         let a = Int(fnStart[k]), b = Int(fnEnd[k])
         guard let (line, _) = Self.lineColumn(a, starts: outLineStarts) else { return nil }
         let lineStart = Int(outLineStarts[line - 1])
-        let raw: String = text.utf8.withContiguousStorageIfAvailable { u in
-            String(decoding: UnsafeBufferPointer(rebasing: u[lineStart ..< b]), as: UTF8.self)
-        } ?? ""
-        // Dedent by the head line's indentation (continuation lines of the
-        // function share it; template literal lines may not, and are kept).
-        let indent = raw.utf8.prefix(while: { $0 == 0x20 }).count
-        let head = String(raw.dropFirst(indent).prefix(while: { _ in true }))
-        guard indent > 0 else { return (head, line) }
-        let pad = String(repeating: " ", count: indent)
-        var lines = head.components(separatedBy: "\n")
-        for i in 1 ..< lines.count where lines[i].hasPrefix(pad) { lines[i].removeFirst(indent) }
-        return (lines.joined(separator: "\n"), line)
+        return text.utf8.withContiguousStorageIfAvailable { u -> (String, Int) in
+            // Dedent the body by the head line's indentation (template
+            // literal lines that start further left are kept as they are).
+            var indent = 0
+            while lineStart + indent < a, u[lineStart + indent] == 0x20 { indent += 1 }
+            let body = String(decoding: UnsafeBufferPointer(rebasing: u[a ..< b]), as: UTF8.self)
+            guard indent > 0 else { return (body, line) }
+            let pad = String(repeating: " ", count: indent)
+            var lines = body.components(separatedBy: "\n")
+            for i in 1 ..< max(1, lines.count) where lines[i].hasPrefix(pad) { lines[i].removeFirst(indent) }
+            return (lines.joined(separator: "\n"), line)
+        }
     }
 
     /// `Error.stack` text with every `url:line:col` whose URL `isThisScript`
@@ -497,7 +505,7 @@ nonisolated private struct P1Frame {
     var isKey = false
 }
 
-extension JeffJSUnminifier {
+nonisolated extension JeffJSUnminifier {
 
     static func lex(_ span: JeffJSBytesSpan) -> Lexed {
         var L = Lexed()
@@ -857,6 +865,8 @@ nonisolated private struct LFrame {
     var cont = false
     var chain = false
     var fnIndex: Int32 = -1
+    /// Blockish frames: first token of the current statement.
+    var stmtHead: Int32 = -1
 }
 
 nonisolated private enum Sep { case none, space, newline(Int) }
@@ -1190,8 +1200,16 @@ nonisolated private struct Printer {
             frames[k].chain = false
             if f.multiline && !f.fill && !R.isBlockish(f.role) { return .newline(f.inner) }
             if R.isBlockish(f.role) {
-                frames[k].cont = true
-                return .newline(f.stmt + w)
+                // Declarations: one declarator per line. Sequence
+                // expressions: only when the rest of the statement is long
+                // (then every comma of it breaks).
+                let h = Int(f.stmtHead)
+                let decl = h >= 0 && (toks[h].type == T.var_ || toks[h].type == T.const_ || toks[h].type == T.let_)
+                if decl || f.cont || restOfStatementExceeds(i, maxLen - col) {
+                    frames[k].cont = true
+                    return .newline(f.stmt + w)
+                }
+                return .space
             }
             if f.fill { return col > maxLen ? .newline(f.inner) : .space }
             if col > maxLen && f.role != R.forHeader && f.role != R.tmpl { return .newline(softIndent()) }
@@ -1201,7 +1219,11 @@ nonisolated private struct Printer {
             var seg = 1
             if i + 1 < toks.count {
                 var e = i + 1
-                if e + 1 < toks.count, toks[e + 1].type == T.lparen, toks[e + 1].match > 0 { e = Int(toks[e + 1].match) }
+                if e + 1 < toks.count, toks[e + 1].type == T.lparen, toks[e + 1].match > 0 {
+                    // Arguments that hold a function body break inside it:
+                    // only `.name(` counts.
+                    e = toks[e + 1].flags & F.containsBlock != 0 ? e + 1 : Int(toks[e + 1].match)
+                }
                 seg = width(i, e)
             }
             if f.chain || col + seg > maxLen {
@@ -1220,6 +1242,27 @@ nonisolated private struct Printer {
         }
         if P == T.colon && p.role == R.labelColon { return .space }
         return wantSpace(pi, i) ? .space : .none
+    }
+
+    /// Whether the statement from token `i` to its end (`;` or the frame's
+    /// closer at this level) is wider than `room`. Bracketed groups are
+    /// skipped through their match; the scan stops as soon as it knows.
+    func restOfStatementExceeds(_ i: Int, _ room: Int) -> Bool {
+        if room <= 0 { return true }
+        var k = i
+        let n = toks.count
+        while k < n {
+            let t = toks[k]
+            if t.type == T.semi || t.type == T.rbrace || t.type == T.rparen || t.type == T.rbrack { return false }
+            if width(i, k) > room { return true }
+            if (t.type == T.lbrace || t.type == T.lparen || t.type == T.lbrack) && t.match > Int32(k) {
+                if t.flags & F.containsBlock != 0 { return false }   // a function body breaks the line anyway
+                k = Int(t.match) + 1
+                continue
+            }
+            k += 1
+        }
+        return false
     }
 
     // MARK: frames on emit
@@ -1248,9 +1291,15 @@ nonisolated private struct Printer {
                 if t.flags & F.containsBlock != 0 { f.multiline = true }
                 else if col + wd > maxLen { f.multiline = true; f.fill = true }
             }
-        case R.call, R.params:
+        case R.call:
+            // Short argument lists stay on the line even past the limit.
             if !f.empty && m > i && t.flags & F.containsBlock == 0 {
-                f.multiline = col + width(i, m) > maxLen
+                let wd = width(i, m)
+                f.multiline = col + wd > maxLen && wd > maxLen / 4
+            }
+        case R.params:
+            if !f.empty && m > i && t.flags & F.containsBlock == 0 {
+                f.multiline = width(i, m) > maxLen
             }
         default:
             break
@@ -1296,6 +1345,11 @@ nonisolated private struct Printer {
                         sep = .newline(defaultIndent())
                     }
                 }
+            }
+            if case .newline = sep, R.isBlockish(frames[frames.count - 1].role), !frames[frames.count - 1].cont {
+                frames[frames.count - 1].stmtHead = Int32(i)
+            } else if prevSig >= 0, Int(frames[frames.count - 1].open) == prevSig {
+                frames[frames.count - 1].stmtHead = Int32(i)
             }
             switch sep {
             case .newline(let ind): newline(ind)

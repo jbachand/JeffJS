@@ -65,6 +65,9 @@ let showResult = args.contains("--result")
 // columns, spans, text, file name), every body compiled (--eager implied):
 // equal for scripts that differ only in whitespace / comments.
 let bcHashCode = args.contains("--bc-hash-code")
+// Large literals compile to lazy payloads that keep their source text
+// (whitespace included): off for the identity hash.
+if bcHashCode { setenv("JEFFJS_COMPILE_LAZYLITERALS", "0", 1) }
 let parseOnly = args.contains("--parse-only") || args.contains("--bc-hash") || bcHashCode
 let bcHash = args.contains("--bc-hash") || bcHashCode
 let repeatCount = args.first(where: { $0.hasPrefix("--repeat=") }).flatMap { Int($0.dropFirst(9)) } ?? (bcHash ? 1 : 5)

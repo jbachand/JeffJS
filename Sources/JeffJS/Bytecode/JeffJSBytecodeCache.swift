@@ -442,7 +442,8 @@ struct JeffJSBytecodeSerializer {
         // Header
         writeU32(JFBC_MAGIC)
         writeU8(JFBC_VERSION)
-        writeU16(packFlags(fb))
+        // hasDebug (bit 12) follows whether the body spans several lines.
+        writeU16(positionFree ? packFlags(fb) & ~UInt16(1 << 12) : packFlags(fb))
         let compiled = fb as? JeffJSFunctionBytecodeCompiled
         var ext: UInt8 = 0
         if let li = fb.lazyInfo {
@@ -771,6 +772,7 @@ struct JeffJSBytecodeDeserializer {
         scriptFilename = String(decoding: data[p ..< (p + nameLen)], as: UTF8.self)
         p += nameLen
         scriptIsModule = data[p] != 0
+        if let sourceText, let scriptFilename { JeffJSScriptSources.register(filename: scriptFilename, text: sourceText) }
     }
 
     /// Read U32 at a specific position without advancing pos.
