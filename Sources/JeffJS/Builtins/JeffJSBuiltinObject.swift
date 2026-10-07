@@ -527,9 +527,14 @@ extension JeffJSContext {
             return newArrayWithLength(0)
         }
         // A function's deferred own properties have to exist before they can
+<<<<<<< HEAD
         // be listed; so does an error's deferred `stack` (JSC lists it), and
         // a lazy payload's top level.
         jsObj.ensureLazyMaterialized()
+=======
+        // be listed; so does an error's deferred `stack` (JSC lists it).
+        if (jsObj.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(jsObj) }
+>>>>>>> d5836c1
         if jsObj.needsLazyNameLength { materializeFunctionNameLength(jsObj) }
         if jsObj.needsLazyPrototype { materializeFunctionPrototype(jsObj) }
         if jsObj.pendingStack != nil { materializeErrorStack(jsObj) }
@@ -570,6 +575,7 @@ extension JeffJSContext {
             for prop in shape.prop {
                 let atom = prop.atom
                 if atom == 0 || (atom & JS_ATOM_TAG_INT) != 0 { continue }
+                if prop.flags.contains(.hidden) { continue }   // host-hidden (JeffJSOwnPropertyOrder)
                 if enumOnly && !prop.flags.contains(.enumerable) { continue }
                 guard rt.atomIsSymbol(atom) else { continue }
                 if let symStr = rt.symbolStringForAtom(atom) {
@@ -646,6 +652,8 @@ extension JeffJSContext {
                 let atom = prop.atom
                 // Skip deleted slots.
                 if atom == 0 { continue }
+                // Host-hidden properties are never listed (JeffJSOwnPropertyOrder).
+                if prop.flags.contains(.hidden) { continue }
 
                 // Skip non-enumerable when caller only wants enumerable.
                 if enumOnly && !prop.flags.contains(.enumerable) { continue }
@@ -731,7 +739,11 @@ extension JeffJSContext {
     /// left the function permanently nameless. Every caller that is about to
     /// clear `extensible` materialises them first.
     func materializeDeferredOwnProps(_ jsObj: JeffJSObject) {
+<<<<<<< HEAD
         jsObj.ensureLazyMaterialized()
+=======
+        if (jsObj.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(jsObj) }
+>>>>>>> d5836c1
         if jsObj.needsLazyNameLength { materializeFunctionNameLength(jsObj) }
         if jsObj.needsLazyPrototype { materializeFunctionPrototype(jsObj) }
     }

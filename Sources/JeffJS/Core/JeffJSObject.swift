@@ -2444,6 +2444,8 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
     @inline(__always) static let lazyPrototypeBit: UInt8 = 1
     @inline(__always) static let lazyNameLengthBit: UInt8 = 2
     @inline(__always) static let lazyStackBit: UInt8 = 4
+    /// Every own property is deferred to a host materialiser (JeffJSOwnPropertyOrder.swift).
+    @inline(__always) static let lazyHostBit: UInt8 = 8
 
     var needsLazyPrototype: Bool {
         @inline(__always) get { (lazyFlags & JeffJSObject.lazyPrototypeBit) != 0 }

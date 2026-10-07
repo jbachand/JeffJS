@@ -337,6 +337,7 @@ struct JeffJSTestRunner {
             ("BrowserFingerprint", { $0.testBrowserFingerprint() }),
             ("AkamaiSensor", { $0.testAkamaiSensor() }),
             ("HomedepotAkamai", { $0.testHomedepotAkamai() }),
+            ("OwnPropertyOrder", { $0.testOwnPropertyOrder() }),
             ("ProgramCompletion", { $0.testProgramCompletion() }),
             ("Redeclaration", { $0.testRedeclaration() }),
             ("DOMParserInsertion", { $0.testDOMParserInsertion() }),

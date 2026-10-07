@@ -516,7 +516,7 @@ func js_proxy_ownKeys(_ ctx: JeffJSContext,
         var keys: [JeffJSValue] = []
         pd.target.toObject()?.ensureLazyMaterialized()
         if let targetObj = pd.target.toObject(), let shape = targetObj.shape {
-            for prop in shape.prop {
+            for prop in shape.prop where !prop.flags.contains(.hidden) {
                 if let name = ctx.rt.atomToString(prop.atom) {
                     keys.append(ctx.newStringValue(name))
                 }
@@ -918,7 +918,7 @@ func js_reflect_ownKeys(_ ctx: JeffJSContext,
     var keys: [JeffJSValue] = []
     targetObj.ensureLazyMaterialized()
     if let shape = targetObj.shape {
-        for prop in shape.prop {
+        for prop in shape.prop where !prop.flags.contains(.hidden) {
             let atomStr = JeffJSString(swiftString: String(prop.atom))
             keys.append(JeffJSValue.makeString(atomStr))
         }

@@ -414,6 +414,9 @@ nonisolated final class JeffJSRuntime {
     /// Identities of objects that must never be freed mid-run (global objects).
     /// freeObject consults this to catch over-releases of load-bearing objects.
     var protectedGlobals: Set<ObjectIdentifier> = []
+    /// Host materialisers of objects whose own properties are created on first touch
+    /// (`JeffJSContext.setLazyOwnProperties`, JeffJSOwnPropertyOrder.swift), keyed by object.
+    var lazyOwnPropertyMaterializers: [ObjectIdentifier: (JeffJSContext, JeffJSValue) -> Void] = [:]
     /// Recycled plain objects (JeffJSObjectPool.swift).
     /// Recent regex inputs' code units and patterns' group names (see
     /// JeffJSRegexCaches; were fields on every string).

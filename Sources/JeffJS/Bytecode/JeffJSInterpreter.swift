@@ -2891,6 +2891,14 @@ extension JeffJSContext {
             }
             return JeffJSForInKeyList(keys: keys)
         }
+        // Host-deferred own properties (JeffJSOwnPropertyOrder) exist before they are enumerated.
+        do {
+            var lp: JeffJSObject? = root
+            while let cur = lp {
+                if (cur.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(cur) }
+                lp = cur.proto
+            }
+        }
         // A String wrapper's index keys are not shape properties: it must take
         // the general path below.
         if let rootShape = root.shape, root.arraySnapshot() == nil,
