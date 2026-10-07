@@ -54,6 +54,7 @@ func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
         o.mark = JeffJSGCMark.white
         o.weakrefCount = 0
         o.realmIndex = 0
+        if (o.lazyFlags & JeffJSObject.lazyOriginBit) != 0 { jeffJS_lazyForget(rt, o) }
         o.lazyFlags = 0            // clears needsLazyPrototype / NameLength / stack
                                    // (the captured stack lives in payload, reset below)
         // Side-box fields (perf/watch-object-size): a plain object without a

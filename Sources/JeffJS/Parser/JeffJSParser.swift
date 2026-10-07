@@ -6779,10 +6779,10 @@ nonisolated final class JeffJSParser {
             parseParenthesizedPrimary()
 
         case 0x5B: // '[' -- array literal
-            parseArrayLiteral()
+            if !tryLazyLiteral() { parseArrayLiteral() }
 
         case 0x7B: // '{' -- object literal
-            parseObjectLiteral()
+            if !tryLazyLiteral() { parseObjectLiteral() }
 
         case JSTokenType.TOK_FUNCTION.rawValue:
             parseFunctionDef(isExpression: true, isArrow: false)
@@ -7175,6 +7175,65 @@ nonisolated final class JeffJSParser {
     // =========================================================================
 
     /// Parse: '[' [ElementList] ']'
+    /// A large pure-data literal (its source span is valid JSON of at least
+    /// `compile.lazyLiteralMinBytes`, with no `__proto__` key, and it is not
+    /// an assignment pattern) compiles to one `lazy_literal` instruction: the
+    /// object is built level by level as it is read (JeffJSLazyPayload.swift).
+    /// JSON is a subset of the literal grammar with the same meaning (string
+    /// escapes, numbers, duplicate keys: last value, first position), so the
+    /// result is indistinguishable from the object the literal would build.
+    /// False (nothing consumed) for everything else.
+    @inline(never)
+    private func tryLazyLiteral() -> Bool {
+        guard jeffJS_lazyLiteralsEnabled else { return false }
+        let start = s.token.ptr
+        let bufLen = min(s.bufLen, s.buf.count)
+        guard start >= 0, bufLen - start >= jeffJS_lazyLiteralMinBytes, bufLen < Int(UInt32.max) else { return false }
+        let r: JeffJSLazyValidation? = s.buf.withUnsafeBufferPointer { p in
+            let pp = UnsafeBufferPointer(rebasing: p[0 ..< bufLen])
+            guard pp[start] == 0x7B || pp[start] == 0x5B else { return nil }
+            return jeffJS_lazyJSONValidate(pp, start: start, end: bufLen)
+        }
+        guard let v = r, !v.sawProtoKey, v.end - start >= jeffJS_lazyLiteralMinBytes,
+              v.maxDepth <= jeffJS_lazyLiteralMaxDepth else { return false }
+        // `{…} = x` / `[…] = x` is a destructuring pattern, not a literal.
+        var j = v.end
+        while j < bufLen, s.buf[j] == 0x20 || s.buf[j] == 0x09 || s.buf[j] == 0x0A || s.buf[j] == 0x0D { j += 1 }
+        if j < bufLen, s.buf[j] == 0x3D, !(j + 1 < bufLen && (s.buf[j + 1] == 0x3D || s.buf[j + 1] == 0x3E)) {
+            return false
+        }
+        let closing: Int = s.buf[start] == 0x7B ? 0x7D : 0x5D
+        // The literal's text as a string constant (fallback when the script
+        // text is gone at run time: bytecode-cache loads).
+        var ascii = true
+        var newlines = 0
+        for k in start ..< v.end {
+            let c = s.buf[k]
+            if c >= 0x80 { ascii = false }
+            if c == 0x0A { newlines += 1 }
+        }
+        let text: JeffJSString
+        if ascii {
+            text = JeffJSString(refCount: 1, len: v.end - start, isWideChar: false,
+                                storage: .str8(Array(s.buf[start ..< v.end])))
+        } else {
+            text = JeffJSString(swiftString: String(decoding: s.buf[start ..< v.end], as: UTF8.self))
+        }
+        let idx = addConstPoolValue(JeffJSValue.makeString(text))
+        if jeffJS_lazyDebug {
+            jeffJS_stderrLine("[lazy] compile literal \(start)..<\(v.end) cpool=\(idx) bc=\(fd.byteCode.len)")
+        }
+        emitOp(.lazy_literal)
+        emitU32(UInt32(idx))
+        emitU32(UInt32(start))
+        // Resume after the literal, as if its closing bracket was just read.
+        s.lineNum += newlines
+        s.token.type = closing
+        s.bufPtr = v.end
+        next()
+        return true
+    }
+
     func parseArrayLiteral() {
         expect(0x5B) // '['
         // Array element expressions always use [+In] per ECMAScript spec

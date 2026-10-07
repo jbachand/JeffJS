@@ -141,6 +141,23 @@ enum JeffJSConfig {
     /// false = the old leak, one reference per literal per parse (A/B:
     /// JEFFJS_COMPILE_LAZYDROPFREESCONSTANTS=0).
     static let lazyDropFreesConstants = bool("compile.lazyDropFreesConstants", default: true)
+    /// A pure-data object/array literal (its source span is valid JSON, no
+    /// `__proto__` key) of at least `compile.lazyLiteralMinBytes` compiles to
+    /// a lazy payload (JeffJSLazyPayload.swift) instead of the object-building
+    /// bytecode. `JEFFJS_COMPILE_LAZYLITERALS=0` = eager.
+    static let compileLazyLiterals = bool("compile.lazyLiterals",      default: true)
+    static let compileLazyLiteralMinBytes = int("compile.lazyLiteralMinBytes", default: 16384)
+
+    // MARK: - JSON
+
+    /// `JSON.parse` of an object/array text of at least
+    /// `json.lazyThresholdBytes` returns a lazy payload (memory proportional
+    /// to what is read; JeffJSLazyPayload.swift). `JEFFJS_JSON_LAZY=0` = eager.
+    static let jsonLazy            = bool("json.lazy",                 default: true)
+    static let jsonLazyThresholdBytes = int("json.lazyThresholdBytes", default: 16384)
+    /// Also revert pristine materialized payload objects at the idle GC
+    /// (default: only on memory pressure / `JeffJSRuntime.evictLazyPayloads`).
+    static let jsonLazyEvictOnIdle = bool("json.lazyEvictOnIdle",      default: false)
 
     // MARK: - Web Storage
 

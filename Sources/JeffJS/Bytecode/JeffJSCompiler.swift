@@ -3466,12 +3466,15 @@ struct JeffJSCompiler {
 
         while pos < len {
             guard pos < buf.count else { break }
-            guard let op = JeffJSOpcode(rawValue: UInt16(buf[pos])) else {
+            // Wide opcodes (0x00 prefix: init_this, private_in, with_*,
+            // lazy_literal) are one instruction of size + 1, not an
+            // `invalid` byte followed by a misread one.
+            guard let (op, opWidth) = readOpcodeFromBuf(buf, pos) else {
                 pos += 1
                 continue
             }
             let info = jeffJSGetOpcodeInfo(op)
-            let instrSize = Int(info.size)
+            let instrSize = max(Int(info.size) + (opWidth - 1), 1)
 
             // Check if this position is a label target
             var i = firstLabel(at: pos)
@@ -3590,12 +3593,15 @@ struct JeffJSCompiler {
 
         while pos < len {
             guard pos < buf.count else { break }
-            guard let op = JeffJSOpcode(rawValue: UInt16(buf[pos])) else {
+            // Wide opcodes (0x00 prefix: init_this, private_in, with_*,
+            // lazy_literal) are one instruction of size + 1, not an
+            // `invalid` byte followed by a misread one.
+            guard let (op, opWidth) = readOpcodeFromBuf(buf, pos) else {
                 pos += 1
                 continue
             }
             let info = jeffJSGetOpcodeInfo(op)
-            let instrSize = Int(info.size)
+            let instrSize = max(Int(info.size) + (opWidth - 1), 1)
 
             // Process jumps with label operands
             if info.format == .label && instrSize == 5 {
@@ -3901,7 +3907,8 @@ struct JeffJSCompiler {
 
         while pos < len {
             guard pos < bc.buf.count else { break }
-            guard let op = JeffJSOpcode(rawValue: UInt16(bc.buf[pos])) else {
+            // Wide opcodes (0x00 prefix) are one instruction of size + 1.
+            guard let (op, opWidth) = readOpcodeFromBuf(bc.buf, pos) else {
                 if isDeadCode { bc.buf[pos] = UInt8(truncatingIfNeeded: JeffJSOpcode.nop.rawValue) }
                 pos += 1
                 continue
@@ -3915,7 +3922,7 @@ struct JeffJSCompiler {
 
             if isDeadCode && op != .nop {
                 let info = jeffJSGetOpcodeInfo(op)
-                let instrSize = Int(info.size)
+                let instrSize = max(Int(info.size) + (opWidth - 1), 1)
                 for i in 0 ..< instrSize {
                     if pos + i < bc.buf.count {
                         bc.buf[pos + i] = UInt8(truncatingIfNeeded: JeffJSOpcode.nop.rawValue)
@@ -3926,7 +3933,7 @@ struct JeffJSCompiler {
             }
 
             let info = jeffJSGetOpcodeInfo(op)
-            let instrSize = Int(info.size)
+            let instrSize = max(Int(info.size) + (opWidth - 1), 1)
 
             if op.isTerminator {
                 isDeadCode = true

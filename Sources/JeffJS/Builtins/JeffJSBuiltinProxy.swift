@@ -514,6 +514,7 @@ func js_proxy_ownKeys(_ ctx: JeffJSContext,
     if trap.isUndefined {
         // Fall through: return target's own property names.
         var keys: [JeffJSValue] = []
+        pd.target.toObject()?.ensureLazyMaterialized()
         if let targetObj = pd.target.toObject(), let shape = targetObj.shape {
             for prop in shape.prop {
                 if let name = ctx.rt.atomToString(prop.atom) {
@@ -915,6 +916,7 @@ func js_reflect_ownKeys(_ ctx: JeffJSContext,
     resultObj.extensible = true
 
     var keys: [JeffJSValue] = []
+    targetObj.ensureLazyMaterialized()
     if let shape = targetObj.shape {
         for prop in shape.prop {
             let atomStr = JeffJSString(swiftString: String(prop.atom))

@@ -212,7 +212,7 @@ nonisolated final class JeffJSInlineCache {
     func updateProto(_ pc: Int, receiverShape: JeffJSShape, holder: JeffJSObject,
                      holderShape: JeffJSShape, propOffset: Int, atom: UInt32 = 0) {
         let idx = pc & Self.mask
-        guard idx < capacity else { return }
+        guard idx < capacity, !receiverShape.isLazySentinel, !holderShape.isLazySentinel else { return }
         receiverShape.icCached = true   // "no own property here": stale if one is appended in place
         let rs = Unmanaged.passRetained(receiverShape).toOpaque()
         let hp = Unmanaged.passRetained(holder).toOpaque()
@@ -227,7 +227,7 @@ nonisolated final class JeffJSInlineCache {
     @inline(__always)
     func update(_ pc: Int, shape: JeffJSShape, propOffset: Int, atom: UInt32 = 0) {
         let idx = pc & Self.mask
-        guard idx < capacity else { return }
+        guard idx < capacity, !shape.isLazySentinel else { return }
         // Retain the new shape before releasing the old one (handles re-caching
         // the same shape without a transient zero refcount).
         let newPtr = Unmanaged.passRetained(shape).toOpaque()
@@ -248,7 +248,7 @@ nonisolated final class JeffJSInlineCache {
     @inline(__always)
     func updateTransition(_ pc: Int, from: JeffJSShape, to: JeffJSShape) {
         let idx = pc & Self.mask
-        guard idx < capacity else { return }
+        guard idx < capacity, !from.isLazySentinel else { return }
         from.icCached = true   // stale if `from` grows in place
         let fromPtr = Unmanaged.passRetained(from).toOpaque()
         let toPtr = Unmanaged.passRetained(to).toOpaque()
@@ -2614,7 +2614,12 @@ func jeffJS_isFastArray(_ o: JeffJSObject) -> Bool {
 @inline(__always)
 func jeffJS_findOwnPropertyIndex(obj: JeffJSObject, atom: UInt32) -> Int {
     guard let shape = obj.shape else { return -1 }
-    guard let idx = findShapeProperty(shape, atom) else { return -1 }
+    guard let idx = findShapeProperty(shape, atom) else {
+        // Safety net for paths that look up own properties without a
+        // chokepoint: a lazy payload stub builds its top level, then retries.
+        if (obj.lazyFlags & JeffJSObject.lazyPayloadBit) != 0 { return jeffJS_findOwnPropertyIndexLazy(obj, atom) }
+        return -1
+    }
     // Soft-recover shape/prop desync: pad missing value slots so the caller
     // can index obj.propValues[idx] directly.
     if idx >= obj.propValues.count {
@@ -2622,6 +2627,14 @@ func jeffJS_findOwnPropertyIndex(obj: JeffJSObject, atom: UInt32) -> Int {
             obj.appendDataValue(.undefined)
         }
     }
+    return idx
+}
+
+/// `jeffJS_findOwnPropertyIndex` on a lazy payload stub (out of line).
+@inline(never)
+func jeffJS_findOwnPropertyIndexLazy(_ obj: JeffJSObject, _ atom: UInt32) -> Int {
+    jeffJS_lazyMaterialize(obj)
+    guard let shape = obj.shape, let idx = findShapeProperty(shape, atom), idx < obj.propValues.count else { return -1 }
     return idx
 }
 
@@ -2904,6 +2917,7 @@ extension JeffJSObject {
 
     /// Number of elements for a fast array.
     var arrayCount: UInt32 {
+        ensureLazyMaterialized()
         if let storage = _fastArrayValues { return storage.count }
         if case .array(_, _, let c) = payload { return c }
         return 0
@@ -2913,6 +2927,7 @@ extension JeffJSObject {
     /// (the enum payload is stale once the ref-type store exists). nil for
     /// non-array payloads. Readers must use this, not `case .array`.
     func arraySnapshot() -> (values: ContiguousArray<JeffJSValue>, count: Int)? {
+        ensureLazyMaterialized()
         if let storage = _fastArrayValues { return (storage.values, Int(storage.count)) }
         if case .array(_, let vals, let count) = payload { return (ContiguousArray(vals), Int(count)) }
         return nil

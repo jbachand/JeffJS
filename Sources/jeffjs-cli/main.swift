@@ -85,6 +85,10 @@ let status: Int32 = MainActor.assumeIsolated {
         return "{\"runs\":\(s.runs),\"cyclesFreed\":\(s.cyclesFreed),\"liveObjects\":\(s.liveObjects),\"heapBytes\":\(s.heapBytes),\"threshold\":\(s.threshold)}"
     }
     env.registerNativeFunction("__mallocInUse") { _ in String(cliMallocInUse()) }
+    // Lazy JSON payloads (JeffJSLazyPayload.swift): counters, and eviction.
+    // __lazyEvict runs with JS on the stack: tests only (hosts evict at idle).
+    env.registerNativeFunction("__lazyStats") { _ in env.lazyPayloadStatsJSON }
+    env.registerNativeFunction("__lazyEvict") { _ in String(env.evictLazyPayloads()) }
     var status: Int32 = 0
     // --eager: compile every function body up front (lazy compilation off).
     if args.contains("--eager") { env.lazyFunctions = false }
@@ -202,12 +206,16 @@ let status: Int32 = MainActor.assumeIsolated {
     // objects, malloc bytes in use since the environment was created, and
     // the per-object average (all engine bytes / live JS objects).
     if args.contains("--heap-report") {
+        // --lazy-evict: what a memory-pressure pass gives back first (lazy
+        // JSON payload objects still exactly what their spans say).
+        if args.contains("--lazy-evict") { print("[lazy] evicted=\(env.evictLazyPayloads())") }
         for _ in 0..<3 { env.runGC() }
         let g = env.gcStatistics
         let delta = cliMallocInUse() - mallocAtStart
         print(String(format: "[heap] liveObjects=%d mallocDelta=%.1fMB perObject=%.0fB footprint=%.1fMB",
                      g.liveObjects, Double(delta) / 1_048_576, Double(delta) / Double(max(g.liveObjects, 1)), cliFootprintMB()))
         print(env.heapHistogram())
+        print("[lazy] " + env.lazyPayloadSummary)
         if args.contains("--roots") { print(env.rootReport()) }
         if args.contains("--big") { print(bigBlockReport(minBytes: 256 * 1024)) }
         if args.contains("--string-dups") { print(JeffJSHeapDebug.stringDuplicateReport(liveInstances(className: "JeffJS.JeffJSString"))) }

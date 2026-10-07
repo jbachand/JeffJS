@@ -1394,7 +1394,7 @@ nonisolated final class JeffJSBytecodeCache {
     /// blobs written by another one, even when nobody bumped
     /// `compilerVersion`. `BytecodeCacheBudgetTests.testEngineSourceHashIsCurrent`
     /// fails when it is stale; `Scripts/update_bytecode_identity.sh` rewrites it.
-    static let engineSourceHash: UInt64 = 0xb04357a314b4c37a // bytecode-identity
+    static let engineSourceHash: UInt64 = 0x39d25a7ef77df52a // bytecode-identity
 
     /// The engine build identity: `compilerVersion`, the blob and entry
     /// layouts, `engineSourceHash`, and the opcode table the interpreter
@@ -1462,6 +1462,11 @@ nonisolated final class JeffJSBytecodeCache {
         // Codegen toggles and the limits the compiler emits against.
         s += "opt=\(JEFFJS_OPTIMIZE ? 1 : 0);short=\(JEFFJS_SHORT_OPCODES ? 1 : 0);"
         s += "mlv=\(JS_MAX_LOCAL_VARS);mss=\(JS_STACK_SIZE_MAX);"
+        // Lazy literals (JeffJSLazyPayload.swift) change the emitted code; the
+        // default setting adds nothing, so default keys are unchanged.
+        if !jeffJS_lazyLiteralsEnabled || jeffJS_lazyLiteralMinBytes != 16384 {
+            s += "ll=\(jeffJS_lazyLiteralsEnabled ? jeffJS_lazyLiteralMinBytes : 0);"
+        }
         // The filename lands in the blob and comes back out in stack traces.
         s += "fn=\(filename)"
         return s

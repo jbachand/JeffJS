@@ -36,6 +36,9 @@ nonisolated final class JeffJSShape: JeffJSGCObjectHeader {
     /// it) would go stale when an own property is appended to the same object.
     /// (Declared next to isHashed so the two flags share padding.)
     var icCached = false
+    /// The realm's lazy-payload stub shape (JeffJSLazyPayload.swift): no
+    /// properties, never cached by an inline cache.
+    var isLazySentinel = false
 
     /// Computed hash that summarises (proto, property-atoms, flags).
     var hash: UInt32 = 0
@@ -155,6 +158,7 @@ nonisolated final class JeffJSShape: JeffJSGCObjectHeader {
 /// Install `newProto` as `shape`'s prototype, taking the single counted
 /// reference a shape owns and releasing the one it held.
 func jeffJS_shapeSetProto(_ shape: JeffJSShape, _ newProto: JeffJSObject?) {
+    newProto?.ensureLazyMaterialized()
     let old = shape.proto
     if old === newProto { return }
     if let p = newProto { _ = JeffJSValue.borrowedObject(p).dupValue() }
@@ -283,6 +287,7 @@ func findHashedShapeProto(_ rt: JeffJSRuntime, _ proto: JeffJSObject?) -> JeffJS
 /// The shape a new empty object with prototype `proto` should start on.
 /// Returns a shape with one owner reference accounted for the caller.
 func jeffJS_rootShape(_ ctx: JeffJSContext, proto: JeffJSObject?) -> JeffJSShape {
+    proto?.ensureLazyMaterialized()
     let rt = ctx.rt
     if let s = findHashedShapeProto(rt, proto) {
         s.refCount += 1

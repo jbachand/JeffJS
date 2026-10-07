@@ -200,6 +200,7 @@ extension JeffJSContext {
 
     /// Own-property existence for one already-resolved atom.
     func hasOwnPropertyAtom(_ jsObj: JeffJSObject, _ atom: UInt32) -> Bool {
+        jsObj.ensureLazyMaterialized()
         if jsObj.needsLazyPrototype, atom == JeffJSAtomID.JS_ATOM_prototype.rawValue {
             return true
         }
@@ -310,7 +311,7 @@ extension JeffJSContext {
         defer { if ownedAtom { rt.freeAtom(atom) } }
         // A function's deferred own properties must exist before they can be
         // described.
-        if jsObj.lazyFlags != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
+        if (jsObj.lazyFlags & JeffJSObject.lazyActiveMask) != 0 { jeffJS_materializeLazyProps(jsObj, atom) }
 
         // Fast-array elements are not shape properties: their attributes
         // live in the element storage (all true unless defineProperty,
@@ -526,7 +527,9 @@ extension JeffJSContext {
             return newArrayWithLength(0)
         }
         // A function's deferred own properties have to exist before they can
-        // be listed; so does an error's deferred `stack` (JSC lists it).
+        // be listed; so does an error's deferred `stack` (JSC lists it), and
+        // a lazy payload's top level.
+        jsObj.ensureLazyMaterialized()
         if jsObj.needsLazyNameLength { materializeFunctionNameLength(jsObj) }
         if jsObj.needsLazyPrototype { materializeFunctionPrototype(jsObj) }
         if jsObj.pendingStack != nil { materializeErrorStack(jsObj) }
@@ -728,6 +731,7 @@ extension JeffJSContext {
     /// left the function permanently nameless. Every caller that is about to
     /// clear `extensible` materialises them first.
     func materializeDeferredOwnProps(_ jsObj: JeffJSObject) {
+        jsObj.ensureLazyMaterialized()
         if jsObj.needsLazyNameLength { materializeFunctionNameLength(jsObj) }
         if jsObj.needsLazyPrototype { materializeFunctionPrototype(jsObj) }
     }

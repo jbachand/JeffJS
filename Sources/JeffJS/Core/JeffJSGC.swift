@@ -776,6 +776,7 @@ func jeffJS_idleGCTickSlow(_ rt: JeffJSRuntime) {
     guard now - rt.gcLastEnd >= interval else { return }
     guard rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain, rt.initComplete else { return }
     rt.gcIdleRuns += 1
+    if JeffJSConfig.jsonLazyEvictOnIdle { rt.evictLazyPayloads() }
     let grown = rt.mallocState.mallocSize - rt.gcLiveAfterLast
     let freedBefore = rt.gcCyclesFreed
     runGC(rt)
@@ -1097,6 +1098,9 @@ func freeGCObject(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader) {
 /// Free a JSObject: release every property value, release the shape, then
 /// let ARC reclaim the Swift object.
 func freeObject(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
+    // A lazy payload object (stub or materialized from a span) leaves the
+    // runtime's record table (JeffJSLazyPayload.swift).
+    if (obj.lazyFlags & JeffJSObject.lazyOriginBit) != 0 { jeffJS_lazyForget(rt, obj) }
     // The global object must only ever be freed at context teardown. If this
     // fires mid-run, some path over-released it; the stack identifies the
     // culprit (this is the root of the shape-wipe corruption family).
