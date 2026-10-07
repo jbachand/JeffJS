@@ -71,6 +71,17 @@ final class JeffJSDOMBridge {
     /// browser behavior where methods are on HTMLElement.prototype, not per-element.
     private var elementPrototype: JeffJSValue?
 
+    /// Per-interface wrapper prototypes set by the host's platform-surface pass
+    /// (`window.__rnSetNodeInterfaces`, WebIDL §3.7.3 / HTML §3.2.2 "element
+    /// interface"): an HTML element's wrapper gets its interface's prototype
+    /// (`[object HTMLDivElement]`, `HTMLIFrameElement.prototype.loading`) — each
+    /// chains to `elementPrototype`. Empty until the host sets them (then every
+    /// wrapper uses `elementPrototype`, as before).
+    var interfacePrototypesByTag: [String: JeffJSValue] = [:]
+    var unknownElementInterfacePrototype: JeffJSValue?
+    var textInterfacePrototype: JeffJSValue?
+    var commentInterfacePrototype: JeffJSValue?
+
     /// `ShadowRoot.prototype` (chains to the element prototype): shadow root
     /// wrappers get it in `wrapElement` (`JeffJSDOMBridge+Shadow.swift`).
     var shadowRootPrototype: JeffJSValue?
@@ -127,6 +138,10 @@ final class JeffJSDOMBridge {
     /// (the previous eager materialisation bound a single empty object to the
     /// shared prototype, leaving `el.classList.add` undefined).
     var classListCache: [UUID: JeffJSValue] = [:]
+    /// `el.style` (one CSSStyleDeclaration per element, made on first read: `el.style
+    /// === el.style`); an accessor on the prototype, never an own property of the
+    /// wrapper (WebIDL: HTMLElement.prototype.style).
+    var styleObjectCache: [UUID: JeffJSValue] = [:]
 
     /// Per-node `relList` wrappers, keyed by `DOMNode.id`. Same lifetime rules
     /// as `classListCache`.
@@ -257,6 +272,11 @@ final class JeffJSDOMBridge {
 
         elementPrototype?.freeValue()
         elementPrototype = nil
+        for (_, v) in interfacePrototypesByTag { v.freeValue() }
+        interfacePrototypesByTag.removeAll()
+        unknownElementInterfacePrototype?.freeValue(); unknownElementInterfacePrototype = nil
+        textInterfacePrototype?.freeValue(); textInterfacePrototype = nil
+        commentInterfacePrototype?.freeValue(); commentInterfacePrototype = nil
         shadowRootPrototype?.freeValue()
         shadowRootPrototype = nil
         customElementHook?.freeValue()
@@ -272,6 +292,8 @@ final class JeffJSDOMBridge {
 
         for (_, v) in classListCache { v.freeValue() }
         classListCache.removeAll()
+        for (_, v) in styleObjectCache { v.freeValue() }
+        styleObjectCache.removeAll()
         for (_, v) in relListCache { v.freeValue() }
         relListCache.removeAll()
         for (_, v) in detachedDocuments { v.freeValue() }
@@ -355,6 +377,7 @@ final class JeffJSDOMBridge {
         if let cachedList = classListCache.removeValue(forKey: nodeID) {
             cachedList.freeValue()
         }
+        if let st = styleObjectCache.removeValue(forKey: nodeID) { st.freeValue() }
         if let cachedList = relListCache.removeValue(forKey: nodeID) {
             cachedList.freeValue()
         }
@@ -468,6 +491,8 @@ final class JeffJSDOMBridge {
             let html = ctx.toSwiftString(args.first ?? .undefined) ?? ""
             return self.parseDetachedDocument(html: html, ctx: ctx)
         }, length: 1)
+
+        installNodeInterfaceHook(on: global, ctx: ctx)
 
         // on* handlers on window (GlobalEventHandlers + WindowEventHandlers)
         // and document; `'ontouchstart' in window` is true as on iOS.
@@ -1205,8 +1230,9 @@ final class JeffJSDOMBridge {
         }
 
         // Create element instance with shared prototype — methods are inherited
-        // (non-enumerable), matching browser behavior.
-        let el = ctx.newObjectProto(proto: elementPrototype!)
+        // (non-enumerable), matching browser behavior. Its interface prototype
+        // (which chains to the shared one) when the host has set them.
+        let el = ctx.newObjectProto(proto: interfacePrototype(for: node) ?? elementPrototype!)
 
         // Store the DOMNode reference in the object's opaque payload
         if let obj = el.toObject() {
@@ -1214,28 +1240,19 @@ final class JeffJSDOMBridge {
         }
         if node.isShadowRoot, let srProto = shadowRootPrototype { _ = ctx.setPrototypeOf(el, proto: srProto) }
 
-        // -- Per-instance read-only properties --
-        ctx.setPropertyStr(obj: el, name: "nodeType", value: .newInt32(nodeTypeInt(node)))
-        // Shared strings: every wrapper of a <div> used to carry its own
-        // "DIV", "DIV" and "div" (perf/watch-object-size).
-        ctx.setPropertyStr(obj: el, name: "nodeName", value: ctx.sharedString(nodeNameStr(node)))
-        ctx.setPropertyStr(obj: el, name: "tagName", value: ctx.sharedString(Self.qualifiedTagName(node)))
-        ctx.setPropertyStr(obj: el, name: "localName", value: ctx.sharedString(node.tagName ?? ""))
+        // `nodeType`, `nodeName`, `tagName`, `localName`, `nativeNodeID` and `style`
+        // are accessors on the shared prototype (WebIDL §3.7.6: attributes live on
+        // the interface prototype; a wrapper has no own properties —
+        // `Object.getOwnPropertyNames(div)` is [] in WebKit, and bot defences and
+        // Google's challenge VM read it). They used to be own data properties.
         if node.isDocumentType {
             // DocumentType: `name` comes from the shared prototype's reflected
             // `name` accessor (the doctype keeps its name under that key).
             ctx.setPropertyStr(obj: el, name: "publicId", value: ctx.newStringValue(node.doctypePublicId))
             ctx.setPropertyStr(obj: el, name: "systemId", value: ctx.newStringValue(node.doctypeSystemId))
         }
-        ctx.setPropertyStr(obj: el, name: "nativeNodeID", value: ctx.newStringValue(node.id.uuidString))
         // `ownerDocument` is an accessor on the shared prototype (it follows
         // adoption and removal from another document's tree).
-
-        // -- Per-instance style sub-object --
-        if node.nodeType == .element {
-            let styleObj = buildStyleObject(for: node, ctx: ctx)
-            ctx.setPropertyStr(obj: el, name: "style", value: styleObj)
-        }
 
         // For <video> elements, trigger native event registration so media
         // events (timeupdate, play, pause, ended, etc.) flow from AVPlayer to JS.
@@ -1252,6 +1269,56 @@ final class JeffJSDOMBridge {
         // A wrapper for a node outside any tree is a collection candidate.
         if node.parent == nil, node !== root, node.nodeType != .document { noteDetached(node) }
         return el
+    }
+
+    /// The interface prototype of `node`'s wrapper (nil = the shared element prototype).
+    func interfacePrototype(for node: DOMNode) -> JeffJSValue? {
+        if interfacePrototypesByTag.isEmpty && textInterfacePrototype == nil { return nil }
+        switch node.nodeType {
+        case .element:
+            guard node.isHTMLNamespace, !node.isShadowRoot, let tag = node.tagName?.lowercased() else { return nil }
+            if let p = interfacePrototypesByTag[tag] { return p }
+            if tag.contains("-") { return nil }          // valid custom element name: HTMLElement
+            return unknownElementInterfacePrototype
+        case .text: return textInterfacePrototype
+        case .comment: return commentInterfacePrototype
+        default: return nil
+        }
+    }
+
+    /// `window.__rnSetNodeInterfaces(byTag, unknown, text, comment)`: the host's
+    /// platform-surface pass hands over the interface prototype objects (each must
+    /// chain to the shared element prototype); wrappers made from now on get them,
+    /// and the cached wrappers that still have the shared prototype are moved.
+    func installNodeInterfaceHook(on global: JeffJSValue, ctx: JeffJSContext) {
+        ctx.setPropertyFunc(obj: global, name: "__rnSetNodeInterfaces", fn: { [weak self] ctx, _, args in
+            guard let self, args.count >= 4, let shared = self.elementPrototype else { return .newBool(false) }
+            func protoOK(_ v: JeffJSValue) -> Bool { v.isObject }
+            for (_, v) in self.interfacePrototypesByTag { v.freeValue() }
+            self.interfacePrototypesByTag.removeAll()
+            let map = args[0]
+            if map.isObject {
+                let keys = ctx.getOwnPropertyNames(obj: map)
+                for k in keys {
+                    let v = ctx.getPropertyStr(obj: map, name: k)
+                    if protoOK(v) { self.interfacePrototypesByTag[k.lowercased()] = v } else { v.freeValue() }
+                }
+            }
+            self.unknownElementInterfacePrototype?.freeValue()
+            self.unknownElementInterfacePrototype = protoOK(args[1]) ? args[1].dupValue() : nil
+            self.textInterfacePrototype?.freeValue()
+            self.textInterfacePrototype = protoOK(args[2]) ? args[2].dupValue() : nil
+            self.commentInterfacePrototype?.freeValue()
+            self.commentInterfacePrototype = protoOK(args[3]) ? args[3].dupValue() : nil
+            // Re-home the wrappers made before (they still have the shared prototype).
+            let sharedObj = shared.toObject()
+            for (id, w) in self.elementCache {
+                guard let o = w.toObject(), o.proto === sharedObj, let node = self.nodeRegistry[id],
+                      let p = self.interfacePrototype(for: node) else { continue }
+                _ = ctx.setPrototypeOf(w, proto: p)
+            }
+            return .newBool(true)
+        }, length: 4)
     }
 
     /// Wraps an array of DOMNodes as a JeffJS array.
@@ -2363,11 +2430,46 @@ final class JeffJSDOMBridge {
             return .newInt32(Int32(targetNode.children.filter { $0.nodeType == .element }.count))
         }, length: 0)
 
-        // -- style sub-object --
+        // -- style sub-object (one per element, made on first read) --
         ctx.setPropertyFunc(obj: el, name: "__get_style", fn: { [weak self] ctx, thisVal, _ in
-            guard let self else { return ctx.newObject() }
-            guard let targetNode = self.extractNode(from: thisVal) else { return ctx.newObject() }
-            return self.buildStyleObject(for: targetNode, ctx: ctx)
+            guard let self else { return .undefined }
+            guard let targetNode = self.extractNode(from: thisVal), targetNode.nodeType == .element else { return .undefined }
+            if let cached = self.styleObjectCache[targetNode.id] { return cached.dupValue() }
+            let st = self.buildStyleObject(for: targetNode, ctx: ctx)
+            self.styleObjectCache[targetNode.id] = st.dupValue()
+            return st
+        }, length: 0)
+        // `el.style = "…"` ([PutForwards=cssText]).
+        ctx.setPropertyFunc(obj: el, name: "__set_style", fn: { [weak self] ctx, thisVal, args in
+            guard let self, let targetNode = self.extractNode(from: thisVal), targetNode.nodeType == .element else { return .undefined }
+            let st: JeffJSValue
+            if let cached = self.styleObjectCache[targetNode.id] { st = cached.dupValue() }
+            else { st = self.buildStyleObject(for: targetNode, ctx: ctx); self.styleObjectCache[targetNode.id] = st.dupValue() }
+            let text = ctx.toSwiftString(args.first ?? .undefined) ?? ""
+            _ = ctx.setPropertyStr(obj: st, name: "cssText", value: ctx.newStringValue(text))
+            st.freeValue()
+            return .undefined
+        }, length: 1)
+        // -- node identity attributes (were own data properties of each wrapper) --
+        ctx.setPropertyFunc(obj: el, name: "__get_nodeType", fn: { [weak self] ctx, thisVal, _ in
+            guard let self, let n = self.extractNode(from: thisVal) else { return .undefined }
+            return .newInt32(self.nodeTypeInt(n))
+        }, length: 0)
+        ctx.setPropertyFunc(obj: el, name: "__get_nodeName", fn: { [weak self] ctx, thisVal, _ in
+            guard let self, let n = self.extractNode(from: thisVal) else { return .undefined }
+            return ctx.sharedString(self.nodeNameStr(n))
+        }, length: 0)
+        ctx.setPropertyFunc(obj: el, name: "__get_tagName", fn: { [weak self] ctx, thisVal, _ in
+            guard let self, let n = self.extractNode(from: thisVal), n.nodeType == .element else { return .undefined }
+            return ctx.sharedString(Self.qualifiedTagName(n))
+        }, length: 0)
+        ctx.setPropertyFunc(obj: el, name: "__get_localName", fn: { [weak self] ctx, thisVal, _ in
+            guard let self, let n = self.extractNode(from: thisVal), n.nodeType == .element else { return .undefined }
+            return ctx.sharedString(n.tagName ?? "")
+        }, length: 0)
+        ctx.setPropertyFunc(obj: el, name: "__get_nativeNodeID", fn: { [weak self] ctx, thisVal, _ in
+            guard let self, let n = self.extractNode(from: thisVal) else { return .undefined }
+            return ctx.newStringValue(n.id.uuidString)
         }, length: 0)
 
         // -- classList sub-object --
@@ -2552,6 +2654,8 @@ final class JeffJSDOMBridge {
     /// used by JeffJS's atom-based setPropertyGetSet overload).
     private func installElementPropertyShim(on el: JeffJSValue, ctx: JeffJSContext) {
         let props: [(String, Bool)] = [
+            ("nodeType", false), ("nodeName", false), ("tagName", false), ("localName", false),
+            ("nativeNodeID", false), ("style", true),
             ("textContent", true), ("innerText", true), ("innerHTML", true), ("outerHTML", true),
             ("content", true), ("classList", false), ("relList", false), ("rel", true),
             ("hreflang", true), ("target", true), ("download", true), ("ping", true),

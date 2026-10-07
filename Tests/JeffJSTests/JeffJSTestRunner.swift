@@ -333,6 +333,7 @@ struct JeffJSTestRunner {
             ("ClassConstructorCall", { $0.testClassConstructorCall() }),
             ("BrowserFingerprint", { $0.testBrowserFingerprint() }),
             ("AkamaiSensor", { $0.testAkamaiSensor() }),
+            ("HomedepotAkamai", { $0.testHomedepotAkamai() }),
             ("ProgramCompletion", { $0.testProgramCompletion() }),
             ("Redeclaration", { $0.testRedeclaration() }),
             ("DOMParserInsertion", { $0.testDOMParserInsertion() }),
