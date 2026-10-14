@@ -1992,6 +1992,24 @@ enum JeffJSProperty {
 /// Out-of-line payload for the rare non-data property kinds. ARC-managed Swift
 /// class, so getter/setter/varRef lifetimes are handled automatically exactly as
 /// the enum's associated values were — no manual refcounting.
+/// A property-extra box without a reference count: the result of `JeffJSObject.extra(at:)`,
+/// valid only until the object's property storage is next modified (the same window the
+/// `== nil` tests and short reads of the interpreter and the app's inspectors use it in). Code
+/// that calls out to JS while holding the box uses `extraStrong(at:)`.
+struct JeffJSExtraRef {
+    let raw: UnsafeRawPointer
+    @inline(__always) private func with<T>(_ f: (JeffJSPropertyExtra) -> T) -> T {
+        Unmanaged<JeffJSPropertyExtra>.fromOpaque(raw)._withUnsafeGuaranteedRef(f)
+    }
+    var kind: JeffJSPropertyExtra.Kind { with { $0.kind } }
+    var getter: JeffJSObject? { with { $0.getter } }
+    var setter: JeffJSObject? { with { $0.setter } }
+    var varRef: JeffJSVarRef? { with { $0.varRef } }
+    var autoRealmAndId: UInt { with { $0.autoRealmAndId } }
+    var autoOpaque: Any? { with { $0.autoOpaque } }
+    func toProperty() -> JeffJSProperty { with { $0.toProperty() } }
+}
+
 nonisolated final class JeffJSPropertyExtra {
     enum Kind: UInt8 { case getset, varRef, autoInit }
     // Layout (perf/watch-object-size): 48 bytes, was 96 (an `Any?` alone was
@@ -3232,9 +3250,11 @@ extension JeffJSObject {
     /// owned and not to be dereferenced; reading `propExtra[i]` here returned a
     /// strong reference (3 retains + 2 releases per property read just to be
     /// compared with nil). Use `extraStrong(at:)` to read the box.
-    @inline(__always) func extra(at i: Int) -> UnsafeRawPointer? {
+    @inline(__always) func extra(at i: Int) -> JeffJSExtraRef? {
         // propExtraCount > 0 implies the side box exists.
-        i < propExtraCount ? _auxU.unsafelyUnwrapped._withUnsafeGuaranteedRef { $0.propExtraRaw(i) } : nil
+        guard i < propExtraCount,
+              let raw = _auxU.unsafelyUnwrapped._withUnsafeGuaranteedRef({ $0.propExtraRaw(i) }) else { return nil }
+        return JeffJSExtraRef(raw: raw)
     }
     @inline(__always) func extraStrong(at i: Int) -> JeffJSPropertyExtra? {
         i < propExtraCount ? _auxU.unsafelyUnwrapped._withUnsafeGuaranteedRef { $0.propExtra[i] } : nil
@@ -3702,7 +3722,7 @@ struct JeffJSObj {
     }
     @inline(__always) var propCount: Int { _with { $0.propValues.count } }
     @inline(__always) func dataValue(at i: Int) -> JeffJSValue { _with { $0.propValues[i] } }
-    @inline(__always) func extra(at i: Int) -> UnsafeRawPointer? { _with { $0.extra(at: i) } }
+    @inline(__always) func extra(at i: Int) -> JeffJSExtraRef? { _with { $0.extra(at: i) } }
     @inline(__always) func extraStrong(at i: Int) -> JeffJSPropertyExtra? { _with { $0.extraStrong(at: i) } }
     @inline(__always) func setExtraSlot(_ i: Int, _ e: JeffJSPropertyExtra?) { _obj.setExtraSlot(i, e) }
     @inline(__always) func propEntry(at i: Int) -> JeffJSProperty { _obj.propEntry(at: i) }
