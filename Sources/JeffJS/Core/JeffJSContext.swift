@@ -209,6 +209,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     private var _atomIterTarget: UInt32 = 0
     private var _atomIterIndex: UInt32 = 0
     private var _atomIterKind: UInt32 = 0
+    private var _atomNext: UInt32 = 0
+    /// Interned "next" (iterator protocol), looked up once per context.
+    var atomNext: UInt32 { if _atomNext == 0 { _atomNext = rt.findAtom("next") }; return _atomNext }
     var atomIterTarget: UInt32 { if _atomIterTarget == 0 { _atomIterTarget = rt.findAtom("_target") }; return _atomIterTarget }
     var atomIterIndex: UInt32 { if _atomIterIndex == 0 { _atomIterIndex = rt.findAtom("_index") }; return _atomIterIndex }
     var atomIterKind: UInt32 { if _atomIterKind == 0 { _atomIterKind = rt.findAtom("_kind") }; return _atomIterKind }
@@ -6815,12 +6818,12 @@ extension JeffJSContext {
         if p._fastArrayValues == nil, case .array(_, let values, let count) = p.payload {
             p.payload = .array(size: UInt32(len), values: values, count: count)
         }
-        let lenAtom = rt.findAtom("length")
+        let lenAtom = JeffJSAtomID.JS_ATOM_length.rawValue
         _ = setProperty(obj: obj, atom: lenAtom, value: newInt64(len))
     }
 
     func getArrayLength(_ obj: JeffJSValue) -> Int64 {
-        let lenAtom = rt.findAtom("length")
+        let lenAtom = JeffJSAtomID.JS_ATOM_length.rawValue
         let lenVal = getProperty(obj: obj, atom: lenAtom)
         if let v = toInt32(lenVal) { return Int64(v) }
         if let v = toFloat64(lenVal) { return Int64(v) }

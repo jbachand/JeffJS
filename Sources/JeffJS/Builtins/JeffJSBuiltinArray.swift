@@ -206,6 +206,21 @@ struct JeffJSBuiltinArray {
             if iter.isException { arr.freeValue(); return iter }
             defer { iter.freeValue() }
 
+            // GetIterator reads `next` once (ES §7.4.2 [[NextMethod]]); the
+            // loop used to look it up by name on every step.
+            let nextMethod = ctx.getProperty(obj: iter, atom: ctx.atomNext)
+            if nextMethod.isException { arr.freeValue(); return nextMethod }
+            defer { nextMethod.freeValue() }
+            // Mirrors QuickJS js_array_iterator_next's special case: when the
+            // method just read is the intrinsic %ArrayIteratorPrototype%.next
+            // (so neither the iterator's own `next` nor the prototype's is
+            // patched; a patched @@iterator is whatever getMethod returned,
+            // and its iterator is stepped by the same rule) step it inline: no {value, done}
+            // object, and no observable difference since the result object
+            // was never visible.
+            let fastStep = jeffJSFastIterators && ctx.arrayIterNextVal.isObject
+                && nextMethod.bits == ctx.arrayIterNextVal.bits && iter.isObject
+
             var k: Int64 = 0
             while true {
                 if k >= MAX_SAFE_INTEGER {
@@ -214,8 +229,41 @@ struct JeffJSBuiltinArray {
                     return ctx.throwTypeError(message: "Array.from: too many elements")
                 }
 
-                let next = ctx.callMethod(iter, name: "next", args: [])
+                if fastStep, let io = iter.toObject() {
+                    let st = ctx.arrayIterStep(io)
+                    if st.exception { arr.freeValue(); return .exception }
+                    if st.done {
+                        ctx.setArrayLength(arr, k)
+                        return arr
+                    }
+                    var val = st.value
+                    if mapping {
+                        let kValue = ctx.newInt64(k)
+                        let mapped = ctx.call(mapFn, this: thisArg, args: [val, kValue])
+                        val.freeValue()
+                        if mapped.isException {
+                            ctx.iteratorClose(iter: iter, isThrow: true)
+                            arr.freeValue()
+                            return mapped
+                        }
+                        val = mapped
+                    }
+                    if !putIndex(ctx: ctx, arr, k, val) {
+                        ctx.iteratorClose(iter: iter, isThrow: true)
+                        arr.freeValue()
+                        return .exception
+                    }
+                    k += 1
+                    continue
+                }
+
+                let next = ctx.callFunction(nextMethod, thisVal: iter, args: [])
                 if next.isException { arr.freeValue(); return next }
+                if !next.isObject {
+                    next.freeValue()
+                    arr.freeValue()
+                    return ctx.throwTypeError(message: "iterator result is not an object")
+                }
 
                 let done = ctx.getProperty(obj: next, atom: JeffJSAtomID.JS_ATOM_done.rawValue)
                 if done.isException { next.freeValue(); arr.freeValue(); return done }

@@ -299,6 +299,7 @@ struct JeffJSTestRunner {
             ("HyperlinkReflection", { $0.testHyperlinkReflection() }),
             ("AssignmentPatterns", { $0.testAssignmentPatterns() }),
             ("IteratorClose", { $0.testIteratorClose() }),
+            ("ArrayFromIterator", { $0.testArrayFromIterator() }),
             ("FreedValueTouches", { $0.testFreedValueTouches() }),
             ("NflConstructor", { $0.testNflConstructor() }),
             ("UnicodeIdentifiers", { $0.testUnicodeIdentifiers() }),
