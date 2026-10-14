@@ -676,6 +676,43 @@ extension JeffJSContext {
     /// `postMessage` reports it as the event's `source`. Not retained.
     var incumbentGlobal: JeffJSValue { enteredFromRealm?.globalObj ?? globalObj }
 
+    /// Native -> JS call with the arguments as `argv[0 ..< argc]` (borrowed: the
+    /// callee dups what it keeps; `argv` may be nil only when `argc == 0`), the
+    /// entry for builtins that call back into JS in a loop (Array.prototype.forEach,
+    /// map, reduce, ... , Promise jobs, sort comparators). A same-realm plain bytecode
+    /// function runs straight through `callInternalRaw` with no `[JeffJSValue]`; any
+    /// other callee (C function, bound, proxy, generator, async, other realm) takes
+    /// `callFunction(_:thisVal:args:)` with an array built from the pointer, so
+    /// behaviour is identical. Mirrors QuickJS `JS_Call` (argc/argv).
+    func callFunction(_ funcVal: JeffJSValue, thisVal: JeffJSValue,
+                      argv: UnsafePointer<JeffJSValue>?, argc: Int) -> JeffJSValue {
+        guard cfgLeanCallEntry, !jeffJSZombiesEnabled, let lo = funcVal.obj, lo.realmIndex == realmIndex,
+              let lfb = lo.fbFastU,
+              lfb._withUnsafeGuaranteedRef({ !$0.isGenerator && !$0.isAsyncFunc }) else {
+            return callFunction(funcVal, thisVal: thisVal,
+                                args: argc == 0 ? [] : Array(UnsafeBufferPointer(start: argv, count: argc)))
+        }
+        // Same prologue as callFunction (depth, task boundary, native stack).
+        callDepth += 1
+        defer { callDepth -= 1 }
+        if callDepth > cfgMaxCallDepth {
+            return throwRangeError(message: "Maximum call stack size exceeded.")
+        }
+        if callDepth == 1 {
+            rt.updateStackLimitForCurrentThread()
+            interruptTerminated = false
+            rt.memoryStopRequested = false
+            jeffJS_idleGCTick(rt)
+            jeffJS_heapCensusTick(rt)
+        }
+        if rt.checkStackOverflow() {
+            return throwRangeError(message: "Maximum call stack size exceeded.")
+        }
+        return JeffJSInterpreter.callInternalRaw(ctx: self, funcObj: funcVal, thisVal: thisVal,
+                                                 argv: argv, argc: argc,
+                                                 stackChecked: cfgFastCallEntry && callDepth > 1)
+    }
+
     func callFunction(_ funcVal: JeffJSValue, thisVal: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         if jeffJSZombiesEnabled, let zo = funcVal.obj, zo.asClass.freeMark {
             JeffJSZombieDebug.reportTouch("CALL", zo.asClass)   // calling a dead function: an under-retained reference
@@ -7663,6 +7700,8 @@ struct JeffJSInterpreter {
     }
     static var traceOpcodes = JeffJSConfig.traceOpcodes
 
+    /// Array-argument entry: a thin wrapper over `callInternalRaw`.
+    @inline(__always)
     static func callInternal(
         ctx: JeffJSContext,
         funcObj: JeffJSValue,
@@ -7676,6 +7715,37 @@ struct JeffJSInterpreter {
         resumeCompletionType: Int = 0,
         stackChecked: Bool = false
     ) -> JeffJSValue {
+        return args.withUnsafeBufferPointer { b in
+            callInternalRaw(ctx: ctx, funcObj: funcObj, thisVal: thisVal, argv: b.baseAddress, argc: b.count,
+                            flags: flags, newTarget: newTarget, generatorObject: generatorObject,
+                            resumeState: resumeState, resumeValue: resumeValue,
+                            resumeCompletionType: resumeCompletionType, stackChecked: stackChecked)
+        }
+    }
+
+    /// The JS function activation (QuickJS `JS_CallInternal`) with its arguments as a
+    /// pointer + count: `argv[0 ..< argc]` are BORROWED for the duration of the call
+    /// (the callee dups what it keeps, see "Ownership of call arguments"). `argv` may
+    /// be nil only when `argc == 0`. No `[JeffJSValue]` is materialised on the plain
+    /// bytecode path; the cold paths (C functions, bound functions, proxies, generator
+    /// and async activations) build one from the pointer.
+    static func callInternalRaw(
+        ctx: JeffJSContext,
+        funcObj: JeffJSValue,
+        thisVal: JeffJSValue,
+        argv: UnsafePointer<JeffJSValue>?,
+        argc: Int,
+        flags: Int = 0,
+        newTarget: JeffJSValue = .undefined,
+        generatorObject: JeffJSValue = .undefined,
+        resumeState: GeneratorSavedState? = nil,
+        resumeValue: JeffJSValue = .undefined,
+        resumeCompletionType: Int = 0,
+        stackChecked: Bool = false
+    ) -> JeffJSValue {
+        @inline(__always) func argsArray() -> [JeffJSValue] {
+            argc == 0 ? [] : Array(UnsafeBufferPointer(start: argv, count: argc))
+        }
         // Guard against stack overflow from deep recursion.
         // Depth lives on the context: static-var read-modify-writes here cost a
         // TLS-backed dynamic exclusivity check per call.
@@ -7708,7 +7778,7 @@ struct JeffJSInterpreter {
         // paths, generator / async resumption) switches like callFunction.
         if obj.realmIndex != ctx.realmIndex, let target = ctx.rt.realm(at: obj.realmIndex), target !== ctx {
             return ctx.callInRealm(target) {
-                callInternal(ctx: $0, funcObj: funcObj, thisVal: thisVal, args: args, flags: flags,
+                callInternalRaw(ctx: $0, funcObj: funcObj, thisVal: thisVal, argv: argv, argc: argc, flags: flags,
                              newTarget: newTarget, generatorObject: generatorObject, resumeState: resumeState,
                              resumeValue: resumeValue, resumeCompletionType: resumeCompletionType)
             }
@@ -7725,6 +7795,7 @@ struct JeffJSInterpreter {
         } else {
             // Cold paths: C functions (e.g. via Promise reaction jobs), bound
             // functions, callable proxies, or payload-only bytecode functions.
+            let args = argsArray()
             if case .cFunc(_, let cFunction, _, _, let magic) = obj.payload {
                 switch cFunction {
                 case .generic(let fn): return fn(ctx, thisVal, args)
@@ -7821,7 +7892,7 @@ struct JeffJSInterpreter {
         // new.target (borrowed from the constructor call site, or the
         // caller's for direct-eval code; releaseFrame resets it).
         frame.newTarget = newTarget
-        frame.argCount = args.count
+        frame.argCount = argc
         // No padding append: `buf` carries the undefined-padded arg slots, and
         // every argBuf consumer (varRef pvalue, detach, syncBufToFrame) bounds-
         // checks or prefers buf. The old pad forced a COW grow per call, and it
@@ -7834,7 +7905,7 @@ struct JeffJSInterpreter {
         // here plus a release and an array uniqueness check in releaseFrame
         // per native→JS call. [callInternal edit, watch-cpu 2026-10-07]
         if !ctx.cfgLeanCallEntry || fb.isGenerator || fb.isAsyncFunc || resumeState != nil {
-            frame.argBuf = args
+            frame.argBuf = argsArray()
             frame.bufArraysLive = true
         }
         }
@@ -7848,7 +7919,7 @@ struct JeffJSInterpreter {
         let varCount = Int(fb.varCount)
         frame.varCount = varCount
 
-        let argSlots = max(Int(fb.argCount), args.count)
+        let argSlots = max(Int(fb.argCount), argc)
 
         // Allocate contiguous unsafe buffer: [arg slots][var slots][value stack].
         // Only the args+vars prefix needs .undefined initialization — the value-
@@ -7869,9 +7940,9 @@ struct JeffJSInterpreter {
         // owned copies when the function can store into its parameters (see
         // "Argument slots"; released in the epilogue).
         if fb.copiesArgs && resumeState == nil {
-            for i in 0..<args.count { buf[i] = args[i].dupValue() }
+            for i in 0..<argc { buf[i] = argv.unsafelyUnwrapped[i].dupValue() }
         } else {
-            for i in 0..<args.count { buf[i] = args[i] }
+            for i in 0..<argc { buf[i] = argv.unsafelyUnwrapped[i] }
         }
         // Remaining arg slots (padding) are already .undefined from initialization
 

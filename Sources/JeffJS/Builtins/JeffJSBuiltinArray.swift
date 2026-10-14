@@ -2033,7 +2033,9 @@ struct JeffJSBuiltinArray {
         let pinned = element.owned ? element.value : element.value.dupValue()
         cbArgs[0] = pinned
         cbArgs[1] = ctx.newInt64(element.index)
-        let r = ctx.callFunction(fn, thisVal: thisArg, args: cbArgs)
+        let r = cbArgs.withUnsafeBufferPointer {
+            ctx.callFunction(fn, thisVal: thisArg, argv: $0.baseAddress, argc: $0.count)
+        }
         return (r, pinned)
     }
 
