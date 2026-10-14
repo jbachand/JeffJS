@@ -141,7 +141,7 @@ struct TypedArrayElementInfo {
             let d = value.isInt ? Double(value.toInt32()) : value.toNumber()
             if d.isNaN || d <= 0 { data[offset] = 0 }
             else if d >= 255 { data[offset] = 255 }
-            else { data[offset] = UInt8(Darwin.round(d)) }
+            else { data[offset] = UInt8(d.rounded(.toNearestOrEven)) }
 
         case JeffJSClassID.int16Array.rawValue:
             let v: Int32 = value.isInt ? value.toInt32() : Self.safeDoubleToInt32(value.toNumber())
@@ -279,7 +279,7 @@ func jeffJS_typedArrayStore(_ classID: Int, _ p: UnsafeMutableRawPointer, _ valu
         p.storeBytes(of: UInt8(truncatingIfNeeded: toInt32()), as: UInt8.self)
     case JeffJSClassID.uint8cArray.rawValue:
         let d = value.isInt ? Double(value.toInt32()) : value.toNumber()
-        let b: UInt8 = (d.isNaN || d <= 0) ? 0 : (d >= 255 ? 255 : UInt8(Darwin.round(d)))
+        let b: UInt8 = (d.isNaN || d <= 0) ? 0 : (d >= 255 ? 255 : UInt8(d.rounded(.toNearestOrEven)))
         p.storeBytes(of: b, as: UInt8.self)
     case JeffJSClassID.int16Array.rawValue, JeffJSClassID.uint16Array.rawValue:
         p.storeBytes(of: UInt16(truncatingIfNeeded: toInt32()).littleEndian, as: UInt16.self)
