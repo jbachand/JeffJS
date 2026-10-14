@@ -1466,8 +1466,7 @@ extension JeffJSContext {
         // interp.leanClosurePayload: the var-refs live in varRefsFast (and its
         // raw mirror) only — one array reference per closure instead of two
         // (a retain at creation, a release and an array copy check at death).
-        obj.payload = .bytecodeFunc(functionBytecode: innerFB, varRefs: jeffJSLeanClosurePayload ? [] : childVarRefs,
-                                    homeObject: inheritedHome)
+        obj.installClosurePayload(innerFB, varRefs: jeffJSLeanClosurePayload ? [] : childVarRefs, home: inheritedHome)
         obj.realmIndex = realmIndex   // the closure belongs to the realm running its enclosing code
         innerFB.liveClosures &+= 1   // perf/memory-census (uncounted in freeObject)
         // A lazy function whose body is not compiled yet keeps fbFast nil:

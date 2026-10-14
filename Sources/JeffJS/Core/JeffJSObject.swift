@@ -2425,6 +2425,21 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
         }
     }
 
+    /// `payload = .bytecodeFunc(...)` for a freshly created or recycled closure,
+    /// building the enum directly in the side box: the generic setter takes the
+    /// enum by value, copies it into the box and destroys the argument
+    /// (retain/release traffic on the body, the var-ref array and the home
+    /// object, ~12 ARC operations per closure).
+    @inline(__always)
+    final func installClosurePayload(_ fb: JeffJSFunctionBytecode, varRefs: [JeffJSVarRef?], home: JeffJSObject?) {
+        let a = ensureAux()
+        a.payload = .bytecodeFunc(functionBytecode: fb, varRefs: varRefs, homeObject: home)
+        if (_flags & JeffJSObject.flagHasCFunc) != 0 {
+            a.cFuncFast = nil
+            _flags &= ~JeffJSObject.flagHasCFunc
+        }
+    }
+
     // -- Denormalized .bytecodeFunc payload (call-path fast fields) -----------
     // Pattern-matching `case .bytecodeFunc(...) = payload` copies the enum
     // (retaining the FB and the varRefs array) on every JS call. The hot call
