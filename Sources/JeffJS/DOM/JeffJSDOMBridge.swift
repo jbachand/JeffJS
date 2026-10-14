@@ -3705,48 +3705,16 @@ final class JeffJSDOMBridge {
     }
 
     /// Returns the next sibling of a node in its parent's children.
-    func nextSibling(of node: DOMNode) -> DOMNode? {
-        guard let parent = node.parent else { return nil }
-        let siblings = parent.children
-        guard let idx = siblings.firstIndex(where: { $0 === node }) else { return nil }
-        let nextIdx = siblings.index(after: idx)
-        return nextIdx < siblings.endIndex ? siblings[nextIdx] : nil
-    }
+    func nextSibling(of node: DOMNode) -> DOMNode? { node.sibling(offset: 1) }
 
     /// Returns the previous sibling of a node in its parent's children.
-    func previousSibling(of node: DOMNode) -> DOMNode? {
-        guard let parent = node.parent else { return nil }
-        let siblings = parent.children
-        guard let idx = siblings.firstIndex(where: { $0 === node }), idx > siblings.startIndex else { return nil }
-        return siblings[siblings.index(before: idx)]
-    }
+    func previousSibling(of node: DOMNode) -> DOMNode? { node.sibling(offset: -1) }
 
     /// Returns the next element sibling.
-    private func nextElementSibling(of node: DOMNode) -> DOMNode? {
-        guard let parent = node.parent else { return nil }
-        let siblings = parent.children
-        guard let idx = siblings.firstIndex(where: { $0 === node }) else { return nil }
-        var i = siblings.index(after: idx)
-        while i < siblings.endIndex {
-            if siblings[i].nodeType == .element { return siblings[i] }
-            i = siblings.index(after: i)
-        }
-        return nil
-    }
+    private func nextElementSibling(of node: DOMNode) -> DOMNode? { node.elementSibling(forward: true) }
 
     /// Returns the previous element sibling.
-    private func previousElementSibling(of node: DOMNode) -> DOMNode? {
-        guard let parent = node.parent else { return nil }
-        let siblings = parent.children
-        guard let idx = siblings.firstIndex(where: { $0 === node }), idx > siblings.startIndex else { return nil }
-        var i = siblings.index(before: idx)
-        while i >= siblings.startIndex {
-            if siblings[i].nodeType == .element { return siblings[i] }
-            if i == siblings.startIndex { break }
-            i = siblings.index(before: i)
-        }
-        return nil
-    }
+    private func previousElementSibling(of node: DOMNode) -> DOMNode? { node.elementSibling(forward: false) }
 
     /// Checks if `parent` contains `child` anywhere in its subtree.
     /// Shared implementation for `insertAdjacentElement/Text/HTML`.

@@ -43,7 +43,16 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
         /// Any change invalidates every node's selector-matching cache (the
         /// language and ancestor filter are functions of the parent chain).
         weak var parent: DOMNode?
-        var children: [DOMNode] = []
+        var children: [DOMNode] = [] { didSet { childrenVersion &+= 1 } }
+        /// Bumped by every change to `children` (`DOMNode+Siblings.swift`).
+        var childrenVersion: UInt64 = 1
+        /// This node's position among its parent's children, valid while
+        /// `posVersion` equals the parent's `childrenVersion` (0 = none; reset
+        /// whenever the parent link changes).
+        var posVersion: UInt64 = 0
+        var posIndex = 0
+        var posElementIndex = 0
+        var posElementCount = 0
         var attributes: [String: String]
         /// Attribute names in the order they were added (see `orderedAttributeNames`).
         var attributeOrder: [String] = []
@@ -107,7 +116,7 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
     public internal(set) var parent: DOMNode? {
         get { state.withLock { $0.parent } }
         set {
-            state.withLock { $0.parent = newValue }
+            state.withLock { $0.parent = newValue; $0.posVersion = 0 }
             DOMNode.bumpSelectorEpoch()
         }
     }

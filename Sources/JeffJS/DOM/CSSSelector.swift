@@ -911,24 +911,13 @@ public struct CSSSelectorMatcher: Sendable {
 
     /// Returns the 0-based index of this element among its element siblings.
     private static func elementIndex(of node: DOMNode) -> Int {
-        guard let parent = node.parent else { return 0 }
-        var index = 0
-        for child in parent.children {
-            if child === node { return index }
-            if child.nodeType == .element { index += 1 }
-        }
-        return 0
+        node.siblingPosition()?.elementIndex ?? 0
     }
 
     /// Returns the 0-based index of this element counting from the end among element siblings.
     private static func elementIndexFromEnd(of node: DOMNode) -> Int {
-        guard let parent = node.parent else { return 0 }
-        var index = 0
-        for child in parent.children.reversed() {
-            if child === node { return index }
-            if child.nodeType == .element { index += 1 }
-        }
-        return 0
+        guard let position = node.siblingPosition() else { return 0 }
+        return position.elementCount - 1 - position.elementIndex
     }
 
     /// Returns the 0-based index of this element among siblings of the same tag name.
@@ -955,11 +944,8 @@ public struct CSSSelectorMatcher: Sendable {
 
     /// Whether the node is the last element child of its parent.
     private static func isLastElement(_ node: DOMNode) -> Bool {
-        guard let parent = node.parent else { return true }
-        for child in parent.children.reversed() {
-            if child.nodeType == .element { return child === node }
-        }
-        return false
+        guard let position = node.siblingPosition() else { return true }
+        return position.elementIndex == position.elementCount - 1
     }
 
     /// Whether the node is the last element child of its type in its parent.
@@ -1314,31 +1300,11 @@ public struct CSSSelectorMatcher: Sendable {
     // MARK: - Sibling Helpers
 
     static func previousElementSibling(of node: DOMNode) -> DOMNode? {
-        guard let parent = node.parent else { return nil }
-        let siblings = parent.children
-        guard let idx = siblings.firstIndex(where: { $0 === node }), idx > 0 else { return nil }
-        var scan = idx - 1
-        while scan >= 0 {
-            let candidate = siblings[scan]
-            if candidate.nodeType == .element {
-                return candidate
-            }
-            if scan == 0 { break }
-            scan -= 1
-        }
-        return nil
+        node.elementSibling(forward: false)
     }
 
     static func nextElementSibling(of node: DOMNode) -> DOMNode? {
-        guard let parent = node.parent else { return nil }
-        let siblings = parent.children
-        guard let idx = siblings.firstIndex(where: { $0 === node }) else { return nil }
-        var scan = idx + 1
-        while scan < siblings.count {
-            if siblings[scan].nodeType == .element { return siblings[scan] }
-            scan += 1
-        }
-        return nil
+        node.elementSibling(forward: true)
     }
 
     // MARK: - Attribute Matching
