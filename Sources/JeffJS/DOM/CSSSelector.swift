@@ -229,9 +229,27 @@ public struct CSSComplexSelector: Sendable {
     /// If non-nil, this selector targets a pseudo-element (::before / ::after / ...).
     public let pseudoElement: CSSPseudoElement?
 
+    /// `pureDescendantPrefix[i]` is true when every combinator left of
+    /// `parts[i - 1]` (those preceding `parts[1..<i]`) is a descendant
+    /// combinator. A descendant combinator before `parts[i]` then needs only
+    /// the *nearest* ancestor matching `parts[i - 1]`: a farther one has a
+    /// subset of its ancestors, and nothing left of it constrains the
+    /// ancestor's position, so if the nearest fails every farther one fails.
+    /// Otherwise the matcher backtracks with a failure memo
+    /// (`CSSSelectorMatcher.ChainMemo`) so the work stays polynomial.
+    let pureDescendantPrefix: [Bool]
+
     public init(parts: [Part], pseudoElement: CSSPseudoElement? = nil) {
         self.parts = parts
         self.pseudoElement = pseudoElement
+        var pure = [Bool](repeating: true, count: parts.count + 1)
+        var allDescendant = true
+        for i in 0..<parts.count {
+            pure[i] = allDescendant
+            if i >= 1, (parts[i].combinator ?? .descendant) != .descendant { allDescendant = false }
+        }
+        pure[parts.count] = allDescendant
+        self.pureDescendantPrefix = pure
     }
 }
 
@@ -406,7 +424,8 @@ public struct CSSSelectorMatcher: Sendable {
         // Fast reject: a compound left of a descendant / child combinator must
         // match an ancestor, so its identifiers must be in the ancestor filter.
         if ancestorFilterRejects(parts, node: node) { return false }
-        return matchesCombinator(parts, last, node: node, context: context)
+        var memo: ChainMemo?
+        return matchesCombinator(selector, last, node: node, context: context, memo: &memo)
     }
 
     /// True when some compound that has to match an ancestor of `node` needs
@@ -429,46 +448,78 @@ public struct CSSSelectorMatcher: Sendable {
         return false
     }
 
-    /// Right-to-left match with backtracking over descendant / general-sibling
-    /// combinators (`.a .b .c` must not fail just because the nearest `.b`
-    /// ancestor has no `.a` above it).
+    /// Failure memo for one `matches` call: (part index, node) pairs for which
+    /// "`parts[index]` matches the node and the rest of the chain holds" was
+    /// found false. Keeps backtracking over descendant / general-sibling
+    /// combinators O(parts x nodes) instead of exponential in the depth. The
+    /// same idea as WebKit's SelectorChecker descendant backtracking (and
+    /// SelectorCompiler, which only backtracks while an earlier combinator can
+    /// still pick a different ancestor).
+    final class ChainMemo {
+        struct Key: Hashable { let index: Int; let node: ObjectIdentifier }
+        var failed = Set<Key>()
+    }
+
+    /// `parts[index]` against `node`, then the rest of the chain.
     private static func matchesChain(
-        _ parts: [CSSComplexSelector.Part],
-        _ index: Int,
-        node: DOMNode,
-        context: CSSMatchContext
+        _ selector: CSSComplexSelector, _ index: Int, node: DOMNode,
+        context: CSSMatchContext, memo: inout ChainMemo?
     ) -> Bool {
-        guard matchesCompound(parts[index].selector, node: node, context: context) else { return false }
+        guard matchesCompound(selector.parts[index].selector, node: node, context: context) else { return false }
         if index == 0 { return true }
-        return matchesCombinator(parts, index, node: node, context: context)
+        return matchesCombinator(selector, index, node: node, context: context, memo: &memo)
+    }
+
+    /// Memoised `matchesChain`, for the backtracking loops.
+    private static func matchesChainMemoised(
+        _ selector: CSSComplexSelector, _ index: Int, node: DOMNode,
+        context: CSSMatchContext, memo: inout ChainMemo?
+    ) -> Bool {
+        if memo == nil { memo = ChainMemo() }
+        let key = ChainMemo.Key(index: index, node: ObjectIdentifier(node))
+        if memo.unsafelyUnwrapped.failed.contains(key) { return false }
+        if matchesChain(selector, index, node: node, context: context, memo: &memo) { return true }
+        memo.unsafelyUnwrapped.failed.insert(key)
+        return false
     }
 
     /// The rest of `matchesChain` once `parts[index]` matched `node`: find the
     /// element the combinator before it points at.
     private static func matchesCombinator(
-        _ parts: [CSSComplexSelector.Part],
-        _ index: Int,
-        node: DOMNode,
-        context: CSSMatchContext
+        _ selector: CSSComplexSelector, _ index: Int, node: DOMNode,
+        context: CSSMatchContext, memo: inout ChainMemo?
     ) -> Bool {
+        let parts = selector.parts
         switch parts[index].combinator ?? .descendant {
         case .child:
             guard let parent = selectorParent(of: node, context: context) else { return false }
-            return matchesChain(parts, index - 1, node: parent, context: context)
+            return matchesChain(selector, index - 1, node: parent, context: context, memo: &memo)
         case .descendant:
             var cursor = selectorParent(of: node, context: context)
+            if selector.pureDescendantPrefix[index] {
+                // Greedy: the nearest ancestor matching the compound decides.
+                let target = parts[index - 1].selector
+                while let ancestor = cursor {
+                    if matchesCompound(target, node: ancestor, context: context) {
+                        if index - 1 == 0 { return true }
+                        return matchesCombinator(selector, index - 1, node: ancestor, context: context, memo: &memo)
+                    }
+                    cursor = selectorParent(of: ancestor, context: context)
+                }
+                return false
+            }
             while let ancestor = cursor {
-                if matchesChain(parts, index - 1, node: ancestor, context: context) { return true }
+                if matchesChainMemoised(selector, index - 1, node: ancestor, context: context, memo: &memo) { return true }
                 cursor = selectorParent(of: ancestor, context: context)
             }
             return false
         case .adjacentSibling:
             guard let sibling = previousElementSibling(of: node) else { return false }
-            return matchesChain(parts, index - 1, node: sibling, context: context)
+            return matchesChain(selector, index - 1, node: sibling, context: context, memo: &memo)
         case .generalSibling:
             var cursor = previousElementSibling(of: node)
             while let sibling = cursor {
-                if matchesChain(parts, index - 1, node: sibling, context: context) { return true }
+                if matchesChainMemoised(selector, index - 1, node: sibling, context: context, memo: &memo) { return true }
                 cursor = previousElementSibling(of: sibling)
             }
             return false
