@@ -1,4 +1,5 @@
 import XCTest
+import Synchronization
 @testable import JeffJS
 
 /// querySelector / querySelectorAll fast paths: early exit, selector-list
@@ -92,5 +93,41 @@ final class DOMQueryFastPathTests: XCTestCase {
         XCTAssertTrue(got.elementsEqual(Self.oracleAll(root, list), by: ===))
         XCTAssertEqual(got.count, 1)
         XCTAssertLessThan(ms, 150, "attribute-anchored list took \(ms) ms")
+    }
+}
+
+/// Readers scanning (querySelectorAll, sibling queries) while the single
+/// writer mutates; run under `swift test --sanitize=thread` too.
+final class DOMQueryConcurrencyTests: XCTestCase {
+    func testConcurrentReadersDuringMutation() {
+        let root = HTMLParser.parse("<div id=\"r\"></div>")
+        let host = root.querySelector("#r")!
+        for i in 0..<200 { let e = DOMNode.element(tag: "li", attributes: ["class": "k\(i % 5)"]); host.appendChild(e) }
+        let stop = Atomic<Bool>(false)
+        let group = DispatchGroup()
+        for t in 0..<3 {
+            group.enter()
+            Thread.detachNewThread {
+                var n = 0
+                while !stop.load(ordering: .acquiring) {
+                    n += root.querySelectorAll("#r > li.k\(t), li:nth-child(2n+1), li + li ~ li.k1").count
+                    if let first = host.firstChildNode { n += first.sibling(offset: 1) == nil ? 0 : 1 }
+                    _ = root.querySelector(".k3")
+                }
+                group.leave()
+            }
+        }
+        for step in 0..<3000 {
+            let kids = host.children
+            switch step % 4 {
+            case 0: host.appendChild(DOMNode.element(tag: "li", attributes: ["class": "k\(step % 5)"]))
+            case 1: if let k = kids.randomElement() { host.removeChild(k) }
+            case 2: if let a = kids.randomElement(), let b = kids.randomElement(), a !== b, a.parent === host {
+                host.removeChild(a); host.insertChild(a, before: b) }
+            default: kids.randomElement()?.setAttribute(name: "class", value: "k\(step % 5)")
+            }
+        }
+        stop.store(true, ordering: .releasing)
+        group.wait()
     }
 }
