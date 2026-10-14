@@ -1337,6 +1337,7 @@ public struct CSSSelectorParser: Sendable {
 
     /// Clear the selector cache. Call on page teardown to free memory.
     public static func clearCache() {
+        CSSQueryPlan.clearCache()
         cacheLock.lock()
         selectorCache.removeAll()
         cacheLock.unlock()
@@ -2241,5 +2242,63 @@ public enum CSSSelector {
         default:
             return true
         }
+    }
+}
+
+// MARK: - Query plans (querySelector / querySelectorAll)
+
+/// A parsed selector list prepared for scanning a subtree (pseudo-element
+/// selectors dropped), cached by selector string in a bounded LRU. Keyed by the
+/// string, never by DOM state, so a plan stays valid across mutations.
+final class CSSQueryPlan: @unchecked Sendable {
+    let selectors: [CSSComplexSelector]
+
+    private init?(list: CSSSelectorList) {
+        let candidates = list.selectors.filter { $0.pseudoElement == nil }
+        guard !candidates.isEmpty else { return nil }
+        selectors = candidates
+    }
+
+    /// True when any selector of the list matches `node`.
+    func matches(_ node: DOMNode, context: CSSMatchContext) -> Bool {
+        for sel in selectors where CSSSelectorMatcher.matches(sel, node: node, context: context) { return true }
+        return false
+    }
+
+    // MARK: Cache (bounded, approximate LRU)
+
+    private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var cache: [String: (plan: CSSQueryPlan?, used: UInt64)] = [:]
+    nonisolated(unsafe) private static var clock: UInt64 = 0
+    private static let capacity = 128
+
+    /// The plan for `selector` (nil when it parses to nothing usable).
+    static func plan(for selector: String) -> CSSQueryPlan? {
+        cacheLock.lock()
+        clock += 1
+        if var hit = cache[selector] {
+            hit.used = clock
+            cache[selector] = hit
+            cacheLock.unlock()
+            return hit.plan
+        }
+        cacheLock.unlock()
+        let built = CSSQueryPlan(list: CSSSelectorParser.parse(selector))
+        cacheLock.lock()
+        if cache.count >= capacity {
+            // Drop the least recently used quarter.
+            let victims = cache.sorted { $0.value.used < $1.value.used }.prefix(capacity / 4).map(\.key)
+            for key in victims { cache.removeValue(forKey: key) }
+        }
+        clock += 1
+        cache[selector] = (built, clock)
+        cacheLock.unlock()
+        return built
+    }
+
+    static func clearCache() {
+        cacheLock.lock()
+        cache.removeAll()
+        cacheLock.unlock()
     }
 }

@@ -708,8 +708,10 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
         }
     }
 
+    /// `querySelector` — the first descendant element matching, in document
+    /// order; the walk stops at it.
     public func querySelector(_ selector: String) -> DOMNode? {
-        querySelectorAll(selector).first
+        runQuery(selector, firstOnly: true).first
     }
 
     /// `Element.matches(selector)` — true when this element itself matches any
@@ -755,27 +757,51 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
     /// The node itself is never part of the result (matching WebKit), but it is
     /// the `:scope` for relative selectors such as `:scope > a`.
     public func querySelectorAll(_ selector: String) -> [DOMNode] {
-        let selectorList = CSSSelectorParser.parse(selector)
-        guard !selectorList.selectors.isEmpty else { return [] }
-        let candidates = selectorList.selectors.filter { $0.pseudoElement == nil }
-        guard !candidates.isEmpty else { return [] }
-        let context = CSSMatchContext(scope: self)
+        runQuery(selector, firstOnly: false)
+    }
 
+    private func runQuery(_ selector: String, firstOnly: Bool) -> [DOMNode] {
+        guard let plan = CSSQueryPlan.plan(for: selector) else { return [] }
+        let context = CSSMatchContext(scope: self)
         var results: [DOMNode] = []
-        forEachDescendantElement { node in
-            if candidates.contains(where: { CSSSelectorMatcher.matches($0, node: node, context: context) }) {
+        walkDescendantElements { node in
+            if plan.matches(node, context: context) {
                 results.append(node)
+                return firstOnly
             }
+            return false
         }
         return results
     }
 
+    /// Pre-order (document order) walk over descendant elements; `body`
+    /// returns true to stop. Iterative (an explicit stack of children
+    /// snapshots), and never asks a text or comment node for its children.
+    func walkDescendantElements(_ body: (DOMNode) -> Bool) {
+        var stack: [(nodes: [DOMNode], next: Int)] = [(children, 0)]
+        while let top = stack.indices.last {
+            if stack[top].next >= stack[top].nodes.count {
+                stack.removeLast()
+                continue
+            }
+            let child = stack[top].nodes[stack[top].next]
+            stack[top].next += 1
+            switch child.nodeType {
+            case .element:
+                if body(child) { return }
+            case .text, .comment, .document, .documentFragment:
+                break
+            }
+            if child.nodeType == .element {
+                let kids = child.children
+                if !kids.isEmpty { stack.append((kids, 0)) }
+            }
+        }
+    }
+
     /// Pre-order (document order) walk over descendant elements.
     func forEachDescendantElement(_ body: (DOMNode) -> Void) {
-        for child in children {
-            if child.nodeType == .element { body(child) }
-            child.forEachDescendantElement(body)
-        }
+        walkDescendantElements { body($0); return false }
     }
 
     func allDescendantElements() -> [DOMNode] {
