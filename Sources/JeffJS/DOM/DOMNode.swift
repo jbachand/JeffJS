@@ -762,9 +762,23 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
 
     private func runQuery(_ selector: String, firstOnly: Bool) -> [DOMNode] {
         guard let plan = CSSQueryPlan.plan(for: selector) else { return [] }
-        let context = CSSMatchContext(scope: self)
+        var context = CSSMatchContext(scope: self)
+        let chain = DOMAncestorChain(tracksFilter: plan.wantsAncestorFilter)
+        // The ancestors a combinator can reach from a descendant: this node
+        // and everything above it, stopping where the matcher's own parent
+        // step would (a shadow root's stored parent is its host).
+        var above: [DOMNode] = []
+        if !(DOMNode.anyShadowRoots && isShadowRoot) {
+            var cursor: DOMNode? = self
+            while let node = cursor {
+                above.append(node)
+                cursor = CSSSelectorMatcher.selectorParent(of: node)
+            }
+        }
+        for node in above.reversed() { chain.push(node) }
+        context.ancestorChain = chain
         var results: [DOMNode] = []
-        walkDescendantElements { node in
+        walkDescendantElements(chain: chain) { node in
             if plan.matches(node, context: context) {
                 results.append(node)
                 return firstOnly
@@ -777,26 +791,28 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
     /// Pre-order (document order) walk over descendant elements; `body`
     /// returns true to stop. Iterative (an explicit stack of children
     /// snapshots), and never asks a text or comment node for its children.
-    func walkDescendantElements(_ body: (DOMNode) -> Bool) {
+    /// With a `chain`, an element is pushed while its subtree is walked and
+    /// `chain.subject` names the element handed to `body`.
+    func walkDescendantElements(chain: DOMAncestorChain? = nil, _ body: (DOMNode) -> Bool) {
         var stack: [(nodes: [DOMNode], next: Int)] = [(children, 0)]
         while let top = stack.indices.last {
             if stack[top].next >= stack[top].nodes.count {
                 stack.removeLast()
+                if chain != nil, !stack.isEmpty { chain.unsafelyUnwrapped.pop() }
                 continue
             }
             let child = stack[top].nodes[stack[top].next]
             stack[top].next += 1
-            switch child.nodeType {
-            case .element:
-                if body(child) { return }
-            case .text, .comment, .document, .documentFragment:
-                break
-            }
-            if child.nodeType == .element {
-                let kids = child.children
-                if !kids.isEmpty { stack.append((kids, 0)) }
+            guard child.nodeType == .element else { continue }
+            chain?.subject = child
+            if body(child) { chain?.subject = nil; return }
+            let kids = child.children
+            if !kids.isEmpty {
+                chain?.push(child)
+                stack.append((kids, 0))
             }
         }
+        chain?.subject = nil
     }
 
     /// Pre-order (document order) walk over descendant elements.

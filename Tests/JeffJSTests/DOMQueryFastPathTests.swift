@@ -26,11 +26,11 @@ final class DOMQueryFastPathTests: XCTestCase {
     func testQuerySelectorIsFirstOfQuerySelectorAll() {
         var r = Gen.RNG(s: 0xBEEF)
         for _ in 0..<120 {
-            let (doc, nodes, _) = Gen.buildTree(&r)
+            let (doc, nodes, hosts) = Gen.buildTree(&r)
             for _ in 0..<30 {
                 // Lists of 1..8 selectors so both the plain and the bucketed path run.
                 let sel = (0..<(1 + r.int(8))).map { _ in Gen.selector(&r) }.joined(separator: ", ")
-                for root in [doc, nodes[r.int(nodes.count)]] {
+                for root in [doc, nodes[r.int(nodes.count)]] + hosts.compactMap(\.shadowRoot) {
                     let all = root.querySelectorAll(sel)
                     let expect = Self.oracleAll(root, sel)
                     XCTAssertTrue(all.elementsEqual(expect, by: ===), "qSA differs from oracle for \(sel)")
@@ -76,5 +76,21 @@ final class DOMQueryFastPathTests: XCTestCase {
         XCTAssertTrue(got.elementsEqual(Self.oracleAll(root, list), by: ===))
         XCTAssertEqual(got.count, 4001)   // every <a> plus section 57
         XCTAssertLessThan(ms, 150, "1200-selector list took \(ms) ms")
+    }
+
+    /// Selectors whose subject is a bare tag but whose ancestors need an
+    /// attribute: only the scan's ancestor filter can reject them cheaply.
+    func testAttributeAnchoredAncestorsAreRejectedByTheChainFilter() {
+        var html = "<div id=\"app\">"
+        for i in 0..<4000 { html += "<section class=\"s\" data-i=\"\(i)\"><a href=\"/x\"><span>t</span></a></section>" }
+        html += "</div>"
+        let root = HTMLParser.parse(html)
+        let list = (0..<300).map { "[data-x\($0)=\"v\"] section a, [data-y\($0)] span" }.joined(separator: ", ") + ", [data-i=\"57\"] a"
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        let got = root.querySelectorAll(list)
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+        XCTAssertTrue(got.elementsEqual(Self.oracleAll(root, list), by: ===))
+        XCTAssertEqual(got.count, 1)
+        XCTAssertLessThan(ms, 150, "attribute-anchored list took \(ms) ms")
     }
 }

@@ -80,6 +80,27 @@ enum DOMSelectorKeyHash {
     static let idKind: UInt8 = 0x69       // "i"
     static let classKind: UInt8 = 0x63    // "c"
     static let langKind: UInt8 = 0x6C     // "l"
+    static let attributeKind: UInt8 = 0x61  // "a" (query ancestor chains only)
+
+    /// Hash of an attribute name, ASCII-lowercased: a selector's `[Name]` is
+    /// looked up lowercased, and the element side hashes every stored key the
+    /// same way, so the two sides agree for HTML and for case-preserved
+    /// foreign-content names alike (their lowercase alias is also a key).
+    @inline(__always)
+    static func attributeNameHash(_ name: String) -> UInt32 {
+        var h: UInt32 = (2_166_136_261 ^ UInt32(attributeKind)) &* 16_777_619
+        for byte in name.utf8 {
+            if byte >= 0x80 { return hash(attributeKind, name.lowercased()) }
+            let lowered = (byte >= 0x41 && byte <= 0x5A) ? byte | 0x20 : byte
+            h = (h ^ UInt32(lowered)) &* 16_777_619
+        }
+        h ^= h >> 16
+        h &*= 0x85EB_CA6B
+        h ^= h >> 13
+        h &*= 0xC2B2_AE35
+        h ^= h >> 16
+        return h
+    }
 
     @inline(__always)
     static func hash<S: StringProtocol>(_ kind: UInt8, _ string: S) -> UInt32 {
