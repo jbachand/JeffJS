@@ -1403,13 +1403,21 @@ extension JeffJSContext {
         obj.extensible = true
 
         // Build the child's var_ref array from its closureVars metadata.
+        // interp.leanClosurePayload: the var-refs are built straight into the closure's side box
+        // (a raw buffer that owns one retain per entry; a recycled closure keeps its buffer);
+        // otherwise into `childVarRefs`, which is also the payload's list.
         var childVarRefs: [JeffJSVarRef?] = []
-        // interp.leanClosurePayload: a recycled closure kept its (emptied)
-        // var-refs array: build into that storage (no allocation).
-        if jeffJSLeanClosurePayload, recycled != nil, let ra = obj.aux { swap(&childVarRefs, &ra.varRefsFast) }
+        let lean = jeffJSLeanClosurePayload
+        var leanAux: JeffJSObjectAux? = nil
         if !innerFB.closureVarsList.isEmpty {
             let closureVars = innerFB.closureVarsList
-            childVarRefs.reserveCapacity(closureVars.count)
+            if lean {
+                let a = obj.ensureAux()
+                a.beginVarRefs(closureVars.count)
+                leanAux = a
+            } else {
+                childVarRefs.reserveCapacity(closureVars.count)
+            }
             for cv in closureVars {
                 if cv.isLocal {
                     // The closure var references the parent's own local/arg slot.
@@ -1434,7 +1442,7 @@ extension JeffJSContext {
                         }
                     }
                     if let vr = existingVR {
-                        childVarRefs.append(vr)
+                        if let la = leanAux { la.appendVarRef(vr) } else { childVarRefs.append(vr) }
                     } else {
                         let vr: JeffJSVarRef
                         if jeffJSRecycleVarRefs, let pv = rt.varRefPool.popLast() {
@@ -1469,22 +1477,24 @@ extension JeffJSContext {
                         }
                         parentFrame.liveVarRefs.append(vr)
                         parentFrame.hasLiveVarRefs = true
-                        childVarRefs.append(vr)
+                        if let la = leanAux { la.appendVarRef(vr) } else { childVarRefs.append(vr) }
                     }
                 } else {
                     // The closure var references the parent's own closure var
                     // (threading through an intermediate function).
                     let parentIdx = cv.varIdx
                     if parentRawCount >= 0 {
-                        if parentIdx < parentRawCount, let u = parentRaw![parentIdx] {
+                        if let la = leanAux {
+                            la.appendVarRefUnmanaged(parentIdx < parentRawCount ? parentRaw![parentIdx] : nil)
+                        } else if parentIdx < parentRawCount, let u = parentRaw![parentIdx] {
                             childVarRefs.append(u.takeUnretainedValue())
                         } else {
                             childVarRefs.append(nil)
                         }
                     } else if parentIdx < varRefs.count {
-                        childVarRefs.append(varRefs[parentIdx])
+                        if let la = leanAux { la.appendVarRef(varRefs[parentIdx]) } else { childVarRefs.append(varRefs[parentIdx]) }
                     } else {
-                        childVarRefs.append(nil)
+                        if let la = leanAux { la.appendVarRef(nil) } else { childVarRefs.append(nil) }
                     }
                 }
             }
@@ -1503,7 +1513,7 @@ extension JeffJSContext {
         // interp.leanClosurePayload: the var-refs live in varRefsFast (and its
         // raw mirror) only — one array reference per closure instead of two
         // (a retain at creation, a release and an array copy check at death).
-        obj.installClosurePayload(innerFB, varRefs: jeffJSLeanClosurePayload ? [] : childVarRefs, home: inheritedHome)
+        obj.installClosurePayload(innerFB, varRefs: lean ? [] : childVarRefs, home: inheritedHome)
         obj.realmIndex = realmIndex   // the closure belongs to the realm running its enclosing code
         innerFB.liveClosures &+= 1   // perf/memory-census (uncounted in freeObject)
         // A lazy function whose body is not compiled yet keeps fbFast nil:
@@ -1516,7 +1526,13 @@ extension JeffJSContext {
         } else {
             obj.fbFast = innerFB
         }
-        obj.varRefsFast = childVarRefs
+        if lean {
+            // (built in place above) a recycled closure with no captures keeps no stale entries:
+            // jeffJS_recycleFunction released them.
+            if leanAux != nil { obj._flags |= JeffJSObject.flagHasVarRefs } else { obj._flags &= ~JeffJSObject.flagHasVarRefs }
+        } else {
+            obj.varRefsFast = childVarRefs
+        }
 
         // Arrow functions capture the enclosing function's `this` value
         // so that `push_this` inside the arrow returns the lexical `this`.

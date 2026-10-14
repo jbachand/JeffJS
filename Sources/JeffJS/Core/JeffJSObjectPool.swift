@@ -66,7 +66,7 @@ func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
                 capturedThis.freeValue()
             }
             if o.storedCFunction != nil { o.storedCFunction = nil; o.storedCFunctionLength = 0 }
-            if !o.varRefsFast.isEmpty { o.varRefsFast = [] }
+            if o.varRefsRawCount > 0 { o.varRefsFast = [] }
             o.payload = .opaque(nil)
         }
         rt.objectPool.append(o)

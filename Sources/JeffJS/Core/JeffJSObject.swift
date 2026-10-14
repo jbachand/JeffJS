@@ -2786,8 +2786,19 @@ nonisolated final class JeffJSObjectAux: JeffJSSideSlot {
     var fbFast: JeffJSFunctionBytecode? = nil
     /// Unretained mirror of a `.typedArray` payload (the payload owns it); set by the payload setter.
     var taU: Unmanaged<JeffJSTypedArray>? = nil
-    var varRefsFast: [JeffJSVarRef?] = []
+    /// The closure's var-refs: a raw buffer that OWNS one Swift retain per non-nil entry
+    /// (released by `releaseVarRefs`, `setVarRefs`, deinit). It used to be a Swift array plus an
+    /// unretained mirror of it; the array's allocation, uniqueness checks and bridge retains
+    /// were most of a closure's var-ref cost. Entries [0, varRefsRawCount) are valid.
     var varRefsRaw: UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>? = nil
+    /// The var-refs as an array (cold readers: tools, the payload-style accessors).
+    var varRefsFast: [JeffJSVarRef?] {
+        guard let p = varRefsRaw else { return [] }
+        var out: [JeffJSVarRef?] = []
+        out.reserveCapacity(varRefsRawCount)
+        for i in 0..<varRefsRawCount { out.append(p[i]?.takeUnretainedValue()) }
+        return out
+    }
     private var _varRefsRawCount: Int32 = 0
     /// Slots allocated at `varRefsRaw` (kept across setVarRefs, so a pooled
     /// closure re-captures without a malloc).
@@ -2862,31 +2873,52 @@ nonisolated final class JeffJSObjectAux: JeffJSSideSlot {
 
     /// Set the closure var-refs and rebuild their unmanaged raw mirror.
     func setVarRefs(_ refs: [JeffJSVarRef?]) {
-        varRefsFast = refs
-        varRefsRawCount = 0
-        if refs.isEmpty { return }   // the mirror buffer stays for reuse
-        if varRefsRaw == nil || Int(_varRefsRawCapacity) < refs.count {
+        beginVarRefs(refs.count)
+        for vr in refs { appendVarRef(vr) }
+    }
+
+    /// Drop the current var-refs (each entry's own retain) and make room for `n` new ones; the
+    /// buffer stays for reuse. Pair with `appendVarRef` n times.
+    func beginVarRefs(_ n: Int) {
+        releaseVarRefs()
+        if n == 0 { return }
+        if varRefsRaw == nil || Int(_varRefsRawCapacity) < n {
             varRefsRaw?.deallocate()
-            let cap = max(refs.count, 4)
+            let cap = max(n, 4)
             varRefsRaw = UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>.allocate(capacity: cap)
             _varRefsRawCapacity = Int32(truncatingIfNeeded: cap)
         }
+    }
+
+    /// Append a var-ref (takes its own retain); room made by `beginVarRefs`.
+    @inline(__always)
+    func appendVarRef(_ vr: JeffJSVarRef?) {
+        let n = varRefsRawCount
+        varRefsRaw.unsafelyUnwrapped[n] = vr.map { Unmanaged.passRetained($0) }
+        _varRefsRawCount = Int32(truncatingIfNeeded: n + 1)
+    }
+    @inline(__always)
+    func appendVarRefUnmanaged(_ u: Unmanaged<JeffJSVarRef>?) {
+        let n = varRefsRawCount
+        if let u = u { _ = u.retain() }
+        varRefsRaw.unsafelyUnwrapped[n] = u
+        _varRefsRawCount = Int32(truncatingIfNeeded: n + 1)
+    }
+
+    /// Release every entry; the buffer is kept (a parked closure re-captures into it).
+    func releaseVarRefs() {
+        let n = varRefsRawCount
+        _varRefsRawCount = 0
+        if n == 0 { return }
         let p = varRefsRaw.unsafelyUnwrapped
         var i = 0
-        for vr in refs {
-            if let vr = vr { p[i] = Unmanaged.passUnretained(vr) } else { p[i] = nil }
-            i += 1
-        }
-        varRefsRawCount = refs.count
+        while i < n { p[i]?.release(); p[i] = nil; i += 1 }
     }
 
-    /// Release the var-refs but keep the array's storage (a parked closure).
-    func clearVarRefsKeepingCapacity() {
-        varRefsRawCount = 0
-        varRefsFast.removeAll(keepingCapacity: true)
-    }
+    /// Release the var-refs but keep the buffer (a parked closure).
+    func clearVarRefsKeepingCapacity() { releaseVarRefs() }
 
-    deinit { varRefsRaw?.deallocate() }
+    deinit { releaseVarRefs(); varRefsRaw?.deallocate() }
 }
 
 extension JeffJSObject {
