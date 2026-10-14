@@ -2247,21 +2247,106 @@ public enum CSSSelector {
 
 // MARK: - Query plans (querySelector / querySelectorAll)
 
-/// A parsed selector list prepared for scanning a subtree (pseudo-element
-/// selectors dropped), cached by selector string in a bounded LRU. Keyed by the
-/// string, never by DOM state, so a plan stays valid across mutations.
+/// A parsed selector list prepared for scanning a subtree: pseudo-element
+/// selectors dropped, and for lists of `bucketThreshold` or more selectors an
+/// index of the selectors by the identifier their *rightmost compound*
+/// requires (id, class, attribute name or tag; WebKit's RuleSet buckets).
+/// An element then tests only the selectors whose bucket key it carries, plus
+/// the selectors with no usable key, instead of every selector in the list.
+///
+/// Keyed by the selector string (like the parse cache), never by DOM state,
+/// so a plan stays valid across mutations; the plan cache is bounded.
 final class CSSQueryPlan: @unchecked Sendable {
+    static let bucketThreshold = 4
+
     let selectors: [CSSComplexSelector]
+    private let byID: [String: [Int]]
+    private let byClass: [String: [Int]]
+    private let byTag: [String: [Int]]
+    private let byAttribute: [String: [Int]]
+    private let unkeyed: [Int]
+    private let bucketed: Bool
+    /// Per selector: identifier hashes that must occur on an ancestor of any
+    /// element it matches (the keys `CSSSelectorMatcher.ancestorFilterRejects`
+    /// tests). A bare-tag subject such as `... a` lands in a big tag bucket;
+    /// these let a bucket entry be rejected with a few bit tests on the
+    /// element's ancestor filter before the matcher is called.
+    private let ancestorKeys: [[UInt32]]
 
     private init?(list: CSSSelectorList) {
         let candidates = list.selectors.filter { $0.pseudoElement == nil }
         guard !candidates.isEmpty else { return nil }
         selectors = candidates
+        ancestorKeys = candidates.map { sel in
+            var keys: [UInt32] = []
+            var index = sel.parts.count - 1
+            while index > 0 {
+                let combinator = sel.parts[index].combinator ?? .descendant
+                index -= 1
+                guard combinator == .descendant || combinator == .child else { continue }
+                keys.append(contentsOf: sel.parts[index].selector.ancestorKeyHashes)
+            }
+            return keys
+        }
+        guard candidates.count >= Self.bucketThreshold else {
+            bucketed = false
+            byID = [:]; byClass = [:]; byTag = [:]; byAttribute = [:]; unkeyed = []
+            return
+        }
+        bucketed = true
+        var ids: [String: [Int]] = [:], classes: [String: [Int]] = [:]
+        var tags: [String: [Int]] = [:], attrs: [String: [Int]] = [:], loose: [Int] = []
+        for (i, sel) in candidates.enumerated() {
+            guard let subject = sel.parts.last?.selector else { loose.append(i); continue }
+            var id: String?, cls: String?, tag: String?, attr: String?
+            for component in subject.components {
+                switch component {
+                case .id(let v): if id == nil { id = v }
+                case .className(let v): if cls == nil { cls = v }
+                case .element(let v): if tag == nil { tag = v }
+                case .attribute(let name, _, _, _): if attr == nil { attr = name.lowercased() }
+                default: break
+                }
+            }
+            if let id { ids[id, default: []].append(i) }
+            else if let cls { classes[cls, default: []].append(i) }
+            else if let attr { attrs[attr, default: []].append(i) }
+            else if let tag { tags[tag, default: []].append(i) }
+            else { loose.append(i) }
+        }
+        byID = ids; byClass = classes; byTag = tags; byAttribute = attrs; unkeyed = loose
     }
 
     /// True when any selector of the list matches `node`.
     func matches(_ node: DOMNode, context: CSSMatchContext) -> Bool {
-        for sel in selectors where CSSSelectorMatcher.matches(sel, node: node, context: context) { return true }
+        guard bucketed else {
+            for sel in selectors where CSSSelectorMatcher.matches(sel, node: node, context: context) { return true }
+            return false
+        }
+        var filter: DOMAncestorFilter?
+        func test(_ indices: [Int]) -> Bool {
+            for i in indices {
+                let keys = ancestorKeys[i]
+                if !keys.isEmpty {
+                    if filter == nil { filter = node.ancestorFilterForMatching() }
+                    let f = filter.unsafelyUnwrapped
+                    var rejected = false
+                    for key in keys where !f.mayContain(key) { rejected = true; break }
+                    if rejected { continue }
+                }
+                if CSSSelectorMatcher.matches(selectors[i], node: node, context: context) { return true }
+            }
+            return false
+        }
+        if !unkeyed.isEmpty, test(unkeyed) { return true }
+        if let tag = node.lowercasedTagName, let hit = byTag[tag], test(hit) { return true }
+        if !byID.isEmpty, let id = node.idAttribute, let hit = byID[id], test(hit) { return true }
+        if !byClass.isEmpty {
+            for cls in node.classNames { if let hit = byClass[cls], test(hit) { return true } }
+        }
+        if !byAttribute.isEmpty {
+            for key in node.attributes.keys { if let hit = byAttribute[key], test(hit) { return true } }
+        }
         return false
     }
 

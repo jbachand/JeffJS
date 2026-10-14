@@ -62,4 +62,19 @@ final class DOMQueryFastPathTests: XCTestCase {
         for i in 0..<1000 { _ = root.querySelectorAll(".c\(i), .b, .a, p, #x\(i)") }
         XCTAssertEqual(root.querySelectorAll(".c1, .b, .a, p, #x1").count, 2)
     }
+
+    func testLongSelectorListIsBucketed() {
+        var html = "<div id=\"app\">"
+        for i in 0..<4000 { html += "<section class=\"s k\(i % 7)\" data-i=\"\(i)\"><a href=\"/x\"><span>t</span></a></section>" }
+        html += "</div>"
+        let root = HTMLParser.parse(html)
+        let list = (0..<300).map { "[data-x\($0)=\"v\"].c\($0), .nosuch\($0) span, #nid\($0), p.q\($0)" }.joined(separator: ", ")
+            + ", [data-i=\"57\"], .k3.s section, section > a"
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        let got = root.querySelectorAll(list)
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+        XCTAssertTrue(got.elementsEqual(Self.oracleAll(root, list), by: ===))
+        XCTAssertEqual(got.count, 4001)   // every <a> plus section 57
+        XCTAssertLessThan(ms, 150, "1200-selector list took \(ms) ms")
+    }
 }
