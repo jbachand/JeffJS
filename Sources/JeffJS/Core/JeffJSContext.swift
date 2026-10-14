@@ -5421,6 +5421,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // Integer-indexed reads go directly to the underlying ArrayBuffer data.
         if jsObj.classID >= JeffJSClassID.uint8cArray.rawValue &&
            jsObj.classID <= JeffJSClassID.float64Array.rawValue {
+            if rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom),
+               let fast = jsObj.typedArrayGet(idx) {
+                return fast
+            }
             if case .typedArray(let ta) = jsObj.payload {
                 if rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom) {
                     guard let bufObj = ta.buffer,
@@ -5803,6 +5807,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // Integer-indexed writes go directly to the underlying ArrayBuffer data.
         if jsObj.classID >= JeffJSClassID.uint8cArray.rawValue &&
            jsObj.classID <= JeffJSClassID.float64Array.rawValue {
+            if value.isInt || value.isFloat64, rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom) {
+                let r = jsObj.typedArraySet(idx, value)
+                if r != -2 { return r }
+            }
             if case .typedArray(let ta) = jsObj.payload {
                 if rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom) {
                     guard let info = typedArrayInfo(forClassID: ta.classID) else { return 0 }

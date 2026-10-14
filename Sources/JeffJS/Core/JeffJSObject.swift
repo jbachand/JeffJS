@@ -1405,7 +1405,15 @@ nonisolated final class JeffJSArrayBuffer {
 nonisolated final class JeffJSTypedArray {
     var refCount: Int = 1
     var obj: JeffJSObject?
-    var buffer: JeffJSObject?
+    var buffer: JeffJSObject? {
+        didSet {
+            if let b = buffer, case .arrayBuffer(let ab) = b.payload { abU = Unmanaged.passUnretained(ab) } else { abU = nil }
+        }
+    }
+    /// The buffer's JeffJSArrayBuffer, unretained: `buffer` owns the object that owns it, and an
+    /// ArrayBuffer object's payload is never replaced after the view adopted it. Read through
+    /// `_withUnsafeGuaranteedRef` by the element fast paths (no payload-enum copy).
+    var abU: Unmanaged<JeffJSArrayBuffer>? = nil
     var classID: Int = 0
     var byteOffset: Int = 0
     var byteLength: Int = 0
@@ -2413,6 +2421,8 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
             if _auxU == nil, case .opaque(let o) = newValue, o == nil { return }
             let a = ensureAux()
             a.payload = newValue
+            if case .typedArray(let t) = newValue { a.taU = Unmanaged.passUnretained(t) }
+            else if a.taU != nil { a.taU = nil }
             if case .cFunc(let realm, let cf, _, _, let magic) = newValue {
                 a.cFuncFast = cf; a.cMagicFast = Int(magic)
                 _flags |= JeffJSObject.flagHasCFunc
@@ -2421,6 +2431,56 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
             else if (_flags & JeffJSObject.flagHasCFunc) != 0 {
                 a.cFuncFast = nil
                 _flags &= ~JeffJSObject.flagHasCFunc
+            }
+        }
+    }
+
+    /// Typed-array element read at integer index `idx` without copying the payload enum:
+    /// nil = not handled here (not a typed array view with an adopted buffer, or a BigInt
+    /// array), the caller takes the general path. Matches the general path's results,
+    /// including `undefined` for a detached buffer or an out-of-range index.
+    @inline(__always)
+    final func typedArrayGet(_ idx: UInt32) -> JeffJSValue? {
+        guard let au = _auxU, let tu = au._withUnsafeGuaranteedRef({ $0.taU }) else { return nil }
+        return tu._withUnsafeGuaranteedRef { ta -> JeffJSValue? in
+            guard let abu = ta.abU else { return nil }
+            return abu._withUnsafeGuaranteedRef { ab -> JeffJSValue? in
+                let cid = ta.classID
+                let bpe = jeffJS_typedArrayBytes(cid)
+                if bpe == 0 { return nil }
+                if ab.detached { return .undefined }
+                guard Int(idx) < ta.length else { return .undefined }
+                let off = ta.byteOffset &+ Int(idx) &* bpe
+                return ab.data.withUnsafeBytes { raw -> JeffJSValue in
+                    guard off >= 0, off &+ bpe <= raw.count else { return .undefined }
+                    return jeffJS_typedArrayLoad(cid, raw.baseAddress.unsafelyUnwrapped + off)
+                }
+            }
+        }
+    }
+
+    /// Typed-array element store of a number (int or double). Returns 1 stored (or silently
+    /// ignored: detached / out of range, as the general path does), -2 = not handled here.
+    /// (1 stored, 0 silently ignored because the buffer is detached or idx is out of range; the
+    /// general path's return values.)
+    /// `value` is borrowed and must be an int32 or float64.
+    @inline(__always)
+    final func typedArraySet(_ idx: UInt32, _ value: JeffJSValue) -> Int {
+        guard let au = _auxU, let tu = au._withUnsafeGuaranteedRef({ $0.taU }) else { return -2 }
+        return tu._withUnsafeGuaranteedRef { ta -> Int in
+            guard let abu = ta.abU else { return -2 }
+            return abu._withUnsafeGuaranteedRef { ab -> Int in
+                let cid = ta.classID
+                let bpe = jeffJS_typedArrayBytes(cid)
+                if bpe == 0 { return -2 }
+                if ab.detached { return 0 }
+                guard Int(idx) < ta.length else { return 0 }
+                let off = ta.byteOffset &+ Int(idx) &* bpe
+                return ab.data.withUnsafeMutableBytes { raw -> Int in
+                    guard off >= 0, off &+ bpe <= raw.count else { return 1 }
+                    jeffJS_typedArrayStore(cid, raw.baseAddress.unsafelyUnwrapped + off, value)
+                    return 1
+                }
             }
         }
     }
@@ -2706,6 +2766,8 @@ nonisolated final class JeffJSObjectAux: JeffJSSideSlot {
     // raw mirror, captured `this`, accessor slots), the rest in `rare`.
     var payload: JeffJSObjectPayload = .opaque(nil)
     var fbFast: JeffJSFunctionBytecode? = nil
+    /// Unretained mirror of a `.typedArray` payload (the payload owns it); set by the payload setter.
+    var taU: Unmanaged<JeffJSTypedArray>? = nil
     var varRefsFast: [JeffJSVarRef?] = []
     var varRefsRaw: UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>? = nil
     private var _varRefsRawCount: Int32 = 0

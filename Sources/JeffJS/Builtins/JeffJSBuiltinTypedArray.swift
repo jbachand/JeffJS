@@ -235,6 +235,65 @@ let float16ArrayInfo = TypedArrayElementInfo(
     isBigInt: false, isClamped: false, isSigned: false, isFloat: true
 )
 
+/// Element size of the numeric (non-BigInt) typed array classes, 0 for anything else.
+@inline(__always)
+func jeffJS_typedArrayBytes(_ classID: Int) -> Int {
+    switch classID {
+    case JeffJSClassID.int8Array.rawValue, JeffJSClassID.uint8Array.rawValue, JeffJSClassID.uint8cArray.rawValue: return 1
+    case JeffJSClassID.int16Array.rawValue, JeffJSClassID.uint16Array.rawValue: return 2
+    case JeffJSClassID.int32Array.rawValue, JeffJSClassID.uint32Array.rawValue, JeffJSClassID.float32Array.rawValue: return 4
+    case JeffJSClassID.float64Array.rawValue: return 8
+    default: return 0
+    }
+}
+
+/// Same results as `TypedArrayElementInfo.readElement` (little endian) for the classes
+/// `jeffJS_typedArrayBytes` accepts, straight from the byte address `p`.
+@inline(__always)
+func jeffJS_typedArrayLoad(_ classID: Int, _ p: UnsafeRawPointer) -> JeffJSValue {
+    switch classID {
+    case JeffJSClassID.int8Array.rawValue: return .newInt32(Int32(p.loadUnaligned(as: Int8.self)))
+    case JeffJSClassID.uint8Array.rawValue, JeffJSClassID.uint8cArray.rawValue: return .newInt32(Int32(p.loadUnaligned(as: UInt8.self)))
+    case JeffJSClassID.int16Array.rawValue: return .newInt32(Int32(Int16(littleEndian: p.loadUnaligned(as: Int16.self))))
+    case JeffJSClassID.uint16Array.rawValue: return .newInt32(Int32(UInt16(littleEndian: p.loadUnaligned(as: UInt16.self))))
+    case JeffJSClassID.int32Array.rawValue: return .newInt32(Int32(littleEndian: p.loadUnaligned(as: Int32.self)))
+    case JeffJSClassID.uint32Array.rawValue: return .newFloat64(Double(UInt32(littleEndian: p.loadUnaligned(as: UInt32.self))))
+    case JeffJSClassID.float32Array.rawValue: return .newFloat64(Double(Float(bitPattern: UInt32(littleEndian: p.loadUnaligned(as: UInt32.self)))))
+    default: return .newFloat64(Double(bitPattern: UInt64(littleEndian: p.loadUnaligned(as: UInt64.self))))
+    }
+}
+
+/// Same stores as `TypedArrayElementInfo.writeElement` (little endian) for an int32 or float64 `value`.
+@inline(__always)
+func jeffJS_typedArrayStore(_ classID: Int, _ p: UnsafeMutableRawPointer, _ value: JeffJSValue) {
+    @inline(__always) func toInt32() -> Int32 {
+        if value.isInt { return value.toInt32() }
+        let d = value.toNumber()
+        guard d.isFinite else { return 0 }
+        let rem = d.truncatingRemainder(dividingBy: 4294967296.0)
+        if rem.isNaN || rem.isInfinite || rem > 9.2e18 || rem < -9.2e18 { return 0 }
+        return Int32(truncatingIfNeeded: Int64(rem))
+    }
+    switch classID {
+    case JeffJSClassID.int8Array.rawValue, JeffJSClassID.uint8Array.rawValue:
+        p.storeBytes(of: UInt8(truncatingIfNeeded: toInt32()), as: UInt8.self)
+    case JeffJSClassID.uint8cArray.rawValue:
+        let d = value.isInt ? Double(value.toInt32()) : value.toNumber()
+        let b: UInt8 = (d.isNaN || d <= 0) ? 0 : (d >= 255 ? 255 : UInt8(Darwin.round(d)))
+        p.storeBytes(of: b, as: UInt8.self)
+    case JeffJSClassID.int16Array.rawValue, JeffJSClassID.uint16Array.rawValue:
+        p.storeBytes(of: UInt16(truncatingIfNeeded: toInt32()).littleEndian, as: UInt16.self)
+    case JeffJSClassID.int32Array.rawValue, JeffJSClassID.uint32Array.rawValue:
+        p.storeBytes(of: UInt32(bitPattern: toInt32()).littleEndian, as: UInt32.self)
+    case JeffJSClassID.float32Array.rawValue:
+        let d = value.isInt ? Double(value.toInt32()) : value.toNumber()
+        p.storeBytes(of: Float(d).bitPattern.littleEndian, as: UInt32.self)
+    default:
+        let d = value.isInt ? Double(value.toInt32()) : value.toNumber()
+        p.storeBytes(of: d.bitPattern.littleEndian, as: UInt64.self)
+    }
+}
+
 /// Lookup TypedArrayElementInfo by classID.
 func typedArrayInfo(forClassID classID: Int) -> TypedArrayElementInfo? {
     return typedArrayInfoTable.first { $0.classID == classID }
