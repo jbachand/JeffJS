@@ -30,6 +30,17 @@ final class TypedArrayFastPathTests: XCTestCase {
         XCTAssertEqual(eval("var a=new Int32Array(1); a[0]=Infinity; a[0]"), "0")
     }
 
+    /// ToUint8Clamp (ES §7.1.12): round half to even (QuickJS: lrint in js_typed_array_set_value).
+    @MainActor
+    func testUint8ClampedRoundsHalfToEven() {
+        for (input, expected) in [("254.5", "254"), ("253.5", "254"), ("0.5", "0"), ("1.5", "2"),
+                                  ("-0.5", "0"), ("NaN", "0"), ("300", "255"), ("2.5", "2"), ("254.6", "255")] {
+            XCTAssertEqual(eval("var a=new Uint8ClampedArray(1); a[0]=\(input); a[0]"), expected, input)
+            // the generic path (a view over an existing buffer, written with set())
+            XCTAssertEqual(eval("var a=new Uint8ClampedArray(1); a.set([\(input)]); a[0]"), expected, "set \(input)")
+        }
+    }
+
     @MainActor
     func testBoundsViewsAndDetach() {
         XCTAssertEqual(eval("var a=new Uint8Array(2); a[5]=9; String(a[5])+a.length"), "undefined2")
