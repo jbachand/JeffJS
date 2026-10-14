@@ -1519,7 +1519,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             // mapped; it is unmapped only when the new descriptor makes it
             // non-writable or turns it into an accessor.
             if idx < shape.prop.count, shape.prop[idx].flags.isVarRef,
-               let e = jsObj.extra(at: idx), e.kind == .varRef, let vr = e.varRef {
+               let e = jsObj.extraStrong(at: idx), e.kind == .varRef, let vr = e.varRef {
                 if (flags & JS_PROP_TMASK) != JS_PROP_GETSET {
                     if (flags & JS_PROP_HAS_VALUE) != 0 {
                         vr.store(value.dupValue())
@@ -1557,7 +1557,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 var oldData = JeffJSValue.undefined
                 var oldGetter: JeffJSObject? = nil
                 var oldSetter: JeffJSObject? = nil
-                if let e = jsObj.extra(at: idx) {
+                if let e = jsObj.extraStrong(at: idx) {
                     if e.kind == .getset { oldGetter = e.getter; oldSetter = e.setter }
                     // .varRef is handled above; .autoInit owns no counted value.
                 } else {
@@ -5463,7 +5463,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // copying JeffJSProperty enums across the call boundary).
         let ownIdx = jeffJS_findOwnPropertyIndex(obj: jsObj, atom: atom)
         if ownIdx >= 0, let ownShape = jsObj.shape, ownIdx < jsObj.propValues.count {
-            if let e = jsObj.extra(at: ownIdx) {
+            if let e = jsObj.extraStrong(at: ownIdx) {
                 // Accessor property — call the getter
                 if e.kind == .getset, let getterObj = e.getter {
                     // The slot's reference is borrowed: a getter that
@@ -5530,7 +5530,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 if pIdx < 0 {
                     if isProxyObject(p) { return proxyOnChainGet(p, atom: atom, receiver: receiver) }
                 } else if p.shape != nil, pIdx < p.propValues.count {
-                    if let e = p.extra(at: pIdx) {
+                    if let e = p.extraStrong(at: pIdx) {
                         if e.kind == .getset, let getterObj = e.getter {
                             let getterVal = JeffJSValue.borrowedObject(getterObj)
                             return callRetainingFunction(getterVal, this: receiver, args: [])
@@ -5556,7 +5556,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 // test sits on the miss path only.
                 if isProxyObject(p) { return proxyOnChainGet(p, atom: atom, receiver: receiver) }
             } else if p.shape != nil, pIdx < p.propValues.count {
-                if let e = p.extra(at: pIdx) {
+                if let e = p.extraStrong(at: pIdx) {
                     if e.kind == .getset, let getterObj = e.getter {
                         // Borrowed from the prototype's slot: see the own-
                         // property branch above.
@@ -5853,14 +5853,14 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             let exFlags = exShape.prop[exIdx].flags
             if exFlags.isVarRef {
                 // Mapped arguments: write through to the live parameter slot.
-                if let e = jsObj.extra(at: exIdx), e.kind == .varRef, let vr = e.varRef {
+                if let e = jsObj.extraStrong(at: exIdx), e.kind == .varRef, let vr = e.varRef {
                     vr.store(value)   // releases the replaced value when the slot owns it
                     return 1
                 }
             }
             if exFlags.isGetSet {
                 // Accessor property — call the setter
-                if let e = jsObj.extra(at: exIdx), e.kind == .getset, let setterObj = e.setter {
+                if let e = jsObj.extraStrong(at: exIdx), e.kind == .getset, let setterObj = e.setter {
                     // Borrowed (callRetainingFunction holds a count for the call).
                     // `makeObject` took a Swift retain nothing gave back: every
                     // accessor whose setter ever ran outlived its runtime.
@@ -5916,7 +5916,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 }
                 if pIdx >= 0, let pShape = p.shape, pIdx < p.propValues.count {
                     if pShape.prop[pIdx].flags.contains(.getset) {
-                        if let e = p.extra(at: pIdx), e.kind == .getset, let setterObj = e.setter {
+                        if let e = p.extraStrong(at: pIdx), e.kind == .getset, let setterObj = e.setter {
                             let setterVal = JeffJSValue.borrowedObject(setterObj)
                             let result = callRetainingFunction(setterVal, this: setterThis ?? obj, args: [value])
                             value.freeValue()
@@ -5951,7 +5951,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             if pIdx >= 0, let pShape = p.shape, pIdx < p.propValues.count {
                 if pShape.prop[pIdx].flags.contains(.getset) {
                     // Inherited accessor — call its setter
-                    if let e = p.extra(at: pIdx), e.kind == .getset, let setterObj = e.setter {
+                    if let e = p.extraStrong(at: pIdx), e.kind == .getset, let setterObj = e.setter {
                         let setterVal = JeffJSValue.borrowedObject(setterObj)
                         // Same ownership as the own-accessor branch above.
                         let result = callRetainingFunction(setterVal, this: setterThis ?? obj, args: [value])

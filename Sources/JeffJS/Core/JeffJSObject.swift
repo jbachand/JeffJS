@@ -2715,6 +2715,13 @@ nonisolated final class JeffJSObjectAux: JeffJSSideSlot {
     var arrowThisVal: JeffJSValue? = nil
     var propExtra: ContiguousArray<JeffJSPropertyExtra?> = []
     var rare: JeffJSObjectAuxRare? = nil
+    /// The address of `propExtra[i]`'s box without retaining it (nil for a data slot).
+    @inline(__always) final func propExtraRaw(_ i: Int) -> UnsafeRawPointer? {
+        propExtra.withUnsafeBufferPointer {
+            UnsafeRawPointer($0.baseAddress.unsafelyUnwrapped)
+                .load(fromByteOffset: i &* MemoryLayout<UnsafeRawPointer?>.stride, as: UnsafeRawPointer?.self)
+        }
+    }
 
     @inline(__always) private func rareBox() -> JeffJSObjectAuxRare {
         if let r = rare { return r }
@@ -3155,8 +3162,15 @@ extension JeffJSObject {
     /// `propExtra` is allocated lazily: it stays EMPTY while every slot is a
     /// plain data slot (the common case), saving one array allocation per
     /// object. INVARIANT: propExtra.isEmpty || propExtra.count == propValues.count.
-    @inline(__always) func extra(at i: Int) -> JeffJSPropertyExtra? {
+    /// Presence test only: the box's address, or nil for a plain data slot. Not
+    /// owned and not to be dereferenced; reading `propExtra[i]` here returned a
+    /// strong reference (3 retains + 2 releases per property read just to be
+    /// compared with nil). Use `extraStrong(at:)` to read the box.
+    @inline(__always) func extra(at i: Int) -> UnsafeRawPointer? {
         // propExtraCount > 0 implies the side box exists.
+        i < propExtraCount ? _auxU.unsafelyUnwrapped._withUnsafeGuaranteedRef { $0.propExtraRaw(i) } : nil
+    }
+    @inline(__always) func extraStrong(at i: Int) -> JeffJSPropertyExtra? {
         i < propExtraCount ? _auxU.unsafelyUnwrapped._withUnsafeGuaranteedRef { $0.propExtra[i] } : nil
     }
 
@@ -3180,7 +3194,7 @@ extension JeffJSObject {
 
     /// Reconstruct the enum form for slot `i`. O(1); cheap for data slots.
     @inline(__always) func propEntry(at i: Int) -> JeffJSProperty {
-        if let e = extra(at: i) { return e.toProperty() }
+        if let e = extraStrong(at: i) { return e.toProperty() }
         return .value(propValues[i])
     }
 
@@ -3243,7 +3257,7 @@ extension JeffJSObject {
     func getOwnPropertyValue(atom: UInt32) -> JeffJSValue {
         let idx = jeffJS_findOwnPropertyIndex(obj: self, atom: atom)
         guard idx >= 0, idx < propValues.count else { return .undefined }
-        guard let e = extra(at: idx) else { return propValues[idx] }
+        guard let e = extraStrong(at: idx) else { return propValues[idx] }
         if e.kind == .varRef, let vr = e.varRef { return vr.pvalue }
         return .undefined
     }
@@ -3255,7 +3269,7 @@ extension JeffJSObject {
     func setOwnPropertyValue(atom: UInt32, value: JeffJSValue) -> Bool {
         let idx = jeffJS_findOwnPropertyIndex(obj: self, atom: atom)
         guard idx >= 0, idx < propValues.count else { return false }
-        if let e = extra(at: idx), e.kind == .varRef, let vr = e.varRef {
+        if let e = extraStrong(at: idx), e.kind == .varRef, let vr = e.varRef {
             vr.store(value)   // releases the replaced value when the slot owns it
             return true
         }
@@ -3622,7 +3636,8 @@ struct JeffJSObj {
     }
     @inline(__always) var propCount: Int { _with { $0.propValues.count } }
     @inline(__always) func dataValue(at i: Int) -> JeffJSValue { _with { $0.propValues[i] } }
-    @inline(__always) func extra(at i: Int) -> JeffJSPropertyExtra? { _with { $0.extra(at: i) } }
+    @inline(__always) func extra(at i: Int) -> UnsafeRawPointer? { _with { $0.extra(at: i) } }
+    @inline(__always) func extraStrong(at i: Int) -> JeffJSPropertyExtra? { _with { $0.extraStrong(at: i) } }
     @inline(__always) func setExtraSlot(_ i: Int, _ e: JeffJSPropertyExtra?) { _obj.setExtraSlot(i, e) }
     @inline(__always) func propEntry(at i: Int) -> JeffJSProperty { _obj.propEntry(at: i) }
     @inline(__always) func setPropEntry(at i: Int, _ p: JeffJSProperty) { _obj.setPropEntry(at: i, p) }

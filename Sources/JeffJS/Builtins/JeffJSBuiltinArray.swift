@@ -2127,7 +2127,7 @@ struct JeffJSBuiltinArray {
             // Construct(%Array%, len) is ArrayCreate(len), no call needed.
             if ctor.isObject, ctor.bits == ctx.arrayCtorIntrinsic.bits, let co = ctor.toObject() {
                 let si = jeffJS_findOwnPropertyIndex(obj: co, atom: JeffJSAtomID.JS_ATOM_Symbol_species.rawValue)
-                if si >= 0, let e = co.extra(at: si), e.kind == .getset, let g = e.getter,
+                if si >= 0, let e = co.extraStrong(at: si), e.kind == .getset, let g = e.getter,
                    let sg = ctx.arraySpeciesGetterVal.toObject(), g === sg {
                     ctor.freeValue()
                     return length == 0 ? ctx.newArray() : ctx.newArrayWithLength(Int(length))
@@ -2316,7 +2316,7 @@ func jeffJS_isPlainArrayWithDefaultSpecies(_ ctx: JeffJSContext, _ v: JeffJSValu
     guard ci >= 0, ap.extra(at: ci) == nil, ap.propValues[ci].bits == ctx.arrayCtorIntrinsic.bits,
           let co = ctx.arrayCtorIntrinsic.toObject() else { return false }
     let si = jeffJS_findOwnPropertyIndex(obj: co, atom: JeffJSAtomID.JS_ATOM_Symbol_species.rawValue)
-    guard si >= 0, let e = co.extra(at: si), e.kind == .getset, let g = e.getter,
+    guard si >= 0, let e = co.extraStrong(at: si), e.kind == .getset, let g = e.getter,
           let sg = ctx.arraySpeciesGetterVal.toObject(), g === sg else { return false }
     return true
 }

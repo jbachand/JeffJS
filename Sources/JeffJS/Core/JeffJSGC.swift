@@ -859,7 +859,7 @@ func markObject(_ rt: JeffJSRuntime,
             }
         } else {
             for i in 0..<n {
-                if let e = obj.extra(at: i) {
+                if let e = obj.extraStrong(at: i) {
                     switch e.kind {
                     case .getset:
                         // Counted: defineProperty dups getter and setter.
