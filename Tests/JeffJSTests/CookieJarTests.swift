@@ -250,4 +250,158 @@ final class CookieJarTests: XCTestCase {
         XCTAssertEqual(JeffJSCookieParsing.registrableDomain(ofHost: "localhost"), "localhost")
         XCTAssertEqual(JeffJSCookieParsing.site(of: URL(string: "file:///tmp/x.html")!), "file")
     }
+    // MARK: read cache (generation + earliest expiry; lastAccess flushed before a change)
+
+    func testCachedReadsInvalidateOnSetStoreClearAndExpiry() {
+        let clock = Clock()
+        let j = jar(clock)
+        j.store(setCookieLines: ["a=1; Path=/", "short=1; Max-Age=5; Path=/"], for: page)
+        XCTAssertEqual(j.documentCookie(for: page), "a=1; short=1")
+        XCTAssertEqual(j.documentCookie(for: page), "a=1; short=1", "a cache hit returns the same string")
+        let g0 = j.changeCount
+        j.setDocumentCookie("b=2; path=/", for: page)
+        XCTAssertGreaterThan(j.changeCount, g0)
+        XCTAssertEqual(j.documentCookie(for: page), "a=1; short=1; b=2")
+        j.store(setCookieLines: ["c=3; Path=/"], for: page)
+        XCTAssertEqual(j.documentCookie(for: page), "a=1; short=1; b=2; c=3")
+        XCTAssertEqual(j.cookieHeader(for: page, sameSite: true), "a=1; short=1; b=2; c=3")
+        // An HttpOnly store changes the header but not document.cookie.
+        j.store(setCookieLines: ["srv=1; Path=/; HttpOnly"], for: page)
+        XCTAssertEqual(j.documentCookie(for: page), "a=1; short=1; b=2; c=3")
+        XCTAssertEqual(j.cookieHeader(for: page, sameSite: true), "a=1; short=1; b=2; c=3; srv=1")
+        // Expiry takes effect without any write: the entry is stale at the second.
+        clock.now += 4
+        XCTAssertEqual(j.documentCookie(for: page), "a=1; short=1; b=2; c=3")
+        clock.now += 1
+        XCTAssertEqual(j.documentCookie(for: page), "a=1; b=2; c=3")
+        XCTAssertEqual(j.cookieHeader(for: page, sameSite: true), "a=1; b=2; c=3; srv=1")
+        XCTAssertEqual(j.allCookies.map(\.name), ["a", "b", "c", "srv"], "the expired cookie is purged")
+        // A write with a rejected cookie changes nothing; a deletion does.
+        let g1 = j.changeCount
+        j.setDocumentCookie("srv=2; path=/", for: page)      // HttpOnly: cannot overwrite
+        XCTAssertEqual(j.changeCount, g1)
+        XCTAssertEqual(j.documentCookie(for: page), "a=1; b=2; c=3")
+        j.setDocumentCookie("a=1; path=/; max-age=0", for: page)
+        XCTAssertEqual(j.documentCookie(for: page), "b=2; c=3")
+        j.removeAll()
+        XCTAssertEqual(j.documentCookie(for: page), "")
+        XCTAssertNil(j.cookieHeader(for: page, sameSite: true))
+    }
+
+    /// Expiry of a cookie stored after the entry was built (an earlier expiry
+    /// than any in the jar at build time) still ends the entry on time.
+    func testCachedReadsSeeAnEarlierExpiryStoredLater() {
+        let clock = Clock()
+        let j = jar(clock)
+        j.store(setCookieLines: ["long=1; Max-Age=500; Path=/"], for: page)
+        XCTAssertEqual(j.cookieHeader(for: page, sameSite: true), "long=1")
+        j.store(setCookieLines: ["short=1; Max-Age=2; Path=/"], for: page)
+        XCTAssertEqual(j.cookieHeader(for: page, sameSite: true), "long=1; short=1")
+        clock.now += 2
+        XCTAssertEqual(j.cookieHeader(for: page, sameSite: true), "long=1")
+        clock.now += 500
+        XCTAssertNil(j.cookieHeader(for: page, sameSite: true))
+    }
+
+    func testCachedReadsKeepFilteringAndOrdering() {
+        let j = jar()
+        j.store(setCookieLines: ["dom=1; Domain=example.com; Path=/", "host=1; Path=/",
+                                 "shop=1; Path=/shop", "deep=1; Path=/shop/cart/",
+                                 "sec=1; Secure; Path=/", "strict=1; SameSite=Strict; Path=/",
+                                 "lax=1; SameSite=Lax; Path=/", "none=1; SameSite=None; Secure; Path=/",
+                                 "srv=1; Path=/; HttpOnly"], for: page)
+        let deep = URL(string: "https://www.example.com/shop/cart/x")!
+        for _ in 0..<3 {
+            XCTAssertEqual(j.cookieHeader(for: deep, sameSite: true),
+                           "deep=1; shop=1; dom=1; host=1; sec=1; strict=1; lax=1; none=1; srv=1")
+            XCTAssertEqual(j.documentCookie(for: deep), "deep=1; shop=1; dom=1; host=1; sec=1; strict=1; lax=1; none=1")
+            XCTAssertEqual(j.cookieHeader(for: deep, sameSite: false), "deep=1; shop=1; dom=1; host=1; sec=1; none=1; srv=1")
+            XCTAssertEqual(j.cookieHeader(for: URL(string: "http://www.example.com/")!, sameSite: true),
+                           "dom=1; host=1; strict=1; lax=1; srv=1")
+            XCTAssertEqual(j.cookieHeader(for: URL(string: "https://api.example.com/shopping")!, sameSite: true), "dom=1")
+            XCTAssertNil(j.cookieHeader(for: URL(string: "https://example.org/")!, sameSite: true))
+        }
+    }
+
+    /// Two hosts' entries stay apart, however the reads interleave.
+    func testCachedHeadersForDifferentURLsDoNotCrossContaminate() {
+        let clock = Clock()
+        let j = jar(clock)
+        let www = URL(string: "https://www.example.com/")!, api = URL(string: "https://api.example.com/v1")!
+        j.store(setCookieLines: ["w=1; Path=/"], for: www)
+        clock.now += 1
+        j.store(setCookieLines: ["a=1; Path=/"], for: api)
+        clock.now += 1
+        j.store(setCookieLines: ["shared=1; Domain=example.com; Path=/"], for: www)
+        clock.now += 1
+        for _ in 0..<3 {
+            XCTAssertEqual(j.cookieHeader(for: www, sameSite: true), "w=1; shared=1")
+            XCTAssertEqual(j.cookieHeader(for: api, sameSite: true), "a=1; shared=1")
+        }
+        j.store(setCookieLines: ["a=2; Path=/"], for: api)
+        XCTAssertEqual(j.cookieHeader(for: www, sameSite: true), "w=1; shared=1")
+        XCTAssertEqual(j.cookieHeader(for: api, sameSite: true), "a=2; shared=1", "a replacement keeps its creation time (§5.7 step 23.3)")
+    }
+
+    /// A cookie the page keeps reading (through cache hits) is not the
+    /// eviction victim at the cap: the hits' lastAccess is flushed before the
+    /// store that evicts.
+    func testCachedReadsStillCountForEviction() {
+        let clock = Clock()
+        let j = jar(clock, max: 3)
+        let www = URL(string: "https://www.example.com/")!, api = URL(string: "https://api.example.com/")!
+        clock.now += 1; j.store(setCookieLines: ["a=1; Path=/"], for: www)                        // host-only www
+        clock.now += 1; j.store(setCookieLines: ["b=1; Path=/"], for: api)                        // host-only api
+        clock.now += 1; j.store(setCookieLines: ["c=1; Domain=example.com; Path=/"], for: www)    // both
+        clock.now += 1; XCTAssertEqual(j.cookieHeader(for: www, sameSite: true), "a=1; c=1")   // miss: a, c at 4
+        clock.now += 1; XCTAssertEqual(j.cookieHeader(for: www, sameSite: true), "a=1; c=1")   // hit
+        clock.now += 1; XCTAssertEqual(j.cookieHeader(for: api, sameSite: true), "b=1; c=1")   // miss: b, c at 6
+        clock.now += 1; XCTAssertEqual(j.cookieHeader(for: www, sameSite: true), "a=1; c=1")   // hit (a stays at 4 until flushed)
+        clock.now += 1; j.store(setCookieLines: ["d=1; Domain=example.com; Path=/"], for: www)
+        let names = Set(j.allCookies.map(\.name))
+        XCTAssertEqual(names, ["a", "c", "d"], "b (read once at 6) goes; a was read at 7 through the cache")
+        XCTAssertEqual(j.cookieHeader(for: api, sameSite: true), "c=1; d=1")
+    }
+
+    /// The restore constructor starts a fresh generation: a reader holding a
+    /// result from before the restore sees the restored cookies.
+    func testRestoredJarServesRestoredCookies() {
+        let clock = Clock()
+        let j = jar(clock)
+        j.store(setCookieLines: ["keep=1; Max-Age=3600; Path=/"], for: page)
+        let data = j.persistentData()
+        let restored = JeffJSMemoryCookieJar(site: "example.com", persistentData: data, clock: { clock.date })
+        XCTAssertEqual(restored.documentCookie(for: page), "keep=1")
+        XCTAssertEqual(restored.documentCookie(for: page), "keep=1")
+        XCTAssertGreaterThan(restored.changeCount, 0)
+    }
+
+    /// The page-level getter: repeated reads, then a write, then a cookie
+    /// stored by "the network" (the jar's store, as a response would).
+    @MainActor
+    func testDocumentCookieGetterUpdatesAfterWriteAndStore() {
+        let env = JeffJSEnvironment(configuration: .init(baseURL: URL(string: "https://www.example.com/a/b.html")!,
+                                                         storageScope: "jeffjs.cookietest.\(UUID().uuidString)"))
+        let r1 = env.eval("""
+        document.cookie = 'a=1; path=/';
+        var reads = [];
+        for (var i = 0; i < 1000; i++) reads.push(document.cookie);
+        var same = reads.every(function (s) { return s === 'a=1'; });
+        document.cookie = 'b=2; path=/';
+        var afterWrite = document.cookie;
+        document.cookie = 'a=1; path=/; max-age=0';
+        [same, afterWrite, document.cookie, document.cookie].join('|');
+        """)
+        guard case .success(let s1) = r1 else { return XCTFail("\(r1)") }
+        XCTAssertEqual(s1, "true|a=1; b=2|b=2|b=2")
+        env.cookieJar?.store(setCookieLines: ["srv=1; Path=/; HttpOnly", "vis=1; Path=/"], for: URL(string: "https://www.example.com/")!)
+        let r2 = env.eval("document.cookie + '|' + document.cookie")
+        guard case .success(let s2) = r2 else { return XCTFail("\(r2)") }
+        XCTAssertEqual(s2, "b=2; vis=1|b=2; vis=1", "a stored response cookie shows; HttpOnly stays hidden")
+        (env.cookieJar as? JeffJSMemoryCookieJar)?.removeAll()
+        let r3 = env.eval("JSON.stringify(document.cookie)")
+        guard case .success(let s3) = r3 else { return XCTFail("\(r3)") }
+        XCTAssertEqual(s3, "\"\"")
+        env.teardown()
+    }
 }

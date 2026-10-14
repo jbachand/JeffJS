@@ -27,6 +27,10 @@
 // Partitioning is the host's business: it gives each top-level site its own
 // jar (React Natively: one per registrable domain, `RNCookieJars`), so the
 // same third-party host embedded on two sites holds two independent cookies.
+//
+// Reads are cached per URL against the jar's generation (JeffJSMemoryCookieJar
+// comment); `JEFFJS_COOKIE_STATS=1` prints call counts and times of the hot
+// paths at exit, `JEFFJS_COOKIE_DEBUG=1` what each document.cookie write did.
 
 import Foundation
 
@@ -479,12 +483,76 @@ nonisolated public enum JeffJSCookieParsing {
     }
 }
 
+// MARK: - Statistics (JEFFJS_COOKIE_STATS=1)
+
+/// Per-process counters for the jar's hot paths (calls, total and average
+/// time, longest result, most cookies seen in a jar), printed on stderr at
+/// exit when `JEFFJS_COOKIE_STATS=1`. One static Bool test per call when off
+/// (a 100k-read loop measures the same with and without the counters).
+nonisolated enum JeffJSCookieStats {
+    static let enabled = ProcessInfo.processInfo.environment["JEFFJS_COOKIE_STATS"] == "1"
+    struct Counter { var calls = 0; var nanos: UInt64 = 0; var maxLength = 0 }
+    private static let lock = NSLock()
+    private static var counters: [String: Counter] = [:]
+    private static var maxJarCount = 0
+    private static var registered = false
+
+    @inline(__always) static func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+
+    static func record(_ key: String, start: UInt64, length: Int, jarCount: Int) {
+        let dt = now() &- start
+        lock.lock()
+        var c = counters[key] ?? Counter()
+        c.calls += 1; c.nanos &+= dt; c.maxLength = max(c.maxLength, length)
+        counters[key] = c
+        maxJarCount = max(maxJarCount, jarCount)
+        if !registered { registered = true; atexit { JeffJSCookieStats.dump() } }
+        lock.unlock()
+    }
+
+    static func dump() {
+        lock.lock(); let snapshot = counters; let jarMax = maxJarCount; lock.unlock()
+        var out = "[CookieStats] max cookies in jar: \(jarMax)\n"
+        for key in snapshot.keys.sorted() {
+            let c = snapshot[key]!
+            let ms = Double(c.nanos) / 1e6
+            let avg = c.calls > 0 ? Double(c.nanos) / Double(c.calls) / 1e3 : 0
+            out += String(format: "[CookieStats] %-16@ calls=%8d total=%9.3f ms avg=%8.3f us maxlen=%d\n", key, c.calls, ms, avg, c.maxLength)
+        }
+        FileHandle.standardError.write(out.data(using: .utf8)!)
+    }
+}
+
 // MARK: - In-memory jar
 
 /// A complete, thread-safe cookie jar in memory. `site` is the partition's
 /// top-level site (informational; the host keeps one jar per site). Session
 /// cookies live as long as the instance; persistent ones can be saved with
 /// `persistentData(maxBytes:)` and restored with `init(site:persistentData:)`.
+///
+/// Reads are cached. Pages read `document.cookie` constantly (Home Depot's
+/// scripts and Akamai's sensor read it in every timer and event handler) and
+/// every fetch/XHR/renderer request asks for its `Cookie:` header, while the
+/// jar changes rarely. The serialized result of `matching` is kept per
+/// (URL, http, sameSite) together with the jar's `generation` (bumped on
+/// every change to `cookies`: store, document.cookie write, expiry purge,
+/// cap eviction, removeAll, restore) and `validUntil`, the earliest expiry
+/// among the jar's cookies when the entry was built. A hit is a dictionary
+/// lookup under the lock; a miss does the RFC 6265bis scan as before. Expiry
+/// still takes effect at the second: the entry is stale once `now` reaches
+/// `validUntil`, and the miss purges.
+///
+/// `lastAccess` (what cap eviction and the persistence byte budget rank by)
+/// is written by a miss as before; a hit only marks its entry as touched and
+/// the touched entries' cookies get `lastAccess = now` the next time the jar
+/// is about to change or be inspected (`flushTouchesLocked`), while the
+/// entry's indices are still valid. Within one entry the cookies always shared
+/// one `lastAccess` (a read stamped them all), so the ranking against cookies
+/// not read since is preserved: a cookie a page keeps reading through the
+/// cache is never the eviction victim. What changes is only the order among
+/// entries read at different moments since the last change: all of them are
+/// stamped alike at the flush. On a small watch jar (60 cookies) that is the
+/// difference between two cookies the page both read since the last write.
 nonisolated public final class JeffJSMemoryCookieJar: JeffJSCookieJar, @unchecked Sendable {
 
     public let site: String?
@@ -493,6 +561,42 @@ nonisolated public final class JeffJSMemoryCookieJar: JeffJSCookieJar, @unchecke
     private let onChange: (@Sendable (_ persistentChanged: Bool) -> Void)?
     private let lock = NSLock()
     private var cookies: [JeffJSCookie] = []
+    /// Changes whenever `cookies` does (see the class comment). Read under the lock.
+    private var generation: UInt64 = 0
+    private var matchCache: [MatchKey: MatchEntry] = [:]
+    /// Entries kept before the cache is dropped whole (a page talks to a
+    /// handful of hosts; the cap is only against a runaway of unique URLs).
+    private static let matchCacheLimit = 256
+
+    private struct MatchKey: Hashable {
+        let url: URL
+        let http: Bool
+        let sameSite: Bool
+    }
+
+    private final class MatchEntry {
+        let generation: UInt64
+        /// The earliest expiry in the whole jar when the entry was built:
+        /// from then on an expired cookie could exist and the scan must run.
+        let validUntil: Double
+        let value: String
+        /// Positions in `cookies` of the matched cookies, valid while
+        /// `generation` is the jar's (serialization order, not store order).
+        let indices: [Int]
+        /// Read through the cache since the last `flushTouchesLocked`.
+        var touched = false
+        init(generation: UInt64, validUntil: Double, value: String, indices: [Int]) {
+            self.generation = generation; self.validUntil = validUntil; self.value = value; self.indices = indices
+        }
+    }
+
+    /// The number of times the jar's cookies changed. A host can compare two
+    /// readings to know whether a `cookieHeader`/`documentCookie` result it
+    /// holds may have changed (not counting expiry).
+    public var changeCount: UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        return generation
+    }
 
     /// - Parameters:
     ///   - maxCookies: the jar's cap; past it expired cookies go first, then
@@ -516,20 +620,27 @@ nonisolated public final class JeffJSMemoryCookieJar: JeffJSCookieJar, @unchecke
         if let persistentData, let list = try? JSONDecoder().decode([JeffJSCookie].self, from: persistentData) {
             let now = clock().timeIntervalSince1970
             cookies = Array(list.filter { ($0.expires ?? .infinity) > now }.prefix(self.maxCookies))
+            generation &+= 1
         }
     }
 
     // MARK: Protocol
 
     public func cookieHeader(for url: URL, sameSite: Bool) -> String? {
-        let list = matching(url, http: true, sameSite: sameSite)
-        return list.isEmpty ? nil : Self.serialize(list)
+        let t0 = JeffJSCookieStats.enabled ? JeffJSCookieStats.now() : 0
+        let s = matching(url, http: true, sameSite: sameSite)
+        let result: String? = s.isEmpty ? nil : s   // a stored cookie never serializes to ""
+        if JeffJSCookieStats.enabled { JeffJSCookieStats.record("jar.cookieHeader", start: t0, length: result?.utf8.count ?? 0, jarCount: countLocked()) }
+        return result
     }
 
     public func store(setCookieLines: [String], for url: URL) {
+        let t0 = JeffJSCookieStats.enabled ? JeffJSCookieStats.now() : 0
+        defer { if JeffJSCookieStats.enabled { JeffJSCookieStats.record("jar.store", start: t0, length: setCookieLines.count, jarCount: countLocked()) } }
         var persistentChanged = false, changed = false
         lock.lock()
         let now = clock().timeIntervalSince1970
+        flushTouchesLocked(now: now)
         for line in setCookieLines {
             guard let c = JeffJSCookieParsing.parse(line, url: url, fromScript: false, now: now) else { continue }
             let r = insertLocked(c, url: url, fromScript: false, now: now)
@@ -541,12 +652,18 @@ nonisolated public final class JeffJSMemoryCookieJar: JeffJSCookieJar, @unchecke
     }
 
     public func documentCookie(for url: URL) -> String {
-        Self.serialize(matching(url, http: false, sameSite: true))
+        let t0 = JeffJSCookieStats.enabled ? JeffJSCookieStats.now() : 0
+        let result = matching(url, http: false, sameSite: true)
+        if JeffJSCookieStats.enabled { JeffJSCookieStats.record("jar.documentCookie", start: t0, length: result.utf8.count, jarCount: countLocked()) }
+        return result
     }
 
     public func setDocumentCookie(_ cookieString: String, for url: URL) {
+        let t0 = JeffJSCookieStats.enabled ? JeffJSCookieStats.now() : 0
+        defer { if JeffJSCookieStats.enabled { JeffJSCookieStats.record("jar.setDocCookie", start: t0, length: cookieString.utf8.count, jarCount: countLocked()) } }
         lock.lock()
         let now = clock().timeIntervalSince1970
+        flushTouchesLocked(now: now)
         var result = (changed: false, persistent: false)
         if let c = JeffJSCookieParsing.parse(cookieString, url: url, fromScript: true, now: now) {
             result = insertLocked(c, url: url, fromScript: true, now: now)
@@ -560,12 +677,19 @@ nonisolated public final class JeffJSMemoryCookieJar: JeffJSCookieJar, @unchecke
     /// Every live cookie (expired ones purged).
     public var allCookies: [JeffJSCookie] {
         lock.lock(); defer { lock.unlock() }
-        purgeExpiredLocked(now: clock().timeIntervalSince1970)
+        let now = clock().timeIntervalSince1970
+        flushTouchesLocked(now: now)
+        purgeExpiredLocked(now: now)
         return cookies
     }
 
     public func removeAll() {
-        lock.lock(); let had = !cookies.isEmpty; cookies.removeAll(); lock.unlock()
+        lock.lock()
+        let had = !cookies.isEmpty
+        cookies.removeAll()
+        matchCache.removeAll()
+        generation &+= 1
+        lock.unlock()
         if had { onChange?(true) }
     }
 
@@ -573,7 +697,9 @@ nonisolated public final class JeffJSMemoryCookieJar: JeffJSCookieJar, @unchecke
     /// recently used first, trimmed to `maxBytes`. Nil when there are none.
     public func persistentData(maxBytes: Int = .max) -> Data? {
         lock.lock()
-        purgeExpiredLocked(now: clock().timeIntervalSince1970)
+        let now = clock().timeIntervalSince1970
+        flushTouchesLocked(now: now)
+        purgeExpiredLocked(now: now)
         var list = cookies.filter { !$0.isSession }
         lock.unlock()
         guard !list.isEmpty else { return nil }
@@ -589,12 +715,19 @@ nonisolated public final class JeffJSMemoryCookieJar: JeffJSCookieJar, @unchecke
 
     // MARK: Internals
 
-    private func matching(_ url: URL, http: Bool, sameSite: Bool) -> [JeffJSCookie] {
-        guard let host = JeffJSCookieParsing.cookieHost(of: url) else { return [] }
-        let path = JeffJSCookieParsing.requestPath(of: url)
-        let secure = JeffJSCookieParsing.isSecure(url)
+    /// The serialized cookies for a request/document at `url` ("" when none),
+    /// through the match cache (class comment).
+    private func matching(_ url: URL, http: Bool, sameSite: Bool) -> String {
+        let key = MatchKey(url: url, http: http, sameSite: sameSite)
         lock.lock(); defer { lock.unlock() }
         let now = clock().timeIntervalSince1970
+        if let e = matchCache[key], e.generation == generation, now < e.validUntil {
+            e.touched = true
+            return e.value
+        }
+        guard let host = JeffJSCookieParsing.cookieHost(of: url) else { return "" }
+        let path = JeffJSCookieParsing.requestPath(of: url)
+        let secure = JeffJSCookieParsing.isSecure(url)
         purgeExpiredLocked(now: now)
         var out: [(cookie: JeffJSCookie, order: Int)] = []
         for i in cookies.indices {
@@ -605,7 +738,7 @@ nonisolated public final class JeffJSMemoryCookieJar: JeffJSCookieJar, @unchecke
             if c.httpOnly && !http { continue }
             if !sameSite && (c.sameSite == .strict || c.sameSite == .lax) { continue }
             cookies[i].lastAccess = now
-            out.append((cookies[i], i))
+            out.append((c, i))
         }
         // §5.8.3 step 2: longer paths first, then earlier creation (then store order).
         out.sort { a, b in
@@ -613,16 +746,44 @@ nonisolated public final class JeffJSMemoryCookieJar: JeffJSCookieJar, @unchecke
             if a.cookie.created != b.cookie.created { return a.cookie.created < b.cookie.created }
             return a.order < b.order
         }
-        return out.map(\.cookie)
+        let value = Self.serialize(out.map(\.cookie))
+        if matchCache.count >= Self.matchCacheLimit { matchCache.removeAll(keepingCapacity: true) }
+        matchCache[key] = MatchEntry(generation: generation, validUntil: earliestExpiryLocked(),
+                                     value: value, indices: out.map(\.order))
+        return value
     }
 
     private static func serialize(_ list: [JeffJSCookie]) -> String {
         list.map { $0.name.isEmpty ? $0.value : "\($0.name)=\($0.value)" }.joined(separator: "; ")
     }
 
+    private func countLocked() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return cookies.count
+    }
+
+    private func earliestExpiryLocked() -> Double {
+        var t = Double.infinity
+        for c in cookies { if let e = c.expires, e < t { t = e } }
+        return t
+    }
+
+    /// Stamps `lastAccess = now` on the cookies of every entry read through the
+    /// cache since the last flush (class comment). Must run before anything
+    /// moves or removes a cookie: the entries' indices are positions.
+    private func flushTouchesLocked(now: Double) {
+        for e in matchCache.values where e.touched {
+            e.touched = false
+            guard e.generation == generation else { continue }
+            for i in e.indices { cookies[i].lastAccess = now }
+        }
+    }
+
     private func purgeExpiredLocked(now: Double) {
         if cookies.contains(where: { ($0.expires ?? .infinity) <= now }) {
+            flushTouchesLocked(now: now)
             cookies.removeAll { ($0.expires ?? .infinity) <= now }
+            generation &+= 1
         }
     }
 
@@ -646,12 +807,14 @@ nonisolated public final class JeffJSMemoryCookieJar: JeffJSCookieJar, @unchecke
             if fromScript && old.httpOnly { return (false, false) }   // step 23.2
             cookie.created = old.created                              // step 23.3
             cookies.remove(at: idx)
+            generation &+= 1
             removedPersistent = !old.isSession
         }
         if let exp = cookie.expires, exp <= now {
             return (removedPersistent, removedPersistent)             // deletion only
         }
         cookies.append(cookie)
+        generation &+= 1
         if cookies.count > maxCookies {
             purgeExpiredLocked(now: now)
             while cookies.count > maxCookies {
@@ -659,6 +822,7 @@ nonisolated public final class JeffJSMemoryCookieJar: JeffJSCookieJar, @unchecke
                 var victim = 0
                 for i in cookies.indices.dropLast() where cookies[i].lastAccess < cookies[victim].lastAccess { victim = i }
                 cookies.remove(at: victim)
+                generation &+= 1
             }
         }
         return (true, removedPersistent || !cookie.isSession)
@@ -681,10 +845,25 @@ final class JeffJSCookieBridge {
     nonisolated static let debug = ProcessInfo.processInfo.environment["JEFFJS_COOKIE_DEBUG"] == "1"
     let jar: any JeffJSCookieJar
     var documentURL: () -> URL?
+    /// The last `document.cookie` string handed to the page, as the engine
+    /// string (one reference held here): a repeated read returns a dup of it
+    /// instead of allocating a fresh string (the jar's own cache hands back
+    /// the same Swift storage, so the `==` is a pointer test). Freed by
+    /// `teardown()` before the context goes; never touched after that (the
+    /// runtime's teardown frees whatever the page still held, this included),
+    /// so there is no free in `deinit`.
+    private var cachedCookie: (string: String, value: JeffJSValue)?
 
     init(jar: any JeffJSCookieJar, documentURL: @escaping () -> URL?) {
         self.jar = jar
         self.documentURL = documentURL
+    }
+
+    /// Gives back the engine string held by the getter cache. Call before the
+    /// context is freed (`JeffJSEnvironment.teardown`); safe to call twice.
+    func teardown() {
+        cachedCookie?.value.freeValue()
+        cachedCookie = nil
     }
 
     func register(on ctx: JeffJSContext) {
@@ -700,7 +879,18 @@ final class JeffJSCookieBridge {
             }
             guard thisVal.toObject() === pageDocument else { return ctx.newStringValue("") }
             guard let self, let url = self.documentURL() else { return ctx.newStringValue("") }
-            return ctx.newStringValue(self.jar.documentCookie(for: url))
+            let t0 = JeffJSCookieStats.enabled ? JeffJSCookieStats.now() : 0
+            let s = self.jar.documentCookie(for: url)
+            let v: JeffJSValue
+            if let c = self.cachedCookie, c.string == s {
+                v = c.value.dupValue()
+            } else {
+                v = ctx.newStringValue(s)
+                self.cachedCookie?.value.freeValue()
+                self.cachedCookie = (s, v.dupValue())
+            }
+            if JeffJSCookieStats.enabled { JeffJSCookieStats.record("js.get", start: t0, length: s.utf8.count, jarCount: 0) }
+            return v
         }, name: "get cookie", length: 0)
         let setter = ctx.newCFunction({ [weak self] ctx, thisVal, args in
             guard thisVal.isObject else {
@@ -709,8 +899,10 @@ final class JeffJSCookieBridge {
             guard thisVal.toObject() === pageDocument else { return JeffJSValue.undefined }
             guard let self, let url = self.documentURL() else { return JeffJSValue.undefined }
             let s = ctx.toSwiftString(args.first ?? .undefined) ?? ""
+            let t0 = JeffJSCookieStats.enabled ? JeffJSCookieStats.now() : 0
             let before = JeffJSCookieBridge.debug ? self.jar.documentCookie(for: url).utf8.count : 0
             self.jar.setDocumentCookie(s, for: url)
+            if JeffJSCookieStats.enabled { JeffJSCookieStats.record("js.set", start: t0, length: s.utf8.count, jarCount: 0) }
             if JeffJSCookieBridge.debug {
                 // JEFFJS_COOKIE_DEBUG=1: what a page's write did (Google's
                 // challenge only writes when document.cookie.length +

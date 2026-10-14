@@ -732,6 +732,8 @@ public final class JeffJSEnvironment {
 
         domBridge?.resetBridge()
         domBridge = nil
+        cookieBridge?.teardown()
+        cookieBridge = nil
         storageBridge = nil
         fetchBridge = nil
         webSocketBridge = nil

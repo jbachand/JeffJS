@@ -756,6 +756,22 @@ final class FetchBridgeTests: XCTestCase {
         XCTAssertEqual(out, "cookie=hop=1||null||hop=1")
     }
 
+    /// A `document.cookie` read before the fetch (the getter's cached string)
+    /// does not survive the response's Set-Cookie: the next read shows it.
+    @MainActor
+    func testDocumentCookieReadAfterResponseSetCookie() async throws {
+        try skipIfNoServer()
+        let env = makeEnvironment()
+        let out = await runJS(env, """
+        document.cookie = 'pre=1; path=/';
+        var before = document.cookie;
+        fetch('/setcookie?c=' + encodeURIComponent('vis=1; Path=/')).then(function(r){ return r.text(); }).then(function(t){
+          globalThis.__out = [before, document.cookie, document.cookie, t].join('||');
+        }).catch(function(e){ globalThis.__out = 'ERR ' + e; });
+        """)
+        XCTAssertEqual(out, "pre=1||pre=1; vis=1||pre=1; vis=1||cookie=pre=1")
+    }
+
     /// credentials: 'omit' neither sends nor stores cookies.
     @MainActor
     func testCredentialsOmitDoesNotStore() async throws {
