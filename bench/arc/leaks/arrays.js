@@ -1,0 +1,2 @@
+var t=0; for(let r=0;r<3000;r++){ var a=[]; for(let i=0;i<40;i++) a.push(i*2); a.splice(3,5,'x','y'); a.shift(); a.unshift(1,2); a.sort(function(x,y){return (x>y)-(x<y)}); var b=a.concat([1,2,3],a).filter(function(v){return typeof v==='number'}).map(function(v){return v+1}); t+=b.length+a.length; a.reverse(); a.length=5; t+=a.indexOf(1); var c=[...b,...a]; t+=c.length; var o=[[1,2],[3]]; t+=o.flat().length; }
+console.log(t);

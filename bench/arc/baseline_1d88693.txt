@@ -1,0 +1,7 @@
+arrays: result=585000 rss=24MB live_objects=16611
+async: result=4510500 rss=22MB live_objects=4645
+calls: result=680000 rss=19MB live_objects=5839
+closures: result=705346 rss=19MB live_objects=5234
+generators: result=114000 rss=19MB live_objects=4591
+mapset: result=1808000 rss=19MB live_objects=4900
+objects: result=400160000 rss=19MB live_objects=6381
