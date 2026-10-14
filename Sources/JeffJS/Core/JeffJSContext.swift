@@ -433,6 +433,13 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
 
     /// Native call depth across callFunction/callInternal (stack-overflow guard).
     var callDepth: Int = 0
+    /// Instance copies of process-wide config switches read on every call
+    /// (a global `let` is a lazy once-initialised accessor: a swift_once check
+    /// per read). Same values, same env/plist overrides, fixed at first use.
+    let cfgMaxCallDepth: Int = JeffJSInterpreter.maxCallDepth
+    let cfgLeanCallEntry: Bool = jeffJSLeanCallEntry
+    let cfgFastCallEntry: Bool = JeffJSRuntime.fastCallEntry
+    let cfgTraceLast: Bool = jeffJSTraceLast
     /// Last two property atoms read via get_field — used to enrich
     /// "cannot read property of undefined" error messages.
     var lastGetFieldAtom: UInt32 = 0

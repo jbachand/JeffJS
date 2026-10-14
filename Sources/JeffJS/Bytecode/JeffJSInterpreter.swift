@@ -686,7 +686,7 @@ extension JeffJSContext {
         // Guard against stack overflow — C function callbacks can recurse back into callFunction
         callDepth += 1
         defer { callDepth -= 1 }
-        if callDepth > JeffJSInterpreter.maxCallDepth {
+        if callDepth > cfgMaxCallDepth {
             return throwRangeError(message: "Maximum call stack size exceeded.")
         }
         if callDepth == 1 {
@@ -706,11 +706,11 @@ extension JeffJSContext {
         // interp.leanCallEntry: a same-realm plain bytecode function goes
         // straight to callInternal without a strong object / body reference
         // (a retain/release pair each) or the payload checks below.
-        if jeffJSLeanCallEntry, let lo = funcVal.obj, lo.realmIndex == realmIndex, let lfb = lo.fbFastU,
+        if cfgLeanCallEntry, let lo = funcVal.obj, lo.realmIndex == realmIndex, let lfb = lo.fbFastU,
            lfb._withUnsafeGuaranteedRef({ !$0.isGenerator && !$0.isAsyncFunc }) {
             return JeffJSInterpreter.callInternal(ctx: self, funcObj: funcVal,
                                                   thisVal: thisVal, args: args,
-                                                  stackChecked: JeffJSRuntime.fastCallEntry && callDepth > 1)
+                                                  stackChecked: cfgFastCallEntry && callDepth > 1)
         }
         guard let obj = funcVal.toObject() else {
             let desc: String
@@ -722,7 +722,7 @@ extension JeffJSContext {
             // The call site belongs in the error's `stack`, not in its
             // message — except under JEFFJS_TRACE_LAST, where the inline
             // frame hint (and the opcode dump) is the point.
-            if jeffJSTraceLast {
+            if cfgTraceLast {
                 var hint = ""
                 var f: JeffJSStackFrame? = self.currentFrame
                 var depth = 0
@@ -752,7 +752,7 @@ extension JeffJSContext {
         if let fastFB = obj.fbFast, !fastFB.isGenerator, !fastFB.isAsyncFunc {
             return JeffJSInterpreter.callInternal(ctx: self, funcObj: funcVal,
                                                   thisVal: thisVal, args: args,
-                                                  stackChecked: JeffJSRuntime.fastCallEntry && callDepth > 1)
+                                                  stackChecked: cfgFastCallEntry && callDepth > 1)
         }
         // C function path (mirrored fields: no payload copy per call). Checked
         // before the bound-function match below, which copies the payload.
@@ -7685,7 +7685,7 @@ struct JeffJSInterpreter {
         #endif
         ctx.callDepth += 1
         defer { ctx.callDepth -= 1 }
-        if ctx.callDepth > maxCallDepth {
+        if ctx.callDepth > ctx.cfgMaxCallDepth {
             _ = jeffJS_coldThrow(ctx, .m0)
             return .exception
         }
@@ -7789,7 +7789,7 @@ struct JeffJSInterpreter {
         let rt = ctx.rt
         let ctxRealm = ctx.realmIndex
         let traceOps = rt.cfgTraceOpcodes
-        let traceLast = jeffJSTraceLast   // register copy: read per opcode below
+        let traceLast = ctx.cfgTraceLast   // register copy: read per opcode below
         let inlineCallsEnabled = rt.cfgUseInlineCalls
         let traceHitThreshold = rt.cfgTraceHitThreshold
 
@@ -7830,7 +7830,7 @@ struct JeffJSInterpreter {
         // inline-call frames, which never set it. Storing it cost a retain
         // here plus a release and an array uniqueness check in releaseFrame
         // per native→JS call. [callInternal edit, watch-cpu 2026-10-07]
-        if !jeffJSLeanCallEntry || fb0.isGenerator || fb0.isAsyncFunc || resumeState != nil {
+        if !ctx.cfgLeanCallEntry || fb0.isGenerator || fb0.isAsyncFunc || resumeState != nil {
             frame.argBuf = args
             frame.bufArraysLive = true
         }
