@@ -4703,12 +4703,12 @@ private func executeFastTrace(
             }
 
         case .get_var, .get_var_undef:
-            guard let ents = fb.icEntries, let gObj = ctx.globalObj.obj, let gShape = gObj.shape else {
+            guard let ents = fb.icEntries, let gObj = ctx.globalObj.obj, let gShapeId = gObj.shapeIdentity else {
                 resume = pc; break traceLoop // deopt: no IC table yet
             }
             let entry = ents[jeffJS_icSlot(ents, pc)]
             if entry.pc == pc,
-               entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
+               entry.shapePtr == gShapeId,
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
                gObj.extra(at: entry.propOffset) == nil {
                 buf[sp] = gObj.dataValue(at: entry.propOffset).dupValue(); sp += 1
@@ -6037,12 +6037,12 @@ private func executeFastTraceLean(
             }
 
         case .get_var, .get_var_undef:
-            guard let ents = icEntries, let gObj = ctx.globalObj.obj, let gShape = gObj.shape else {
+            guard let ents = icEntries, let gObj = ctx.globalObj.obj, let gShapeId = gObj.shapeIdentity else {
                 ctx.interruptCounter = interrupt; return pc // deopt: no IC table yet
             }
             let entry = ents[jeffJS_icSlot(ents, pc)]
             if entry.pc == pc,
-               entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
+               entry.shapePtr == gShapeId,
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
                gObj.extra(at: entry.propOffset) == nil {
                 buf[sp] = gObj.dataValue(at: entry.propOffset).dupValue(); sp += 1
