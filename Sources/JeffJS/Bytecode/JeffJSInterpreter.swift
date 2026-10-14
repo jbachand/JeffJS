@@ -7718,11 +7718,11 @@ struct JeffJSInterpreter {
         // Hot path: a plain bytecode function. The denormalized fbFast field
         // avoids pattern-matching the payload enum, which copies it (retaining
         // the FB and the varRefs array) on every call.
-        let fb0: JeffJSFunctionBytecode
-        let varRefsOpt: [JeffJSVarRef?]
+        var fb: JeffJSFunctionBytecode   // mutable so inline calls can swap callee's bytecode in
+        let hasVarRefs0: Bool
         if let fastFB = obj.fbFast {
-            fb0 = fastFB
-            varRefsOpt = obj.varRefsFast
+            fb = fastFB
+            hasVarRefs0 = obj.varRefsRawCount > 0
         } else {
             // Cold paths: C functions (e.g. via Promise reaction jobs), bound
             // functions, callable proxies, or payload-only bytecode functions.
@@ -7770,8 +7770,8 @@ struct JeffJSInterpreter {
             // varRefsFast only (the payload's list is empty).
             let payloadVarRefs = varRefs.isEmpty ? obj.varRefsFast : varRefs
             obj.varRefsFast = payloadVarRefs
-            fb0 = fbFromPayload
-            varRefsOpt = payloadVarRefs
+            fb = fbFromPayload
+            hasVarRefs0 = !payloadVarRefs.isEmpty
         }
 
         // NOTE: keep this a strong `var`. unowned(unsafe) here was measured
@@ -7779,7 +7779,6 @@ struct JeffJSInterpreter {
         // function captures were removed): the compiler then copies (retains)
         // the reference around member accesses instead of relying on the
         // variable's own ownership.
-        var fb = fb0  // mutable so inline calls can swap callee's bytecode in
         var bc = fb.bytecodePtr
         var bcLen = fb.bytecodeLen
 
@@ -7794,13 +7793,18 @@ struct JeffJSInterpreter {
         let traceHitThreshold = rt.cfgTraceHitThreshold
 
         // Set up the call frame (pooled to avoid malloc/free per call)
-        unowned(unsafe) var frame: JeffJSStackFrame = rt.acquireFrame()   // frames are immortal (rt.allFrames)
+        // Frames are immortal (rt.allFrames). The entry setup runs through a
+        // guaranteed reference: a plain `unowned(unsafe)` local is copied
+        // (retain/release) around the field stores below.
+        let frameU = rt.acquireFrameU()
+        let isConstructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0
+        let isDerivedCtor = isConstructor && fb.isDerivedClassConstructor
+        do { unowned(unsafe) let frame: JeffJSStackFrame = frameU.takeUnretainedValue()
         frame.prevFrame = ctx.currentFrame
         frame.curFunc = funcObj
         // ES spec §10.2.1.2: For non-strict functions, coerce undefined/null this
         // to the global object. Strict mode functions receive this as-is.
-        let isConstructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0
-        let isStrict = fb0.isStrictMode
+        let isStrict = fb.isStrictMode
         if !isConstructor && !isStrict {
             if thisVal.isUndefined || thisVal.isNull {
                 frame.thisVal = ctx.globalObj
@@ -7812,7 +7816,7 @@ struct JeffJSInterpreter {
         }
         // Arrow functions use the lexical `this` captured at closure creation
         // time, overriding whatever the caller passed.
-        if fb0.isArrow, let arrowThis = obj.arrowThisVal {
+        if fb.isArrow, let arrowThis = obj.arrowThisVal {
             frame.thisVal = arrowThis
         }
         // new.target (borrowed from the constructor call site, or the
@@ -7830,10 +7834,12 @@ struct JeffJSInterpreter {
         // inline-call frames, which never set it. Storing it cost a retain
         // here plus a release and an array uniqueness check in releaseFrame
         // per native→JS call. [callInternal edit, watch-cpu 2026-10-07]
-        if !ctx.cfgLeanCallEntry || fb0.isGenerator || fb0.isAsyncFunc || resumeState != nil {
+        if !ctx.cfgLeanCallEntry || fb.isGenerator || fb.isAsyncFunc || resumeState != nil {
             frame.argBuf = args
             frame.bufArraysLive = true
         }
+        }
+        unowned(unsafe) var frame: JeffJSStackFrame = frameU.takeUnretainedValue()
 
         // Initialize local variables. Append into the pooled frame's array
         // (released with keepingCapacity) instead of assigning a fresh array —
@@ -7863,7 +7869,7 @@ struct JeffJSInterpreter {
         // Copy args into buffer at offset 0: borrowed from the caller, or
         // owned copies when the function can store into its parameters (see
         // "Argument slots"; released in the epilogue).
-        if fb0.copiesArgs && resumeState == nil {
+        if fb.copiesArgs && resumeState == nil {
             for i in 0..<args.count { buf[i] = args[i].dupValue() }
         } else {
             for i in 0..<args.count { buf[i] = args[i] }
@@ -7880,8 +7886,8 @@ struct JeffJSInterpreter {
 
         // Named function expression self-reference: initialize the local variable
         // that holds the function's own name binding (ES spec §15.2.4).
-        if fb0.selfRefVarIdx >= 0 {
-            buf[varBase + fb0.selfRefVarIdx] = funcObj.dupValue()
+        if fb.selfRefVarIdx >= 0 {
+            buf[varBase + fb.selfRefVarIdx] = funcObj.dupValue()
         }
 
         // Push frame
@@ -7910,7 +7916,7 @@ struct JeffJSInterpreter {
         var vrCount: Int = obj.varRefsRawCount
         // Tracks whether `varRefs` holds a non-empty array so the inline call
         // paths can skip the (out-of-line) isEmpty check per call/return.
-        var varRefsLoaded = !varRefsOpt.isEmpty
+        var varRefsLoaded = hasVarRefs0
 
         // Inline call stack for non-recursive function calls.
         // Lazy: the empty array literal is allocation-free; reserveCapacity here
@@ -13609,7 +13615,7 @@ struct JeffJSInterpreter {
         // Derived class constructor: `this` was bound by init_this (owned by
         // the frame). An explicit object return wins; `undefined` returns
         // `this`, which must have been initialised by super().
-        if isConstructor, fb0.isDerivedClassConstructor {
+        if isDerivedCtor {
             let boundThis = frame.thisVal
             frame.thisVal = .undefined
             if retVal.isException {

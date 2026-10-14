@@ -1860,6 +1860,36 @@ nonisolated final class JeffJSStackFrame {
 
     init() {}
 
+    /// Only what the next acquire does not overwrite: callInternal /
+    /// enterInlineFrame set curFunc, thisVal, argCount, varCount and the buf*
+    /// fields on every use. Runs on every inline return.
+    @inline(__always)
+    final func resetForRelease() {
+        if ownsThis {
+            thisVal.freeValue()
+            thisVal = .undefined
+            ownsThis = false
+        }
+        if !newTarget.isUndefined { newTarget = .undefined }
+        curPC = 0
+        buf = nil
+        // The arrays are materialised on demand; one flag instead of two
+        // array-count loads per return.
+        if bufArraysLive {
+            // argBuf shares the caller's argument array, so it is dropped
+            // rather than emptied in place: removeAll(keepingCapacity:) on
+            // a shared buffer copied it, one allocation per return, and
+            // left the caller unable to reuse its array without a copy.
+            argBuf = []
+            varBuf.removeAll(keepingCapacity: true)
+            bufArraysLive = false
+        }
+        if hasLiveVarRefs {
+            liveVarRefs.removeAll(keepingCapacity: true)
+            hasLiveVarRefs = false
+        }
+    }
+
     // NOTE: The frame pool lives on JeffJSRuntime (acquireFrame/releaseFrame).
     // It used to be a static here, but static-var mutation costs a TLS-backed
     // exclusivity check per call and recycled frames across runtimes.

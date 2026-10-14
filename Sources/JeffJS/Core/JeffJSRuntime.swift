@@ -513,35 +513,11 @@ nonisolated final class JeffJSRuntime {
 
     @inline(__always)
     func releaseFrameU(_ u: Unmanaged<JeffJSStackFrame>) {
-        // Only reset what the next acquire does not overwrite: callInternal /
-        // enterInlineFrame set curFunc, thisVal, argCount, varCount and the
-        // buf* fields on every use. This runs on every inline return.
-        u._withUnsafeGuaranteedRef { frame in
-            if frame.ownsThis {
-                frame.thisVal.freeValue()
-                frame.thisVal = .undefined
-                frame.ownsThis = false
-            }
-            if !frame.newTarget.isUndefined { frame.newTarget = .undefined }
-            frame.curPC = 0
-            frame.buf = nil
-            // The arrays are materialised on demand; one flag instead of two
-            // array-count loads per return.
-            if frame.bufArraysLive {
-                // argBuf shares the caller's argument array, so it is dropped
-                // rather than emptied in place: removeAll(keepingCapacity:) on
-                // a shared buffer copied it, one allocation per return, and
-                // left the caller unable to reuse its array without a copy.
-                frame.argBuf = []
-                frame.varBuf.removeAll(keepingCapacity: true)
-                frame.bufArraysLive = false
-            }
-            if frame.hasLiveVarRefs {
-                frame.liveVarRefs.removeAll(keepingCapacity: true)
-                frame.hasLiveVarRefs = false
-            }
-            frame.nextFree = frameFreeListU
-        }
+        // The reset is a method on the frame so it runs on a guaranteed
+        // reference with nothing captured: the closure form retained and
+        // released the runtime and the frame on every return.
+        u._withUnsafeGuaranteedRef { $0.resetForRelease() }
+        u._withUnsafeGuaranteedRef { $0.nextFree = frameFreeListU }
         frameFreeListU = u
         frameFreeCount += 1
     }
