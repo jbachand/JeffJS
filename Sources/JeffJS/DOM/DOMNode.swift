@@ -43,7 +43,16 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
         /// Any change invalidates every node's selector-matching cache (the
         /// language and ancestor filter are functions of the parent chain).
         weak var parent: DOMNode?
-        var children: [DOMNode] = []
+        var children: [DOMNode] = [] { didSet { childrenVersion &+= 1 } }
+        /// Bumped by every change to `children` (`DOMNode+Siblings.swift`).
+        var childrenVersion: UInt64 = 1
+        /// This node's position among its parent's children, valid while
+        /// `posVersion` equals the parent's `childrenVersion` (0 = none; reset
+        /// whenever the parent link changes).
+        var posVersion: UInt64 = 0
+        var posIndex = 0
+        var posElementIndex = 0
+        var posElementCount = 0
         var attributes: [String: String]
         /// Attribute names in the order they were added (see `orderedAttributeNames`).
         var attributeOrder: [String] = []
@@ -107,7 +116,7 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
     public internal(set) var parent: DOMNode? {
         get { state.withLock { $0.parent } }
         set {
-            state.withLock { $0.parent = newValue }
+            state.withLock { $0.parent = newValue; $0.posVersion = 0 }
             DOMNode.bumpSelectorEpoch()
         }
     }
@@ -708,8 +717,10 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
         }
     }
 
+    /// `querySelector` — the first descendant element matching, in document
+    /// order; the walk stops at it.
     public func querySelector(_ selector: String) -> DOMNode? {
-        querySelectorAll(selector).first
+        runQuery(selector, firstOnly: true).first
     }
 
     /// `Element.matches(selector)` — true when this element itself matches any
@@ -755,27 +766,67 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
     /// The node itself is never part of the result (matching WebKit), but it is
     /// the `:scope` for relative selectors such as `:scope > a`.
     public func querySelectorAll(_ selector: String) -> [DOMNode] {
-        let selectorList = CSSSelectorParser.parse(selector)
-        guard !selectorList.selectors.isEmpty else { return [] }
-        let candidates = selectorList.selectors.filter { $0.pseudoElement == nil }
-        guard !candidates.isEmpty else { return [] }
-        let context = CSSMatchContext(scope: self)
+        runQuery(selector, firstOnly: false)
+    }
 
-        var results: [DOMNode] = []
-        forEachDescendantElement { node in
-            if candidates.contains(where: { CSSSelectorMatcher.matches($0, node: node, context: context) }) {
-                results.append(node)
+    private func runQuery(_ selector: String, firstOnly: Bool) -> [DOMNode] {
+        guard let plan = CSSQueryPlan.plan(for: selector) else { return [] }
+        var context = CSSMatchContext(scope: self)
+        let chain = DOMAncestorChain(tracksFilter: plan.wantsAncestorFilter)
+        // The ancestors a combinator can reach from a descendant: this node
+        // and everything above it, stopping where the matcher's own parent
+        // step would (a shadow root's stored parent is its host).
+        var above: [DOMNode] = []
+        if !(DOMNode.anyShadowRoots && isShadowRoot) {
+            var cursor: DOMNode? = self
+            while let node = cursor {
+                above.append(node)
+                cursor = CSSSelectorMatcher.selectorParent(of: node)
             }
+        }
+        for node in above.reversed() { chain.push(node) }
+        context.ancestorChain = chain
+        var results: [DOMNode] = []
+        walkDescendantElements(chain: chain) { node in
+            if plan.matches(node, context: context) {
+                results.append(node)
+                return firstOnly
+            }
+            return false
         }
         return results
     }
 
+    /// Pre-order (document order) walk over descendant elements; `body`
+    /// returns true to stop. Iterative (an explicit stack of children
+    /// snapshots), and never asks a text or comment node for its children.
+    /// With a `chain`, an element is pushed while its subtree is walked and
+    /// `chain.subject` names the element handed to `body`.
+    func walkDescendantElements(chain: DOMAncestorChain? = nil, _ body: (DOMNode) -> Bool) {
+        var stack: [(nodes: [DOMNode], next: Int)] = [(children, 0)]
+        while let top = stack.indices.last {
+            if stack[top].next >= stack[top].nodes.count {
+                stack.removeLast()
+                if chain != nil, !stack.isEmpty { chain.unsafelyUnwrapped.pop() }
+                continue
+            }
+            let child = stack[top].nodes[stack[top].next]
+            stack[top].next += 1
+            guard child.nodeType == .element else { continue }
+            chain?.subject = child
+            if body(child) { chain?.subject = nil; return }
+            let kids = child.children
+            if !kids.isEmpty {
+                chain?.push(child)
+                stack.append((kids, 0))
+            }
+        }
+        chain?.subject = nil
+    }
+
     /// Pre-order (document order) walk over descendant elements.
     func forEachDescendantElement(_ body: (DOMNode) -> Void) {
-        for child in children {
-            if child.nodeType == .element { body(child) }
-            child.forEachDescendantElement(body)
-        }
+        walkDescendantElements { body($0); return false }
     }
 
     func allDescendantElements() -> [DOMNode] {

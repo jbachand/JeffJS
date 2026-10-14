@@ -229,9 +229,27 @@ public struct CSSComplexSelector: Sendable {
     /// If non-nil, this selector targets a pseudo-element (::before / ::after / ...).
     public let pseudoElement: CSSPseudoElement?
 
+    /// `pureDescendantPrefix[i]` is true when every combinator left of
+    /// `parts[i - 1]` (those preceding `parts[1..<i]`) is a descendant
+    /// combinator. A descendant combinator before `parts[i]` then needs only
+    /// the *nearest* ancestor matching `parts[i - 1]`: a farther one has a
+    /// subset of its ancestors, and nothing left of it constrains the
+    /// ancestor's position, so if the nearest fails every farther one fails.
+    /// Otherwise the matcher backtracks with a failure memo
+    /// (`CSSSelectorMatcher.ChainMemo`) so the work stays polynomial.
+    let pureDescendantPrefix: [Bool]
+
     public init(parts: [Part], pseudoElement: CSSPseudoElement? = nil) {
         self.parts = parts
         self.pseudoElement = pseudoElement
+        var pure = [Bool](repeating: true, count: parts.count + 1)
+        var allDescendant = true
+        for i in 0..<parts.count {
+            pure[i] = allDescendant
+            if i >= 1, (parts[i].combinator ?? .descendant) != .descendant { allDescendant = false }
+        }
+        pure[parts.count] = allDescendant
+        self.pureDescendantPrefix = pure
     }
 }
 
@@ -377,6 +395,10 @@ public struct CSSMatchContext: Sendable {
     /// tree's shadow root reaches it (featureless: only `:host`-family
     /// compounds match it). nil = a document-tree rule.
     public var shadowHost: DOMNode?
+    /// The ancestors of the node a query is currently testing, when a
+    /// subtree scan carries them (`DOMAncestorChain`); nil everywhere else.
+    /// Honoured only for `ancestorChain.subject` itself.
+    var ancestorChain: DOMAncestorChain?
 
     public init(scope: DOMNode? = nil, shadowHost: DOMNode? = nil) {
         self.scope = scope
@@ -385,6 +407,60 @@ public struct CSSMatchContext: Sendable {
 
     /// No scoping element — `:scope` then behaves like `:root`.
     public static let none = CSSMatchContext(scope: nil)
+}
+
+/// The ancestors of the element a subtree scan (`querySelectorAll`) is
+/// testing, root-most first, kept as strong references on the scan's own
+/// stack: combinators step to the parent by index, with no `parent` getter
+/// (a lock and a weak load per step). Optionally also a counting Bloom filter
+/// of the ancestors' tag, id, class and attribute-name hashes, maintained on
+/// push / pop, which long selector lists use to reject entries cheaply.
+/// One scan's private state: never shared between threads.
+final class DOMAncestorChain: @unchecked Sendable {
+    var nodes: [DOMNode] = []
+    /// The element being tested; the chain describes its ancestors.
+    var subject: DOMNode?
+    let tracksFilter: Bool
+    private var counters: [UInt16]
+    private var hashes: [UInt32] = []
+    private var levelStart: [Int] = []
+
+    init(tracksFilter: Bool) {
+        self.tracksFilter = tracksFilter
+        counters = tracksFilter ? [UInt16](repeating: 0, count: 512) : []
+    }
+
+    func push(_ node: DOMNode) {
+        nodes.append(node)
+        guard tracksFilter else { return }
+        levelStart.append(hashes.count)
+        if node.nodeType == .element {
+            if let tag = node.lowercasedTagName { hashes.append(DOMSelectorKeyHash.hash(DOMSelectorKeyHash.tagKind, tag)) }
+            if let id = node.idAttribute { hashes.append(DOMSelectorKeyHash.hash(DOMSelectorKeyHash.idKind, id)) }
+            for cls in node.classNames { hashes.append(DOMSelectorKeyHash.hash(DOMSelectorKeyHash.classKind, cls)) }
+            for key in node.attributes.keys { hashes.append(DOMSelectorKeyHash.attributeNameHash(key)) }
+        }
+        for h in hashes[levelStart[levelStart.count - 1]...] {
+            counters[Int(h & 511)] &+= 1
+            counters[Int((h >> 9) & 511)] &+= 1
+        }
+    }
+
+    func pop() {
+        nodes.removeLast()
+        guard tracksFilter else { return }
+        let start = levelStart.removeLast()
+        for h in hashes[start...] {
+            counters[Int(h & 511)] &-= 1
+            counters[Int((h >> 9) & 511)] &-= 1
+        }
+        hashes.removeSubrange(start...)
+    }
+
+    @inline(__always)
+    func mayContain(_ hash: UInt32) -> Bool {
+        counters[Int(hash & 511)] > 0 && counters[Int((hash >> 9) & 511)] > 0
+    }
 }
 
 // MARK: - Selector Matching
@@ -398,6 +474,12 @@ public struct CSSSelectorMatcher: Sendable {
 
     /// Test whether a complex selector matches a DOM node within a scope.
     public static func matches(_ selector: CSSComplexSelector, node: DOMNode, context: CSSMatchContext) -> Bool {
+        let chain = context.ancestorChain.flatMap { $0.subject === node ? $0 : nil }
+        return matches(selector, node: node, context: context, chain: chain)
+    }
+
+    static func matches(_ selector: CSSComplexSelector, node: DOMNode, context: CSSMatchContext,
+                        chain: DOMAncestorChain?) -> Bool {
         let parts = selector.parts
         let last = parts.count - 1
         guard last >= 0 else { return false }
@@ -405,8 +487,10 @@ public struct CSSSelectorMatcher: Sendable {
         if last == 0 { return true }
         // Fast reject: a compound left of a descendant / child combinator must
         // match an ancestor, so its identifiers must be in the ancestor filter.
-        if ancestorFilterRejects(parts, node: node) { return false }
-        return matchesCombinator(parts, last, node: node, context: context)
+        if chain == nil, ancestorFilterRejects(parts, node: node) { return false }
+        var memo: ChainMemo?
+        return matchesCombinator(selector, last, node: node, context: context, chain: chain,
+                                 upTo: chain?.nodes.count ?? 0, memo: &memo)
     }
 
     /// True when some compound that has to match an ancestor of `node` needs
@@ -429,46 +513,92 @@ public struct CSSSelectorMatcher: Sendable {
         return false
     }
 
-    /// Right-to-left match with backtracking over descendant / general-sibling
-    /// combinators (`.a .b .c` must not fail just because the nearest `.b`
-    /// ancestor has no `.a` above it).
+    /// Failure memo for one `matches` call: (part index, node) pairs for which
+    /// "`parts[index]` matches the node and the rest of the chain holds" was
+    /// found false. Keeps backtracking over descendant / general-sibling
+    /// combinators O(parts x nodes) instead of exponential in the depth. The
+    /// same idea as WebKit's SelectorChecker descendant backtracking (and
+    /// SelectorCompiler, which only backtracks while an earlier combinator can
+    /// still pick a different ancestor).
+    final class ChainMemo {
+        struct Key: Hashable { let index: Int; let node: ObjectIdentifier }
+        var failed = Set<Key>()
+    }
+
+    /// `parts[index]` against `node`, then the rest of the chain.
     private static func matchesChain(
-        _ parts: [CSSComplexSelector.Part],
-        _ index: Int,
-        node: DOMNode,
-        context: CSSMatchContext
+        _ selector: CSSComplexSelector, _ index: Int, node: DOMNode,
+        context: CSSMatchContext, chain: DOMAncestorChain?, upTo: Int, memo: inout ChainMemo?
     ) -> Bool {
-        guard matchesCompound(parts[index].selector, node: node, context: context) else { return false }
+        guard matchesCompound(selector.parts[index].selector, node: node, context: context) else { return false }
         if index == 0 { return true }
-        return matchesCombinator(parts, index, node: node, context: context)
+        return matchesCombinator(selector, index, node: node, context: context, chain: chain, upTo: upTo, memo: &memo)
+    }
+
+    /// The element a combinator steps to from `node` and how many chain
+    /// entries lie above it. With a chain (`upTo` ancestors known above
+    /// `node`) the parent is `chain.nodes[upTo - 1]`.
+    @inline(__always)
+    private static func parentStep(_ node: DOMNode, _ context: CSSMatchContext,
+                                   _ chain: DOMAncestorChain?, _ upTo: Int) -> (DOMNode?, Int) {
+        if let chain { return upTo > 0 ? (chain.nodes[upTo - 1], upTo - 1) : (nil, 0) }
+        return (selectorParent(of: node, context: context), 0)
+    }
+
+    /// Memoised `matchesChain`, for the backtracking loops.
+    private static func matchesChainMemoised(
+        _ selector: CSSComplexSelector, _ index: Int, node: DOMNode,
+        context: CSSMatchContext, chain: DOMAncestorChain?, upTo: Int, memo: inout ChainMemo?
+    ) -> Bool {
+        if memo == nil { memo = ChainMemo() }
+        let key = ChainMemo.Key(index: index, node: ObjectIdentifier(node))
+        if memo.unsafelyUnwrapped.failed.contains(key) { return false }
+        if matchesChain(selector, index, node: node, context: context, chain: chain, upTo: upTo, memo: &memo) { return true }
+        memo.unsafelyUnwrapped.failed.insert(key)
+        return false
     }
 
     /// The rest of `matchesChain` once `parts[index]` matched `node`: find the
     /// element the combinator before it points at.
     private static func matchesCombinator(
-        _ parts: [CSSComplexSelector.Part],
-        _ index: Int,
-        node: DOMNode,
-        context: CSSMatchContext
+        _ selector: CSSComplexSelector, _ index: Int, node: DOMNode,
+        context: CSSMatchContext, chain: DOMAncestorChain?, upTo: Int, memo: inout ChainMemo?
     ) -> Bool {
+        let parts = selector.parts
         switch parts[index].combinator ?? .descendant {
         case .child:
-            guard let parent = selectorParent(of: node, context: context) else { return false }
-            return matchesChain(parts, index - 1, node: parent, context: context)
+            let (parent, parentUp) = parentStep(node, context, chain, upTo)
+            guard let parent else { return false }
+            return matchesChain(selector, index - 1, node: parent, context: context, chain: chain, upTo: parentUp, memo: &memo)
         case .descendant:
-            var cursor = selectorParent(of: node, context: context)
+            var (cursor, cursorUp) = parentStep(node, context, chain, upTo)
+            if selector.pureDescendantPrefix[index] {
+                // Greedy: the nearest ancestor matching the compound decides.
+                let target = parts[index - 1].selector
+                while let ancestor = cursor {
+                    if matchesCompound(target, node: ancestor, context: context) {
+                        if index - 1 == 0 { return true }
+                        return matchesCombinator(selector, index - 1, node: ancestor, context: context,
+                                                 chain: chain, upTo: cursorUp, memo: &memo)
+                    }
+                    (cursor, cursorUp) = parentStep(ancestor, context, chain, cursorUp)
+                }
+                return false
+            }
             while let ancestor = cursor {
-                if matchesChain(parts, index - 1, node: ancestor, context: context) { return true }
-                cursor = selectorParent(of: ancestor, context: context)
+                if matchesChainMemoised(selector, index - 1, node: ancestor, context: context,
+                                        chain: chain, upTo: cursorUp, memo: &memo) { return true }
+                (cursor, cursorUp) = parentStep(ancestor, context, chain, cursorUp)
             }
             return false
         case .adjacentSibling:
             guard let sibling = previousElementSibling(of: node) else { return false }
-            return matchesChain(parts, index - 1, node: sibling, context: context)
+            return matchesChain(selector, index - 1, node: sibling, context: context, chain: chain, upTo: upTo, memo: &memo)
         case .generalSibling:
             var cursor = previousElementSibling(of: node)
             while let sibling = cursor {
-                if matchesChain(parts, index - 1, node: sibling, context: context) { return true }
+                if matchesChainMemoised(selector, index - 1, node: sibling, context: context,
+                                        chain: chain, upTo: upTo, memo: &memo) { return true }
                 cursor = previousElementSibling(of: sibling)
             }
             return false
@@ -715,6 +845,7 @@ public struct CSSSelectorMatcher: Sendable {
 
         var innerContext = context
         innerContext.scope = anchor
+        innerContext.ancestorChain = nil
         var result = false
 
         for anchored in has.anchored {
@@ -780,24 +911,13 @@ public struct CSSSelectorMatcher: Sendable {
 
     /// Returns the 0-based index of this element among its element siblings.
     private static func elementIndex(of node: DOMNode) -> Int {
-        guard let parent = node.parent else { return 0 }
-        var index = 0
-        for child in parent.children {
-            if child === node { return index }
-            if child.nodeType == .element { index += 1 }
-        }
-        return 0
+        node.siblingPosition()?.elementIndex ?? 0
     }
 
     /// Returns the 0-based index of this element counting from the end among element siblings.
     private static func elementIndexFromEnd(of node: DOMNode) -> Int {
-        guard let parent = node.parent else { return 0 }
-        var index = 0
-        for child in parent.children.reversed() {
-            if child === node { return index }
-            if child.nodeType == .element { index += 1 }
-        }
-        return 0
+        guard let position = node.siblingPosition() else { return 0 }
+        return position.elementCount - 1 - position.elementIndex
     }
 
     /// Returns the 0-based index of this element among siblings of the same tag name.
@@ -824,11 +944,8 @@ public struct CSSSelectorMatcher: Sendable {
 
     /// Whether the node is the last element child of its parent.
     private static func isLastElement(_ node: DOMNode) -> Bool {
-        guard let parent = node.parent else { return true }
-        for child in parent.children.reversed() {
-            if child.nodeType == .element { return child === node }
-        }
-        return false
+        guard let position = node.siblingPosition() else { return true }
+        return position.elementIndex == position.elementCount - 1
     }
 
     /// Whether the node is the last element child of its type in its parent.
@@ -1183,31 +1300,11 @@ public struct CSSSelectorMatcher: Sendable {
     // MARK: - Sibling Helpers
 
     static func previousElementSibling(of node: DOMNode) -> DOMNode? {
-        guard let parent = node.parent else { return nil }
-        let siblings = parent.children
-        guard let idx = siblings.firstIndex(where: { $0 === node }), idx > 0 else { return nil }
-        var scan = idx - 1
-        while scan >= 0 {
-            let candidate = siblings[scan]
-            if candidate.nodeType == .element {
-                return candidate
-            }
-            if scan == 0 { break }
-            scan -= 1
-        }
-        return nil
+        node.elementSibling(forward: false)
     }
 
     static func nextElementSibling(of node: DOMNode) -> DOMNode? {
-        guard let parent = node.parent else { return nil }
-        let siblings = parent.children
-        guard let idx = siblings.firstIndex(where: { $0 === node }) else { return nil }
-        var scan = idx + 1
-        while scan < siblings.count {
-            if siblings[scan].nodeType == .element { return siblings[scan] }
-            scan += 1
-        }
-        return nil
+        node.elementSibling(forward: true)
     }
 
     // MARK: - Attribute Matching
@@ -1286,6 +1383,7 @@ public struct CSSSelectorParser: Sendable {
 
     /// Clear the selector cache. Call on page teardown to free memory.
     public static func clearCache() {
+        CSSQueryPlan.clearCache()
         cacheLock.lock()
         selectorCache.removeAll()
         cacheLock.unlock()
@@ -2190,5 +2288,153 @@ public enum CSSSelector {
         default:
             return true
         }
+    }
+}
+
+// MARK: - Query plans (querySelector / querySelectorAll)
+
+/// A parsed selector list prepared for scanning a subtree: pseudo-element
+/// selectors dropped, and for lists of `bucketThreshold` or more selectors an
+/// index of the selectors by the identifier their *rightmost compound*
+/// requires (id, class, attribute name or tag; WebKit's RuleSet buckets).
+/// An element then tests only the selectors whose bucket key it carries, plus
+/// the selectors with no usable key, instead of every selector in the list.
+///
+/// Keyed by the selector string (like the parse cache), never by DOM state,
+/// so a plan stays valid across mutations; the plan cache is bounded.
+final class CSSQueryPlan: @unchecked Sendable {
+    static let bucketThreshold = 4
+
+    let selectors: [CSSComplexSelector]
+    private let byID: [String: [Int]]
+    private let byClass: [String: [Int]]
+    private let byTag: [String: [Int]]
+    private let byAttribute: [String: [Int]]
+    private let unkeyed: [Int]
+    private let bucketed: Bool
+    /// Per selector: identifier hashes (tag, id, class, attribute name) that
+    /// must occur on an ancestor of any element it matches. A bare-tag subject
+    /// such as `[data-x] ... a` lands in a big tag bucket; these let a bucket
+    /// entry be rejected with a few counter reads on the scan's ancestor
+    /// chain (`DOMAncestorChain`) before the matcher is called.
+    /// Whether a plan wants the chain's filter maintained.
+    var wantsAncestorFilter: Bool { bucketed }
+    private let ancestorKeys: [[UInt32]]
+
+    private init?(list: CSSSelectorList) {
+        let candidates = list.selectors.filter { $0.pseudoElement == nil }
+        guard !candidates.isEmpty else { return nil }
+        selectors = candidates
+        ancestorKeys = candidates.map { sel in
+            var keys: [UInt32] = []
+            var index = sel.parts.count - 1
+            while index > 0 {
+                let combinator = sel.parts[index].combinator ?? .descendant
+                index -= 1
+                guard combinator == .descendant || combinator == .child else { continue }
+                let compound = sel.parts[index].selector
+                keys.append(contentsOf: compound.ancestorKeyHashes)
+                for component in compound.components {
+                    if case .attribute(let name, _, _, _) = component {
+                        keys.append(DOMSelectorKeyHash.attributeNameHash(name))
+                    }
+                }
+            }
+            return keys
+        }
+        guard candidates.count >= Self.bucketThreshold else {
+            bucketed = false
+            byID = [:]; byClass = [:]; byTag = [:]; byAttribute = [:]; unkeyed = []
+            return
+        }
+        bucketed = true
+        var ids: [String: [Int]] = [:], classes: [String: [Int]] = [:]
+        var tags: [String: [Int]] = [:], attrs: [String: [Int]] = [:], loose: [Int] = []
+        for (i, sel) in candidates.enumerated() {
+            guard let subject = sel.parts.last?.selector else { loose.append(i); continue }
+            var id: String?, cls: String?, tag: String?, attr: String?
+            for component in subject.components {
+                switch component {
+                case .id(let v): if id == nil { id = v }
+                case .className(let v): if cls == nil { cls = v }
+                case .element(let v): if tag == nil { tag = v }
+                case .attribute(let name, _, _, _): if attr == nil { attr = name.lowercased() }
+                default: break
+                }
+            }
+            if let id { ids[id, default: []].append(i) }
+            else if let cls { classes[cls, default: []].append(i) }
+            else if let attr { attrs[attr, default: []].append(i) }
+            else if let tag { tags[tag, default: []].append(i) }
+            else { loose.append(i) }
+        }
+        byID = ids; byClass = classes; byTag = tags; byAttribute = attrs; unkeyed = loose
+    }
+
+    /// True when any selector of the list matches `node`.
+    func matches(_ node: DOMNode, context: CSSMatchContext) -> Bool {
+        guard bucketed else {
+            for sel in selectors where CSSSelectorMatcher.matches(sel, node: node, context: context) { return true }
+            return false
+        }
+        let chain = context.ancestorChain.flatMap { $0.subject === node && $0.tracksFilter ? $0 : nil }
+        func test(_ indices: [Int]) -> Bool {
+            for i in indices {
+                if let chain {
+                    var rejected = false
+                    for key in ancestorKeys[i] where !chain.mayContain(key) { rejected = true; break }
+                    if rejected { continue }
+                }
+                if CSSSelectorMatcher.matches(selectors[i], node: node, context: context) { return true }
+            }
+            return false
+        }
+        if !unkeyed.isEmpty, test(unkeyed) { return true }
+        if let tag = node.lowercasedTagName, let hit = byTag[tag], test(hit) { return true }
+        if !byID.isEmpty, let id = node.idAttribute, let hit = byID[id], test(hit) { return true }
+        if !byClass.isEmpty {
+            for cls in node.classNames { if let hit = byClass[cls], test(hit) { return true } }
+        }
+        if !byAttribute.isEmpty {
+            for key in node.attributes.keys { if let hit = byAttribute[key], test(hit) { return true } }
+        }
+        return false
+    }
+
+    // MARK: Cache (bounded, approximate LRU)
+
+    private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var cache: [String: (plan: CSSQueryPlan?, used: UInt64)] = [:]
+    nonisolated(unsafe) private static var clock: UInt64 = 0
+    private static let capacity = 128
+
+    /// The plan for `selector` (nil when it parses to nothing usable).
+    static func plan(for selector: String) -> CSSQueryPlan? {
+        cacheLock.lock()
+        clock += 1
+        if var hit = cache[selector] {
+            hit.used = clock
+            cache[selector] = hit
+            cacheLock.unlock()
+            return hit.plan
+        }
+        cacheLock.unlock()
+        let built = CSSQueryPlan(list: CSSSelectorParser.parse(selector))
+        cacheLock.lock()
+        if cache.count >= capacity {
+            // Drop the least recently used quarter.
+            let victims = cache.sorted { $0.value.used < $1.value.used }.prefix(capacity / 4).map(\.key)
+            for key in victims { cache.removeValue(forKey: key) }
+        }
+        clock += 1
+        cache[selector] = (built, clock)
+        cacheLock.unlock()
+        return built
+    }
+
+    static func clearCache() {
+        cacheLock.lock()
+        cache.removeAll()
+        cacheLock.unlock()
     }
 }
