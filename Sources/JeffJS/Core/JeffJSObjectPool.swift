@@ -208,11 +208,13 @@ extension JeffJSRuntime {
     /// Release the Swift references the pooled objects still carry (their
     /// original makeObject retain). Called from free().
     func drainObjectPool() {
-        for o in objectPool { Unmanaged.passUnretained(o).release() }
+        // The pools are unretained: each entry rides the Swift retain of its
+        // original makeObject, released here.
+        objectPool.forEachUnretained { $0.release() }
         objectPool.removeAll()
-        for o in arrayPool { Unmanaged.passUnretained(o).release() }
+        arrayPool.forEachUnretained { $0.release() }
         arrayPool.removeAll()
-        for o in functionPool { Unmanaged.passUnretained(o).release() }
+        functionPool.forEachUnretained { $0.release() }
         functionPool.removeAll()
         arrayStoragePool.removeAll()
         varRefPool.removeAll()   // parked var-refs hold the runtime (ownerRuntime)

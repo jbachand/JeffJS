@@ -421,19 +421,19 @@ nonisolated final class JeffJSRuntime {
     /// Recent regex inputs' code units and patterns' group names (see
     /// JeffJSRegexCaches; were fields on every string).
     let regexCaches = JeffJSRegexCaches()
-    var objectPool: [JeffJSObject] = []
+    var objectPool = JeffJSRawStack<JeffJSObject>(retaining: false)
     /// Parked bytecode-function objects with their side boxes
     /// (jeffJS_recycleFunction); createClosure pops from it.
-    var functionPool: [JeffJSObject] = []
+    var functionPool = JeffJSRawStack<JeffJSObject>(retaining: false)
     /// interp.recycleVarRefs: live var-refs no closure held any more when
     /// their frame went away (jeffJS_detachFrameVarRefs); createClosure
     /// reuses them.
-    var varRefPool: [JeffJSVarRef] = []
+    var varRefPool = JeffJSRawStack<JeffJSVarRef>(retaining: true)
     /// Recycled arrays (JeffJSObjectPool.swift): empty, `length` 0, no
     /// element storage, off the GC list.
-    var arrayPool: [JeffJSObject] = []
+    var arrayPool = JeffJSRawStack<JeffJSObject>(retaining: false)
     /// Element stores taken from recycled arrays: empty, capacity kept.
-    var arrayStoragePool: [JeffJSFastArrayStorage] = []
+    var arrayStoragePool = JeffJSRawStack<JeffJSFastArrayStorage>(retaining: true)
     /// Spare argument array for native calls from the trace interpreter
     /// (`jeffJS_nativeCallFromSlots`): empty, capacity kept.
     var spareNativeArgs: [JeffJSValue] = []
@@ -810,7 +810,7 @@ nonisolated final class JeffJSRuntime {
     /// (`freeGCObjectChildren`, `jeffJS_recycleObject`, `clearGCState`).
     var gcObjects: ContiguousArray<Unmanaged<JeffJSGCObjectHeader>> = []
     /// Objects whose refcount hit zero during a GC cycle (deferred free).
-    var gcZeroRefCountObjects: [JeffJSGCObjectHeader] = []
+    var gcZeroRefCountObjects = JeffJSRawStack<JeffJSGCObjectHeader>(retaining: true)
     /// Temporary list used during GC cycle detection (phase 3). Unretained
     /// for the same reason as `gcObjects`.
     var gcTmpObjects: ContiguousArray<Unmanaged<JeffJSGCObjectHeader>> = []
@@ -1293,9 +1293,9 @@ nonisolated final class JeffJSRuntime {
     private func takeLiveInitObjects() -> [JeffJSGCObjectHeader] {
         guard !initObjects.isEmpty else { return [] }
         var parked = Set<ObjectIdentifier>()
-        for o in objectPool { parked.insert(ObjectIdentifier(o)) }
-        for o in arrayPool { parked.insert(ObjectIdentifier(o)) }
-        for o in functionPool { parked.insert(ObjectIdentifier(o)) }
+        objectPool.forEachUnretained { parked.insert(ObjectIdentifier($0.takeUnretainedValue())) }
+        arrayPool.forEachUnretained { parked.insert(ObjectIdentifier($0.takeUnretainedValue())) }
+        functionPool.forEachUnretained { parked.insert(ObjectIdentifier($0.takeUnretainedValue())) }
         var out: [JeffJSGCObjectHeader] = []
         out.reserveCapacity(initObjects.count)
         for u in initObjects {
