@@ -3028,8 +3028,11 @@ func jeffJS_isFastArray(_ o: JeffJSObject) -> Bool {
 /// Mirrors `find_own_property` in QuickJS.
 @inline(__always)
 func jeffJS_findOwnPropertyIndex(obj: JeffJSObject, atom: UInt32) -> Int {
-    guard let shape = obj.shape else { return -1 }
-    guard let idx = findShapeProperty(shape, atom) else {
+    // The shape is read through its raw bits and a guaranteed reference: `guard let shape = obj.shape`
+    // retained and released it on every property lookup.
+    guard let sp = obj.shapeIdentity else { return -1 }
+    let shapeU = Unmanaged<JeffJSShape>.fromOpaque(sp)
+    guard let idx = shapeU._withUnsafeGuaranteedRef({ findShapeProperty($0, atom) }) else {
         // Safety net for paths that look up own properties without a
         // chokepoint: a lazy payload stub builds its top level, then retries.
         if (obj.lazyFlags & JeffJSObject.lazyPayloadBit) != 0 { return jeffJS_findOwnPropertyIndexLazy(obj, atom) }
@@ -3038,7 +3041,8 @@ func jeffJS_findOwnPropertyIndex(obj: JeffJSObject, atom: UInt32) -> Int {
     // Soft-recover shape/prop desync: pad missing value slots so the caller
     // can index obj.propValues[idx] directly.
     if idx >= obj.propValues.count {
-        while obj.propValues.count < shape.prop.count {
+        let want = shapeU._withUnsafeGuaranteedRef { $0.prop.count }
+        while obj.propValues.count < want {
             obj.appendDataValue(.undefined)
         }
     }

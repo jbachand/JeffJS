@@ -327,14 +327,21 @@ func typedArrayCoerceElement(_ ctx: JeffJSContext, _ info: TypedArrayElementInfo
 }
 
 private func validateTypedArray(_ thisVal: JeffJSValue) -> (JeffJSTypedArray, JeffJSArrayBuffer)? {
-    guard let obj = thisVal.toObject() else { return nil }
-    if case .typedArray(let ta) = obj.payload {
-        if let bufObj = ta.buffer, case .arrayBuffer(let ab) = bufObj.payload {
-            if ab.detached { return nil }
-            return (ta, ab)
+    guard let obj = thisVal.obj else { return nil }
+    // Unretained mirrors (JeffJSObjectAux.taU, JeffJSTypedArray.abU): no payload-enum copies.
+    guard let (ta, ab) = obj._with({ o -> (JeffJSTypedArray, JeffJSArrayBuffer)? in
+        guard let au = o._auxU, let tu = au._withUnsafeGuaranteedRef({ $0.taU }) else { return nil }
+        let t = tu.takeUnretainedValue()
+        guard let abu = t.abU else { return nil }
+        return (t, abu.takeUnretainedValue())
+    }) else {
+        guard let o = thisVal.toObject() else { return nil }
+        if case .typedArray(let ta) = o.payload, let bufObj = ta.buffer, case .arrayBuffer(let ab) = bufObj.payload {
+            return ab.detached ? nil : (ta, ab)
         }
+        return nil
     }
-    return nil
+    return ab.detached ? nil : (ta, ab)
 }
 
 // MARK: - ArrayBuffer Constructor

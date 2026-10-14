@@ -5466,8 +5466,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // Check own properties via shape-based lookup (index form avoids
         // copying JeffJSProperty enums across the call boundary).
         let ownIdx = jeffJS_findOwnPropertyIndex(obj: jsObj, atom: atom)
-        if ownIdx >= 0, let ownShape = jsObj.shape, ownIdx < jsObj.propValues.count {
-            if let e = jsObj.extraStrong(at: ownIdx) {
+        if ownIdx >= 0, jsObj.shapeIdentity != nil, ownIdx < jsObj.propValues.count {
+            if jsObj.extra(at: ownIdx) != nil, let e = jsObj.extraStrong(at: ownIdx) {
                 // Accessor property — call the getter
                 if e.kind == .getset, let getterObj = e.getter {
                     // The slot's reference is borrowed: a getter that
@@ -5484,7 +5484,6 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 }
                 return .JS_UNDEFINED
             }
-            _ = ownShape
             return jsObj.propValues[ownIdx].dupValue()
         }
 
@@ -5533,8 +5532,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 let pIdx = jeffJS_findOwnPropertyIndex(obj: p, atom: atom)
                 if pIdx < 0 {
                     if isProxyObject(p) { return proxyOnChainGet(p, atom: atom, receiver: receiver) }
-                } else if p.shape != nil, pIdx < p.propValues.count {
-                    if let e = p.extraStrong(at: pIdx) {
+                } else if p.shapeIdentity != nil, pIdx < p.propValues.count {
+                    if p.extra(at: pIdx) != nil, let e = p.extraStrong(at: pIdx) {
                         if e.kind == .getset, let getterObj = e.getter {
                             let getterVal = JeffJSValue.borrowedObject(getterObj)
                             return callRetainingFunction(getterVal, this: receiver, args: [])
