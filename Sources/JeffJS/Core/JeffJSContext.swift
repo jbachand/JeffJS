@@ -68,7 +68,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// holds a reference to this context (e.g. polyfill loading on DispatchQueue.global).
     /// The retain cycle (runtime → contextList → ... and context → rt) is broken
     /// explicitly by free() and teardown().
-    var rt: JeffJSRuntime
+    let rt: JeffJSRuntime
 
     /// A TypeError waiting for the source text of the instruction that raised
     /// it (JSC's source appender, see JeffJSErrorText.swift).
