@@ -29,7 +29,7 @@ final class JeffJSStorageBridge {
     // MARK: - Shared state
 
     /// The persistent store new bridges use (the host replaces it at startup).
-    static var defaultStore: any JeffJSWebStorageStore = JeffJSMemoryWebStorage()
+    nonisolated(unsafe) static var defaultStore: any JeffJSWebStorageStore = JeffJSMemoryWebStorage()
     /// sessionStorage areas, keyed by `<browsing context> <origin>`. They live
     /// for the process (a relaunch starts a new session, like a new tab).
     nonisolated static let sessionStore = JeffJSMemoryWebStorage(quotaBytes: JeffJSConfig.storageSessionQuotaBytes)
