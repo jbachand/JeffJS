@@ -80,7 +80,7 @@ nonisolated public struct JeffJSNetworkLogEntry: Sendable {
 
 /// A fetch failure with a DOM-style `name` so JS can build the right error
 /// object (`TypeError`, `AbortError`, ...).
-struct JeffJSFetchFailure: LocalizedError {
+nonisolated struct JeffJSFetchFailure: LocalizedError {
     let name: String
     let message: String
     var errorDescription: String? { message }
@@ -90,7 +90,7 @@ struct JeffJSFetchFailure: LocalizedError {
 
 /// A fully resolved request, built on the main actor from JS values so the
 /// networking half never touches the JS heap.
-struct JeffJSFetchSpec {
+nonisolated struct JeffJSFetchSpec {
     var urlString: String
     var method: String = "GET"
     var headers: [(name: String, value: String)] = []
@@ -109,7 +109,7 @@ struct JeffJSFetchSpec {
 }
 
 /// The network result, before it is turned into JS values.
-struct JeffJSFetchResult {
+nonisolated struct JeffJSFetchResult {
     var status: Int
     var statusText: String
     var url: String
@@ -125,7 +125,7 @@ struct JeffJSFetchResult {
 
 /// Implements `redirect: follow | manual | error` and records whether any
 /// redirect happened so the response can report `redirected` / final `url`.
-final class JeffJSRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+nonisolated final class JeffJSRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     let mode: String
     private(set) var didRedirect = false
     private(set) var blockedRedirect: HTTPURLResponse?

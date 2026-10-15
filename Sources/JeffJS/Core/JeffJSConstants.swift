@@ -7,168 +7,168 @@ import Foundation
 
 // MARK: - Optimization Flags
 
-let JEFFJS_OPTIMIZE = JeffJSConfig.optimizeEnabled
+nonisolated(unsafe) let JEFFJS_OPTIMIZE = JeffJSConfig.optimizeEnabled
 let JEFFJS_SHORT_OPCODES = JeffJSConfig.shortOpcodes
 
 // MARK: - Limits
 
-let JS_MAX_LOCAL_VARS: Int = JeffJSConfig.maxLocalVars
+nonisolated(unsafe) let JS_MAX_LOCAL_VARS: Int = JeffJSConfig.maxLocalVars
 let JS_STACK_SIZE_MAX: Int = JeffJSConfig.maxStackSize
-let JS_STRING_LEN_MAX: Int = (1 << 30) - 1
+nonisolated(unsafe) let JS_STRING_LEN_MAX: Int = (1 << 30) - 1
 let JS_DEFAULT_STACK_SIZE: Int = JeffJSConfig.defaultStackSize
 
 // MARK: - Rope Thresholds
 
-let JS_STRING_ROPE_SHORT_LEN: Int = JeffJSConfig.ropeShortLen
+nonisolated(unsafe) let JS_STRING_ROPE_SHORT_LEN: Int = JeffJSConfig.ropeShortLen
 let JS_STRING_ROPE_SHORT2_LEN: Int = JeffJSConfig.ropeShort2Len
-let JS_STRING_ROPE_MAX_DEPTH: Int = JeffJSConfig.ropeMaxDepth
+nonisolated(unsafe) let JS_STRING_ROPE_MAX_DEPTH: Int = JeffJSConfig.ropeMaxDepth
 let ROPE_N_BUCKETS: Int = 44
 
 // MARK: - JS Modes
 
-let JS_MODE_STRICT: Int = 1 << 0
+nonisolated(unsafe) let JS_MODE_STRICT: Int = 1 << 0
 let JS_MODE_ASYNC: Int = 1 << 2
-let JS_MODE_BACKTRACE_BARRIER: Int = 1 << 3
+nonisolated(unsafe) let JS_MODE_BACKTRACE_BARRIER: Int = 1 << 3
 
 // MARK: - Property Flags
 
-let JS_PROP_CONFIGURABLE: Int = 1 << 0
+nonisolated(unsafe) let JS_PROP_CONFIGURABLE: Int = 1 << 0
 let JS_PROP_WRITABLE: Int = 1 << 1
-let JS_PROP_ENUMERABLE: Int = 1 << 2
+nonisolated(unsafe) let JS_PROP_ENUMERABLE: Int = 1 << 2
 let JS_PROP_C_W_E: Int = (1 << 0) | (1 << 1) | (1 << 2)
-let JS_PROP_LENGTH: Int = 1 << 3
+nonisolated(unsafe) let JS_PROP_LENGTH: Int = 1 << 3
 let JS_PROP_TMASK: Int = 3 << 4
-let JS_PROP_NORMAL: Int = 0 << 4
+nonisolated(unsafe) let JS_PROP_NORMAL: Int = 0 << 4
 let JS_PROP_GETSET: Int = 1 << 4
-let JS_PROP_VARREF: Int = 2 << 4
+nonisolated(unsafe) let JS_PROP_VARREF: Int = 2 << 4
 let JS_PROP_AUTOINIT: Int = 3 << 4
-let JS_PROP_HAS_SHIFT: Int = 8
+nonisolated(unsafe) let JS_PROP_HAS_SHIFT: Int = 8
 let JS_PROP_HAS_CONFIGURABLE: Int = 1 << 8
-let JS_PROP_HAS_WRITABLE: Int = 1 << 9
+nonisolated(unsafe) let JS_PROP_HAS_WRITABLE: Int = 1 << 9
 let JS_PROP_HAS_ENUMERABLE: Int = 1 << 10
-let JS_PROP_HAS_GET: Int = 1 << 11
+nonisolated(unsafe) let JS_PROP_HAS_GET: Int = 1 << 11
 let JS_PROP_HAS_SET: Int = 1 << 12
-let JS_PROP_HAS_VALUE: Int = 1 << 13
+nonisolated(unsafe) let JS_PROP_HAS_VALUE: Int = 1 << 13
 let JS_PROP_THROW: Int = 1 << 14
-let JS_PROP_THROW_STRICT: Int = 1 << 15
+nonisolated(unsafe) let JS_PROP_THROW_STRICT: Int = 1 << 15
 let JS_PROP_NO_EXOTIC: Int = 1 << 16
-let JS_PROP_INITIAL_SIZE: Int = 2
+nonisolated(unsafe) let JS_PROP_INITIAL_SIZE: Int = 2
 let JS_PROP_INITIAL_HASH_SIZE: Int = 4
-let JS_PROP_NO_ADD: Int = 1 << 17
+nonisolated(unsafe) let JS_PROP_NO_ADD: Int = 1 << 17
 let JS_PROP_DEFINE_PROPERTY: Int = 1 << 18
 
 // MARK: - Atom Constants
 
-let JS_ATOM_NULL: UInt32 = 0
+nonisolated(unsafe) let JS_ATOM_NULL: UInt32 = 0
 let JS_ATOM_HASH_MASK: UInt32 = (1 << 30) - 1
-let JS_ATOM_HASH_PRIVATE: UInt32 = (1 << 30) - 1
+nonisolated(unsafe) let JS_ATOM_HASH_PRIVATE: UInt32 = (1 << 30) - 1
 let JS_ATOM_TAG_INT: UInt32 = 1 << 31
-let JS_ATOM_MAX_INT: UInt32 = (1 << 31) - 1
+nonisolated(unsafe) let JS_ATOM_MAX_INT: UInt32 = (1 << 31) - 1
 let JS_ATOM_MAX: UInt32 = (1 << 30) - 1
 
 // MARK: - Eval Flags
 
-let JS_EVAL_TYPE_GLOBAL: Int = 0 << 0
+nonisolated(unsafe) let JS_EVAL_TYPE_GLOBAL: Int = 0 << 0
 let JS_EVAL_TYPE_MODULE: Int = 1 << 0
-let JS_EVAL_TYPE_DIRECT: Int = 2 << 0
+nonisolated(unsafe) let JS_EVAL_TYPE_DIRECT: Int = 2 << 0
 let JS_EVAL_TYPE_INDIRECT: Int = 3 << 0
-let JS_EVAL_TYPE_MASK: Int = 3 << 0
+nonisolated(unsafe) let JS_EVAL_TYPE_MASK: Int = 3 << 0
 let JS_EVAL_FLAG_STRICT: Int = 1 << 3
-let JS_EVAL_FLAG_COMPILE_ONLY: Int = 1 << 5
+nonisolated(unsafe) let JS_EVAL_FLAG_COMPILE_ONLY: Int = 1 << 5
 let JS_EVAL_FLAG_BACKTRACE_BARRIER: Int = 1 << 6
-let JS_EVAL_FLAG_ASYNC: Int = 1 << 7
+nonisolated(unsafe) let JS_EVAL_FLAG_ASYNC: Int = 1 << 7
 
 // MARK: - Type Conversion Hints
 
-let HINT_STRING: Int = 0
+nonisolated(unsafe) let HINT_STRING: Int = 0
 let HINT_NUMBER: Int = 1
-let HINT_NONE: Int = 2
+nonisolated(unsafe) let HINT_NONE: Int = 2
 let HINT_FORCE_ORDINARY: Int = 1 << 4
 
 // MARK: - PC2Line Encoding
 
-let PC2LINE_BASE: Int = -1
+nonisolated(unsafe) let PC2LINE_BASE: Int = -1
 let PC2LINE_RANGE: Int = 5
-let PC2LINE_OP_FIRST: Int = 1
+nonisolated(unsafe) let PC2LINE_OP_FIRST: Int = 1
 
 // MARK: - Call Flags
 
-let JS_CALL_FLAG_CONSTRUCTOR: Int = 1 << 0
+nonisolated(unsafe) let JS_CALL_FLAG_CONSTRUCTOR: Int = 1 << 0
 let JS_CALL_FLAG_COPY_ARGV: Int = 1 << 1
-let JS_CALL_FLAG_GENERATOR: Int = 1 << 2
+nonisolated(unsafe) let JS_CALL_FLAG_GENERATOR: Int = 1 << 2
 
 // MARK: - GetPropertyNames (GPN) Flags
 
-let JS_GPN_STRING_MASK: Int = 1 << 0
+nonisolated(unsafe) let JS_GPN_STRING_MASK: Int = 1 << 0
 let JS_GPN_SYMBOL_MASK: Int = 1 << 1
-let JS_GPN_PRIVATE_MASK: Int = 1 << 2
+nonisolated(unsafe) let JS_GPN_PRIVATE_MASK: Int = 1 << 2
 let JS_GPN_ENUM_ONLY: Int = 1 << 4
-let JS_GPN_SET_ENUM: Int = 1 << 5
+nonisolated(unsafe) let JS_GPN_SET_ENUM: Int = 1 << 5
 
 // MARK: - Interrupt Counter
 
-let JS_INTERRUPT_COUNTER_INIT: Int = JeffJSConfig.interruptCounterInit
+nonisolated(unsafe) let JS_INTERRUPT_COUNTER_INIT: Int = JeffJSConfig.interruptCounterInit
 
 // MARK: - Backtrace Flags
 
-let JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL: Int = 1 << 0
+nonisolated(unsafe) let JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL: Int = 1 << 0
 
 // MARK: - Strip Flags
 
-let JS_STRIP_SOURCE: UInt8 = 1 << 0
+nonisolated(unsafe) let JS_STRIP_SOURCE: UInt8 = 1 << 0
 let JS_STRIP_DEBUG: UInt8 = 1 << 1
 
 // MARK: - BigInt / Limb (64-bit platform)
 
 typealias JSLimb = UInt64
 typealias JSSignedLimb = Int64
-let JS_LIMB_BITS: Int = 64
+nonisolated(unsafe) let JS_LIMB_BITS: Int = 64
 let JS_LIMB_DIGITS: Int = 19
-let JS_SHORT_BIG_INT_BITS: Int = 64
+nonisolated(unsafe) let JS_SHORT_BIG_INT_BITS: Int = 64
 
 // MARK: - Miscellaneous Constants
 
-let JS_MAX_SAFE_INTEGER: Int64 = (1 << 53) - 1
+nonisolated(unsafe) let JS_MAX_SAFE_INTEGER: Int64 = (1 << 53) - 1
 let JS_MIN_SAFE_INTEGER: Int64 = -((1 << 53) - 1)
 
-let JS_WRITE_OBJ_BYTECODE: Int = 1 << 0
+nonisolated(unsafe) let JS_WRITE_OBJ_BYTECODE: Int = 1 << 0
 let JS_WRITE_OBJ_BSWAP: Int = 1 << 1
-let JS_WRITE_OBJ_SAB: Int = 1 << 2
+nonisolated(unsafe) let JS_WRITE_OBJ_SAB: Int = 1 << 2
 let JS_WRITE_OBJ_REFERENCE: Int = 1 << 3
-let JS_WRITE_OBJ_STRIP_SOURCE: Int = 1 << 4
+nonisolated(unsafe) let JS_WRITE_OBJ_STRIP_SOURCE: Int = 1 << 4
 let JS_WRITE_OBJ_STRIP_DEBUG: Int = 1 << 5
 
-let JS_READ_OBJ_BYTECODE: Int = 1 << 0
+nonisolated(unsafe) let JS_READ_OBJ_BYTECODE: Int = 1 << 0
 let JS_READ_OBJ_ROM_DATA: Int = 1 << 1
-let JS_READ_OBJ_SAB: Int = 1 << 2
+nonisolated(unsafe) let JS_READ_OBJ_SAB: Int = 1 << 2
 let JS_READ_OBJ_REFERENCE: Int = 1 << 3
 
-let JS_DEF_CFUNC: Int = 0
+nonisolated(unsafe) let JS_DEF_CFUNC: Int = 0
 let JS_DEF_CGETSET: Int = 1
-let JS_DEF_CGETSET_MAGIC: Int = 2
+nonisolated(unsafe) let JS_DEF_CGETSET_MAGIC: Int = 2
 let JS_DEF_PROP_STRING: Int = 3
-let JS_DEF_PROP_INT32: Int = 4
+nonisolated(unsafe) let JS_DEF_PROP_INT32: Int = 4
 let JS_DEF_PROP_INT64: Int = 5
-let JS_DEF_PROP_DOUBLE: Int = 6
+nonisolated(unsafe) let JS_DEF_PROP_DOUBLE: Int = 6
 let JS_DEF_PROP_UNDEFINED: Int = 7
-let JS_DEF_OBJECT: Int = 8
+nonisolated(unsafe) let JS_DEF_OBJECT: Int = 8
 let JS_DEF_ALIAS: Int = 9
 
-let JS_CFUNC_GENERIC: Int = 0
+nonisolated(unsafe) let JS_CFUNC_GENERIC: Int = 0
 let JS_CFUNC_GENERIC_MAGIC: Int = 1
-let JS_CFUNC_CONSTRUCTOR: Int = 2
+nonisolated(unsafe) let JS_CFUNC_CONSTRUCTOR: Int = 2
 let JS_CFUNC_CONSTRUCTOR_MAGIC: Int = 3
-let JS_CFUNC_CONSTRUCTOR_OR_FUNC: Int = 4
+nonisolated(unsafe) let JS_CFUNC_CONSTRUCTOR_OR_FUNC: Int = 4
 let JS_CFUNC_CONSTRUCTOR_OR_FUNC_MAGIC: Int = 5
-let JS_CFUNC_F_F: Int = 6
+nonisolated(unsafe) let JS_CFUNC_F_F: Int = 6
 let JS_CFUNC_F_F_F: Int = 7
-let JS_CFUNC_GETTER: Int = 8
+nonisolated(unsafe) let JS_CFUNC_GETTER: Int = 8
 let JS_CFUNC_SETTER: Int = 9
-let JS_CFUNC_GETTER_MAGIC: Int = 10
+nonisolated(unsafe) let JS_CFUNC_GETTER_MAGIC: Int = 10
 let JS_CFUNC_SETTER_MAGIC: Int = 11
-let JS_CFUNC_ITERATOR_NEXT: Int = 12
+nonisolated(unsafe) let JS_CFUNC_ITERATOR_NEXT: Int = 12
 
-let JS_PARSE_JSON_EXT: Int = 1 << 0
+nonisolated(unsafe) let JS_PARSE_JSON_EXT: Int = 1 << 0
 
 // NOTE: JSValueTag is now defined in JeffJSValue.swift.
 // The duplicate definition that was here has been removed.
@@ -176,7 +176,7 @@ let JS_PARSE_JSON_EXT: Int = 1 << 0
 // MARK: - JSClassID
 
 /// Built-in class IDs matching QuickJS JS_CLASS_* values exactly.
-enum JSClassID: Int {
+nonisolated enum JSClassID: Int {
     case JS_CLASS_OBJECT = 1
     case JS_CLASS_ARRAY = 2
     case JS_CLASS_ERROR = 3
@@ -242,14 +242,14 @@ enum JSClassID: Int {
 }
 
 /// First and last typed array class IDs for range checks.
-let JS_CLASS_TYPED_ARRAY_FIRST = JSClassID.JS_CLASS_UINT8C_ARRAY.rawValue
+nonisolated(unsafe) let JS_CLASS_TYPED_ARRAY_FIRST = JSClassID.JS_CLASS_UINT8C_ARRAY.rawValue
 let JS_CLASS_TYPED_ARRAY_LAST = JSClassID.JS_CLASS_FLOAT64_ARRAY.rawValue
-let JS_TYPED_ARRAY_COUNT = JS_CLASS_TYPED_ARRAY_LAST - JS_CLASS_TYPED_ARRAY_FIRST + 1
+nonisolated(unsafe) let JS_TYPED_ARRAY_COUNT = JS_CLASS_TYPED_ARRAY_LAST - JS_CLASS_TYPED_ARRAY_FIRST + 1
 
 // MARK: - JSErrorEnum
 
 /// Matches QuickJS JS_*_ERROR enum for native error types.
-enum JSErrorEnum: Int {
+nonisolated enum JSErrorEnum: Int {
     case JS_EVAL_ERROR = 0
     case JS_RANGE_ERROR = 1
     case JS_REFERENCE_ERROR = 2
@@ -268,7 +268,7 @@ enum JSErrorEnum: Int {
 // MARK: - JSWeakRefHeaderTypeEnum
 
 /// Weak reference header type tags.
-enum JSWeakRefHeaderTypeEnum: Int {
+nonisolated enum JSWeakRefHeaderTypeEnum: Int {
     case JS_WEAK_REF_HEADER_MAP = 0
     case JS_WEAK_REF_HEADER_WEAKREF = 1
     case JS_WEAK_REF_HEADER_WEAK_MAP_ENTRY = 2
@@ -278,7 +278,7 @@ enum JSWeakRefHeaderTypeEnum: Int {
 // MARK: - JSAtomTypeEnum
 
 /// Atom type classification matching QuickJS JS_ATOM_TYPE_*.
-enum JSAtomTypeEnum: Int {
+nonisolated enum JSAtomTypeEnum: Int {
     case JS_ATOM_TYPE_STRING = 0
     case JS_ATOM_TYPE_GLOBAL_SYMBOL = 1
     case JS_ATOM_TYPE_SYMBOL = 2
@@ -288,7 +288,7 @@ enum JSAtomTypeEnum: Int {
 // MARK: - JSAtomKindEnum
 
 /// Atom kind classification for parsing/internal use.
-enum JSAtomKindEnum: Int {
+nonisolated enum JSAtomKindEnum: Int {
     case JS_ATOM_KIND_STRING = 0
     case JS_ATOM_KIND_SYMBOL = 1
     case JS_ATOM_KIND_PRIVATE = 2
@@ -297,7 +297,7 @@ enum JSAtomKindEnum: Int {
 // MARK: - JSAutoInitIDEnum
 
 /// Auto-init IDs for lazily initialized properties.
-enum JSAutoInitIDEnum: Int {
+nonisolated enum JSAutoInitIDEnum: Int {
     case JS_AUTOINIT_ID_PROTOTYPE = 0
     case JS_AUTOINIT_ID_MODULE_NS = 1
     case JS_AUTOINIT_ID_PROP = 2
@@ -306,7 +306,7 @@ enum JSAutoInitIDEnum: Int {
 // MARK: - JSClosureTypeEnum
 
 /// Closure variable types matching QuickJS closure_var types.
-enum JSClosureTypeEnum: Int {
+nonisolated enum JSClosureTypeEnum: Int {
     case JS_CLOSURE_VAR_LOCAL = 0
     case JS_CLOSURE_VAR_ARG = 1
     case JS_CLOSURE_VAR_VAR_REF = 2
@@ -316,7 +316,7 @@ enum JSClosureTypeEnum: Int {
 // MARK: - JSVarKindEnum
 
 /// Variable declaration kind matching QuickJS JSVarKindEnum.
-enum JSVarKindEnum: Int {
+nonisolated enum JSVarKindEnum: Int {
     case JS_VAR_NORMAL = 0
     case JS_VAR_FUNCTION_DECL = 1
     case JS_VAR_NEW_FUNCTION_DECL = 2
@@ -332,7 +332,7 @@ enum JSVarKindEnum: Int {
 // MARK: - JSFunctionKindEnum
 
 /// Function kind matching QuickJS JSFunctionKindEnum.
-enum JSFunctionKindEnum: Int {
+nonisolated enum JSFunctionKindEnum: Int {
     case JS_FUNC_NORMAL = 0
     case JS_FUNC_GENERATOR = 1
     case JS_FUNC_ASYNC = 2
@@ -342,7 +342,7 @@ enum JSFunctionKindEnum: Int {
 // MARK: - JSIteratorKindEnum
 
 /// Iterator kind for Map/Set/Array iterators.
-enum JSIteratorKindEnum: Int {
+nonisolated enum JSIteratorKindEnum: Int {
     case JS_ITERATOR_KIND_KEY = 0
     case JS_ITERATOR_KIND_VALUE = 1
     case JS_ITERATOR_KIND_KEY_AND_VALUE = 2
@@ -351,7 +351,7 @@ enum JSIteratorKindEnum: Int {
 // MARK: - JSStrictEqModeEnum
 
 /// Strict equality comparison modes.
-enum JSStrictEqModeEnum: Int {
+nonisolated enum JSStrictEqModeEnum: Int {
     case JS_EQ_STRICT = 0
     case JS_EQ_SAME_VALUE = 1
     case JS_EQ_SAME_VALUE_ZERO = 2
@@ -360,7 +360,7 @@ enum JSStrictEqModeEnum: Int {
 // MARK: - JSExportTypeEnum
 
 /// Module export entry types.
-enum JSExportTypeEnum: Int {
+nonisolated enum JSExportTypeEnum: Int {
     case JS_EXPORT_TYPE_LOCAL = 0
     case JS_EXPORT_TYPE_INDIRECT = 1
 }
@@ -368,7 +368,7 @@ enum JSExportTypeEnum: Int {
 // MARK: - JSModuleStatus
 
 /// Module loading/evaluation state machine.
-enum JSModuleStatus: Int {
+nonisolated enum JSModuleStatus: Int {
     case JS_MODULE_STATUS_UNLINKED = 0
     case JS_MODULE_STATUS_LINKING = 1
     case JS_MODULE_STATUS_LINKED = 2
@@ -380,7 +380,7 @@ enum JSModuleStatus: Int {
 // MARK: - JSFreeModuleEnum
 
 /// Controls how module resources are freed.
-enum JSFreeModuleEnum: Int {
+nonisolated enum JSFreeModuleEnum: Int {
     case JS_FREE_MODULE_ALL = 0
     case JS_FREE_MODULE_NOT_RESOLVED = 1
     case JS_FREE_MODULE_NOT_EVALUATED = 2
@@ -389,7 +389,7 @@ enum JSFreeModuleEnum: Int {
 // MARK: - JSVarDefEnum
 
 /// Variable definition types for bytecode.
-enum JSVarDefEnum: Int {
+nonisolated enum JSVarDefEnum: Int {
     case JS_VAR_DEF_WITH = 0
     case JS_VAR_DEF_LET = 1
     case JS_VAR_DEF_CONST = 2
@@ -402,7 +402,7 @@ enum JSVarDefEnum: Int {
 // MARK: - JSPromiseStateEnum
 
 /// Promise internal states matching the spec.
-enum JSPromiseStateEnum: Int {
+nonisolated enum JSPromiseStateEnum: Int {
     case JS_PROMISE_PENDING = 0
     case JS_PROMISE_FULFILLED = 1
     case JS_PROMISE_REJECTED = 2
@@ -411,7 +411,7 @@ enum JSPromiseStateEnum: Int {
 // MARK: - JSGeneratorStateEnum
 
 /// Generator function internal states.
-enum JSGeneratorStateEnum: Int {
+nonisolated enum JSGeneratorStateEnum: Int {
     case JS_GENERATOR_STATE_SUSPENDED_START = 0
     case JS_GENERATOR_STATE_SUSPENDED_YIELD = 1
     case JS_GENERATOR_STATE_SUSPENDED_YIELD_STAR = 2
@@ -422,7 +422,7 @@ enum JSGeneratorStateEnum: Int {
 // MARK: - JSOverloadableOperatorEnum
 
 /// Overloadable operator IDs for operator overloading support.
-enum JSOverloadableOperatorEnum: Int {
+nonisolated enum JSOverloadableOperatorEnum: Int {
     case JS_OVOP_ADD = 0
     case JS_OVOP_SUB = 1
     case JS_OVOP_MUL = 2
@@ -448,20 +448,20 @@ enum JSOverloadableOperatorEnum: Int {
 // MARK: - JSRegExpFlags
 
 /// RegExp flag bits matching QuickJS LRE_FLAG_*.
-let LRE_FLAG_GLOBAL: Int = 1 << 0
+nonisolated(unsafe) let LRE_FLAG_GLOBAL: Int = 1 << 0
 let LRE_FLAG_IGNORECASE: Int = 1 << 1
-let LRE_FLAG_MULTILINE: Int = 1 << 2
+nonisolated(unsafe) let LRE_FLAG_MULTILINE: Int = 1 << 2
 let LRE_FLAG_DOTALL: Int = 1 << 3
-let LRE_FLAG_UNICODE: Int = 1 << 4
+nonisolated(unsafe) let LRE_FLAG_UNICODE: Int = 1 << 4
 let LRE_FLAG_STICKY: Int = 1 << 5
-let LRE_FLAG_INDICES: Int = 1 << 6
+nonisolated(unsafe) let LRE_FLAG_INDICES: Int = 1 << 6
 let LRE_FLAG_UNICODE_SETS: Int = 1 << 7
-let LRE_FLAG_NAMED_GROUPS: Int = 1 << 8
+nonisolated(unsafe) let LRE_FLAG_NAMED_GROUPS: Int = 1 << 8
 
 // MARK: - JSTokenType (parser token IDs)
 
 /// Token IDs for the JS parser, matching QuickJS TOK_* values.
-enum JSTokenType: Int {
+nonisolated enum JSTokenType: Int {
     case TOK_NUMBER = 128
     case TOK_STRING = 129
     case TOK_TEMPLATE = 130
@@ -561,7 +561,7 @@ enum JSTokenType: Int {
 // MARK: - JSDescriptionFlagEnum
 
 /// Descriptor behavior flags for Object.defineProperty internals.
-enum JSDescriptionFlagEnum: Int {
+nonisolated enum JSDescriptionFlagEnum: Int {
     case JS_DESC_FLAG_DATA = 0
     case JS_DESC_FLAG_ACCESSOR = 1
 }
@@ -569,7 +569,7 @@ enum JSDescriptionFlagEnum: Int {
 // MARK: - JSIteratorHelperKindEnum
 
 /// Iterator helper method identifiers.
-enum JSIteratorHelperKindEnum: Int {
+nonisolated enum JSIteratorHelperKindEnum: Int {
     case JS_ITERATOR_HELPER_KIND_MAP = 0
     case JS_ITERATOR_HELPER_KIND_FILTER = 1
     case JS_ITERATOR_HELPER_KIND_TAKE = 2
@@ -580,46 +580,46 @@ enum JSIteratorHelperKindEnum: Int {
 // MARK: - JSObjectHeaderFlags
 
 /// Bit layout in JSObject header_flags, mirroring QuickJS.
-let JS_OBJECT_CLASS_SHIFT: Int = 0
+nonisolated(unsafe) let JS_OBJECT_CLASS_SHIFT: Int = 0
 let JS_OBJECT_CLASS_MASK: Int = 0x3F
-let JS_OBJECT_EXTENSIBLE_BIT: Int = 1 << 6
+nonisolated(unsafe) let JS_OBJECT_EXTENSIBLE_BIT: Int = 1 << 6
 let JS_OBJECT_FREE_IN_GC_BIT: Int = 1 << 7
-let JS_OBJECT_IS_EXOTIC_BIT: Int = 1 << 8
+nonisolated(unsafe) let JS_OBJECT_IS_EXOTIC_BIT: Int = 1 << 8
 let JS_OBJECT_HAS_MAP_BIT: Int = 1 << 9
-let JS_OBJECT_TMP_MARK_BIT: Int = 1 << 10
+nonisolated(unsafe) let JS_OBJECT_TMP_MARK_BIT: Int = 1 << 10
 let JS_OBJECT_IS_UNCATCHABLE_ERROR_BIT: Int = 1 << 11
 
 // MARK: - JSShapeFlags
 
 /// Bit-field layout of JSShape flags.
-let JS_SHAPE_HAS_SMALL_ARRAY_INDEX: Int = 1 << 0
+nonisolated(unsafe) let JS_SHAPE_HAS_SMALL_ARRAY_INDEX: Int = 1 << 0
 let JS_SHAPE_HASH_RESIZE_THRESHOLD: Double = 0.7
-let JS_SHAPE_INITIAL_HASH_LOG2_SIZE: Int = 4
+nonisolated(unsafe) let JS_SHAPE_INITIAL_HASH_LOG2_SIZE: Int = 4
 
 // MARK: - JSArrayBufferFlags
 
-let JS_ARRAY_BUFFER_DETACHED: Int = 1 << 0
+nonisolated(unsafe) let JS_ARRAY_BUFFER_DETACHED: Int = 1 << 0
 let JS_ARRAY_BUFFER_SHARED: Int = 1 << 1
 
 // MARK: - JSTypedArrayFlags
 
-let JS_TYPED_ARRAY_BYTE_OFFSET_MASK: Int = 0x7FFFFFFF
+nonisolated(unsafe) let JS_TYPED_ARRAY_BYTE_OFFSET_MASK: Int = 0x7FFFFFFF
 let JS_TYPED_ARRAY_LENGTH_TRACKING: Int = 1 << 31
 
 // MARK: - Helper Functions
 
 /// Check if a class ID corresponds to a typed array.
-func jsClassIsTypedArray(_ classID: Int) -> Bool {
+nonisolated func jsClassIsTypedArray(_ classID: Int) -> Bool {
     return classID >= JS_CLASS_TYPED_ARRAY_FIRST && classID <= JS_CLASS_TYPED_ARRAY_LAST
 }
 
 /// Check if a JSValueTag is a reference (heap-allocated) type.
-func jsTagIsHeapAllocated(_ tag: JSValueTag) -> Bool {
+nonisolated func jsTagIsHeapAllocated(_ tag: JSValueTag) -> Bool {
     return tag.rawValue < 0
 }
 
 /// Size in bytes for each typed array element by class ID offset.
-let JS_TYPED_ARRAY_ELEMENT_SIZES: [Int] = [
+nonisolated(unsafe) let JS_TYPED_ARRAY_ELEMENT_SIZES: [Int] = [
     1,  // Uint8ClampedArray
     1,  // Int8Array
     1,  // Uint8Array
@@ -634,7 +634,7 @@ let JS_TYPED_ARRAY_ELEMENT_SIZES: [Int] = [
 ]
 
 /// Returns the byte size of a typed array element given the class ID.
-func jsTypedArrayElementSize(_ classID: Int) -> Int {
+nonisolated func jsTypedArrayElementSize(_ classID: Int) -> Int {
     let index = classID - JS_CLASS_TYPED_ARRAY_FIRST
     guard index >= 0, index < JS_TYPED_ARRAY_ELEMENT_SIZES.count else { return 0 }
     return JS_TYPED_ARRAY_ELEMENT_SIZES[index]

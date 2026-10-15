@@ -50,7 +50,7 @@ nonisolated final class JeffJSClassFieldsCtx {
     weak var ctorFd: JeffJSFunctionDefCompiler?
 }
 
-extension JeffJSParser {
+nonisolated extension JeffJSParser {
 
     // =========================================================================
     // MARK: - Synthetic-function helpers

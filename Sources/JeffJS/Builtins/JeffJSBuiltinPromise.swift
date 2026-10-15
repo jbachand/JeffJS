@@ -21,7 +21,7 @@ import Foundation
 /// - The handler function (onFulfilled or onRejected)
 /// - The capability of the dependent promise (resolve + reject functions)
 /// - The reaction type (fulfill vs reject)
-struct JeffJSPromiseReaction {
+nonisolated struct JeffJSPromiseReaction {
     /// The handler closure. May be JS_UNDEFINED for default pass-through.
     var handler: JeffJSValue
 
@@ -62,7 +62,7 @@ struct JeffJSPromiseReaction {
 /// value and any reaction queued on a promise that dies still pending.
 /// `new Promise(function () {}).then(f)` used to pin `f` and the derived
 /// promise for the life of the runtime.
-func jeffJS_promiseDataFree(_ d: JeffJSPromiseData) {
+nonisolated func jeffJS_promiseDataFree(_ d: JeffJSPromiseData) {
     let fulfill = d.promiseFulfillReactions
     let reject = d.promiseRejectReactions
     let result = d.promiseResult
@@ -131,7 +131,7 @@ private nonisolated final class PromiseAllData {
 
 // MARK: - JeffJSBuiltinPromise
 
-struct JeffJSBuiltinPromise {
+nonisolated struct JeffJSBuiltinPromise {
 
     // MARK: - Recursion Guard for resolvePromise
 

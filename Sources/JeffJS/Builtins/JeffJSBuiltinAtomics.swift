@@ -39,11 +39,11 @@ nonisolated final class JSAtomicsWaiter {
 /// In QuickJS the waiter lists are global (process-wide) because
 /// SharedArrayBuffers can be transferred between agents.
 /// We use NSLock for the global lock instead of a C mutex.
-private let jsAtomicsGlobalLock = NSLock()
+nonisolated(unsafe) private let jsAtomicsGlobalLock = NSLock()
 private var jsAtomicsWaiterLists: [JSAtomicsWaiterKey: [JSAtomicsWaiter]] = [:]
 
 /// Key for the global waiter list map.
-private struct JSAtomicsWaiterKey: Hashable {
+nonisolated private struct JSAtomicsWaiterKey: Hashable {
     let bufferID: ObjectIdentifier
     let byteIndex: Int
 
@@ -63,7 +63,7 @@ private struct JSAtomicsWaiterKey: Hashable {
 /// and element size, or throws a TypeError.
 ///
 /// Mirrors QuickJS `js_atomics_get_typed_array_and_index`.
-private func js_atomics_validateTypedArray(
+nonisolated private func js_atomics_validateTypedArray(
     ctx: JeffJSContext,
     typedArrayVal: JeffJSValue,
     indexVal: JeffJSValue,
@@ -162,7 +162,7 @@ private func js_atomics_validateTypedArray(
 
 /// The element's raw little-endian bits.
 @inline(__always)
-private func js_atomics_loadBits(_ data: [UInt8], _ byteIndex: Int) -> UInt64 {
+nonisolated private func js_atomics_loadBits(_ data: [UInt8], _ byteIndex: Int) -> UInt64 {
     guard byteIndex >= 0, byteIndex + 7 < data.count else { return 0 }
     var raw: UInt64 = 0
     for i in 0 ..< 8 { raw |= UInt64(data[byteIndex + i]) << (i * 8) }
@@ -170,21 +170,21 @@ private func js_atomics_loadBits(_ data: [UInt8], _ byteIndex: Int) -> UInt64 {
 }
 
 @inline(__always)
-private func js_atomics_storeBits(_ data: inout [UInt8], _ byteIndex: Int, _ bits: UInt64) {
+nonisolated private func js_atomics_storeBits(_ data: inout [UInt8], _ byteIndex: Int, _ bits: UInt64) {
     guard byteIndex >= 0, byteIndex + 7 < data.count else { return }
     for i in 0 ..< 8 { data[byteIndex + i] = UInt8((bits >> (i * 8)) & 0xFF) }
 }
 
 /// The JS value for a 64-bit element: a BigInt, signed or not.
 @inline(__always)
-private func js_atomics_bigIntValue(_ bits: UInt64, isSigned: Bool) -> JeffJSValue {
+nonisolated private func js_atomics_bigIntValue(_ bits: UInt64, isSigned: Bool) -> JeffJSValue {
     isSigned ? .newBigInt(Int64(bitPattern: bits)) : .newBigInt(JBigInt(bits))
 }
 
 /// ToBigInt, then the low 64 bits (ES §25.4.2.1 step 2: a BigInt array's
 /// operands go through ToBigInt, so a Number operand is a TypeError).
 /// Returns nil with the exception already thrown.
-private func js_atomics_bigIntBits(_ ctx: JeffJSContext, _ v: JeffJSValue) -> UInt64? {
+nonisolated private func js_atomics_bigIntBits(_ ctx: JeffJSContext, _ v: JeffJSValue) -> UInt64? {
     if v.isBigInt { return v.bigIntValue.lowUInt64 }
     let b = ctx.toBigIntValue(v)
     if b.isException { return nil }
@@ -205,7 +205,7 @@ private func js_atomics_bigIntBits(_ ctx: JeffJSContext, _ v: JeffJSValue) -> UI
 /// use a lock for correctness.
 ///
 /// Mirrors the inline atomic loads in QuickJS `js_atomics_op`.
-private func js_atomics_load_raw(
+nonisolated private func js_atomics_load_raw(
     buffer: JeffJSArrayBuffer,
     byteIndex: Int,
     elemSize: Int,
@@ -286,7 +286,7 @@ private func js_atomics_load_raw(
 /// Returns the stored value (for Atomics.store's return convention).
 ///
 /// Mirrors the inline atomic stores in QuickJS `js_atomics_store`.
-private func js_atomics_store_raw(
+nonisolated private func js_atomics_store_raw(
     buffer: JeffJSArrayBuffer,
     byteIndex: Int,
     elemSize: Int,
@@ -339,7 +339,7 @@ private func js_atomics_store_raw(
 }
 
 /// Read the current 32-bit value at a byte offset (for Atomics.wait comparison).
-private func js_atomics_read_int32(
+nonisolated private func js_atomics_read_int32(
     buffer: JeffJSArrayBuffer,
     byteIndex: Int
 ) -> Int32 {
@@ -352,7 +352,7 @@ private func js_atomics_read_int32(
 }
 
 /// Read the current 64-bit value at a byte offset (for Atomics.wait on BigInt64).
-private func js_atomics_read_int64(
+nonisolated private func js_atomics_read_int64(
     buffer: JeffJSArrayBuffer,
     byteIndex: Int
 ) -> Int64 {
@@ -371,7 +371,7 @@ private func js_atomics_read_int64(
 // MARK: - Classify typed array element type
 
 /// Returns (isBigInt, isSigned) for a typed array class ID.
-private func js_atomics_classify(_ classID: Int) -> (isBigInt: Bool, isSigned: Bool) {
+nonisolated private func js_atomics_classify(_ classID: Int) -> (isBigInt: Bool, isSigned: Bool) {
     switch classID {
     case JeffJSClassID.int8Array.rawValue:      return (false, true)
     case JeffJSClassID.uint8Array.rawValue:     return (false, false)
@@ -402,7 +402,7 @@ private func js_atomics_classify(_ classID: Int) -> (isBigInt: Bool, isSigned: B
 ///   1. Atomically load the current value.
 ///   2. If current == expectedValue, store replacementValue.
 ///   3. Return the old value.
-enum JSAtomicsOpKind: Int {
+nonisolated enum JSAtomicsOpKind: Int {
     case add = 0
     case and = 1
     case or  = 2
@@ -412,7 +412,7 @@ enum JSAtomicsOpKind: Int {
     case compareExchange = 6
 }
 
-func js_atomics_op(
+nonisolated func js_atomics_op(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue],
@@ -567,7 +567,7 @@ func js_atomics_op(
 /// `Atomics.load(typedArray, index)` -- atomically reads a value.
 ///
 /// Mirrors QuickJS `js_atomics_load`.
-func js_atomics_load(
+nonisolated func js_atomics_load(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -608,7 +608,7 @@ func js_atomics_load(
 /// Returns the value that was written (after type coercion).
 ///
 /// Mirrors QuickJS `js_atomics_store`.
-func js_atomics_store(
+nonisolated func js_atomics_store(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -664,7 +664,7 @@ func js_atomics_store(
 ///   - isLockFree(4) => true
 ///   - isLockFree(8) => true (on 64-bit platforms)
 ///   - All other values => false
-func js_atomics_isLockFree(
+nonisolated func js_atomics_isLockFree(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -712,7 +712,7 @@ func js_atomics_isLockFree(
 ///   - "timed-out" if the timeout expired.
 ///
 /// Throws TypeError if the runtime is not allowed to block.
-func js_atomics_wait(
+nonisolated func js_atomics_wait(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -859,7 +859,7 @@ func js_atomics_wait(
 /// - `count` is the number of waiters to wake (default: +Infinity = all).
 ///
 /// Returns the number of agents that were woken.
-func js_atomics_notify(
+nonisolated func js_atomics_notify(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -929,7 +929,7 @@ func js_atomics_notify(
 
 /// Create a JeffJSValue string from a Swift string.
 /// Used for Atomics.wait return values ("ok", "not-equal", "timed-out").
-private func js_atomics_makeResultString(ctx: JeffJSContext, str: String) -> JeffJSValue {
+nonisolated private func js_atomics_makeResultString(ctx: JeffJSContext, str: String) -> JeffJSValue {
     let jsStr = JeffJSString(swiftString: str)
     return JeffJSValue.makeString(jsStr)
 }
@@ -937,7 +937,7 @@ private func js_atomics_makeResultString(ctx: JeffJSContext, str: String) -> Jef
 // MARK: - Convenience wrappers for individual Atomics methods
 
 /// `Atomics.add(typedArray, index, value)`
-func js_atomics_add(
+nonisolated func js_atomics_add(
     ctx: JeffJSContext, this: JeffJSValue, argv: [JeffJSValue]
 ) -> JeffJSValue {
     return js_atomics_op(ctx: ctx, this: this, argv: argv,
@@ -945,7 +945,7 @@ func js_atomics_add(
 }
 
 /// `Atomics.and(typedArray, index, value)`
-func js_atomics_and(
+nonisolated func js_atomics_and(
     ctx: JeffJSContext, this: JeffJSValue, argv: [JeffJSValue]
 ) -> JeffJSValue {
     return js_atomics_op(ctx: ctx, this: this, argv: argv,
@@ -953,7 +953,7 @@ func js_atomics_and(
 }
 
 /// `Atomics.or(typedArray, index, value)`
-func js_atomics_or(
+nonisolated func js_atomics_or(
     ctx: JeffJSContext, this: JeffJSValue, argv: [JeffJSValue]
 ) -> JeffJSValue {
     return js_atomics_op(ctx: ctx, this: this, argv: argv,
@@ -961,7 +961,7 @@ func js_atomics_or(
 }
 
 /// `Atomics.sub(typedArray, index, value)`
-func js_atomics_sub(
+nonisolated func js_atomics_sub(
     ctx: JeffJSContext, this: JeffJSValue, argv: [JeffJSValue]
 ) -> JeffJSValue {
     return js_atomics_op(ctx: ctx, this: this, argv: argv,
@@ -969,7 +969,7 @@ func js_atomics_sub(
 }
 
 /// `Atomics.xor(typedArray, index, value)`
-func js_atomics_xor(
+nonisolated func js_atomics_xor(
     ctx: JeffJSContext, this: JeffJSValue, argv: [JeffJSValue]
 ) -> JeffJSValue {
     return js_atomics_op(ctx: ctx, this: this, argv: argv,
@@ -977,7 +977,7 @@ func js_atomics_xor(
 }
 
 /// `Atomics.exchange(typedArray, index, value)`
-func js_atomics_exchange(
+nonisolated func js_atomics_exchange(
     ctx: JeffJSContext, this: JeffJSValue, argv: [JeffJSValue]
 ) -> JeffJSValue {
     return js_atomics_op(ctx: ctx, this: this, argv: argv,
@@ -985,7 +985,7 @@ func js_atomics_exchange(
 }
 
 /// `Atomics.compareExchange(typedArray, index, expectedValue, replacementValue)`
-func js_atomics_compareExchange(
+nonisolated func js_atomics_compareExchange(
     ctx: JeffJSContext, this: JeffJSValue, argv: [JeffJSValue]
 ) -> JeffJSValue {
     return js_atomics_op(ctx: ctx, this: this, argv: argv,
@@ -996,7 +996,7 @@ func js_atomics_compareExchange(
 
 /// Function list for the `Atomics` object.
 /// Mirrors QuickJS `js_atomics_funcs`.
-let js_atomics_funcs: [(name: String, func_: JSCFunctionType, length: Int)] = [
+nonisolated(unsafe) let js_atomics_funcs: [(name: String, func_: JSCFunctionType, length: Int)] = [
     ("add", .generic({ ctx, this, argv in
         js_atomics_add(ctx: ctx, this: this, argv: argv)
     }), 3),
@@ -1046,7 +1046,7 @@ let js_atomics_funcs: [(name: String, func_: JSCFunctionType, length: Int)] = [
 ///     load, or, store, sub, wait, notify, xor)
 ///   - `Atomics[Symbol.toStringTag] = "Atomics"` (non-enumerable, non-writable,
 ///     configurable)
-func js_addIntrinsicAtomics(ctx: JeffJSContext) {
+nonisolated func js_addIntrinsicAtomics(ctx: JeffJSContext) {
     // Create the Atomics object (a plain object, not a constructor).
     let atomicsVal = ctx.newPlainObject()
 

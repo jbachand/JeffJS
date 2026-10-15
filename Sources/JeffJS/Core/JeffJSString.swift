@@ -7,10 +7,10 @@ import Foundation
 // MARK: - Forward references for types defined elsewhere
 
 /// Placeholder until JeffJSContext is defined.
-protocol JeffJSContextProtocol: AnyObject {}
+nonisolated protocol JeffJSContextProtocol: AnyObject {}
 
 /// Placeholder until JeffJSRuntime is defined.
-protocol JeffJSRuntimeProtocol: AnyObject {}
+nonisolated protocol JeffJSRuntimeProtocol: AnyObject {}
 
 // NOTE: JeffJSValue, JSValueTag, and JSValuePayload are now defined in
 // JeffJSValue.swift. The placeholder definitions that were here have been
@@ -19,7 +19,7 @@ protocol JeffJSRuntimeProtocol: AnyObject {}
 // MARK: - String storage
 
 /// Backing store for an 8-bit (Latin-1) or 16-bit (UTF-16) character array.
-enum JeffJSStringStorage {
+nonisolated enum JeffJSStringStorage {
     case str8([UInt8])
     case str16([UInt16])
 }
@@ -262,7 +262,7 @@ nonisolated final class JeffJSStringRope: JeffJSStringBase {
 
 /// Allocate a fresh, zeroed-out `JeffJSString` that can hold up to `maxLen`
 /// characters of the requested width.
-func jeffJS_allocString(maxLen: Int, isWideChar: Bool) -> JeffJSString? {
+nonisolated func jeffJS_allocString(maxLen: Int, isWideChar: Bool) -> JeffJSString? {
     guard maxLen >= 0, maxLen <= 0x7FFF_FFFF else { return nil }
 
     let storage: JeffJSStringStorage
@@ -287,7 +287,7 @@ func jeffJS_allocString(maxLen: Int, isWideChar: Bool) -> JeffJSString? {
 /// Length in UTF-16 code units of any string representation, without
 /// flattening or re-encoding.
 @inline(__always)
-func jeffJS_stringLength(_ sb: JeffJSStringBase) -> Int {
+nonisolated func jeffJS_stringLength(_ sb: JeffJSStringBase) -> Int {
     switch sb.kind {
     case JeffJSStringBase.kindFlat: return unsafeDowncast(sb, to: JeffJSString.self).len
     case JeffJSStringBase.kindRope: return unsafeDowncast(sb, to: JeffJSStringRope.self).len
@@ -295,7 +295,7 @@ func jeffJS_stringLength(_ sb: JeffJSStringBase) -> Int {
     }
 }
 
-func jeffJS_getString(str: JeffJSString, at index: Int) -> UInt32 {
+nonisolated func jeffJS_getString(str: JeffJSString, at index: Int) -> UInt32 {
     guard index >= 0, index < str.len else { return 0 }
     switch str.storage {
     case .str8(let buf):
@@ -308,7 +308,7 @@ func jeffJS_getString(str: JeffJSString, at index: Int) -> UInt32 {
 // MARK: - Substring
 
 /// Create a new `JeffJSString` that is a copy of `str[start ..< end]`.
-func jeffJS_subString(str: JeffJSString, start: Int, end: Int) -> JeffJSString? {
+nonisolated func jeffJS_subString(str: JeffJSString, start: Int, end: Int) -> JeffJSString? {
     let s = max(start, 0)
 
     switch str.storage {
@@ -354,14 +354,14 @@ func jeffJS_subString(str: JeffJSString, start: Int, end: Int) -> JeffJSString? 
 
 // Precomputed powers of 263 for 4x-unrolled polynomial hash.
 // Using file-scope lets so the compiler emits them as constants.
-private let _h263_p1: UInt32 = 263
+nonisolated(unsafe) private let _h263_p1: UInt32 = 263
 private let _h263_p2: UInt32 = 263 &* 263
-private let _h263_p3: UInt32 = 263 &* 263 &* 263
+nonisolated(unsafe) private let _h263_p3: UInt32 = 263 &* 263 &* 263
 private let _h263_p4: UInt32 = 263 &* 263 &* 263 &* 263
 
 /// Polynomial hash for 8-bit data matching QuickJS `hash_string8`.
 /// 4x unrolled: processes 4 bytes per iteration using precomputed powers of 263.
-func jeffJS_hashString8(data: [UInt8], len: Int, h: UInt32 = 0) -> UInt32 {
+nonisolated func jeffJS_hashString8(data: [UInt8], len: Int, h: UInt32 = 0) -> UInt32 {
     var hash = h
     let count = min(len, data.count)
     guard count > 0 else { return hash }
@@ -386,7 +386,7 @@ func jeffJS_hashString8(data: [UInt8], len: Int, h: UInt32 = 0) -> UInt32 {
 
 /// Polynomial hash for 16-bit data matching QuickJS `hash_string16`.
 /// 4x unrolled: processes 4 code units per iteration.
-func jeffJS_hashString16(data: [UInt16], len: Int, h: UInt32 = 0) -> UInt32 {
+nonisolated func jeffJS_hashString16(data: [UInt16], len: Int, h: UInt32 = 0) -> UInt32 {
     var hash = h
     let count = min(len, data.count)
     guard count > 0 else { return hash }
@@ -410,7 +410,7 @@ func jeffJS_hashString16(data: [UInt16], len: Int, h: UInt32 = 0) -> UInt32 {
 }
 
 /// Compute and cache the hash of a `JeffJSString`.
-func jeffJS_computeHash(str: JeffJSString) -> UInt32 {
+nonisolated func jeffJS_computeHash(str: JeffJSString) -> UInt32 {
     let h: UInt32
     switch str.storage {
     case .str8(let buf):
@@ -427,7 +427,7 @@ func jeffJS_computeHash(str: JeffJSString) -> UInt32 {
 
 /// Lexicographic comparison of two strings. Returns <0, 0, or >0.
 /// Uses memcmp fast-path for same-width strings.
-func jeffJS_stringCompare(s1: JeffJSString, s2: JeffJSString) -> Int {
+nonisolated func jeffJS_stringCompare(s1: JeffJSString, s2: JeffJSString) -> Int {
     if s1 === s2 { return 0 }
 
     // Fast path: both 8-bit — memcmp is SIMD-optimized on Apple platforms
@@ -474,7 +474,7 @@ func jeffJS_stringCompare(s1: JeffJSString, s2: JeffJSString) -> Int {
 
 /// Content equality (independent of encoding width).
 /// Uses memcmp fast-path for same-width strings (SIMD-optimized on Apple platforms).
-func jeffJS_stringEquals(s1: JeffJSString, s2: JeffJSString) -> Bool {
+nonisolated func jeffJS_stringEquals(s1: JeffJSString, s2: JeffJSString) -> Bool {
     if s1 === s2 { return true }
     if s1.len != s2.len { return false }
     if s1.len == 0 { return true }
@@ -518,7 +518,7 @@ func jeffJS_stringEquals(s1: JeffJSString, s2: JeffJSString) -> Bool {
 
 /// Find the first occurrence of `needle` in the 8-bit string starting at `fromIndex`.
 /// Returns the index, or -1 if not found. Uses memchr which is SIMD-optimized.
-func jeffJS_indexOf8(_ str: JeffJSString, needle: UInt8, fromIndex: Int = 0) -> Int {
+nonisolated func jeffJS_indexOf8(_ str: JeffJSString, needle: UInt8, fromIndex: Int = 0) -> Int {
     guard !str.isWideChar, case .str8(let data) = str.storage else { return -1 }
     let start = max(fromIndex, 0)
     let len = min(str.len, data.count)
@@ -534,7 +534,7 @@ func jeffJS_indexOf8(_ str: JeffJSString, needle: UInt8, fromIndex: Int = 0) -> 
 
 /// Find the first occurrence of a substring in an 8-bit string.
 /// Uses memchr to find the first byte, then memcmp to verify the rest.
-func jeffJS_indexOfString8(_ haystack: JeffJSString, _ needle: JeffJSString, fromIndex: Int = 0) -> Int {
+nonisolated func jeffJS_indexOfString8(_ haystack: JeffJSString, _ needle: JeffJSString, fromIndex: Int = 0) -> Int {
     guard !haystack.isWideChar && !needle.isWideChar else { return -1 }
     guard case .str8(let hData) = haystack.storage, case .str8(let nData) = needle.storage else { return -1 }
     let hLen = min(haystack.len, hData.count)
@@ -572,7 +572,7 @@ func jeffJS_indexOfString8(_ haystack: JeffJSString, _ needle: JeffJSString, fro
 /// UInt32 (for the integer-atom fast-path in QuickJS).
 ///
 /// Returns `(true, value)` on success, `(false, 0)` otherwise.
-func jeffJS_isNumericString(_ str: JeffJSString) -> (Bool, UInt32) {
+nonisolated func jeffJS_isNumericString(_ str: JeffJSString) -> (Bool, UInt32) {
     guard str.len > 0 else { return (false, 0) }
 
     let first = jeffJS_getString(str: str, at: 0)
@@ -597,7 +597,7 @@ func jeffJS_isNumericString(_ str: JeffJSString) -> (Bool, UInt32) {
 // MARK: - Concat / Rope
 
 /// Maximum rope depth before we force-flatten.
-private let kMaxRopeDepth: UInt8 = 32
+nonisolated(unsafe) private let kMaxRopeDepth: UInt8 = 32
 
 /// Concatenate two string values.
 /// If both sides are short enough or we've exceeded the max rope depth, the
@@ -621,7 +621,7 @@ private let kMaxRopeDepth: UInt8 = 32
 /// (netflix's emotion serializer returned `styles: l` and later computed
 /// `n.styles + ";"`: the in-place append grew the cached `styles` string on
 /// every render, so every class-name hash differed from the server's.)
-func jeffJS_concatStrings(s1: JeffJSValue, s2: JeffJSValue, ownedRefs: Int = 0) -> JeffJSValue {
+nonisolated func jeffJS_concatStrings(s1: JeffJSValue, s2: JeffJSValue, ownedRefs: Int = 0) -> JeffJSValue {
     // Phase 4 fast path: left operand is a buffer accumulator nobody else
     // holds. Append right operand directly — amortized O(1).
     if let sb = s1.stringBase, sb.kind == JeffJSStringBase.kindBuffer {
@@ -688,7 +688,7 @@ func jeffJS_concatStrings(s1: JeffJSValue, s2: JeffJSValue, ownedRefs: Int = 0) 
 
 /// Length and wide-char flag of a string value of any representation,
 /// without flattening ropes or buffers.
-private func jeffJS_stringLenWide(_ v: JeffJSValue) -> (Int, Bool)? {
+nonisolated private func jeffJS_stringLenWide(_ v: JeffJSValue) -> (Int, Bool)? {
     guard let sb = v.stringBase else { return nil }
     switch sb.kind {
     case JeffJSStringBase.kindFlat:
@@ -701,7 +701,7 @@ private func jeffJS_stringLenWide(_ v: JeffJSValue) -> (Int, Bool)? {
 }
 
 /// Compute the depth of a value that might be a rope.
-private func ropeDepth(_ v: JeffJSValue) -> UInt8 {
+nonisolated private func ropeDepth(_ v: JeffJSValue) -> UInt8 {
     if let sb = v.stringBase, sb.kind == JeffJSStringBase.kindRope {
         return unsafeDowncast(sb, to: JeffJSStringRope.self).depth
     }
@@ -710,7 +710,7 @@ private func ropeDepth(_ v: JeffJSValue) -> UInt8 {
 
 /// Flatten two `JeffJSString`s into a single contiguous string.
 /// Uses memcpy for same-width fast path.
-private func jeffJS_flatConcatStrings(_ s1: JeffJSString, _ s2: JeffJSString) -> JeffJSString {
+nonisolated private func jeffJS_flatConcatStrings(_ s1: JeffJSString, _ s2: JeffJSString) -> JeffJSString {
     let wide = s1.isWideChar || s2.isWideChar
     let totalLen = s1.len + s2.len
 
@@ -773,7 +773,7 @@ private func jeffJS_flatConcatStrings(_ s1: JeffJSString, _ s2: JeffJSString) ->
 // MARK: - Flatten rope
 
 /// Recursively flatten a `JeffJSStringRope` into a contiguous `JeffJSString`.
-func jeffJS_flattenRope(_ rope: JeffJSStringRope) -> JeffJSString {
+nonisolated func jeffJS_flattenRope(_ rope: JeffJSStringRope) -> JeffJSString {
     let wide = rope.isWideChar
 
     if wide {
@@ -797,7 +797,7 @@ func jeffJS_flattenRope(_ rope: JeffJSStringRope) -> JeffJSString {
     }
 }
 
-private func flattenInto16(_ buf: inout [UInt16], _ offset: inout Int, _ val: JeffJSValue) {
+nonisolated private func flattenInto16(_ buf: inout [UInt16], _ offset: inout Int, _ val: JeffJSValue) {
     if let obj = val.heapRef {
         if let rope = obj as? JeffJSStringRope {
             flattenInto16(&buf, &offset, rope.left)
@@ -830,7 +830,7 @@ private func flattenInto16(_ buf: inout [UInt16], _ offset: inout Int, _ val: Je
     }
 }
 
-private func flattenInto8(_ buf: inout [UInt8], _ offset: inout Int, _ val: JeffJSValue) {
+nonisolated private func flattenInto8(_ buf: inout [UInt8], _ offset: inout Int, _ val: JeffJSValue) {
     if let obj = val.heapRef {
         if let rope = obj as? JeffJSStringRope {
             flattenInto8(&buf, &offset, rope.left)
@@ -1294,7 +1294,7 @@ nonisolated final class JeffJSStringBuffer: JeffJSStringBase {
 
 // MARK: - Swift String interop helpers
 
-extension JeffJSString {
+nonisolated extension JeffJSString {
 
     /// Create a `JeffJSString` from a Swift `String`.
     /// Uses 8-bit storage when all scalars fit in Latin-1, otherwise 16-bit.
@@ -1374,7 +1374,7 @@ extension JeffJSString {
 /// Latin-1 bytes -> Swift String. ASCII (the common case) decodes in one
 /// pass; the old path built an array of Character values per byte and was
 /// the top allocation source on the real-world suite (JSON, sort, join...).
-func jeffJS_swiftStringFromLatin1(_ buf: [UInt8], count: Int) -> String {
+nonisolated func jeffJS_swiftStringFromLatin1(_ buf: [UInt8], count: Int) -> String {
     let n = min(count, buf.count)
     if n == 0 { return "" }
     return buf.withUnsafeBufferPointer { p -> String in
@@ -1394,7 +1394,7 @@ func jeffJS_swiftStringFromLatin1(_ buf: [UInt8], count: Int) -> String {
 }
 
 /// UTF-16 code units -> Swift String without an intermediate Array copy.
-func jeffJS_swiftStringFromUTF16(_ buf: [UInt16], count: Int) -> String {
+nonisolated func jeffJS_swiftStringFromUTF16(_ buf: [UInt16], count: Int) -> String {
     let n = min(count, buf.count)
     if n == 0 { return "" }
     return buf.withUnsafeBufferPointer { p in

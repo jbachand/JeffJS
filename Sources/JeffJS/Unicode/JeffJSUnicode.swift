@@ -6,7 +6,7 @@ import Foundation
 
 // MARK: - JeffJS Unicode Utilities
 
-struct JeffJSUnicode {
+nonisolated struct JeffJSUnicode {
 
     // MARK: - Character Classification
 

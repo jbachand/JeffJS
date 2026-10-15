@@ -22,7 +22,7 @@ nonisolated(unsafe) var jeffJS_icStats = [Int](repeating: 0, count: 8)
 @inline(__always) func jeffJS_icCount(_ k: Int) { jeffJS_icStats[k] &+= 1 }
 nonisolated(unsafe) private var jeffJS_profNames: [ObjectIdentifier: (JeffJSFunctionBytecode, String)] = [:]
 
-private func jeffJS_profName(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode) -> String {
+nonisolated private func jeffJS_profName(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode) -> String {
     let id = ObjectIdentifier(fb)
     if let e = jeffJS_profNames[id], e.0 === fb { return e.1 }
     var name = fb.nameAtom != 0 ? ctx.atomToSwiftString(fb.nameAtom) : ""
@@ -38,7 +38,7 @@ private func jeffJS_profName(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode)
     return s
 }
 
-private func jeffJS_profStart() {
+nonisolated private func jeffJS_profStart() {
     jeffJS_profStarted = true
     let us = UInt32(ProcessInfo.processInfo.environment["JEFFJS_JSPROF_US"].flatMap { UInt32($0) } ?? 1000)
     let t = Thread {
@@ -51,7 +51,7 @@ private func jeffJS_profStart() {
 
 /// Called by a dispatcher when `jeffJS_profTick` is set.
 @inline(never)
-func jeffJS_profSample(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int) {
+nonisolated func jeffJS_profSample(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int) {
     jeffJS_profTick = false
     jeffJS_profTotal += 1
     let leaf = jeffJS_profName(ctx, fb)
@@ -75,11 +75,11 @@ func jeffJS_profSample(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc:
 
 /// Lazily starts the ticker (first call from callInternal).
 @inline(__always)
-func jeffJS_profEnsureStarted() {
+nonisolated func jeffJS_profEnsureStarted() {
     if !jeffJS_profStarted { jeffJS_profStart() }
 }
 
-func jeffJS_profDump(label: String) {
+nonisolated func jeffJS_profDump(label: String) {
     guard jeffJS_profTotal > 0 else { return }
     var out = "[jsprof] \(label) samples=\(jeffJS_profTotal)\n[jsprof] == self (function)\n"
     for (k, v) in jeffJS_profSelf.sorted(by: { $0.value > $1.value }).prefix(45) {

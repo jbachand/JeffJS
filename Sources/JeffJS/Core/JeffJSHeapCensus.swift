@@ -24,7 +24,7 @@ nonisolated(unsafe) var jeffJS_heapCensusRunGC = false
 /// (refCount minus in-heap edges): a steady excess there is a refcount leak.
 nonisolated(unsafe) var jeffJS_heapCensusRefs: [String] = []
 
-func jeffJS_bootstrapHeapCensus() {
+nonisolated func jeffJS_bootstrapHeapCensus() {
     let env = ProcessInfo.processInfo.environment
     jeffJS_heapCensusInterval = env["JEFFJS_HEAP_CENSUS_S"].flatMap(Double.init) ?? 0
     jeffJS_heapCensusRunGC = env["JEFFJS_HEAP_CENSUS_GC"] == "1"
@@ -33,13 +33,13 @@ func jeffJS_bootstrapHeapCensus() {
 
 /// Called at the start of every top-level native -> JS call.
 @inline(__always)
-func jeffJS_heapCensusTick(_ rt: JeffJSRuntime) {
+nonisolated func jeffJS_heapCensusTick(_ rt: JeffJSRuntime) {
     guard jeffJS_heapCensusInterval > 0 else { return }
     jeffJS_heapCensusTickSlow(rt)
 }
 
 @inline(never)
-func jeffJS_heapCensusTickSlow(_ rt: JeffJSRuntime) {
+nonisolated func jeffJS_heapCensusTickSlow(_ rt: JeffJSRuntime) {
     rt.heapCensusCalls += 1
     let now = CFAbsoluteTimeGetCurrent()
     if rt.heapCensusLastTime == 0 { rt.heapCensusLastTime = now; rt.heapCensusStartTime = now }
@@ -51,7 +51,7 @@ func jeffJS_heapCensusTickSlow(_ rt: JeffJSRuntime) {
     fflush(stdout)
 }
 
-extension JeffJSRuntime {
+nonisolated extension JeffJSRuntime {
     /// Live GC objects by kind (see the file header). Keys are stable across
     /// calls, so two censuses can be diffed.
     public func heapCensus() -> [String: Int] {

@@ -37,7 +37,7 @@ import Foundation
 
 /// Either a resolved option record or the JS exception to propagate.
 /// (`Result` needs `Error` conformance, which a raw `JeffJSValue` has not.)
-enum JeffJSIntlResolve<T> {
+nonisolated enum JeffJSIntlResolve<T> {
     case ok(T)
     case failed(JeffJSValue)
 }

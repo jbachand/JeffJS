@@ -11,7 +11,7 @@
 import Foundation
 
 /// A cache entry: the quantum key(s) plus metadata needed to decode.
-struct QuantumCacheEntry: Codable {
+nonisolated struct QuantumCacheEntry: Codable {
     let keys: [UInt32]
     let messageLength: Int
     let seedOffset: Int

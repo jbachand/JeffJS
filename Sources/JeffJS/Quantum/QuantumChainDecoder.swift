@@ -21,7 +21,7 @@ import Foundation
 /// Not actor-isolated: pure compute that owns its own field cache.
 /// Create a fresh decoder per background task to keep cache access
 /// thread-confined.
-final class QuantumChainDecoder {
+nonisolated final class QuantumChainDecoder {
 
     private let field = QuantumChainField()
     private let encoder = QuantumChainEncoder()  // reused for cellBit() helper

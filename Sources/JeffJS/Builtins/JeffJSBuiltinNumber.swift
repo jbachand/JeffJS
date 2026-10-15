@@ -11,7 +11,7 @@ import Foundation
 
 // MARK: - JeffJSContext helpers for Number/Boolean builtins
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
     /// Create an object with a given class ID (delegates to newObjectClass).
     func newObject(classID: Int) -> JeffJSValue {
         return newObjectClass(classID: classID)
@@ -172,7 +172,7 @@ extension JeffJSContext {
 
 // MARK: - JeffJSBuiltinNumber
 
-struct JeffJSBuiltinNumber {
+nonisolated struct JeffJSBuiltinNumber {
 
     // MARK: - IEEE 754 Constants
 
@@ -844,7 +844,7 @@ struct JeffJSBuiltinNumber {
 
 // MARK: - JeffJSBuiltinBoolean
 
-struct JeffJSBuiltinBoolean {
+nonisolated struct JeffJSBuiltinBoolean {
 
     // MARK: - Intrinsic Registration
 
@@ -948,7 +948,7 @@ struct JeffJSBuiltinBoolean {
 
 // MARK: - JeffJSBuiltinBigInt
 
-struct JeffJSBuiltinBigInt {
+nonisolated struct JeffJSBuiltinBigInt {
 
     /// `this` as a BigInt primitive, unwrapping a `BigInt` wrapper object.
     /// Returns `.exception` (without throwing) when `this` is neither.
@@ -1055,7 +1055,7 @@ struct JeffJSBuiltinBigInt {
 /// when the decimal exponent n is in (-6, 21], exponent form otherwise, and
 /// the exponent written without zero padding). Swift's own layout differs:
 /// "1e-07" for 1e-7, "1e+20" for 1e20 (JS: "100000000000000000000").
-func jeffJS_formatDoubleJS(_ d: Double) -> String {
+nonisolated func jeffJS_formatDoubleJS(_ d: Double) -> String {
     let negative = d < 0
     let s = "\(Swift.abs(d))"
     var mant = Substring(s)
@@ -1100,7 +1100,7 @@ func jeffJS_formatDoubleJS(_ d: Double) -> String {
 /// N / 2^scaleBits, N in little-endian 32-bit limbs. Every double below 2 is
 /// exact here (the smallest half-gap is 2^-1075), and multiplying by a radix
 /// (≤ 36) only grows the integer bits the loop floors away.
-struct RadixFixedPoint {
+nonisolated struct RadixFixedPoint {
     static let scaleBits = 1088          // 34 limbs of fraction
     static let limbCount = 36            // + 2 limbs of integer headroom
     var limbs: [UInt32]

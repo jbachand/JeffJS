@@ -14,7 +14,7 @@ import Foundation
 // MARK: - StabilizerState
 
 /// Stabilizer state represented by a (2N) x (2N+1) binary tableau.
-final class StabilizerState {
+nonisolated final class StabilizerState {
 
     let n: Int
     /// 2N rows, each with 2N+1 columns: [x0..xN-1, z0..zN-1, phase].

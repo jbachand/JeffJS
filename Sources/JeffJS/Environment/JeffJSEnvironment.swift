@@ -15,7 +15,7 @@ import CoreGraphics  // CGRect/CGPoint/CGSize geometry helpers for the layout-re
 // MARK: - Eval Result
 
 /// Result of evaluating JavaScript in a JeffJSEnvironment.
-public enum JeffJSEvalResult {
+nonisolated public enum JeffJSEvalResult {
     case success(String?)
     case exception(String)
 }

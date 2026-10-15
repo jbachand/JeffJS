@@ -16,7 +16,7 @@ import Foundation
 /// A complex number stored as two `Float` values. Memory layout matches
 /// Metal's `float2` (two contiguous 32-bit floats), so arrays of Complex64
 /// can be blitted to/from GPU buffers without conversion.
-struct Complex64: Equatable {
+nonisolated struct Complex64: Equatable {
     var real: Float
     var imag: Float
 
@@ -97,7 +97,7 @@ struct Complex64: Equatable {
 /// stride-based pair iteration. For an N-qubit register and a gate on
 /// qubit `q`, we iterate over all index pairs `(i0, i1)` that differ only
 /// in bit `q`. This is O(2^N) per gate, the theoretical minimum.
-final class QuantumState {
+nonisolated final class QuantumState {
 
     let numQubits: Int
     let dimension: Int

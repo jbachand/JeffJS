@@ -16,13 +16,13 @@ import Foundation
 // MARK: - Proxy Chain Resolution Limit
 
 /// Maximum number of proxy chain resolutions (prevents infinite loops).
-private let JS_MAX_PROXY_CHAIN = 1000
+nonisolated(unsafe) private let JS_MAX_PROXY_CHAIN = 1000
 
 // MARK: - Proxy Helpers
 
 /// Extract JSProxyData from a proxy object, checking for revocation.
 /// Returns nil and throws TypeError if the proxy is revoked.
-private func getProxyData(_ ctx: JeffJSContext,
+nonisolated private func getProxyData(_ ctx: JeffJSContext,
                           _ obj: JeffJSObject) -> JeffJSProxyData? {
     guard obj.classID == JeffJSClassID.proxy.rawValue else { return nil }
     guard case .proxyData(let pd) = obj.payload else { return nil }
@@ -35,7 +35,7 @@ private func getProxyData(_ ctx: JeffJSContext,
 
 /// Resolve through a chain of proxies to find the ultimate target.
 /// Returns nil and throws TypeError if the chain exceeds JS_MAX_PROXY_CHAIN.
-private func resolveProxyChain(_ ctx: JeffJSContext,
+nonisolated private func resolveProxyChain(_ ctx: JeffJSContext,
                                _ val: JeffJSValue) -> JeffJSValue {
     var current = val
     var depth = 0
@@ -59,7 +59,7 @@ private func resolveProxyChain(_ ctx: JeffJSContext,
 /// Look up a trap method on the handler. Returns .undefined if the handler
 /// does not define the named trap (which means the operation falls through
 /// to the target).
-private func getTrap(_ ctx: JeffJSContext,
+nonisolated private func getTrap(_ ctx: JeffJSContext,
                      _ handler: JeffJSValue,
                      _ trapName: UInt32) -> JeffJSValue {
     guard let handlerObj = handler.toObject() else { return .undefined }
@@ -79,7 +79,7 @@ private func getTrap(_ ctx: JeffJSContext,
 /// Cannot be called without `new`.
 ///
 /// Mirrors `js_proxy_constructor` in QuickJS.
-func js_proxy_constructor(_ ctx: JeffJSContext,
+nonisolated func js_proxy_constructor(_ ctx: JeffJSContext,
                           _ newTarget: JeffJSValue,
                           _ argv: [JeffJSValue],
                           _ isConstructorCall: Bool) -> JeffJSValue {
@@ -104,7 +104,7 @@ func js_proxy_constructor(_ ctx: JeffJSContext,
 }
 
 /// Internal proxy creation. Mirrors `JS_CreateProxy` in QuickJS.
-private func js_create_proxy(_ ctx: JeffJSContext,
+nonisolated private func js_create_proxy(_ ctx: JeffJSContext,
                              target: JeffJSValue,
                              handler: JeffJSValue) -> JeffJSValue {
     // Determine if the target is callable (proxy inherits callability).
@@ -138,7 +138,7 @@ private func js_create_proxy(_ ctx: JeffJSContext,
 /// Proxy.revocable(target, handler) - creates {proxy, revoke} pair.
 ///
 /// Mirrors `js_proxy_revocable` in QuickJS.
-func js_proxy_revocable(_ ctx: JeffJSContext,
+nonisolated func js_proxy_revocable(_ ctx: JeffJSContext,
                         _ thisVal: JeffJSValue,
                         _ argv: [JeffJSValue]) -> JeffJSValue {
     guard argv.count >= 2 else {
@@ -187,7 +187,7 @@ private nonisolated final class ProxyRevokeData {
 }
 
 /// The actual revoke function body.
-func js_proxy_revoke_func(_ ctx: JeffJSContext,
+nonisolated func js_proxy_revoke_func(_ ctx: JeffJSContext,
                           _ thisVal: JeffJSValue,
                           _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let obj = thisVal.toObject(),
@@ -221,7 +221,7 @@ func js_proxy_revoke_func(_ ctx: JeffJSContext,
 // MARK: - 13 Proxy Traps (Exotic Methods)
 
 /// 1. getPrototypeOf trap.
-func js_proxy_getPrototypeOf(_ ctx: JeffJSContext,
+nonisolated func js_proxy_getPrototypeOf(_ ctx: JeffJSContext,
                              _ proxyObj: JeffJSObject) -> JeffJSValue {
     guard let pd = getProxyData(ctx, proxyObj) else { return .exception }
 
@@ -245,7 +245,7 @@ func js_proxy_getPrototypeOf(_ ctx: JeffJSContext,
 }
 
 /// 2. setPrototypeOf trap.
-func js_proxy_setPrototypeOf(_ ctx: JeffJSContext,
+nonisolated func js_proxy_setPrototypeOf(_ ctx: JeffJSContext,
                              _ proxyObj: JeffJSObject,
                              _ proto: JeffJSValue) -> JeffJSValue {
     guard let pd = getProxyData(ctx, proxyObj) else { return .exception }
@@ -266,7 +266,7 @@ func js_proxy_setPrototypeOf(_ ctx: JeffJSContext,
 }
 
 /// 3. isExtensible trap.
-func js_proxy_isExtensible(_ ctx: JeffJSContext,
+nonisolated func js_proxy_isExtensible(_ ctx: JeffJSContext,
                            _ proxyObj: JeffJSObject) -> JeffJSValue {
     guard let pd = getProxyData(ctx, proxyObj) else { return .exception }
 
@@ -285,7 +285,7 @@ func js_proxy_isExtensible(_ ctx: JeffJSContext,
 }
 
 /// 4. preventExtensions trap.
-func js_proxy_preventExtensions(_ ctx: JeffJSContext,
+nonisolated func js_proxy_preventExtensions(_ ctx: JeffJSContext,
                                 _ proxyObj: JeffJSObject) -> JeffJSValue {
     guard let pd = getProxyData(ctx, proxyObj) else { return .exception }
 
@@ -304,7 +304,7 @@ func js_proxy_preventExtensions(_ ctx: JeffJSContext,
 }
 
 /// 5. getOwnPropertyDescriptor trap.
-func js_proxy_getOwnPropertyDescriptor(_ ctx: JeffJSContext,
+nonisolated func js_proxy_getOwnPropertyDescriptor(_ ctx: JeffJSContext,
                                        _ proxyObj: JeffJSObject,
                                        _ atom: UInt32) -> JeffJSValue {
     guard let pd = getProxyData(ctx, proxyObj) else { return .exception }
@@ -356,7 +356,7 @@ func js_proxy_getOwnPropertyDescriptor(_ ctx: JeffJSContext,
 }
 
 /// 6. defineProperty trap.
-func js_proxy_defineProperty(_ ctx: JeffJSContext,
+nonisolated func js_proxy_defineProperty(_ ctx: JeffJSContext,
                              _ proxyObj: JeffJSObject,
                              _ atom: UInt32,
                              _ desc: JeffJSValue,
@@ -386,7 +386,7 @@ func js_proxy_defineProperty(_ ctx: JeffJSContext,
 }
 
 /// 7. has trap (used by `in` operator).
-func js_proxy_has(_ ctx: JeffJSContext,
+nonisolated func js_proxy_has(_ ctx: JeffJSContext,
                   _ proxyObj: JeffJSObject,
                   _ atom: UInt32) -> JeffJSValue {
     guard let pd = getProxyData(ctx, proxyObj) else { return .exception }
@@ -416,7 +416,7 @@ func js_proxy_has(_ ctx: JeffJSContext,
 }
 
 /// 8. get trap.
-func js_proxy_get(_ ctx: JeffJSContext,
+nonisolated func js_proxy_get(_ ctx: JeffJSContext,
                   _ proxyObj: JeffJSObject,
                   _ atom: UInt32,
                   _ receiver: JeffJSValue) -> JeffJSValue {
@@ -445,7 +445,7 @@ func js_proxy_get(_ ctx: JeffJSContext,
 }
 
 /// 9. set trap.
-func js_proxy_set(_ ctx: JeffJSContext,
+nonisolated func js_proxy_set(_ ctx: JeffJSContext,
                   _ proxyObj: JeffJSObject,
                   _ atom: UInt32,
                   _ value: JeffJSValue,
@@ -482,7 +482,7 @@ func js_proxy_set(_ ctx: JeffJSContext,
 }
 
 /// 10. deleteProperty trap.
-func js_proxy_deleteProperty(_ ctx: JeffJSContext,
+nonisolated func js_proxy_deleteProperty(_ ctx: JeffJSContext,
                              _ proxyObj: JeffJSObject,
                              _ atom: UInt32) -> JeffJSValue {
     guard let pd = getProxyData(ctx, proxyObj) else { return .exception }
@@ -511,7 +511,7 @@ func js_proxy_deleteProperty(_ ctx: JeffJSContext,
 }
 
 /// 11. ownKeys trap.
-func js_proxy_ownKeys(_ ctx: JeffJSContext,
+nonisolated func js_proxy_ownKeys(_ ctx: JeffJSContext,
                       _ proxyObj: JeffJSObject) -> JeffJSValue {
     guard let pd = getProxyData(ctx, proxyObj) else { return .exception }
 
@@ -545,7 +545,7 @@ func js_proxy_ownKeys(_ ctx: JeffJSContext,
 /// Object.keys / Object.getOwnPropertyNames / Reflect.ownKeys / for-in /
 /// JSON.stringify read a proxy through this; they used to walk the proxy
 /// object's own (empty) shape and saw nothing.
-func jeffJS_proxyOwnKeys(_ ctx: JeffJSContext, _ proxyObj: JeffJSObject,
+nonisolated func jeffJS_proxyOwnKeys(_ ctx: JeffJSContext, _ proxyObj: JeffJSObject,
                          strings: Bool, symbols: Bool, enumerableOnly: Bool) -> [JeffJSValue]? {
     let list = js_proxy_ownKeys(ctx, proxyObj)
     if list.isException { return nil }
@@ -592,7 +592,7 @@ func jeffJS_proxyOwnKeys(_ ctx: JeffJSContext, _ proxyObj: JeffJSObject,
 }
 
 /// 12. apply trap (for callable proxies).
-func js_proxy_apply(_ ctx: JeffJSContext,
+nonisolated func js_proxy_apply(_ ctx: JeffJSContext,
                     _ proxyObj: JeffJSObject,
                     _ thisArg: JeffJSValue,
                     _ argv: [JeffJSValue]) -> JeffJSValue {
@@ -616,7 +616,7 @@ func js_proxy_apply(_ ctx: JeffJSContext,
 }
 
 /// 13. construct trap (for constructable proxies).
-func js_proxy_construct(_ ctx: JeffJSContext,
+nonisolated func js_proxy_construct(_ ctx: JeffJSContext,
                         _ proxyObj: JeffJSObject,
                         _ argv: [JeffJSValue],
                         _ newTarget: JeffJSValue) -> JeffJSValue {
@@ -652,7 +652,7 @@ func js_proxy_construct(_ ctx: JeffJSContext,
 /// Installed on the JS_CLASS_PROXY class definition.
 ///
 /// Mirrors the JSExoticMethods setup in `js_proxy_exotic_methods` in QuickJS.
-let js_proxy_exotic_methods: JeffJSExoticMethods = {
+nonisolated(unsafe) let js_proxy_exotic_methods: JeffJSExoticMethods = {
     var m = JeffJSExoticMethods()
     m.getOwnProperty = { ctx, obj, atom in
         // Dispatch to getOwnPropertyDescriptor trap.
@@ -703,7 +703,7 @@ let js_proxy_exotic_methods: JeffJSExoticMethods = {
 // MARK: - Proxy GC Support
 
 /// Finalizer for Proxy objects. Releases target and handler.
-func js_proxy_finalizer(_ rt: JeffJSRuntime, _ val: JeffJSValue) {
+nonisolated func js_proxy_finalizer(_ rt: JeffJSRuntime, _ val: JeffJSValue) {
     guard let obj = val.toObject(),
           obj.classID == JeffJSClassID.proxy.rawValue,
           case .proxyData(var pd) = obj.payload else { return }
@@ -716,7 +716,7 @@ func js_proxy_finalizer(_ rt: JeffJSRuntime, _ val: JeffJSValue) {
 }
 
 /// GC mark function for Proxy objects.
-func js_proxy_mark(_ rt: JeffJSRuntime,
+nonisolated func js_proxy_mark(_ rt: JeffJSRuntime,
                    _ val: JeffJSValue,
                    _ markFunc: (JeffJSValue) -> Void) {
     guard let obj = val.toObject(),
@@ -731,7 +731,7 @@ func js_proxy_mark(_ rt: JeffJSRuntime,
 // MARK: - Reflect Static Methods
 
 /// Reflect.apply(target, thisArg, argumentsList)
-func js_reflect_apply(_ ctx: JeffJSContext,
+nonisolated func js_reflect_apply(_ ctx: JeffJSContext,
                       _ thisVal: JeffJSValue,
                       _ argv: [JeffJSValue]) -> JeffJSValue {
     guard argv.count >= 3 else {
@@ -764,7 +764,7 @@ func js_reflect_apply(_ ctx: JeffJSContext,
 }
 
 /// Reflect.construct(target, argumentsList [, newTarget])
-func js_reflect_construct(_ ctx: JeffJSContext,
+nonisolated func js_reflect_construct(_ ctx: JeffJSContext,
                           _ thisVal: JeffJSValue,
                           _ argv: [JeffJSValue]) -> JeffJSValue {
     guard argv.count >= 2 else {
@@ -788,7 +788,7 @@ func js_reflect_construct(_ ctx: JeffJSContext,
 }
 
 /// Reflect.defineProperty(target, propertyKey, attributes)
-func js_reflect_defineProperty(_ ctx: JeffJSContext,
+nonisolated func js_reflect_defineProperty(_ ctx: JeffJSContext,
                                _ thisVal: JeffJSValue,
                                _ argv: [JeffJSValue]) -> JeffJSValue {
     guard argv.count >= 3 else {
@@ -802,7 +802,7 @@ func js_reflect_defineProperty(_ ctx: JeffJSContext,
 }
 
 /// Reflect.deleteProperty(target, propertyKey)
-func js_reflect_deleteProperty(_ ctx: JeffJSContext,
+nonisolated func js_reflect_deleteProperty(_ ctx: JeffJSContext,
                                _ thisVal: JeffJSValue,
                                _ argv: [JeffJSValue]) -> JeffJSValue {
     guard argv.count >= 2 else {
@@ -816,7 +816,7 @@ func js_reflect_deleteProperty(_ ctx: JeffJSContext,
 }
 
 /// Reflect.get(target, propertyKey [, receiver])
-func js_reflect_get(_ ctx: JeffJSContext,
+nonisolated func js_reflect_get(_ ctx: JeffJSContext,
                     _ thisVal: JeffJSValue,
                     _ argv: [JeffJSValue]) -> JeffJSValue {
     guard argv.count >= 2 else {
@@ -840,7 +840,7 @@ func js_reflect_get(_ ctx: JeffJSContext,
 }
 
 /// Reflect.getOwnPropertyDescriptor(target, propertyKey)
-func js_reflect_getOwnPropertyDescriptor(_ ctx: JeffJSContext,
+nonisolated func js_reflect_getOwnPropertyDescriptor(_ ctx: JeffJSContext,
                                          _ thisVal: JeffJSValue,
                                          _ argv: [JeffJSValue]) -> JeffJSValue {
     guard argv.count >= 2 else {
@@ -856,7 +856,7 @@ func js_reflect_getOwnPropertyDescriptor(_ ctx: JeffJSContext,
 }
 
 /// Reflect.getPrototypeOf(target)
-func js_reflect_getPrototypeOf(_ ctx: JeffJSContext,
+nonisolated func js_reflect_getPrototypeOf(_ ctx: JeffJSContext,
                                _ thisVal: JeffJSValue,
                                _ argv: [JeffJSValue]) -> JeffJSValue {
     guard !argv.isEmpty else {
@@ -875,7 +875,7 @@ func js_reflect_getPrototypeOf(_ ctx: JeffJSContext,
 }
 
 /// Reflect.has(target, propertyKey) - equivalent to `key in target`.
-func js_reflect_has(_ ctx: JeffJSContext,
+nonisolated func js_reflect_has(_ ctx: JeffJSContext,
                     _ thisVal: JeffJSValue,
                     _ argv: [JeffJSValue]) -> JeffJSValue {
     guard argv.count >= 2 else {
@@ -889,7 +889,7 @@ func js_reflect_has(_ ctx: JeffJSContext,
 }
 
 /// Reflect.isExtensible(target)
-func js_reflect_isExtensible(_ ctx: JeffJSContext,
+nonisolated func js_reflect_isExtensible(_ ctx: JeffJSContext,
                              _ thisVal: JeffJSValue,
                              _ argv: [JeffJSValue]) -> JeffJSValue {
     guard !argv.isEmpty else {
@@ -903,7 +903,7 @@ func js_reflect_isExtensible(_ ctx: JeffJSContext,
 }
 
 /// Reflect.ownKeys(target)
-func js_reflect_ownKeys(_ ctx: JeffJSContext,
+nonisolated func js_reflect_ownKeys(_ ctx: JeffJSContext,
                         _ thisVal: JeffJSValue,
                         _ argv: [JeffJSValue]) -> JeffJSValue {
     guard !argv.isEmpty else {
@@ -939,7 +939,7 @@ func js_reflect_ownKeys(_ ctx: JeffJSContext,
 }
 
 /// Reflect.preventExtensions(target)
-func js_reflect_preventExtensions(_ ctx: JeffJSContext,
+nonisolated func js_reflect_preventExtensions(_ ctx: JeffJSContext,
                                   _ thisVal: JeffJSValue,
                                   _ argv: [JeffJSValue]) -> JeffJSValue {
     guard !argv.isEmpty else {
@@ -954,7 +954,7 @@ func js_reflect_preventExtensions(_ ctx: JeffJSContext,
 }
 
 /// Reflect.set(target, propertyKey, value [, receiver])
-func js_reflect_set(_ ctx: JeffJSContext,
+nonisolated func js_reflect_set(_ ctx: JeffJSContext,
                     _ thisVal: JeffJSValue,
                     _ argv: [JeffJSValue]) -> JeffJSValue {
     guard argv.count >= 3 else {
@@ -968,7 +968,7 @@ func js_reflect_set(_ ctx: JeffJSContext,
 }
 
 /// Reflect.setPrototypeOf(target, proto)
-func js_reflect_setPrototypeOf(_ ctx: JeffJSContext,
+nonisolated func js_reflect_setPrototypeOf(_ ctx: JeffJSContext,
                                _ thisVal: JeffJSValue,
                                _ argv: [JeffJSValue]) -> JeffJSValue {
     guard argv.count >= 2 else {
@@ -989,13 +989,13 @@ func js_reflect_setPrototypeOf(_ ctx: JeffJSContext,
 
 /// Reflect method registration table.
 /// Mirrors `js_reflect_funcs` in QuickJS.
-struct JSReflectFuncEntry {
+nonisolated struct JSReflectFuncEntry {
     let name: String
     let length: Int
     let func_: (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue
 }
 
-let js_reflect_funcs: [JSReflectFuncEntry] = [
+nonisolated(unsafe) let js_reflect_funcs: [JSReflectFuncEntry] = [
     JSReflectFuncEntry(name: "apply",                      length: 3, func_: js_reflect_apply),
     JSReflectFuncEntry(name: "construct",                  length: 2, func_: js_reflect_construct),
     JSReflectFuncEntry(name: "defineProperty",             length: 3, func_: js_reflect_defineProperty),
@@ -1014,7 +1014,7 @@ let js_reflect_funcs: [JSReflectFuncEntry] = [
 // MARK: - Proxy Class Definition
 
 /// Class definition for JS_CLASS_PROXY.
-let js_proxy_class: JeffJSClass = {
+nonisolated(unsafe) let js_proxy_class: JeffJSClass = {
     var c = JeffJSClass()
     c.classNameAtom = 0 // Set to Proxy atom at init time
     c.finalizer = js_proxy_finalizer

@@ -40,7 +40,7 @@ import Foundation
 // MARK: - Listener Record
 
 /// One registered listener (DOM "event listener" struct).
-private final class JeffJSEventListenerRecord {
+nonisolated private final class JeffJSEventListenerRecord {
     let listener: JeffJSValue       // owned: function or object with handleEvent
     let capture: Bool
     let once: Bool
@@ -70,7 +70,7 @@ private final class JeffJSEventListenerRecord {
 // MARK: - Listener Store
 
 /// targetKey -> event type -> listener list (registration order).
-private final class JeffJSEventListenerStore {
+nonisolated private final class JeffJSEventListenerStore {
     private var store: [String: [String: [JeffJSEventListenerRecord]]] = [:]
 
     /// A snapshot (clone) of the listener list — what dispatch iterates.
@@ -121,7 +121,7 @@ private final class JeffJSEventListenerStore {
 // MARK: - Dispatch Frame
 
 /// State of one in-progress dispatch (DOM "dispatch flag" + event path).
-private final class JeffJSEventDispatchFrame {
+nonisolated private final class JeffJSEventDispatchFrame {
     let event: JeffJSValue          // owned
     let path: [JeffJSValue]         // owned
     /// > 0 while a passive listener runs ("in passive listener flag").

@@ -14,7 +14,7 @@
 
 import Foundation
 
-extension JeffJSObject {
+nonisolated extension JeffJSObject {
     /// Clear [[Extensible]]. Arrays also switch their element writes to the
     /// checked path, since adding an element is now an error.
     func makeNonExtensible() {
@@ -23,7 +23,7 @@ extension JeffJSObject {
     }
 }
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
 
     /// A failed [[Set]]: releases the consumed value and throws only when
     /// the caller asked for it (strict code, `Set(O, P, V, true)`).

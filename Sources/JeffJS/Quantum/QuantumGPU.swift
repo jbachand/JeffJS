@@ -9,7 +9,7 @@ import Foundation
 import Metal
 
 /// GPU-accelerated search over the quantum field.
-final class QuantumGPU {
+nonisolated final class QuantumGPU {
 
     private let device: MTLDevice
     private let queue: MTLCommandQueue

@@ -8,7 +8,7 @@ import Synchronization
 // MARK: - Forward references
 
 /// Forward reference for `JeffJSShape` (defined in a separate file).
-protocol JeffJSShapeProtocol: AnyObject {
+nonisolated protocol JeffJSShapeProtocol: AnyObject {
     var propCount: Int { get }
     var propHashEnd: Int { get }
     var proto: JeffJSObject? { get set }
@@ -21,7 +21,7 @@ protocol JeffJSShapeProtocol: AnyObject {
 // JeffJSShape is now a concrete final class defined in JeffJSShape.swift.
 
 /// Forward reference for `JeffJSContext`.
-protocol JeffJSContextRef: JeffJSContextProtocol {
+nonisolated protocol JeffJSContextRef: JeffJSContextProtocol {
     func throwOutOfMemory() -> JeffJSValue
     func throwTypeError(_ msg: String) -> JeffJSValue
 }
@@ -33,7 +33,7 @@ protocol JeffJSContextRef: JeffJSContextProtocol {
 
 /// Monomorphic inline cache entry for property access.
 /// Caches the shape identity + property offset for O(1) repeated lookups.
-struct JeffJSICEntry {
+nonisolated struct JeffJSICEntry {
     // Layout (perf/watch-object-size): 40 bytes, was 56. pc/offset are 32-bit
     // and a transition entry's successor shape and a prototype entry's holder
     // shape share one slot (an entry is one or the other: `holderPtr` says
@@ -96,7 +96,7 @@ struct JeffJSICEntry {
 
 /// Read through a prototype-chain IC entry. nil on any mismatch.
 @inline(__always)
-func jeffJS_icProtoHit(_ entry: JeffJSICEntry) -> JeffJSValue? {
+nonisolated func jeffJS_icProtoHit(_ entry: JeffJSICEntry) -> JeffJSValue? {
     guard let hp = entry.holderPtr, let hsp = entry.holderShapePtr else { return nil }
     return Unmanaged<JeffJSObject>.fromOpaque(hp)._withUnsafeGuaranteedRef { h -> JeffJSValue? in
         guard h.shapeIdentity == hsp, entry.propOffset >= 0,
@@ -118,7 +118,7 @@ func jeffJS_icProtoHit(_ entry: JeffJSICEntry) -> JeffJSValue? {
 /// bytecode the table was built for — the invariant the 2026-09-29 audit
 /// established for every site (`entry.pc == pc` still guards each hit).
 @inline(__always)
-func jeffJS_icSlot(_ ents: UnsafeMutablePointer<JeffJSICEntry>, _ pc: Int) -> Int {
+nonisolated func jeffJS_icSlot(_ ents: UnsafeMutablePointer<JeffJSICEntry>, _ pc: Int) -> Int {
     return Int(UnsafeRawPointer(ents).load(fromByteOffset: -2 &- (pc &<< 1), as: UInt16.self))
 }
 
@@ -476,7 +476,7 @@ nonisolated final class JeffJSSourceText {
 
 /// A JS string from UTF-8 bytes: Latin-1 storage when every code point fits
 /// (ASCII is a straight copy), UTF-16 otherwise.
-func jeffJS_stringFromUTF8(_ u: UnsafeBufferPointer<UInt8>) -> JeffJSString {
+nonisolated func jeffJS_stringFromUTF8(_ u: UnsafeBufferPointer<UInt8>) -> JeffJSString {
     var acc: UInt8 = 0
     for b in u { acc |= b }
     if acc < 0x80 {
@@ -498,7 +498,7 @@ func jeffJS_stringFromUTF8(_ u: UnsafeBufferPointer<UInt8>) -> JeffJSString {
 
 /// How to re-parse one lazily compiled function (recorded by the parser
 /// when the function was first parsed, see JeffJSParser.recordLazySeed).
-struct JeffJSLazySeed {
+nonisolated struct JeffJSLazySeed {
     enum Kind: UInt8 {
         /// `(params) { body }` starting at the '(' token: function
         /// declarations/expressions, object-literal and class methods,
@@ -1019,7 +1019,7 @@ nonisolated class JeffJSFunctionBytecode {
 // MARK: - Enums
 
 /// GC object type tags (mirrors QuickJS `JS_GC_OBJ_TYPE_*`).
-enum JSGCObjectTypeEnum: UInt8 {
+nonisolated enum JSGCObjectTypeEnum: UInt8 {
     case jsObject       = 0
     case functionBytecode = 1
     case shape          = 2
@@ -1034,7 +1034,7 @@ enum JSGCObjectTypeEnum: UInt8 {
 }
 
 /// QuickJS property flags (JS_PROP_*).
-struct JeffJSPropertyFlags: OptionSet {
+nonisolated struct JeffJSPropertyFlags: OptionSet {
     let rawValue: UInt32
 
     static let configurable = JeffJSPropertyFlags(rawValue: 1 << 0)
@@ -1073,7 +1073,7 @@ struct JeffJSPropertyFlags: OptionSet {
 // MARK: - C function type
 
 /// Mirrors QuickJS `JSCFunctionType`.
-enum JSCFunctionType {
+nonisolated enum JSCFunctionType {
     case generic( (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue )
     case genericMagic( (JeffJSContext, JeffJSValue, [JeffJSValue], Int) -> JeffJSValue )
     case constructor( (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue )
@@ -1138,7 +1138,7 @@ nonisolated(unsafe) var jeffJS_threadOwnersActive: Int = 0
 /// The runtime objects created on this thread belong to (a background
 /// compile's), or nil.
 @inline(never)
-func jeffJS_threadOwnerRuntime() -> JeffJSRuntime? {
+nonisolated func jeffJS_threadOwnerRuntime() -> JeffJSRuntime? {
     guard let p = pthread_getspecific(jeffJS_threadOwnerKey) else { return nil }
     return Unmanaged<JeffJSRuntime>.fromOpaque(p).takeUnretainedValue()
 }
@@ -1346,7 +1346,7 @@ nonisolated class JeffJSGCObjectHeader {
 // MARK: - Supporting structs
 
 /// Bound function data (`js_bound_function`).
-struct JeffJSBoundFunction {
+nonisolated struct JeffJSBoundFunction {
     var funcObj: JeffJSValue
     var thisVal: JeffJSValue
     var argc: Int
@@ -1423,7 +1423,7 @@ nonisolated final class JeffJSTypedArray {
 }
 
 /// Proxy data (`JSProxyData`).
-struct JeffJSProxyData {
+nonisolated struct JeffJSProxyData {
     var target: JeffJSValue
     var handler: JeffJSValue
     var isFunc: Bool
@@ -1441,7 +1441,7 @@ struct JeffJSProxyData {
 }
 
 /// Promise reaction types.
-enum JeffJSPromiseStateEnum: UInt8 {
+nonisolated enum JeffJSPromiseStateEnum: UInt8 {
     case pending   = 0
     case fulfilled = 1
     case rejected  = 2
@@ -1472,7 +1472,7 @@ nonisolated final class JeffJSAsyncFunctionState {
 }
 
 /// Generator state.
-enum JeffJSGeneratorStateEnum: UInt8 {
+nonisolated enum JeffJSGeneratorStateEnum: UInt8 {
     case suspended_start  = 0
     case suspended_yield  = 1
     case suspended_yield_star = 2
@@ -1484,7 +1484,7 @@ enum JeffJSGeneratorStateEnum: UInt8 {
 /// When a generator yields, the entire execution context (program counter,
 /// stack, locals, arguments) is captured here so that `.next()` can
 /// re-enter the dispatch loop at the exact point where it left off.
-struct GeneratorSavedState {
+nonisolated struct GeneratorSavedState {
     var pc: Int
     var sp: Int
     var stack: [JeffJSValue]
@@ -1643,7 +1643,7 @@ nonisolated final class JeffJSGlobalObject {
 }
 
 /// Global variable definition.
-struct JeffJSGlobalVarDef {
+nonisolated struct JeffJSGlobalVarDef {
     var flags: UInt8 = 0
     var atom: UInt32 = 0
 }
@@ -1904,7 +1904,7 @@ nonisolated final class JeffJSStackFrame {
 }
 
 /// Shape property descriptor (one per own-property slot in the shape).
-struct JeffJSShapeProperty {
+nonisolated struct JeffJSShapeProperty {
     var hashNext: UInt32 = 0
     var flags: JeffJSPropertyFlags = []
     var atom: UInt32 = 0
@@ -1918,7 +1918,7 @@ struct JeffJSShapeProperty {
 // MARK: - Object payload enum
 
 /// Union payload for `JeffJSObject`.  Mirrors the C union inside `JSObject`.
-enum JeffJSObjectPayload {
+nonisolated enum JeffJSObjectPayload {
     case opaque(Any?)
 
     case bytecodeFunc(
@@ -1982,7 +1982,7 @@ enum JeffJSObjectPayload {
 /// zero enum-witness per read); the rare accessor/varRef/autoInit cases live in
 /// a parallel `JeffJSPropertyExtra` box. Use the object's `propEntry(at:)` /
 /// `setPropEntry(at:_:)` / `appendProp(_:)` / `dataValue(at:)` helpers.
-enum JeffJSProperty {
+nonisolated enum JeffJSProperty {
     case value(JeffJSValue)
     case getset(getter: JeffJSObject?, setter: JeffJSObject?)
     case varRef(JeffJSVarRef)
@@ -1996,7 +1996,7 @@ enum JeffJSProperty {
 /// valid only until the object's property storage is next modified (the same window the
 /// `== nil` tests and short reads of the interpreter and the app's inspectors use it in). Code
 /// that calls out to JS while holding the box uses `extraStrong(at:)`.
-struct JeffJSExtraRef {
+nonisolated struct JeffJSExtraRef {
     let raw: UnsafeRawPointer
     @inline(__always) private func with<T>(_ f: (JeffJSPropertyExtra) -> T) -> T {
         Unmanaged<JeffJSPropertyExtra>.fromOpaque(raw)._withUnsafeGuaranteedRef(f)
@@ -2921,7 +2921,7 @@ nonisolated final class JeffJSObjectAux: JeffJSSideSlot {
     deinit { releaseVarRefs(); varRefsRaw?.deallocate() }
 }
 
-extension JeffJSObject {
+nonisolated extension JeffJSObject {
     /// Recycle-pool eligibility (see JeffJSObjectPool.swift): a plain,
     /// non-exotic object holding only data slots, with no weak references,
     /// function payload or auxiliary storage. Cheap field tests only.
@@ -2957,7 +2957,7 @@ extension JeffJSObject {
 
 /// Mirrors QuickJS `JS_CLASS_*` enum values.
 /// MUST match JSClassID in JeffJSConstants.swift exactly.
-enum JeffJSClassID: Int {
+nonisolated enum JeffJSClassID: Int {
     case object          = 1
     case array           = 2
     case error           = 3
@@ -3025,7 +3025,7 @@ enum JeffJSClassID: Int {
 
 /// Create a new JS object with a given prototype and class ID.
 /// Mirrors `JS_NewObjectProtoClass`.
-func jeffJS_createObject(ctx: JeffJSContext,
+nonisolated func jeffJS_createObject(ctx: JeffJSContext,
                          proto: JeffJSObject?,
                          classID: UInt16) -> JeffJSObject {
     let obj = JeffJSObject(refCount: 1, gcObjType: .jsObject, mark: false)
@@ -3069,7 +3069,7 @@ func jeffJS_createObject(ctx: JeffJSContext,
 /// True when `o` keeps its elements in the fast-array store (ref-type
 /// storage or the `.array` payload).
 @inline(__always)
-func jeffJS_isFastArray(_ o: JeffJSObject) -> Bool {
+nonisolated func jeffJS_isFastArray(_ o: JeffJSObject) -> Bool {
     if o._fastArrayValues != nil { return true }
     if case .array = o.payload { return true }
     return false
@@ -3077,7 +3077,7 @@ func jeffJS_isFastArray(_ o: JeffJSObject) -> Bool {
 
 /// Mirrors `find_own_property` in QuickJS.
 @inline(__always)
-func jeffJS_findOwnPropertyIndex(obj: JeffJSObject, atom: UInt32) -> Int {
+nonisolated func jeffJS_findOwnPropertyIndex(obj: JeffJSObject, atom: UInt32) -> Int {
     // The shape is read through its raw bits and a guaranteed reference: `guard let shape = obj.shape`
     // retained and released it on every property lookup.
     guard let sp = obj.shapeIdentity else { return -1 }
@@ -3101,7 +3101,7 @@ func jeffJS_findOwnPropertyIndex(obj: JeffJSObject, atom: UInt32) -> Int {
 
 /// `jeffJS_findOwnPropertyIndex` on a lazy payload stub (out of line).
 @inline(never)
-func jeffJS_findOwnPropertyIndexLazy(_ obj: JeffJSObject, _ atom: UInt32) -> Int {
+nonisolated func jeffJS_findOwnPropertyIndexLazy(_ obj: JeffJSObject, _ atom: UInt32) -> Int {
     jeffJS_lazyMaterialize(obj)
     guard let shape = obj.shape, let idx = findShapeProperty(shape, atom), idx < obj.propValues.count else { return -1 }
     return idx
@@ -3113,7 +3113,7 @@ func jeffJS_findOwnPropertyIndexLazy(_ obj: JeffJSObject, _ atom: UInt32) -> Int
 ///
 /// Compatibility wrapper around `jeffJS_findOwnPropertyIndex` for callers
 /// that want the descriptor pair; hot paths should use the index form.
-func jeffJS_findOwnProperty(obj: JeffJSObject,
+nonisolated func jeffJS_findOwnProperty(obj: JeffJSObject,
                              atom: UInt32) -> (JeffJSShapeProperty?, JeffJSProperty?) {
     let idx = jeffJS_findOwnPropertyIndex(obj: obj, atom: atom)
     guard idx >= 0, let shape = obj.shape else { return (nil, nil) }
@@ -3125,7 +3125,7 @@ func jeffJS_findOwnProperty(obj: JeffJSObject,
 /// table and propCount.  The caller must know the atom is not already present.
 /// Use this instead of appending to `shape.prop` directly — raw appends bypass
 /// the hash table and break `jeffJS_findOwnPropertyIndex`.
-func jeffJS_appendOwnProperty(_ ctx: JeffJSContext,
+nonisolated func jeffJS_appendOwnProperty(_ ctx: JeffJSContext,
                               _ obj: JeffJSObject,
                               atom: UInt32,
                               flags: JeffJSPropertyFlags,
@@ -3141,7 +3141,7 @@ func jeffJS_appendOwnProperty(_ ctx: JeffJSContext,
 ///
 /// Mirrors `add_property` in QuickJS.
 @discardableResult
-func jeffJS_addProperty(ctx: JeffJSContext,
+nonisolated func jeffJS_addProperty(ctx: JeffJSContext,
                          obj: JeffJSObject,
                          atom: UInt32,
                          flags: JeffJSPropertyFlags) -> JeffJSProperty? {
@@ -3190,7 +3190,7 @@ func jeffJS_addProperty(ctx: JeffJSContext,
 /// Returns `true` if the property was found and removed, `false` otherwise.
 ///
 /// Mirrors `delete_property` in QuickJS.
-func jeffJS_deleteProperty(ctx: JeffJSContext,
+nonisolated func jeffJS_deleteProperty(ctx: JeffJSContext,
                             obj: JeffJSObject,
                             atom: UInt32) -> Bool {
     guard let shape = obj.shape else { return false }
@@ -3236,7 +3236,7 @@ func jeffJS_deleteProperty(ctx: JeffJSContext,
 
 // MARK: - Object helpers
 
-extension JeffJSObject {
+nonisolated extension JeffJSObject {
 
     /// Quick check: is this object callable?
     var isCallable: Bool {
@@ -3602,7 +3602,7 @@ extension JeffJSObject {
 
 // MARK: - Debug helpers
 
-extension JeffJSObject: CustomDebugStringConvertible {
+nonisolated extension JeffJSObject: CustomDebugStringConvertible {
     var debugDescription: String {
         let className: String
         if let cid = JeffJSClassID(rawValue: classID) {
@@ -3614,7 +3614,7 @@ extension JeffJSObject: CustomDebugStringConvertible {
     }
 }
 
-extension JeffJSProperty: CustomDebugStringConvertible {
+nonisolated extension JeffJSProperty: CustomDebugStringConvertible {
     var debugDescription: String {
         switch self {
         case .value(let v):
@@ -3642,7 +3642,7 @@ extension JeffJSProperty: CustomDebugStringConvertible {
 ///   let id = handle.classID        // access property, optimizer elides ARC
 ///   handle.refCount += 1           // direct refcount manipulation
 ///   if handle === other { ... }    // identity comparison via pointer
-struct JeffJSObj {
+nonisolated struct JeffJSObj {
     let _ptr: UnsafeMutableRawPointer
 
     @inline(__always)

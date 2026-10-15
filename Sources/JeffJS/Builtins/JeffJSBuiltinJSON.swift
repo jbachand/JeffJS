@@ -12,7 +12,7 @@ import Foundation
 // MARK: - JSON Parse Token
 
 /// Token types used by the JSON lexer/parser.
-private enum JSONToken {
+nonisolated private enum JSONToken {
     case string(String)
     case number(Double)
     case lbrace        // {
@@ -88,7 +88,7 @@ private nonisolated final class JSONParseState {
 
 // MARK: - JeffJSBuiltinJSON
 
-struct JeffJSBuiltinJSON {
+nonisolated struct JeffJSBuiltinJSON {
 
     // MARK: - Intrinsic Registration
 
@@ -1112,7 +1112,7 @@ struct JeffJSBuiltinJSON {
 /// infrastructure. Methods that don't yet exist on the real JeffJSContext are
 /// defined here as stubs that will be wired up when the full context is
 /// implemented.
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
 
     // MARK: - Value Creation
 
@@ -1378,7 +1378,7 @@ extension JeffJSContext {
 
 /// UTF-8 bytes of a JS string for the JSON parser: Latin-1 storage that is
 /// all ASCII is returned as-is; otherwise code units are transcoded directly.
-func jeffJS_utf8Bytes(of js: JeffJSString) -> [UInt8] {
+nonisolated func jeffJS_utf8Bytes(of js: JeffJSString) -> [UInt8] {
     let n = js.len
     switch js.storage {
     case .str8(let b):

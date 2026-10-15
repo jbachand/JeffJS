@@ -19,7 +19,7 @@
 import Foundation
 
 /// Compact wire-format envelope for quantum-encoded data.
-struct QuantumEnvelope: Codable {
+nonisolated struct QuantumEnvelope: Codable {
     static let protocolVersion: UInt8 = 1
 
     let version: UInt8

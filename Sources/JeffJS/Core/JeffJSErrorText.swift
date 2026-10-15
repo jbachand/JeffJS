@@ -27,7 +27,7 @@ import Foundation
 
 /// A runtime error whose final text quotes the source of the instruction
 /// that raised it.
-struct JeffJSSourceAppender {
+nonisolated struct JeffJSSourceAppender {
     enum Kind { case notAnObject, notAFunction, notAConstructor }
     /// Identity of the error object the text belongs to.
     let error: ObjectIdentifier
@@ -39,7 +39,7 @@ struct JeffJSSourceAppender {
     let baseMessage: String
 }
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
 
     /// JSC `errorDescriptionForValue`: strings quoted, objects by class
     /// name, symbols by their descriptive string, the rest as ToString.

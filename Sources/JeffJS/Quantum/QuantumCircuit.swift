@@ -16,7 +16,7 @@ import Metal
 // MARK: - QuantumGate
 
 /// Describes a single gate operation applied to one or two qubits.
-enum QuantumGate {
+nonisolated enum QuantumGate {
     case h(Int)
     case x(Int)
     case y(Int)
@@ -37,7 +37,7 @@ enum QuantumGate {
 /// NOT `@JeffJSHostActor` — computation runs off the main thread via Task.
 /// Only the bridge (QuantumSimulatorBridge) is actor-confined.
 
-final class QuantumCircuit {
+nonisolated final class QuantumCircuit {
 
     // MARK: Public state
 

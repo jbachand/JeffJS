@@ -18,7 +18,7 @@
 
 import Foundation
 
-extension JeffJSPropertyFlags {
+nonisolated extension JeffJSPropertyFlags {
     /// Engine-private attribute: skipped by every own-key enumeration (see the file header).
     /// Stored in the shape next to C/W/E; kept when the property is redefined.
     static let hidden = JeffJSPropertyFlags(rawValue: 1 << 6)
@@ -30,7 +30,7 @@ extension JeffJSPropertyFlags {
     static let shadowable = JeffJSPropertyFlags(rawValue: 1 << 7)
 }
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
 
     /// Hides (or shows again) the own property `atom` of `obj`. A hidden property is also made
     /// non-enumerable (the enumerable-only paths then need no check of their own); showing it
@@ -165,7 +165,7 @@ extension JeffJSContext {
 
 // MARK: - Host-deferred own properties
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
 
     /// Defers every own property of `obj` to `materializer`, which runs (once, with the object)
     /// the first time anything reads, lists, defines, deletes or looks up an own property of

@@ -13,26 +13,26 @@ import Foundation
 
 /// Magic bits encode which collection type a shared C-function operates on.
 /// QuickJS uses `magic & 0x3` for the base type and `magic >> 2` for sub-variants.
-private let MAGIC_MAP:      Int16 = 0
+nonisolated(unsafe) private let MAGIC_MAP:      Int16 = 0
 private let MAGIC_SET:      Int16 = 1
-private let MAGIC_WEAKMAP:  Int16 = 2
+nonisolated(unsafe) private let MAGIC_WEAKMAP:  Int16 = 2
 private let MAGIC_WEAKSET:  Int16 = 3
 
 /// Sub-magic for iterator kind (shifted left by 2 and OR'd with base type).
-private let MAGIC_ITER_KEY:          Int16 = 0 << 2
+nonisolated(unsafe) private let MAGIC_ITER_KEY:          Int16 = 0 << 2
 private let MAGIC_ITER_VALUE:        Int16 = 1 << 2
-private let MAGIC_ITER_KEY_AND_VALUE: Int16 = 2 << 2
+nonisolated(unsafe) private let MAGIC_ITER_KEY_AND_VALUE: Int16 = 2 << 2
 
 // MARK: - Hash Table Constants
 
-private let JS_MAP_INITIAL_HASH_SIZE = 4
+nonisolated(unsafe) private let JS_MAP_INITIAL_HASH_SIZE = 4
 private let JS_MAP_HASH_DELETED      = -1
 
 // MARK: - SameValueZero Comparison
 
 /// SameValueZero: NaN === NaN, -0 === +0.
 /// Used by Map/Set per the ES spec for key comparison.
-private func sameValueZero(_ a: JeffJSValue, _ b: JeffJSValue) -> Bool {
+nonisolated private func sameValueZero(_ a: JeffJSValue, _ b: JeffJSValue) -> Bool {
     // BigInts compare by value, not by allocation (`m.get(2n**70n)`).
     if a.isBigInt || b.isBigInt {
         return a.isBigInt && b.isBigInt && JeffJSBigIntOps.equal(a, b)
@@ -59,7 +59,7 @@ private func sameValueZero(_ a: JeffJSValue, _ b: JeffJSValue) -> Bool {
 // MARK: - Key Normalization
 
 /// Normalize keys: -0 -> +0 (spec requirement for Map/Set).
-private func normalizeKey(_ val: JeffJSValue) -> JeffJSValue {
+nonisolated private func normalizeKey(_ val: JeffJSValue) -> JeffJSValue {
     if val.isFloat64 {
         let d = val.toFloat64()
         // Canonicalize integral doubles (including -0) to the int32
@@ -75,11 +75,11 @@ private func normalizeKey(_ val: JeffJSValue) -> JeffJSValue {
 // MARK: - Hashing
 
 /// Knuth multiplicative hash constant (golden ratio * 2^32).
-private let KNUTH_MULTIPLIER: UInt32 = 2654435769
+nonisolated(unsafe) private let KNUTH_MULTIPLIER: UInt32 = 2654435769
 
 /// Compute a hash for a JeffJSValue key.
 /// Uses Knuth multiplicative hashing, type-dispatched.
-private func mapHashKey(_ key: JeffJSValue) -> UInt32 {
+nonisolated private func mapHashKey(_ key: JeffJSValue) -> UInt32 {
     switch key.getTag() {
     case .int_:
         let v = key.toInt32()
@@ -127,7 +127,7 @@ private func mapHashKey(_ key: JeffJSValue) -> UInt32 {
 // MARK: - JSMapState Operations
 
 /// Initialize the hash table for a map state.
-private func mapStateInit(_ s: JeffJSMapState) {
+nonisolated private func mapStateInit(_ s: JeffJSMapState) {
     s.hashSize = JS_MAP_INITIAL_HASH_SIZE
     s.hashTable = [Int](repeating: -1, count: JS_MAP_INITIAL_HASH_SIZE)
     s.count = 0
@@ -136,7 +136,7 @@ private func mapStateInit(_ s: JeffJSMapState) {
 }
 
 /// Resize the hash table when the load factor exceeds 0.75.
-private func mapStateResize(_ s: JeffJSMapState) {
+nonisolated private func mapStateResize(_ s: JeffJSMapState) {
     let newSize = s.hashSize * 2
     s.hashTable = [Int](repeating: -1, count: newSize)
     s.hashSize = newSize
@@ -153,7 +153,7 @@ private func mapStateResize(_ s: JeffJSMapState) {
 }
 
 /// Find a record matching `key` in the map state. Returns the record index or -1.
-private func mapStateFind(_ s: JeffJSMapState, key: JeffJSValue) -> Int {
+nonisolated private func mapStateFind(_ s: JeffJSMapState, key: JeffJSValue) -> Int {
     guard s.hashSize > 0 else { return -1 }
     let h = Int(mapHashKey(key) % UInt32(s.hashSize))
     var idx = s.hashTable[h]
@@ -169,7 +169,7 @@ private func mapStateFind(_ s: JeffJSMapState, key: JeffJSValue) -> Int {
 
 /// Insert a new record into the map state. Returns the new record.
 /// Does NOT check for duplicates; caller is responsible.
-private func mapStateInsert(_ s: JeffJSMapState, key: JeffJSValue, value: JeffJSValue) -> JeffJSMapRecord {
+nonisolated private func mapStateInsert(_ s: JeffJSMapState, key: JeffJSValue, value: JeffJSValue) -> JeffJSMapRecord {
     // Resize if load factor > 0.75.
     if s.count * 4 >= s.hashSize * 3 {
         mapStateResize(s)
@@ -200,7 +200,7 @@ private func mapStateInsert(_ s: JeffJSMapState, key: JeffJSValue, value: JeffJS
 }
 
 /// Delete a record by index, marking it empty.
-private func mapStateDelete(_ s: JeffJSMapState, index: Int, keyOwned: Bool = true) {
+nonisolated private func mapStateDelete(_ s: JeffJSMapState, index: Int, keyOwned: Bool = true) {
     guard index >= 0 && index < s.records.count else { return }
     let rec = s.records[index]
     if rec.empty { return }
@@ -240,7 +240,7 @@ private func mapStateDelete(_ s: JeffJSMapState, index: Int, keyOwned: Bool = tr
 /// index), so a map used as a queue — set, delete, set, delete — grew its
 /// table without bound. Rebuild it once three quarters of it is holes and
 /// nothing is walking it.
-private func mapStateCompactIfSparse(_ s: JeffJSMapState) {
+nonisolated private func mapStateCompactIfSparse(_ s: JeffJSMapState) {
     let n = s.records.count
     guard n >= 32, s.count * 4 < n, s.iterating == 0 else { return }
     let live = s.records.filter { !$0.empty }
@@ -257,7 +257,7 @@ private func mapStateCompactIfSparse(_ s: JeffJSMapState) {
 }
 
 /// Clear all records in a map state.
-private func mapStateClear(_ s: JeffJSMapState) {
+nonisolated private func mapStateClear(_ s: JeffJSMapState) {
     for i in 0..<s.records.count {
         let rec = s.records[i]
         if !rec.empty {
@@ -285,7 +285,7 @@ private func mapStateClear(_ s: JeffJSMapState) {
 /// runtime, even though `map.clear()` on a surviving map freed the same
 /// records. The table is emptied before anything is released so a cascading
 /// free that re-enters the map sees a consistent, empty state.
-func jeffJS_mapStateFree(_ s: JeffJSMapState) {
+nonisolated func jeffJS_mapStateFree(_ s: JeffJSMapState) {
     guard !s.records.isEmpty else { return }
     var pending: [JeffJSValue] = []
     pending.reserveCapacity(s.count * 2)
@@ -309,7 +309,7 @@ func jeffJS_mapStateFree(_ s: JeffJSMapState) {
 
 /// Extract the JeffJSMapState payload from a value, verifying correct class ID.
 /// Returns nil and throws TypeError if invalid.
-private func getMapState(_ ctx: JeffJSContext, thisVal: JeffJSValue, classID: Int) -> JeffJSMapState? {
+nonisolated private func getMapState(_ ctx: JeffJSContext, thisVal: JeffJSValue, classID: Int) -> JeffJSMapState? {
     guard let obj = thisVal.toObject() else {
         _ = ctx.throwTypeError("not an object")
         return nil
@@ -331,7 +331,7 @@ private func getMapState(_ ctx: JeffJSContext, thisVal: JeffJSValue, classID: In
 /// `magic` distinguishes which type (0=Map, 1=Set, 2=WeakMap, 3=WeakSet).
 ///
 /// Mirrors `js_map_constructor` in QuickJS.
-func js_map_constructor(_ ctx: JeffJSContext,
+nonisolated func js_map_constructor(_ ctx: JeffJSContext,
                         _ newTarget: JeffJSValue,
                         _ argv: [JeffJSValue],
                         _ magic: Int) -> JeffJSValue {
@@ -378,7 +378,7 @@ func js_map_constructor(_ ctx: JeffJSContext,
 /// Add one element (Set) or one `[key, value]` entry (Map) taken from the
 /// constructor's iterable. `elem` is borrowed. False after a TypeError
 /// (a Map entry that is not an object).
-private func js_map_addIterableElement(_ ctx: JeffJSContext, _ s: JeffJSMapState,
+nonisolated private func js_map_addIterableElement(_ ctx: JeffJSContext, _ s: JeffJSMapState,
                                        _ elem: JeffJSValue, isSet: Bool, isWeak: Bool) -> Bool {
     // The adder is WeakSet.prototype.add / WeakMap.prototype.set, which throw
     // a TypeError for a key that cannot be held weakly (ES §24.3.3.5, §24.4.3.1).
@@ -421,7 +421,7 @@ private func js_map_addIterableElement(_ ctx: JeffJSContext, _ s: JeffJSMapState
 
 /// Helper: iterate over an iterable and populate the map/set state.
 /// Returns false with an exception pending.
-private func js_map_forEach_iterable(_ ctx: JeffJSContext,
+nonisolated private func js_map_forEach_iterable(_ ctx: JeffJSContext,
                                      _ s: JeffJSMapState,
                                      _ iterable: JeffJSValue,
                                      isSet: Bool,
@@ -538,7 +538,7 @@ private func js_map_forEach_iterable(_ ctx: JeffJSContext,
 
 // MARK: - Map.prototype.get
 
-func js_map_get(_ ctx: JeffJSContext,
+nonisolated func js_map_get(_ ctx: JeffJSContext,
                 _ thisVal: JeffJSValue,
                 _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let s = getMapState(ctx, thisVal: thisVal, classID: JSClassID.JS_CLASS_MAP.rawValue) else {
@@ -555,7 +555,7 @@ func js_map_get(_ ctx: JeffJSContext,
 
 // MARK: - Map.prototype.set
 
-func js_map_set(_ ctx: JeffJSContext,
+nonisolated func js_map_set(_ ctx: JeffJSContext,
                 _ thisVal: JeffJSValue,
                 _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let s = getMapState(ctx, thisVal: thisVal, classID: JSClassID.JS_CLASS_MAP.rawValue) else {
@@ -576,7 +576,7 @@ func js_map_set(_ ctx: JeffJSContext,
 
 // MARK: - Map.prototype.has
 
-func js_map_has(_ ctx: JeffJSContext,
+nonisolated func js_map_has(_ ctx: JeffJSContext,
                 _ thisVal: JeffJSValue,
                 _ argv: [JeffJSValue],
                 _ magic: Int) -> JeffJSValue {
@@ -599,7 +599,7 @@ func js_map_has(_ ctx: JeffJSContext,
 
 // MARK: - Map.prototype.delete
 
-func js_map_delete(_ ctx: JeffJSContext,
+nonisolated func js_map_delete(_ ctx: JeffJSContext,
                    _ thisVal: JeffJSValue,
                    _ argv: [JeffJSValue],
                    _ magic: Int) -> JeffJSValue {
@@ -626,7 +626,7 @@ func js_map_delete(_ ctx: JeffJSContext,
 
 // MARK: - Map.prototype.clear
 
-func js_map_clear(_ ctx: JeffJSContext,
+nonisolated func js_map_clear(_ ctx: JeffJSContext,
                   _ thisVal: JeffJSValue,
                   _ argv: [JeffJSValue],
                   _ magic: Int) -> JeffJSValue {
@@ -646,7 +646,7 @@ func js_map_clear(_ ctx: JeffJSContext,
 
 // MARK: - Map.prototype.forEach
 
-func js_map_forEach(_ ctx: JeffJSContext,
+nonisolated func js_map_forEach(_ ctx: JeffJSContext,
                     _ thisVal: JeffJSValue,
                     _ argv: [JeffJSValue],
                     _ magic: Int) -> JeffJSValue {
@@ -702,7 +702,7 @@ func js_map_forEach(_ ctx: JeffJSContext,
 
 // MARK: - size getter
 
-func js_map_get_size(_ ctx: JeffJSContext,
+nonisolated func js_map_get_size(_ ctx: JeffJSContext,
                      _ thisVal: JeffJSValue,
                      _ magic: Int) -> JeffJSValue {
     let classID: Int
@@ -720,7 +720,7 @@ func js_map_get_size(_ ctx: JeffJSContext,
 
 // MARK: - Set.prototype.add
 
-func js_set_add(_ ctx: JeffJSContext,
+nonisolated func js_set_add(_ ctx: JeffJSContext,
                 _ thisVal: JeffJSValue,
                 _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let s = getMapState(ctx, thisVal: thisVal, classID: JSClassID.JS_CLASS_SET.rawValue) else {
@@ -736,7 +736,7 @@ func js_set_add(_ ctx: JeffJSContext,
 
 // MARK: - WeakMap.prototype.get
 
-func js_weakmap_get(_ ctx: JeffJSContext,
+nonisolated func js_weakmap_get(_ ctx: JeffJSContext,
                     _ thisVal: JeffJSValue,
                     _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let s = getMapState(ctx, thisVal: thisVal, classID: JSClassID.JS_CLASS_WEAKMAP.rawValue) else {
@@ -752,7 +752,7 @@ func js_weakmap_get(_ ctx: JeffJSContext,
 
 // MARK: - WeakMap.prototype.set
 
-func js_weakmap_set(_ ctx: JeffJSContext,
+nonisolated func js_weakmap_set(_ ctx: JeffJSContext,
                     _ thisVal: JeffJSValue,
                     _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let s = getMapState(ctx, thisVal: thisVal, classID: JSClassID.JS_CLASS_WEAKMAP.rawValue) else {
@@ -776,7 +776,7 @@ func js_weakmap_set(_ ctx: JeffJSContext,
 
 // MARK: - WeakSet.prototype.add
 
-func js_weakset_add(_ ctx: JeffJSContext,
+nonisolated func js_weakset_add(_ ctx: JeffJSContext,
                     _ thisVal: JeffJSValue,
                     _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let s = getMapState(ctx, thisVal: thisVal, classID: JSClassID.JS_CLASS_WEAKSET.rawValue) else {
@@ -824,7 +824,7 @@ nonisolated final class JSMapIteratorData {
 /// Create a map/set iterator. `magic` encodes base type + iterator kind.
 ///
 /// Mirrors `js_create_map_iterator` in QuickJS.
-func js_map_iterator_create(_ ctx: JeffJSContext,
+nonisolated func js_map_iterator_create(_ ctx: JeffJSContext,
                             _ thisVal: JeffJSValue,
                             _ argv: [JeffJSValue],
                             _ magic: Int) -> JeffJSValue {
@@ -882,7 +882,7 @@ func js_map_iterator_create(_ ctx: JeffJSContext,
 }
 
 /// Map/Set iterator next. Mirrors `js_map_iterator_next` in QuickJS.
-func js_map_iterator_next(_ ctx: JeffJSContext,
+nonisolated func js_map_iterator_next(_ ctx: JeffJSContext,
                           _ thisVal: JeffJSValue,
                           _ argv: [JeffJSValue],
                           _ pdone: UnsafeMutablePointer<Int32>?,
@@ -946,21 +946,21 @@ func js_map_iterator_next(_ ctx: JeffJSContext,
 // MARK: - Map.prototype.entries / keys / values / [Symbol.iterator]
 
 /// entries() = [Symbol.iterator]() for Map.
-func js_map_entries(_ ctx: JeffJSContext,
+nonisolated func js_map_entries(_ ctx: JeffJSContext,
                     _ thisVal: JeffJSValue,
                     _ argv: [JeffJSValue]) -> JeffJSValue {
     return js_map_iterator_create(ctx, thisVal, argv,
                                   Int(MAGIC_MAP | MAGIC_ITER_KEY_AND_VALUE))
 }
 
-func js_map_keys(_ ctx: JeffJSContext,
+nonisolated func js_map_keys(_ ctx: JeffJSContext,
                  _ thisVal: JeffJSValue,
                  _ argv: [JeffJSValue]) -> JeffJSValue {
     return js_map_iterator_create(ctx, thisVal, argv,
                                   Int(MAGIC_MAP | MAGIC_ITER_KEY))
 }
 
-func js_map_values(_ ctx: JeffJSContext,
+nonisolated func js_map_values(_ ctx: JeffJSContext,
                    _ thisVal: JeffJSValue,
                    _ argv: [JeffJSValue]) -> JeffJSValue {
     return js_map_iterator_create(ctx, thisVal, argv,
@@ -970,14 +970,14 @@ func js_map_values(_ ctx: JeffJSContext,
 // MARK: - Set.prototype.entries / keys / values / [Symbol.iterator]
 
 /// values() = [Symbol.iterator]() for Set. keys() is an alias.
-func js_set_values(_ ctx: JeffJSContext,
+nonisolated func js_set_values(_ ctx: JeffJSContext,
                    _ thisVal: JeffJSValue,
                    _ argv: [JeffJSValue]) -> JeffJSValue {
     return js_map_iterator_create(ctx, thisVal, argv,
                                   Int(MAGIC_SET | MAGIC_ITER_VALUE))
 }
 
-func js_set_entries(_ ctx: JeffJSContext,
+nonisolated func js_set_entries(_ ctx: JeffJSContext,
                     _ thisVal: JeffJSValue,
                     _ argv: [JeffJSValue]) -> JeffJSValue {
     return js_map_iterator_create(ctx, thisVal, argv,
@@ -987,7 +987,7 @@ func js_set_entries(_ ctx: JeffJSContext,
 // MARK: - Set.prototype new methods (ES2025)
 
 /// Set.prototype.union(other)
-func js_set_union(_ ctx: JeffJSContext,
+nonisolated func js_set_union(_ ctx: JeffJSContext,
                   _ thisVal: JeffJSValue,
                   _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let s = getMapState(ctx, thisVal: thisVal, classID: JSClassID.JS_CLASS_SET.rawValue) else {
@@ -1025,7 +1025,7 @@ func js_set_union(_ ctx: JeffJSContext,
 }
 
 /// Set.prototype.intersection(other)
-func js_set_intersection(_ ctx: JeffJSContext,
+nonisolated func js_set_intersection(_ ctx: JeffJSContext,
                          _ thisVal: JeffJSValue,
                          _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let s = getMapState(ctx, thisVal: thisVal, classID: JSClassID.JS_CLASS_SET.rawValue) else {
@@ -1056,7 +1056,7 @@ func js_set_intersection(_ ctx: JeffJSContext,
 }
 
 /// Set.prototype.difference(other)
-func js_set_difference(_ ctx: JeffJSContext,
+nonisolated func js_set_difference(_ ctx: JeffJSContext,
                        _ thisVal: JeffJSValue,
                        _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let s = getMapState(ctx, thisVal: thisVal, classID: JSClassID.JS_CLASS_SET.rawValue) else {
@@ -1087,7 +1087,7 @@ func js_set_difference(_ ctx: JeffJSContext,
 }
 
 /// Set.prototype.symmetricDifference(other)
-func js_set_symmetricDifference(_ ctx: JeffJSContext,
+nonisolated func js_set_symmetricDifference(_ ctx: JeffJSContext,
                                 _ thisVal: JeffJSValue,
                                 _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let s = getMapState(ctx, thisVal: thisVal, classID: JSClassID.JS_CLASS_SET.rawValue) else {
@@ -1131,7 +1131,7 @@ func js_set_symmetricDifference(_ ctx: JeffJSContext,
 }
 
 /// Set.prototype.isSubsetOf(other)
-func js_set_isSubsetOf(_ ctx: JeffJSContext,
+nonisolated func js_set_isSubsetOf(_ ctx: JeffJSContext,
                        _ thisVal: JeffJSValue,
                        _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let s = getMapState(ctx, thisVal: thisVal, classID: JSClassID.JS_CLASS_SET.rawValue) else {
@@ -1156,7 +1156,7 @@ func js_set_isSubsetOf(_ ctx: JeffJSContext,
 }
 
 /// Set.prototype.isSupersetOf(other)
-func js_set_isSupersetOf(_ ctx: JeffJSContext,
+nonisolated func js_set_isSupersetOf(_ ctx: JeffJSContext,
                          _ thisVal: JeffJSValue,
                          _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let s = getMapState(ctx, thisVal: thisVal, classID: JSClassID.JS_CLASS_SET.rawValue) else {
@@ -1181,7 +1181,7 @@ func js_set_isSupersetOf(_ ctx: JeffJSContext,
 }
 
 /// Set.prototype.isDisjointFrom(other)
-func js_set_isDisjointFrom(_ ctx: JeffJSContext,
+nonisolated func js_set_isDisjointFrom(_ ctx: JeffJSContext,
                            _ thisVal: JeffJSValue,
                            _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let s = getMapState(ctx, thisVal: thisVal, classID: JSClassID.JS_CLASS_SET.rawValue) else {
@@ -1211,7 +1211,7 @@ func js_set_isDisjointFrom(_ ctx: JeffJSContext,
 
 /// Map.groupBy(items, callbackFn)
 /// Groups elements of an iterable into a Map using a classifier callback.
-func js_map_groupBy(_ ctx: JeffJSContext,
+nonisolated func js_map_groupBy(_ ctx: JeffJSContext,
                     _ thisVal: JeffJSValue,
                     _ argv: [JeffJSValue]) -> JeffJSValue {
     guard argv.count >= 2 else {
@@ -1255,7 +1255,7 @@ func js_map_groupBy(_ ctx: JeffJSContext,
 
 /// GC finalizer for Map/Set/WeakMap/WeakSet objects.
 /// Clears all records and releases stored values.
-func js_map_finalizer(_ rt: JeffJSRuntime, _ val: JeffJSValue) {
+nonisolated func js_map_finalizer(_ rt: JeffJSRuntime, _ val: JeffJSValue) {
     guard let obj = val.toObject() else { return }
     if case .mapState(let s) = obj.payload {
         // Release all stored keys and values.
@@ -1273,7 +1273,7 @@ func js_map_finalizer(_ rt: JeffJSRuntime, _ val: JeffJSValue) {
 }
 
 /// GC mark function for Map/Set. Marks all stored keys and values.
-func js_map_mark(_ rt: JeffJSRuntime,
+nonisolated func js_map_mark(_ rt: JeffJSRuntime,
                  _ val: JeffJSValue,
                  _ markFunc: (JeffJSValue) -> Void) {
     guard let obj = val.toObject() else { return }
@@ -1287,7 +1287,7 @@ func js_map_mark(_ rt: JeffJSRuntime,
 
 // MARK: - Map/Set Iterator Finalizer
 
-func js_map_iterator_finalizer(_ rt: JeffJSRuntime, _ val: JeffJSValue) {
+nonisolated func js_map_iterator_finalizer(_ rt: JeffJSRuntime, _ val: JeffJSValue) {
     guard let obj = val.toObject(),
           case .opaque(let opaque) = obj.payload,
           let iterData = opaque as? JSMapIteratorData else { return }
@@ -1296,7 +1296,7 @@ func js_map_iterator_finalizer(_ rt: JeffJSRuntime, _ val: JeffJSValue) {
     iterData.mapState = nil
 }
 
-func js_map_iterator_mark(_ rt: JeffJSRuntime,
+nonisolated func js_map_iterator_mark(_ rt: JeffJSRuntime,
                           _ val: JeffJSValue,
                           _ markFunc: (JeffJSValue) -> Void) {
     guard let obj = val.toObject(),
@@ -1309,14 +1309,14 @@ func js_map_iterator_mark(_ rt: JeffJSRuntime,
 
 /// Function list entry for registering C functions on prototypes.
 /// Mirrors `JSCFunctionListEntry` in QuickJS.
-struct JSMapFuncEntry {
+nonisolated struct JSMapFuncEntry {
     let name: String
     let length: Int
     let magic: Int
     let funcType: JSMapFuncType
 }
 
-enum JSMapFuncType {
+nonisolated enum JSMapFuncType {
     case generic((JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue)
     case genericMagic((JeffJSContext, JeffJSValue, [JeffJSValue], Int) -> JeffJSValue)
     case getterMagic((JeffJSContext, JeffJSValue, Int) -> JeffJSValue)
@@ -1324,7 +1324,7 @@ enum JSMapFuncType {
 }
 
 /// Map.prototype function table.
-let js_map_proto_funcs: [JSMapFuncEntry] = [
+nonisolated(unsafe) let js_map_proto_funcs: [JSMapFuncEntry] = [
     JSMapFuncEntry(name: "get",     length: 1, magic: Int(MAGIC_MAP),
                    funcType: .generic(js_map_get)),
     JSMapFuncEntry(name: "set",     length: 2, magic: Int(MAGIC_MAP),
@@ -1346,7 +1346,7 @@ let js_map_proto_funcs: [JSMapFuncEntry] = [
 ]
 
 /// Set.prototype function table.
-let js_set_proto_funcs: [JSMapFuncEntry] = [
+nonisolated(unsafe) let js_set_proto_funcs: [JSMapFuncEntry] = [
     JSMapFuncEntry(name: "add",     length: 1, magic: Int(MAGIC_SET),
                    funcType: .generic(js_set_add)),
     JSMapFuncEntry(name: "has",     length: 1, magic: Int(MAGIC_SET),
@@ -1381,7 +1381,7 @@ let js_set_proto_funcs: [JSMapFuncEntry] = [
 ]
 
 /// WeakMap.prototype function table.
-let js_weakmap_proto_funcs: [JSMapFuncEntry] = [
+nonisolated(unsafe) let js_weakmap_proto_funcs: [JSMapFuncEntry] = [
     JSMapFuncEntry(name: "get",    length: 1, magic: Int(MAGIC_WEAKMAP),
                    funcType: .generic(js_weakmap_get)),
     JSMapFuncEntry(name: "set",    length: 2, magic: Int(MAGIC_WEAKMAP),
@@ -1393,7 +1393,7 @@ let js_weakmap_proto_funcs: [JSMapFuncEntry] = [
 ]
 
 /// WeakSet.prototype function table.
-let js_weakset_proto_funcs: [JSMapFuncEntry] = [
+nonisolated(unsafe) let js_weakset_proto_funcs: [JSMapFuncEntry] = [
     JSMapFuncEntry(name: "add",    length: 1, magic: Int(MAGIC_WEAKSET),
                    funcType: .generic(js_weakset_add)),
     JSMapFuncEntry(name: "has",    length: 1, magic: Int(MAGIC_WEAKSET),
@@ -1403,7 +1403,7 @@ let js_weakset_proto_funcs: [JSMapFuncEntry] = [
 ]
 
 /// Map/Set iterator function table.
-let js_map_iterator_proto_funcs: [JSMapFuncEntry] = [
+nonisolated(unsafe) let js_map_iterator_proto_funcs: [JSMapFuncEntry] = [
     JSMapFuncEntry(name: "next", length: 0, magic: 0,
                    funcType: .iteratorNext(js_map_iterator_next)),
 ]
@@ -1414,7 +1414,7 @@ let js_map_iterator_proto_funcs: [JSMapFuncEntry] = [
 /// The constructors and prototypes are already created by addIntrinsicMapSet()
 /// in JeffJSContext; this function wires the real method implementations from
 /// the function tables above onto those prototypes.
-struct JeffJSBuiltinMap {
+nonisolated struct JeffJSBuiltinMap {
 
     static func addIntrinsic(ctx: JeffJSContext) {
         // Replace the placeholder constructors (from addIntrinsicMapSet) with
@@ -1607,14 +1607,14 @@ nonisolated final class JeffJSWeakKeyMarker {
 }
 
 @inline(__always)
-private func jeffJS_weakKeyRuntime(_ o: JeffJSObject) -> JeffJSRuntime? {
+nonisolated private func jeffJS_weakKeyRuntime(_ o: JeffJSObject) -> JeffJSRuntime? {
     o.ownerRuntime ?? JeffJSGCObjectHeader.activeRuntime
 }
 
 /// Registers `rec` (just inserted, weak collection) on its key object.
 /// False when the key is not an object or has no runtime: the record then
 /// keeps owning its key like a strong collection would.
-func jeffJS_weakKeyAttach(_ rec: JeffJSMapRecord) -> Bool {
+nonisolated func jeffJS_weakKeyAttach(_ rec: JeffJSMapRecord) -> Bool {
     guard rec.key.isObject, let o = rec.key.toObject(), let rt = jeffJS_weakKeyRuntime(o) else { return false }
     rt.weakMapKeyRecords[ObjectIdentifier(o), default: []].append(rec)
     o.weakrefCount += 1
@@ -1625,7 +1625,7 @@ func jeffJS_weakKeyAttach(_ rec: JeffJSMapRecord) -> Bool {
 
 /// Unregisters a weak record that is being removed from its collection
 /// (`delete`, or the collection died). `key` is the record's former key.
-func jeffJS_weakKeyDetach(_ rec: JeffJSMapRecord, key: JeffJSValue) {
+nonisolated func jeffJS_weakKeyDetach(_ rec: JeffJSMapRecord, key: JeffJSValue) {
     guard rec.weakKey else { return }
     rec.weakKey = false
     guard let o = key.toObject(), let rt = jeffJS_weakKeyRuntime(o) else { return }
@@ -1639,7 +1639,7 @@ func jeffJS_weakKeyDetach(_ rec: JeffJSMapRecord, key: JeffJSValue) {
 
 /// The key object `o` is being freed: drop every weak record keyed by it and
 /// release the values. Called from `weakrefFree`.
-func jeffJS_weakKeyDied(_ rt: JeffJSRuntime, _ o: JeffJSObject) {
+nonisolated func jeffJS_weakKeyDied(_ rt: JeffJSRuntime, _ o: JeffJSObject) {
     o.weakrefCount = 0
     guard let recs = rt.weakMapKeyRecords.removeValue(forKey: ObjectIdentifier(o)) else { return }
     for rec in recs where rec.weakKey && !rec.empty {
@@ -1659,7 +1659,7 @@ func jeffJS_weakKeyDied(_ rt: JeffJSRuntime, _ o: JeffJSObject) {
 
 /// Marks the values of the weak records keyed by `o` (see above).
 @inline(never)
-func jeffJS_markWeakKeyValues(_ rt: JeffJSRuntime, _ o: JeffJSObject, _ markFunc: JeffJSMarkFunc) {
+nonisolated func jeffJS_markWeakKeyValues(_ rt: JeffJSRuntime, _ o: JeffJSObject, _ markFunc: JeffJSMarkFunc) {
     guard let recs = rt.weakMapKeyRecords[ObjectIdentifier(o)] else { return }
     for rec in recs where rec.weakKey && !rec.empty {
         if let c = rec.value.toGCObjectHeader() { markFunc(rt, c) }

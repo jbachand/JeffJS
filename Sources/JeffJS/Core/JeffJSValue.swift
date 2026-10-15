@@ -27,7 +27,7 @@ import Foundation
 /// Mirrors QuickJS JS_TAG_* constants exactly.
 /// Kept for backward compatibility — existing code that reads `.tag` still works
 /// through the computed property on JeffJSValue.
-enum JSValueTag: Int64 {
+nonisolated enum JSValueTag: Int64 {
     case first              = -11
     case bigInt             = -10
     case bigFloat           = -9
@@ -54,7 +54,7 @@ enum JSValueTag: Int64 {
 
 /// Backward-compatible payload enum. Existing code that pattern-matches on `.u`
 /// still works through the computed property on JeffJSValue.
-enum JSValuePayload {
+nonisolated enum JSValuePayload {
     case int32(Int32)
     case float64(Double)
     case ptr(AnyObject?)
@@ -81,7 +81,7 @@ enum JSValuePayload {
 /// No heap table — direct pointer embedding like C/QuickJS.
 ///
 /// Fast isDouble check: `((bits >> 48) &- 0x7FF9) & 0x7FFF >= 7`
-struct JeffJSValue {
+nonisolated struct JeffJSValue {
 
     // ---- 8-byte storage ----
     var bits: UInt64
@@ -849,7 +849,7 @@ struct JeffJSValue {
 
 // MARK: - Equatable
 
-extension JeffJSValue: Equatable {
+nonisolated extension JeffJSValue: Equatable {
     /// Structural equality (same tag and same pointer/payload).
     /// This is NOT JS `===`; it is used for internal identity checks.
     /// Two values are the same object if their bits are identical
@@ -867,7 +867,7 @@ extension JeffJSValue: Equatable {
 /// Called from JeffJSValue.freeValue() when refcount reaches zero.
 /// Respects GC phase: defers freeing during active collection.
 @inline(never)
-func _freeGCObjectSlow(_ hdr: JeffJSGCObjectHeader) {
+nonisolated func _freeGCObjectSlow(_ hdr: JeffJSGCObjectHeader) {
     guard let rt = hdr.ownerRuntime else { return }
     if rt.gcPhase != .JS_GC_PHASE_NONE {
         rt.gcZeroRefCountObjects.append(hdr)
@@ -879,7 +879,7 @@ func _freeGCObjectSlow(_ hdr: JeffJSGCObjectHeader) {
 /// Free a standalone JeffJSFunctionBytecode when its refcount reaches zero.
 /// Frees constant pool values and releases the Unmanaged retain.
 @inline(never)
-func _freeFBSlow(_ fb: JeffJSFunctionBytecode) {
+nonisolated func _freeFBSlow(_ fb: JeffJSFunctionBytecode) {
     for cpVal in fb.cpool {
         cpVal.freeValue()
     }
@@ -890,7 +890,7 @@ func _freeFBSlow(_ fb: JeffJSFunctionBytecode) {
 /// Decrement string refcount and release when it hits zero.
 /// Uses only Unmanaged operations to avoid ARC retain/release on intermediates.
 @inline(never)
-func _freeStringSlow(_ ptr: UnsafeRawPointer) {
+nonisolated func _freeStringSlow(_ ptr: UnsafeRawPointer) {
     // Peek at the isa pointer to determine subtype without creating an ARC reference.
     // We use Unmanaged throughout to avoid ARC retain traffic on the hot path.
     let unmgd = Unmanaged<AnyObject>.fromOpaque(UnsafeMutableRawPointer(mutating: ptr))
@@ -918,7 +918,7 @@ func _freeStringSlow(_ ptr: UnsafeRawPointer) {
     }
 }
 
-extension JeffJSValue: CustomDebugStringConvertible {
+nonisolated extension JeffJSValue: CustomDebugStringConvertible {
     var debugDescription: String {
         let tagName = JSValueTag(rawValue: tag).map { "\($0)" } ?? "unknown(\(tag))"
         if _isHeapTag, let ptr = _rawPtr {

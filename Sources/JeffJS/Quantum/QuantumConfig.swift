@@ -16,7 +16,7 @@ import Foundation
 
 // MARK: - Grid Dimensions
 
-enum QuantumConstants {
+nonisolated enum QuantumConstants {
 
     static let bitsVX      = 5
     static let bitsVY      = 5

@@ -1,6 +1,6 @@
 // Cold error paths of JeffJSInterpreter.callInternal: the messages live here so LLVM does not hoist
 // their string-literal constants into the interpreter prologue (stored to the stack on every call).
-enum JeffJSColdError {
+nonisolated enum JeffJSColdError {
     case m0
     case m1
     case m2
@@ -18,7 +18,7 @@ enum JeffJSColdError {
 }
 
 @inline(never) @discardableResult
-func jeffJS_coldThrow(_ ctx: JeffJSContext, _ e: JeffJSColdError) -> JeffJSValue {
+nonisolated func jeffJS_coldThrow(_ ctx: JeffJSContext, _ e: JeffJSColdError) -> JeffJSValue {
     switch e {
     case .m0: return ctx.throwRangeError(message: "Maximum call stack size exceeded.")
     case .m1: return ctx.throwTypeError(message: "not a bytecode function")
@@ -38,7 +38,7 @@ func jeffJS_coldThrow(_ ctx: JeffJSContext, _ e: JeffJSColdError) -> JeffJSValue
 }
 
 @inline(never) @discardableResult
-func jeffJS_coldThrowPC(_ ctx: JeffJSContext, _ k: Int, _ pc: Int) -> JeffJSValue {
+nonisolated func jeffJS_coldThrowPC(_ ctx: JeffJSContext, _ k: Int, _ pc: Int) -> JeffJSValue {
     switch k {
     case 0: return ctx.throwInternalError(message: "Invalid opcode 0 (trap) at pc=\(pc) - uninitialized bytecode")
     case 1: return ctx.throwInternalError(message: "wide opcode dispatched directly at pc=\(pc)")
@@ -47,46 +47,46 @@ func jeffJS_coldThrowPC(_ ctx: JeffJSContext, _ k: Int, _ pc: Int) -> JeffJSValu
 }
 
 @inline(never)
-func jeffJS_coldThrowClassCall(_ ctx: JeffJSContext, _ nm: String) {
+nonisolated func jeffJS_coldThrowClassCall(_ ctx: JeffJSContext, _ nm: String) {
     _ = ctx.throwTypeError(message: nm.isEmpty
         ? "Cannot call a class constructor without |new|"
         : "Cannot call a class constructor \(nm) without |new|")
 }
 
 @inline(never)
-func jeffJS_coldThrowErrorMessage(_ ctx: JeffJSContext, _ errType: UInt8, _ atom: UInt32) -> String {
+nonisolated func jeffJS_coldThrowErrorMessage(_ ctx: JeffJSContext, _ errType: UInt8, _ atom: UInt32) -> String {
     return errType == ThrowErrorType.constAssign.rawValue
         ? "Attempted to assign to readonly property."
         : ctx.atomToSwiftString(atom)
 }
 
 @inline(never)
-func jeffJS_coldThrowCantFind(_ ctx: JeffJSContext, _ atom: UInt32) {
+nonisolated func jeffJS_coldThrowCantFind(_ ctx: JeffJSContext, _ atom: UInt32) {
     _ = ctx.throwReferenceError(message: "Can't find variable: \(ctx.rt.atomToString(atom) ?? "")")
 }
 
 @inline(never)
-func jeffJS_coldTypeofIsFunction(_ val: JeffJSValue) -> Bool {
+nonisolated func jeffJS_coldTypeofIsFunction(_ val: JeffJSValue) -> Bool {
     return JeffJSOperators.jsTypeof(val) == "function"
 }
 
 @inline(never)
-func jeffJS_coldPrint1(_ idx: Int, _ vr: JeffJSVarRef, _ val: JeffJSValue) {
+nonisolated func jeffJS_coldPrint1(_ idx: Int, _ vr: JeffJSVarRef, _ val: JeffJSValue) {
     print("[VAR_REF] get idx=\(idx) isDetached=\(vr.isDetached) isArg=\(vr.isArg) varIdx=\(vr.varIdx) val.bits=0x\(String(val.bits, radix: 16)) frame=\(vr.parentFrame != nil)")
 }
 @inline(never)
-func jeffJS_coldPrint2(_ idx: Int, _ vrCount: Int) {
+nonisolated func jeffJS_coldPrint2(_ idx: Int, _ vrCount: Int) {
     print("[VAR_REF] get idx=\(idx) OUT OF RANGE (count=\(vrCount))")
 }
 @inline(never)
-func jeffJS_coldPrint3(_ vr: JeffJSVarRef, _ val: JeffJSValue) {
+nonisolated func jeffJS_coldPrint3(_ vr: JeffJSVarRef, _ val: JeffJSValue) {
     print("[VAR_REF0] isDetached=\(vr.isDetached) isArg=\(vr.isArg) varIdx=\(vr.varIdx) val.bits=0x\(String(val.bits, radix: 16))/\(val.toInt32()) frame=\(vr.parentFrame != nil)")
 }
 @inline(never)
-func jeffJS_coldPrint4() { print("[VAR_REF0] empty varRefs") }
+nonisolated func jeffJS_coldPrint4() { print("[VAR_REF0] empty varRefs") }
 
 @inline(never)
-func jeffJS_coldForOfNext(_ ctx: JeffJSContext, _ method: JeffJSValue, _ iter: JeffJSValue) {
+nonisolated func jeffJS_coldForOfNext(_ ctx: JeffJSContext, _ method: JeffJSValue, _ iter: JeffJSValue) {
     print("[FOR-OF-NEXT] method.isFunction=\(method.isFunction) method.isUndefined=\(method.isUndefined) iter.isObject=\(iter.isObject)")
     if iter.toObject() != nil {
         print("[FOR-OF-NEXT] iter has _target: \(ctx.getPropertyStr(obj: iter, name: "_target").isObject)")
@@ -95,7 +95,7 @@ func jeffJS_coldForOfNext(_ ctx: JeffJSContext, _ method: JeffJSValue, _ iter: J
 }
 
 @inline(never)
-func jeffJS_coldForOf(_ ctx: JeffJSContext, _ forOfResult: JeffJSValue, _ forOfDone: Bool, _ forOfDoneVal: JeffJSValue) {
+nonisolated func jeffJS_coldForOf(_ ctx: JeffJSContext, _ forOfResult: JeffJSValue, _ forOfDone: Bool, _ forOfDoneVal: JeffJSValue) {
     let v = ctx.getPropertyStr(obj: forOfResult, name: "value")
     print("[FOR-OF] result.isObject=\(forOfResult.isObject) done=\(forOfDone) doneVal.bits=0x\(String(forOfDoneVal.bits, radix: 16)) value=\(ctx.toSwiftString(v) ?? "nil")")
     if let obj = forOfResult.toObject() {
@@ -104,12 +104,12 @@ func jeffJS_coldForOf(_ ctx: JeffJSContext, _ forOfResult: JeffJSValue, _ forOfD
 }
 
 @inline(never)
-func jeffJS_coldTraceDeopt(_ traceInfo: TraceBlockInfo, _ resumePC: Int, _ fbChanged: Bool, _ opsRun: Int,
+nonisolated func jeffJS_coldTraceDeopt(_ traceInfo: TraceBlockInfo, _ resumePC: Int, _ fbChanged: Bool, _ opsRun: Int,
                            _ bc: UnsafePointer<UInt8>, _ bcLen: Int) {
     jeffJS_stderrLine("[trace] start=\(traceInfo.startPC) resume=\(resumePC) region=[\(traceInfo.entryPC),\(traceInfo.exitPC)) fbChanged=\(fbChanged) ops=\(opsRun) op=\(resumePC >= 0 && resumePC < bcLen ? String(describing: unsafeBitCast(UInt16(bc[resumePC]), to: JeffJSOpcode.self)) : "?")")
 }
 
 @inline(never)
-func jeffJS_coldStackDelta(_ op: JeffJSOpcode, _ expected: Int, _ actual: Int, _ pc: Int) {
+nonisolated func jeffJS_coldStackDelta(_ op: JeffJSOpcode, _ expected: Int, _ actual: Int, _ pc: Int) {
     print("[JeffJS-STACK] \(op): expected sp delta \(expected) but got \(actual) at pc=\(pc)")
 }

@@ -8,7 +8,7 @@
 import Foundation
 
 /// Decodes quantum-encoded master keys back to data.
-final class QuantumDecoder {
+nonisolated final class QuantumDecoder {
 
     private let field = QuantumField()
 

@@ -34,6 +34,69 @@ final class EngineThreadingRuleTests: XCTestCase {
     static let heapDirectories = ["Core", "Builtins", "Bytecode", "Parser", "RegExp",
                                   "StdLib", "Utils", "Config", "Unicode"]
 
+    /// For each line: does it start outside a multi-line string literal? (The polyfills are multi-line JS strings;
+    /// declarations are recognised at column 0, so indentation stands in for brace depth.)
+    static func topLevelLineFlags(_ lines: [String]) -> [Bool] {
+        var inside = false
+        return lines.map { line in
+            let start = !inside
+            var count = 0, rest = Substring(line)
+            while let r = rest.range(of: "\"\"\"") { count += 1; rest = rest[r.upperBound...] }
+            if count % 2 == 1 { inside.toggle() }
+            return start
+        }
+    }
+
+    /// The same rule for every other top-level declaration (struct, enum, protocol, func, extension, global): under
+    /// the app's default MainActor isolation an unannotated one is main-actor-isolated, and an `async` host-actor
+    /// body (JSScriptEngine.initialize, the dynamic-import task, fetch completions) that calls it hops to the main
+    /// thread in the middle of running JS and resumes there — two threads in one runtime (page thread work, 2026-10-14).
+    /// DOM/, Environment/ and Quantum/ host bridges say `@JeffJSHostActor` (and their extensions inherit it).
+    /// `Scripts/annotate_nonisolated.py`-style fix: add `nonisolated` (`nonisolated(unsafe)` for globals).
+    func testTopLevelDeclarationsAreNonisolated() throws {
+        let sources = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/JeffJS", isDirectory: true)
+        let decl = try NSRegularExpression(pattern:
+            #"^((?:@\w+(?:\([^)]*\))?\s+)*)((?:(?:public|internal|private|fileprivate|open|final|indirect|nonisolated(?:\(unsafe\))?)\s+)*)(struct|enum|class|actor|protocol|extension|func|let|var)\b(\s+[A-Za-z_]\w*)?"#)
+        let hostDirs: Set<String> = ["DOM", "Environment", "Quantum"]
+        let hostNames: Set<String> = ["JeffJSDOMBridge", "JeffJSEventBridge", "JeffJSFetchBridge", "JeffJSWebSocketBridge",
+            "JeffJSIndexedDBBridge", "JeffJSWebAPIsBridge", "JeffJSDynamicImportBridge", "JeffJSVideoBridge",
+            "JeffJSStorageBridge", "JeffJSCookieBridge", "JeffJSEnvironment", "JeffJSIntlBridge",
+            "JeffJSDynamicImportDelegate", "JeffJSVideoProvider"]
+        var offenders: [String] = []
+        var checked = 0
+        guard let walker = FileManager.default.enumerator(at: sources, includingPropertiesForKeys: nil) else { return }
+        for case let url as URL in walker where url.pathExtension == "swift" {
+            if url.lastPathComponent == "JeffJSHostActor.swift" { continue }
+            let top = url.deletingLastPathComponent().path.replacingOccurrences(of: sources.path + "/", with: "")
+                .split(separator: "/").first.map(String.init) ?? ""
+            let lines = try String(contentsOf: url, encoding: .utf8).components(separatedBy: "\n")
+            let tops = Self.topLevelLineFlags(lines)
+            for (i, line) in lines.enumerated() {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                let ns = line as NSString
+                if let f = line.first, !f.isWhitespace, tops[i], !trimmed.hasPrefix("//"), !trimmed.hasPrefix("*"), !trimmed.hasPrefix("/*"),
+                   let m = decl.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) {
+                    checked += 1
+                    var context = line
+                    var j = i - 1
+                    while j >= 0, lines[j].trimmingCharacters(in: .whitespaces).hasPrefix("@") { context += lines[j]; j -= 1 }
+                    if i > 0 { context += lines[i - 1] }
+                    let isolated = ["nonisolated", "JeffJSHostActor", "@MainActor"].contains { context.contains($0) }
+                    let kind = ns.substring(with: m.range(at: 3))
+                    let name = m.range(at: 4).location == NSNotFound ? "" : ns.substring(with: m.range(at: 4)).trimmingCharacters(in: .whitespaces)
+                    let hostExt = kind == "extension" && (hostDirs.contains(top) || hostNames.contains(name))
+                    if !isolated && !hostExt && !(["class", "actor"].contains(kind) && hostNames.contains(name)) {
+                        offenders.append("\(top)/\(url.lastPathComponent):\(i + 1): \(kind) \(name)")
+                    }
+                }
+            }
+        }
+        XCTAssertGreaterThan(checked, 500, "found too few declarations; is the source path right? \(sources.path)")
+        XCTAssertTrue(offenders.isEmpty, "\(offenders.count) top-level engine declaration(s) without `nonisolated`:\n" + offenders.prefix(40).joined(separator: "\n"))
+    }
+
     func testEngineClassesAreNonisolated() throws {
         let sources = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()

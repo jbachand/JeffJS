@@ -14,7 +14,7 @@ import Foundation
 // MARK: - Flags
 // ============================================================================
 
-struct JeffJSRegExpFlags: OptionSet, Sendable {
+nonisolated struct JeffJSRegExpFlags: OptionSet, Sendable {
     let rawValue: Int
 
     // ECMAScript-visible flags
@@ -40,7 +40,7 @@ struct JeffJSRegExpFlags: OptionSet, Sendable {
 // ============================================================================
 
 /// An inclusive range of Unicode code points [lo, hi].
-struct CharRange: Equatable {
+nonisolated struct CharRange: Equatable {
     var lo: UInt32
     var hi: UInt32
 
@@ -60,7 +60,7 @@ struct CharRange: Equatable {
 // ============================================================================
 
 /// Normalise a range list: sort by lo then hi, merge overlapping/adjacent.
-private func crNormalize(_ ranges: [CharRange]) -> [CharRange] {
+nonisolated private func crNormalize(_ ranges: [CharRange]) -> [CharRange] {
     guard ranges.count > 1 else { return ranges }
     var sorted = ranges.sorted { $0.lo < $1.lo || ($0.lo == $1.lo && $0.hi < $1.hi) }
     var out = [CharRange]()
@@ -78,19 +78,19 @@ private func crNormalize(_ ranges: [CharRange]) -> [CharRange] {
 }
 
 /// Add a single code point to a range list.
-func crAddChar(_ ranges: inout [CharRange], _ c: UInt32) {
+nonisolated func crAddChar(_ ranges: inout [CharRange], _ c: UInt32) {
     ranges.append(CharRange(c))
 }
 
 /// Add an inclusive range [lo, hi] to a range list.
-func crAddRange(_ ranges: inout [CharRange], _ lo: UInt32, _ hi: UInt32) {
+nonisolated func crAddRange(_ ranges: inout [CharRange], _ lo: UInt32, _ hi: UInt32) {
     if lo <= hi {
         ranges.append(CharRange(lo, hi))
     }
 }
 
 /// Complement the character class over [0, 0x10FFFF].
-func crComplement(_ ranges: [CharRange]) -> [CharRange] {
+nonisolated func crComplement(_ ranges: [CharRange]) -> [CharRange] {
     let norm = crNormalize(ranges)
     var out = [CharRange]()
     var prev: UInt32 = 0
@@ -108,14 +108,14 @@ func crComplement(_ ranges: [CharRange]) -> [CharRange] {
 }
 
 /// Union of two sorted, normalised range lists.
-func crUnion(_ a: [CharRange], _ b: [CharRange]) -> [CharRange] {
+nonisolated func crUnion(_ a: [CharRange], _ b: [CharRange]) -> [CharRange] {
     var combined = a
     combined.append(contentsOf: b)
     return crNormalize(combined)
 }
 
 /// Intersection of two sorted, normalised range lists.
-func crIntersection(_ a: [CharRange], _ b: [CharRange]) -> [CharRange] {
+nonisolated func crIntersection(_ a: [CharRange], _ b: [CharRange]) -> [CharRange] {
     let na = crNormalize(a)
     let nb = crNormalize(b)
     var out = [CharRange]()
@@ -136,12 +136,12 @@ func crIntersection(_ a: [CharRange], _ b: [CharRange]) -> [CharRange] {
 }
 
 /// Subtraction:  a \ b.
-func crSubtraction(_ a: [CharRange], _ b: [CharRange]) -> [CharRange] {
+nonisolated func crSubtraction(_ a: [CharRange], _ b: [CharRange]) -> [CharRange] {
     return crIntersection(a, crComplement(b))
 }
 
 /// Test membership.
-func crContains(_ ranges: [CharRange], _ c: UInt32) -> Bool {
+nonisolated func crContains(_ ranges: [CharRange], _ c: UInt32) -> Bool {
     // Binary search on a normalised list.
     let norm = ranges // Caller should pass normalised, but tolerate unsorted.
     var lo = 0, hi = norm.count - 1
@@ -163,7 +163,7 @@ func crContains(_ ranges: [CharRange], _ c: UInt32) -> Bool {
 // ============================================================================
 
 /// ECMAScript WhiteSpace + LineTerminator (\s).
-func lreIsSpace(_ c: UInt32) -> Bool {
+nonisolated func lreIsSpace(_ c: UInt32) -> Bool {
     switch c {
     case 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0xA0, 0x1680,
          0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF:
@@ -175,7 +175,7 @@ func lreIsSpace(_ c: UInt32) -> Bool {
 
 /// ECMAScript \w character (word character).
 @inline(__always)
-func lreIsWordChar(_ c: UInt32) -> Bool {
+nonisolated func lreIsWordChar(_ c: UInt32) -> Bool {
     if c >= 0x61 && c <= 0x7A { return true }   // a-z
     if c >= 0x41 && c <= 0x5A { return true }   // A-Z
     if c >= 0x30 && c <= 0x39 { return true }   // 0-9
@@ -186,18 +186,18 @@ func lreIsWordChar(_ c: UInt32) -> Bool {
 /// it also contains every character whose canonical value is a basic word
 /// character, i.e. U+017F (folds to "s") and U+212A KELVIN SIGN (folds to "k").
 @inline(__always)
-func lreIsWordChar(_ c: UInt32, _ flags: JeffJSRegExpFlags) -> Bool {
+nonisolated func lreIsWordChar(_ c: UInt32, _ flags: JeffJSRegExpFlags) -> Bool {
     if lreIsWordChar(c) { return true }
     return (c == 0x017F || c == 0x212A) && flags.isUnicode && flags.contains(.ignoreCase)
 }
 
 /// ECMAScript \d character.
-private func lreIsDigit(_ c: UInt32) -> Bool {
+nonisolated private func lreIsDigit(_ c: UInt32) -> Bool {
     return c >= 0x30 && c <= 0x39
 }
 
 /// ECMAScript LineTerminator.
-private func lreIsLineTerminator(_ c: UInt32) -> Bool {
+nonisolated private func lreIsLineTerminator(_ c: UInt32) -> Bool {
     return c == 0x0A || c == 0x0D || c == 0x2028 || c == 0x2029
 }
 
@@ -298,7 +298,7 @@ nonisolated final class LRECaseTables {
 /// mappings, with the handful of characters where that identity does not hold
 /// special-cased (Cherokee folds to its uppercase letters; U+0131 and U+0130
 /// have no simple folding; three Unicode 15 foldings have no case mapping).
-func lreSimpleCaseFold(_ c: UInt32) -> UInt32 {
+nonisolated func lreSimpleCaseFold(_ c: UInt32) -> UInt32 {
     if c < 0x80 { return (c >= 0x41 && c <= 0x5A) ? c + 0x20 : c }
     if c >= 0xAB70 && c <= 0xABBF { return c - 0xAB70 + 0x13A0 }   // Cherokee small -> capital
     if c >= 0x13F8 && c <= 0x13FD { return c - 8 }
@@ -327,7 +327,7 @@ func lreSimpleCaseFold(_ c: UInt32) -> UInt32 {
 
 /// Legacy (non-unicode) Canonicalize: toUppercase when it yields exactly one
 /// UTF-16 code unit and does not map a non-ASCII character to ASCII.
-func lreLegacyCanonicalize(_ c: UInt32) -> UInt32 {
+nonisolated func lreLegacyCanonicalize(_ c: UInt32) -> UInt32 {
     if c < 0x80 { return (c >= 0x61 && c <= 0x7A) ? c - 0x20 : c }
     guard c <= 0xFFFF, let s = Unicode.Scalar(c) else { return c }   // lone surrogates map to themselves
     let p = s.properties
@@ -338,13 +338,13 @@ func lreLegacyCanonicalize(_ c: UInt32) -> UInt32 {
 }
 
 /// Canonicalize(rer, ch) for the given flags.
-func lreCanonicalizeChar(_ c: UInt32, _ flags: JeffJSRegExpFlags) -> UInt32 {
+nonisolated func lreCanonicalizeChar(_ c: UInt32, _ flags: JeffJSRegExpFlags) -> UInt32 {
     return LRECaseTables.forFlags(flags).canonicalize(c)
 }
 
 /// Case conversion that may expand (e.g. German sharp-s -> "SS").
 /// Returns an array of code points.
-func lreCaseConv(_ c: UInt32, isUpper: Bool) -> [UInt32] {
+nonisolated func lreCaseConv(_ c: UInt32, isUpper: Bool) -> [UInt32] {
     guard let scalar = Unicode.Scalar(c) else { return [c] }
     let str = String(scalar)
     let converted = isUpper ? str.uppercased() : str.lowercased()
@@ -357,7 +357,7 @@ func lreCaseConv(_ c: UInt32, isUpper: Bool) -> [UInt32] {
 
 /// Returns the set of CharRanges for a Unicode property name or value.
 /// Supports General_Category values, Script values, and binary properties.
-private func lreGetUnicodePropertyRanges(_ name: String, negate: Bool) -> [CharRange]? {
+nonisolated private func lreGetUnicodePropertyRanges(_ name: String, negate: Bool) -> [CharRange]? {
     // Canonical name comparison: strip underscores/hyphens/spaces, lowercase.
     let key = name.lowercased().replacingOccurrences(of: "_", with: "")
                   .replacingOccurrences(of: "-", with: "")
@@ -559,7 +559,7 @@ private func lreGetUnicodePropertyRanges(_ name: String, negate: Bool) -> [CharR
 
 /// General_Category values (ECMA-262 table 66) by long name or alias, keys normalised like
 /// `lreGetUnicodePropertyRanges` (lowercased, `_`/`-`/space removed).
-private func lreGeneralCategoryPredicate(_ key: String) -> ((Unicode.Scalar) -> Bool)? {
+nonisolated private func lreGeneralCategoryPredicate(_ key: String) -> ((Unicode.Scalar) -> Bool)? {
     typealias G = Unicode.GeneralCategory
     let cats: [G]
     switch key {
@@ -611,7 +611,7 @@ private func lreGeneralCategoryPredicate(_ key: String) -> ((Unicode.Scalar) -> 
 /// Binary Unicode properties (ECMA-262 table 67) by name or alias, except the ones with explicit
 /// range tables in `lreGetUnicodePropertyRanges` (ASCII, Any, Assigned, Emoji_Component,
 /// Extended_Pictographic, Regional_Indicator).
-private func lreBinaryPropertyPredicate(_ key: String) -> ((Unicode.Scalar) -> Bool)? {
+nonisolated private func lreBinaryPropertyPredicate(_ key: String) -> ((Unicode.Scalar) -> Bool)? {
     switch key {
     case "alpha", "alphabetic": return { $0.properties.isAlphabetic }
     case "ahex", "asciihexdigit": return { $0.properties.isASCIIHexDigit }
@@ -666,7 +666,7 @@ private func lreBinaryPropertyPredicate(_ key: String) -> ((Unicode.Scalar) -> B
 
 /// Build character ranges by scanning Unicode scalars that match a predicate.
 /// We scan BMP + a small portion of supplementary planes.
-private func lreUnicodeCategoryRanges(_ predicate: (Unicode.Scalar) -> Bool) -> [CharRange] {
+nonisolated private func lreUnicodeCategoryRanges(_ predicate: (Unicode.Scalar) -> Bool) -> [CharRange] {
     var ranges = [CharRange]()
     var runStart: UInt32? = nil
 
@@ -704,7 +704,7 @@ private func lreUnicodeCategoryRanges(_ predicate: (Unicode.Scalar) -> Bool) -> 
 
 /// Get character ranges for a script name (very common ones only).
 /// For a production engine this would use ICU or a generated table.
-private func lreGetScriptRanges(_ name: String) -> [CharRange]? {
+nonisolated private func lreGetScriptRanges(_ name: String) -> [CharRange]? {
     switch name {
     case "latin":
         return [CharRange(0x41, 0x5A), CharRange(0x61, 0x7A),
@@ -755,7 +755,7 @@ private func lreGetScriptRanges(_ name: String) -> [CharRange]? {
 // MARK: - Unicode.Scalar.Properties helpers
 // ============================================================================
 
-private extension Unicode.GeneralCategory {
+nonisolated private extension Unicode.GeneralCategory {
     var _isPunctuation: Bool {
         switch self {
         case .connectorPunctuation, .dashPunctuation, .openPunctuation,
@@ -809,7 +809,7 @@ private extension Unicode.GeneralCategory {
     }
 }
 
-private extension Unicode.Scalar {
+nonisolated private extension Unicode.Scalar {
     var isLetter: Bool {
         properties.generalCategory._isLetter
     }
@@ -929,20 +929,20 @@ private nonisolated final class REBytecodeBuilder {
 ///   [3..4] bytecode length (UInt16, little-endian)
 /// Then `bytecodeLength` bytes of opcodes follow.
 /// After that, NUL-terminated group name strings (if .named flag set).
-private let kHeaderSize = 5
+nonisolated(unsafe) private let kHeaderSize = 5
 
 // ============================================================================
 // MARK: - Compiler
 // ============================================================================
 
 /// Result of compilation.
-struct JeffJSRegExpCompileResult {
+nonisolated struct JeffJSRegExpCompileResult {
     var bytecode: [UInt8]
     var error: String?
 }
 
 /// Compile a regex pattern string into bytecode.
-func lreCompile(pattern: String, flags: JeffJSRegExpFlags) -> JeffJSRegExpCompileResult {
+nonisolated func lreCompile(pattern: String, flags: JeffJSRegExpFlags) -> JeffJSRegExpCompileResult {
     let compiler = RECompiler(pattern: pattern, flags: flags)
     return compiler.compile()
 }
@@ -2331,7 +2331,7 @@ private nonisolated final class RECompiler {
 // ============================================================================
 
 /// \w character ranges.
-func lreWordCharRanges() -> [CharRange] {
+nonisolated func lreWordCharRanges() -> [CharRange] {
     return [
         CharRange(0x30, 0x39),    // 0-9
         CharRange(0x41, 0x5A),    // A-Z
@@ -2341,7 +2341,7 @@ func lreWordCharRanges() -> [CharRange] {
 }
 
 /// \s character ranges (ECMAScript WhiteSpace + LineTerminator).
-func lreSpaceCharRanges() -> [CharRange] {
+nonisolated func lreSpaceCharRanges() -> [CharRange] {
     return [
         CharRange(0x09, 0x0D),    // TAB, LF, VT, FF, CR
         CharRange(0x20, 0x20),    // SPACE
@@ -2357,7 +2357,7 @@ func lreSpaceCharRanges() -> [CharRange] {
 }
 
 /// Line terminator ranges (for . without s flag).
-private func lreLineTerminatorRanges() -> [CharRange] {
+nonisolated private func lreLineTerminatorRanges() -> [CharRange] {
     return [
         CharRange(0x0A, 0x0A),
         CharRange(0x0D, 0x0D),
@@ -2370,14 +2370,14 @@ private func lreLineTerminatorRanges() -> [CharRange] {
 // ============================================================================
 
 /// Match result codes.
-enum LREExecResult: Int {
+nonisolated enum LREExecResult: Int {
     case noMatch = 0
     case match = 1
     case error = -1
 }
 
 /// Result returned from lreExec.
-struct JeffJSRegExpExecResult {
+nonisolated struct JeffJSRegExpExecResult {
     var result: LREExecResult
     var captures: [(start: Int, end: Int)?]
 }
@@ -2390,7 +2390,7 @@ struct JeffJSRegExpExecResult {
 ///   - startPos: The position to start matching from.
 ///   - flags: Additional execution flags (usually the same as compile flags).
 /// - Returns: Match result and capture groups.
-func lreExec(bytecode: [UInt8], input: [UInt32], startPos: Int,
+nonisolated func lreExec(bytecode: [UInt8], input: [UInt32], startPos: Int,
              flags: JeffJSRegExpFlags) -> JeffJSRegExpExecResult {
     let vm = REVirtualMachine(bytecode: bytecode, input: input,
                               startPos: startPos, flags: flags)
@@ -2398,7 +2398,7 @@ func lreExec(bytecode: [UInt8], input: [UInt32], startPos: Int,
 }
 
 /// Overload for String input.
-func lreExec(bytecode: [UInt8], input: String, startPos: Int,
+nonisolated func lreExec(bytecode: [UInt8], input: String, startPos: Int,
              flags: JeffJSRegExpFlags) -> JeffJSRegExpExecResult {
     let codePoints: [UInt32]
     if flags.isUnicode {
@@ -2413,7 +2413,7 @@ func lreExec(bytecode: [UInt8], input: String, startPos: Int,
 /// True when `pos` is the low half of a surrogate pair (u / v mode never
 /// starts a match there: AdvanceStringIndex steps over the whole pair).
 @inline(__always)
-func lreIsInsideSurrogatePair(_ input: UnsafeBufferPointer<UInt32>, _ pos: Int) -> Bool {
+nonisolated func lreIsInsideSurrogatePair(_ input: UnsafeBufferPointer<UInt32>, _ pos: Int) -> Bool {
     guard pos > 0 && pos < input.count else { return false }
     let lo = input[pos], hi = input[pos - 1]
     return lo >= 0xDC00 && lo <= 0xDFFF && hi >= 0xD800 && hi <= 0xDBFF
@@ -2437,7 +2437,7 @@ func lreIsInsideSurrogatePair(_ input: UnsafeBufferPointer<UInt32>, _ pos: Int) 
 ///   - flags: Execution flags.
 ///   - isUnicode: Whether to advance by surrogate pairs on zero-length matches.
 /// - Returns: Array of (start, end) tuples for each full match, or nil on error.
-func lreExecGlobalMatch(bytecode: [UInt8], input: [UInt32],
+nonisolated func lreExecGlobalMatch(bytecode: [UInt8], input: [UInt32],
                         flags: JeffJSRegExpFlags,
                         isUnicode: Bool) -> [(start: Int, end: Int)]? {
     let vm = REVirtualMachine(bytecode: bytecode, input: input,
@@ -2519,7 +2519,7 @@ func lreExecGlobalMatch(bytecode: [UInt8], input: [UInt32],
 }
 
 /// Pre-filter for global match: quickly skip positions where the first opcode can't match.
-private struct GlobalMatchPreFilter {
+nonisolated private struct GlobalMatchPreFilter {
     enum FilterKind {
         case none                       // No pre-filter, try every position
         case singleChar(UInt32)         // First opcode is char_ matching this value
@@ -2635,21 +2635,21 @@ private struct GlobalMatchPreFilter {
 // ============================================================================
 
 /// Extract the flags from compiled bytecode.
-func lreGetFlags(_ bytecode: [UInt8]) -> JeffJSRegExpFlags {
+nonisolated func lreGetFlags(_ bytecode: [UInt8]) -> JeffJSRegExpFlags {
     guard bytecode.count >= kHeaderSize else { return [] }
     let raw = Int(bytecode[0]) | (Int(bytecode[1]) << 8)
     return JeffJSRegExpFlags(rawValue: raw)
 }
 
 /// Extract the capture count from compiled bytecode.
-func lreGetCaptureCount(_ bytecode: [UInt8]) -> Int {
+nonisolated func lreGetCaptureCount(_ bytecode: [UInt8]) -> Int {
     guard bytecode.count >= kHeaderSize else { return 0 }
     return Int(bytecode[2])
 }
 
 /// Extract group names from compiled bytecode.  Returns an array of length
 /// `captureCount` where unnamed groups have `nil`.
-func lreGetGroupNames(_ bytecode: [UInt8]) -> [String?] {
+nonisolated func lreGetGroupNames(_ bytecode: [UInt8]) -> [String?] {
     let flags = lreGetFlags(bytecode)
     let captureCount = lreGetCaptureCount(bytecode)
     guard flags.contains(.named), bytecode.count > kHeaderSize else {
@@ -3671,7 +3671,7 @@ nonisolated final class REVirtualMachine {
 // ============================================================================
 
 /// Compile and execute a regex in one call. Convenience wrapper.
-func lreCompileAndExec(pattern: String, input: String, flags: JeffJSRegExpFlags,
+nonisolated func lreCompileAndExec(pattern: String, input: String, flags: JeffJSRegExpFlags,
                        startPos: Int = 0) -> JeffJSRegExpExecResult {
     let compiled = lreCompile(pattern: pattern, flags: flags)
     if compiled.error != nil {
@@ -3682,7 +3682,7 @@ func lreCompileAndExec(pattern: String, input: String, flags: JeffJSRegExpFlags,
 }
 
 /// Parse regex flags from a flag string ("gimsuyvd").
-func lreParseFlags(_ flagStr: String) -> JeffJSRegExpFlags? {
+nonisolated func lreParseFlags(_ flagStr: String) -> JeffJSRegExpFlags? {
     var flags = JeffJSRegExpFlags()
     var seen = Set<Character>()
     for ch in flagStr {
@@ -3712,7 +3712,7 @@ func lreParseFlags(_ flagStr: String) -> JeffJSRegExpFlags? {
 // ============================================================================
 
 /// Disassemble compiled regex bytecode into a human-readable string.
-func lreDisassemble(_ bytecode: [UInt8]) -> String {
+nonisolated func lreDisassemble(_ bytecode: [UInt8]) -> String {
     guard bytecode.count >= kHeaderSize else { return "<invalid bytecode>" }
 
     let flags = lreGetFlags(bytecode)

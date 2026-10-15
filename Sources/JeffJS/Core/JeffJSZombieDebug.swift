@@ -28,7 +28,7 @@ nonisolated(unsafe) var jeffJS_rcReportRegistered: Bool = false
 
 /// Copy the config/env-derived debug flags into their plain stored globals.
 /// Idempotent; called from JeffJSRuntime.init.
-func jeffJS_bootstrapDebugFlags() {
+nonisolated func jeffJS_bootstrapDebugFlags() {
     jeffJSZombiesEnabled = ProcessInfo.processInfo.environment["JEFFJS_ZOMBIES"] == "1"
     jeffJSTraceDebug = ProcessInfo.processInfo.environment["JEFFJS_TRACE_DEBUG"] == "1"
     jeffJSObjectPoolDisabled = ProcessInfo.processInfo.environment["JEFFJS_NO_POOL"] == "1"
@@ -50,7 +50,7 @@ func jeffJS_bootstrapDebugFlags() {
     }
 }
 
-enum JeffJSZombieDebug {
+nonisolated enum JeffJSZombieDebug {
     /// Most recently created context (zombie mode only): its live frame chain
     /// is printed with each report so the touch can be tied to JS source.
     nonisolated(unsafe) static weak var context: JeffJSContext?

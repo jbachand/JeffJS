@@ -13,7 +13,7 @@ import Foundation
 // MARK: - OpcodeFormat
 
 /// Operand encoding format for each opcode, matching QuickJS OP_FMT_*.
-enum OpcodeFormat: UInt8 {
+nonisolated enum OpcodeFormat: UInt8 {
     case none = 0          // no operand
     case none_int          // no operand, implicit int
     case none_loc          // no operand, implicit local
@@ -49,7 +49,7 @@ enum OpcodeFormat: UInt8 {
 
 /// Metadata for a single bytecode instruction.
 /// Used by the compiler, disassembler, and interpreter.
-struct OpcodeInfo {
+nonisolated struct OpcodeInfo {
     let name: String       // human-readable opcode name
     let size: UInt8        // total instruction size in bytes (including opcode byte)
     let nPop: Int8         // stack items consumed (-1 = variable)
@@ -68,7 +68,7 @@ struct OpcodeInfo {
 /// Note: UInt16 raw type is used because temporary opcodes (enter_scope through
 /// line_num) push the total count past 255. Only opcodes with rawValue < 256
 /// appear in final bytecode; temporary opcodes are resolved during compilation.
-enum JeffJSOpcode: UInt16, CaseIterable {
+nonisolated enum JeffJSOpcode: UInt16, CaseIterable {
 
     // ---------------------------------------------------------------
     // Invalid opcode (trap for uninitialized bytecode)
@@ -508,7 +508,7 @@ enum JeffJSOpcode: UInt16, CaseIterable {
 ///
 /// This table is indexed by JeffJSOpcode.rawValue. The order must match
 /// the enum case order exactly.
-let jeffJSOpcodeInfo: [OpcodeInfo] = [
+nonisolated(unsafe) let jeffJSOpcodeInfo: [OpcodeInfo] = [
 
     // ---------------------------------------------------------------
     // Invalid opcode (trap for uninitialized bytecode)
@@ -1279,20 +1279,20 @@ let jeffJSOpcodeInfo: [OpcodeInfo] = [
 /// Look up opcode info by raw opcode byte value.
 /// Returns nil for out-of-range values.
 @inline(__always)
-func jeffJSGetOpcodeInfo(_ op: UInt8) -> OpcodeInfo? {
+nonisolated func jeffJSGetOpcodeInfo(_ op: UInt8) -> OpcodeInfo? {
     guard Int(op) < jeffJSOpcodeInfo.count else { return nil }
     return jeffJSOpcodeInfo[Int(op)]
 }
 
 /// Look up opcode info by enum case.
 @inline(__always)
-func jeffJSGetOpcodeInfo(_ op: JeffJSOpcode) -> OpcodeInfo {
+nonisolated func jeffJSGetOpcodeInfo(_ op: JeffJSOpcode) -> OpcodeInfo {
     return jeffJSOpcodeInfo[Int(op.rawValue)]
 }
 
 // MARK: - Opcode Classification Helpers
 
-extension JeffJSOpcode {
+nonisolated extension JeffJSOpcode {
 
     /// Human-readable opcode name for debug logging.
     var debugName: String { String(describing: self) }
@@ -1400,7 +1400,7 @@ extension JeffJSOpcode {
 
 /// Values for the special_object opcode's u8 operand.
 /// Matches QuickJS OP_SPECIAL_OBJECT_* values.
-enum SpecialObjectType: UInt8 {
+nonisolated enum SpecialObjectType: UInt8 {
     case arguments          = 0   // non-mapped arguments object
     case mappedArguments    = 1   // mapped arguments object
     case thisVal            = 2   // this value
@@ -1415,7 +1415,7 @@ enum SpecialObjectType: UInt8 {
 
 /// Flags for the define_method and define_method_computed u8 operand.
 /// Matches QuickJS JS_PROP_* method definition flags.
-enum DefineMethodFlags: UInt8 {
+nonisolated enum DefineMethodFlags: UInt8 {
     case method         = 0    // regular method
     case getter         = 2    // getter
     case setter         = 4    // setter
@@ -1430,14 +1430,14 @@ enum DefineMethodFlags: UInt8 {
 // MARK: - Define Class Flags
 
 /// Flags for the define_class u8 operand.
-enum DefineClassFlags: UInt8 {
+nonisolated enum DefineClassFlags: UInt8 {
     case hasHeritage    = 1    // class extends ...
 }
 
 // MARK: - Import Flags
 
 /// Flags for the import opcode's u8 operand.
-enum ImportFlags: UInt8 {
+nonisolated enum ImportFlags: UInt8 {
     case default_       = 0    // default import
     case star           = 1    // import * as ...
 }
@@ -1446,7 +1446,7 @@ enum ImportFlags: UInt8 {
 
 /// Error type encoding for the throw_error opcode's u8 operand.
 /// Matches QuickJS JS_THROW_ERROR_* values.
-enum ThrowErrorType: UInt8 {
+nonisolated enum ThrowErrorType: UInt8 {
     case deleteSuperProperty    = 0   // delete super.prop
     case setPropertyReadOnly    = 1   // assignment to const
     case varRedeclaration       = 2   // var redeclared in scope
@@ -1460,7 +1460,7 @@ enum ThrowErrorType: UInt8 {
 
 /// Verify the opcode info table has exactly the right number of entries.
 /// This runs at module initialization time.
-private let _opcodeTableCheck: Void = {
+nonisolated(unsafe) private let _opcodeTableCheck: Void = {
     assert(jeffJSOpcodeInfo.count == JeffJSOpcode.allCases.count,
            "Opcode info table size (\(jeffJSOpcodeInfo.count)) does not match opcode count (\(JeffJSOpcode.allCases.count))")
 }()
@@ -1468,7 +1468,7 @@ private let _opcodeTableCheck: Void = {
 
 /// Highest valid opcode raw value (wide opcodes included); used by the
 /// compiler's bitcast decode to reject garbage bytes after the wide prefix.
-let jeffJSMaxOpcodeRawValue: UInt16 = {
+nonisolated(unsafe) let jeffJSMaxOpcodeRawValue: UInt16 = {
     var m: UInt16 = 0
     var v: UInt16 = 0
     while v < 1024 {
@@ -1480,4 +1480,4 @@ let jeffJSMaxOpcodeRawValue: UInt16 = {
 
 /// JEFFJS_DUMP=1 dumps compiled bytecode. Read once: ProcessInfo.environment
 /// rebuilds a dictionary on every access and it was consulted per function.
-let jeffJSDumpEnabled: Bool = ProcessInfo.processInfo.environment["JEFFJS_DUMP"] != nil
+nonisolated(unsafe) let jeffJSDumpEnabled: Bool = ProcessInfo.processInfo.environment["JEFFJS_DUMP"] != nil

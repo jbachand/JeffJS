@@ -113,7 +113,7 @@ nonisolated final class JSFinalizationRegistryData {
 /// - `target` must be an object or a non-registered symbol.
 /// - Throws TypeError if called without `new`.
 /// - Throws TypeError if `target` is not a valid weak-ref target.
-func js_weakref_constructor(
+nonisolated func js_weakref_constructor(
     ctx: JeffJSContext,
     newTarget: JeffJSValue,
     this: JeffJSValue,
@@ -186,7 +186,7 @@ func js_weakref_constructor(
 ///   3. Record that target was observed by weakRef (marks it as live
 ///      for the remainder of the current turn).
 ///   4. Return target.
-func js_weakref_deref(
+nonisolated func js_weakref_deref(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -225,7 +225,7 @@ func js_weakref_deref(
 /// Releases the weak reference cell.
 ///
 /// Mirrors QuickJS `weak_ref_finalizer` for JS_CLASS_WEAKREF.
-func js_weakref_finalizer(rt: JeffJSRuntime, val: JeffJSValue) {
+nonisolated func js_weakref_finalizer(rt: JeffJSRuntime, val: JeffJSValue) {
     guard let obj = val.toObject(),
           case .opaque(let opaque) = obj.payload,
           let data = opaque as? JSWeakRefData else {
@@ -248,7 +248,7 @@ func js_weakref_finalizer(rt: JeffJSRuntime, val: JeffJSValue) {
 /// trace other internal values.
 ///
 /// Mirrors QuickJS `weak_ref_gc_mark` for JS_CLASS_WEAKREF.
-func js_weakref_gc_mark(
+nonisolated func js_weakref_gc_mark(
     rt: JeffJSRuntime,
     val: JeffJSValue,
     markFunc: (_ val: JeffJSValue) -> Void
@@ -266,7 +266,7 @@ func js_weakref_gc_mark(
 ///   - Any symbol that is NOT a registered (global) symbol
 ///
 /// Mirrors QuickJS `js_weakref_is_target`.
-func js_weakref_isValidTarget(_ val: JeffJSValue) -> Bool {
+nonisolated func js_weakref_isValidTarget(_ val: JeffJSValue) -> Bool {
     if val.isObject {
         return true
     }
@@ -291,7 +291,7 @@ func js_weakref_isValidTarget(_ val: JeffJSValue) -> Bool {
 ///
 /// - `cleanupCallback` must be callable.
 /// - Throws TypeError if called without `new`.
-func js_finrec_constructor(
+nonisolated func js_finrec_constructor(
     ctx: JeffJSContext,
     newTarget: JeffJSValue,
     this: JeffJSValue,
@@ -356,7 +356,7 @@ func js_finrec_constructor(
 ///      [[UnregisterToken]]: unregisterToken }.
 ///   7. Append cell to finalizationRegistry.[[Cells]].
 ///   8. Return undefined.
-func js_finrec_register(
+nonisolated func js_finrec_register(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -452,7 +452,7 @@ func js_finrec_register(
 ///         i.  Remove cell from finalizationRegistry.[[Cells]].
 ///         ii. Set removed to true.
 ///   6. Return removed.
-func js_finrec_unregister(
+nonisolated func js_finrec_unregister(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -507,7 +507,7 @@ func js_finrec_unregister(
 /// (via the job/microtask queue) with the held value.
 ///
 /// Mirrors QuickJS `js_weakref_check` / cleanup scheduling.
-func js_finrec_scheduleCleanup(
+nonisolated func js_finrec_scheduleCleanup(
     ctx: JeffJSContext,
     registryObj: JeffJSObject,
     data: JSFinalizationRegistryData
@@ -532,7 +532,7 @@ func js_finrec_scheduleCleanup(
 /// collected, calls `cleanupCallback(heldValue)` and removes the entry.
 ///
 /// Mirrors QuickJS `js_finrec_cleanup`.
-func js_finrec_runCleanup(
+nonisolated func js_finrec_runCleanup(
     ctx: JeffJSContext,
     registryObj: JeffJSObject,
     data: JSFinalizationRegistryData
@@ -590,7 +590,7 @@ func js_finrec_runCleanup(
 ///
 /// In QuickJS this goes through `JS_Call(ctx, callback, undefined, 1, &held_value)`.
 /// We model the same call convention.
-private func js_finrec_invokeCleanup(
+nonisolated private func js_finrec_invokeCleanup(
     ctx: JeffJSContext,
     callback: JeffJSValue,
     heldValue: JeffJSValue
@@ -630,7 +630,7 @@ private func js_finrec_invokeCleanup(
 /// Releases all entries and the cleanup callback.
 ///
 /// Mirrors QuickJS `finrec_finalizer`.
-func js_finrec_finalizer(rt: JeffJSRuntime, val: JeffJSValue) {
+nonisolated func js_finrec_finalizer(rt: JeffJSRuntime, val: JeffJSValue) {
     guard let obj = val.toObject(),
           case .opaque(let opaque) = obj.payload,
           let data = opaque as? JSFinalizationRegistryData else {
@@ -664,7 +664,7 @@ func js_finrec_finalizer(rt: JeffJSRuntime, val: JeffJSValue) {
 /// We do NOT mark targets (they are weak).
 ///
 /// Mirrors QuickJS `finrec_gc_mark`.
-func js_finrec_gc_mark(
+nonisolated func js_finrec_gc_mark(
     rt: JeffJSRuntime,
     val: JeffJSValue,
     markFunc: (_ val: JeffJSValue) -> Void
@@ -693,7 +693,7 @@ func js_finrec_gc_mark(
 /// whose targets have been collected.  Schedules cleanup jobs as needed.
 ///
 /// Mirrors QuickJS `js_weakref_check` which walks the weak_ref_list.
-func js_weakref_check(rt: JeffJSRuntime) {
+nonisolated func js_weakref_check(rt: JeffJSRuntime) {
     // Walk all GC objects looking for FinalizationRegistry instances.
     // In QuickJS this uses the weak_ref_list; we iterate the GC object list
     // since we do not yet have a separate weak-ref list.
@@ -720,7 +720,7 @@ func js_weakref_check(rt: JeffJSRuntime) {
 ///   - Return SameValueNonNumber(x, y) -- same as ===.
 ///
 /// Mirrors QuickJS `js_same_value` / `JS_EQ_SAME_VALUE`.
-private func js_sameValue(_ x: JeffJSValue, _ y: JeffJSValue) -> Bool {
+nonisolated private func js_sameValue(_ x: JeffJSValue, _ y: JeffJSValue) -> Bool {
     // Different tags => not same value.
     if !JeffJSValue.sameTag(x, y) {
         // Special case: int32 and float64 can represent the same number.
@@ -760,7 +760,7 @@ private func js_sameValue(_ x: JeffJSValue, _ y: JeffJSValue) -> Bool {
 
 /// Function list for `WeakRef.prototype`.
 /// Mirrors QuickJS `js_weakref_proto_funcs`.
-let js_weakref_proto_funcs: [(name: String, func_: JSCFunctionType, length: Int)] = [
+nonisolated(unsafe) let js_weakref_proto_funcs: [(name: String, func_: JSCFunctionType, length: Int)] = [
     ("deref", .generic({ ctx, this, argv in
         js_weakref_deref(ctx: ctx, this: this, argv: argv)
     }), 0),
@@ -768,7 +768,7 @@ let js_weakref_proto_funcs: [(name: String, func_: JSCFunctionType, length: Int)
 
 /// Function list for `FinalizationRegistry.prototype`.
 /// Mirrors QuickJS `js_finrec_proto_funcs`.
-let js_finrec_proto_funcs: [(name: String, func_: JSCFunctionType, length: Int)] = [
+nonisolated(unsafe) let js_finrec_proto_funcs: [(name: String, func_: JSCFunctionType, length: Int)] = [
     ("register", .generic({ ctx, this, argv in
         js_finrec_register(ctx: ctx, this: this, argv: argv)
     }), 2),
@@ -786,7 +786,7 @@ let js_finrec_proto_funcs: [(name: String, func_: JSCFunctionType, length: Int)]
 ///   - JS_CLASS_FINALIZATION_REGISTRY with finalizer and gc_mark
 ///   - WeakRef constructor and prototype
 ///   - FinalizationRegistry constructor and prototype
-func js_addIntrinsicWeakRef(rt: JeffJSRuntime) {
+nonisolated func js_addIntrinsicWeakRef(rt: JeffJSRuntime) {
     // Register JS_CLASS_WEAKREF.
     let weakRefClassIdx = Int(JeffJSClassID.weakRef.rawValue)
     while rt.classArray.count <= weakRefClassIdx {
@@ -819,7 +819,7 @@ func js_addIntrinsicWeakRef(rt: JeffJSRuntime) {
 ///
 /// Mirrors the relevant portion of `JS_AddIntrinsicBasicObjects` and
 /// the `js_weakref_*` / `js_finrec_*` setup in QuickJS.
-func js_initWeakRefAndFinalizationRegistry(ctx: JeffJSContext) {
+nonisolated func js_initWeakRefAndFinalizationRegistry(ctx: JeffJSContext) {
     // --- WeakRef ---
 
     // 1. Create WeakRef.prototype with deref() and @@toStringTag.

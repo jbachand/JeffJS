@@ -44,7 +44,7 @@
 import Foundation
 
 /// Errors raised by the chain encoder.
-enum QuantumChainError: Error, CustomStringConvertible {
+nonisolated enum QuantumChainError: Error, CustomStringConvertible {
     case messageTooLong(bits: Int, max: Int)
     case noChainFound
 
@@ -64,7 +64,7 @@ enum QuantumChainError: Error, CustomStringConvertible {
 /// Not actor-isolated: instances are pure compute and own their own
 /// `QuantumChainField` cache. Create a fresh encoder per background task
 /// to avoid sharing the cache across threads.
-final class QuantumChainEncoder {
+nonisolated final class QuantumChainEncoder {
 
     private let field = QuantumChainField()
 

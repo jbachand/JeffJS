@@ -4040,7 +4040,7 @@ final class JeffJSDOMBridge {
 /// always carry a path ("https://a.b" -> "https://a.b/"). Used by the
 /// `href` / `origin` / `protocol` / `host` / `hostname` / `port` /
 /// `pathname` / `search` / `hash` reflections on `<a>` and `<area>`.
-struct JeffJSHyperlinkURL {
+nonisolated struct JeffJSHyperlinkURL {
     enum Part: String, CaseIterable {
         case origin, `protocol`, username, password, host, hostname, port, pathname, search, hash
     }

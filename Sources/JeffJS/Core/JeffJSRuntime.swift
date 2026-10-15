@@ -14,7 +14,7 @@ import Foundation
 // MARK: - JSMallocState
 
 /// Mirrors QuickJS `JSMallocState`. Tracks memory allocation statistics.
-struct JSMallocState {
+nonisolated struct JSMallocState {
     /// Current number of allocated bytes (malloc_size sum).
     var mallocCount: Int
     /// Total bytes allocated over lifetime.
@@ -36,7 +36,7 @@ struct JSMallocState {
 
 /// Mirrors QuickJS `JSMemoryUsage` — snapshot of current memory usage.
 /// Returned by `JS_ComputeMemoryUsage`.
-struct JSMemoryUsage {
+nonisolated struct JSMemoryUsage {
     var mallocSize: Int64
     var mallocLimit: Int64
     var memoryUsedSize: Int64
@@ -133,7 +133,7 @@ nonisolated class JeffJSAtomStruct {
 
 /// Mirrors QuickJS `JSClass`. Defines a class with its name, finalizer,
 /// GC mark function, exotic methods, etc.
-struct JeffJSClass {
+nonisolated struct JeffJSClass {
     /// Atom index for the class name (e.g., "Object", "Array").
     var classNameAtom: UInt32 = 0
     /// Finalizer called when an object of this class is freed.
@@ -152,7 +152,7 @@ struct JeffJSClass {
 
 /// Mirrors QuickJS `JSExoticMethods` — custom property access behavior.
 /// Used for Array, String, Proxy, TypedArray, etc.
-struct JeffJSExoticMethods {
+nonisolated struct JeffJSExoticMethods {
     var getOwnProperty: ((JeffJSContext, JeffJSValue, UInt32) -> Int)?
     var getOwnPropertyNames: ((JeffJSContext, JeffJSValue, Int) -> [UInt32]?)?
     var deleteProperty: ((JeffJSContext, JeffJSValue, UInt32) -> Int)?
@@ -179,7 +179,7 @@ struct JeffJSExoticMethods {
 /// Predefined atom IDs matching JSPredefinedAtom in JeffJSAtom.swift.
 /// Only includes atoms that are actively referenced by JeffJS code.
 /// Raw values MUST match JSPredefinedAtom exactly.
-enum JeffJSAtomID: UInt32 {
+nonisolated enum JeffJSAtomID: UInt32 {
     case JS_ATOM_NULL = 0
 
     // Well-known property names
@@ -2278,7 +2278,7 @@ nonisolated final class JeffJSRuntime {
 /// Compare a Swift string's UTF-8 with a JS string's code units without
 /// materialising either (Latin-1 / BMP without surrogates only; callers
 /// route other strings through the Swift path).
-func jeffJS_utf8Equals(_ str: String, _ js: JeffJSString) -> Bool {
+nonisolated func jeffJS_utf8Equals(_ str: String, _ js: JeffJSString) -> Bool {
     var it = str.utf8.makeIterator()
     @inline(__always) func take() -> UInt32? { if let b = it.next() { return UInt32(b) } ; return nil }
     switch js.storage {
@@ -2300,7 +2300,7 @@ func jeffJS_utf8Equals(_ str: String, _ js: JeffJSString) -> Bool {
 
 /// True when `str`'s UTF-8 is exactly `bytes`.
 @inline(__always)
-func jeffJS_utf8Equal(_ str: String, _ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+nonisolated func jeffJS_utf8Equal(_ str: String, _ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
     let u = str.utf8
     guard u.count == bytes.count else { return false }
     if let r = u.withContiguousStorageIfAvailable({ s -> Bool in
@@ -2315,7 +2315,7 @@ func jeffJS_utf8Equal(_ str: String, _ bytes: UnsafeBufferPointer<UInt8>) -> Boo
 /// fractional part. "01", "1.0", "+1", " 1" and 2^31 or above are ordinary
 /// string keys. Mirrors QuickJS's `__JS_AtomFromUInt32` admission test.
 @inline(__always)
-func jeffJS_canonicalArrayIndex<S: Sequence>(utf8: S, max: UInt32 = JS_ATOM_MAX_INT) -> UInt32? where S.Element == UInt8 {
+nonisolated func jeffJS_canonicalArrayIndex<S: Sequence>(utf8: S, max: UInt32 = JS_ATOM_MAX_INT) -> UInt32? where S.Element == UInt8 {
     var value: UInt64 = 0
     var count = 0
     var first: UInt8 = 0

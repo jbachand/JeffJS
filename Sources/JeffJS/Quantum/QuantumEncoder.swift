@@ -9,7 +9,7 @@
 import Foundation
 
 /// Result of a successful encode operation.
-struct QuantumEncodeResult {
+nonisolated struct QuantumEncodeResult {
     /// One master key per chunk (single key for short messages).
     let keys: [UInt32]
     /// Original message length in bytes.
@@ -19,7 +19,7 @@ struct QuantumEncodeResult {
 }
 
 /// Encodes byte data into quantum master keys.
-final class QuantumEncoder {
+nonisolated final class QuantumEncoder {
 
     private let field = QuantumField()
     #if canImport(Metal)

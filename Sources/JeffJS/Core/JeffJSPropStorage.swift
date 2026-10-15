@@ -10,7 +10,7 @@ import Foundation
 /// capacity) triple: no ownership semantics of its own. The owning
 /// JeffJSObject frees the buffer in deinit; code that moves the storage out
 /// of an object (freeObject) calls `deallocateStorage()` itself.
-struct JeffJSPropStorage: RandomAccessCollection {
+nonisolated struct JeffJSPropStorage: RandomAccessCollection {
     typealias Index = Int
     typealias Element = JeffJSValue
 
@@ -102,7 +102,7 @@ struct JeffJSPropStorage: RandomAccessCollection {
 /// Own or prototype-chain read. nil on any mismatch. The returned value is
 /// borrowed (dup before pushing).
 @inline(__always)
-func jeffJS_icRead(_ ptr: UnsafeRawPointer, _ entry: JeffJSICEntry) -> JeffJSValue? {
+nonisolated func jeffJS_icRead(_ ptr: UnsafeRawPointer, _ entry: JeffJSICEntry) -> JeffJSValue? {
     return Unmanaged<JeffJSObject>.fromOpaque(ptr)._withUnsafeGuaranteedRef { o -> JeffJSValue? in
         guard let sid = o.shapeIdentity, sid == entry.shapePtr else { return nil }
         if entry.holderPtr != nil { return jeffJS_icProtoHit(entry) }
@@ -115,7 +115,7 @@ func jeffJS_icRead(_ ptr: UnsafeRawPointer, _ entry: JeffJSICEntry) -> JeffJSVal
 /// Own data-slot write. Takes the `val` reference and releases the previous
 /// slot value (QuickJS set_value). Does not touch the receiver reference.
 @inline(__always)
-func jeffJS_icWrite(_ ptr: UnsafeRawPointer, _ entry: JeffJSICEntry, _ val: JeffJSValue) -> Bool {
+nonisolated func jeffJS_icWrite(_ ptr: UnsafeRawPointer, _ entry: JeffJSICEntry, _ val: JeffJSValue) -> Bool {
     return Unmanaged<JeffJSObject>.fromOpaque(ptr)._withUnsafeGuaranteedRef { o -> Bool in
         guard entry.writable, let sid = o.shapeIdentity, sid == entry.shapePtr else { return false }
         let off = entry.propOffset
@@ -130,7 +130,7 @@ func jeffJS_icWrite(_ ptr: UnsafeRawPointer, _ entry: JeffJSICEntry, _ val: Jeff
 /// define_field transition-cache hit: move the receiver from the cached
 /// starting shape to its successor and append `val` (reference taken).
 @inline(__always)
-func jeffJS_icDefine(_ ptr: UnsafeRawPointer, _ entry: JeffJSICEntry, _ val: JeffJSValue, _ rt: JeffJSRuntime) -> Bool {
+nonisolated func jeffJS_icDefine(_ ptr: UnsafeRawPointer, _ entry: JeffJSICEntry, _ val: JeffJSValue, _ rt: JeffJSRuntime) -> Bool {
     return Unmanaged<JeffJSObject>.fromOpaque(ptr)._withUnsafeGuaranteedRef { o -> Bool in
         guard let sid = o.shapeIdentity, sid == entry.shapePtr, let toPtr = entry.nextShapePtr, o.extensible else { return false }
         return Unmanaged<JeffJSShape>.fromOpaque(toPtr)._withUnsafeGuaranteedRef { next -> Bool in

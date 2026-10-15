@@ -18,7 +18,7 @@ import Foundation
 /// A sorted table of (start, end) code-point ranges.  Supports O(log n)
 /// membership testing via binary search.  Mirrors the range table encoding
 /// used in QuickJS libunicode-table.h.
-struct UnicodeRangeTable {
+nonisolated struct UnicodeRangeTable {
     /// Flattened array of range pairs: [start0, end0, start1, end1, ...].
     /// Each pair is inclusive on both ends: start <= cp <= end.
     let ranges: [UInt32]
@@ -51,7 +51,7 @@ struct UnicodeRangeTable {
 // =============================================================================
 
 /// Unicode General Category values used by JeffJS.
-enum UnicodeCategory: UInt8 {
+nonisolated enum UnicodeCategory: UInt8 {
     case Cn = 0   // Unassigned
     case Lu = 1   // Uppercase Letter
     case Ll = 2   // Lowercase Letter
@@ -89,7 +89,7 @@ enum UnicodeCategory: UInt8 {
 // =============================================================================
 
 /// Central repository for Unicode data tables consumed by JeffJSUnicode.
-struct JeffJSUnicodeTable {
+nonisolated struct JeffJSUnicodeTable {
 
     // =========================================================================
     // MARK: - ID_Start Table (ECMAScript IdentifierStart)

@@ -15,7 +15,7 @@ import Foundation
 
 /// Implements the Function built-in for JeffJS.
 /// Mirrors QuickJS js_function_proto_* functions and the Function constructor.
-struct JeffJSBuiltinFunction {
+nonisolated struct JeffJSBuiltinFunction {
 
     // MARK: - Intrinsic Registration
 

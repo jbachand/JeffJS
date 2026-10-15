@@ -15,7 +15,7 @@ import Foundation
 // MARK: - Typed Array Element Info
 
 /// Metadata for each typed array element type.
-struct TypedArrayElementInfo {
+nonisolated struct TypedArrayElementInfo {
     let name: String
     let classID: Int
     let bytesPerElement: Int
@@ -215,7 +215,7 @@ struct TypedArrayElementInfo {
 }
 
 /// Table of all typed array types indexed by (classID - first typed array classID).
-let typedArrayInfoTable: [TypedArrayElementInfo] = [
+nonisolated(unsafe) let typedArrayInfoTable: [TypedArrayElementInfo] = [
     TypedArrayElementInfo(name: "Int8Array",         classID: JeffJSClassID.int8Array.rawValue,      bytesPerElement: 1, isBigInt: false, isClamped: false, isSigned: true,  isFloat: false),
     TypedArrayElementInfo(name: "Uint8Array",        classID: JeffJSClassID.uint8Array.rawValue,     bytesPerElement: 1, isBigInt: false, isClamped: false, isSigned: false, isFloat: false),
     TypedArrayElementInfo(name: "Uint8ClampedArray", classID: JeffJSClassID.uint8cArray.rawValue,    bytesPerElement: 1, isBigInt: false, isClamped: true,  isSigned: false, isFloat: false),
@@ -230,14 +230,14 @@ let typedArrayInfoTable: [TypedArrayElementInfo] = [
 ]
 
 /// Float16Array info (not backed by a classID yet, but included for completeness).
-let float16ArrayInfo = TypedArrayElementInfo(
+nonisolated(unsafe) let float16ArrayInfo = TypedArrayElementInfo(
     name: "Float16Array", classID: 0, bytesPerElement: 2,
     isBigInt: false, isClamped: false, isSigned: false, isFloat: true
 )
 
 /// Element size of the numeric (non-BigInt) typed array classes, 0 for anything else.
 @inline(__always)
-func jeffJS_typedArrayBytes(_ classID: Int) -> Int {
+nonisolated func jeffJS_typedArrayBytes(_ classID: Int) -> Int {
     switch classID {
     case JeffJSClassID.int8Array.rawValue, JeffJSClassID.uint8Array.rawValue, JeffJSClassID.uint8cArray.rawValue: return 1
     case JeffJSClassID.int16Array.rawValue, JeffJSClassID.uint16Array.rawValue: return 2
@@ -250,7 +250,7 @@ func jeffJS_typedArrayBytes(_ classID: Int) -> Int {
 /// Same results as `TypedArrayElementInfo.readElement` (little endian) for the classes
 /// `jeffJS_typedArrayBytes` accepts, straight from the byte address `p`.
 @inline(__always)
-func jeffJS_typedArrayLoad(_ classID: Int, _ p: UnsafeRawPointer) -> JeffJSValue {
+nonisolated func jeffJS_typedArrayLoad(_ classID: Int, _ p: UnsafeRawPointer) -> JeffJSValue {
     switch classID {
     case JeffJSClassID.int8Array.rawValue: return .newInt32(Int32(p.loadUnaligned(as: Int8.self)))
     case JeffJSClassID.uint8Array.rawValue, JeffJSClassID.uint8cArray.rawValue: return .newInt32(Int32(p.loadUnaligned(as: UInt8.self)))
@@ -265,7 +265,7 @@ func jeffJS_typedArrayLoad(_ classID: Int, _ p: UnsafeRawPointer) -> JeffJSValue
 
 /// Same stores as `TypedArrayElementInfo.writeElement` (little endian) for an int32 or float64 `value`.
 @inline(__always)
-func jeffJS_typedArrayStore(_ classID: Int, _ p: UnsafeMutableRawPointer, _ value: JeffJSValue) {
+nonisolated func jeffJS_typedArrayStore(_ classID: Int, _ p: UnsafeMutableRawPointer, _ value: JeffJSValue) {
     @inline(__always) func toInt32() -> Int32 {
         if value.isInt { return value.toInt32() }
         let d = value.toNumber()
@@ -295,14 +295,14 @@ func jeffJS_typedArrayStore(_ classID: Int, _ p: UnsafeMutableRawPointer, _ valu
 }
 
 /// Lookup TypedArrayElementInfo by classID.
-func typedArrayInfo(forClassID classID: Int) -> TypedArrayElementInfo? {
+nonisolated func typedArrayInfo(forClassID classID: Int) -> TypedArrayElementInfo? {
     return typedArrayInfoTable.first { $0.classID == classID }
 }
 
 // MARK: - ArrayBuffer Helpers
 
 /// Validate and extract the JeffJSArrayBuffer from an object.
-private func getArrayBuffer(_ thisVal: JeffJSValue) -> JeffJSArrayBuffer? {
+nonisolated private func getArrayBuffer(_ thisVal: JeffJSValue) -> JeffJSArrayBuffer? {
     guard let obj = thisVal.toObject() else { return nil }
     if obj.classID == JeffJSClassID.arrayBuffer.rawValue ||
        obj.classID == JeffJSClassID.sharedArrayBuffer.rawValue {
@@ -316,7 +316,7 @@ private func getArrayBuffer(_ thisVal: JeffJSValue) -> JeffJSArrayBuffer? {
 /// BigInt array, else ToNumber — strings, booleans, null and objects (valueOf) are
 /// converted, not stored as 0. Returns an owned value, nil when the conversion threw.
 /// `value` is borrowed.
-func typedArrayCoerceElement(_ ctx: JeffJSContext, _ info: TypedArrayElementInfo, _ value: JeffJSValue) -> JeffJSValue? {
+nonisolated func typedArrayCoerceElement(_ ctx: JeffJSContext, _ info: TypedArrayElementInfo, _ value: JeffJSValue) -> JeffJSValue? {
     if info.isBigInt {
         let b = ctx.toBigIntValue(value)
         return b.isException ? nil : b
@@ -326,7 +326,7 @@ func typedArrayCoerceElement(_ ctx: JeffJSContext, _ info: TypedArrayElementInfo
     return ok ? .newFloat64(d) : nil
 }
 
-private func validateTypedArray(_ thisVal: JeffJSValue) -> (JeffJSTypedArray, JeffJSArrayBuffer)? {
+nonisolated private func validateTypedArray(_ thisVal: JeffJSValue) -> (JeffJSTypedArray, JeffJSArrayBuffer)? {
     guard let obj = thisVal.obj else { return nil }
     // Unretained mirrors (JeffJSObjectAux.taU, JeffJSTypedArray.abU): no payload-enum copies.
     guard let (ta, ab) = obj._with({ o -> (JeffJSTypedArray, JeffJSArrayBuffer)? in
@@ -347,7 +347,7 @@ private func validateTypedArray(_ thisVal: JeffJSValue) -> (JeffJSTypedArray, Je
 // MARK: - ArrayBuffer Constructor
 
 /// new ArrayBuffer(length) or new ArrayBuffer(length, { maxByteLength })
-func jsArrayBuffer_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated func jsArrayBuffer_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                                _ argv: [JeffJSValue]) -> JeffJSValue {
     var byteLength = 0
     if argv.count >= 1 {
@@ -402,7 +402,7 @@ func jsArrayBuffer_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 // MARK: - ArrayBuffer Prototype Methods
 
 /// ArrayBuffer.prototype.byteLength getter
-func jsArrayBuffer_byteLength(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
+nonisolated func jsArrayBuffer_byteLength(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
     guard let ab = getArrayBuffer(thisVal) else {
         return ctx.throwTypeError("not an ArrayBuffer")
     }
@@ -411,7 +411,7 @@ func jsArrayBuffer_byteLength(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> J
 }
 
 /// ArrayBuffer.prototype.slice(begin, end)
-func jsArrayBuffer_slice(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated func jsArrayBuffer_slice(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                          _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let ab = getArrayBuffer(thisVal), !ab.detached else {
         return ctx.throwTypeError("ArrayBuffer is detached")
@@ -444,7 +444,7 @@ func jsArrayBuffer_slice(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 }
 
 /// ArrayBuffer.prototype.resize(newLength)
-func jsArrayBuffer_resize(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated func jsArrayBuffer_resize(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                           _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let ab = getArrayBuffer(thisVal), !ab.detached else {
         return ctx.throwTypeError("ArrayBuffer is detached")
@@ -463,7 +463,7 @@ func jsArrayBuffer_resize(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 }
 
 /// ArrayBuffer.prototype.transfer() / transferToFixedLength()
-func jsArrayBuffer_transfer(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated func jsArrayBuffer_transfer(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                             _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let ab = getArrayBuffer(thisVal), !ab.detached else {
         return ctx.throwTypeError("ArrayBuffer is detached")
@@ -492,7 +492,7 @@ func jsArrayBuffer_transfer(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 }
 
 /// ArrayBuffer.isView(value) — static method.
-func jsArrayBuffer_isView(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated func jsArrayBuffer_isView(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                           _ argv: [JeffJSValue]) -> JeffJSValue {
     guard argv.count >= 1, let obj = argv[0].toObject() else { return .newBool(false) }
     if case .typedArray(_) = obj.payload { return .newBool(true) }
@@ -501,7 +501,7 @@ func jsArrayBuffer_isView(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 }
 
 /// ArrayBuffer.prototype.maxByteLength getter
-func jsArrayBuffer_maxByteLength(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
+nonisolated func jsArrayBuffer_maxByteLength(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
     guard let ab = getArrayBuffer(thisVal) else {
         return ctx.throwTypeError("not an ArrayBuffer")
     }
@@ -509,20 +509,20 @@ func jsArrayBuffer_maxByteLength(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -
 }
 
 /// ArrayBuffer.prototype.resizable getter
-func jsArrayBuffer_resizable(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
+nonisolated func jsArrayBuffer_resizable(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
     guard let ab = getArrayBuffer(thisVal) else { return ctx.throwTypeError("not an ArrayBuffer") }
     return .newBool(ab.data.capacity > ab.byteLength)
 }
 
 /// ArrayBuffer.prototype.detached getter
-func jsArrayBuffer_detached(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
+nonisolated func jsArrayBuffer_detached(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
     guard let ab = getArrayBuffer(thisVal) else { return ctx.throwTypeError("not an ArrayBuffer") }
     return .newBool(ab.detached)
 }
 
 // MARK: - SharedArrayBuffer Constructor
 
-func jsSharedArrayBuffer_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated func jsSharedArrayBuffer_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                                      _ argv: [JeffJSValue]) -> JeffJSValue {
     var byteLength = 0
     if argv.count >= 1 {
@@ -549,7 +549,7 @@ func jsSharedArrayBuffer_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValu
 }
 
 /// SharedArrayBuffer.prototype.grow(newLength)
-func jsSharedArrayBuffer_grow(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated func jsSharedArrayBuffer_grow(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                               _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let ab = getArrayBuffer(thisVal), ab.shared else {
         return ctx.throwTypeError("not a SharedArrayBuffer")
@@ -564,7 +564,7 @@ func jsSharedArrayBuffer_grow(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 }
 
 /// SharedArrayBuffer.prototype.growable getter
-func jsSharedArrayBuffer_growable(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
+nonisolated func jsSharedArrayBuffer_growable(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
     guard let ab = getArrayBuffer(thisVal), ab.shared else {
         return ctx.throwTypeError("not a SharedArrayBuffer")
     }
@@ -587,7 +587,7 @@ func jsSharedArrayBuffer_growable(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) 
 /// releasing the buffer over-releases a never-retained allocation
 /// (`new Uint8Array(2);` as a statement crashed on the spot).
 @inline(__always)
-func typedArrayAdoptNewBuffer(_ ta: JeffJSTypedArray, _ bufObj: JeffJSObject) {
+nonisolated func typedArrayAdoptNewBuffer(_ ta: JeffJSTypedArray, _ bufObj: JeffJSObject) {
     _ = JeffJSValue.makeObject(bufObj)
     ta.buffer = bufObj
 }
@@ -598,7 +598,7 @@ func typedArrayAdoptNewBuffer(_ ta: JeffJSTypedArray, _ bufObj: JeffJSObject) {
 /// through `JeffJSValue.makeObject(...).dupValue()`: that would take a second
 /// `Unmanaged` retain which nothing ever releases.
 @inline(__always)
-func typedArrayAdoptBuffer(_ ta: JeffJSTypedArray, _ bufObj: JeffJSObject) {
+nonisolated func typedArrayAdoptBuffer(_ ta: JeffJSTypedArray, _ bufObj: JeffJSObject) {
     ta.buffer = bufObj
     bufObj.refCount += 1
     if JeffJSGCObjectHeader.trackRefcounts { JeffJSGCObjectHeader.trackDup(bufObj) }
@@ -610,14 +610,14 @@ func typedArrayAdoptBuffer(_ ta: JeffJSTypedArray, _ bufObj: JeffJSObject) {
 /// taken the first time it was boxed and is released when its JS refcount
 /// reaches zero, which cannot happen while the value returned here holds one.
 @inline(__always)
-func typedArrayBufferValue(_ buf: JeffJSObject) -> JeffJSValue {
+nonisolated func typedArrayBufferValue(_ buf: JeffJSObject) -> JeffJSValue {
     return JeffJSValue.makeObjectRecycled(buf).dupValue()
 }
 
 // MARK: - TypedArray Constructor (generic)
 
 /// Create a typed array from: length, another typed array, an array-like, or (buffer, offset, length).
-func jsTypedArray_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated func jsTypedArray_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                               _ argv: [JeffJSValue], classID: Int) -> JeffJSValue {
     guard let info = typedArrayInfo(forClassID: classID) else {
         return ctx.throwTypeError("Unknown typed array type")
@@ -736,7 +736,7 @@ func jsTypedArray_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 // MARK: - TypedArray Prototype Methods
 
 /// %TypedArray%.prototype.at(index)
-func jsTypedArray_at(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_at(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let (ta, ab) = validateTypedArray(thisVal) else {
         return ctx.throwTypeError("not a typed array or buffer detached")
     }
@@ -748,7 +748,7 @@ func jsTypedArray_at(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Jeff
 }
 
 /// %TypedArray%.prototype.buffer getter
-func jsTypedArray_buffer(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
+nonisolated func jsTypedArray_buffer(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
     guard let obj = thisVal.toObject() else { return .undefined }
     if case .typedArray(let ta) = obj.payload, let buf = ta.buffer {
         // The buffer stays owned by the typed array: hand the caller its own
@@ -759,28 +759,28 @@ func jsTypedArray_buffer(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJS
 }
 
 /// %TypedArray%.prototype.byteLength getter
-func jsTypedArray_byteLength(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
+nonisolated func jsTypedArray_byteLength(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
     guard let (ta, ab) = validateTypedArray(thisVal) else { return .newInt32(0) }
     if ab.detached { return .newInt32(0) }
     return .newInt32(Int32(ta.byteLength))
 }
 
 /// %TypedArray%.prototype.byteOffset getter
-func jsTypedArray_byteOffset(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
+nonisolated func jsTypedArray_byteOffset(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
     guard let (ta, ab) = validateTypedArray(thisVal) else { return .newInt32(0) }
     if ab.detached { return .newInt32(0) }
     return .newInt32(Int32(ta.byteOffset))
 }
 
 /// %TypedArray%.prototype.length getter
-func jsTypedArray_length(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
+nonisolated func jsTypedArray_length(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
     guard let (ta, ab) = validateTypedArray(thisVal) else { return .newInt32(0) }
     if ab.detached { return .newInt32(0) }
     return .newInt32(Int32(ta.length))
 }
 
 /// %TypedArray%.prototype.set(source [, offset])
-func jsTypedArray_set(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_set(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let (ta, ab) = validateTypedArray(thisVal) else {
         return ctx.throwTypeError("not a typed array")
     }
@@ -848,7 +848,7 @@ func jsTypedArray_set(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Jef
 }
 
 /// %TypedArray%.prototype.slice(start, end)
-func jsTypedArray_slice(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_slice(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let (ta, ab) = validateTypedArray(thisVal) else {
         return ctx.throwTypeError("not a typed array")
     }
@@ -886,7 +886,7 @@ func jsTypedArray_slice(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [J
 }
 
 /// %TypedArray%.prototype.subarray(begin, end) — creates a view, no copy.
-func jsTypedArray_subarray(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_subarray(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let (ta, _) = validateTypedArray(thisVal) else {
         return ctx.throwTypeError("not a typed array")
     }
@@ -914,7 +914,7 @@ func jsTypedArray_subarray(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
 }
 
 /// %TypedArray%.prototype.fill(value [, start [, end]])
-func jsTypedArray_fill(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_fill(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let (ta, ab) = validateTypedArray(thisVal) else {
         return ctx.throwTypeError("not a typed array")
     }
@@ -942,7 +942,7 @@ func jsTypedArray_fill(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Je
 }
 
 /// %TypedArray%.prototype.copyWithin(target, start [, end])
-func jsTypedArray_copyWithin(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_copyWithin(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let (ta, ab) = validateTypedArray(thisVal) else {
         return ctx.throwTypeError("not a typed array")
     }
@@ -974,7 +974,7 @@ func jsTypedArray_copyWithin(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ arg
 }
 
 /// %TypedArray%.prototype.reverse()
-func jsTypedArray_reverse(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_reverse(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let (ta, ab) = validateTypedArray(thisVal) else {
         return ctx.throwTypeError("not a typed array")
     }
@@ -998,7 +998,7 @@ func jsTypedArray_reverse(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: 
 }
 
 /// %TypedArray%.prototype.indexOf(searchElement [, fromIndex])
-func jsTypedArray_indexOf(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_indexOf(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let (ta, ab) = validateTypedArray(thisVal) else { return .newInt32(-1) }
     guard let info = typedArrayInfo(forClassID: ta.classID) else { return .newInt32(-1) }
     let searchVal = argv.count >= 1 ? argv[0] : JeffJSValue.undefined
@@ -1014,7 +1014,7 @@ func jsTypedArray_indexOf(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: 
 }
 
 /// %TypedArray%.prototype.lastIndexOf(searchElement [, fromIndex])
-func jsTypedArray_lastIndexOf(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_lastIndexOf(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let (ta, ab) = validateTypedArray(thisVal) else { return .newInt32(-1) }
     guard let info = typedArrayInfo(forClassID: ta.classID) else { return .newInt32(-1) }
     let searchVal = argv.count >= 1 ? argv[0] : JeffJSValue.undefined
@@ -1032,14 +1032,14 @@ func jsTypedArray_lastIndexOf(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ ar
 }
 
 /// %TypedArray%.prototype.includes(searchElement [, fromIndex])
-func jsTypedArray_includes(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_includes(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let result = jsTypedArray_indexOf(ctx, thisVal, argv)
     if result.isInt { return .newBool(result.toInt32() >= 0) }
     return .newBool(false)
 }
 
 /// %TypedArray%.prototype.join([separator])
-func jsTypedArray_join(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_join(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let (ta, ab) = validateTypedArray(thisVal) else {
         return .makeString(JeffJSString(swiftString: ""))
     }
@@ -1070,19 +1070,19 @@ func jsTypedArray_join(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Je
 }
 
 /// %TypedArray%.prototype.toString() — same as Array.prototype.join
-func jsTypedArray_toString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_toString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return jsTypedArray_join(ctx, thisVal, [])
 }
 
 /// %TypedArray%.prototype.toLocaleString()
-func jsTypedArray_toLocaleString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_toLocaleString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return jsTypedArray_join(ctx, thisVal, [])
 }
 
 // MARK: - DataView
 
 /// new DataView(buffer [, byteOffset [, byteLength]])
-func jsDataView_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated func jsDataView_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                             _ argv: [JeffJSValue]) -> JeffJSValue {
     guard argv.count >= 1, let bufObj = argv[0].toObject() else {
         return ctx.throwTypeError("First argument must be an ArrayBuffer")
@@ -1119,7 +1119,7 @@ func jsDataView_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 }
 
 /// Generic DataView get method.
-private func dataViewGet(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated private func dataViewGet(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                          _ argv: [JeffJSValue], bytesPerElement: Int,
                          reader: ([UInt8], Int, Bool) -> JeffJSValue) -> JeffJSValue {
     guard let obj = thisVal.toObject(), obj.classID == JeffJSClassID.dataView.rawValue,
@@ -1141,7 +1141,7 @@ private func dataViewGet(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 }
 
 /// Generic DataView set method.
-private func dataViewSet(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated private func dataViewSet(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                          _ argv: [JeffJSValue], bytesPerElement: Int,
                          bigIntElement: Bool = false,
                          writer: (inout [UInt8], Int, JeffJSValue, Bool) -> Void) -> JeffJSValue {
@@ -1177,19 +1177,19 @@ private func dataViewSet(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 
 // DataView typed read helpers
 
-func jsDataView_getInt8(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_getInt8(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewGet(ctx, thisVal, argv, bytesPerElement: 1) { data, off, _ in
         .newInt32(Int32(Int8(bitPattern: data[off])))
     }
 }
 
-func jsDataView_getUint8(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_getUint8(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewGet(ctx, thisVal, argv, bytesPerElement: 1) { data, off, _ in
         .newInt32(Int32(data[off]))
     }
 }
 
-func jsDataView_getInt16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_getInt16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewGet(ctx, thisVal, argv, bytesPerElement: 2) { data, off, le in
         var raw = UInt16(data[off]) | (UInt16(data[off + 1]) << 8)
         if !le { raw = raw.byteSwapped }
@@ -1197,7 +1197,7 @@ func jsDataView_getInt16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [
     }
 }
 
-func jsDataView_getUint16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_getUint16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewGet(ctx, thisVal, argv, bytesPerElement: 2) { data, off, le in
         var raw = UInt16(data[off]) | (UInt16(data[off + 1]) << 8)
         if !le { raw = raw.byteSwapped }
@@ -1205,7 +1205,7 @@ func jsDataView_getUint16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: 
     }
 }
 
-func jsDataView_getInt32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_getInt32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewGet(ctx, thisVal, argv, bytesPerElement: 4) { data, off, le in
         var raw = UInt32(data[off]) | (UInt32(data[off+1]) << 8) | (UInt32(data[off+2]) << 16) | (UInt32(data[off+3]) << 24)
         if !le { raw = raw.byteSwapped }
@@ -1213,7 +1213,7 @@ func jsDataView_getInt32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [
     }
 }
 
-func jsDataView_getUint32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_getUint32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewGet(ctx, thisVal, argv, bytesPerElement: 4) { data, off, le in
         var raw = UInt32(data[off]) | (UInt32(data[off+1]) << 8) | (UInt32(data[off+2]) << 16) | (UInt32(data[off+3]) << 24)
         if !le { raw = raw.byteSwapped }
@@ -1221,7 +1221,7 @@ func jsDataView_getUint32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: 
     }
 }
 
-func jsDataView_getFloat32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_getFloat32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewGet(ctx, thisVal, argv, bytesPerElement: 4) { data, off, le in
         var raw = UInt32(data[off]) | (UInt32(data[off+1]) << 8) | (UInt32(data[off+2]) << 16) | (UInt32(data[off+3]) << 24)
         if !le { raw = raw.byteSwapped }
@@ -1229,7 +1229,7 @@ func jsDataView_getFloat32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
     }
 }
 
-func jsDataView_getFloat64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_getFloat64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewGet(ctx, thisVal, argv, bytesPerElement: 8) { data, off, le in
         var raw: UInt64 = 0
         for i in 0..<8 { raw |= UInt64(data[off + i]) << (i * 8) }
@@ -1238,7 +1238,7 @@ func jsDataView_getFloat64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
     }
 }
 
-func jsDataView_getBigInt64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_getBigInt64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewGet(ctx, thisVal, argv, bytesPerElement: 8) { data, off, le in
         var raw: UInt64 = 0
         for i in 0..<8 { raw |= UInt64(data[off + i]) << (i * 8) }
@@ -1247,7 +1247,7 @@ func jsDataView_getBigInt64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv
     }
 }
 
-func jsDataView_getBigUint64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_getBigUint64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewGet(ctx, thisVal, argv, bytesPerElement: 8) { data, off, le in
         var raw: UInt64 = 0
         for i in 0..<8 { raw |= UInt64(data[off + i]) << (i * 8) }
@@ -1256,7 +1256,7 @@ func jsDataView_getBigUint64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ arg
     }
 }
 
-func jsDataView_getFloat16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_getFloat16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewGet(ctx, thisVal, argv, bytesPerElement: 2) { data, off, le in
         var raw = UInt16(data[off]) | (UInt16(data[off + 1]) << 8)
         if !le { raw = raw.byteSwapped }
@@ -1279,21 +1279,21 @@ func jsDataView_getFloat16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
 
 // DataView set methods
 
-func jsDataView_setInt8(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_setInt8(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewSet(ctx, thisVal, argv, bytesPerElement: 1) { data, off, val, _ in
         let v = val.isInt ? val.toInt32() : JeffJSTypeConvert.doubleToInt32(val.toNumber())  // ToInt32; `Int32(d)` trapped
         data[off] = UInt8(bitPattern: Int8(truncatingIfNeeded: v))
     }
 }
 
-func jsDataView_setUint8(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_setUint8(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewSet(ctx, thisVal, argv, bytesPerElement: 1) { data, off, val, _ in
         let v = val.isInt ? val.toInt32() : JeffJSTypeConvert.doubleToInt32(val.toNumber())  // ToInt32; `Int32(d)` trapped
         data[off] = UInt8(truncatingIfNeeded: v)
     }
 }
 
-func jsDataView_setInt16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_setInt16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewSet(ctx, thisVal, argv, bytesPerElement: 2) { data, off, val, le in
         let v = val.isInt ? val.toInt32() : JeffJSTypeConvert.doubleToInt32(val.toNumber())  // ToInt32; `Int32(d)` trapped
         var raw = UInt16(bitPattern: Int16(truncatingIfNeeded: v))
@@ -1302,7 +1302,7 @@ func jsDataView_setInt16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [
     }
 }
 
-func jsDataView_setUint16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_setUint16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewSet(ctx, thisVal, argv, bytesPerElement: 2) { data, off, val, le in
         let v = val.isInt ? val.toInt32() : JeffJSTypeConvert.doubleToInt32(val.toNumber())  // ToInt32; `Int32(d)` trapped
         var raw = UInt16(truncatingIfNeeded: v)
@@ -1311,7 +1311,7 @@ func jsDataView_setUint16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: 
     }
 }
 
-func jsDataView_setInt32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_setInt32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewSet(ctx, thisVal, argv, bytesPerElement: 4) { data, off, val, le in
         let v = val.isInt ? val.toInt32() : JeffJSTypeConvert.doubleToInt32(val.toNumber())  // ToInt32; `Int32(d)` trapped
         var raw = UInt32(bitPattern: v)
@@ -1320,7 +1320,7 @@ func jsDataView_setInt32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [
     }
 }
 
-func jsDataView_setUint32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_setUint32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewSet(ctx, thisVal, argv, bytesPerElement: 4) { data, off, val, le in
         let d = val.isInt ? Double(val.toInt32()) : val.toNumber()
         var raw = JeffJSTypeConvert.doubleToUInt32(d)  // ToUint32; `UInt32(d)` trapped
@@ -1329,7 +1329,7 @@ func jsDataView_setUint32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: 
     }
 }
 
-func jsDataView_setFloat32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_setFloat32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewSet(ctx, thisVal, argv, bytesPerElement: 4) { data, off, val, le in
         let d = val.isInt ? Double(val.toInt32()) : val.toNumber()
         var raw = Float(d).bitPattern
@@ -1338,7 +1338,7 @@ func jsDataView_setFloat32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
     }
 }
 
-func jsDataView_setFloat64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_setFloat64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewSet(ctx, thisVal, argv, bytesPerElement: 8) { data, off, val, le in
         let d = val.isInt ? Double(val.toInt32()) : val.toNumber()
         var raw = d.bitPattern
@@ -1347,7 +1347,7 @@ func jsDataView_setFloat64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
     }
 }
 
-func jsDataView_setBigInt64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_setBigInt64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewSet(ctx, thisVal, argv, bytesPerElement: 8, bigIntElement: true) { data, off, val, le in
         var raw: UInt64 = val.isBigInt ? val.bigIntValue.lowUInt64 : 0
         if !le { raw = raw.byteSwapped }
@@ -1355,7 +1355,7 @@ func jsDataView_setBigInt64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv
     }
 }
 
-func jsDataView_setBigUint64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_setBigUint64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewSet(ctx, thisVal, argv, bytesPerElement: 8, bigIntElement: true) { data, off, val, le in
         var raw: UInt64 = val.isBigInt ? val.bigIntValue.lowUInt64 : 0
         if !le { raw = raw.byteSwapped }
@@ -1363,7 +1363,7 @@ func jsDataView_setBigUint64(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ arg
     }
 }
 
-func jsDataView_setFloat16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDataView_setFloat16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return dataViewSet(ctx, thisVal, argv, bytesPerElement: 2) { data, off, val, le in
         let d = val.isInt ? Double(val.toInt32()) : val.toNumber()
         let f32 = Float(d)
@@ -1383,19 +1383,19 @@ func jsDataView_setFloat16(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
 
 // MARK: - DataView getters for buffer, byteLength, byteOffset
 
-func jsDataView_buffer(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
+nonisolated func jsDataView_buffer(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
     guard let obj = thisVal.toObject(), obj.classID == JeffJSClassID.dataView.rawValue,
           case .typedArray(let ta) = obj.payload, let buf = ta.buffer else { return .undefined }
     return typedArrayBufferValue(buf)
 }
 
-func jsDataView_byteLength(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
+nonisolated func jsDataView_byteLength(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
     guard let obj = thisVal.toObject(), obj.classID == JeffJSClassID.dataView.rawValue,
           case .typedArray(let ta) = obj.payload else { return .newInt32(0) }
     return .newInt32(Int32(ta.byteLength))
 }
 
-func jsDataView_byteOffset(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
+nonisolated func jsDataView_byteOffset(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
     guard let obj = thisVal.toObject(), obj.classID == JeffJSClassID.dataView.rawValue,
           case .typedArray(let ta) = obj.payload else { return .newInt32(0) }
     return .newInt32(Int32(ta.byteOffset))
@@ -1404,7 +1404,7 @@ func jsDataView_byteOffset(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> Jeff
 // MARK: - TypedArray.from() static method
 
 /// `TypedArray.from(source, mapFn?, thisArg?)` — Create a typed array from an iterable or array-like.
-func jsTypedArray_from(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated func jsTypedArray_from(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                        _ argv: [JeffJSValue], classID: Int) -> JeffJSValue {
     guard let info = typedArrayInfo(forClassID: classID) else {
         return ctx.throwTypeError("Unknown typed array type")
@@ -1491,7 +1491,7 @@ func jsTypedArray_from(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 // MARK: - TypedArray.of() static method
 
 /// `TypedArray.of(...items)` — Create a typed array from arguments.
-func jsTypedArray_of(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated func jsTypedArray_of(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                      _ argv: [JeffJSValue], classID: Int) -> JeffJSValue {
     guard let info = typedArrayInfo(forClassID: classID) else {
         return ctx.throwTypeError("Unknown typed array type")
@@ -1529,7 +1529,7 @@ func jsTypedArray_of(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 
 /// The typed array behind `thisVal`, or a TypeError (ValidateTypedArray:
 /// not a typed array, or its buffer is detached).
-private func typedArrayReceiver(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated private func typedArrayReceiver(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                                 _ method: String)
     -> (ta: JeffJSTypedArray, ab: JeffJSArrayBuffer, info: TypedArrayElementInfo)? {
     guard let (ta, ab) = validateTypedArray(thisVal),
@@ -1543,7 +1543,7 @@ private func typedArrayReceiver(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 /// Element `i` of the view, re-read through the buffer each time (a callback
 /// may have written to it). Out of range (or a detached buffer) reads as
 /// undefined.
-private func typedArrayElement(_ thisVal: JeffJSValue, _ i: Int) -> JeffJSValue {
+nonisolated private func typedArrayElement(_ thisVal: JeffJSValue, _ i: Int) -> JeffJSValue {
     guard let (ta, ab) = validateTypedArray(thisVal), i < ta.length,
           let info = typedArrayInfo(forClassID: ta.classID) else { return .undefined }
     return info.readElement(ab.data, offset: ta.byteOffset + i * info.bytesPerElement)
@@ -1553,7 +1553,7 @@ private func typedArrayElement(_ thisVal: JeffJSValue, _ i: Int) -> JeffJSValue 
 /// `[Symbol.iterator]` (the same function object as `values`): an Array
 /// Iterator over the view (QuickJS js_create_array_iterator accepts typed
 /// arrays after validating them).
-func jsTypedArray_iterator(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated func jsTypedArray_iterator(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                            kind: JeffJSArrayIteratorKind, method: String) -> JeffJSValue {
     guard typedArrayReceiver(ctx, thisVal, method) != nil else { return .exception }
     // createArrayIterator keeps the target: hand it its own reference.
@@ -1562,7 +1562,7 @@ func jsTypedArray_iterator(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 
 /// `get %TypedArray%.prototype[@@toStringTag]`: the concrete constructor's
 /// name for a typed array, undefined for anything else (no TypeError).
-func jsTypedArray_toStringTag(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
+nonisolated func jsTypedArray_toStringTag(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> JeffJSValue {
     guard let obj = thisVal.toObject(), case .typedArray(let ta) = obj.payload,
           let info = typedArrayInfo(forClassID: ta.classID) else { return .undefined }
     return ctx.newStringValue(info.name)
@@ -1572,7 +1572,7 @@ func jsTypedArray_toStringTag(_ ctx: JeffJSContext, _ thisVal: JeffJSValue) -> J
 /// view's elements (forEach, every, some, find*, reduce*): validate the
 /// receiver as a typed array, then run the generic Array.prototype
 /// implementation, which reads `length` and the indexed elements.
-func jsTypedArray_arrayGeneric(
+nonisolated func jsTypedArray_arrayGeneric(
     _ method: String,
     _ impl: @escaping (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue
 ) -> (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue {
@@ -1583,17 +1583,17 @@ func jsTypedArray_arrayGeneric(
 }
 
 /// A new typed array of `classID` holding `values` (borrowed).
-private func typedArrayFromValues(_ ctx: JeffJSContext, classID: Int,
+nonisolated private func typedArrayFromValues(_ ctx: JeffJSContext, classID: Int,
                                   _ values: [JeffJSValue]) -> JeffJSValue {
     return jsTypedArray_of(ctx, .undefined, values, classID: classID)
 }
 
-private func freeAll(_ values: [JeffJSValue]) {
+nonisolated private func freeAll(_ values: [JeffJSValue]) {
     for v in values { v.freeValue() }
 }
 
 /// `%TypedArray%.prototype.map(callbackfn [, thisArg])` — same element type.
-func jsTypedArray_map(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_map(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let (ta, _, _) = typedArrayReceiver(ctx, thisVal, "map") else { return .exception }
     let fn = argv.count > 0 ? argv[0] : .undefined
     guard ctx.isCallable(fn) else { return ctx.throwTypeError(message: "map: callback is not a function") }
@@ -1614,7 +1614,7 @@ func jsTypedArray_map(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Jef
 }
 
 /// `%TypedArray%.prototype.filter(callbackfn [, thisArg])` — same element type.
-func jsTypedArray_filter(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_filter(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let (ta, _, _) = typedArrayReceiver(ctx, thisVal, "filter") else { return .exception }
     let fn = argv.count > 0 ? argv[0] : .undefined
     guard ctx.isCallable(fn) else { return ctx.throwTypeError(message: "filter: callback is not a function") }
@@ -1634,7 +1634,7 @@ func jsTypedArray_filter(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [
 /// The view's elements in `%TypedArray%.prototype.sort` order, or nil after
 /// a throwing comparator. Without a comparator the order is numeric (NaN
 /// last, -0 before +0); BigInt views compare their 64-bit integers exactly.
-private func typedArraySortedElements(_ ctx: JeffJSContext, _ ta: JeffJSTypedArray,
+nonisolated private func typedArraySortedElements(_ ctx: JeffJSContext, _ ta: JeffJSTypedArray,
                                       _ ab: JeffJSArrayBuffer, _ info: TypedArrayElementInfo,
                                       comparefn: JeffJSValue) -> [JeffJSValue]? {
     let n = ta.length
@@ -1690,7 +1690,7 @@ private func typedArraySortedElements(_ ctx: JeffJSContext, _ ta: JeffJSTypedArr
 }
 
 /// `%TypedArray%.prototype.sort([comparefn])` — in place, returns the view.
-func jsTypedArray_sort(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_sort(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let comparefn = argv.count > 0 ? argv[0] : .undefined
     if !comparefn.isUndefined && !ctx.isCallable(comparefn) {
         return ctx.throwTypeError(message: "sort: comparator must be a function")
@@ -1712,7 +1712,7 @@ func jsTypedArray_sort(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Je
 }
 
 /// `%TypedArray%.prototype.toSorted([comparefn])` — a sorted copy.
-func jsTypedArray_toSorted(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_toSorted(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let comparefn = argv.count > 0 ? argv[0] : .undefined
     if !comparefn.isUndefined && !ctx.isCallable(comparefn) {
         return ctx.throwTypeError(message: "toSorted: comparator must be a function")
@@ -1727,7 +1727,7 @@ func jsTypedArray_toSorted(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
 }
 
 /// `%TypedArray%.prototype.toReversed()` — a reversed copy.
-func jsTypedArray_toReversed(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_toReversed(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let (ta, ab, info) = typedArrayReceiver(ctx, thisVal, "toReversed") else { return .exception }
     let vals: [JeffJSValue] = (0..<ta.length).reversed().map {
         info.readElement(ab.data, offset: ta.byteOffset + $0 * info.bytesPerElement)
@@ -1739,7 +1739,7 @@ func jsTypedArray_toReversed(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ arg
 
 /// `%TypedArray%.prototype.with(index, value)` — a copy with one element
 /// replaced; RangeError when the index is outside the view.
-func jsTypedArray_with(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsTypedArray_with(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     guard let (ta, ab, info) = typedArrayReceiver(ctx, thisVal, "with") else { return .exception }
     let len = ta.length
     var rel = ctx.toIntegerOrInfinity(argv.count > 0 ? argv[0] : .undefined)
@@ -1760,7 +1760,7 @@ func jsTypedArray_with(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Je
 // MARK: - Strict Equality Helper
 
 /// Simple strict equality for typed array element comparison.
-private func jeffJS_strictEqual(_ a: JeffJSValue, _ b: JeffJSValue) -> Bool {
+nonisolated private func jeffJS_strictEqual(_ a: JeffJSValue, _ b: JeffJSValue) -> Bool {
     if !JeffJSValue.sameTag(a, b) { return false }
     if a.isInt && b.isInt { return a.toInt32() == b.toInt32() }
     if a.isFloat64 && b.isFloat64 { return a.toFloat64() == b.toFloat64() }
@@ -1770,7 +1770,7 @@ private func jeffJS_strictEqual(_ a: JeffJSValue, _ b: JeffJSValue) -> Bool {
 // MARK: - Getter helper for typed array / ArrayBuffer properties
 
 /// Add a getter property to a prototype object (for use by TypedArray/ArrayBuffer registration).
-func jeffJS_addGetterProperty(
+nonisolated func jeffJS_addGetterProperty(
     ctx: JeffJSContext, proto: JeffJSObject, name: String,
     getter fn: @escaping (JeffJSContext, JeffJSValue) -> JeffJSValue
 ) {
@@ -1818,7 +1818,7 @@ func jeffJS_addGetterProperty(
 // MARK: - Initialization
 
 /// Install ArrayBuffer, SharedArrayBuffer, all 12 TypedArray types, and DataView on the global.
-func jeffJS_initTypedArrays(ctx: JeffJSContext, globalObj: JeffJSObject) {
+nonisolated func jeffJS_initTypedArrays(ctx: JeffJSContext, globalObj: JeffJSObject) {
     // ArrayBuffer
     let abCtor = jeffJS_createObject(ctx: ctx, proto: nil, classID: UInt16(JeffJSClassID.cFunction.rawValue))
     abCtor.isConstructor = true

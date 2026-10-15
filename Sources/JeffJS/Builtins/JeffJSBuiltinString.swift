@@ -12,7 +12,7 @@ import Foundation
 
 // MARK: - JeffJSContext extensions for String builtins
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
     /// Convert a JS string value to an array of UTF-16 code units.
     func toUTF16Array(_ val: JeffJSValue) -> [UInt16] {
         // Straight from the string's own storage (the Swift String round trip
@@ -134,7 +134,7 @@ nonisolated final class JeffJSStringIteratorData {
 
 // MARK: - JeffJSBuiltinString
 
-struct JeffJSBuiltinString {
+nonisolated struct JeffJSBuiltinString {
 
     // MARK: - Intrinsic Registration
 
@@ -1966,7 +1966,7 @@ struct JeffJSBuiltinString {
 
 /// Provides convenient access to well-known atom constants used by builtins.
 /// These map to the predefined atoms in JeffJSAtom.swift.
-struct JeffJSAtomConstants {
+nonisolated struct JeffJSAtomConstants {
     static let Symbol_iterator:            UInt32 = JSPredefinedAtom.Symbol_iterator.rawValue
     static let Symbol_match:               UInt32 = JSPredefinedAtom.Symbol_match.rawValue
     static let Symbol_matchAll:            UInt32 = JSPredefinedAtom.Symbol_matchAll.rawValue

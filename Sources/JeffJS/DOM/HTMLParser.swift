@@ -3,7 +3,7 @@ import Foundation
 /// Builds a DOM tree from HTML, following the HTML Standard §13.2.6 tree
 /// construction algorithm: insertion modes, the list of active formatting
 /// elements, the adoption agency, foster parenting, and foreign content.
-public struct HTMLParser: Sendable {
+nonisolated public struct HTMLParser: Sendable {
 
     /// Parse a whole document. `scriptingEnabled` mirrors the flag in
     /// §13.2.6.4.4: with scripting on (a browser's default, and ours) the
@@ -33,7 +33,7 @@ public struct HTMLParser: Sendable {
 
 // MARK: - Element categories
 
-enum HTMLElements {
+nonisolated enum HTMLElements {
 
     /// §13.2.4.2 "special" — the elements the adoption agency and the
     /// `</p>`-style implied-end-tag rules treat as block-ish boundaries.
@@ -88,7 +88,7 @@ enum HTMLElements {
 
 /// One parse. Mutable state lives here rather than on the `HTMLParser` facade
 /// so the facade can stay a `Sendable` struct of static entry points.
-final class HTMLTreeBuilder {
+nonisolated final class HTMLTreeBuilder {
 
     enum InsertionMode {
         case initial, beforeHTML, beforeHead, inHead, inHeadNoscript, afterHead

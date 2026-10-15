@@ -32,7 +32,7 @@ nonisolated(unsafe) var jeffJS_bigStringLogged = 0
 
 /// Smallest string payload (code units) the trigger counts; smaller strings
 /// are accounted with the objects that hold them.
-let jeffJS_allocTriggerMinStringLen = 512
+nonisolated(unsafe) let jeffJS_allocTriggerMinStringLen = 512
 
 /// The runtime running JS on the calling thread, if any: `activeRuntime`
 /// when the stack pointer is inside the stack its JS last entered on
@@ -40,7 +40,7 @@ let jeffJS_allocTriggerMinStringLen = 512
 /// thread (background compiles, the bytecode cache); those must not touch a
 /// runtime's counters or call its host hook.
 @inline(__always)
-func jeffJS_runtimeOnThisThread() -> JeffJSRuntime? {
+nonisolated func jeffJS_runtimeOnThisThread() -> JeffJSRuntime? {
     guard let rt = JeffJSGCObjectHeader.activeRuntime else { return nil }
     var probe: UInt8 = 0
     let sp = withUnsafeMutablePointer(to: &probe) { UInt(bitPattern: $0) }
@@ -49,7 +49,7 @@ func jeffJS_runtimeOnThisThread() -> JeffJSRuntime? {
 
 /// A string payload of `len` code units was just made (JeffJSString.init).
 @inline(never)
-func jeffJS_noteStringAllocation(len: Int, wide: Bool) {
+nonisolated func jeffJS_noteStringAllocation(len: Int, wide: Bool) {
     guard let rt = jeffJS_runtimeOnThisThread() else { return }
     rt.noteAllocation(wide ? len &<< 1 : len)
     if jeffJS_bigStringLog > 0, len >= jeffJS_bigStringLog { rt.logBigString(len: len, wide: wide) }
@@ -57,11 +57,11 @@ func jeffJS_noteStringAllocation(len: Int, wide: Bool) {
 
 /// An ArrayBuffer store of `bytes` was just made.
 @inline(never)
-func jeffJS_noteBufferAllocation(_ bytes: Int) {
+nonisolated func jeffJS_noteBufferAllocation(_ bytes: Int) {
     jeffJS_runtimeOnThisThread()?.noteAllocation(bytes)
 }
 
-extension JeffJSRuntime {
+nonisolated extension JeffJSRuntime {
 
     /// `bytes` were allocated outside the object count. `collectable`: a
     /// collection could give them back (strings, buffers — not stack segments,
@@ -161,7 +161,7 @@ nonisolated final class JeffJSFunctionSourceCache {
     static let maxBytes = 16 * 1024 * 1024
 }
 
-extension JeffJSRuntime {
+nonisolated extension JeffJSRuntime {
     /// `Function.prototype.toString` text of the span: an owned JS value, or
     /// nil when the span is not in the text.
     func functionSourceString(_ text: JeffJSSourceText, start: Int, len: Int) -> JeffJSValue? {

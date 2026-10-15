@@ -27,7 +27,7 @@
 
 import Foundation
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
 
     /// Defines (or replaces in place) the own property `atom` of `obj` from a complete
     /// descriptor. Borrows `value`, `getter` and `setter` (the property takes its own counts).
@@ -78,6 +78,6 @@ extension JeffJSContext {
 
 /// `JEFFJS_DEBUG_DEFINEREFUSED=1`: one stderr line per native definition the routine refused
 /// (a non-configurable property, a non-extensible object).
-enum JeffJSDefineOwnPropertyDebug {
+nonisolated enum JeffJSDefineOwnPropertyDebug {
     static let enabled: Bool = ProcessInfo.processInfo.environment["JEFFJS_DEBUG_DEFINEREFUSED"] == "1"
 }

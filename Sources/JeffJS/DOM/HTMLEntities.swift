@@ -5,7 +5,7 @@ import Foundation
 // 2231 names, 106 of which are the legacy semicolon-less ones. Stored as one
 // packed string and decoded once, lazily: 2231 Swift dictionary literals cost
 // minutes of type-checking, a single literal costs nothing.
-enum HTMLEntities {
+nonisolated enum HTMLEntities {
 
     /// Longest legacy (semicolon-less) name, `frac34`. Bounds the backtracking
     /// scan for `&amp` / `&notit;`-style references.

@@ -4,7 +4,7 @@ import Synchronization
 // MARK: - Selector Components
 
 /// A single component of a CSS selector.
-public enum CSSSelectorComponent: Sendable {
+nonisolated public enum CSSSelectorComponent: Sendable {
     case element(String)    // div, p, h1
     case className(String)  // .header
     case id(String)         // #main
@@ -78,7 +78,7 @@ public enum CSSSelectorComponent: Sendable {
 }
 
 /// CSS pseudo-elements supported for content generation and styling.
-public enum CSSPseudoElement: String, Sendable {
+nonisolated public enum CSSPseudoElement: String, Sendable {
     case before = "before"
     case after = "after"
     case placeholder = "placeholder"
@@ -94,7 +94,7 @@ public enum CSSPseudoElement: String, Sendable {
     case part = "part"
 }
 
-public enum CSSAttributeOperator: Sendable {
+nonisolated public enum CSSAttributeOperator: Sendable {
     case equals
     case containsWord      // ~=
     case startsWithOrDash  // |=
@@ -106,7 +106,7 @@ public enum CSSAttributeOperator: Sendable {
 /// `[attr=value i]` / `[attr=value s]`. `.auto` means "whatever HTML says for
 /// this attribute" — case-insensitive for the legacy HTML attribute list,
 /// case-sensitive otherwise.
-public enum CSSAttributeCaseSensitivity: Sendable {
+nonisolated public enum CSSAttributeCaseSensitivity: Sendable {
     case auto
     case insensitive
     case sensitive
@@ -117,7 +117,7 @@ public enum CSSAttributeCaseSensitivity: Sendable {
 ///
 /// `anchored` holds the same selectors rewritten with an explicit leading
 /// `:scope` compound so the ordinary right-to-left matcher can evaluate them.
-public struct CSSHasSelector: Sendable {
+nonisolated public struct CSSHasSelector: Sendable {
     /// Identity for the per-pass match cache (structs have no identity of their own).
     public let id: Int
     public let selectors: [CSSComplexSelector]
@@ -154,7 +154,7 @@ public struct CSSHasSelector: Sendable {
 }
 
 /// A compound selector — all components must match the same element.
-public struct CSSCompoundSelector: Sendable {
+nonisolated public struct CSSCompoundSelector: Sendable {
     public let components: [CSSSelectorComponent]
     /// Hashes of the identifiers an element must carry to match this compound
     /// (tag name, id, classes, the primary subtag of a `:lang()` range, and
@@ -206,7 +206,7 @@ public struct CSSCompoundSelector: Sendable {
 }
 
 /// Combinator between compound selectors.
-public enum CSSCombinator: Sendable {
+nonisolated public enum CSSCombinator: Sendable {
     case descendant       // whitespace
     case child            // >
     case adjacentSibling  // +
@@ -214,7 +214,7 @@ public enum CSSCombinator: Sendable {
 }
 
 /// A complex selector is a chain of compound selectors with combinators.
-public struct CSSComplexSelector: Sendable {
+nonisolated public struct CSSComplexSelector: Sendable {
     public struct Part: Sendable {
         /// The combinator *preceding* this compound (nil on the first part of
         /// an absolute selector; set on the first part of a relative one).
@@ -254,7 +254,7 @@ public struct CSSComplexSelector: Sendable {
 }
 
 /// A selector list: "h1, h2, h3" — any selector matching means the rule applies.
-public struct CSSSelectorList: Sendable {
+nonisolated public struct CSSSelectorList: Sendable {
     public let selectors: [CSSComplexSelector]
     /// False when some group in the list failed to parse (an invalid selector).
     public let isValid: Bool
@@ -267,7 +267,7 @@ public struct CSSSelectorList: Sendable {
 
 // MARK: - Specificity
 
-public struct CSSSpecificity: Comparable, Sendable {
+nonisolated public struct CSSSpecificity: Comparable, Sendable {
     public let inline: Int
     public let ids: Int
     public let classes: Int
@@ -386,7 +386,7 @@ public struct CSSSpecificity: Comparable, Sendable {
 /// Interaction state (`:hover`, `:focus`, `:target`, ...) is read from
 /// `DOMInteractionState.shared` / the `DOMNode` static accessors, so the common
 /// matching path costs nothing extra.
-public struct CSSMatchContext: Sendable {
+nonisolated public struct CSSMatchContext: Sendable {
     /// The `:scope` element. `querySelectorAll` sets it to the node it was
     /// called on; `:has()` re-points it at the anchor element.
     public var scope: DOMNode?
@@ -416,7 +416,7 @@ public struct CSSMatchContext: Sendable {
 /// of the ancestors' tag, id, class and attribute-name hashes, maintained on
 /// push / pop, which long selector lists use to reject entries cheaply.
 /// One scan's private state: never shared between threads.
-final class DOMAncestorChain: @unchecked Sendable {
+nonisolated final class DOMAncestorChain: @unchecked Sendable {
     var nodes: [DOMNode] = []
     /// The element being tested; the chain describes its ancestors.
     var subject: DOMNode?
@@ -465,7 +465,7 @@ final class DOMAncestorChain: @unchecked Sendable {
 
 // MARK: - Selector Matching
 
-public struct CSSSelectorMatcher: Sendable {
+nonisolated public struct CSSSelectorMatcher: Sendable {
 
     /// Test whether a complex selector matches a DOM node.
     public static func matches(_ selector: CSSComplexSelector, node: DOMNode) -> Bool {
@@ -1373,7 +1373,7 @@ public struct CSSSelectorMatcher: Sendable {
 
 // MARK: - Selector Parsing
 
-public struct CSSSelectorParser: Sendable {
+nonisolated public struct CSSSelectorParser: Sendable {
 
     /// Cache of parsed selector lists keyed by their source strings.
     /// Avoids re-parsing the same selector strings that appear across stylesheets
@@ -2233,7 +2233,7 @@ public struct CSSSelectorParser: Sendable {
 
 /// Entry point for selector support queries — backs `@supports selector(...)`
 /// and lets the host check a selector before relying on it.
-public enum CSSSelector {
+nonisolated public enum CSSSelector {
 
     /// Parse a selector list (cached).
     public static func parse(_ selector: String) -> CSSSelectorList {
@@ -2302,7 +2302,7 @@ public enum CSSSelector {
 ///
 /// Keyed by the selector string (like the parse cache), never by DOM state,
 /// so a plan stays valid across mutations; the plan cache is bounded.
-final class CSSQueryPlan: @unchecked Sendable {
+nonisolated final class CSSQueryPlan: @unchecked Sendable {
     static let bucketThreshold = 4
 
     let selectors: [CSSComplexSelector]

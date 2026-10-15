@@ -57,7 +57,7 @@ extension JeffJSContext {
 
 // MARK: - Charset / text decoding
 
-enum JeffJSFetchText {
+nonisolated enum JeffJSFetchText {
 
     /// `charset=` parameter of a Content-Type value, lowercased, or nil.
     static func charset(fromContentType contentType: String?) -> String? {
@@ -138,12 +138,12 @@ enum JeffJSFetchText {
 // MARK: - Request body extraction
 
 /// Bytes plus the Content-Type the body implies (nil = caller's header wins).
-struct JeffJSFetchBodyData {
+nonisolated struct JeffJSFetchBodyData {
     var bytes: [UInt8]
     var contentType: String?
 }
 
-enum JeffJSFetchBodyExtractor {
+nonisolated enum JeffJSFetchBodyExtractor {
 
     /// Extract request-body bytes from a JS value.
     ///

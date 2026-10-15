@@ -19,7 +19,7 @@ import Foundation
 
 nonisolated public enum JeffJSScriptSources {
 
-    private final class WeakText {
+    private nonisolated final class WeakText {
         weak var text: JeffJSSourceText?
         init(_ t: JeffJSSourceText) { text = t }
     }

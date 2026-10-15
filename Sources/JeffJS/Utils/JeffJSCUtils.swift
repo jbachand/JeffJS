@@ -10,7 +10,7 @@ import Foundation
 
 /// Port of QuickJS `DynBuf` — a growable byte buffer used for bytecode
 /// serialisation, string building, and general binary output.
-struct DynBuf {
+nonisolated struct DynBuf {
     var buf: [UInt8]
     var size: Int       // allocated capacity
     var len: Int        // used length (number of bytes written)
@@ -257,11 +257,11 @@ struct DynBuf {
 // MARK: - Integer Conversion Utilities
 
 /// Digits table used by integer-to-string conversions (radix 2-36).
-private let kDigits: [Character] = Array("0123456789abcdefghijklmnopqrstuvwxyz")
+nonisolated(unsafe) private let kDigits: [Character] = Array("0123456789abcdefghijklmnopqrstuvwxyz")
 
 /// Convert a signed 64-bit integer to a string in the given radix (2-36).
 /// Mirrors `i64toa` in QuickJS cutils.c.
-func i64toa(_ val: Int64, radix: Int = 10) -> String {
+nonisolated func i64toa(_ val: Int64, radix: Int = 10) -> String {
     guard radix >= 2, radix <= 36 else { return "0" }
 
     if val == 0 { return "0" }
@@ -298,7 +298,7 @@ func i64toa(_ val: Int64, radix: Int = 10) -> String {
 
 /// Convert an unsigned 64-bit integer to a string in the given radix (2-36).
 /// Mirrors `u64toa` in QuickJS cutils.c.
-func u64toa(_ val: UInt64, radix: Int = 10) -> String {
+nonisolated func u64toa(_ val: UInt64, radix: Int = 10) -> String {
     guard radix >= 2, radix <= 36 else { return "0" }
 
     if val == 0 { return "0" }
@@ -319,7 +319,7 @@ func u64toa(_ val: UInt64, radix: Int = 10) -> String {
 
 /// Convert a signed 64-bit integer to a string in an arbitrary radix (2-36).
 /// Same as `i64toa` but named to match the QuickJS `i64toa_radix` variant.
-func i64toaRadix(_ val: Int64, radix: Int) -> String {
+nonisolated func i64toaRadix(_ val: Int64, radix: Int) -> String {
     return i64toa(val, radix: radix)
 }
 
@@ -330,7 +330,7 @@ func i64toaRadix(_ val: Int64, radix: Int) -> String {
 /// On malformed input, returns (0xFFFD, 1) — the Unicode replacement character.
 ///
 /// Mirrors the UTF-8 decoding in QuickJS `unicode_from_utf8`.
-func unicodeFromUTF8(_ data: [UInt8], offset: Int) -> (codePoint: UInt32, bytesConsumed: Int) {
+nonisolated func unicodeFromUTF8(_ data: [UInt8], offset: Int) -> (codePoint: UInt32, bytesConsumed: Int) {
     guard offset < data.count else {
         return (0xFFFD, 0)
     }
@@ -395,7 +395,7 @@ func unicodeFromUTF8(_ data: [UInt8], offset: Int) -> (codePoint: UInt32, bytesC
 ///
 /// Mirrors `unicode_to_utf8` in QuickJS cutils.c.
 @discardableResult
-func unicodeToUTF8(_ buf: inout [UInt8], _ codePoint: UInt32) -> Int {
+nonisolated func unicodeToUTF8(_ buf: inout [UInt8], _ codePoint: UInt32) -> Int {
     if codePoint < 0x80 {
         buf.append(UInt8(codePoint))
         return 1
@@ -425,37 +425,37 @@ func unicodeToUTF8(_ buf: inout [UInt8], _ codePoint: UInt32) -> Int {
 /// Decode a supplementary code point from a UTF-16 surrogate pair.
 /// Mirrors the macro in QuickJS: `(((hi) - 0xD800) << 10) + ((lo) - 0xDC00) + 0x10000`.
 @inline(__always)
-func unicodeFromUTF16Surrogates(high: UInt16, low: UInt16) -> UInt32 {
+nonisolated func unicodeFromUTF16Surrogates(high: UInt16, low: UInt16) -> UInt32 {
     return (UInt32(high) - 0xD800) * 0x400 + (UInt32(low) - 0xDC00) + 0x10000
 }
 
 /// Returns `true` if `c` is a UTF-16 high surrogate (U+D800..U+DBFF).
 @inline(__always)
-func isHiSurrogate(_ c: UInt16) -> Bool {
+nonisolated func isHiSurrogate(_ c: UInt16) -> Bool {
     return c >= 0xD800 && c <= 0xDBFF
 }
 
 /// Overload for UInt32.
 @inline(__always)
-func isHiSurrogate(_ c: UInt32) -> Bool {
+nonisolated func isHiSurrogate(_ c: UInt32) -> Bool {
     return c >= 0xD800 && c <= 0xDBFF
 }
 
 /// Returns `true` if `c` is a UTF-16 low surrogate (U+DC00..U+DFFF).
 @inline(__always)
-func isLoSurrogate(_ c: UInt16) -> Bool {
+nonisolated func isLoSurrogate(_ c: UInt16) -> Bool {
     return c >= 0xDC00 && c <= 0xDFFF
 }
 
 /// Overload for UInt32.
 @inline(__always)
-func isLoSurrogate(_ c: UInt32) -> Bool {
+nonisolated func isLoSurrogate(_ c: UInt32) -> Bool {
     return c >= 0xDC00 && c <= 0xDFFF
 }
 
 /// Returns `true` if `c` is any surrogate (high or low).
 @inline(__always)
-func isSurrogate(_ c: UInt32) -> Bool {
+nonisolated func isSurrogate(_ c: UInt32) -> Bool {
     return c >= 0xD800 && c <= 0xDFFF
 }
 
@@ -464,7 +464,7 @@ func isSurrogate(_ c: UInt32) -> Bool {
 /// Count leading zeros of a 32-bit unsigned integer.
 /// Returns 32 for input 0.  Mirrors `clz32` in QuickJS cutils.c.
 @inline(__always)
-func clz32(_ v: UInt32) -> Int {
+nonisolated func clz32(_ v: UInt32) -> Int {
     if v == 0 { return 32 }
     return v.leadingZeroBitCount
 }
@@ -472,7 +472,7 @@ func clz32(_ v: UInt32) -> Int {
 /// Count leading zeros of a 64-bit unsigned integer.
 /// Returns 64 for input 0.  Mirrors `clz64` in QuickJS cutils.c.
 @inline(__always)
-func clz64(_ v: UInt64) -> Int {
+nonisolated func clz64(_ v: UInt64) -> Int {
     if v == 0 { return 64 }
     return v.leadingZeroBitCount
 }
@@ -480,7 +480,7 @@ func clz64(_ v: UInt64) -> Int {
 /// Count trailing zeros of a 32-bit unsigned integer.
 /// Returns 32 for input 0.  Mirrors `ctz32` in QuickJS cutils.c.
 @inline(__always)
-func ctz32(_ v: UInt32) -> Int {
+nonisolated func ctz32(_ v: UInt32) -> Int {
     if v == 0 { return 32 }
     return v.trailingZeroBitCount
 }
@@ -488,20 +488,20 @@ func ctz32(_ v: UInt32) -> Int {
 /// Count trailing zeros of a 64-bit unsigned integer.
 /// Returns 64 for input 0.  Mirrors `ctz64` in QuickJS cutils.c.
 @inline(__always)
-func ctz64(_ v: UInt64) -> Int {
+nonisolated func ctz64(_ v: UInt64) -> Int {
     if v == 0 { return 64 }
     return v.trailingZeroBitCount
 }
 
 /// Returns `true` if `v` is a power of two (and non-zero).
 @inline(__always)
-func isPowerOf2(_ v: Int) -> Bool {
+nonisolated func isPowerOf2(_ v: Int) -> Bool {
     return v > 0 && (v & (v - 1)) == 0
 }
 
 /// Returns the smallest power of 2 >= `v`.  If `v <= 0`, returns 1.
 /// If the result would overflow `Int`, returns the largest power of 2.
-func nextPowerOf2(_ v: Int) -> Int {
+nonisolated func nextPowerOf2(_ v: Int) -> Int {
     if v <= 1 { return 1 }
     // If already a power of 2, return it.
     if v & (v - 1) == 0 { return v }
@@ -515,19 +515,19 @@ func nextPowerOf2(_ v: Int) -> Int {
 
 /// Ceiling integer division: ceil(a / b) for non-negative a, positive b.
 @inline(__always)
-func ceilDiv(_ a: Int, _ b: Int) -> Int {
+nonisolated func ceilDiv(_ a: Int, _ b: Int) -> Int {
     return (a + b - 1) / b
 }
 
 /// Maximum of two values.  Provided for parity with C macro usage.
 @inline(__always)
-func jeffMax<T: Comparable>(_ a: T, _ b: T) -> T {
+nonisolated func jeffMax<T: Comparable>(_ a: T, _ b: T) -> T {
     return a >= b ? a : b
 }
 
 /// Minimum of two values.
 @inline(__always)
-func jeffMin<T: Comparable>(_ a: T, _ b: T) -> T {
+nonisolated func jeffMin<T: Comparable>(_ a: T, _ b: T) -> T {
     return a <= b ? a : b
 }
 
@@ -535,7 +535,7 @@ func jeffMin<T: Comparable>(_ a: T, _ b: T) -> T {
 
 /// Encode an unsigned 32-bit integer in unsigned LEB128 format into `buf`.
 /// Mirrors `put_leb128` in QuickJS cutils.c.
-func putLEB128(_ buf: inout DynBuf, _ val: UInt32) {
+nonisolated func putLEB128(_ buf: inout DynBuf, _ val: UInt32) {
     var v = val
     while true {
         let byte = UInt8(v & 0x7F)
@@ -551,7 +551,7 @@ func putLEB128(_ buf: inout DynBuf, _ val: UInt32) {
 
 /// Encode a signed 32-bit integer in signed LEB128 format into `buf`.
 /// Mirrors `put_sleb128` in QuickJS cutils.c.
-func putSLEB128(_ buf: inout DynBuf, _ val: Int32) {
+nonisolated func putSLEB128(_ buf: inout DynBuf, _ val: Int32) {
     var v = val
     while true {
         let byte = UInt8(v & 0x7F)
@@ -570,7 +570,7 @@ func putSLEB128(_ buf: inout DynBuf, _ val: Int32) {
 /// Decode an unsigned LEB128-encoded integer from `data` starting at `offset`.
 /// Returns the decoded value and the new offset past the consumed bytes.
 /// Mirrors `get_leb128` in QuickJS cutils.c.
-func getLEB128(_ data: [UInt8], _ offset: Int) -> (val: UInt32, newOffset: Int) {
+nonisolated func getLEB128(_ data: [UInt8], _ offset: Int) -> (val: UInt32, newOffset: Int) {
     var result: UInt32 = 0
     var shift: UInt32 = 0
     var pos = offset
@@ -594,7 +594,7 @@ func getLEB128(_ data: [UInt8], _ offset: Int) -> (val: UInt32, newOffset: Int) 
 /// Decode a signed LEB128-encoded integer from `data` starting at `offset`.
 /// Returns the decoded value and the new offset past the consumed bytes.
 /// Mirrors `get_sleb128` in QuickJS cutils.c.
-func getSLEB128(_ data: [UInt8], _ offset: Int) -> (val: Int32, newOffset: Int) {
+nonisolated func getSLEB128(_ data: [UInt8], _ offset: Int) -> (val: Int32, newOffset: Int) {
     var result: Int32 = 0
     var shift: Int32 = 0
     var pos = offset
@@ -622,14 +622,14 @@ func getSLEB128(_ data: [UInt8], _ offset: Int) -> (val: Int32, newOffset: Int) 
 }
 
 /// Convenience: encode unsigned LEB128 into a byte array.
-func encodeLEB128(_ val: UInt32) -> [UInt8] {
+nonisolated func encodeLEB128(_ val: UInt32) -> [UInt8] {
     var dynbuf = DynBuf()
     putLEB128(&dynbuf, val)
     return dynbuf.toBytes()
 }
 
 /// Convenience: encode signed LEB128 into a byte array.
-func encodeSLEB128(_ val: Int32) -> [UInt8] {
+nonisolated func encodeSLEB128(_ val: Int32) -> [UInt8] {
     var dynbuf = DynBuf()
     putSLEB128(&dynbuf, val)
     return dynbuf.toBytes()
@@ -640,14 +640,14 @@ func encodeSLEB128(_ val: Int32) -> [UInt8] {
 /// Case-insensitive prefix check.
 /// Returns `true` if `str` starts with `prefix` (case-insensitive).
 /// Mirrors `has_suffix` / prefix checks in QuickJS cutils.c.
-func jeffHasPrefix(_ str: String, _ prefix: String) -> Bool {
+nonisolated func jeffHasPrefix(_ str: String, _ prefix: String) -> Bool {
     return str.lowercased().hasPrefix(prefix.lowercased())
 }
 
 /// Null-safe string comparison. Two nil values are considered equal.
 /// Returns `true` if both strings are equal or both are nil.
 /// Mirrors `pstrcmp` behaviour in QuickJS cutils.c.
-func pstrcmp(_ s1: String?, _ s2: String?) -> Bool {
+nonisolated func pstrcmp(_ s1: String?, _ s2: String?) -> Bool {
     switch (s1, s2) {
     case (.none, .none):
         return true
@@ -660,7 +660,7 @@ func pstrcmp(_ s1: String?, _ s2: String?) -> Bool {
 
 /// Duplicate a string into a new allocation (identity in Swift, but
 /// provided for API parity with C `pstrdup`).
-func pstrdup(_ s: String?) -> String? {
+nonisolated func pstrdup(_ s: String?) -> String? {
     return s
 }
 
@@ -670,7 +670,7 @@ func pstrdup(_ s: String?) -> String? {
 /// Returns `(result, overflow)` where `overflow` is `true` if the
 /// addition overflowed.  Mirrors QuickJS `safe_add_int32` in cutils.c.
 @inline(__always)
-func safeAddInt32(_ a: Int32, _ b: Int32) -> (result: Int32, overflow: Bool) {
+nonisolated func safeAddInt32(_ a: Int32, _ b: Int32) -> (result: Int32, overflow: Bool) {
     let (result, overflow) = a.addingReportingOverflow(b)
     return (result, overflow)
 }
@@ -678,7 +678,7 @@ func safeAddInt32(_ a: Int32, _ b: Int32) -> (result: Int32, overflow: Bool) {
 /// Multiply two Int32 values with overflow detection.
 /// Mirrors QuickJS `safe_mul_int32` in cutils.c.
 @inline(__always)
-func safeMulInt32(_ a: Int32, _ b: Int32) -> (result: Int32, overflow: Bool) {
+nonisolated func safeMulInt32(_ a: Int32, _ b: Int32) -> (result: Int32, overflow: Bool) {
     let (result, overflow) = a.multipliedReportingOverflow(by: b)
     return (result, overflow)
 }
@@ -686,7 +686,7 @@ func safeMulInt32(_ a: Int32, _ b: Int32) -> (result: Int32, overflow: Bool) {
 /// Add two Int64 values with overflow detection.
 /// Mirrors QuickJS `safe_add_int64` in cutils.c.
 @inline(__always)
-func safeAddInt64(_ a: Int64, _ b: Int64) -> (result: Int64, overflow: Bool) {
+nonisolated func safeAddInt64(_ a: Int64, _ b: Int64) -> (result: Int64, overflow: Bool) {
     let (result, overflow) = a.addingReportingOverflow(b)
     return (result, overflow)
 }
@@ -694,21 +694,21 @@ func safeAddInt64(_ a: Int64, _ b: Int64) -> (result: Int64, overflow: Bool) {
 /// Multiply two Int64 values with overflow detection.
 /// Mirrors QuickJS `safe_mul_int64` in cutils.c.
 @inline(__always)
-func safeMulInt64(_ a: Int64, _ b: Int64) -> (result: Int64, overflow: Bool) {
+nonisolated func safeMulInt64(_ a: Int64, _ b: Int64) -> (result: Int64, overflow: Bool) {
     let (result, overflow) = a.multipliedReportingOverflow(by: b)
     return (result, overflow)
 }
 
 /// Subtract two Int32 values with overflow detection.
 @inline(__always)
-func safeSubInt32(_ a: Int32, _ b: Int32) -> (result: Int32, overflow: Bool) {
+nonisolated func safeSubInt32(_ a: Int32, _ b: Int32) -> (result: Int32, overflow: Bool) {
     let (result, overflow) = a.subtractingReportingOverflow(b)
     return (result, overflow)
 }
 
 /// Subtract two Int64 values with overflow detection.
 @inline(__always)
-func safeSubInt64(_ a: Int64, _ b: Int64) -> (result: Int64, overflow: Bool) {
+nonisolated func safeSubInt64(_ a: Int64, _ b: Int64) -> (result: Int64, overflow: Bool) {
     let (result, overflow) = a.subtractingReportingOverflow(b)
     return (result, overflow)
 }
@@ -724,14 +724,14 @@ func safeSubInt64(_ a: Int64, _ b: Int64) -> (result: Int64, overflow: Bool) {
 /// - Parameters:
 ///   - array: The array to sort in-place.
 ///   - compare: Comparison function returning <0, 0, or >0.
-func rqsort<T>(array: inout [T], compare: (T, T) -> Int) {
+nonisolated func rqsort<T>(array: inout [T], compare: (T, T) -> Int) {
     let n = array.count
     if n < 2 { return }
     rqsortImpl(array: &array, lo: 0, hi: n - 1, compare: compare)
 }
 
 /// Internal recursive quicksort implementation.
-private func rqsortImpl<T>(array: inout [T], lo: Int, hi: Int, compare: (T, T) -> Int) {
+nonisolated private func rqsortImpl<T>(array: inout [T], lo: Int, hi: Int, compare: (T, T) -> Int) {
     if hi - lo < 10 {
         // Insertion sort for small partitions (stable).
         insertionSort(array: &array, lo: lo, hi: hi, compare: compare)
@@ -782,7 +782,7 @@ private func rqsortImpl<T>(array: inout [T], lo: Int, hi: Int, compare: (T, T) -
 }
 
 /// Insertion sort for small sub-arrays — stable and efficient for n < ~16.
-private func insertionSort<T>(array: inout [T], lo: Int, hi: Int, compare: (T, T) -> Int) {
+nonisolated private func insertionSort<T>(array: inout [T], lo: Int, hi: Int, compare: (T, T) -> Int) {
     for i in (lo + 1) ... hi {
         let key = array[i]
         var j = i - 1
@@ -798,19 +798,19 @@ private func insertionSort<T>(array: inout [T], lo: Int, hi: Int, compare: (T, T
 
 /// Swap the byte order of a 16-bit value.
 @inline(__always)
-func bswap16(_ v: UInt16) -> UInt16 {
+nonisolated func bswap16(_ v: UInt16) -> UInt16 {
     return v.byteSwapped
 }
 
 /// Swap the byte order of a 32-bit value.
 @inline(__always)
-func bswap32(_ v: UInt32) -> UInt32 {
+nonisolated func bswap32(_ v: UInt32) -> UInt32 {
     return v.byteSwapped
 }
 
 /// Swap the byte order of a 64-bit value.
 @inline(__always)
-func bswap64(_ v: UInt64) -> UInt64 {
+nonisolated func bswap64(_ v: UInt64) -> UInt64 {
     return v.byteSwapped
 }
 
@@ -818,14 +818,14 @@ func bswap64(_ v: UInt64) -> UInt64 {
 
 /// Read a little-endian UInt16 from a byte array at the given offset.
 @inline(__always)
-func getLE16(_ data: [UInt8], _ offset: Int) -> UInt16 {
+nonisolated func getLE16(_ data: [UInt8], _ offset: Int) -> UInt16 {
     guard offset + 1 < data.count else { return 0 }
     return UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
 }
 
 /// Read a little-endian UInt32 from a byte array at the given offset.
 @inline(__always)
-func getLE32(_ data: [UInt8], _ offset: Int) -> UInt32 {
+nonisolated func getLE32(_ data: [UInt8], _ offset: Int) -> UInt32 {
     guard offset + 3 < data.count else { return 0 }
     return UInt32(data[offset])
          | (UInt32(data[offset + 1]) << 8)
@@ -835,7 +835,7 @@ func getLE32(_ data: [UInt8], _ offset: Int) -> UInt32 {
 
 /// Read a little-endian UInt64 from a byte array at the given offset.
 @inline(__always)
-func getLE64(_ data: [UInt8], _ offset: Int) -> UInt64 {
+nonisolated func getLE64(_ data: [UInt8], _ offset: Int) -> UInt64 {
     let lo = UInt64(getLE32(data, offset))
     let hi = UInt64(getLE32(data, offset + 4))
     return lo | (hi << 32)
@@ -843,7 +843,7 @@ func getLE64(_ data: [UInt8], _ offset: Int) -> UInt64 {
 
 /// Write a little-endian UInt16 into a byte array at the given offset.
 @inline(__always)
-func putLE16(_ data: inout [UInt8], _ offset: Int, _ val: UInt16) {
+nonisolated func putLE16(_ data: inout [UInt8], _ offset: Int, _ val: UInt16) {
     guard offset + 1 < data.count else { return }
     data[offset]     = UInt8(val & 0xFF)
     data[offset + 1] = UInt8((val >> 8) & 0xFF)
@@ -851,7 +851,7 @@ func putLE16(_ data: inout [UInt8], _ offset: Int, _ val: UInt16) {
 
 /// Write a little-endian UInt32 into a byte array at the given offset.
 @inline(__always)
-func putLE32(_ data: inout [UInt8], _ offset: Int, _ val: UInt32) {
+nonisolated func putLE32(_ data: inout [UInt8], _ offset: Int, _ val: UInt32) {
     guard offset + 3 < data.count else { return }
     data[offset]     = UInt8(val & 0xFF)
     data[offset + 1] = UInt8((val >> 8) & 0xFF)
@@ -861,7 +861,7 @@ func putLE32(_ data: inout [UInt8], _ offset: Int, _ val: UInt32) {
 
 /// Write a little-endian UInt64 into a byte array at the given offset.
 @inline(__always)
-func putLE64(_ data: inout [UInt8], _ offset: Int, _ val: UInt64) {
+nonisolated func putLE64(_ data: inout [UInt8], _ offset: Int, _ val: UInt64) {
     putLE32(&data, offset, UInt32(val & 0xFFFF_FFFF))
     putLE32(&data, offset + 4, UInt32((val >> 32) & 0xFFFF_FFFF))
 }
@@ -871,7 +871,7 @@ func putLE64(_ data: inout [UInt8], _ offset: Int, _ val: UInt64) {
 /// Returns the numeric value of a hex digit character, or -1 if not a hex digit.
 /// Mirrors `from_hex` in QuickJS cutils.c.
 @inline(__always)
-func fromHex(_ c: UInt8) -> Int {
+nonisolated func fromHex(_ c: UInt8) -> Int {
     let ch = c
     if ch >= 0x30 && ch <= 0x39 { return Int(ch - 0x30) }        // '0'-'9'
     if ch >= 0x41 && ch <= 0x46 { return Int(ch - 0x41) + 10 }   // 'A'-'F'
@@ -881,38 +881,38 @@ func fromHex(_ c: UInt8) -> Int {
 
 /// Returns `true` if the ASCII byte is a decimal digit.
 @inline(__always)
-func isDigit(_ c: UInt8) -> Bool {
+nonisolated func isDigit(_ c: UInt8) -> Bool {
     return c >= 0x30 && c <= 0x39
 }
 
 /// Returns `true` if the ASCII byte is a hex digit.
 @inline(__always)
-func isXDigit(_ c: UInt8) -> Bool {
+nonisolated func isXDigit(_ c: UInt8) -> Bool {
     return fromHex(c) >= 0
 }
 
 /// Returns `true` if the ASCII byte is a letter (a-z, A-Z).
 @inline(__always)
-func isAlpha(_ c: UInt8) -> Bool {
+nonisolated func isAlpha(_ c: UInt8) -> Bool {
     return (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)
 }
 
 /// Returns `true` if the ASCII byte is alphanumeric.
 @inline(__always)
-func isAlnum(_ c: UInt8) -> Bool {
+nonisolated func isAlnum(_ c: UInt8) -> Bool {
     return isAlpha(c) || isDigit(c)
 }
 
 /// Convert an ASCII byte to uppercase.
 @inline(__always)
-func toUpper(_ c: UInt8) -> UInt8 {
+nonisolated func toUpper(_ c: UInt8) -> UInt8 {
     if c >= 0x61 && c <= 0x7A { return c - 32 }
     return c
 }
 
 /// Convert an ASCII byte to lowercase.
 @inline(__always)
-func toLower(_ c: UInt8) -> UInt8 {
+nonisolated func toLower(_ c: UInt8) -> UInt8 {
     if c >= 0x41 && c <= 0x5A { return c + 32 }
     return c
 }

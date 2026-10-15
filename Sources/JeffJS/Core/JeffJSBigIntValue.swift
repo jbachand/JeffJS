@@ -20,7 +20,7 @@ import Foundation
 /// values generically and expects every `toGCObjectHeader()` result to be
 /// tracked.
 @inline(never)
-func jeffJS_newHeapBigInt(_ v: JBigInt) -> JeffJSValue {
+nonisolated func jeffJS_newHeapBigInt(_ v: JBigInt) -> JeffJSValue {
     let bi = JeffJSBigInt(v)
     if let rt = bi.ownerRuntime {
         addGCObject(rt, bi)
@@ -28,7 +28,7 @@ func jeffJS_newHeapBigInt(_ v: JBigInt) -> JeffJSValue {
     return JeffJSValue.makeBigInt(bi)
 }
 
-extension JeffJSValue {
+nonisolated extension JeffJSValue {
 
     /// BigInt from an Int64 — inline when it fits, heap otherwise.
     @inline(__always)
@@ -69,7 +69,7 @@ extension JeffJSValue {
 
 /// StringToBigInt (ES 7.1.14). Returns nil when the string is not a valid
 /// BigInt literal (the caller turns that into SyntaxError or `false`).
-func jeffJS_stringToBigInt(_ raw: String) -> JBigInt? {
+nonisolated func jeffJS_stringToBigInt(_ raw: String) -> JBigInt? {
     var bytes = Array(raw.utf8)
     // Trim JS whitespace / line terminators.
     func isWS(_ c: UInt8) -> Bool {
@@ -112,11 +112,11 @@ func jeffJS_stringToBigInt(_ raw: String) -> JBigInt? {
 
 // MARK: - Operators
 
-enum JeffJSBigIntBinOp {
+nonisolated enum JeffJSBigIntBinOp {
     case add, sub, mul, div, mod, pow, and, or, xor, shl, sar
 }
 
-struct JeffJSBigIntOps {
+nonisolated struct JeffJSBigIntOps {
 
     /// BigInt ⊗ BigInt. Both operands must already be BigInts.
     static func binary(ctx: JeffJSContext, op: JeffJSBigIntBinOp,
@@ -257,7 +257,7 @@ struct JeffJSBigIntOps {
 
 // MARK: - Abstract operations on the context
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
 
     /// ToBigInt (ES 7.1.13) — used by `BigInt64Array` stores, `DataView`
     /// setters and `Atomics`. Numbers are a TypeError here (unlike the

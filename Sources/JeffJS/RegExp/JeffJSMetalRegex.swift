@@ -17,7 +17,7 @@ import Foundation
 
 /// Mirrors the `NFAInstr` struct in JeffJSMetalRegex.metal exactly.
 /// 8 bytes, naturally aligned — no padding issues across Swift/Metal boundary.
-struct NFAInstruction {
+nonisolated struct NFAInstruction {
     var op: UInt8 = 0
     var padding: UInt8 = 0
     var arg1: UInt16 = 0   // character or jump target
@@ -26,7 +26,7 @@ struct NFAInstruction {
 }
 
 /// Mirrors the `MatchResult` struct in JeffJSMetalRegex.metal.
-struct GPUMatchResult {
+nonisolated struct GPUMatchResult {
     var matchStart: Int32 = -1
     var matchLength: Int32 = 0
 }
@@ -35,7 +35,7 @@ struct GPUMatchResult {
 // MARK: - NFA opcodes (must match Metal constants)
 // ============================================================================
 
-private enum NFAOp: UInt8 {
+nonisolated private enum NFAOp: UInt8 {
     case char_     = 1
     case any       = 2
     case range     = 3
@@ -289,7 +289,7 @@ nonisolated final class JeffJSMetalRegex {
 
 /// Recursive-descent compiler that translates a regex pattern into a flat
 /// array of NFA instructions suitable for the Metal compute shader.
-private struct NFACompiler {
+nonisolated private struct NFACompiler {
     let pattern: [Unicode.Scalar]
     let flags: JeffJSRegExpFlags
     var pos: Int = 0

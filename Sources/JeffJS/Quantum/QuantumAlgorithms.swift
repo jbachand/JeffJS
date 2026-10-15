@@ -19,33 +19,33 @@ import Foundation
 // MARK: - Result Types
 
 /// Result of the Deutsch-Jozsa algorithm.
-struct DeutschJozsaResult {
+nonisolated struct DeutschJozsaResult {
     let isConstant: Bool
     let measurements: [Int]
 }
 
 /// Oracle type for Deutsch-Jozsa.
-enum OracleType {
+nonisolated enum OracleType {
     case constant0
     case constant1
     case balanced
 }
 
 /// Result of the Bernstein-Vazirani algorithm.
-struct BernsteinVaziraniResult {
+nonisolated struct BernsteinVaziraniResult {
     let recoveredSecret: String
     let measurements: [Int]
 }
 
 /// Result of error correction.
-struct ErrorCorrectionResult {
+nonisolated struct ErrorCorrectionResult {
     let errorQubit: Int
     let syndrome: (Int, Int)
     let corrected: Bool
 }
 
 /// Result of Shor's factoring algorithm.
-struct ShorResult {
+nonisolated struct ShorResult {
     let factors: (Int, Int)?
     let N: Int
     let numQubits: Int
@@ -53,14 +53,14 @@ struct ShorResult {
 }
 
 /// Result of quantum teleportation.
-struct TeleportResult {
+nonisolated struct TeleportResult {
     let aliceMeasurements: (Int, Int)
     let bobOutcome: Int
     let success: Bool
 }
 
 /// Result of superdense coding.
-struct SuperdenseResult {
+nonisolated struct SuperdenseResult {
     let sent: (Int, Int)
     let received: (Int, Int)
     let success: Bool
@@ -70,7 +70,7 @@ struct SuperdenseResult {
 
 /// Modular exponentiation: (base^exp) mod modulus, using repeated squaring.
 /// Equivalent to Python's pow(base, exp, mod).
-private func modPow(base: Int, exp: Int, mod: Int) -> Int {
+nonisolated private func modPow(base: Int, exp: Int, mod: Int) -> Int {
     guard mod > 1 else { return 0 }
     var result = 1
     var b = base % mod
@@ -86,7 +86,7 @@ private func modPow(base: Int, exp: Int, mod: Int) -> Int {
 }
 
 /// Greatest common divisor (Euclidean algorithm).
-private func gcd(_ a: Int, _ b: Int) -> Int {
+nonisolated private func gcd(_ a: Int, _ b: Int) -> Int {
     var a = abs(a)
     var b = abs(b)
     while b != 0 {
@@ -100,7 +100,7 @@ private func gcd(_ a: Int, _ b: Int) -> Int {
 /// Find the denominator of the closest fraction p/q to `value` with q <= maxDenom.
 /// Uses the continued fraction expansion to converge on the best rational
 /// approximation, which is what extracts the period in Shor's algorithm.
-private func continuedFractionDenominator(of value: Double, maxDenom: Int) -> Int {
+nonisolated private func continuedFractionDenominator(of value: Double, maxDenom: Int) -> Int {
     guard value > 0 && value < 1 else { return 1 }
 
     var remainder = value
@@ -125,7 +125,7 @@ private func continuedFractionDenominator(of value: Double, maxDenom: Int) -> In
 }
 
 /// Number of bits needed to represent N: ceil(log2(N+1)).
-private func bitsNeeded(_ N: Int) -> Int {
+nonisolated private func bitsNeeded(_ N: Int) -> Int {
     Int(ceil(log2(Double(N + 1))))
 }
 
@@ -134,7 +134,7 @@ private func bitsNeeded(_ N: Int) -> Int {
 /// Namespace for quantum algorithm implementations.
 /// All methods are static; the enum has no cases (unconstructable).
 
-enum QuantumAlgorithms {
+nonisolated enum QuantumAlgorithms {
 
     // MARK: 1. Deutsch-Jozsa
 

@@ -17,7 +17,7 @@ import Foundation
 /// A single-key chain master key. Encodes an arbitrary-length message
 /// (within the precision floor — see `QuantumChainEncoder.maxBits`) by
 /// burying it in a deep octree address.
-struct QuantumChainKey: Codable, Equatable {
+nonisolated struct QuantumChainKey: Codable, Equatable {
     /// Number of message bits encoded (also = depth of the octree).
     let bitCount: Int
     /// Original message length in bytes (so the decoder can strip bit-padding).

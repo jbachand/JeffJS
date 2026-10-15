@@ -12,13 +12,13 @@ import Foundation
 /// JEFFJS_EVAL_KEEPTOPLEVELCONSTANTS=1: keep (leak) the constant pool of a
 /// script's top-level function after it ran — the behaviour before
 /// perf/memory-census (A/B).
-let jeffJSKeepTopLevelConstants = ProcessInfo.processInfo.environment["JEFFJS_EVAL_KEEPTOPLEVELCONSTANTS"] == "1"
+nonisolated(unsafe) let jeffJSKeepTopLevelConstants = ProcessInfo.processInfo.environment["JEFFJS_EVAL_KEEPTOPLEVELCONSTANTS"] == "1"
 /// JEFFJS_EVAL_KEEPNESTEDBODIES=1: release only the non-function constants
 /// (keep every nested function body of a finished script) (A/B).
-let jeffJSKeepNestedBodies = ProcessInfo.processInfo.environment["JEFFJS_EVAL_KEEPNESTEDBODIES"] == "1"
+nonisolated(unsafe) let jeffJSKeepNestedBodies = ProcessInfo.processInfo.environment["JEFFJS_EVAL_KEEPNESTEDBODIES"] == "1"
 /// JEFFJS_ERROR_KEEPMESSAGEREF=1: engine-thrown errors keep the extra
 /// reference to their message string (the leak before perf/memory-census, A/B).
-let jeffJSKeepErrorMessageRef = ProcessInfo.processInfo.environment["JEFFJS_ERROR_KEEPMESSAGEREF"] == "1"
+nonisolated(unsafe) let jeffJSKeepErrorMessageRef = ProcessInfo.processInfo.environment["JEFFJS_ERROR_KEEPMESSAGEREF"] == "1"
 #if canImport(CoreFoundation)
 import CoreFoundation
 #endif
@@ -6620,7 +6620,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
 
 /// Extensions to JeffJSObject (forward-declared in JeffJSValue.swift)
 /// to add the fields needed by JeffJSContext.
-extension JeffJSObject {
+nonisolated extension JeffJSObject {
     // NOTE: classID (UInt16), extensible (Bool), and shape (JeffJSShape?) are
     // stored properties defined directly on JeffJSObject in JeffJSObject.swift.
     // Do NOT redeclare them here.
@@ -6728,7 +6728,7 @@ extension JeffJSObject {
 /// Type alias for native JS functions (matches the pattern used in newCFunction)
 typealias JeffJSNativeFunc = (_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ args: [JeffJSValue]) -> JeffJSValue
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
 
     // -- Property by index (for arrays) --
 
@@ -7232,7 +7232,7 @@ nonisolated final class JeffJSWeakObjectBox {
 /// `Symbol.prototype.toString` / `valueOf` / `description` were all looking
 /// for, so every one of them threw on a boxed symbol.
 @inline(__always)
-func jeffJS_unwrapSymbolObject(_ v: JeffJSValue) -> JeffJSValue? {
+nonisolated func jeffJS_unwrapSymbolObject(_ v: JeffJSValue) -> JeffJSValue? {
     guard let obj = v.toObject(),
           obj.classID == JeffJSClassID.symbol.rawValue else { return nil }
     if obj.primitiveValue.isSymbol { return obj.primitiveValue }
@@ -7252,7 +7252,7 @@ func jeffJS_unwrapSymbolObject(_ v: JeffJSValue) -> JeffJSValue? {
 /// ToIntegerOrInfinity result → absolute index in [0, len]; negative values
 /// count from the end. NaN is 0.
 @inline(__always)
-func jeffJS_relativeIndex(_ d: Double, _ len: Int64) -> Int64 {
+nonisolated func jeffJS_relativeIndex(_ d: Double, _ len: Int64) -> Int64 {
     if d.isNaN { return 0 }
     if d < 0 {
         if d <= -Double(len) { return 0 }
@@ -7264,7 +7264,7 @@ func jeffJS_relativeIndex(_ d: Double, _ len: Int64) -> Int64 {
 
 /// Saturating Double → Int64 (NaN → 0, ±Infinity / out of range → min/max).
 @inline(__always)
-func jeffJS_clampToInt64(_ d: Double) -> Int64 {
+nonisolated func jeffJS_clampToInt64(_ d: Double) -> Int64 {
     if d.isNaN { return 0 }
     if d >= 9223372036854775807.0 { return .max }
     if d <= -9223372036854775808.0 { return .min }
@@ -7273,7 +7273,7 @@ func jeffJS_clampToInt64(_ d: Double) -> Int64 {
 
 /// Saturating Double → Int (NaN → 0).
 @inline(__always)
-func jeffJS_clampToInt(_ d: Double) -> Int {
+nonisolated func jeffJS_clampToInt(_ d: Double) -> Int {
     return Int(jeffJS_clampToInt64(d))
 }
 
@@ -7283,7 +7283,7 @@ func jeffJS_clampToInt(_ d: Double) -> Int {
 /// RangeError checks see them as out of range; sums with a length cannot
 /// overflow). `Int(d)` trapped on all of those.
 @inline(__always)
-func jeffJS_intArg(_ d: Double) -> Int {
+nonisolated func jeffJS_intArg(_ d: Double) -> Int {
     if d.isNaN { return 0 }
     if d >= 9007199254740992.0 { return 9007199254740992 }
     if d <= -9007199254740992.0 { return -9007199254740992 }
@@ -7292,4 +7292,4 @@ func jeffJS_intArg(_ d: Double) -> Int {
 
 /// Largest ArrayBuffer / typed-array byte length (QuickJS: INT32_MAX). Past it
 /// CreateByteDataBlock throws a RangeError instead of trying the allocation.
-let jeffJS_maxByteLength: Int = Int(Int32.max)
+nonisolated(unsafe) let jeffJS_maxByteLength: Int = Int(Int32.max)

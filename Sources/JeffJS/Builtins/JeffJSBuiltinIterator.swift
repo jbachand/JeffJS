@@ -103,7 +103,7 @@ nonisolated final class JeffJSIteratorHelperData {
 ///
 /// Mirrors QuickJS js_iterator_proto, js_generator_proto,
 /// js_async_generator_proto, and the ES2025 Iterator Helpers proposal.
-struct JeffJSBuiltinIterator {
+nonisolated struct JeffJSBuiltinIterator {
 
     // MARK: - Intrinsic Registration
 

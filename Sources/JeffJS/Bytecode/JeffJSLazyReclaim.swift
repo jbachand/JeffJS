@@ -57,7 +57,7 @@ import Synchronization
 
 /// Memory warnings / backgrounding bump this (any thread); runtimes with
 /// `compile.lazyDropOnMemoryPressure` serve each new value once.
-let jeffJS_lazyPressureGeneration = Atomic<Int>(0)
+nonisolated(unsafe) let jeffJS_lazyPressureGeneration = Atomic<Int>(0)
 
 /// One reclaim cycle in progress (see the file header).
 nonisolated final class JeffJSLazyReclaimCycle {
@@ -90,7 +90,7 @@ nonisolated final class JeffJSLazyReclaimCycle {
 /// Registers the memory-warning / background / memory-pressure observers
 /// once per process. UIKit's notification names are used as strings so the
 /// engine needs no UIKit; both are posted on the main thread.
-enum JeffJSLazyPressureObserver {
+nonisolated enum JeffJSLazyPressureObserver {
     nonisolated(unsafe) private static var source: DispatchSourceMemoryPressure? = nil
     private static let installed: Bool = {
         for name in ["UIApplicationDidReceiveMemoryWarningNotification",
@@ -122,7 +122,7 @@ enum JeffJSLazyPressureObserver {
     static func notePressure() { jeffJS_lazyPressureGeneration.add(1, ordering: .relaxed) }
 }
 
-extension JeffJSRuntime {
+nonisolated extension JeffJSRuntime {
     /// Longest slice, and the least time between two slices, in seconds.
     /// After a quiet stretch (no idle tick for `lazyReclaimQuietGap`: the
     /// page is not running script) a slice may take `lazyReclaimQuietBudget`
@@ -310,7 +310,7 @@ extension JeffJSRuntime {
     }
 }
 
-extension JeffJSCompiler {
+nonisolated extension JeffJSCompiler {
     /// The constant pool for a body recompiled after an idle reclaim: the
     /// fresh compile's `new` pool, except that each nested function whose
     /// old bytecode object (from `old`, the pool the dropped body kept) is

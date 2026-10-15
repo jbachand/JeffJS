@@ -15,7 +15,7 @@ import Metal
 
 /// GPU-accelerated quantum gate operations using Metal compute kernels.
 /// Singleton: the shader is compiled ONCE and reused across all circuits.
-final class QuantumSimulatorGPU {
+nonisolated final class QuantumSimulatorGPU {
 
     /// Shared instance — avoids recompiling Metal shaders per circuit.
     static let shared: QuantumSimulatorGPU? = QuantumSimulatorGPU()

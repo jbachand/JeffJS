@@ -33,11 +33,11 @@ import Synchronization
 // either order, and an older entry never replaces a newer one.
 
 /// The global selector epoch.
-let domSelectorEpoch = Atomic<UInt64>(1)
+nonisolated(unsafe) let domSelectorEpoch = Atomic<UInt64>(1)
 
 /// One node's selector-matching cache entry: valid while `epoch` equals the
 /// global selector epoch.
-struct DOMSelectorCacheEntry {
+nonisolated struct DOMSelectorCacheEntry {
     var epoch: UInt64 = 0
     /// Interned language (`DOMLanguageTable`).
     var languageID: UInt32 = DOMLanguageTable.none
@@ -52,7 +52,7 @@ struct DOMSelectorCacheEntry {
 /// A 512-bit Bloom filter of identifier hashes (tag names, ids, classes and
 /// primary language subtags), two bits per key. "May contain" can be a false
 /// positive, never a false negative, so it only ever *rejects* selectors.
-public struct DOMAncestorFilter: Sendable, Equatable {
+nonisolated public struct DOMAncestorFilter: Sendable, Equatable {
     var bits = SIMD8<UInt64>(repeating: 0)
 
     public init() {}
@@ -75,7 +75,7 @@ public struct DOMAncestorFilter: Sendable, Equatable {
 /// Identifier hashes shared by the filter's two sides (the element and the
 /// selector): FNV-1a over the UTF-8 bytes, salted by kind, then an avalanche
 /// so both 9-bit slices are well mixed.
-enum DOMSelectorKeyHash {
+nonisolated enum DOMSelectorKeyHash {
     static let tagKind: UInt8 = 0x74      // "t"
     static let idKind: UInt8 = 0x69       // "i"
     static let classKind: UInt8 = 0x63    // "c"
@@ -125,7 +125,7 @@ enum DOMSelectorKeyHash {
 /// Interned lowercased language tags, so a node caches its language as an
 /// integer.
 /// IDs 0 and 1 are reserved: no language, and "unknown" (`lang=""`).
-final class DOMLanguageTable: @unchecked Sendable {
+nonisolated final class DOMLanguageTable: @unchecked Sendable {
     static let shared = DOMLanguageTable()
 
     static let none: UInt32 = 0

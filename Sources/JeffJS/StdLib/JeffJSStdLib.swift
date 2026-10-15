@@ -55,7 +55,7 @@ private nonisolated final class JeffJSConsoleState {
 /// let ctx = rt.newContext()
 /// JeffJSStdLib.addIntrinsics(ctx: ctx)
 /// ```
-struct JeffJSStdLib {
+nonisolated struct JeffJSStdLib {
 
     /// Per-context console message callback: (level, message) -> Void.
     /// When set, console output routes here instead of stdout.
@@ -1730,7 +1730,7 @@ private nonisolated final class JeffJSStdLibState {
 
 // MARK: - QuickJS 'std' Module
 
-extension JeffJSStdLib {
+nonisolated extension JeffJSStdLib {
 
     /// Register the 'std' module.
     /// Mirrors `js_init_module_std` from quickjs-libc.c.
@@ -1882,7 +1882,7 @@ extension JeffJSStdLib {
 
 // MARK: - QuickJS 'os' Module
 
-extension JeffJSStdLib {
+nonisolated extension JeffJSStdLib {
 
     /// Register the 'os' module.
     /// Mirrors `js_init_module_os` from quickjs-libc.c.
@@ -2276,7 +2276,7 @@ extension JeffJSStdLib {
 
 // MARK: - Event Loop
 
-extension JeffJSStdLib {
+nonisolated extension JeffJSStdLib {
 
     /// Run the event loop until all pending jobs and timers have been processed.
     /// Mirrors `js_std_loop` from quickjs-libc.c.
@@ -2315,7 +2315,7 @@ extension JeffJSStdLib {
 
 /// Extension on JeffJSContext providing TypedArray operations needed by the StdLib.
 /// TODO: Replace with full TypedArray support once JeffJSContext natively supports TypedArrays.
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
 
     /// Creates a new Uint8Array-like object from the given bytes.
     /// Currently returns a plain JS array of integers as a stub.

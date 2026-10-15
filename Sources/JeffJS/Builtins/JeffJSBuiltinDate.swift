@@ -13,37 +13,37 @@ import Foundation
 // MARK: - Internal Date Constants
 
 /// Milliseconds per day.
-private let msPerDay: Double = 86400000.0
+nonisolated(unsafe) private let msPerDay: Double = 86400000.0
 
 /// Milliseconds per hour.
-private let msPerHour: Double = 3600000.0
+nonisolated(unsafe) private let msPerHour: Double = 3600000.0
 
 /// Milliseconds per minute.
-private let msPerMinute: Double = 60000.0
+nonisolated(unsafe) private let msPerMinute: Double = 60000.0
 
 /// Milliseconds per second.
-private let msPerSecond: Double = 1000.0
+nonisolated(unsafe) private let msPerSecond: Double = 1000.0
 
 /// Maximum representable time value: +/- 8.64e15 ms (100 million days).
-private let maxTimeValue: Double = 8.64e15
+nonisolated(unsafe) private let maxTimeValue: Double = 8.64e15
 
 // MARK: - Date Arithmetic (ECMA-262 sec 21.4.1)
 
 /// Day(t) = floor(t / msPerDay)
 @inline(__always)
-private func day(_ t: Double) -> Double {
+nonisolated private func day(_ t: Double) -> Double {
     return Darwin.floor(t / msPerDay)
 }
 
 /// TimeWithinDay(t) = t modulo msPerDay
 @inline(__always)
-private func timeWithinDay(_ t: Double) -> Double {
+nonisolated private func timeWithinDay(_ t: Double) -> Double {
     let r = t.truncatingRemainder(dividingBy: msPerDay)
     return r < 0 ? r + msPerDay : r
 }
 
 /// DaysInYear(y) — number of days in year y.
-private func daysInYear(_ y: Double) -> Double {
+nonisolated private func daysInYear(_ y: Double) -> Double {
     // Double remainders: `Int(y)` trapped for years like 1e20 (`Date.UTC(1e20)`).
     if y.truncatingRemainder(dividingBy: 4) != 0 { return 365 }
     if y.truncatingRemainder(dividingBy: 100) != 0 { return 366 }
@@ -52,7 +52,7 @@ private func daysInYear(_ y: Double) -> Double {
 }
 
 /// DayFromYear(y) — day number of the first day of year y.
-private func dayFromYear(_ y: Double) -> Double {
+nonisolated private func dayFromYear(_ y: Double) -> Double {
     return 365.0 * (y - 1970.0)
          + Darwin.floor((y - 1969.0) / 4.0)
          - Darwin.floor((y - 1901.0) / 100.0)
@@ -61,12 +61,12 @@ private func dayFromYear(_ y: Double) -> Double {
 
 /// TimeFromYear(y) — time value at the start of year y.
 @inline(__always)
-private func timeFromYear(_ y: Double) -> Double {
+nonisolated private func timeFromYear(_ y: Double) -> Double {
     return msPerDay * dayFromYear(y)
 }
 
 /// YearFromTime(t) — the year containing time t.
-private func yearFromTime(_ t: Double) -> Double {
+nonisolated private func yearFromTime(_ t: Double) -> Double {
     // Binary search for the year.
     var lo = Darwin.floor(t / msPerDay / 366.0) + 1970.0
     var hi = Darwin.floor(t / msPerDay / 365.0) + 1970.0
@@ -86,18 +86,18 @@ private func yearFromTime(_ t: Double) -> Double {
 
 /// InLeapYear(t) — 1 if t falls in a leap year, 0 otherwise.
 @inline(__always)
-private func inLeapYear(_ t: Double) -> Double {
+nonisolated private func inLeapYear(_ t: Double) -> Double {
     return daysInYear(yearFromTime(t)) == 366 ? 1 : 0
 }
 
 /// DayWithinYear(t) — zero-based day-of-year for time t.
 @inline(__always)
-private func dayWithinYear(_ t: Double) -> Double {
+nonisolated private func dayWithinYear(_ t: Double) -> Double {
     return day(t) - dayFromYear(yearFromTime(t))
 }
 
 /// MonthFromTime(t) — zero-based month (0=Jan, 11=Dec).
-private func monthFromTime(_ t: Double) -> Double {
+nonisolated private func monthFromTime(_ t: Double) -> Double {
     let d = dayWithinYear(t)
     let leap = inLeapYear(t)
 
@@ -116,7 +116,7 @@ private func monthFromTime(_ t: Double) -> Double {
 }
 
 /// DateFromTime(t) — 1-based day of month.
-private func dateFromTime(_ t: Double) -> Double {
+nonisolated private func dateFromTime(_ t: Double) -> Double {
     let d = dayWithinYear(t)
     let m = monthFromTime(t)
     let leap = inLeapYear(t)
@@ -140,41 +140,41 @@ private func dateFromTime(_ t: Double) -> Double {
 
 /// WeekDay(t) — day of week (0=Sunday, 6=Saturday).
 @inline(__always)
-private func weekDay(_ t: Double) -> Double {
+nonisolated private func weekDay(_ t: Double) -> Double {
     let r = (day(t) + 4).truncatingRemainder(dividingBy: 7)
     return r < 0 ? r + 7 : r
 }
 
 /// HourFromTime(t)
 @inline(__always)
-private func hourFromTime(_ t: Double) -> Double {
+nonisolated private func hourFromTime(_ t: Double) -> Double {
     let r = Darwin.floor(t / msPerHour).truncatingRemainder(dividingBy: 24)
     return r < 0 ? r + 24 : r
 }
 
 /// MinFromTime(t)
 @inline(__always)
-private func minFromTime(_ t: Double) -> Double {
+nonisolated private func minFromTime(_ t: Double) -> Double {
     let r = Darwin.floor(t / msPerMinute).truncatingRemainder(dividingBy: 60)
     return r < 0 ? r + 60 : r
 }
 
 /// SecFromTime(t)
 @inline(__always)
-private func secFromTime(_ t: Double) -> Double {
+nonisolated private func secFromTime(_ t: Double) -> Double {
     let r = Darwin.floor(t / msPerSecond).truncatingRemainder(dividingBy: 60)
     return r < 0 ? r + 60 : r
 }
 
 /// msFromTime(t)
 @inline(__always)
-private func msFromTime(_ t: Double) -> Double {
+nonisolated private func msFromTime(_ t: Double) -> Double {
     let r = t.truncatingRemainder(dividingBy: msPerSecond)
     return r < 0 ? r + msPerSecond : r
 }
 
 /// MakeTime(hour, min, sec, ms)
-private func makeTime(_ hour: Double, _ min: Double, _ sec: Double, _ ms: Double) -> Double {
+nonisolated private func makeTime(_ hour: Double, _ min: Double, _ sec: Double, _ ms: Double) -> Double {
     if hour.isNaN || min.isNaN || sec.isNaN || ms.isNaN { return Double.nan }
     if hour.isInfinite || min.isInfinite || sec.isInfinite || ms.isInfinite { return Double.nan }
     let h = Darwin.trunc(hour)
@@ -185,7 +185,7 @@ private func makeTime(_ hour: Double, _ min: Double, _ sec: Double, _ ms: Double
 }
 
 /// MakeDay(year, month, date)
-private func makeDay(_ year: Double, _ month: Double, _ date: Double) -> Double {
+nonisolated private func makeDay(_ year: Double, _ month: Double, _ date: Double) -> Double {
     if year.isNaN || month.isNaN || date.isNaN { return Double.nan }
     if year.isInfinite || month.isInfinite || date.isInfinite { return Double.nan }
 
@@ -212,7 +212,7 @@ private func makeDay(_ year: Double, _ month: Double, _ date: Double) -> Double 
 
 /// MakeDate(day, time)
 @inline(__always)
-private func makeDate(_ day: Double, _ time: Double) -> Double {
+nonisolated private func makeDate(_ day: Double, _ time: Double) -> Double {
     if day.isNaN || time.isNaN { return Double.nan }
     if day.isInfinite || time.isInfinite { return Double.nan }
     return day * msPerDay + time
@@ -220,7 +220,7 @@ private func makeDate(_ day: Double, _ time: Double) -> Double {
 
 /// TimeClip(time) — clamp to valid range or NaN.
 @inline(__always)
-private func timeClip(_ t: Double) -> Double {
+nonisolated private func timeClip(_ t: Double) -> Double {
     if t.isNaN || t.isInfinite { return Double.nan }
     if Swift.abs(t) > maxTimeValue { return Double.nan }
     return Darwin.trunc(t) + 0  // +0 converts -0 to +0
@@ -230,7 +230,7 @@ private func timeClip(_ t: Double) -> Double {
 /// Using `TimeZone.current.secondsFromGMT()` (the offset right now) made every
 /// date on the other side of a DST boundary an hour off: in a US zone
 /// `new Date("Dec 25, 1995 13:30:00")` came out an hour before QuickJS.
-private func localOffsetMs(atUTC t: Double) -> Double {
+nonisolated private func localOffsetMs(atUTC t: Double) -> Double {
     if t.isNaN || t.isInfinite { return 0 }
     let secs = TimeZone.current.secondsFromGMT(for: Date(timeIntervalSince1970: t / 1000.0))
     return Double(secs) * msPerSecond
@@ -238,19 +238,19 @@ private func localOffsetMs(atUTC t: Double) -> Double {
 
 /// LocalTZA — the current local timezone offset in milliseconds
 /// (kept for callers that have no particular instant in hand).
-private func localTZA() -> Double {
+nonisolated private func localTZA() -> Double {
     return Double(-TimeZone.current.secondsFromGMT()) * msPerSecond
 }
 
 /// LocalTime(t) — convert UTC to local time.
-private func localTime(_ t: Double) -> Double {
+nonisolated private func localTime(_ t: Double) -> Double {
     if t.isNaN { return t }
     return t + localOffsetMs(atUTC: t)
 }
 
 /// UTC(t) — convert local time to UTC. The offset depends on the instant, so
 /// take one refinement step (this is what V8/JSC do).
-private func utcTime(_ t: Double) -> Double {
+nonisolated private func utcTime(_ t: Double) -> Double {
     if t.isNaN { return t }
     let firstGuess = t - localOffsetMs(atUTC: t)
     return t - localOffsetMs(atUTC: firstGuess)
@@ -260,7 +260,7 @@ private func utcTime(_ t: Double) -> Double {
 
 /// Extract the internal time value from a Date object.
 /// Returns NaN if the object is not a Date or has invalid data.
-private func getDateValue(_ thisVal: JeffJSValue) -> Double {
+nonisolated private func getDateValue(_ thisVal: JeffJSValue) -> Double {
     guard let obj = thisVal.toObject() else { return Double.nan }
     guard obj.classID == JeffJSClassID.date.rawValue else { return Double.nan }
     if case .objectData(let v) = obj.payload {
@@ -271,7 +271,7 @@ private func getDateValue(_ thisVal: JeffJSValue) -> Double {
 }
 
 /// Set the internal time value on a Date object.
-private func setDateValue(_ thisVal: JeffJSValue, _ t: Double) {
+nonisolated private func setDateValue(_ thisVal: JeffJSValue, _ t: Double) {
     guard let obj = thisVal.toObject() else { return }
     guard obj.classID == JeffJSClassID.date.rawValue else { return }
     obj.payload = .objectData(.newFloat64(timeClip(t)))
@@ -282,7 +282,7 @@ private func setDateValue(_ thisVal: JeffJSValue, _ t: Double) {
 /// Parse an ISO 8601 date string. Returns the time value in ms, or NaN.
 /// Supports: YYYY, YYYY-MM, YYYY-MM-DD, YYYY-MM-DDTHH:mm, YYYY-MM-DDTHH:mm:ss,
 /// YYYY-MM-DDTHH:mm:ss.sss, with optional timezone Z or +/-HH:mm.
-private func parseISODate(_ str: String) -> Double {
+nonisolated private func parseISODate(_ str: String) -> Double {
     let chars = Array(str.utf8)
     let len = chars.count
     var pos = 0
@@ -419,18 +419,18 @@ private func parseISODate(_ str: String) -> Double {
 //   YYYY-MM-DD HH:MM[...]                        (ISO with a space)
 // A trailing parenthesised zone name is ignored, as are unknown words.
 
-private let jeffJS_monthNames = ["jan", "feb", "mar", "apr", "may", "jun",
+nonisolated(unsafe) private let jeffJS_monthNames = ["jan", "feb", "mar", "apr", "may", "jun",
                                  "jul", "aug", "sep", "oct", "nov", "dec"]
-private let jeffJS_dayNames = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]
+nonisolated(unsafe) private let jeffJS_dayNames = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]
 /// Obsolete but still-seen US zone abbreviations -> offset in minutes.
-private let jeffJS_tzAbbrevs: [String: Int] = [
+nonisolated(unsafe) private let jeffJS_tzAbbrevs: [String: Int] = [
     "gmt": 0, "utc": 0, "ut": 0, "z": 0,
     "est": -300, "edt": -240, "cst": -360, "cdt": -300,
     "mst": -420, "mdt": -360, "pst": -480, "pdt": -420,
 ]
 
 /// The "natural" (non-ISO) date parser. Returns NaN when nothing matched.
-private func jsDateParseLegacy(_ chars: [UInt8]) -> Double {
+nonisolated private func jsDateParseLegacy(_ chars: [UInt8]) -> Double {
     let len = chars.count
     var pos = 0
 
@@ -623,7 +623,7 @@ private func jsDateParseLegacy(_ chars: [UInt8]) -> Double {
     return timeClip(t)
 }
 
-private func jsDateParse(_ str: String) -> Double {
+nonisolated private func jsDateParse(_ str: String) -> Double {
     var chars = Array(str.utf8)
     // "2026-09-20 10:00" — an ISO date with a space instead of 'T'. Browsers
     // and QuickJS accept it and read it as a local time. This has to be
@@ -651,7 +651,7 @@ private func jsDateParse(_ str: String) -> Double {
 /// Date() constructor implementation.
 /// Handles: new Date(), new Date(value), new Date(dateString),
 /// new Date(year, monthIndex, [day, hours, minutes, seconds, ms]).
-func jsDate_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated func jsDate_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                         _ argv: [JeffJSValue], _ isNew: Bool) -> JeffJSValue {
     if !isNew {
         // Called as a function — return a string like Date().
@@ -722,14 +722,14 @@ func jsDate_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 // MARK: - Date Static Methods
 
 /// Date.now() — returns current time in milliseconds since epoch.
-func jsDate_now(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated func jsDate_now(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                 _ argv: [JeffJSValue]) -> JeffJSValue {
     let ms = Date().timeIntervalSince1970 * 1000.0
     return .newFloat64(Darwin.trunc(ms))
 }
 
 /// Date.parse(string) — parse a date string.
-func jsDate_parse(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated func jsDate_parse(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                   _ argv: [JeffJSValue]) -> JeffJSValue {
     guard argv.count >= 1, argv[0].isString, let s = argv[0].stringValue else {
         return .newFloat64(Double.nan)
@@ -738,7 +738,7 @@ func jsDate_parse(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 }
 
 /// Date.UTC(year, month, ...) — returns time value for UTC date.
-func jsDate_UTC(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+nonisolated func jsDate_UTC(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                 _ argv: [JeffJSValue]) -> JeffJSValue {
     func argToDouble(_ i: Int, _ def: Double) -> Double {
         guard i < argv.count else { return def }
@@ -769,68 +769,68 @@ func jsDate_UTC(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 // MARK: - Date Prototype Getters
 
 /// getTime()
-func jsDate_getTime(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getTime(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return .newFloat64(getDateValue(thisVal))
 }
 
 /// getFullYear()
-func jsDate_getFullYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getFullYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64(yearFromTime(localTime(t)))
 }
 
 /// getMonth()
-func jsDate_getMonth(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getMonth(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64(monthFromTime(localTime(t)))
 }
 
 /// getDate()
-func jsDate_getDate(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getDate(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64(dateFromTime(localTime(t)))
 }
 
 /// getDay()
-func jsDate_getDay(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getDay(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64(weekDay(localTime(t)))
 }
 
 /// getHours()
-func jsDate_getHours(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getHours(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64(hourFromTime(localTime(t)))
 }
 
 /// getMinutes()
-func jsDate_getMinutes(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getMinutes(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64(minFromTime(localTime(t)))
 }
 
 /// getSeconds()
-func jsDate_getSeconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getSeconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64(secFromTime(localTime(t)))
 }
 
 /// getMilliseconds()
-func jsDate_getMilliseconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getMilliseconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64(msFromTime(localTime(t)))
 }
 
 /// getTimezoneOffset() — returns offset in minutes (positive = west of UTC).
-func jsDate_getTimezoneOffset(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getTimezoneOffset(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64((t - localTime(t)) / msPerMinute)
@@ -838,42 +838,42 @@ func jsDate_getTimezoneOffset(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ ar
 
 // MARK: - UTC Getters
 
-func jsDate_getUTCFullYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getUTCFullYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal); if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64(yearFromTime(t))
 }
 
-func jsDate_getUTCMonth(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getUTCMonth(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal); if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64(monthFromTime(t))
 }
 
-func jsDate_getUTCDate(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getUTCDate(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal); if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64(dateFromTime(t))
 }
 
-func jsDate_getUTCDay(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getUTCDay(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal); if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64(weekDay(t))
 }
 
-func jsDate_getUTCHours(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getUTCHours(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal); if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64(hourFromTime(t))
 }
 
-func jsDate_getUTCMinutes(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getUTCMinutes(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal); if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64(minFromTime(t))
 }
 
-func jsDate_getUTCSeconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getUTCSeconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal); if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64(secFromTime(t))
 }
 
-func jsDate_getUTCMilliseconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getUTCMilliseconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal); if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64(msFromTime(t))
 }
@@ -881,7 +881,7 @@ func jsDate_getUTCMilliseconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ a
 // MARK: - Setters
 
 /// Helper to extract optional argument as Double.
-private func optArg(_ argv: [JeffJSValue], _ i: Int) -> Double? {
+nonisolated private func optArg(_ argv: [JeffJSValue], _ i: Int) -> Double? {
     guard i < argv.count else { return nil }
     let v = argv[i]
     if v.isUndefined { return nil }
@@ -891,14 +891,14 @@ private func optArg(_ argv: [JeffJSValue], _ i: Int) -> Double? {
 }
 
 /// setTime(timeValue)
-func jsDate_setTime(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_setTime(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let v = optArg(argv, 0) ?? Double.nan
     setDateValue(thisVal, v)
     return .newFloat64(timeClip(v))
 }
 
 /// setMilliseconds(ms)
-func jsDate_setMilliseconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_setMilliseconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     var t = getDateValue(thisVal)
     if t.isNaN { return .newFloat64(Double.nan) }
     t = localTime(t)
@@ -910,7 +910,7 @@ func jsDate_setMilliseconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv
 }
 
 /// setSeconds([sec [, ms]])
-func jsDate_setSeconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_setSeconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     var t = getDateValue(thisVal)
     if t.isNaN { return .newFloat64(Double.nan) }
     t = localTime(t)
@@ -923,7 +923,7 @@ func jsDate_setSeconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Je
 }
 
 /// setMinutes([min [, sec [, ms]]])
-func jsDate_setMinutes(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_setMinutes(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     var t = getDateValue(thisVal)
     if t.isNaN { return .newFloat64(Double.nan) }
     t = localTime(t)
@@ -937,7 +937,7 @@ func jsDate_setMinutes(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Je
 }
 
 /// setHours([hour [, min [, sec [, ms]]]])
-func jsDate_setHours(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_setHours(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     var t = getDateValue(thisVal)
     if t.isNaN { return .newFloat64(Double.nan) }
     t = localTime(t)
@@ -952,7 +952,7 @@ func jsDate_setHours(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Jeff
 }
 
 /// setDate(date)
-func jsDate_setDate(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_setDate(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     var t = getDateValue(thisVal)
     if t.isNaN { return .newFloat64(Double.nan) }
     t = localTime(t)
@@ -964,7 +964,7 @@ func jsDate_setDate(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJ
 }
 
 /// setMonth([month [, date]])
-func jsDate_setMonth(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_setMonth(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     var t = getDateValue(thisVal)
     if t.isNaN { return .newFloat64(Double.nan) }
     t = localTime(t)
@@ -977,7 +977,7 @@ func jsDate_setMonth(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Jeff
 }
 
 /// setFullYear([year [, month [, date]]])
-func jsDate_setFullYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_setFullYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     // ES §21.4.4.21 step 3: "If t is NaN, set t to +0; otherwise LocalTime(t)".
     var t = getDateValue(thisVal)
     t = t.isNaN ? 0 : localTime(t)
@@ -992,7 +992,7 @@ func jsDate_setFullYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [J
 
 // MARK: - UTC Setters
 
-func jsDate_setUTCMilliseconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_setUTCMilliseconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal); if t.isNaN { return .newFloat64(Double.nan) }
     let ms = optArg(argv, 0) ?? Double.nan
     let newTime = makeTime(hourFromTime(t), minFromTime(t), secFromTime(t), ms)
@@ -1000,7 +1000,7 @@ func jsDate_setUTCMilliseconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ a
     setDateValue(thisVal, u); return .newFloat64(u)
 }
 
-func jsDate_setUTCSeconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_setUTCSeconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal); if t.isNaN { return .newFloat64(Double.nan) }
     let s = optArg(argv, 0) ?? secFromTime(t)
     let ms = optArg(argv, 1) ?? msFromTime(t)
@@ -1009,7 +1009,7 @@ func jsDate_setUTCSeconds(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: 
     setDateValue(thisVal, u); return .newFloat64(u)
 }
 
-func jsDate_setUTCMinutes(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_setUTCMinutes(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal); if t.isNaN { return .newFloat64(Double.nan) }
     let m = optArg(argv, 0) ?? minFromTime(t)
     let s = optArg(argv, 1) ?? secFromTime(t)
@@ -1019,7 +1019,7 @@ func jsDate_setUTCMinutes(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: 
     setDateValue(thisVal, u); return .newFloat64(u)
 }
 
-func jsDate_setUTCHours(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_setUTCHours(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal); if t.isNaN { return .newFloat64(Double.nan) }
     let h = optArg(argv, 0) ?? hourFromTime(t)
     let m = optArg(argv, 1) ?? minFromTime(t)
@@ -1030,7 +1030,7 @@ func jsDate_setUTCHours(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [J
     setDateValue(thisVal, u); return .newFloat64(u)
 }
 
-func jsDate_setUTCDate(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_setUTCDate(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal); if t.isNaN { return .newFloat64(Double.nan) }
     let dt = optArg(argv, 0) ?? Double.nan
     let newDay = makeDay(yearFromTime(t), monthFromTime(t), dt)
@@ -1038,7 +1038,7 @@ func jsDate_setUTCDate(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [Je
     setDateValue(thisVal, u); return .newFloat64(u)
 }
 
-func jsDate_setUTCMonth(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_setUTCMonth(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal); if t.isNaN { return .newFloat64(Double.nan) }
     let m = optArg(argv, 0) ?? monthFromTime(t)
     let dt = optArg(argv, 1) ?? dateFromTime(t)
@@ -1047,7 +1047,7 @@ func jsDate_setUTCMonth(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [J
     setDateValue(thisVal, u); return .newFloat64(u)
 }
 
-func jsDate_setUTCFullYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_setUTCFullYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     var t = getDateValue(thisVal)
     if t.isNaN { t = 0 }
     let y = optArg(argv, 0) ?? yearFromTime(t)
@@ -1060,7 +1060,7 @@ func jsDate_setUTCFullYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
 
 // MARK: - Conversion Methods
 
-private let dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+nonisolated(unsafe) private let dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 private let monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
@@ -1069,7 +1069,7 @@ private let monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
 /// in the current locale, daylight or standard for that instant. Pages
 /// fingerprint `new Date().toString()` against the Safari UA (akamai navigation
 /// fix, 2026-09-29; JeffJS printed no name).
-private let tzNameLock = NSLock()
+nonisolated(unsafe) private let tzNameLock = NSLock()
 nonisolated(unsafe) private var tzNameCache: [String: String] = [:]
 private func timeZoneNameSuffix(_ t: Double) -> String {
     guard t.isFinite else { return "" }
@@ -1086,7 +1086,7 @@ private func timeZoneNameSuffix(_ t: Double) -> String {
 }
 
 /// Format a UTC time value into a full toString() format.
-private func formatDateToString(_ t: Double) -> String {
+nonisolated private func formatDateToString(_ t: Double) -> String {
     if t.isNaN { return "Invalid Date" }
     let lt = localTime(t)
     let y = Int(yearFromTime(lt))
@@ -1107,13 +1107,13 @@ private func formatDateToString(_ t: Double) -> String {
 }
 
 /// toString()
-func jsDate_toString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_toString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     return .makeString(JeffJSString(swiftString: formatDateToString(t)))
 }
 
 /// toDateString()
-func jsDate_toDateString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_toDateString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     if t.isNaN { return .makeString(JeffJSString(swiftString: "Invalid Date")) }
     let lt = localTime(t)
@@ -1126,7 +1126,7 @@ func jsDate_toDateString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [
 }
 
 /// toTimeString()
-func jsDate_toTimeString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_toTimeString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     if t.isNaN { return .makeString(JeffJSString(swiftString: "Invalid Date")) }
     let lt = localTime(t)
@@ -1142,7 +1142,7 @@ func jsDate_toTimeString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [
 }
 
 /// toISOString()
-func jsDate_toISOString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_toISOString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     // ES §21.4.4.36 step 3: a RangeError (JSC's text "Invalid Date"); it was a
     // TypeError, which `catch (e) { if (e instanceof RangeError) … }` missed.
@@ -1167,7 +1167,7 @@ func jsDate_toISOString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [J
 }
 
 /// toUTCString()
-func jsDate_toUTCString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_toUTCString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     if t.isNaN { return .makeString(JeffJSString(swiftString: "Invalid Date")) }
     let y = Int(yearFromTime(t))
@@ -1183,7 +1183,7 @@ func jsDate_toUTCString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [J
 }
 
 /// toLocaleDateString(), toLocaleTimeString(), toLocaleString()
-func jsDate_toLocaleString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_toLocaleString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     if t.isNaN { return .makeString(JeffJSString(swiftString: "Invalid Date")) }
     let date = Date(timeIntervalSince1970: t / 1000.0)
@@ -1193,7 +1193,7 @@ func jsDate_toLocaleString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
     return .makeString(JeffJSString(swiftString: JeffJSIntlBridge.webKitSpaces(formatter.string(from: date))))
 }
 
-func jsDate_toLocaleDateString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_toLocaleDateString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     if t.isNaN { return .makeString(JeffJSString(swiftString: "Invalid Date")) }
     let date = Date(timeIntervalSince1970: t / 1000.0)
@@ -1203,7 +1203,7 @@ func jsDate_toLocaleDateString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ a
     return .makeString(JeffJSString(swiftString: JeffJSIntlBridge.webKitSpaces(formatter.string(from: date))))
 }
 
-func jsDate_toLocaleTimeString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_toLocaleTimeString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     if t.isNaN { return .makeString(JeffJSString(swiftString: "Invalid Date")) }
     let date = Date(timeIntervalSince1970: t / 1000.0)
@@ -1215,7 +1215,7 @@ func jsDate_toLocaleTimeString(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ a
 
 /// toJSON(key) — ES §21.4.4.37, generic: ToPrimitive(this, number); a
 /// non-finite number is null, else Invoke(this, "toISOString").
-func jsDate_toJSON(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_toJSON(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     if thisVal.isUndefined || thisVal.isNull {
         return ctx.throwTypeError(message: "Type error")
     }
@@ -1238,7 +1238,7 @@ func jsDate_toJSON(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJS
 }
 
 /// getYear() — Annex B §B.2.3.1: YearFromTime(LocalTime(t)) − 1900.
-func jsDate_getYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_getYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let t = getDateValue(thisVal)
     if t.isNaN { return .newFloat64(Double.nan) }
     return .newFloat64(yearFromTime(localTime(t)) - 1900)
@@ -1246,7 +1246,7 @@ func jsDate_getYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJ
 
 /// setYear(year) — Annex B §B.2.3.2 (0…99 means 1900…1999). `argv` is
 /// already numeric (the prototype wrapper converts setter arguments).
-func jsDate_setYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_setYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     var t = getDateValue(thisVal)
     t = t.isNaN ? 0 : localTime(t)
     let y = optArg(argv, 0) ?? Double.nan
@@ -1263,20 +1263,20 @@ func jsDate_setYear(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJ
 }
 
 /// True when `v` is a Date object (thisTimeValue's check).
-func jsDate_isDate(_ v: JeffJSValue) -> Bool {
+nonisolated func jsDate_isDate(_ v: JeffJSValue) -> Bool {
     guard let obj = v.toObject() else { return false }
     return obj.classID == JeffJSClassID.date.rawValue
 }
 
 /// valueOf()
-func jsDate_valueOf(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_valueOf(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     return .newFloat64(getDateValue(thisVal))
 }
 
 /// [Symbol.toPrimitive](hint) — ES §21.4.4.45: `this` must be an object; the
 /// hint must be "string", "default" (string first) or "number" (number first);
 /// then OrdinaryToPrimitive. Messages are JavaScriptCore's.
-func jsDate_toPrimitive(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated func jsDate_toPrimitive(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     guard thisVal.isObject else {
         return ctx.throwTypeError(message: "Date.prototype[Symbol.toPrimitive] expected |this| to be an object.")
     }
@@ -1310,7 +1310,7 @@ func jsDate_toPrimitive(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [J
 // MARK: - Date Built-in Installation
 
 /// Install the Date constructor and prototype on the global object.
-func jeffJS_initDate(ctx: JeffJSContext, globalObj: JeffJSObject) {
+nonisolated func jeffJS_initDate(ctx: JeffJSContext, globalObj: JeffJSObject) {
     // Date.prototype inherits from Object.prototype per the spec.
     let objectProto = ctx.classProto[JSClassID.JS_CLASS_OBJECT.rawValue].toObject()
     // ES §21.4.4: Date.prototype is an ordinary object, not a Date instance (no

@@ -35,7 +35,7 @@ import Synchronization
 // DOM reads are the node's per-call-safe getters.
 
 /// The record of a shadow root (on the root node's state).
-public final class DOMShadowRootInfo: @unchecked Sendable {
+nonisolated public final class DOMShadowRootInfo: @unchecked Sendable {
     public weak var host: DOMNode?
     /// "open" or "closed".
     public let mode: String
@@ -67,7 +67,7 @@ public final class DOMShadowRootInfo: @unchecked Sendable {
 }
 
 /// One shadow tree's slot assignment.
-struct DOMSlotAssignment {
+nonisolated struct DOMSlotAssignment {
     let epoch: UInt64
     /// The tree's slots in tree order.
     let slots: [DOMNode]
@@ -79,7 +79,7 @@ struct DOMSlotAssignment {
 
 /// Set once any shadow root has been attached in this process: until then the
 /// flat-tree accessors are the plain tree ones.
-private let domShadowRootsAttached = Atomic<Bool>(false)
+nonisolated(unsafe) private let domShadowRootsAttached = Atomic<Bool>(false)
 
 extension DOMNode {
 

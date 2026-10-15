@@ -18,7 +18,7 @@ import Foundation
 // MARK: - Public Result Types
 
 /// Result of `JeffJSEnvironment.snapshotUserGlobals()`.
-public struct JeffJSSnapshotResult {
+nonisolated public struct JeffJSSnapshotResult {
     /// JSON blob suitable for `restoreUserGlobals(from:)`.
     public let json: String
     /// User keys whose values could not be serialized (functions, native, etc.).
@@ -27,14 +27,14 @@ public struct JeffJSSnapshotResult {
 }
 
 /// Result of `JeffJSEnvironment.restoreUserGlobals(from:)`.
-public struct JeffJSRestoreResult {
+nonisolated public struct JeffJSRestoreResult {
     /// Number of top-level globalThis keys that were restored.
     public let restored: Int
 }
 
 // MARK: - JS Scripts
 
-enum JeffJSGlobalSnapshot {
+nonisolated enum JeffJSGlobalSnapshot {
 
     /// Serializes user-added globalThis own properties to a tagged JSON tree.
     ///

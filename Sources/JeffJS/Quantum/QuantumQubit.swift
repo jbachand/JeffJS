@@ -8,7 +8,7 @@
 import Foundation
 
 /// A single qubit in the field with deterministic motion parameters.
-struct Qubit {
+nonisolated struct Qubit {
     let x:      Float
     let y:      Float
     let speed:  Float
@@ -19,7 +19,7 @@ struct Qubit {
 // MARK: - Qubit Field
 
 /// Thread-safe cache of generated qubit arrays keyed by seed.
-final class QuantumField {
+nonisolated final class QuantumField {
 
     private var cache: [UInt32: [Qubit]] = [:]
     private let cacheLimit = 64
@@ -109,7 +109,7 @@ final class QuantumField {
 /// Fast, deterministic PRNG used to generate qubit fields. The same seed
 /// always produces the same sequence of qubits, which is what makes the
 /// encoder/decoder round-trip without storing the field itself.
-struct SplitMix64 {
+nonisolated struct SplitMix64 {
     private var state: UInt64
 
     init(seed: UInt64) { state = seed }

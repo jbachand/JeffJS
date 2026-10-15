@@ -39,7 +39,7 @@ import Foundation
 
 /// One MutationObserver known to the bridge (created by `observe`, dropped
 /// by `disconnect` or when it has neither registrations nor records).
-final class JeffJSMutationObserverEntry {
+nonisolated final class JeffJSMutationObserverEntry {
     let id: Int
     /// The observer JS object (owned). Its `__moCallback` is the callback.
     let object: JeffJSValue
@@ -58,7 +58,7 @@ final class JeffJSMutationObserverEntry {
     }
 }
 
-struct JeffJSMutationObserverOptions {
+nonisolated struct JeffJSMutationObserverOptions {
     var childList = false
     var attributes = false
     var characterData = false
@@ -70,7 +70,7 @@ struct JeffJSMutationObserverOptions {
 
 /// A "registered observer" on a node. Transient registrations (added to a
 /// node removed from under a `subtree` registration) carry their source node.
-struct JeffJSMutationRegistration {
+nonisolated struct JeffJSMutationRegistration {
     let observerID: Int
     var options: JeffJSMutationObserverOptions
     let transientSource: UUID?

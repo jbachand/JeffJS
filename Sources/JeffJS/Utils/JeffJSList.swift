@@ -40,20 +40,20 @@ nonisolated final class ListHead {
 
 /// Initialize (or re-initialize) a list head as an empty list.
 /// Equivalent to `INIT_LIST_HEAD` / `init_list_head` in QuickJS.
-func initListHead(_ head: ListHead) {
+nonisolated func initListHead(_ head: ListHead) {
     head.prev = head
     head.next = head
 }
 
 /// Returns `true` if the list contains no elements (head points to itself).
 /// Equivalent to `list_empty` in QuickJS.
-func listEmpty(_ head: ListHead) -> Bool {
+nonisolated func listEmpty(_ head: ListHead) -> Bool {
     return head.next === head
 }
 
 /// Returns `true` if the list contains no elements.
 /// Alias for `listEmpty` matching the C name `list_is_empty`.
-func listIsEmpty(_ head: ListHead) -> Bool {
+nonisolated func listIsEmpty(_ head: ListHead) -> Bool {
     return head.next === head
 }
 
@@ -61,7 +61,7 @@ func listIsEmpty(_ head: ListHead) -> Bool {
 
 /// Internal: insert `entry` between `prev` and `next`.
 /// Equivalent to `__list_add` in the Linux kernel list implementation.
-private func _listAdd(_ entry: ListHead, _ prev: ListHead, _ next: ListHead) {
+nonisolated private func _listAdd(_ entry: ListHead, _ prev: ListHead, _ next: ListHead) {
     next.prev = entry
     entry.next = next
     entry.prev = prev
@@ -72,7 +72,7 @@ private func _listAdd(_ entry: ListHead, _ prev: ListHead, _ next: ListHead) {
 /// Equivalent to `list_add` in QuickJS (adds to front of list).
 ///
 /// For a list `H <-> A <-> B`, calling `listAdd(X, H)` produces `H <-> X <-> A <-> B`.
-func listAdd(_ entry: ListHead, _ head: ListHead) {
+nonisolated func listAdd(_ entry: ListHead, _ head: ListHead) {
     _listAdd(entry, head, head.next)
 }
 
@@ -80,7 +80,7 @@ func listAdd(_ entry: ListHead, _ head: ListHead) {
 /// Equivalent to `list_add_tail` in QuickJS.
 ///
 /// For a list `H <-> A <-> B`, calling `listAddTail(X, H)` produces `H <-> A <-> B <-> X`.
-func listAddTail(_ entry: ListHead, _ head: ListHead) {
+nonisolated func listAddTail(_ entry: ListHead, _ head: ListHead) {
     _listAdd(entry, head.prev, head)
 }
 
@@ -89,7 +89,7 @@ func listAddTail(_ entry: ListHead, _ head: ListHead) {
 /// Remove `entry` from its current list by relinking its neighbors.
 /// After removal, `entry.prev` and `entry.next` are set to `nil` to make
 /// accidental use obvious. Equivalent to `list_del` in QuickJS.
-func listDel(_ entry: ListHead) {
+nonisolated func listDel(_ entry: ListHead) {
     entry.prev.next = entry.next
     entry.next.prev = entry.prev
     entry.prev = nil
@@ -99,7 +99,7 @@ func listDel(_ entry: ListHead) {
 /// Remove `entry` from its current list and re-initialize it as an empty
 /// list (self-referencing sentinel). Useful when the node may be re-inserted
 /// later. Equivalent to `list_del_init` in the Linux kernel.
-func listDelInit(_ entry: ListHead) {
+nonisolated func listDelInit(_ entry: ListHead) {
     entry.prev.next = entry.next
     entry.next.prev = entry.prev
     entry.prev = entry
@@ -109,7 +109,7 @@ func listDelInit(_ entry: ListHead) {
 // MARK: - Move
 
 /// Remove `entry` from its current list and insert it after `head`.
-func listMoveToFront(_ entry: ListHead, _ head: ListHead) {
+nonisolated func listMoveToFront(_ entry: ListHead, _ head: ListHead) {
     // Unlink
     entry.prev.next = entry.next
     entry.next.prev = entry.prev
@@ -118,7 +118,7 @@ func listMoveToFront(_ entry: ListHead, _ head: ListHead) {
 }
 
 /// Remove `entry` from its current list and insert it before `head` (tail).
-func listMoveToTail(_ entry: ListHead, _ head: ListHead) {
+nonisolated func listMoveToTail(_ entry: ListHead, _ head: ListHead) {
     // Unlink
     entry.prev.next = entry.next
     entry.next.prev = entry.prev
@@ -130,7 +130,7 @@ func listMoveToTail(_ entry: ListHead, _ head: ListHead) {
 
 /// Splice the contents of `list` into the position after `head`.
 /// `list` will be empty after this operation.
-func listSplice(_ list: ListHead, _ head: ListHead) {
+nonisolated func listSplice(_ list: ListHead, _ head: ListHead) {
     guard !listEmpty(list) else { return }
     let first = list.next!
     let last = list.prev!
@@ -150,7 +150,7 @@ func listSplice(_ list: ListHead, _ head: ListHead) {
 // MARK: - Count
 
 /// Returns the number of entries in the list (O(n) traversal).
-func listCount(_ head: ListHead) -> Int {
+nonisolated func listCount(_ head: ListHead) -> Int {
     var count = 0
     var node = head.next!
     while node !== head {
@@ -167,7 +167,7 @@ func listCount(_ head: ListHead) -> Int {
 ///
 /// **Not safe for removal during iteration** — use `listForEachSafe` if
 /// entries may be removed inside the closure.
-func listForEach(_ head: ListHead, body: (ListHead) -> Void) {
+nonisolated func listForEach(_ head: ListHead, body: (ListHead) -> Void) {
     var node = head.next!
     while node !== head {
         body(node)
@@ -177,7 +177,7 @@ func listForEach(_ head: ListHead, body: (ListHead) -> Void) {
 
 /// Iterate over every node in reverse order (tail to front).
 /// Equivalent to `list_for_each_prev` in the Linux kernel.
-func listForEachPrev(_ head: ListHead, body: (ListHead) -> Void) {
+nonisolated func listForEachPrev(_ head: ListHead, body: (ListHead) -> Void) {
     var node = head.prev!
     while node !== head {
         body(node)
@@ -190,7 +190,7 @@ func listForEachPrev(_ head: ListHead, body: (ListHead) -> Void) {
 ///
 /// The next pointer is captured before `body` executes, so calling
 /// `listDel` on the current node inside `body` is safe.
-func listForEachSafe(_ head: ListHead, body: (ListHead) -> Void) {
+nonisolated func listForEachSafe(_ head: ListHead, body: (ListHead) -> Void) {
     var node = head.next!
     while node !== head {
         let nextNode = node.next!
@@ -201,7 +201,7 @@ func listForEachSafe(_ head: ListHead, body: (ListHead) -> Void) {
 
 /// Reverse-direction safe iteration.
 /// Equivalent to `list_for_each_prev_safe` in the Linux kernel.
-func listForEachPrevSafe(_ head: ListHead, body: (ListHead) -> Void) {
+nonisolated func listForEachPrevSafe(_ head: ListHead, body: (ListHead) -> Void) {
     var node = head.prev!
     while node !== head {
         let prevNode = node.prev!
@@ -223,13 +223,13 @@ func listForEachPrevSafe(_ head: ListHead, body: (ListHead) -> Void) {
 /// - Precondition: The `ListHead` must have been created with `init(owner:)`
 ///   and the owner must still be alive.
 /// - Returns: The owner cast to type `T`.
-func listEntry<T: AnyObject>(_ node: ListHead) -> T {
+nonisolated func listEntry<T: AnyObject>(_ node: ListHead) -> T {
     return node._owner as! T
 }
 
 /// Retrieve the owner object of type `T` from a `ListHead` node, returning
 /// `nil` if the owner has been deallocated or is not of the expected type.
-func listEntryOptional<T: AnyObject>(_ node: ListHead) -> T? {
+nonisolated func listEntryOptional<T: AnyObject>(_ node: ListHead) -> T? {
     return node._owner as? T
 }
 
@@ -237,7 +237,7 @@ func listEntryOptional<T: AnyObject>(_ node: ListHead) -> T? {
 
 /// Iterate over list entries, automatically casting each node's owner to `T`.
 /// Equivalent to `list_for_each_entry` in the Linux kernel.
-func listForEachEntry<T: AnyObject>(_ head: ListHead, type: T.Type, body: (T) -> Void) {
+nonisolated func listForEachEntry<T: AnyObject>(_ head: ListHead, type: T.Type, body: (T) -> Void) {
     var node = head.next!
     while node !== head {
         if let entry: T = listEntryOptional(node) {
@@ -249,7 +249,7 @@ func listForEachEntry<T: AnyObject>(_ head: ListHead, type: T.Type, body: (T) ->
 
 /// Iterate over list entries with safe removal, casting each node's owner to `T`.
 /// Equivalent to `list_for_each_entry_safe` in the Linux kernel.
-func listForEachEntrySafe<T: AnyObject>(_ head: ListHead, type: T.Type, body: (T) -> Void) {
+nonisolated func listForEachEntrySafe<T: AnyObject>(_ head: ListHead, type: T.Type, body: (T) -> Void) {
     var node = head.next!
     while node !== head {
         let nextNode = node.next!
@@ -261,7 +261,7 @@ func listForEachEntrySafe<T: AnyObject>(_ head: ListHead, type: T.Type, body: (T
 }
 
 /// Iterate over list entries in reverse, casting each node's owner to `T`.
-func listForEachEntryReverse<T: AnyObject>(_ head: ListHead, type: T.Type, body: (T) -> Void) {
+nonisolated func listForEachEntryReverse<T: AnyObject>(_ head: ListHead, type: T.Type, body: (T) -> Void) {
     var node = head.prev!
     while node !== head {
         if let entry: T = listEntryOptional(node) {
@@ -282,7 +282,7 @@ func listForEachEntryReverse<T: AnyObject>(_ head: ListHead, type: T.Type, body:
 ///     // node is ListHead
 /// }
 /// ```
-struct ListSequence: Sequence {
+nonisolated struct ListSequence: Sequence {
     let head: ListHead
 
     init(_ head: ListHead) {
@@ -295,7 +295,7 @@ struct ListSequence: Sequence {
 }
 
 /// Iterator for `ListSequence`.
-struct ListIterator: IteratorProtocol {
+nonisolated struct ListIterator: IteratorProtocol {
     let head: ListHead
     var current: ListHead?
 
@@ -315,7 +315,7 @@ struct ListIterator: IteratorProtocol {
 
 /// A `Sequence`-conforming wrapper for safe iteration (allows removal during
 /// iteration). Captures the next pointer before yielding each element.
-struct ListSequenceSafe: Sequence {
+nonisolated struct ListSequenceSafe: Sequence {
     let head: ListHead
 
     init(_ head: ListHead) {
@@ -328,7 +328,7 @@ struct ListSequenceSafe: Sequence {
 }
 
 /// Iterator that pre-captures the next pointer, safe for element removal.
-struct ListIteratorSafe: IteratorProtocol {
+nonisolated struct ListIteratorSafe: IteratorProtocol {
     let head: ListHead
     var current: ListHead?
     var nextNode: ListHead?
@@ -357,7 +357,7 @@ struct ListIteratorSafe: IteratorProtocol {
 ///     // obj is MyClass
 /// }
 /// ```
-struct TypedListSequence<T: AnyObject>: Sequence {
+nonisolated struct TypedListSequence<T: AnyObject>: Sequence {
     let head: ListHead
 
     init(_ head: ListHead) {
@@ -370,7 +370,7 @@ struct TypedListSequence<T: AnyObject>: Sequence {
 }
 
 /// Iterator for `TypedListSequence`.
-struct TypedListIterator<T: AnyObject>: IteratorProtocol {
+nonisolated struct TypedListIterator<T: AnyObject>: IteratorProtocol {
     let head: ListHead
     var current: ListHead?
 

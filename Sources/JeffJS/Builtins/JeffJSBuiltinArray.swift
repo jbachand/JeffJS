@@ -10,14 +10,14 @@ import Foundation
 // MARK: - Array length limits
 
 /// Maximum valid array length per ECMAScript spec: 2^32 - 1.
-private let MAX_SAFE_ARRAY_LENGTH: UInt32 = 0xFFFF_FFFF
+nonisolated(unsafe) private let MAX_SAFE_ARRAY_LENGTH: UInt32 = 0xFFFF_FFFF
 
 /// Maximum safe integer: 2^53 - 1 (used for generic length validation).
-private let MAX_SAFE_INTEGER: Int64 = (1 << 53) - 1
+nonisolated(unsafe) private let MAX_SAFE_INTEGER: Int64 = (1 << 53) - 1
 
 // MARK: - JeffJSBuiltinArray
 
-struct JeffJSBuiltinArray {
+nonisolated struct JeffJSBuiltinArray {
 
     // MARK: - Intrinsic registration
 
@@ -2241,7 +2241,7 @@ struct JeffJSBuiltinArray {
 // MARK: - Array iterator kind
 
 /// Iteration kind for Array iterators.
-enum JeffJSArrayIteratorKind: Int {
+nonisolated enum JeffJSArrayIteratorKind: Int {
     case key = 0
     case value = 1
     case keyAndValue = 2
@@ -2251,7 +2251,7 @@ enum JeffJSArrayIteratorKind: Int {
 
 /// These are the context methods that the Array builtin relies on.
 /// The actual JeffJSContext class will provide implementations.
-protocol JeffJSContextArrayOps {
+nonisolated protocol JeffJSContextArrayOps {
     // Array-specific
     var arrayPrototype: JeffJSValue { get }
     func newArrayWithLength(_ length: Int) -> JeffJSValue
@@ -2308,7 +2308,7 @@ protocol JeffJSContextArrayOps {
 /// intrinsic %Array% data property, and %Array%[@@species] is its original
 /// accessor: ArraySpeciesCreate(v, n) is then ArrayCreate(n).
 @inline(__always)
-func jeffJS_isPlainArrayWithDefaultSpecies(_ ctx: JeffJSContext, _ v: JeffJSValue) -> Bool {
+nonisolated func jeffJS_isPlainArrayWithDefaultSpecies(_ ctx: JeffJSContext, _ v: JeffJSValue) -> Bool {
     guard let o = v.obj, let cs = ctx.arrayShape,
           o.shapeIdentity == UnsafeRawPointer(Unmanaged.passUnretained(cs).toOpaque()),
           let ap = cs.proto else { return false }
@@ -2324,7 +2324,7 @@ func jeffJS_isPlainArrayWithDefaultSpecies(_ ctx: JeffJSContext, _ v: JeffJSValu
 /// Neither %Array.prototype% nor %Object.prototype% (the chain of a plain
 /// array) has an @@isConcatSpreadable property.
 @inline(__always)
-func jeffJS_noProtoConcatSpreadable(_ ctx: JeffJSContext) -> Bool {
+nonisolated func jeffJS_noProtoConcatSpreadable(_ ctx: JeffJSContext) -> Bool {
     let atom = JeffJSAtomID.JS_ATOM_Symbol_isConcatSpreadable.rawValue
     guard let ap = ctx.arrayShape?.proto, let aps = ap.shape else { return false }
     if findShapeProperty(aps, atom) != nil { return false }
@@ -2337,7 +2337,7 @@ func jeffJS_noProtoConcatSpreadable(_ ctx: JeffJSContext) -> Bool {
 
 // MARK: - interp.leanCallEntry: reused callback argument arrays (watch CPU fix, 2026-10-07)
 
-extension JeffJSRuntime {
+nonisolated extension JeffJSRuntime {
     /// `[element, index, array]` for an iteration builtin's callbacks: the
     /// runtime's spare 3-slot array when it is free (a nested builtin finds
     /// it taken and allocates), instead of one allocation per builtin call.

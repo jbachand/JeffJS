@@ -18,7 +18,7 @@ import Foundation
 
 /// Implements the global object built-in functions for JeffJS.
 /// Mirrors QuickJS js_global_* functions and global property setup.
-struct JeffJSBuiltinGlobal {
+nonisolated struct JeffJSBuiltinGlobal {
 
     // MARK: - Intrinsic Registration
 

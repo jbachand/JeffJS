@@ -10,7 +10,7 @@
 
 import Foundation
 
-enum JeffJSStackDiag {
+nonisolated enum JeffJSStackDiag {
     /// Optional label stamped by test harnesses to localize reports.
     nonisolated(unsafe) static var currentLabel: String = ""
 

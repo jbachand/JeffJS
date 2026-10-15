@@ -12,12 +12,12 @@ import Foundation
 // Debug modes (zombies, refcount tracking) bypass the pool so identities stay
 // unique.
 
-let jeffJSObjectPoolCapacity = 4096
+nonisolated(unsafe) let jeffJSObjectPoolCapacity = 4096
 
 /// Called from JeffJSValue.freeValueHeap when an object's refcount is about
 /// to reach zero. Returns true when the object was recycled.
 @inline(never)
-func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
+nonisolated func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
     return Unmanaged<JeffJSObject>.fromOpaque(ptr)._withUnsafeGuaranteedRef { o -> Bool in
         if o.classID == JeffJSClassID.array.rawValue { return jeffJS_recycleArray(o) }
         if o.classID == JeffJSClassID.bytecodeFunction.rawValue { return jeffJS_recycleFunction(o) }
@@ -79,7 +79,7 @@ func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
     }
 }
 
-let jeffJSFunctionPoolCapacity = 1024
+nonisolated(unsafe) let jeffJSFunctionPoolCapacity = 1024
 
 /// Closures die as fast as they are made (`arr.forEach(function (v) {...})`
 /// in a loop, React's inline handlers). A dying ordinary bytecode function
@@ -90,7 +90,7 @@ let jeffJSFunctionPoolCapacity = 1024
 /// pool every closure paid two mallocs and two frees). A/B: JEFFJS_NO_POOL=1
 /// (all pools) or JEFFJS_GC_FUNCTIONPOOL=0.
 @inline(never)
-func jeffJS_recycleFunction(_ o: JeffJSObject) -> Bool {
+nonisolated func jeffJS_recycleFunction(_ o: JeffJSObject) -> Bool {
     let bad: UInt16 = JeffJSObject.flagExotic | JeffJSObject.flagFastArray | JeffJSObject.flagProtectedGlobal
         | JeffJSObject.flagImmutablePrototype | JeffJSObject.flagHTMLDDA | JeffJSObject.flagStdArrayPrototype
         | JeffJSObject.flagHasCFunc
@@ -152,7 +152,7 @@ func jeffJS_recycleFunction(_ o: JeffJSObject) -> Bool {
 /// JEFFJS_GC_FUNCTIONPOOL=0 turns the function-object pool off (A/B).
 nonisolated(unsafe) var jeffJS_functionPoolEnabled: Bool = true
 
-let jeffJSArrayPoolCapacity = 1024
+nonisolated(unsafe) let jeffJSArrayPoolCapacity = 1024
 let jeffJSArrayStorageKeepCapacity = 64
 
 /// Array literals (`[a, b, c]`, `[]` in obfuscated predicates) die as fast
@@ -163,7 +163,7 @@ let jeffJSArrayStorageKeepCapacity = 64
 /// (extra properties, accessors, frozen/sealed, weak refs, a subclass shape
 /// with more properties) takes the regular free path.
 @inline(never)
-func jeffJS_recycleArray(_ o: JeffJSObject) -> Bool {
+nonisolated func jeffJS_recycleArray(_ o: JeffJSObject) -> Bool {
     guard !jeffJSObjectPoolDisabled, o.refCount == 1, o.isPoolableArray,
           let rt = o.ownerRuntime, rt.initComplete,
           rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain,
@@ -204,7 +204,7 @@ func jeffJS_recycleArray(_ o: JeffJSObject) -> Bool {
     return true
 }
 
-extension JeffJSRuntime {
+nonisolated extension JeffJSRuntime {
     /// Release the Swift references the pooled objects still carry (their
     /// original makeObject retain). Called from free().
     func drainObjectPool() {
@@ -221,7 +221,7 @@ extension JeffJSRuntime {
     }
 }
 
-let jeffJSVarRefPoolCapacity = 1024
+nonisolated(unsafe) let jeffJSVarRefPoolCapacity = 1024
 
 /// interp.recycleVarRefs: detach the live var-refs of a frame that is going
 /// away — or, for one that nothing but the frame holds any more (every
@@ -232,7 +232,7 @@ let jeffJSVarRefPoolCapacity = 1024
 /// release and a free. Callers sync the frame first when they need to
 /// (jeffJS_syncForDetach).
 @inline(never)
-func jeffJS_detachFrameVarRefs(_ frame: JeffJSStackFrame, _ rt: JeffJSRuntime) {
+nonisolated func jeffJS_detachFrameVarRefs(_ frame: JeffJSStackFrame, _ rt: JeffJSRuntime) {
     if !jeffJSRecycleVarRefs {
         for vr in frame.liveVarRefs where !vr.isDetached {
             vr.value = vr.pvalue.dupValue()

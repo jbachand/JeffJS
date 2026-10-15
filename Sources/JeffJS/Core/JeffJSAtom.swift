@@ -26,7 +26,7 @@ typealias JSAtom = UInt32
 
 /// Mirrors QuickJS JSAtomKindEnum.
 /// Determines what kind of atom this is (for property key semantics).
-enum JSAtomType: UInt8 {
+nonisolated enum JSAtomType: UInt8 {
     case string       = 0  // regular string atom
     case globalSymbol = 1  // Symbol.for("...") -- globally registered
     case symbol       = 2  // unique symbol (Symbol("..."))
@@ -446,19 +446,19 @@ nonisolated class JSAtomTable {
 
 /// Check if an atom is a tagged integer (bit 31 set).
 @inline(__always)
-func js_atom_is_tagged_int(_ atom: JSAtom) -> Bool {
+nonisolated func js_atom_is_tagged_int(_ atom: JSAtom) -> Bool {
     return (atom & JS_ATOM_TAG_INT) != 0
 }
 
 /// Create a tagged-int atom from a UInt32.
 @inline(__always)
-func js_atom_from_uint32(_ n: UInt32) -> JSAtom {
+nonisolated func js_atom_from_uint32(_ n: UInt32) -> JSAtom {
     return n | JS_ATOM_TAG_INT
 }
 
 /// Extract the UInt32 from a tagged-int atom.
 @inline(__always)
-func js_atom_to_uint32(_ atom: JSAtom) -> UInt32 {
+nonisolated func js_atom_to_uint32(_ atom: JSAtom) -> UInt32 {
     return atom & JS_ATOM_MAX_INT
 }
 
@@ -478,7 +478,7 @@ func js_atom_to_uint32(_ atom: JSAtom) -> UInt32 {
 ///   - Well-known symbol names (Symbol.iterator, etc.)
 ///   - Internal names (prefixed with underscores)
 ///   - Built-in constructor/prototype names
-enum JSPredefinedAtom: UInt32 {
+nonisolated enum JSPredefinedAtom: UInt32 {
     // -----------------------------------------------------------------------
     // MARK: Keywords and reserved words (must come first, order matters)
     // -----------------------------------------------------------------------
@@ -1659,7 +1659,7 @@ enum JSPredefinedAtom: UInt32 {
 
 /// Provides fast access to predefined atom IDs without going through the enum.
 /// Usage: JSAtomID.length, JSAtomID.prototype, etc.
-enum JSAtomID {
+nonisolated enum JSAtomID {
     static let null_:                  JSAtom = JSPredefinedAtom.null_.rawValue
     static let false_:                 JSAtom = JSPredefinedAtom.false_.rawValue
     static let true_:                  JSAtom = JSPredefinedAtom.true_.rawValue
@@ -1857,18 +1857,18 @@ enum JSAtomID {
 // MARK: - First / Last keyword atom helpers
 
 /// The first keyword atom index (for fast keyword detection in the parser).
-let JS_ATOM_FIRST_KEYWORD = JSPredefinedAtom.null_.rawValue
+nonisolated(unsafe) let JS_ATOM_FIRST_KEYWORD = JSPredefinedAtom.null_.rawValue
 
 /// The last keyword atom index.
-let JS_ATOM_LAST_KEYWORD = JSPredefinedAtom.await_.rawValue
+nonisolated(unsafe) let JS_ATOM_LAST_KEYWORD = JSPredefinedAtom.await_.rawValue
 
 /// The last strict-mode reserved word atom index.
-let JS_ATOM_LAST_STRICT_KEYWORD = JSPredefinedAtom.yield_.rawValue
+nonisolated(unsafe) let JS_ATOM_LAST_STRICT_KEYWORD = JSPredefinedAtom.yield_.rawValue
 
 /// Check if an atom is a keyword (used by the parser).
-func jsAtomIsKeyword(_ atom: JSAtom) -> Bool {
+nonisolated func jsAtomIsKeyword(_ atom: JSAtom) -> Bool {
     return atom >= JS_ATOM_FIRST_KEYWORD && atom <= JS_ATOM_LAST_KEYWORD
 }
 
 /// The total number of predefined atoms.
-let JS_ATOM_END = JSPredefinedAtom.END.rawValue
+nonisolated(unsafe) let JS_ATOM_END = JSPredefinedAtom.END.rawValue

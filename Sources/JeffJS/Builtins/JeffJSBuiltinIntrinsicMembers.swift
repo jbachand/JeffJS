@@ -21,7 +21,7 @@
 
 import Foundation
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
 
     func addIntrinsicWellKnownMembers() {
         let speciesAtom = JeffJSAtomID.JS_ATOM_Symbol_species.rawValue

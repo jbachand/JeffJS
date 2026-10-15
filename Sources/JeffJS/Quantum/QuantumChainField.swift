@@ -10,7 +10,7 @@
 import Foundation
 
 /// A qubit with Double-precision motion parameters.
-struct ChainQubit {
+nonisolated struct ChainQubit {
     let x:      Double
     let y:      Double
     let speed:  Double
@@ -26,7 +26,7 @@ struct ChainQubit {
 /// `qubits(forSeed:)`. The chain encoder/decoder are designed so each
 /// background task instantiates its own encoder/decoder (and therefore its
 /// own field), keeping cache access thread-confined.
-final class QuantumChainField {
+nonisolated final class QuantumChainField {
 
     /// In-memory cache of generated fields.
     private var cache: [UInt32: [ChainQubit]] = [:]

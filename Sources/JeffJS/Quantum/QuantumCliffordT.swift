@@ -13,7 +13,7 @@ import Foundation
 
 // MARK: - CliffordTSimulator
 
-final class CliffordTSimulator {
+nonisolated final class CliffordTSimulator {
 
     let n: Int
     /// Stabilizer decomposition: list of (coefficient, stabilizer state) terms.

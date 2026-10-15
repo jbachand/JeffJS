@@ -5,7 +5,7 @@
 
 import Foundation
 
-public enum JeffJSHeapDebug {
+nonisolated public enum JeffJSHeapDebug {
     /// Text (truncated) and refcount of the JeffJSString at `p`, or nil when
     /// `p` is not a flat JeffJSString.
     public static func describeString(at p: UnsafeRawPointer) -> String? {

@@ -9,7 +9,7 @@ import Foundation
 // MARK: - DtoaFormat
 
 /// Output format for `jsDtoa` / `jsDtoa2`, matching QuickJS JS_DTOA_* modes.
-enum DtoaFormat: Int {
+nonisolated enum DtoaFormat: Int {
     /// Shortest representation that round-trips (Grisu/Dragon4 equivalent).
     /// Corresponds to `JS_DTOA_FORMAT_FREE` in QuickJS.
     case free = 0
@@ -26,7 +26,7 @@ enum DtoaFormat: Int {
 // MARK: - ATOD Flags (ASCII-to-double parsing flags)
 
 /// Mirrors `ATOD_*` flags from QuickJS quickjs.c / dtoa.c.
-struct ATODFlags: OptionSet {
+nonisolated struct ATODFlags: OptionSet {
     let rawValue: UInt32
 
     /// Only parse integer strings (no decimal point or exponent).
@@ -60,7 +60,7 @@ struct ATODFlags: OptionSet {
 // MARK: - JS_DTOA Flags (double-to-ASCII formatting flags)
 
 /// Mirrors `JS_DTOA_*` flags from QuickJS.
-struct JSDtoaFlags: OptionSet {
+nonisolated struct JSDtoaFlags: OptionSet {
     let rawValue: UInt32
 
     /// Use shortest (free-form) format.
@@ -83,31 +83,31 @@ struct JSDtoaFlags: OptionSet {
 
 /// Returns `true` if `d` is NaN.  Mirrors QuickJS `isnan()`.
 @inline(__always)
-func jsIsNaN(_ d: Double) -> Bool {
+nonisolated func jsIsNaN(_ d: Double) -> Bool {
     return d.isNaN
 }
 
 /// Returns `true` if `d` is +Infinity or -Infinity.  Mirrors QuickJS `isinf()`.
 @inline(__always)
-func jsIsInfinity(_ d: Double) -> Bool {
+nonisolated func jsIsInfinity(_ d: Double) -> Bool {
     return d.isInfinite
 }
 
 /// Returns `true` if `d` is neither NaN nor Infinity.  Mirrors QuickJS `isfinite()`.
 @inline(__always)
-func jsIsFinite(_ d: Double) -> Bool {
+nonisolated func jsIsFinite(_ d: Double) -> Bool {
     return d.isFinite
 }
 
 /// Returns `true` if `d` is negative zero.
 @inline(__always)
-func jsIsNegativeZero(_ d: Double) -> Bool {
+nonisolated func jsIsNegativeZero(_ d: Double) -> Bool {
     return d == 0.0 && d.bitPattern == (-0.0 as Double).bitPattern
 }
 
 /// Returns the sign bit of a double (1 for negative, 0 for positive/+0).
 @inline(__always)
-func jsSignBit(_ d: Double) -> Int {
+nonisolated func jsSignBit(_ d: Double) -> Int {
     return d.bitPattern >> 63 == 1 ? 1 : 0
 }
 
@@ -125,13 +125,13 @@ func jsSignBit(_ d: Double) -> Int {
 ///   - nDigits: Number of digits (interpretation depends on `format`).
 ///   - format: Output format mode (free, frac, or fixed).
 /// - Returns: The formatted string.
-func jsDtoa(_ buf: inout DynBuf, _ d: Double, radix: Int, nDigits: Int, format: DtoaFormat) -> String {
+nonisolated func jsDtoa(_ buf: inout DynBuf, _ d: Double, radix: Int, nDigits: Int, format: DtoaFormat) -> String {
     return jsDtoa2(&buf, d, radix: radix, nDigits: nDigits, format: format, expEnabled: false)
 }
 
 /// Extended version of `jsDtoa` with explicit exponential-notation control.
 /// Mirrors `js_dtoa2` / the internal dtoa logic in QuickJS.
-func jsDtoa2(_ buf: inout DynBuf, _ d: Double, radix: Int, nDigits: Int, format: DtoaFormat, expEnabled: Bool) -> String {
+nonisolated func jsDtoa2(_ buf: inout DynBuf, _ d: Double, radix: Int, nDigits: Int, format: DtoaFormat, expEnabled: Bool) -> String {
     // Handle special values first.
     if d.isNaN {
         return "NaN"
@@ -196,7 +196,7 @@ func jsDtoa2(_ buf: inout DynBuf, _ d: Double, radix: Int, nDigits: Int, format:
 /// Format a double using the shortest decimal representation that round-trips.
 /// This mirrors the Grisu2/Dragon4 algorithm used by QuickJS for free-form
 /// output (i.e. `Number.prototype.toString()` with no arguments).
-private func formatDoubleFree(_ d: Double) -> String {
+nonisolated private func formatDoubleFree(_ d: Double) -> String {
     if d == 0.0 {
         return jsSignBit(d) != 0 ? "0" : "0"
     }
@@ -248,7 +248,7 @@ private func formatDoubleFree(_ d: Double) -> String {
 /// for which n / 10^f - x is as close to zero as possible; if there are two such
 /// n, pick the larger n"): round half up on the exact value. Scaling by powers of
 /// ten in floating point, `log10`, or printf's round-half-even cannot give that.
-private func exactDecimalDigits(_ d: Double) -> (digits: [UInt8], exponent: Int) {
+nonisolated private func exactDecimalDigits(_ d: Double) -> (digits: [UInt8], exponent: Int) {
     let a = Swift.abs(d)
     var mant = a.significandBitPattern
     var e2: Int
@@ -314,7 +314,7 @@ private func exactDecimalDigits(_ d: Double) -> (digits: [UInt8], exponent: Int)
 
 /// The shortest digits that round-trip to `|d|` (Number::toString's digits):
 /// `|d| = 0.D1 D2 … × 10^exponent`, `D1 != 0`, no trailing zeros. `d` finite, non-zero.
-private func shortestDecimalDigits(_ d: Double) -> (digits: [UInt8], exponent: Int) {
+nonisolated private func shortestDecimalDigits(_ d: Double) -> (digits: [UInt8], exponent: Int) {
     // Swift's description is the shortest round-trip, closest representation.
     let s = "\(Swift.abs(d))"
     var mantissa = Substring(s)
@@ -339,7 +339,7 @@ private func shortestDecimalDigits(_ d: Double) -> (digits: [UInt8], exponent: I
 /// followed by `count` zeros (`count + 1` digits) and `carried` is true.
 /// `count <= 0` rounds to nothing, or to a lone carried `1` when `count == 0` and
 /// the leading digit is >= 5.
-private func roundDigitsHalfUp(_ digits: [UInt8], count: Int) -> (digits: [UInt8], carried: Bool) {
+nonisolated private func roundDigitsHalfUp(_ digits: [UInt8], count: Int) -> (digits: [UInt8], carried: Bool) {
     if count < 0 { return ([], false) }
     if count == 0 {
         if let first = digits.first, first >= 5 { return ([1], true) }
@@ -361,14 +361,14 @@ private func roundDigitsHalfUp(_ digits: [UInt8], count: Int) -> (digits: [UInt8
 }
 
 @inline(__always)
-private func digitString<S: Sequence>(_ digits: S) -> String where S.Element == UInt8 {
+nonisolated private func digitString<S: Sequence>(_ digits: S) -> String where S.Element == UInt8 {
     var s = ""
     for d in digits { s.unicodeScalars.append(Unicode.Scalar(d + 48)) }
     return s
 }
 
 @inline(__always)
-private func exponentSuffix(_ e: Int) -> String {
+nonisolated private func exponentSuffix(_ e: Int) -> String {
     return (e < 0 ? "e-" : "e+") + String(Swift.abs(e))
 }
 
@@ -376,12 +376,12 @@ private func exponentSuffix(_ e: Int) -> String {
 
 /// Format a double with exactly `nDigits` fractional digits.
 /// Mirrors `js_fcvt` in QuickJS dtoa.c.
-func jsFcvt(_ d: Double, nDigits: Int) -> String {
+nonisolated func jsFcvt(_ d: Double, nDigits: Int) -> String {
     return formatDoubleFrac(d, nDigits: nDigits)
 }
 
 /// Extended variant with format control.
-func jsFcvt1(_ d: Double, nDigits: Int, format: DtoaFormat) -> String {
+nonisolated func jsFcvt1(_ d: Double, nDigits: Int, format: DtoaFormat) -> String {
     switch format {
     case .frac:
         return formatDoubleFrac(d, nDigits: nDigits)
@@ -396,7 +396,7 @@ func jsFcvt1(_ d: Double, nDigits: Int, format: DtoaFormat) -> String {
 /// `|d| < 1e21` (callers handle the rest): exactly `nDigits` fractional digits,
 /// ties rounded up (away from zero), "-" only for `d < 0` (so `-0` gives "0.00"
 /// while `-0.0001` gives "-0.00").
-private func formatDoubleFrac(_ d: Double, nDigits: Int) -> String {
+nonisolated private func formatDoubleFrac(_ d: Double, nDigits: Int) -> String {
     if d.isNaN { return "NaN" }
     if d.isInfinite { return d < 0 ? "-Infinity" : "Infinity" }
     let f = max(nDigits, 0)
@@ -429,7 +429,7 @@ private func formatDoubleFrac(_ d: Double, nDigits: Int) -> String {
 /// exactly `nDigits` significant digits (trailing zeros kept), ties rounded up,
 /// exponential notation when the exponent is < -6 or >= the precision (only if
 /// `expEnabled`; otherwise always positional). `-0` formats like `0`.
-private func formatDoubleFixed(_ d: Double, nDigits: Int, expEnabled: Bool) -> String {
+nonisolated private func formatDoubleFixed(_ d: Double, nDigits: Int, expEnabled: Bool) -> String {
     if d.isNaN { return "NaN" }
     if d.isInfinite { return d < 0 ? "-Infinity" : "Infinity" }
     let p = max(nDigits, 1)
@@ -471,7 +471,7 @@ private func formatDoubleFixed(_ d: Double, nDigits: Int, expEnabled: Bool) -> S
 /// `nDigits` fractional digits, ties rounded up; `nDigits < 0` means
 /// "fractionDigits undefined": as many digits as needed to identify the value
 /// (the shortest round-trip digits). `-0` formats like `0`.
-private func formatDoubleExponential(_ d: Double, nDigits: Int) -> String {
+nonisolated private func formatDoubleExponential(_ d: Double, nDigits: Int) -> String {
     if d.isNaN { return "NaN" }
     if d.isInfinite { return d < 0 ? "-Infinity" : "Infinity" }
 
@@ -505,7 +505,7 @@ private func formatDoubleExponential(_ d: Double, nDigits: Int) -> String {
 /// Format a double in a non-decimal radix (2-36).
 /// Used by `Number.prototype.toString(radix)`.
 /// Mirrors the non-decimal path in QuickJS `js_dtoa`.
-private func formatDoubleRadix(_ absVal: Double, negative: Bool, radix: Int) -> String {
+nonisolated private func formatDoubleRadix(_ absVal: Double, negative: Bool, radix: Int) -> String {
     let digits = "0123456789abcdefghijklmnopqrstuvwxyz"
     let digitsArr = Array(digits)
     let r = Double(radix)
@@ -563,7 +563,7 @@ private func formatDoubleRadix(_ absVal: Double, negative: Bool, radix: Int) -> 
 // MARK: - String-to-Number Parsing (jsAtof)
 
 /// Result of parsing a numeric string.
-enum JsAtofResult {
+nonisolated enum JsAtofResult {
     case double(Double)
     case integer(Int64)
     case bigInt(String)   // raw digit string for BigInt creation
@@ -581,7 +581,7 @@ enum JsAtofResult {
 ///   - flags: Parsing behaviour flags.
 ///   - radix: Default radix (0 = auto-detect, 10 = decimal, etc.).
 /// - Returns: The parsed result.
-func jsAtof(_ str: String, flags: ATODFlags, radix: Int) -> JsAtofResult {
+nonisolated func jsAtof(_ str: String, flags: ATODFlags, radix: Int) -> JsAtofResult {
     let chars = Array(str.utf8)
     var pos = 0
     let len = chars.count
@@ -682,7 +682,7 @@ func jsAtof(_ str: String, flags: ATODFlags, radix: Int) -> JsAtofResult {
 // MARK: - Internal Parsing Helpers
 
 /// Parse a decimal floating-point number from UTF-8 bytes.
-private func parseDecimalFloat(_ chars: [UInt8], _ pos: inout Int, _ len: Int,
+nonisolated private func parseDecimalFloat(_ chars: [UInt8], _ pos: inout Int, _ len: Int,
                                 negative: Bool, flags: ATODFlags) -> JsAtofResult {
     var intStr = ""
     var fracStr = ""
@@ -809,7 +809,7 @@ private func parseDecimalFloat(_ chars: [UInt8], _ pos: inout Int, _ len: Int,
 }
 
 /// Parse an integer in an arbitrary radix from UTF-8 bytes.
-private func parseRadixInteger(_ chars: [UInt8], _ pos: inout Int, _ len: Int,
+nonisolated private func parseRadixInteger(_ chars: [UInt8], _ pos: inout Int, _ len: Int,
                                 negative: Bool, radix: Int,
                                 flags: ATODFlags,
                                 hasRadixPrefix: Bool) -> JsAtofResult {
@@ -907,7 +907,7 @@ private func parseRadixInteger(_ chars: [UInt8], _ pos: inout Int, _ len: Int,
 /// Parse a string of digits in the given radix as a Double.
 /// Used when the integer overflows UInt64.
 /// Mirrors `js_atod` / radix parsing fallback in QuickJS.
-func parseRadixString(_ str: String, radix: Int) -> Double {
+nonisolated func parseRadixString(_ str: String, radix: Int) -> Double {
     var result: Double = 0.0
     let r = Double(radix)
     for ch in str {
@@ -919,7 +919,7 @@ func parseRadixString(_ str: String, radix: Int) -> Double {
 }
 
 /// Return the numeric value of a digit character in the given radix, or -1.
-private func digitValue(_ c: UInt8, radix: Int) -> Int {
+nonisolated private func digitValue(_ c: UInt8, radix: Int) -> Int {
     var val: Int
     if c >= 0x30 && c <= 0x39 /* '0'-'9' */ {
         val = Int(c - 0x30)
@@ -935,13 +935,13 @@ private func digitValue(_ c: UInt8, radix: Int) -> Int {
 }
 
 /// Character variant of `digitValue`.
-private func digitValueChar(_ ch: Character, radix: Int) -> Int {
+nonisolated private func digitValueChar(_ ch: Character, radix: Int) -> Int {
     guard let ascii = ch.asciiValue else { return -1 }
     return digitValue(ascii, radix: radix)
 }
 
 /// Check if the byte sequence at `pos` matches the given ASCII literal.
-private func matchesLiteral(_ chars: [UInt8], _ pos: Int, _ literal: String) -> Bool {
+nonisolated private func matchesLiteral(_ chars: [UInt8], _ pos: Int, _ literal: String) -> Bool {
     let literalBytes = Array(literal.utf8)
     guard pos + literalBytes.count <= chars.count else { return false }
     for i in 0 ..< literalBytes.count {
@@ -954,7 +954,7 @@ private func matchesLiteral(_ chars: [UInt8], _ pos: Int, _ literal: String) -> 
 
 /// Returns `true` if the byte is an ASCII whitespace character matching the
 /// ES2024 `WhiteSpace` or `LineTerminator` productions.
-private func isWhitespace(_ c: UInt8) -> Bool {
+nonisolated private func isWhitespace(_ c: UInt8) -> Bool {
     switch c {
     case 0x09, // TAB
          0x0A, // LF
@@ -972,7 +972,7 @@ private func isWhitespace(_ c: UInt8) -> Bool {
 
 /// Parse an integer from a string with an optional radix.
 /// Mirrors the `parseInt()` global function behaviour.
-func jsParseInt(_ str: String, radix: Int = 0) -> JsAtofResult {
+nonisolated func jsParseInt(_ str: String, radix: Int = 0) -> JsAtofResult {
     var flags: ATODFlags = [.intOnly, .acceptTrailing]
     if radix == 0 || radix == 16 {
         flags.insert(.acceptPrefixAfterSign)
@@ -985,7 +985,7 @@ func jsParseInt(_ str: String, radix: Int = 0) -> JsAtofResult {
 
 /// Parse a float from a string.
 /// Mirrors the `parseFloat()` global function behaviour.
-func jsParseFloat(_ str: String) -> JsAtofResult {
+nonisolated func jsParseFloat(_ str: String) -> JsAtofResult {
     let flags: ATODFlags = [.acceptTrailing, .acceptInfinity]
     return jsAtof(str, flags: flags, radix: 10)
 }
@@ -994,7 +994,7 @@ func jsParseFloat(_ str: String) -> JsAtofResult {
 
 /// Implementation of `Number.prototype.toFixed(fractionDigits)`.
 /// Mirrors `js_number_toFixed` in QuickJS.
-func jsNumberToFixed(_ d: Double, fractionDigits: Int) -> String {
+nonisolated func jsNumberToFixed(_ d: Double, fractionDigits: Int) -> String {
     if d.isNaN { return "NaN" }
     if d.isInfinite { return d < 0 ? "-Infinity" : "Infinity" }
     let clamped = max(0, min(fractionDigits, 100))
@@ -1004,7 +1004,7 @@ func jsNumberToFixed(_ d: Double, fractionDigits: Int) -> String {
 /// Implementation of `Number.prototype.toExponential(fractionDigits)`.
 /// `nil` = fractionDigits undefined (shortest round-trip digits).
 /// Mirrors `js_number_toExponential` in QuickJS.
-func jsNumberToExponential(_ d: Double, fractionDigits: Int?) -> String {
+nonisolated func jsNumberToExponential(_ d: Double, fractionDigits: Int?) -> String {
     if d.isNaN { return "NaN" }
     if d.isInfinite { return d < 0 ? "-Infinity" : "Infinity" }
     guard let f = fractionDigits else { return formatDoubleExponential(d, nDigits: -1) }
@@ -1013,7 +1013,7 @@ func jsNumberToExponential(_ d: Double, fractionDigits: Int?) -> String {
 
 /// Implementation of `Number.prototype.toPrecision(precision)`.
 /// Mirrors `js_number_toPrecision` in QuickJS.
-func jsNumberToPrecision(_ d: Double, precision: Int) -> String {
+nonisolated func jsNumberToPrecision(_ d: Double, precision: Int) -> String {
     if d.isNaN { return "NaN" }
     if d.isInfinite { return d < 0 ? "-Infinity" : "Infinity" }
     let clamped = max(1, min(precision, 100))
@@ -1022,7 +1022,7 @@ func jsNumberToPrecision(_ d: Double, precision: Int) -> String {
 
 /// Implementation of `Number.prototype.toString(radix)`.
 /// Mirrors `js_number_toString` in QuickJS.
-func jsNumberToString(_ d: Double, radix: Int = 10) -> String {
+nonisolated func jsNumberToString(_ d: Double, radix: Int = 10) -> String {
     if d.isNaN { return "NaN" }
     if d.isInfinite { return d < 0 ? "-Infinity" : "Infinity" }
 

@@ -11,7 +11,7 @@
 
 import Foundation
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
 
     @inline(__always)
     func isProxyObject(_ o: JeffJSObject) -> Bool {

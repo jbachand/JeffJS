@@ -159,7 +159,7 @@ nonisolated final class JeffJSShape: JeffJSGCObjectHeader {
 
 /// Install `newProto` as `shape`'s prototype, taking the single counted
 /// reference a shape owns and releasing the one it held.
-func jeffJS_shapeSetProto(_ shape: JeffJSShape, _ newProto: JeffJSObject?) {
+nonisolated func jeffJS_shapeSetProto(_ shape: JeffJSShape, _ newProto: JeffJSObject?) {
     newProto?.ensureLazyMaterialized()
     let old = shape.proto
     if old === newProto { return }
@@ -176,7 +176,7 @@ func jeffJS_shapeSetProto(_ shape: JeffJSShape, _ newProto: JeffJSObject?) {
 ///   - proto: Prototype object (may be nil for `Object.create(null)`).
 ///   - hashSize: Must be a power of two (minimum 1).
 ///   - propSize: Number of property slots to pre-allocate.
-func createShape(_ ctx: JeffJSContext,
+nonisolated func createShape(_ ctx: JeffJSContext,
                  proto: JeffJSObject?,
                  hashSize: Int,
                  propSize: Int) -> JeffJSShape {
@@ -191,14 +191,14 @@ func createShape(_ ctx: JeffJSContext,
 /// Create a deep copy of `shape`, producing an independent shape with identical
 /// properties but its own storage.  The clone is **not** inserted into the
 /// runtime shape hash table.
-func cloneShape(_ ctx: JeffJSContext, _ shape: JeffJSShape) -> JeffJSShape {
+nonisolated func cloneShape(_ ctx: JeffJSContext, _ shape: JeffJSShape) -> JeffJSShape {
     return cloneShapeRT(ctx.rt, shape)
 }
 
 /// A private shape's tables under a new identity (for an object whose shape an inline
 /// cache holds): the arrays move, nothing is copied; the old shape is left empty for its
 /// owner to release.
-func jeffJS_moveShapeTables(_ rt: JeffJSRuntime, _ shape: JeffJSShape) -> JeffJSShape {
+nonisolated func jeffJS_moveShapeTables(_ rt: JeffJSRuntime, _ shape: JeffJSShape) -> JeffJSShape {
     let s = JeffJSShape()
     if let p = shape.proto { _ = JeffJSValue.borrowedObject(p).dupValue() }   // one count per shape
     s.proto = shape.proto
@@ -223,7 +223,7 @@ func jeffJS_moveShapeTables(_ rt: JeffJSRuntime, _ shape: JeffJSShape) -> JeffJS
 }
 
 /// `cloneShape` for callers that only have the runtime (object proto setter).
-func cloneShapeRT(_ rt: JeffJSRuntime, _ shape: JeffJSShape) -> JeffJSShape {
+nonisolated func cloneShapeRT(_ rt: JeffJSRuntime, _ shape: JeffJSShape) -> JeffJSShape {
     let s = JeffJSShape()
     // The clone is a second owner of the prototype: one count per shape.
     if let p = shape.proto { _ = JeffJSValue.borrowedObject(p).dupValue() }
@@ -273,7 +273,7 @@ func cloneShapeRT(_ rt: JeffJSRuntime, _ shape: JeffJSShape) -> JeffJSShape {
 // / `find_hashed_shape_prop` / `js_shape_prepare_update`.
 
 /// Find the hashed empty shape for `proto`.
-func findHashedShapeProto(_ rt: JeffJSRuntime, _ proto: JeffJSObject?) -> JeffJSShape? {
+nonisolated func findHashedShapeProto(_ rt: JeffJSRuntime, _ proto: JeffJSObject?) -> JeffJSShape? {
     guard rt.shapeHashSize > 0 else { return nil }
     let h = shapeInitialHash(proto)
     var cur = rt.shapeHash[Int(h & UInt32(rt.shapeHashSize - 1))]
@@ -288,7 +288,7 @@ func findHashedShapeProto(_ rt: JeffJSRuntime, _ proto: JeffJSObject?) -> JeffJS
 
 /// The shape a new empty object with prototype `proto` should start on.
 /// Returns a shape with one owner reference accounted for the caller.
-func jeffJS_rootShape(_ ctx: JeffJSContext, proto: JeffJSObject?) -> JeffJSShape {
+nonisolated func jeffJS_rootShape(_ ctx: JeffJSContext, proto: JeffJSObject?) -> JeffJSShape {
     proto?.ensureLazyMaterialized()
     let rt = ctx.rt
     if let s = findHashedShapeProto(rt, proto) {
@@ -304,7 +304,7 @@ func jeffJS_rootShape(_ ctx: JeffJSContext, proto: JeffJSObject?) -> JeffJSShape
 
 /// Drop one owner reference from `shape`. Private shapes are freed at zero;
 /// hashed shapes remain cached in the transition table.
-func jeffJS_leaveShape(_ rt: JeffJSRuntime, _ shape: JeffJSShape) {
+nonisolated func jeffJS_leaveShape(_ rt: JeffJSRuntime, _ shape: JeffJSShape) {
     guard shape.refCount > 0 else { return }
     shape.refCount -= 1
     if shape.refCount == 0 && !shape.isHashed {
@@ -316,7 +316,7 @@ func jeffJS_leaveShape(_ rt: JeffJSRuntime, _ shape: JeffJSShape) {
 /// On a hashed (shared) shape this follows or creates a hashed transition;
 /// on a private shape it appends in place.
 @discardableResult
-func jeffJS_objectAddShapeProperty(_ ctx: JeffJSContext,
+nonisolated func jeffJS_objectAddShapeProperty(_ ctx: JeffJSContext,
                                    _ obj: JeffJSObject,
                                    atom: UInt32,
                                    flags: UInt32) -> Int {
@@ -356,7 +356,7 @@ func jeffJS_objectAddShapeProperty(_ ctx: JeffJSContext,
 
 /// Lookup a property by atom in a shape's property hash table.
 /// - Returns: The property index into `shape.prop`, or `nil` if not found.
-func findShapeProperty(_ shape: JeffJSShape, _ atom: UInt32) -> Int? {
+nonisolated func findShapeProperty(_ shape: JeffJSShape, _ atom: UInt32) -> Int? {
     guard shape.propCount > 0, !shape.prop.isEmpty, !shape.propHash.isEmpty else { return nil }
 
     let h = Int(atom & shape.propHashMask)
@@ -383,7 +383,7 @@ func findShapeProperty(_ shape: JeffJSShape, _ atom: UInt32) -> Int? {
 ///
 /// - Returns: The index of the newly added property.
 @discardableResult
-func addShapeProperty(_ ctx: JeffJSContext,
+nonisolated func addShapeProperty(_ ctx: JeffJSContext,
                       _ shape: JeffJSShape,
                       atom: UInt32,
                       flags: UInt32) -> Int {
@@ -442,7 +442,7 @@ func addShapeProperty(_ ctx: JeffJSContext,
 
 /// Mark property at `propertyIndex` as deleted.  The slot is not physically
 /// removed; instead its atom is set to 0 and the deleted count is incremented.
-func removeShapeProperty(_ ctx: JeffJSContext,
+nonisolated func removeShapeProperty(_ ctx: JeffJSContext,
                          _ shape: JeffJSShape,
                          propertyIndex: Int) {
     guard propertyIndex >= 0, propertyIndex < shape.prop.count else { return }
@@ -478,7 +478,7 @@ func removeShapeProperty(_ ctx: JeffJSContext,
 
 /// Compact a shape's property list by removing deleted entries and
 /// re-indexing the owning object's property values array to match.
-func compactProperties(_ ctx: JeffJSContext, _ obj: JeffJSObject) {
+nonisolated func compactProperties(_ ctx: JeffJSContext, _ obj: JeffJSObject) {
     guard let shape = obj.shape else { return }
     guard shape.deletedPropCount > 0 else { return }
 
@@ -524,7 +524,7 @@ func compactProperties(_ ctx: JeffJSContext, _ obj: JeffJSObject) {
 // MARK: - Property hash table resize (per-shape)
 
 /// Rebuild the per-shape property hash table with a new size.
-private func reshapePropertyHash(_ shape: JeffJSShape, newBits: Int) {
+nonisolated private func reshapePropertyHash(_ shape: JeffJSShape, newBits: Int) {
     let newSize = nextPowerOfTwo(newBits)
     shape.propHashMask = UInt32(newSize - 1)
     shape.propHash = [UInt32](repeating: JeffJSShape.noNext, count: newSize)
@@ -541,13 +541,13 @@ private func reshapePropertyHash(_ shape: JeffJSShape, newBits: Int) {
 
 /// QuickJS's shape_hash: multiply-add with the magic constant 0x9e370001.
 /// This is a Knuth multiplicative hash step.
-func shapeHash(_ h: UInt32, _ val: UInt32) -> UInt32 {
+nonisolated func shapeHash(_ h: UInt32, _ val: UInt32) -> UInt32 {
     return h &* 0x9e370001 &+ val
 }
 
 /// Compute the initial hash seed for a shape from its prototype.
 /// Uses the object pointer identity converted to UInt32.
-func shapeInitialHash(_ proto: JeffJSObject?) -> UInt32 {
+nonisolated func shapeInitialHash(_ proto: JeffJSObject?) -> UInt32 {
     guard let proto = proto else { return 0 }
     let bits = UInt(bitPattern: ObjectIdentifier(proto))
     // Fold 64-bit pointer into 32 bits
@@ -561,7 +561,7 @@ func shapeInitialHash(_ proto: JeffJSObject?) -> UInt32 {
 ///
 /// This enables shape-transition sharing: if object A already went through
 /// the same transition, we reuse its shape rather than creating a new one.
-func findHashedShape(_ rt: JeffJSRuntime,
+nonisolated func findHashedShape(_ rt: JeffJSRuntime,
                      _ baseShape: JeffJSShape,
                      atom: UInt32,
                      propFlags: UInt32) -> JeffJSShape? {
@@ -609,7 +609,7 @@ func findHashedShape(_ rt: JeffJSRuntime,
 }
 
 /// Insert `shape` into the runtime's shape hash table.
-func insertHashedShape(_ rt: JeffJSRuntime, _ shape: JeffJSShape) {
+nonisolated func insertHashedShape(_ rt: JeffJSRuntime, _ shape: JeffJSShape) {
     if rt.shapeHashSize == 0 {
         resizeShapeHash(rt, newBits: 1)
     }
@@ -627,7 +627,7 @@ func insertHashedShape(_ rt: JeffJSRuntime, _ shape: JeffJSShape) {
 }
 
 /// Remove `shape` from the runtime's shape hash table.
-func removeHashedShape(_ rt: JeffJSRuntime, _ shape: JeffJSShape) {
+nonisolated func removeHashedShape(_ rt: JeffJSRuntime, _ shape: JeffJSShape) {
     guard shape.isHashed, rt.shapeHashSize > 0 else { return }
 
     let idx = Int(shape.hash & UInt32(rt.shapeHashSize - 1))
@@ -652,7 +652,7 @@ func removeHashedShape(_ rt: JeffJSRuntime, _ shape: JeffJSShape) {
 }
 
 /// Resize the runtime shape hash table to `newSize` buckets (must be power of 2).
-func resizeShapeHash(_ rt: JeffJSRuntime, newBits: Int) {
+nonisolated func resizeShapeHash(_ rt: JeffJSRuntime, newBits: Int) {
     let newSize = nextPowerOfTwo(max(newBits, 1))
     var newTable = [JeffJSShape?](repeating: nil, count: newSize)
 
@@ -682,11 +682,11 @@ func resizeShapeHash(_ rt: JeffJSRuntime, newBits: Int) {
 ///
 /// If the shape's reference count is > 1 (shared by multiple objects) it is
 /// cloned so each object gets its own copy.
-func prepareShapeUpdate(_ ctx: JeffJSContext, _ obj: JeffJSObject) {
+nonisolated func prepareShapeUpdate(_ ctx: JeffJSContext, _ obj: JeffJSObject) {
     prepareShapeUpdateRT(ctx.rt, obj)
 }
 
-func prepareShapeUpdateRT(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
+nonisolated func prepareShapeUpdateRT(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
     guard let shape = obj.shape else { return }
     // A hashed shape is shared by definition (other objects may sit on it or
     // reach it through transitions); a private shape with several owners is
@@ -714,7 +714,7 @@ func prepareShapeUpdateRT(_ rt: JeffJSRuntime, _ obj: JeffJSObject) {
 // MARK: - Utility
 
 /// Round up to the nearest power of two (minimum 1).
-private func nextPowerOfTwo(_ n: Int) -> Int {
+nonisolated private func nextPowerOfTwo(_ n: Int) -> Int {
     guard n > 1 else { return 1 }
     // Subtract 1 so exact powers of two stay unchanged.
     var v = n - 1

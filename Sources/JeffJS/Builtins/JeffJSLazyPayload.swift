@@ -56,7 +56,7 @@ import Foundation
 
 /// Immutable bytes a lazy payload is scanned from. The bytes must not change
 /// for the lifetime of the source; `withBytes` may be called many times.
-protocol LazyBytesSource: AnyObject {
+nonisolated protocol LazyBytesSource: AnyObject {
     var byteCount: Int { get }
     func withBytes<R>(_ body: (UnsafeBufferPointer<UInt8>) -> R) -> R
 }
@@ -73,7 +73,7 @@ nonisolated final class JeffJSByteArraySource: LazyBytesSource {
 }
 
 /// A script's UTF-8 source (shared with lazy compilation).
-extension JeffJSSourceText: LazyBytesSource {
+nonisolated extension JeffJSSourceText: LazyBytesSource {
     var byteCount: Int { bytes.count }
     func withBytes<R>(_ body: (UnsafeBufferPointer<UInt8>) -> R) -> R {
         bytes.withUnsafeBufferPointer(body)
@@ -236,12 +236,12 @@ nonisolated(unsafe) let jeffJS_jsonLazyThreshold = JeffJSConfig.jsonLazyThreshol
 nonisolated(unsafe) let jeffJS_lazyLiteralsEnabled = JeffJSConfig.compileLazyLiterals
 nonisolated(unsafe) let jeffJS_lazyLiteralMinBytes = JeffJSConfig.compileLazyLiteralMinBytes
 /// Nesting deeper than this compiles eagerly (the parser's own limits apply).
-let jeffJS_lazyLiteralMaxDepth = 256
+nonisolated(unsafe) let jeffJS_lazyLiteralMaxDepth = 256
 nonisolated(unsafe) let jeffJS_lazyDebug = ProcessInfo.processInfo.environment["JEFFJS_LAZYDEBUG"] == "1"
 
 // MARK: - Object helpers
 
-extension JeffJSObject {
+nonisolated extension JeffJSObject {
     /// `lazyFlags` bit: this object is an unmaterialized lazy payload stub.
     @inline(__always) static let lazyPayloadBit: UInt8 = 8
     /// `lazyFlags` bit: the object has a lazy payload record (stub or
@@ -262,7 +262,7 @@ extension JeffJSObject {
 
 /// Free/recycle hook: the object is going away.
 @inline(never)
-func jeffJS_lazyForget(_ rt: JeffJSRuntime?, _ o: JeffJSObject) {
+nonisolated func jeffJS_lazyForget(_ rt: JeffJSRuntime?, _ o: JeffJSObject) {
     guard let rt = rt ?? o.ownerRuntime ?? JeffJSGCObjectHeader.activeRuntime else {
         o.lazyFlags &= ~(JeffJSObject.lazyOriginBit | JeffJSObject.lazyPayloadBit)
         return
@@ -273,14 +273,14 @@ func jeffJS_lazyForget(_ rt: JeffJSRuntime?, _ o: JeffJSObject) {
 // MARK: - Validation
 
 /// Byte classes.
-@inline(__always) private func jsonIsWS(_ c: UInt8) -> Bool { c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D }
+@inline(__always) nonisolated private func jsonIsWS(_ c: UInt8) -> Bool { c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D }
 @inline(__always) private func jsonIsDigit(_ c: UInt8) -> Bool { c >= 0x30 && c <= 0x39 }
 @inline(__always) private func jsonIsHex(_ c: UInt8) -> Bool {
     (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66)
 }
 
 /// Result of validating one JSON value.
-struct JeffJSLazyValidation {
+nonisolated struct JeffJSLazyValidation {
     /// Offset just past the value.
     var end: Int
     var skips: [UInt64]
@@ -295,7 +295,7 @@ struct JeffJSLazyValidation {
 /// the grammar the eager parser (JeffJSBuiltinJSON.parseValue) accepts.
 /// Returns nil on any syntax error. Iterative: no depth limit, no allocation
 /// beyond the container stack and the skip table.
-func jeffJS_lazyJSONValidate(_ p: UnsafeBufferPointer<UInt8>, start: Int, end: Int,
+nonisolated func jeffJS_lazyJSONValidate(_ p: UnsafeBufferPointer<UInt8>, start: Int, end: Int,
                              skipMinBytes: Int = 256) -> JeffJSLazyValidation? {
     var i = start
     var stack: [Int] = []          // container start offsets (sign bit = array)
@@ -462,13 +462,13 @@ func jeffJS_lazyJSONValidate(_ p: UnsafeBufferPointer<UInt8>, start: Int, end: I
                                 maxDepth: maxDepth)
 }
 
-let jeffJS_protoUnits: [UInt16] = Array("__proto__".utf16)
+nonisolated(unsafe) let jeffJS_protoUnits: [UInt16] = Array("__proto__".utf16)
 
 // MARK: - Decoding (same results as JeffJSBuiltinJSON.parseString / parseNumber)
 
 /// UTF-16 code units of the (validated) JSON string whose quotes are at
 /// `qs` and `qe - 1`. nil only on malformed input.
-func jeffJS_lazyDecodeUnits(_ p: UnsafeBufferPointer<UInt8>, _ qs: Int, _ qe: Int) -> [UInt16]? {
+nonisolated func jeffJS_lazyDecodeUnits(_ p: UnsafeBufferPointer<UInt8>, _ qs: Int, _ qe: Int) -> [UInt16]? {
     var out: [UInt16] = []
     out.reserveCapacity(qe - qs - 2)
     var i = qs + 1
@@ -529,7 +529,7 @@ func jeffJS_lazyDecodeUnits(_ p: UnsafeBufferPointer<UInt8>, _ qs: Int, _ qe: In
 /// The JS number for the validated JSON number in [s, e) — the eager
 /// parser's rule (Int32 when integral and in range without '.'/exponent),
 /// except that `-0` stays negative zero (ES §25.5.1: JSON.parse("-0") is -0).
-func jeffJS_jsonNumberValue(_ p: UnsafeBufferPointer<UInt8>, _ s: Int, _ e: Int) -> JeffJSValue {
+nonisolated func jeffJS_jsonNumberValue(_ p: UnsafeBufferPointer<UInt8>, _ s: Int, _ e: Int) -> JeffJSValue {
     var hasFrac = false
     var neg = false
     var small: Int64 = 0
@@ -562,7 +562,7 @@ func jeffJS_jsonNumberValue(_ p: UnsafeBufferPointer<UInt8>, _ s: Int, _ e: Int)
 }
 
 @inline(__always)
-private func jeffJS_fnv64(_ p: UnsafeBufferPointer<UInt8>, _ s: Int, _ e: Int) -> UInt64 {
+nonisolated private func jeffJS_fnv64(_ p: UnsafeBufferPointer<UInt8>, _ s: Int, _ e: Int) -> UInt64 {
     var h: UInt64 = 0xcbf2_9ce4_8422_2325
     var k = s
     while k < e { h = (h ^ UInt64(p[k])) &* 0x0000_0100_0000_01B3; k += 1 }
@@ -570,7 +570,7 @@ private func jeffJS_fnv64(_ p: UnsafeBufferPointer<UInt8>, _ s: Int, _ e: Int) -
 }
 
 /// The JS string for the validated JSON string literal [qs, qe).
-private func jeffJS_lazyStringValue(_ b: JeffJSLazyPayloadBuffer, _ p: UnsafeBufferPointer<UInt8>,
+nonisolated private func jeffJS_lazyStringValue(_ b: JeffJSLazyPayloadBuffer, _ p: UnsafeBufferPointer<UInt8>,
                                     _ qs: Int, _ qe: Int) -> JeffJSValue {
     let s = qs + 1, e = qe - 1
     var simple = true
@@ -606,7 +606,7 @@ private func jeffJS_lazyStringValue(_ b: JeffJSLazyPayloadBuffer, _ p: UnsafeBuf
 }
 
 /// The (owned) atom for the validated JSON key literal [qs, qe).
-private func jeffJS_lazyKeyAtom(_ rt: JeffJSRuntime, _ p: UnsafeBufferPointer<UInt8>, _ qs: Int, _ qe: Int) -> UInt32 {
+nonisolated private func jeffJS_lazyKeyAtom(_ rt: JeffJSRuntime, _ p: UnsafeBufferPointer<UInt8>, _ qs: Int, _ qe: Int) -> UInt32 {
     let s = qs + 1, e = qe - 1
     var k = s
     var esc = false
@@ -633,13 +633,13 @@ private func jeffJS_lazyKeyAtom(_ rt: JeffJSRuntime, _ p: UnsafeBufferPointer<UI
 // MARK: - Scanning helpers (validated input)
 
 @inline(__always)
-private func lzSkipWS(_ p: UnsafeBufferPointer<UInt8>, _ i: inout Int) {
+nonisolated private func lzSkipWS(_ p: UnsafeBufferPointer<UInt8>, _ i: inout Int) {
     while i < p.count, jsonIsWS(p[i]) { i += 1 }
 }
 
 /// Past the string starting at i (p[i] == '"').
 @inline(__always)
-private func lzSkipString(_ p: UnsafeBufferPointer<UInt8>, _ i: inout Int) {
+nonisolated private func lzSkipString(_ p: UnsafeBufferPointer<UInt8>, _ i: inout Int) {
     i += 1
     while i < p.count {
         let c = p[i]
@@ -649,7 +649,7 @@ private func lzSkipString(_ p: UnsafeBufferPointer<UInt8>, _ i: inout Int) {
 }
 
 /// Past the container starting at i (skip table, else bracket matching).
-private func lzSkipContainer(_ b: JeffJSLazyPayloadBuffer, _ p: UnsafeBufferPointer<UInt8>, _ i: inout Int) {
+nonisolated private func lzSkipContainer(_ b: JeffJSLazyPayloadBuffer, _ p: UnsafeBufferPointer<UInt8>, _ i: inout Int) {
     if let e = b.skipEnd(i) { i = e; return }
     var depth = 0
     while i < p.count {
@@ -665,7 +665,7 @@ private func lzSkipContainer(_ b: JeffJSLazyPayloadBuffer, _ p: UnsafeBufferPoin
 }
 
 @inline(__always)
-private func lzSkipNumber(_ p: UnsafeBufferPointer<UInt8>, _ i: inout Int) {
+nonisolated private func lzSkipNumber(_ p: UnsafeBufferPointer<UInt8>, _ i: inout Int) {
     while i < p.count {
         let c = p[i]
         if (c >= 0x30 && c <= 0x39) || c == 0x2D || c == 0x2B || c == 0x2E || c == 0x65 || c == 0x45 { i += 1 } else { return }
@@ -674,7 +674,7 @@ private func lzSkipNumber(_ p: UnsafeBufferPointer<UInt8>, _ i: inout Int) {
 
 // MARK: - Stubs
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
     /// The realm's sentinel shape for lazy stubs (prototype Object.prototype
     /// or Array.prototype, no properties, never inline-cached).
     func lazySentinelShape(array: Bool) -> JeffJSShape {
@@ -758,7 +758,7 @@ extension JeffJSContext {
 /// property operations used here (and any re-entrant lookup) see an
 /// ordinary object.
 @inline(never)
-func jeffJS_lazyMaterialize(_ o: JeffJSObject) {
+nonisolated func jeffJS_lazyMaterialize(_ o: JeffJSObject) {
     o.lazyFlags &= ~JeffJSObject.lazyPayloadBit
     guard let rt = o.ownerRuntime ?? JeffJSGCObjectHeader.activeRuntime,
           let (b, start) = rt.lazyPayload.record(o),
@@ -775,7 +775,7 @@ func jeffJS_lazyMaterialize(_ o: JeffJSObject) {
 
 /// The value at i (validated); advances i past it. Owned.
 @inline(__always)
-private func lzValue(_ ctx: JeffJSContext, _ b: JeffJSLazyPayloadBuffer,
+nonisolated private func lzValue(_ ctx: JeffJSContext, _ b: JeffJSLazyPayloadBuffer,
                      _ p: UnsafeBufferPointer<UInt8>, _ i: inout Int) -> JeffJSValue {
     let c = p[i]
     switch c {
@@ -797,7 +797,7 @@ private func lzValue(_ ctx: JeffJSContext, _ b: JeffJSLazyPayloadBuffer,
     }
 }
 
-private func jeffJS_lazyMaterializeObject(_ ctx: JeffJSContext, _ rt: JeffJSRuntime, _ o: JeffJSObject,
+nonisolated private func jeffJS_lazyMaterializeObject(_ ctx: JeffJSContext, _ rt: JeffJSRuntime, _ o: JeffJSObject,
                                           _ b: JeffJSLazyPayloadBuffer, _ p: UnsafeBufferPointer<UInt8>,
                                           _ start: Int) {
     rt.lazyPayload.objectsMaterialized += 1
@@ -838,7 +838,7 @@ private func jeffJS_lazyMaterializeObject(_ ctx: JeffJSContext, _ rt: JeffJSRunt
     }
 }
 
-private func jeffJS_lazyMaterializeArray(_ ctx: JeffJSContext, _ rt: JeffJSRuntime, _ o: JeffJSObject,
+nonisolated private func jeffJS_lazyMaterializeArray(_ ctx: JeffJSContext, _ rt: JeffJSRuntime, _ o: JeffJSObject,
                                          _ b: JeffJSLazyPayloadBuffer, _ p: UnsafeBufferPointer<UInt8>,
                                          _ start: Int) {
     rt.lazyPayload.arraysMaterialized += 1
@@ -881,7 +881,7 @@ private func jeffJS_lazyMaterializeArray(_ ctx: JeffJSContext, _ rt: JeffJSRunti
 
 // MARK: - Eviction
 
-extension JeffJSRuntime {
+nonisolated extension JeffJSRuntime {
     /// Revert every pristine object materialized from a lazy payload back to
     /// a stub, walking down from each live root (children first). Call with
     /// no JS on the stack. Returns the number of objects reverted.
@@ -902,7 +902,7 @@ extension JeffJSRuntime {
 }
 
 /// One payload's eviction walk.
-private struct JSONEvict {
+nonisolated private struct JSONEvict {
     let rt: JeffJSRuntime
     let b: JeffJSLazyPayloadBuffer
 
@@ -1026,7 +1026,7 @@ private struct JSONEvict {
 }
 
 /// Past any value at i.
-private func lzSkipAny(_ b: JeffJSLazyPayloadBuffer, _ p: UnsafeBufferPointer<UInt8>, _ i: inout Int) {
+nonisolated private func lzSkipAny(_ b: JeffJSLazyPayloadBuffer, _ p: UnsafeBufferPointer<UInt8>, _ i: inout Int) {
     let c = p[i]
     switch c {
     case 0x7B, 0x5B: lzSkipContainer(b, p, &i)
@@ -1040,7 +1040,7 @@ private func lzSkipAny(_ b: JeffJSLazyPayloadBuffer, _ p: UnsafeBufferPointer<UI
 /// Is `v` what the value at i materializes to? A container only has to be
 /// an object (collected into `children` with its span for the caller to
 /// check). Advances i.
-private func lzSameValue(_ rt: JeffJSRuntime, _ b: JeffJSLazyPayloadBuffer, _ p: UnsafeBufferPointer<UInt8>,
+nonisolated private func lzSameValue(_ rt: JeffJSRuntime, _ b: JeffJSLazyPayloadBuffer, _ p: UnsafeBufferPointer<UInt8>,
                          _ i: inout Int, _ v: JeffJSValue, _ children: inout [(JeffJSObject, Int)]) -> Bool {
     let c = p[i]
     switch c {
@@ -1077,7 +1077,7 @@ private func lzSameValue(_ rt: JeffJSRuntime, _ b: JeffJSLazyPayloadBuffer, _ p:
 
 // MARK: - Lazy literals (compiler side: JeffJSParser.tryLazyLiteral)
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
     /// `lazy_literal`: a fresh lazy payload for the literal whose JSON text
     /// is `cpool[cpoolIndex]` (a string; released with a top-level script's
     /// constants after it ran) and which starts at `sourceOffset` of the

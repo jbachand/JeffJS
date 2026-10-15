@@ -15,13 +15,13 @@ import Foundation
 
 /// Numeric value of an int or float64 JeffJSValue (trace arithmetic).
 @inline(__always)
-func jeffJS_traceNum(_ v: JeffJSValue) -> Double {
+nonisolated func jeffJS_traceNum(_ v: JeffJSValue) -> Double {
     v.isInt ? Double(v.toInt32()) : v.toFloat64()
 }
 
 /// ToInt32 for an int or float64 value (trace bitwise ops on float operands).
 @inline(__always)
-func jeffJS_traceToInt32(_ v: JeffJSValue) -> Int32 {
+nonisolated func jeffJS_traceToInt32(_ v: JeffJSValue) -> Int32 {
     v.isInt ? v.toInt32() : JeffJSTypeConvert.doubleToInt32(v.toFloat64())
 }
 
@@ -31,7 +31,7 @@ func jeffJS_traceToInt32(_ v: JeffJSValue) -> Int32 {
 // peepholes (get_loc push_i8 <op>, get_loc get_loc <op>, push_const <op>).
 
 @inline(__always)
-func jeffJS_cmpInt(_ cmp: UInt8, _ x: Int32, _ y: Int32) -> Bool {
+nonisolated func jeffJS_cmpInt(_ cmp: UInt8, _ x: Int32, _ y: Int32) -> Bool {
     switch cmp {
     case 0: return x < y
     case 1: return x <= y
@@ -43,7 +43,7 @@ func jeffJS_cmpInt(_ cmp: UInt8, _ x: Int32, _ y: Int32) -> Bool {
 }
 
 @inline(__always)
-func jeffJS_cmpDouble(_ cmp: UInt8, _ x: Double, _ y: Double) -> Bool {
+nonisolated func jeffJS_cmpDouble(_ cmp: UInt8, _ x: Double, _ y: Double) -> Bool {
     switch cmp {
     case 0: return x < y
     case 1: return x <= y
@@ -57,7 +57,7 @@ func jeffJS_cmpDouble(_ cmp: UInt8, _ x: Double, _ y: Double) -> Bool {
 /// Generic (non-numeric) fused compare, mirroring the main loop's slow paths.
 /// Consumes both values. nil on exception.
 @inline(never)
-func jeffJS_cmpGeneric(_ ctx: JeffJSContext, _ cmp: UInt8, _ lhs: JeffJSValue, _ rhs: JeffJSValue) -> Bool? {
+nonisolated func jeffJS_cmpGeneric(_ ctx: JeffJSContext, _ cmp: UInt8, _ lhs: JeffJSValue, _ rhs: JeffJSValue) -> Bool? {
     defer { lhs.freeValue(); rhs.freeValue() }
     switch cmp {
     case 0:
@@ -81,7 +81,7 @@ func jeffJS_cmpGeneric(_ ctx: JeffJSContext, _ cmp: UInt8, _ lhs: JeffJSValue, _
 
 /// Int32 arithmetic with the same overflow-to-double rules as add/sub/mul.
 @inline(__always)
-func jeffJS_arithInt(_ ar: UInt8, _ x: Int32, _ y: Int32) -> JeffJSValue {
+nonisolated func jeffJS_arithInt(_ ar: UInt8, _ x: Int32, _ y: Int32) -> JeffJSValue {
     switch ar {
     case 0:
         let (r, o) = x.addingReportingOverflow(y)
@@ -105,7 +105,7 @@ func jeffJS_arithInt(_ ar: UInt8, _ x: Int32, _ y: Int32) -> JeffJSValue {
 /// Numeric (double operand) result of a fused arithmetic op. Sub-ops 3-5 are
 /// the bitwise and/or/xor and produce an int32 like the plain opcodes do.
 @inline(__always)
-func jeffJS_arithNumeric(_ ar: UInt8, _ x: Double, _ y: Double) -> JeffJSValue {
+nonisolated func jeffJS_arithNumeric(_ ar: UInt8, _ x: Double, _ y: Double) -> JeffJSValue {
     switch ar {
     case 0: return .newFloat64(x + y)
     case 1: return .newFloat64(x - y)
@@ -119,7 +119,7 @@ func jeffJS_arithNumeric(_ ar: UInt8, _ x: Double, _ y: Double) -> JeffJSValue {
 /// Generic fused arithmetic (strings, objects, ...); consumes both values.
 /// nil on exception.
 @inline(never)
-func jeffJS_arithGeneric(_ ctx: JeffJSContext, _ ar: UInt8, _ lhs: JeffJSValue, _ rhs: JeffJSValue) -> JeffJSValue? {
+nonisolated func jeffJS_arithGeneric(_ ctx: JeffJSContext, _ ar: UInt8, _ lhs: JeffJSValue, _ rhs: JeffJSValue) -> JeffJSValue? {
     if ar == 0 {
         let r = JeffJSOperators.jsAdd(ctx: ctx, lhs: lhs, rhs: rhs)
         lhs.freeValue(); rhs.freeValue()
@@ -143,12 +143,12 @@ func jeffJS_arithGeneric(_ ctx: JeffJSContext, _ ar: UInt8, _ lhs: JeffJSValue, 
 /// Marker in an inline-cache entry's `atom` field: the site's cached slot is in the
 /// global lexical record (entry.shapePtr = the record's shape), not on the global
 /// object (whose entries carry `ctx.globalLexEpoch` there).
-let jeffJSLexicalICTag: UInt32 = 0xFFFF_FFFF
+nonisolated(unsafe) let jeffJSLexicalICTag: UInt32 = 0xFFFF_FFFF
 
 /// Read a script-level let/const/class binding through a lexical IC entry: nil on
 /// a shape mismatch (a binding was added) or while the slot is in its TDZ.
 @inline(__always)
-func jeffJS_lexicalICGet(_ ctx: JeffJSContext, _ entry: JeffJSICEntry) -> JeffJSValue? {
+nonisolated func jeffJS_lexicalICGet(_ ctx: JeffJSContext, _ entry: JeffJSICEntry) -> JeffJSValue? {
     guard let lo = ctx.globalVarObj.obj, lo.shapeIdentity == entry.shapePtr,
           entry.propOffset >= 0, entry.propOffset < lo.propCount else { return nil }
     let v = lo.dataValue(at: entry.propOffset)
@@ -159,7 +159,7 @@ func jeffJS_lexicalICGet(_ ctx: JeffJSContext, _ entry: JeffJSICEntry) -> JeffJS
 /// Store through a lexical IC entry (writable bindings only; a const's entry has
 /// `writable` false). true: `val` moved into the slot; false: nothing changed.
 @inline(__always)
-func jeffJS_lexicalICPut(_ ctx: JeffJSContext, _ entry: JeffJSICEntry, _ val: JeffJSValue) -> Bool {
+nonisolated func jeffJS_lexicalICPut(_ ctx: JeffJSContext, _ entry: JeffJSICEntry, _ val: JeffJSValue) -> Bool {
     guard entry.writable, let lo = ctx.globalVarObj.obj, lo.shapeIdentity == entry.shapePtr,
           entry.propOffset >= 0, entry.propOffset < lo.propCount else { return false }
     let old = lo.dataValue(at: entry.propOffset)
@@ -174,7 +174,7 @@ func jeffJS_lexicalICPut(_ ctx: JeffJSContext, _ entry: JeffJSICEntry, _ val: Je
 /// reported once instead of reading below the value buffer. File-scope so it
 /// captures none of the interpreter's locals (which would pin them to memory).
 @inline(__always)
-func jeffJS_pop(_ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: inout Int, _ spBase: Int,
+nonisolated func jeffJS_pop(_ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: inout Int, _ spBase: Int,
                 _ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int) -> JeffJSValue {
     if sp <= spBase {
         jeffJS_reportStackUnderflow(ctx, fb, pc, sp, spBase)
@@ -198,7 +198,7 @@ func jeffJS_pop(_ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: inout Int, _ spB
 /// method call on the call trace's `unowned(unsafe)` function reference
 /// retained and released it around every constant load.
 @inline(__always)
-func jeffJS_const(_ p: UnsafeMutablePointer<JeffJSValue>?, _ n: Int, _ i: Int) -> JeffJSValue {
+nonisolated func jeffJS_const(_ p: UnsafeMutablePointer<JeffJSValue>?, _ n: Int, _ i: Int) -> JeffJSValue {
     if let p = p, i < n { return p[i] }
     return .undefined
 }
@@ -206,7 +206,7 @@ func jeffJS_const(_ p: UnsafeMutablePointer<JeffJSValue>?, _ n: Int, _ i: Int) -
 /// Atom of a string key usable for the keyed caches (a named, non-index
 /// atom), or 0.
 @inline(__always)
-func jeffJS_keyedAtom(_ key: JeffJSValue) -> UInt32 {
+nonisolated func jeffJS_keyedAtom(_ key: JeffJSValue) -> UInt32 {
     let a = key.cachedKeyAtom
     return (a & JS_ATOM_TAG_INT) == 0 ? a : 0
 }
@@ -216,7 +216,7 @@ func jeffJS_keyedAtom(_ key: JeffJSValue) -> UInt32 {
 /// element index that never reaches the prototype (ES §10.4.5), and a
 /// module namespace is exotic. Their keyed sites are never cached.
 @inline(__always)
-func jeffJS_keyedCacheExcluded(_ o: JeffJSObj) -> Bool {
+nonisolated func jeffJS_keyedCacheExcluded(_ o: JeffJSObj) -> Bool {
     let c = o.classID
     return (c >= JeffJSClassID.uint8cArray.rawValue && c <= JeffJSClassID.float64Array.rawValue)
         || c == JeffJSClassID.moduleNamespace.rawValue
@@ -224,7 +224,7 @@ func jeffJS_keyedCacheExcluded(_ o: JeffJSObj) -> Bool {
 
 /// Keyed read cache hit (borrowed value), or nil.
 @inline(__always)
-func jeffJS_keyedICGet(_ ents: UnsafeMutablePointer<JeffJSICEntry>?, _ pc: Int, _ jsObj: JeffJSObj, _ atom: UInt32) -> JeffJSValue? {
+nonisolated func jeffJS_keyedICGet(_ ents: UnsafeMutablePointer<JeffJSICEntry>?, _ pc: Int, _ jsObj: JeffJSObj, _ atom: UInt32) -> JeffJSValue? {
     guard let ents = ents else { return nil }
     let entry = ents[jeffJS_icSlot(ents, pc)]
     guard entry.pc == pc, entry.atom == atom, let sid = jsObj.shapeIdentity, entry.shapePtr == sid else { return nil }
@@ -238,7 +238,7 @@ func jeffJS_keyedICGet(_ ents: UnsafeMutablePointer<JeffJSICEntry>?, _ pc: Int, 
 /// Keyed read cache miss: full lookup (owned result or exception), then
 /// cache an own data slot or a depth-1 prototype slot.
 @inline(never)
-func jeffJS_keyedGetMiss(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int,
+nonisolated func jeffJS_keyedGetMiss(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int,
                          _ obj: JeffJSValue, _ jsObj: JeffJSObj, _ atom: UInt32) -> JeffJSValue {
     #if JEFFJS_JSPROF
     jeffJS_icCount(4)
@@ -261,7 +261,7 @@ func jeffJS_keyedGetMiss(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ p
 /// Keyed write: cache hit stores `val` (taking its reference) and returns
 /// true; nil-shape or mismatch returns false.
 @inline(__always)
-func jeffJS_keyedICPut(_ ents: UnsafeMutablePointer<JeffJSICEntry>?, _ pc: Int, _ jsObj: JeffJSObj, _ atom: UInt32,
+nonisolated func jeffJS_keyedICPut(_ ents: UnsafeMutablePointer<JeffJSICEntry>?, _ pc: Int, _ jsObj: JeffJSObj, _ atom: UInt32,
                        _ val: JeffJSValue) -> Bool {
     guard let ents = ents else { return false }
     let entry = ents[jeffJS_icSlot(ents, pc)]
@@ -274,7 +274,7 @@ func jeffJS_keyedICPut(_ ents: UnsafeMutablePointer<JeffJSICEntry>?, _ pc: Int, 
 /// a cache hit; false leaves the stack untouched (deopt). Out of line so the
 /// trace loops' register allocation does not pay for it.
 @inline(never)
-func jeffJS_traceKeyedGet(_ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: Int,
+nonisolated func jeffJS_traceKeyedGet(_ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: Int,
                           _ ents: UnsafeMutablePointer<JeffJSICEntry>?, _ pc: Int) -> Bool {
     let key = buf[sp - 1], objV = buf[sp - 2]
     let kAtom = jeffJS_keyedAtom(key)
@@ -289,7 +289,7 @@ func jeffJS_traceKeyedGet(_ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: Int,
 /// value on a keyed-cache hit of the get_array_el site at `elPC`, else nil
 /// (the caller runs the three instructions normally).
 @inline(never)
-func jeffJS_traceThisKeyedGet(_ ents: UnsafeMutablePointer<JeffJSICEntry>?, _ elPC: Int,
+nonisolated func jeffJS_traceThisKeyedGet(_ ents: UnsafeMutablePointer<JeffJSICEntry>?, _ elPC: Int,
                               _ thisV: JeffJSValue, _ key: JeffJSValue) -> JeffJSValue? {
     let kAtom = jeffJS_keyedAtom(key)
     guard kAtom != 0, let tObj = thisV.obj, let hv = jeffJS_keyedICGet(ents, elPC, tObj, kAtom) else { return nil }
@@ -303,7 +303,7 @@ func jeffJS_traceThisKeyedGet(_ ents: UnsafeMutablePointer<JeffJSICEntry>?, _ el
 /// it taken and allocates; a callee that kept the array only costs the copy
 /// `removeAll(keepingCapacity:)` then makes).
 @inline(never)
-func jeffJS_nativeCallFromSlots(_ ctx: JeffJSContext, _ rt: JeffJSRuntime, _ cf: JSCFunctionType,
+nonisolated func jeffJS_nativeCallFromSlots(_ ctx: JeffJSContext, _ rt: JeffJSRuntime, _ cf: JSCFunctionType,
                                 _ thisVal: JeffJSValue, _ argp: UnsafeMutablePointer<JeffJSValue>,
                                 _ argc: Int, _ magic: Int) -> JeffJSValue {
     // interp.leanNativeArgs: one reused array per argument count (1–4),
@@ -347,7 +347,7 @@ func jeffJS_nativeCallFromSlots(_ ctx: JeffJSContext, _ rt: JeffJSRuntime, _ cf:
 /// Trace `put_array_el` with a named string key ([obj, key, val] -> []) on
 /// a cache hit; false leaves the stack untouched (deopt).
 @inline(never)
-func jeffJS_traceKeyedPut(_ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: Int,
+nonisolated func jeffJS_traceKeyedPut(_ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: Int,
                           _ ents: UnsafeMutablePointer<JeffJSICEntry>?, _ pc: Int) -> Bool {
     let val = buf[sp - 1], key = buf[sp - 2], objV = buf[sp - 3]
     let kAtom = jeffJS_keyedAtom(key)
@@ -361,7 +361,7 @@ func jeffJS_traceKeyedPut(_ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: Int,
 /// parser's orphan `object` sentinel below the elements is dropped as the
 /// main loop does; anything else there leaves the stack untouched (deopt).
 @inline(never)
-func jeffJS_traceArrayFrom(_ ctx: JeffJSContext, _ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: Int, _ count: Int) -> Bool {
+nonisolated func jeffJS_traceArrayFrom(_ ctx: JeffJSContext, _ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: Int, _ count: Int) -> Bool {
     let below = buf[sp - count - 1]
     guard let bo = below.obj, bo.classID == JeffJSClassID.object.rawValue, bo.propCount == 0 else { return false }
     let arr = ctx.newArrayFromSlots(buf + (sp - count), count)   // takes the element references
@@ -373,7 +373,7 @@ func jeffJS_traceArrayFrom(_ ctx: JeffJSContext, _ buf: UnsafeMutablePointer<Jef
 /// Keyed write miss: full sloppy/strict set (takes `val`), then cache the
 /// slot. Returns false on exception.
 @inline(never)
-func jeffJS_keyedPutMiss(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int,
+nonisolated func jeffJS_keyedPutMiss(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int,
                          _ obj: JeffJSValue, _ jsObj: JeffJSObj, _ atom: UInt32, _ val: JeffJSValue) -> Bool {
     #if JEFFJS_JSPROF
     jeffJS_icCount(5)
@@ -407,7 +407,7 @@ func jeffJS_keyedPutMiss(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ p
 /// Borrowed result of a named read on a string primitive, or nil when the
 /// site's cache does not cover it (caller: generic path / deopt).
 @inline(never)
-func jeffJS_stringFieldGet(_ ctx: JeffJSContext, _ ents: UnsafeMutablePointer<JeffJSICEntry>?, _ pc: Int,
+nonisolated func jeffJS_stringFieldGet(_ ctx: JeffJSContext, _ ents: UnsafeMutablePointer<JeffJSICEntry>?, _ pc: Int,
                            _ s: JeffJSValue, _ atom: UInt32) -> JeffJSValue? {
     if atom == JeffJSAtomID.JS_ATOM_length.rawValue {
         guard let sb = s.stringBase else { return nil }
@@ -426,7 +426,7 @@ func jeffJS_stringFieldGet(_ ctx: JeffJSContext, _ ents: UnsafeMutablePointer<Je
 /// Cache miss for a named read on a string primitive: remember
 /// String.prototype's own data slot for `atom` at this site.
 @inline(never)
-func jeffJS_stringFieldFill(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int, _ atom: UInt32) {
+nonisolated func jeffJS_stringFieldFill(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int, _ atom: UInt32) {
     guard (atom & JS_ATOM_TAG_INT) == 0, atom != JeffJSAtomID.JS_ATOM_length.rawValue else { return }
     if ctx.stringProtoRaw == nil {
         guard let p = ctx.classProto[JSClassID.JS_CLASS_STRING.rawValue].toObject() else { return }
@@ -446,7 +446,7 @@ func jeffJS_stringFieldFill(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, 
 /// metadata accessor call plus `___chkstk_darwin` per call of the
 /// interpreter (~6% of a callback-heavy profile).
 @inline(never)
-func jeffJS_stderrLine(_ s: String) {
+nonisolated func jeffJS_stderrLine(_ s: String) {
     FileHandle.standardError.write((s + "\n").data(using: .utf8)!)
 }
 
@@ -487,11 +487,11 @@ nonisolated(unsafe) let jeffJSTraceLast = ProcessInfo.processInfo.environment["J
 nonisolated(unsafe) var jeffJSLastOps = [(fb: JeffJSFunctionBytecode?, pc: Int, op: UInt8, sp: Int)](repeating: (nil, 0, 0, 0), count: 128)
 nonisolated(unsafe) var jeffJSLastOpsIdx = 0
 @inline(never)
-func jeffJS_recordLastOp(_ fb: JeffJSFunctionBytecode, _ pc: Int, _ op: UInt8, _ sp: Int) {
+nonisolated func jeffJS_recordLastOp(_ fb: JeffJSFunctionBytecode, _ pc: Int, _ op: UInt8, _ sp: Int) {
     jeffJSLastOps[jeffJSLastOpsIdx & 127] = (fb, pc, op, sp)
     jeffJSLastOpsIdx &+= 1
 }
-func jeffJS_dumpLastOps(_ ctx: JeffJSContext) {
+nonisolated func jeffJS_dumpLastOps(_ ctx: JeffJSContext) {
     guard jeffJSTraceLast else { return }
     var out = "[JeffJS] last executed opcodes (oldest first):\n"
     let n = min(jeffJSLastOpsIdx, 128)
@@ -510,7 +510,7 @@ func jeffJS_dumpLastOps(_ ctx: JeffJSContext) {
 nonisolated(unsafe) var jeffJS_underflowReports = 0
 
 @inline(never)
-func jeffJS_reportStackUnderflow(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int, _ sp: Int, _ spBase: Int) {
+nonisolated func jeffJS_reportStackUnderflow(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int, _ sp: Int, _ spBase: Int) {
     // The traces have no per-pop guards: keep this function out of them.
     fb.traceEntryEnabled = false
     if let blocks = fb.traceBlocks { for b in blocks.values { b.isActive = false; b.disabled = true } }
@@ -540,7 +540,7 @@ func jeffJS_reportStackUnderflow(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytec
 /// bit patterns, so most `if_false`/`if_true` conditions never need the
 /// generic ToBoolean.
 @inline(__always)
-func jeffJS_fastToBool(_ v: JeffJSValue) -> Bool {
+nonisolated func jeffJS_fastToBool(_ v: JeffJSValue) -> Bool {
     if v.bits == JeffJSValue.JS_TRUE.bits { return true }
     if v.bits == JeffJSValue.JS_FALSE.bits { return false }
     return JeffJSTypeConvert.toBool(v)
@@ -560,7 +560,7 @@ func jeffJS_fastToBool(_ v: JeffJSValue) -> Bool {
 /// What to do with an iterator result handed back by a `yield*` delegate
 /// inside an **async** generator: an async iterator's `next()` answers with a
 /// promise *of* `{value, done}`, not with the record.
-enum JeffJSDelegateResult {
+nonisolated enum JeffJSDelegateResult {
     case ready(JeffJSValue)      // owned iterator-result object
     case park(JeffJSValue)       // owned pending promise to await
     case rejected                // exception already thrown
@@ -570,7 +570,7 @@ enum JeffJSDelegateResult {
 /// usually another async generator whose step did not park, so the promise is
 /// already settled by the time it comes back; a pending one parks the
 /// delegating generator on it, exactly as an `await` in its own body would.
-func jeffJS_asyncDelegateResult(_ ctx: JeffJSContext, _ result: JeffJSValue) -> JeffJSDelegateResult {
+nonisolated func jeffJS_asyncDelegateResult(_ ctx: JeffJSContext, _ result: JeffJSValue) -> JeffJSDelegateResult {
     guard let obj = result.toObject(),
           obj.classID == JSClassID.JS_CLASS_PROMISE.rawValue,
           case .promiseData(let pd) = obj.payload else {
@@ -590,7 +590,7 @@ func jeffJS_asyncDelegateResult(_ ctx: JeffJSContext, _ result: JeffJSValue) -> 
     }
 }
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
     /// Creates a new JS string value from a Swift String.
     /// Bridges `ctx.newString(s)` to a proper JeffJSString allocation.
     func newString(_ s: String) -> JeffJSValue {
@@ -3667,7 +3667,7 @@ extension JeffJSContext {
 // relies on; the dispatch loop still bounds the program counter via `pc < bcLen`.
 
 @inline(never)
-private func jeffJS_coldTraceOp(_ ctx: JeffJSContext, _ op: JeffJSOpcode, _ pc: Int, _ sp: Int, _ spBase: Int,
+nonisolated private func jeffJS_coldTraceOp(_ ctx: JeffJSContext, _ op: JeffJSOpcode, _ pc: Int, _ sp: Int, _ spBase: Int,
                         _ bc: UnsafePointer<UInt8>, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {
     var extra = ""
     if op == .put_loc || op == .put_loc0 || op == .put_loc1 || op == .put_loc2 || op == .put_loc3
@@ -3698,31 +3698,31 @@ private func jeffJS_coldTraceOp(_ ctx: JeffJSContext, _ op: JeffJSOpcode, _ pc: 
 
 /// Read a UInt8 from bytecode at the given offset.
 @inline(__always)
-private func readU8(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> UInt8 {
+nonisolated private func readU8(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> UInt8 {
     return bc[pos]
 }
 
 /// Read a signed Int8 from bytecode.
 @inline(__always)
-private func readI8(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> Int8 {
+nonisolated private func readI8(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> Int8 {
     return Int8(bitPattern: bc[pos])
 }
 
 /// Read a little-endian UInt16 from bytecode.
 @inline(__always)
-private func readU16(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> UInt16 {
+nonisolated private func readU16(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> UInt16 {
     return UInt16(bc[pos]) | (UInt16(bc[pos + 1]) << 8)
 }
 
 /// Read a little-endian Int16 from bytecode.
 @inline(__always)
-private func readI16(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> Int16 {
+nonisolated private func readI16(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> Int16 {
     return Int16(bitPattern: readU16(bc, pos))
 }
 
 /// Read a little-endian UInt32 from bytecode.
 @inline(__always)
-private func readU32(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> UInt32 {
+nonisolated private func readU32(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> UInt32 {
     return UInt32(bc[pos]) |
            (UInt32(bc[pos + 1]) << 8) |
            (UInt32(bc[pos + 2]) << 16) |
@@ -3731,7 +3731,7 @@ private func readU32(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> UInt32 {
 
 /// Read a little-endian Int32 from bytecode.
 @inline(__always)
-private func readI32(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> Int32 {
+nonisolated private func readI32(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> Int32 {
     return Int32(bitPattern: readU32(bc, pos))
 }
 
@@ -3740,7 +3740,7 @@ private func readI32(_ bc: UnsafePointer<UInt8>, _ pos: Int) -> Int32 {
 /// may release them afterwards. Generators and async functions keep their
 /// frame (and those references) alive across suspensions.
 @inline(__always)
-func jeffJS_isPlainBytecodeCallee(_ v: JeffJSValue) -> Bool {
+nonisolated func jeffJS_isPlainBytecodeCallee(_ v: JeffJSValue) -> Bool {
     guard let o = v.obj, let fb = o.fbFast else { return false }
     return !fb.isGenerator && !fb.isAsyncFunc
 }
@@ -3781,7 +3781,7 @@ func jeffJS_isPlainBytecodeCallee(_ v: JeffJSValue) -> Bool {
 /// Store an owned value into argument slot `idx`, releasing the replaced one
 /// when the frame owns its argument slots.
 @inline(__always)
-func jeffJS_storeArg(_ buf: UnsafeMutablePointer<JeffJSValue>, _ idx: Int, _ val: JeffJSValue, _ owned: Bool) {
+nonisolated func jeffJS_storeArg(_ buf: UnsafeMutablePointer<JeffJSValue>, _ idx: Int, _ val: JeffJSValue, _ owned: Bool) {
     let old = buf[idx]
     buf[idx] = val
     if owned { old.freeValue() }
@@ -3796,7 +3796,7 @@ func jeffJS_storeArg(_ buf: UnsafeMutablePointer<JeffJSValue>, _ idx: Int, _ val
 /// Reads the slot layout off the frame (`buf`, `bufVarBase`, `argCount`,
 /// kept current by every call path) to keep the call sites small.
 @inline(never)
-func jeffJS_releaseOwnedArgSlots(_ frame: JeffJSStackFrame, bufOwned: Bool) {
+nonisolated func jeffJS_releaseOwnedArgSlots(_ frame: JeffJSStackFrame, bufOwned: Bool) {
     guard let buf = frame.buf else { return }
     let varBase = frame.bufVarBase
     var i = bufOwned ? 0 : frame.argCount
@@ -3828,7 +3828,7 @@ func jeffJS_releaseOwnedArgSlots(_ frame: JeffJSStackFrame, bufOwned: Bool) {
 /// its result replaces the left operand's variable (`l = l + x`, `l += x`),
 /// which makes appending into the left operand's buffer safe.
 @inline(__always)
-func jeffJS_storedLocalIndex(_ bc: UnsafePointer<UInt8>, _ pos: Int, _ bcLen: Int) -> Int {
+nonisolated func jeffJS_storedLocalIndex(_ bc: UnsafePointer<UInt8>, _ pos: Int, _ bcLen: Int) -> Int {
     guard pos < bcLen else { return -1 }
     let b = bc[pos]
     @inline(__always) func op(_ o: JeffJSOpcode) -> UInt8 { UInt8(truncatingIfNeeded: o.rawValue) }
@@ -3849,7 +3849,7 @@ func jeffJS_storedLocalIndex(_ bc: UnsafePointer<UInt8>, _ pos: Int, _ bcLen: In
 /// (`stackRefs`, 0 when borrowed from a local) plus the local variable the
 /// next instruction overwrites with the result, if that local holds it.
 @inline(__always)
-func jeffJS_concatOwnedRefs(_ lhs: JeffJSValue, stackRefs: Int,
+nonisolated func jeffJS_concatOwnedRefs(_ lhs: JeffJSValue, stackRefs: Int,
                             _ bc: UnsafePointer<UInt8>, _ nextPC: Int, _ bcLen: Int,
                             _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) -> Int {
     let idx = jeffJS_storedLocalIndex(bc, nextPC, bcLen)
@@ -3858,7 +3858,7 @@ func jeffJS_concatOwnedRefs(_ lhs: JeffJSValue, stackRefs: Int,
 }
 
 @inline(never)
-private func executeFastTrace(
+nonisolated private func executeFastTrace(
     state: inout JeffJSInterpreter.HotState,
     startPC: Int,
     ctx: JeffJSContext,
@@ -5748,7 +5748,7 @@ private func executeFastTrace(
 // outweighs its benefit on loops that never call. The compiler marks each
 // trace block with `hasCalls`; the main loop picks the variant.
 // =============================================================================
-private func executeFastTraceLean(
+nonisolated private func executeFastTraceLean(
     bc: UnsafePointer<UInt8>,
     bcLen: Int,
     entryPC: Int,
@@ -7048,7 +7048,7 @@ private func executeFastTraceLean(
 // MARK: - Type Conversion Helpers
 // =============================================================================
 
-struct JeffJSTypeConvert {
+nonisolated struct JeffJSTypeConvert {
 
     // MARK: ToNumber
 
@@ -7282,7 +7282,7 @@ struct JeffJSTypeConvert {
 // MARK: - Operator Helpers
 // =============================================================================
 
-struct JeffJSOperators {
+nonisolated struct JeffJSOperators {
 
     // MARK: Addition
 
@@ -7681,7 +7681,7 @@ struct JeffJSOperators {
 
 /// The class ids `typeof` reports as "function" (the jsTypeof list).
 @inline(__always)
-func jeffJS_isFunctionClassID(_ cid: Int) -> Bool {
+nonisolated func jeffJS_isFunctionClassID(_ cid: Int) -> Bool {
     return cid == JeffJSClassID.cFunction.rawValue ||
         cid == JeffJSClassID.bytecodeFunction.rawValue ||
         cid == JeffJSClassID.boundFunction.rawValue ||
@@ -7702,7 +7702,7 @@ func jeffJS_isFunctionClassID(_ cid: Int) -> Bool {
 // =============================================================================
 
 /// Compare two JeffJSString values for equality.
-private func jeffJS_stringEqual(_ a: JeffJSString, _ b: JeffJSString) -> Bool {
+nonisolated private func jeffJS_stringEqual(_ a: JeffJSString, _ b: JeffJSString) -> Bool {
     if a === b { return true }
     if a.len != b.len { return false }
     // interp.fastStringEquals: two interned keys of one runtime are equal
@@ -7734,7 +7734,7 @@ private func jeffJS_stringEqual(_ a: JeffJSString, _ b: JeffJSString) -> Bool {
 
 /// Lexicographic comparison of two JeffJSString values.
 /// Returns < 0, 0, or > 0.
-private func jeffJS_stringCompare(_ a: JeffJSString, _ b: JeffJSString) -> Int {
+nonisolated private func jeffJS_stringCompare(_ a: JeffJSString, _ b: JeffJSString) -> Int {
     let len = min(a.len, b.len)
     for i in 0..<len {
         let ca = jeffJS_getString(str: a, at: i)
@@ -7747,7 +7747,7 @@ private func jeffJS_stringCompare(_ a: JeffJSString, _ b: JeffJSString) -> Int {
 }
 
 /// Convert a JeffJSString to a Swift String.
-private func jeffJS_toSwiftString(_ s: JeffJSString) -> String {
+nonisolated private func jeffJS_toSwiftString(_ s: JeffJSString) -> String {
     switch s.storage {
     case .str8(let buf):
         return String(buf.prefix(s.len).map { Character(Unicode.Scalar($0)) })
@@ -7764,7 +7764,7 @@ private func jeffJS_toSwiftString(_ s: JeffJSString) -> String {
 /// (callInternal) and all supporting dispatch logic.
 ///
 /// Port of `JS_CallInternal()` from QuickJS quickjs.c.
-struct JeffJSInterpreter {
+nonisolated struct JeffJSInterpreter {
 
     // =========================================================================
     // MARK: - Inline Call Frame
@@ -13976,7 +13976,7 @@ struct JeffJSInterpreter {
 /// Close an iterator record found while unwinding an exception. The pending
 /// exception is preserved across `return()` (which may itself throw; QuickJS
 /// swallows that error, as the spec requires for a throw completion).
-private func jeffJS_closeIteratorForUnwind(_ ctx: JeffJSContext, _ iter: JeffJSValue) {
+nonisolated private func jeffJS_closeIteratorForUnwind(_ ctx: JeffJSContext, _ iter: JeffJSValue) {
     guard iter.isObject else { return }
     let rt = ctx.rt
     let pending = rt.currentException
@@ -13992,12 +13992,12 @@ private func jeffJS_closeIteratorForUnwind(_ ctx: JeffJSContext, _ iter: JeffJSV
 /// interp.fastCallEntry; the sync allocated two arrays on every return of a
 /// function whose locals a closure captured (or that built `arguments`).
 @inline(__always)
-private func jeffJS_syncForDetach(_ frame: JeffJSStackFrame, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {
+nonisolated private func jeffJS_syncForDetach(_ frame: JeffJSStackFrame, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {
     if JeffJSRuntime.fastCallEntry, frame.buf != nil { return }
     jeffJS_syncBufToFrame(frame, buf, varBase)
 }
 
-private func jeffJS_syncBufToFrame(_ frame: JeffJSStackFrame, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {
+nonisolated private func jeffJS_syncBufToFrame(_ frame: JeffJSStackFrame, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {
     // The frame arrays are materialised lazily: the call paths no
     // longer fill argBuf/varBuf per call (that array churn dominated
     // call cost). Consumers that need the arrays (arguments object,
@@ -14021,7 +14021,7 @@ private func jeffJS_syncBufToFrame(_ frame: JeffJSStackFrame, _ buf: UnsafeMutab
 /// Copy the frame arrays back into the unsafe buffer (after external
 /// modification, e.g. generator restore).
 @inline(never)
-private func jeffJS_syncFrameToBuf(_ frame: JeffJSStackFrame, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {
+nonisolated private func jeffJS_syncFrameToBuf(_ frame: JeffJSStackFrame, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {
     for i in 0..<frame.argBuf.count {
         if i < varBase { buf[i] = frame.argBuf[i] }
     }
@@ -14032,7 +14032,7 @@ private func jeffJS_syncFrameToBuf(_ frame: JeffJSStackFrame, _ buf: UnsafeMutab
 
 // MARK: - Unsafe inline call stack (per runtime)
 
-extension JeffJSRuntime {
+nonisolated extension JeffJSRuntime {
     /// Push a saved caller state. Frames are trivially copyable, so this is
     /// a plain store; the buffer grows geometrically and is never shrunk.
     @inline(__always)
@@ -14066,7 +14066,7 @@ extension JeffJSRuntime {
 // Dynamic opcode-sequence profile (build with -Xswiftc -DJEFFJS_OPPROF):
 // counts executed opcodes and consecutive pairs across all three
 // dispatchers, dumped to stderr at exit. Used to pick superinstructions.
-let jeffJS_opProfN = 320
+nonisolated(unsafe) let jeffJS_opProfN = 320
 nonisolated(unsafe) var jeffJS_opProfPairs = [UInt64](repeating: 0, count: 320 * 320)
 nonisolated(unsafe) var jeffJS_opProfSingles = [UInt64](repeating: 0, count: 320)
 nonisolated(unsafe) var jeffJS_opProfPrev = 0
@@ -14075,17 +14075,17 @@ nonisolated(unsafe) var jeffJS_opProfMain = [UInt64](repeating: 0, count: 320)
 nonisolated(unsafe) var jeffJS_opProfDeopt = [UInt64](repeating: 0, count: 320)
 nonisolated(unsafe) var jeffJS_opProfRegistered = false
 @inline(__always)
-func jeffJS_opProfRecord(_ op: Int) {
+nonisolated func jeffJS_opProfRecord(_ op: Int) {
     if !jeffJS_opProfRegistered { jeffJS_opProfRegistered = true; atexit(jeffJS_opProfDump) }
     jeffJS_opProfSingles[op] &+= 1
     jeffJS_opProfPairs[jeffJS_opProfPrev * jeffJS_opProfN + op] &+= 1
     jeffJS_opProfPrev = op
 }
-func jeffJS_opProfName(_ v: Int) -> String {
+nonisolated func jeffJS_opProfName(_ v: Int) -> String {
     if let op = JeffJSOpcode(rawValue: UInt16(v)) { return String(describing: op) }
     return "op\(v)"
 }
-func jeffJS_opProfDump() {
+nonisolated func jeffJS_opProfDump() {
     var total: UInt64 = 0
     for c in jeffJS_opProfSingles { total &+= c }
     var out = "OPPROF total ops \(total)\n== top opcodes\n"
@@ -14121,7 +14121,7 @@ func jeffJS_opProfDump() {
 /// A for-in normally sees a handful of keys, where a linear scan over
 /// UInt32s is much cheaper than hashing each one; the set is only built
 /// once an object turns out to be large.
-struct JeffJSKeySeen {
+nonisolated struct JeffJSKeySeen {
     private var list: [UInt32] = []
     private var set: Set<UInt32>?
     private static let promoteAt = 48
@@ -14144,7 +14144,7 @@ struct JeffJSKeySeen {
 /// Out-of-line on purpose: inlining these arms into the main dispatch switch
 /// costs ~2x on every call-heavy kernel.
 @inline(never)
-func jeffJS_arithSlow(_ ctx: JeffJSContext, _ op: JeffJSBigIntBinOp,
+nonisolated func jeffJS_arithSlow(_ ctx: JeffJSContext, _ op: JeffJSBigIntBinOp,
                       _ lhs: JeffJSValue, _ rhs: JeffJSValue) -> JeffJSValue {
     let r = JeffJSOperators.jsArith(ctx: ctx, op: op, lhs: lhs, rhs: rhs)
     lhs.freeValue(); rhs.freeValue()
@@ -14153,7 +14153,7 @@ func jeffJS_arithSlow(_ ctx: JeffJSContext, _ op: JeffJSBigIntBinOp,
 
 /// `>>>` slow path — BigInts have no unsigned shift.
 @inline(never)
-func jeffJS_shrSlow(_ ctx: JeffJSContext, _ lhs: JeffJSValue, _ rhs: JeffJSValue) -> JeffJSValue {
+nonisolated func jeffJS_shrSlow(_ ctx: JeffJSContext, _ lhs: JeffJSValue, _ rhs: JeffJSValue) -> JeffJSValue {
     defer { lhs.freeValue(); rhs.freeValue() }
     if lhs.isBigInt || rhs.isBigInt {
         return ctx.throwTypeError(message: "BigInts have no unsigned right shift, use >> instead")
@@ -14167,7 +14167,7 @@ func jeffJS_shrSlow(_ ctx: JeffJSContext, _ lhs: JeffJSValue, _ rhs: JeffJSValue
 /// ToNumeric for the unary opcodes: a Number or a BigInt (owned), or
 /// `.exception`. Consumes `val`.
 @inline(never)
-func jeffJS_toNumericSlow(_ ctx: JeffJSContext, _ val: JeffJSValue) -> JeffJSValue {
+nonisolated func jeffJS_toNumericSlow(_ ctx: JeffJSContext, _ val: JeffJSValue) -> JeffJSValue {
     let n = ctx.toNumericValue(val)
     val.freeValue()
     return n
@@ -14175,7 +14175,7 @@ func jeffJS_toNumericSlow(_ ctx: JeffJSContext, _ val: JeffJSValue) -> JeffJSVal
 
 /// `++` / `--` on an already-numeric value (borrows it).
 @inline(never)
-func jeffJS_incDecValue(_ n: JeffJSValue, _ delta: Int64) -> JeffJSValue {
+nonisolated func jeffJS_incDecValue(_ n: JeffJSValue, _ delta: Int64) -> JeffJSValue {
     if n.isBigInt { return JeffJSBigIntOps.addInt(n, delta) }
     let d = n.isInt ? Double(n.toInt32()) : n.toFloat64()
     return .newFloat64(d + Double(delta))
@@ -14183,7 +14183,7 @@ func jeffJS_incDecValue(_ n: JeffJSValue, _ delta: Int64) -> JeffJSValue {
 
 /// Unary `-` slow path. Consumes `val`.
 @inline(never)
-func jeffJS_negSlow(_ ctx: JeffJSContext, _ val: JeffJSValue) -> JeffJSValue {
+nonisolated func jeffJS_negSlow(_ ctx: JeffJSContext, _ val: JeffJSValue) -> JeffJSValue {
     let n = jeffJS_toNumericSlow(ctx, val)
     if n.isException { return .exception }
     if n.isBigInt {
@@ -14194,7 +14194,7 @@ func jeffJS_negSlow(_ ctx: JeffJSContext, _ val: JeffJSValue) -> JeffJSValue {
 
 /// Unary `+` slow path — a TypeError on BigInts. Consumes `val`.
 @inline(never)
-func jeffJS_plusSlow(_ ctx: JeffJSContext, _ val: JeffJSValue) -> JeffJSValue {
+nonisolated func jeffJS_plusSlow(_ ctx: JeffJSContext, _ val: JeffJSValue) -> JeffJSValue {
     if val.isBigInt {
         val.freeValue()
         return ctx.throwTypeError(message: "Cannot convert a BigInt value to a number")
@@ -14206,7 +14206,7 @@ func jeffJS_plusSlow(_ ctx: JeffJSContext, _ val: JeffJSValue) -> JeffJSValue {
 
 /// Unary `~` slow path. Consumes `val`.
 @inline(never)
-func jeffJS_bitNotSlow(_ ctx: JeffJSContext, _ val: JeffJSValue) -> JeffJSValue {
+nonisolated func jeffJS_bitNotSlow(_ ctx: JeffJSContext, _ val: JeffJSValue) -> JeffJSValue {
     if val.isBigInt {
         let r = JeffJSBigIntOps.bitwiseNot(val); val.freeValue(); return r
     }
@@ -14222,9 +14222,9 @@ func jeffJS_bitNotSlow(_ ctx: JeffJSContext, _ val: JeffJSValue) -> JeffJSValue 
 /// atom and the function's own source text around it to stderr — to catch
 /// a reference compiled against the wrong atom ("Can't find variable: CONNECT"
 /// for a local `nF--` in Akamai's challenge script on homedepot).
-let jeffJSRefErrDebug = ProcessInfo.processInfo.environment["JEFFJS_REFERR_DEBUG"] == "1"
+nonisolated(unsafe) let jeffJSRefErrDebug = ProcessInfo.processInfo.environment["JEFFJS_REFERR_DEBUG"] == "1"
 
-func jeffJSDumpRefError(ctx: JeffJSContext, fb: JeffJSFunctionBytecode, pc: Int, atom: UInt32) {
+nonisolated func jeffJSDumpRefError(ctx: JeffJSContext, fb: JeffJSFunctionBytecode, pc: Int, atom: UInt32) {
     let name = ctx.rt.atomToString(atom) ?? "?"
     let fn = ctx.rt.atomToString(fb.nameAtom) ?? "?"
     var src = ""

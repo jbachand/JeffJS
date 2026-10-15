@@ -25,7 +25,7 @@ nonisolated(unsafe) let jeffJSForceMetalGC =
 
 /// Mirror of the Metal shader's GCNode struct.
 /// 16 bytes, matching the GPU layout: int32 + uint32 + uint32 + uint8 + 3 padding.
-struct MetalGCNode {
+nonisolated struct MetalGCNode {
     var refCount: Int32
     var childCount: UInt32
     var childOffset: UInt32

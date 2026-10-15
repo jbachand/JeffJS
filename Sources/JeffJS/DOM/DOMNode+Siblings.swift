@@ -22,7 +22,7 @@ import Synchronization
 // seeding pass writes only into children whose parent link is still the
 // parent it read, under the child's lock, where the writer resets the tag.
 
-struct DOMSiblingPosition {
+nonisolated struct DOMSiblingPosition {
     let parent: DOMNode
     let index: Int
     let elementIndex: Int

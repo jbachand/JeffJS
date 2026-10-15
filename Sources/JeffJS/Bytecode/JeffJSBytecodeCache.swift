@@ -14,7 +14,7 @@ import Foundation
 // MARK: - Serialization Format Constants
 
 /// Magic bytes: "JFBC" (JeffJS Function ByteCode)
-private let JFBC_MAGIC: UInt32 = 0x4A46_4243
+nonisolated(unsafe) private let JFBC_MAGIC: UInt32 = 0x4A46_4243
 /// Version 2: adds atom table for cross-runtime portability
 /// 5: per-function source span + the script text (Function.prototype.toString)
 /// 6: atom-table entries are tagged (u8 kind: 0 = JS_ATOM_NULL, 1 = string),
@@ -25,54 +25,54 @@ private let JFBC_MAGIC: UInt32 = 0x4A46_4243
 ///    not compiled yet (a stub: no bytecode, no constant pool), bit 2 = the
 ///    pc->line / pc->column tables follow (stack traces of cached code).
 ///    The trailer after the script text names the script (filename, module).
-private let JFBC_VERSION: UInt8 = 7
+nonisolated(unsafe) private let JFBC_VERSION: UInt8 = 7
 
 /// Function record `ext` bits (v7).
-private let EXT_LAZY: UInt8 = 1
+nonisolated(unsafe) private let EXT_LAZY: UInt8 = 1
 private let EXT_LAZY_PENDING: UInt8 = 2
-private let EXT_DEBUG: UInt8 = 4
+nonisolated(unsafe) private let EXT_DEBUG: UInt8 = 4
 /// Expression-span table (length-prefixed bytes after the debug tables).
-private let EXT_SPANS: UInt8 = 8
+nonisolated(unsafe) private let EXT_SPANS: UInt8 = 8
 /// The function is a script's / eval's top-level code (no payload).
-private let EXT_TOPLEVEL: UInt8 = 16
+nonisolated(unsafe) private let EXT_TOPLEVEL: UInt8 = 16
 /// Bytes of a lazy seed: kind, funcKind, jsMode, u16 flags, u32 start,
 /// u32 line, u32 name atom.
-private let LAZY_SEED_BYTES = 17
+nonisolated(unsafe) private let LAZY_SEED_BYTES = 17
 
 /// Magic bytes for a *disk cache entry*: "JBCK" (JeffJS ByteCode Key).
 /// A disk entry is this header followed by the JFBC blob. The blob format is
 /// untouched, so a precompiled `.jfbc` produced by the polyfill generator
 /// still loads through `evalPrecompiled`.
-private let JBCK_MAGIC: UInt32 = 0x4A42_434B
+nonisolated(unsafe) private let JBCK_MAGIC: UInt32 = 0x4A42_434B
 /// Disk-entry header version. Bump when the header layout changes.
-private let JBCK_HEADER_VERSION: UInt8 = 1
+nonisolated(unsafe) private let JBCK_HEADER_VERSION: UInt8 = 1
 
 /// Atom-table entry kinds (v6+).
-private let ATOM_ENTRY_NULL: UInt8 = 0
+nonisolated(unsafe) private let ATOM_ENTRY_NULL: UInt8 = 0
 private let ATOM_ENTRY_STRING: UInt8 = 1
 
 /// Constant pool entry tags
-private let CPOOL_UNDEFINED: UInt8 = 0
+nonisolated(unsafe) private let CPOOL_UNDEFINED: UInt8 = 0
 private let CPOOL_NULL: UInt8 = 1
-private let CPOOL_INT32: UInt8 = 2
+nonisolated(unsafe) private let CPOOL_INT32: UInt8 = 2
 private let CPOOL_FLOAT64: UInt8 = 3
-private let CPOOL_BOOL_FALSE: UInt8 = 4
+nonisolated(unsafe) private let CPOOL_BOOL_FALSE: UInt8 = 4
 private let CPOOL_BOOL_TRUE: UInt8 = 5
-private let CPOOL_STRING8: UInt8 = 6
+nonisolated(unsafe) private let CPOOL_STRING8: UInt8 = 6
 private let CPOOL_STRING16: UInt8 = 7
-private let CPOOL_FUNCTION: UInt8 = 8
+nonisolated(unsafe) private let CPOOL_FUNCTION: UInt8 = 8
 /// Tagged-template site object: u32 part count, then per part the cooked
 /// string (or undefined) and the raw string as nested cpool entries. Rebuilt
 /// as a frozen array with a frozen `raw` array (JeffJSContext.newTemplateObject).
-private let CPOOL_TEMPLATE: UInt8 = 9
+nonisolated(unsafe) private let CPOOL_TEMPLATE: UInt8 = 9
 /// BigInt literal: sign byte, then u32 limb count and that many u32 limbs
 /// (little-endian magnitude, the JBigInt layout).
-private let CPOOL_BIGINT: UInt8 = 10
+nonisolated(unsafe) private let CPOOL_BIGINT: UInt8 = 10
 
 // MARK: - Flag Packing
 
 /// Pack boolean flags into a UInt16 bitmask.
-private func packFlags(_ fb: JeffJSFunctionBytecode) -> UInt16 {
+nonisolated private func packFlags(_ fb: JeffJSFunctionBytecode) -> UInt16 {
     var flags: UInt16 = 0
     if fb.isGenerator                   { flags |= 1 << 0 }
     if fb.isAsyncFunc                   { flags |= 1 << 1 }
@@ -96,7 +96,7 @@ private func packFlags(_ fb: JeffJSFunctionBytecode) -> UInt16 {
 }
 
 /// Unpack boolean flags from a UInt16 bitmask.
-private func unpackFlags(_ flags: UInt16, into fb: JeffJSFunctionBytecode) {
+nonisolated private func unpackFlags(_ flags: UInt16, into fb: JeffJSFunctionBytecode) {
     fb.isGenerator                   = (flags & (1 << 0)) != 0
     fb.isAsyncFunc                   = (flags & (1 << 1)) != 0
     fb.isArrow                       = (flags & (1 << 2)) != 0
@@ -118,7 +118,7 @@ private func unpackFlags(_ flags: UInt16, into fb: JeffJSFunctionBytecode) {
 
 /// One decoded instruction: how wide the opcode itself is, how many bytes
 /// the whole instruction takes, and where its atom operand sits (if any).
-private struct DecodedInstruction {
+nonisolated private struct DecodedInstruction {
     let size: Int
     let atomOffset: Int?
 }
@@ -137,7 +137,7 @@ private struct DecodedInstruction {
 /// the blob is loaded into a runtime whose atom numbering differs from the
 /// one that compiled it (a precompiled `.jfbc`, or a disk cache written by
 /// an earlier process).
-private func decodeInstruction(_ bc: [UInt8], _ pc: Int) -> DecodedInstruction? {
+nonisolated private func decodeInstruction(_ bc: [UInt8], _ pc: Int) -> DecodedInstruction? {
     guard pc < bc.count else { return nil }
     let b0 = bc[pc]
     let rawValue: Int
@@ -174,7 +174,7 @@ private func decodeInstruction(_ bc: [UInt8], _ pc: Int) -> DecodedInstruction? 
 /// agree instruction-for-instruction with the interpreter's decode, and a
 /// disagreement is silent atom corruption rather than a crash, so it is worth
 /// asserting directly instead of hoping a snippet happens to expose it.
-enum JeffJSBytecodeWalk {
+nonisolated enum JeffJSBytecodeWalk {
 
     /// Offset of the first byte of every instruction in `bc`.
     static func instructionBoundaries(_ bc: [UInt8]) -> [Int] {
@@ -207,7 +207,7 @@ enum JeffJSBytecodeWalk {
 /// Walks the opcode stream using OpcodeInfo.format to find atom operands,
 /// assigns each unique atom a sequential index, and rewrites the bytecode
 /// in-place to use table indices instead of runtime atom IDs.
-private struct AtomTableBuilder {
+nonisolated private struct AtomTableBuilder {
 
     /// Maps runtime atom ID → index in the atom table
     private var atomToIndex: [UInt32: UInt32] = [:]
@@ -255,7 +255,7 @@ private struct AtomTableBuilder {
 }
 
 /// Read little-endian U32 from byte array.
-private func readU32LE(_ data: [UInt8], _ pos: Int) -> UInt32 {
+nonisolated private func readU32LE(_ data: [UInt8], _ pos: Int) -> UInt32 {
     UInt32(data[pos]) |
     (UInt32(data[pos + 1]) << 8) |
     (UInt32(data[pos + 2]) << 16) |
@@ -263,7 +263,7 @@ private func readU32LE(_ data: [UInt8], _ pos: Int) -> UInt32 {
 }
 
 /// Read little-endian U32 from a span (mapped entry).
-private func readU32LE(_ data: JeffJSBytesSpan, _ pos: Int) -> UInt32 {
+nonisolated private func readU32LE(_ data: JeffJSBytesSpan, _ pos: Int) -> UInt32 {
     UInt32(data[pos]) |
     (UInt32(data[pos + 1]) << 8) |
     (UInt32(data[pos + 2]) << 16) |
@@ -271,7 +271,7 @@ private func readU32LE(_ data: JeffJSBytesSpan, _ pos: Int) -> UInt32 {
 }
 
 /// Write little-endian U32 to byte array.
-private func writeU32LE(_ data: inout [UInt8], _ pos: Int, _ val: UInt32) {
+nonisolated private func writeU32LE(_ data: inout [UInt8], _ pos: Int, _ val: UInt32) {
     data[pos]     = UInt8(val & 0xFF)
     data[pos + 1] = UInt8((val >> 8) & 0xFF)
     data[pos + 2] = UInt8((val >> 16) & 0xFF)
@@ -281,7 +281,7 @@ private func writeU32LE(_ data: inout [UInt8], _ pos: Int, _ val: UInt32) {
 // MARK: - Atom Remapper (Deserialization)
 
 /// Remaps atom table indices in bytecode back to runtime atom IDs.
-private struct AtomRemapper {
+nonisolated private struct AtomRemapper {
 
     /// Maps table index → runtime atom ID
     let indexToAtom: [UInt32]
@@ -315,7 +315,7 @@ private struct AtomRemapper {
 
 /// Serializes a JeffJSFunctionBytecode to a portable byte array.
 /// Atoms are stored as strings in an atom table — bytecode is cross-runtime portable.
-struct JeffJSBytecodeSerializer {
+nonisolated struct JeffJSBytecodeSerializer {
 
     private var buf: [UInt8] = []
     private var atomTable: AtomTableBuilder
@@ -620,7 +620,7 @@ struct JeffJSBytecodeSerializer {
 
 /// Deserializes bytes into a fresh JeffJSFunctionBytecode with new cpool values.
 /// If a runtime is provided, atom table indices are remapped to the runtime's atom IDs.
-struct JeffJSBytecodeDeserializer {
+nonisolated struct JeffJSBytecodeDeserializer {
     /// The last file name read (shared by the functions of one blob).
     private var fileNameMemo: (text: String, string: JeffJSString)? = nil
 
@@ -1252,7 +1252,7 @@ struct JeffJSBytecodeDeserializer {
 ///   * the blob format version itself (`JFBC_VERSION`).
 ///
 /// All of them are folded in here.
-struct JeffJSBytecodeCacheKey {
+nonisolated struct JeffJSBytecodeCacheKey {
     /// FNV-1a over `desc`, a separator, then the source bytes.
     let hash: UInt64
     /// Canonical rendering of every compile input except the source text.

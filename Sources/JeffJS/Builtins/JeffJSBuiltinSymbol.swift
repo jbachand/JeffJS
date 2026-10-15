@@ -42,7 +42,7 @@ nonisolated final class JeffJSSymbolRegistry {
 /// Mirrors `js_thisBooleanValue` / `js_thisNumberValue` pattern in QuickJS.
 ///
 /// Returns the atom on success, or throws TypeError and returns 0 on failure.
-private func thisSymbolValue(_ ctx: JeffJSContext,
+nonisolated private func thisSymbolValue(_ ctx: JeffJSContext,
                              _ thisVal: JeffJSValue) -> UInt32 {
     // Case 1: bare symbol value (tag == .symbol)
     if thisVal.isSymbol {
@@ -70,7 +70,7 @@ private func thisSymbolValue(_ ctx: JeffJSContext,
 /// Extract the atom index from a symbol JeffJSValue.
 /// Symbols are stored as mkPtr(.symbol, ptr) where the ptr holds the
 /// atom entry, or as a tagged int for well-known symbols.
-private func extractSymbolAtom(_ val: JeffJSValue) -> UInt32 {
+nonisolated private func extractSymbolAtom(_ val: JeffJSValue) -> UInt32 {
     if val.isInt {
         return UInt32(bitPattern: val.toInt32())
     }
@@ -89,7 +89,7 @@ private func extractSymbolAtom(_ val: JeffJSValue) -> UInt32 {
 /// Cannot be called with `new` (throws TypeError).
 ///
 /// Mirrors `js_symbol_constructor` in QuickJS.
-func js_symbol_constructor(_ ctx: JeffJSContext,
+nonisolated func js_symbol_constructor(_ ctx: JeffJSContext,
                            _ newTarget: JeffJSValue,
                            _ argv: [JeffJSValue],
                            _ isConstructorCall: Bool) -> JeffJSValue {
@@ -130,7 +130,7 @@ func js_symbol_constructor(_ ctx: JeffJSContext,
 /// given key, or creates one if it doesn't exist.
 ///
 /// Mirrors `js_symbol_for` in QuickJS.
-func js_symbol_for(_ ctx: JeffJSContext,
+nonisolated func js_symbol_for(_ ctx: JeffJSContext,
                    _ thisVal: JeffJSValue,
                    _ argv: [JeffJSValue]) -> JeffJSValue {
     guard !argv.isEmpty else {
@@ -182,7 +182,7 @@ func js_symbol_for(_ ctx: JeffJSContext,
 /// symbol, or undefined if the symbol is not in the global registry.
 ///
 /// Mirrors `js_symbol_keyFor` in QuickJS.
-func js_symbol_keyFor(_ ctx: JeffJSContext,
+nonisolated func js_symbol_keyFor(_ ctx: JeffJSContext,
                       _ thisVal: JeffJSValue,
                       _ argv: [JeffJSValue]) -> JeffJSValue {
     guard !argv.isEmpty else {
@@ -226,7 +226,7 @@ func js_symbol_keyFor(_ ctx: JeffJSContext,
 /// Symbol.prototype.toString() - returns "Symbol(description)".
 ///
 /// Mirrors `js_symbol_toString` in QuickJS.
-func js_symbol_toString(_ ctx: JeffJSContext,
+nonisolated func js_symbol_toString(_ ctx: JeffJSContext,
                         _ thisVal: JeffJSValue,
                         _ argv: [JeffJSValue]) -> JeffJSValue {
     let atom = thisSymbolValue(ctx, thisVal)
@@ -247,7 +247,7 @@ func js_symbol_toString(_ ctx: JeffJSContext,
 /// Symbol.prototype.valueOf() - returns the primitive symbol value.
 ///
 /// Mirrors `js_symbol_valueOf` in QuickJS.
-func js_symbol_valueOf(_ ctx: JeffJSContext,
+nonisolated func js_symbol_valueOf(_ ctx: JeffJSContext,
                        _ thisVal: JeffJSValue,
                        _ argv: [JeffJSValue]) -> JeffJSValue {
     // If thisVal is already a symbol, return it.
@@ -272,7 +272,7 @@ func js_symbol_valueOf(_ ctx: JeffJSContext,
 /// or undefined if the symbol was created without a description.
 ///
 /// Mirrors `js_symbol_get_description` in QuickJS.
-func js_symbol_get_description(_ ctx: JeffJSContext,
+nonisolated func js_symbol_get_description(_ ctx: JeffJSContext,
                                _ thisVal: JeffJSValue) -> JeffJSValue {
     // Validate that thisVal is a symbol or Symbol wrapper.
     let isValid: Bool
@@ -297,7 +297,7 @@ func js_symbol_get_description(_ ctx: JeffJSContext,
 }
 
 /// Helper: extract the description string from a symbol value.
-func getSymbolDescription(_ val: JeffJSValue) -> String {
+nonisolated func getSymbolDescription(_ val: JeffJSValue) -> String {
     // Direct symbol.
     if val.isSymbol {
         if let atomStr = val.heapRef as? JeffJSString {
@@ -324,7 +324,7 @@ func getSymbolDescription(_ val: JeffJSValue) -> String {
 /// Returns the primitive symbol value, ignoring the hint.
 ///
 /// Mirrors `js_symbol_toPrimitive` in QuickJS.
-func js_symbol_toPrimitive(_ ctx: JeffJSContext,
+nonisolated func js_symbol_toPrimitive(_ ctx: JeffJSContext,
                            _ thisVal: JeffJSValue,
                            _ argv: [JeffJSValue]) -> JeffJSValue {
     // Same as valueOf: return the primitive symbol.
@@ -338,7 +338,7 @@ func js_symbol_toPrimitive(_ ctx: JeffJSContext,
 ///
 /// In QuickJS, well-known symbols are predefined atoms with
 /// JS_ATOM_TYPE_SYMBOL type, created at runtime initialization.
-struct WellKnownSymbol {
+nonisolated struct WellKnownSymbol {
     let name: String
     let atomID: UInt32
 
@@ -348,7 +348,7 @@ struct WellKnownSymbol {
 
 /// All well-known symbols from the ES specification.
 /// The atomID values correspond to the JSPredefinedAtom / JeffJSAtomID enums.
-let js_well_known_symbols: [WellKnownSymbol] = [
+nonisolated(unsafe) let js_well_known_symbols: [WellKnownSymbol] = [
     WellKnownSymbol(name: "asyncIterator",       atomID: JSPredefinedAtom.Symbol_asyncIterator.rawValue,
                     description: "Symbol.asyncIterator"),
     WellKnownSymbol(name: "hasInstance",          atomID: JSPredefinedAtom.Symbol_hasInstance.rawValue,
@@ -380,18 +380,18 @@ let js_well_known_symbols: [WellKnownSymbol] = [
 // MARK: - Symbol Prototype Function Table
 
 /// Symbol.prototype method registration table.
-struct JSSymbolFuncEntry {
+nonisolated struct JSSymbolFuncEntry {
     let name: String
     let length: Int
     let funcType: JSSymbolFuncType
 }
 
-enum JSSymbolFuncType {
+nonisolated enum JSSymbolFuncType {
     case generic((JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue)
     case getter((JeffJSContext, JeffJSValue) -> JeffJSValue)
 }
 
-let js_symbol_proto_funcs: [JSSymbolFuncEntry] = [
+nonisolated(unsafe) let js_symbol_proto_funcs: [JSSymbolFuncEntry] = [
     JSSymbolFuncEntry(name: "toString",    length: 0,
                       funcType: .generic(js_symbol_toString)),
     JSSymbolFuncEntry(name: "valueOf",     length: 0,
@@ -402,7 +402,7 @@ let js_symbol_proto_funcs: [JSSymbolFuncEntry] = [
 ]
 
 /// Symbol constructor static function table (Symbol.for, Symbol.keyFor).
-let js_symbol_static_funcs: [JSSymbolFuncEntry] = [
+nonisolated(unsafe) let js_symbol_static_funcs: [JSSymbolFuncEntry] = [
     JSSymbolFuncEntry(name: "for",     length: 1,
                       funcType: .generic(js_symbol_for)),
     JSSymbolFuncEntry(name: "keyFor",  length: 1,
@@ -423,7 +423,7 @@ let js_symbol_static_funcs: [JSSymbolFuncEntry] = [
 /// 2. Create the Symbol constructor function.
 /// 3. Add Symbol.for and Symbol.keyFor as static methods.
 /// 4. Add all well-known symbols as static properties on Symbol.
-func js_init_symbol_builtin(_ ctx: JeffJSContext,
+nonisolated func js_init_symbol_builtin(_ ctx: JeffJSContext,
                             _ globalObj: JeffJSObject) {
     // 1. Create Symbol.prototype.
     let symProto = JeffJSObject()
@@ -523,7 +523,7 @@ func js_init_symbol_builtin(_ ctx: JeffJSContext,
 // MARK: - Symbol GC Support
 
 /// Finalizer for Symbol wrapper objects.
-func js_symbol_finalizer(_ rt: JeffJSRuntime, _ val: JeffJSValue) {
+nonisolated func js_symbol_finalizer(_ rt: JeffJSRuntime, _ val: JeffJSValue) {
     guard let obj = val.toObject(),
           obj.classID == JeffJSClassID.symbol.rawValue else { return }
     if case .objectData(let inner) = obj.payload {
@@ -533,7 +533,7 @@ func js_symbol_finalizer(_ rt: JeffJSRuntime, _ val: JeffJSValue) {
 }
 
 /// GC mark function for Symbol wrapper objects.
-func js_symbol_mark(_ rt: JeffJSRuntime,
+nonisolated func js_symbol_mark(_ rt: JeffJSRuntime,
                     _ val: JeffJSValue,
                     _ markFunc: (JeffJSValue) -> Void) {
     guard let obj = val.toObject(),
@@ -546,7 +546,7 @@ func js_symbol_mark(_ rt: JeffJSRuntime,
 // MARK: - Symbol Class Definition
 
 /// Class definition for JS_CLASS_SYMBOL.
-let js_symbol_class: JeffJSClass = {
+nonisolated(unsafe) let js_symbol_class: JeffJSClass = {
     var c = JeffJSClass()
     c.classNameAtom = 0  // Set to "Symbol" atom at init time
     c.finalizer = js_symbol_finalizer

@@ -13,7 +13,7 @@ import Foundation
 
 /// Holds all data associated with a single token produced by the lexer.
 /// Mirrors the C union `JSToken` in quickjs.c.
-struct JeffJSToken {
+nonisolated struct JeffJSToken {
     /// Token type — either a JSTokenType raw value (>= 128) or an ASCII char code (< 128).
     var type: Int = 0
 
@@ -190,7 +190,7 @@ nonisolated class JeffJSParseState {
 
 /// Minimal context protocol that the tokenizer needs.
 /// The real JeffJSContext will conform to this.
-protocol JeffJSTokenizerContext: AnyObject {
+nonisolated protocol JeffJSTokenizerContext: AnyObject {
     /// Find or create an atom for the given string. Returns 0 on failure.
     func findAtom(_ name: String) -> UInt32
     /// The string behind an atom, or nil if there is none. The parser needs it
@@ -211,7 +211,7 @@ nonisolated class JeffJSFunctionDef {
 
 /// Maps keyword strings to their JSTokenType raw values.
 /// Order must match the QuickJS keyword atom table.
-private let keywordTable: [(String, Int)] = [
+nonisolated(unsafe) private let keywordTable: [(String, Int)] = [
     ("null",        JSTokenType.TOK_NULL.rawValue),
     ("false",       JSTokenType.TOK_FALSE.rawValue),
     ("true",        JSTokenType.TOK_TRUE.rawValue),
@@ -270,13 +270,13 @@ private let keywordTable: [(String, Int)] = [
 
 /// Keyword token -> its source spelling (for keywords used as property
 /// names, e.g. `Array.of`, `promise.then`, `obj.default`).
-func jeffJS_keywordName(forToken tok: Int) -> String? {
+nonisolated func jeffJS_keywordName(forToken tok: Int) -> String? {
     for (name, value) in keywordTable where value == tok { return name }
     return nil
 }
 
 /// Pre-built dictionary for fast keyword lookup.
-private let keywordDict: [String: Int] = {
+nonisolated(unsafe) private let keywordDict: [String: Int] = {
     var d = [String: Int](minimumCapacity: keywordTable.count)
     for (kw, tok) in keywordTable {
         d[kw] = tok
@@ -286,13 +286,13 @@ private let keywordDict: [String: Int] = {
 
 /// Set of strict-mode-only reserved words.
 /// These are keywords only in strict mode; in sloppy mode they are valid identifiers.
-private let strictModeReservedWords: Set<String> = [
+nonisolated(unsafe) private let strictModeReservedWords: Set<String> = [
     "implements", "interface", "let", "package", "private",
     "protected", "public", "static", "yield",
 ]
 
 /// Set of future reserved words (always reserved).
-private let futureReservedWords: Set<String> = [
+nonisolated(unsafe) private let futureReservedWords: Set<String> = [
     "enum",
 ]
 
@@ -300,7 +300,7 @@ private let futureReservedWords: Set<String> = [
 
 /// Returns true if `c` can be the first character of a JavaScript identifier.
 /// Matches QuickJS `lre_js_is_ident_first`.
-func jeffJS_isIdentFirst(_ c: UInt32) -> Bool {
+nonisolated func jeffJS_isIdentFirst(_ c: UInt32) -> Bool {
     if c == 0x24 { return true }  // $
     if c == 0x5F { return true }  // _
     // A-Z
@@ -316,7 +316,7 @@ func jeffJS_isIdentFirst(_ c: UInt32) -> Bool {
 
 /// Returns true if `c` can appear after the first character in an identifier.
 /// Matches QuickJS `lre_js_is_ident_next`.
-func jeffJS_isIdentNext(_ c: UInt32) -> Bool {
+nonisolated func jeffJS_isIdentNext(_ c: UInt32) -> Bool {
     if jeffJS_isIdentFirst(c) { return true }
     // 0-9
     if c >= 0x30 && c <= 0x39 { return true }
@@ -333,7 +333,7 @@ func jeffJS_isIdentNext(_ c: UInt32) -> Bool {
 /// the letter categories plus Nl and Other_ID_Start (℘ U+2118, ℮ U+212E,
 /// ゛ U+309B, ゜ U+309C). It was `Character.isLetter`, so cnn.com's inline
 /// script failed with "Invalid character '℘'".
-private func jeffJS_isUnicodeLetter(_ c: UInt32) -> Bool {
+nonisolated private func jeffJS_isUnicodeLetter(_ c: UInt32) -> Bool {
     guard let scalar = Unicode.Scalar(c) else { return false }
     return scalar.properties.isIDStart
 }
@@ -341,7 +341,7 @@ private func jeffJS_isUnicodeLetter(_ c: UInt32) -> Bool {
 /// IdentifierPartChar beyond ASCII: Unicode `ID_Continue` (adds Mn, Mc, Nd,
 /// Pc and Other_ID_Continue — combining marks were rejected before) plus
 /// ZWNJ / ZWJ.
-private func jeffJS_isUnicodeIdentPart(_ c: UInt32) -> Bool {
+nonisolated private func jeffJS_isUnicodeIdentPart(_ c: UInt32) -> Bool {
     guard let scalar = Unicode.Scalar(c) else { return false }
     return scalar.properties.isIDContinue ||
            c == 0x200C || c == 0x200D  // ZWNJ, ZWJ
@@ -349,7 +349,7 @@ private func jeffJS_isUnicodeIdentPart(_ c: UInt32) -> Bool {
 
 // MARK: - Low-level Buffer Helpers
 
-extension JeffJSParseState {
+nonisolated extension JeffJSParseState {
 
     /// Peek at the current byte without advancing.
     @inline(__always)
@@ -478,7 +478,7 @@ extension JeffJSParseState {
 
 // MARK: - Error Reporting
 
-extension JeffJSParseState {
+nonisolated extension JeffJSParseState {
 
     /// Extract the source line containing the given byte offset.
     /// Returns a source snippet around the error position and the adjusted caret column.
@@ -564,7 +564,7 @@ extension JeffJSParseState {
 }
 
 /// A parse error as the SyntaxError object reports it.
-struct JeffJSSyntaxErrorInfo {
+nonisolated struct JeffJSSyntaxErrorInfo {
     let text: String
     let filename: String
     let line: Int
@@ -573,7 +573,7 @@ struct JeffJSSyntaxErrorInfo {
 
 // MARK: - Line / Column Tracking
 
-extension JeffJSParseState {
+nonisolated extension JeffJSParseState {
 
     /// Compute 1-based line and column numbers for a byte offset.
     /// Scans from the beginning of the buffer each time.
@@ -635,7 +635,7 @@ extension JeffJSParseState {
 
 // MARK: - Skip Whitespace and Comments
 
-extension JeffJSParseState {
+nonisolated extension JeffJSParseState {
 
     /// Skip all whitespace and comments. Sets `gotLF` if a line terminator
     /// was encountered (needed for ASI). Returns false on unterminated block comment.
@@ -810,7 +810,7 @@ extension JeffJSParseState {
 
 // MARK: - Parse Identifier
 
-extension JeffJSParseState {
+nonisolated extension JeffJSParseState {
 
     /// Parse an identifier or keyword starting at `bufPtr`.
     /// The first character has already been validated as an identifier start.
@@ -1183,7 +1183,7 @@ extension JeffJSParseState {
 
 // MARK: - Parse String
 
-extension JeffJSParseState {
+nonisolated extension JeffJSParseState {
 
     /// Parse a string literal (single-quoted or double-quoted).
     /// `sep` is the opening quote character (0x22 for ", 0x27 for ').
@@ -1402,7 +1402,7 @@ extension JeffJSParseState {
 
 // MARK: - Parse Template Literal
 
-extension JeffJSParseState {
+nonisolated extension JeffJSParseState {
 
     /// Parse a template literal part. Called when bufPtr is positioned right after
     /// the opening backtick (`) or the closing `}` of an interpolation.
@@ -1570,7 +1570,7 @@ extension JeffJSParseState {
 
 // MARK: - Parse Regular Expression
 
-extension JeffJSParseState {
+nonisolated extension JeffJSParseState {
 
     /// Parse a regular expression literal. bufPtr is positioned right after
     /// the opening '/'. The token type is set to TOK_REGEXP.
@@ -1675,7 +1675,7 @@ extension JeffJSParseState {
 
 // MARK: - Parse Number
 
-extension JeffJSParseState {
+nonisolated extension JeffJSParseState {
 
     /// Parse a numeric literal. bufPtr is positioned at the first digit (or '.').
     /// Sets token to TOK_NUMBER.
@@ -2082,7 +2082,7 @@ extension JeffJSParseState {
 
 // MARK: - Main Tokenizer: nextToken()
 
-extension JeffJSParseState {
+nonisolated extension JeffJSParseState {
 
     /// The main tokenizer entry point.
     /// Reads the next token from the source buffer, updates `self.token`.
@@ -2528,7 +2528,7 @@ extension JeffJSParseState {
 
 // MARK: - Regex / Division Disambiguation
 
-extension JeffJSParseState {
+nonisolated extension JeffJSParseState {
 
     /// Returns true if '/' should be treated as division (not regex).
     /// Division follows tokens that can end an expression:
@@ -2571,7 +2571,7 @@ extension JeffJSParseState {
 
 // MARK: - Regex Re-tokenization
 
-extension JeffJSParseState {
+nonisolated extension JeffJSParseState {
 
     /// Re-lex the current '/' token as the start of a regular expression.
     /// This is called by the parser when it determines that '/' is a regex,
@@ -2594,7 +2594,7 @@ extension JeffJSParseState {
 
 // MARK: - Simple / Lightweight Lookahead
 
-extension JeffJSParseState {
+nonisolated extension JeffJSParseState {
 
     /// Lightweight lookahead that tokenizes the next token without updating the
     /// parse state. Returns the token type.
@@ -2657,7 +2657,7 @@ extension JeffJSParseState {
 
 // MARK: - Token Expectations
 
-extension JeffJSParseState {
+nonisolated extension JeffJSParseState {
 
     /// Expect the current token to have the given type. If it does not, report
     /// an error and return false. On success, advance to the next token.
@@ -2807,7 +2807,7 @@ extension JeffJSParseState {
 
 // MARK: - JSON Tokenizer
 
-extension JeffJSParseState {
+nonisolated extension JeffJSParseState {
 
     /// Separate JSON tokenizer with ext_json support.
     /// Mirrors `json_next_token` in quickjs.c.
@@ -3214,7 +3214,7 @@ extension JeffJSParseState {
 
 // MARK: - Module Detection
 
-extension JeffJSParseState {
+nonisolated extension JeffJSParseState {
 
     /// Heuristic to detect whether source code is an ES module.
     /// Scans for top-level `import` or `export` statements.
@@ -3248,20 +3248,20 @@ extension JeffJSParseState {
 
 /// Returns true if the token type is an assignment operator.
 /// Mirrors the QuickJS check: tok >= TOK_MUL_ASSIGN && tok <= TOK_DOUBLE_QUESTION_MARK_ASSIGN
-func jeffJS_isAssignmentOp(_ tokType: Int) -> Bool {
+nonisolated func jeffJS_isAssignmentOp(_ tokType: Int) -> Bool {
     return tokType >= JSTokenType.TOK_SHL_ASSIGN.rawValue &&
            tokType <= JSTokenType.TOK_DOUBLE_QUESTION_MARK_ASSIGN.rawValue
 }
 
 /// Returns true if the token is a keyword.
-func jeffJS_isKeyword(_ tokType: Int) -> Bool {
+nonisolated func jeffJS_isKeyword(_ tokType: Int) -> Bool {
     return tokType >= JSTokenType.TOK_NULL.rawValue &&
            tokType <= JSTokenType.TOK_ACCESSOR.rawValue
 }
 
 /// Returns true if the token could start an expression.
 /// Used by the parser for ASI and other decisions.
-func jeffJS_canStartExpr(_ tokType: Int) -> Bool {
+nonisolated func jeffJS_canStartExpr(_ tokType: Int) -> Bool {
     // Identifiers, literals, keywords that start expressions, unary operators
     if tokType == JSTokenType.TOK_IDENT.rawValue ||
        tokType == JSTokenType.TOK_NUMBER.rawValue ||
@@ -3342,7 +3342,7 @@ nonisolated final class JeffJSSimpleTokenizerContext: JeffJSTokenizerContext {
 
 // MARK: - Convenience Initializer
 
-extension JeffJSParseState {
+nonisolated extension JeffJSParseState {
 
     /// Create a parse state for standalone tokenization.
     /// The context is owned by the parse state (strong reference via `ownedCtx`).

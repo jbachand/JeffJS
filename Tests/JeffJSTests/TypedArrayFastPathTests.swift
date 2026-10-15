@@ -6,7 +6,7 @@ import XCTest
 @testable import JeffJS
 
 final class TypedArrayFastPathTests: XCTestCase {
-    @MainActor
+    @JeffJSHostActor
     private func eval(_ js: String, file: StaticString = #filePath, line: UInt = #line) -> String {
         let env = JeffJSEnvironment(configuration: .init(storageScope: "jeffjs.test.typedarrayfast"))
         switch env.eval(js) {
@@ -15,7 +15,7 @@ final class TypedArrayFastPathTests: XCTestCase {
         }
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testConversionsMatchSpec() {
         // Each store converts like ES ToInt8/ToUint8Clamp/ToInt32/... and reads back.
         XCTAssertEqual(eval("var a=new Int8Array(1); a[0]=200; a[0]"), "-56")
@@ -31,7 +31,7 @@ final class TypedArrayFastPathTests: XCTestCase {
     }
 
     /// ToUint8Clamp (ES §7.1.12): round half to even (QuickJS: lrint in js_typed_array_set_value).
-    @MainActor
+    @JeffJSHostActor
     func testUint8ClampedRoundsHalfToEven() {
         for (input, expected) in [("254.5", "254"), ("253.5", "254"), ("0.5", "0"), ("1.5", "2"),
                                   ("-0.5", "0"), ("NaN", "0"), ("300", "255"), ("2.5", "2"), ("254.6", "255")] {
@@ -41,7 +41,7 @@ final class TypedArrayFastPathTests: XCTestCase {
         }
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testBoundsViewsAndDetach() {
         XCTAssertEqual(eval("var a=new Uint8Array(2); a[5]=9; String(a[5])+a.length"), "undefined2")
         XCTAssertEqual(eval("var b=new ArrayBuffer(16); var v=new Int16Array(b,4,3); v[2]=-2; new Uint8Array(b)[8]+','+new Uint8Array(b)[9]"), "254,255")

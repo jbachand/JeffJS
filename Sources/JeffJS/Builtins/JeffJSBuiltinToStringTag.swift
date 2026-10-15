@@ -17,7 +17,7 @@ import Foundation
 
 /// classID -> @@toStringTag string for prototypes reachable through
 /// `ctx.classProto`.
-private let jeffJS_toStringTagByClass: [(JSClassID, String)] = [
+nonisolated(unsafe) private let jeffJS_toStringTagByClass: [(JSClassID, String)] = [
     (.JS_CLASS_MAP,                    "Map"),
     (.JS_CLASS_SET,                    "Set"),
     (.JS_CLASS_WEAKMAP,                "WeakMap"),
@@ -50,7 +50,7 @@ private let jeffJS_toStringTagByClass: [(JSClassID, String)] = [
 ]
 
 /// Namespace/global singletons that carry the tag on the object itself.
-private let jeffJS_toStringTagByGlobal: [(String, String)] = [
+nonisolated(unsafe) private let jeffJS_toStringTagByGlobal: [(String, String)] = [
     ("Math", "Math"),
     ("JSON", "JSON"),
     ("Reflect", "Reflect"),
@@ -59,7 +59,7 @@ private let jeffJS_toStringTagByGlobal: [(String, String)] = [
 
 /// Globals whose `.prototype` carries the tag, for builtins that do not
 /// register a `classProto[]` entry (Intl objects, the Iterator helper base).
-private let jeffJS_toStringTagByCtorProto: [(String, String)] = [
+nonisolated(unsafe) private let jeffJS_toStringTagByCtorProto: [(String, String)] = [
     ("Intl.Collator", "Intl.Collator"),
     ("Intl.DateTimeFormat", "Intl.DateTimeFormat"),
     ("Intl.NumberFormat", "Intl.NumberFormat"),
@@ -70,7 +70,7 @@ private let jeffJS_toStringTagByCtorProto: [(String, String)] = [
     ("Intl.Locale", "Intl.Locale"),
 ]
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
 
     /// Define `obj[Symbol.toStringTag] = tag` with spec attributes
     /// (non-writable, non-enumerable, configurable). No-op when the object
@@ -120,7 +120,7 @@ extension JeffJSContext {
 
 // MARK: - Builtin property attributes
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
 
     /// Clear the `enumerable` bit on every own property of `obj`.
     /// Builtin methods and constructor statics are never enumerable

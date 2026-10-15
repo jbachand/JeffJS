@@ -21,7 +21,7 @@ import Foundation
 /// `mag` is little-endian (mag[0] is the least significant limb) and always
 /// normalised: no trailing zero limbs, and zero is the empty array with
 /// `negative == false` (there is no negative zero).
-struct JBigInt: Hashable, CustomStringConvertible {
+nonisolated struct JBigInt: Hashable, CustomStringConvertible {
 
     var negative: Bool
     var mag: [UInt32]

@@ -9,7 +9,7 @@ import Foundation
 /// `Bundle.module` is synthesized by SwiftPM only. These sources are also
 /// compiled directly into a host app (React Natively builds the engine into
 /// its own module), where the resources ship in the app bundle instead.
-let jeffJSResourceBundle: Bundle = {
+nonisolated(unsafe) let jeffJSResourceBundle: Bundle = {
     #if SWIFT_PACKAGE
     return Bundle.module
     #else
@@ -17,7 +17,7 @@ let jeffJSResourceBundle: Bundle = {
     #endif
 }()
 
-enum JeffJSConfig {
+nonisolated enum JeffJSConfig {
 
     // MARK: - Plist backing store (loaded once at process start)
 

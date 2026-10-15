@@ -8,7 +8,7 @@ import Foundation
 /// spec's "switch the tokenizer to the … state" steps work. A single `step()`
 /// never emits a token *after* a start tag, so the tree builder's state change
 /// always lands before the next byte is read.
-public struct HTMLTokenizer: Sendable {
+nonisolated public struct HTMLTokenizer: Sendable {
 
     /// The subset of tokenizer states the tree builder may switch into.
     public enum ContentState: Sendable {

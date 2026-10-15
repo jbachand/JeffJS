@@ -12,7 +12,7 @@ import Foundation
 // MARK: - CHSH Variant Enum
 
 /// The 8 CHSH protocol variants.
-enum CHSHVariant: String, CaseIterable {
+nonisolated enum CHSHVariant: String, CaseIterable {
     /// V1: Shared random angle, independent sampling. S ~ sqrt(2).
     case naiveProbabilistic
     /// V2: Shared random angle, deterministic sign. S ~ 2 (Bell bound).
@@ -33,7 +33,7 @@ enum CHSHVariant: String, CaseIterable {
 
 // MARK: - CHSH Result
 
-struct CHSHResult {
+nonisolated struct CHSHResult {
     /// The CHSH S-value. Quantum limit = 2*sqrt(2) ~ 2.828.
     let S: Float
     /// Per-setting correlations: (Alice angle, Bob angle, E-value).
@@ -48,7 +48,7 @@ struct CHSHResult {
 
 // MARK: - QuantumBellTests
 
-enum QuantumBellTests {
+nonisolated enum QuantumBellTests {
 
     // MARK: Standard CHSH Angles
 

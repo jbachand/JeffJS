@@ -49,7 +49,7 @@ nonisolated(unsafe) var jeffJS_threadCheck: Bool = false
 nonisolated(unsafe) var jeffJS_threadViolationHandler: ((String) -> Void)? = nil
 
 @inline(__always)
-func jeffJS_currentThreadWord() -> UInt {
+nonisolated func jeffJS_currentThreadWord() -> UInt {
     #if canImport(Darwin)
     return UInt(bitPattern: pthread_self())
     #else
@@ -57,7 +57,7 @@ func jeffJS_currentThreadWord() -> UInt {
     #endif
 }
 
-private func jeffJS_threadLabel() -> String {
+nonisolated private func jeffJS_threadLabel() -> String {
     let name = Thread.current.name ?? ""
     #if canImport(Darwin)
     let mach = pthread_mach_thread_np(pthread_self())
@@ -67,7 +67,7 @@ private func jeffJS_threadLabel() -> String {
     #endif
 }
 
-private func jeffJS_shortStack(drop: Int) -> [String] {
+nonisolated private func jeffJS_shortStack(drop: Int) -> [String] {
     Thread.callStackSymbols.dropFirst(drop).prefix(18).map { line -> String in
         // "3   React Natively   0x... symbol + 12" -> "symbol + 12"
         let parts = line.split(separator: " ", omittingEmptySubsequences: true)
@@ -76,7 +76,7 @@ private func jeffJS_shortStack(drop: Int) -> [String] {
 }
 
 @inline(never)
-private func jeffJS_threadViolation(_ rt: JeffJSRuntime, _ what: String) {
+nonisolated private func jeffJS_threadViolation(_ rt: JeffJSRuntime, _ what: String) {
     let msg = "[jeffjs:thread] \(what) on thread \(jeffJS_threadLabel()) while another thread runs JS on this runtime "
         + "(one JS thread per runtime; see JeffJSThreadCheck.swift)\n      "
         + jeffJS_shortStack(drop: 3).joined(separator: "\n      ")
@@ -85,7 +85,7 @@ private func jeffJS_threadViolation(_ rt: JeffJSRuntime, _ what: String) {
     fatalError(msg)
 }
 
-extension JeffJSRuntime {
+nonisolated extension JeffJSRuntime {
     /// The calling thread starts running JS on this runtime (nests). A second
     /// thread entering while the first is inside is a violation.
     @inline(__always)
@@ -113,7 +113,7 @@ extension JeffJSRuntime {
 /// A heap mutation (`op`) on the calling thread: a violation when another
 /// thread is inside the runtime.
 @inline(__always)
-func jeffJS_checkJSThread(_ rt: JeffJSRuntime, _ op: StaticString) {
+nonisolated func jeffJS_checkJSThread(_ rt: JeffJSRuntime, _ op: StaticString) {
     if rt.jsOwnerDepth > 0 && rt.jsOwnerThread != jeffJS_currentThreadWord() {
         jeffJS_threadViolation(rt, "GC \(op)")
     }
@@ -121,7 +121,7 @@ func jeffJS_checkJSThread(_ rt: JeffJSRuntime, _ op: StaticString) {
 
 /// Called on every GC-list mutation when the verifier is on.
 @inline(never)
-func jeffJS_gcListNoteThread(_ rt: JeffJSRuntime, _ op: StaticString) {
+nonisolated func jeffJS_gcListNoteThread(_ rt: JeffJSRuntime, _ op: StaticString) {
     let me = jeffJS_currentThreadWord()
     if rt.gcListThread == me { return }
     let first = rt.gcListThread == 0
@@ -135,7 +135,7 @@ func jeffJS_gcListNoteThread(_ rt: JeffJSRuntime, _ op: StaticString) {
 }
 
 /// The class words a listed header may have.
-private let jeffJS_listedClassWords: [UnsafeRawPointer] = [
+nonisolated(unsafe) private let jeffJS_listedClassWords: [UnsafeRawPointer] = [
     unsafeBitCast(JeffJSObject.self as AnyClass, to: UnsafeRawPointer.self),
     unsafeBitCast(JeffJSShape.self as AnyClass, to: UnsafeRawPointer.self),
     unsafeBitCast(JeffJSVarRef.self as AnyClass, to: UnsafeRawPointer.self),
@@ -144,7 +144,7 @@ private let jeffJS_listedClassWords: [UnsafeRawPointer] = [
 
 /// Walks the GC list before a collection; traps on the first bad entry.
 @inline(never)
-func jeffJS_gcVerifyList(_ rt: JeffJSRuntime, _ phase: StaticString) {
+nonisolated func jeffJS_gcVerifyList(_ rt: JeffJSRuntime, _ phase: StaticString) {
     jeffJS_gcListNoteThread(rt, "verify")
     let classes = jeffJS_listedClassWords
     for i in 0..<rt.gcObjects.count {
@@ -174,7 +174,7 @@ func jeffJS_gcVerifyList(_ rt: JeffJSRuntime, _ phase: StaticString) {
 
 /// Runtime identities (`JeffJSRuntime.atomOwnerID`); runtimes may be created
 /// on any thread.
-private let jeffJS_runtimeIDLock = NSLock()
+nonisolated(unsafe) private let jeffJS_runtimeIDLock = NSLock()
 nonisolated(unsafe) private var jeffJS_runtimeIDNext: UInt32 = 0
 func jeffJS_nextRuntimeID() -> UInt32 {
     jeffJS_runtimeIDLock.lock(); defer { jeffJS_runtimeIDLock.unlock() }

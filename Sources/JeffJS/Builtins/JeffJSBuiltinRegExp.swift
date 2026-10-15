@@ -22,7 +22,7 @@ import Foundation
 
 /// Extract the pattern string from a RegExp object.
 /// QuickJS stores pattern and compiled bytecode in the `.regexp` payload.
-private func js_regexp_getPattern(_ obj: JeffJSObject) -> JeffJSString? {
+nonisolated private func js_regexp_getPattern(_ obj: JeffJSObject) -> JeffJSString? {
     if case .regexp(let pattern, _) = obj.payload {
         return pattern
     }
@@ -51,7 +51,7 @@ private func js_regexp_getPattern(_ obj: JeffJSObject) -> JeffJSString? {
 /// string is shared (one more count on it); a rope or buffer is copied into a
 /// fresh flat string (the rope's cached `flat` is owned by the rope and has
 /// no JS reference of its own to count against). nil for non-strings.
-private func js_regexp_adoptPattern(_ val: JeffJSValue) -> JeffJSString? {
+nonisolated private func js_regexp_adoptPattern(_ val: JeffJSValue) -> JeffJSString? {
     guard let sb = val.stringBase else { return nil }
     if sb.kind == JeffJSStringBase.kindFlat {
         _ = val.dupValue()
@@ -64,25 +64,25 @@ private func js_regexp_adoptPattern(_ val: JeffJSValue) -> JeffJSString? {
 
 /// A newly created pattern string (refCount 1, never wrapped): wrapping it
 /// once gives it the JS ARC retain its single count stands for.
-private func js_regexp_adoptFreshPattern(_ s: JeffJSString) -> JeffJSString {
+nonisolated private func js_regexp_adoptFreshPattern(_ s: JeffJSString) -> JeffJSString {
     _ = JeffJSValue.makeString(s)
     return s
 }
 
 /// Share another RegExp's pattern: one more count on it.
-private func js_regexp_sharePattern(_ s: JeffJSString) -> JeffJSString {
+nonisolated private func js_regexp_sharePattern(_ s: JeffJSString) -> JeffJSString {
     _ = JeffJSValue.borrowedString(s).dupValue()
     return s
 }
 
 /// Drop the payload's reference on its pattern (the object is dying, or
 /// compile() is replacing the pattern).
-func js_regexp_releasePattern(_ s: JeffJSString?) {
+nonisolated func js_regexp_releasePattern(_ s: JeffJSString?) {
     if let s { JeffJSValue.borrowedString(s).freeValue() }
 }
 
 /// Extract the compiled bytecode from a RegExp object.
-private func js_regexp_getBytecode(_ obj: JeffJSObject) -> JeffJSString? {
+nonisolated private func js_regexp_getBytecode(_ obj: JeffJSObject) -> JeffJSString? {
     if case .regexp(_, let bytecode) = obj.payload {
         return bytecode
     }
@@ -93,7 +93,7 @@ private func js_regexp_getBytecode(_ obj: JeffJSObject) -> JeffJSString? {
 ///
 /// In QuickJS the first byte of the regex bytecode stores the flags.
 /// Layout: `lre_byte_code[0]` = flags (LRE_FLAG_*).
-private func js_regexp_getFlags(_ obj: JeffJSObject) -> Int {
+nonisolated private func js_regexp_getFlags(_ obj: JeffJSObject) -> Int {
     guard case .regexp(_, let bytecode) = obj.payload,
           let bc = bytecode,
           bc.len > 0 else {
@@ -105,7 +105,7 @@ private func js_regexp_getFlags(_ obj: JeffJSObject) -> Int {
 /// Extract the capture group count from the compiled regex bytecode header.
 ///
 /// Header layout: [0..1] flags (UInt16), [2] capture_count, [3..4] bc length.
-private func js_regexp_getCaptureCount(_ obj: JeffJSObject) -> Int {
+nonisolated private func js_regexp_getCaptureCount(_ obj: JeffJSObject) -> Int {
     guard case .regexp(_, let bytecode) = obj.payload,
           let bc = bytecode,
           bc.len > 2 else {
@@ -118,7 +118,7 @@ private func js_regexp_getCaptureCount(_ obj: JeffJSObject) -> Int {
 
 /// The flag characters in the canonical order defined by the spec.
 /// Used by the `flags` getter and `toString`.
-private let js_regexp_flag_chars: [(flag: Int, char: Character)] = [
+nonisolated(unsafe) private let js_regexp_flag_chars: [(flag: Int, char: Character)] = [
     (LRE_FLAG_INDICES,       "d"),
     (LRE_FLAG_GLOBAL,        "g"),
     (LRE_FLAG_IGNORECASE,    "i"),
@@ -135,7 +135,7 @@ private let js_regexp_flag_chars: [(flag: Int, char: Character)] = [
 ///
 /// Returns -1 on error (duplicate or invalid flag).
 /// Mirrors QuickJS `lre_parse_flags`.
-private func js_regexp_parseFlags(_ flagsStr: JeffJSString?) -> Int {
+nonisolated private func js_regexp_parseFlags(_ flagsStr: JeffJSString?) -> Int {
     guard let str = flagsStr else { return 0 }
 
     var flags = 0
@@ -171,7 +171,7 @@ private func js_regexp_parseFlags(_ flagsStr: JeffJSString?) -> Int {
 ///
 /// The flags are emitted in alphabetical order: d, g, i, m, s, u, v, y.
 /// Mirrors QuickJS flag string construction.
-private func js_regexp_buildFlagsString(_ flags: Int) -> JeffJSString {
+nonisolated private func js_regexp_buildFlagsString(_ flags: Int) -> JeffJSString {
     var chars: [UInt8] = []
     for (flag, ch) in js_regexp_flag_chars {
         if flags & flag != 0 {
@@ -198,7 +198,7 @@ private func js_regexp_buildFlagsString(_ flags: Int) -> JeffJSString {
 ///   - If pattern is a RegExp, extract its source and flags.
 ///   - Otherwise, coerce pattern to string.
 ///   - Compile the regex.
-func js_regexp_constructor(
+nonisolated func js_regexp_constructor(
     ctx: JeffJSContext,
     newTarget: JeffJSValue,
     this: JeffJSValue,
@@ -294,7 +294,7 @@ func js_regexp_constructor(
 ///   - [1]...[n]: capture groups
 ///
 /// Returns null if no match.
-func js_regexp_exec(
+nonisolated func js_regexp_exec(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -462,7 +462,7 @@ func js_regexp_exec(
 
 /// `magic` of the intrinsic RegExp.prototype.exec (a `.generic` native never
 /// reads its magic): RegExpExec tells it apart from a page's own `exec`.
-let JEFFJS_REGEXP_EXEC_MAGIC: Int16 = 0x7E5E
+nonisolated(unsafe) let JEFFJS_REGEXP_EXEC_MAGIC: Int16 = 0x7E5E
 
 /// The `exec` RegExpExec must call instead of the builtin one: `R.exec` when
 /// it is callable and not the intrinsic (own or inherited), else nil (the
@@ -471,7 +471,7 @@ let JEFFJS_REGEXP_EXEC_MAGIC: Int16 = 0x7E5E
 /// core-js's fix-regexp-well-known-symbol-logic judged @@match / @@replace /
 /// @@search broken and replaced String.prototype.match / replace / search
 /// with JS wrappers on every page that ships it.
-func js_regexp_userExecFunction(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue? {
+nonisolated func js_regexp_userExecFunction(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue? {
     guard this.isObject else { return nil }
     let ex = ctx.getProperty(obj: this, atom: JeffJSAtomID.JS_ATOM_exec.rawValue)
     if ex.isException { return .exception }
@@ -488,7 +488,7 @@ func js_regexp_userExecFunction(ctx: JeffJSContext, this: JeffJSValue) -> JeffJS
 
 /// RegExpExec with a resolved `exec` (see js_regexp_userExecFunction): calls
 /// it and requires an object or null (step 2.b); nil `userExec` = builtin.
-func js_regexp_execVia(ctx: JeffJSContext, this: JeffJSValue, input: JeffJSValue,
+nonisolated func js_regexp_execVia(ctx: JeffJSContext, this: JeffJSValue, input: JeffJSValue,
                        userExec: JeffJSValue?) -> JeffJSValue {
     guard let fn = userExec else { return js_regexp_exec(ctx: ctx, this: this, argv: [input]) }
     let r = ctx.callFunction(fn, thisVal: this, args: [input])
@@ -502,7 +502,7 @@ func js_regexp_execVia(ctx: JeffJSContext, this: JeffJSValue, input: JeffJSValue
 /// `RegExp.prototype.test(string)` -- shorthand for `exec !== null`.
 ///
 /// Mirrors QuickJS `js_regexp_test`.
-func js_regexp_test(
+nonisolated func js_regexp_test(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -532,7 +532,7 @@ func js_regexp_test(
 /// `RegExp.prototype.toString()` -- returns "/pattern/flags".
 ///
 /// Mirrors QuickJS `js_regexp_toString`.
-func js_regexp_toString(
+nonisolated func js_regexp_toString(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -604,7 +604,7 @@ func js_regexp_toString(
 ///
 /// This is a non-standard method kept for web compatibility (Annex B).
 /// It recompiles the RegExp in-place with a new pattern and/or flags.
-func js_regexp_compile(
+nonisolated func js_regexp_compile(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -674,7 +674,7 @@ func js_regexp_compile(
 /// Generic flag getter.  `magic` encodes which flag bit to test.
 ///
 /// Mirrors QuickJS `js_regexp_get_flag` with magic parameter.
-func js_regexp_get_flag(
+nonisolated func js_regexp_get_flag(
     ctx: JeffJSContext,
     this: JeffJSValue,
     magic: Int
@@ -698,42 +698,42 @@ func js_regexp_get_flag(
 }
 
 /// `get RegExp.prototype.global`
-func js_regexp_get_global(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
+nonisolated func js_regexp_get_global(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
     return js_regexp_get_flag(ctx: ctx, this: this, magic: LRE_FLAG_GLOBAL)
 }
 
 /// `get RegExp.prototype.ignoreCase`
-func js_regexp_get_ignoreCase(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
+nonisolated func js_regexp_get_ignoreCase(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
     return js_regexp_get_flag(ctx: ctx, this: this, magic: LRE_FLAG_IGNORECASE)
 }
 
 /// `get RegExp.prototype.multiline`
-func js_regexp_get_multiline(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
+nonisolated func js_regexp_get_multiline(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
     return js_regexp_get_flag(ctx: ctx, this: this, magic: LRE_FLAG_MULTILINE)
 }
 
 /// `get RegExp.prototype.dotAll`
-func js_regexp_get_dotAll(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
+nonisolated func js_regexp_get_dotAll(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
     return js_regexp_get_flag(ctx: ctx, this: this, magic: LRE_FLAG_DOTALL)
 }
 
 /// `get RegExp.prototype.unicode`
-func js_regexp_get_unicode(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
+nonisolated func js_regexp_get_unicode(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
     return js_regexp_get_flag(ctx: ctx, this: this, magic: LRE_FLAG_UNICODE)
 }
 
 /// `get RegExp.prototype.unicodeSets`
-func js_regexp_get_unicodeSets(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
+nonisolated func js_regexp_get_unicodeSets(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
     return js_regexp_get_flag(ctx: ctx, this: this, magic: LRE_FLAG_UNICODE_SETS)
 }
 
 /// `get RegExp.prototype.sticky`
-func js_regexp_get_sticky(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
+nonisolated func js_regexp_get_sticky(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
     return js_regexp_get_flag(ctx: ctx, this: this, magic: LRE_FLAG_STICKY)
 }
 
 /// `get RegExp.prototype.hasIndices`
-func js_regexp_get_hasIndices(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
+nonisolated func js_regexp_get_hasIndices(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSValue {
     return js_regexp_get_flag(ctx: ctx, this: this, magic: LRE_FLAG_INDICES)
 }
 
@@ -741,7 +741,7 @@ func js_regexp_get_hasIndices(ctx: JeffJSContext, this: JeffJSValue) -> JeffJSVa
 ///
 /// Returns the pattern with appropriate escaping.
 /// Mirrors QuickJS `js_regexp_get_source`.
-func js_regexp_get_source(
+nonisolated func js_regexp_get_source(
     ctx: JeffJSContext,
     this: JeffJSValue
 ) -> JeffJSValue {
@@ -767,7 +767,7 @@ func js_regexp_get_source(
 /// becomes "\/", and line terminators become "\n", "\r", "\u2028",
 /// "\u2029" — so `new RegExp("a/b").source` is "a\/b" and `/a\/b/.source`
 /// stays "a\/b" (it was "a/b", and toString escaped the escape: "/a\\/b/").
-func js_regexp_escapedSource(_ pattern: JeffJSString) -> JeffJSString {
+nonisolated func js_regexp_escapedSource(_ pattern: JeffJSString) -> JeffJSString {
     if pattern.len == 0 { return JeffJSString(swiftString: "(?:)") }
     var out: [UInt16] = []
     out.reserveCapacity(pattern.len + 4)
@@ -809,7 +809,7 @@ func js_regexp_escapedSource(_ pattern: JeffJSString) -> JeffJSString {
 ///
 /// Returns a string containing the flag characters in canonical order.
 /// Mirrors QuickJS `js_regexp_get_flags`.
-func js_regexp_get_flags(
+nonisolated func js_regexp_get_flags(
     ctx: JeffJSContext,
     this: JeffJSValue
 ) -> JeffJSValue {
@@ -864,7 +864,7 @@ func js_regexp_get_flags(
 ///
 /// Non-global: equivalent to exec(string).
 /// Global: loop exec() collecting all matches, reset lastIndex to 0.
-func js_regexp_Symbol_match(
+nonisolated func js_regexp_Symbol_match(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -982,7 +982,7 @@ func js_regexp_Symbol_match(
 ///
 /// Returns .exception as a sentinel if the fast path cannot be used (bytecode
 /// extraction fails), signaling the caller to fall back to the slow path.
-private func js_regexp_globalMatchFast(
+nonisolated private func js_regexp_globalMatchFast(
     ctx: JeffJSContext,
     obj: JeffJSObject,
     inputStr: JeffJSString,
@@ -1099,7 +1099,7 @@ private func js_regexp_globalMatchFast(
 /// `RegExp.prototype[@@matchAll](string)` -- returns a RegExp String Iterator.
 ///
 /// Mirrors QuickJS `js_regexp_Symbol_matchAll`.
-func js_regexp_Symbol_matchAll(
+nonisolated func js_regexp_Symbol_matchAll(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -1169,7 +1169,7 @@ func js_regexp_Symbol_matchAll(
 ///
 /// If replaceValue is a function, it is called for each match.
 /// If replaceValue is a string, it is interpolated with $-substitutions.
-func js_regexp_Symbol_replace(
+nonisolated func js_regexp_Symbol_replace(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -1351,7 +1351,7 @@ func js_regexp_Symbol_replace(
 /// Mirrors QuickJS `js_regexp_Symbol_search`.
 ///
 /// Saves and restores lastIndex.  Returns the index of the first match, or -1.
-func js_regexp_Symbol_search(
+nonisolated func js_regexp_Symbol_search(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -1408,7 +1408,7 @@ func js_regexp_Symbol_search(
 /// `RegExp.prototype[@@split](string, limit)`
 ///
 /// Mirrors QuickJS `js_regexp_Symbol_split`.
-func js_regexp_Symbol_split(
+nonisolated func js_regexp_Symbol_split(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -1578,7 +1578,7 @@ func js_regexp_Symbol_split(
 /// RegExp.prototype[@@split] steps 4-25 (ES §22.2.6.14) for a receiver that is
 /// not a plain RegExp: SpeciesConstructor, `flags` read through Get, a sticky
 /// splitter built with Construct, and RegExpExec at each position.
-private func js_regexp_split_generic(ctx: JeffJSContext, rx: JeffJSValue, input: JeffJSValue,
+nonisolated private func js_regexp_split_generic(ctx: JeffJSContext, rx: JeffJSValue, input: JeffJSValue,
                                      inputStr: JeffJSString, limit: UInt32) -> JeffJSValue {
     // C = SpeciesConstructor(rx, %RegExp%)
     var ctor = ctx.regexpCtor.dupValue()
@@ -1668,7 +1668,7 @@ private func js_regexp_split_generic(ctx: JeffJSContext, rx: JeffJSValue, input:
 }
 
 /// `get RegExp[@@species]` -- returns the constructor.
-func js_regexp_get_species(
+nonisolated func js_regexp_get_species(
     ctx: JeffJSContext,
     this: JeffJSValue
 ) -> JeffJSValue {
@@ -1719,7 +1719,7 @@ nonisolated final class JSRegExpStringIteratorData {
 /// `%RegExpStringIteratorPrototype%.next()`
 ///
 /// Mirrors QuickJS `js_regexp_string_iterator_next`.
-func js_regexp_string_iterator_next(
+nonisolated func js_regexp_string_iterator_next(
     ctx: JeffJSContext,
     this: JeffJSValue,
     argv: [JeffJSValue]
@@ -1780,7 +1780,7 @@ func js_regexp_string_iterator_next(
 /// methods.
 ///
 /// Mirrors QuickJS `js_is_standard_regexp`.
-func js_isStandardRegexp(_ obj: JeffJSObject) -> Bool {
+nonisolated func js_isStandardRegexp(_ obj: JeffJSObject) -> Bool {
     // A standard regexp has classID == regexp AND no overridden exec/flags.
     if obj.classID != JSClassID.JS_CLASS_REGEXP.rawValue {
         return false
@@ -1807,7 +1807,7 @@ func js_isStandardRegexp(_ obj: JeffJSObject) -> Bool {
 /// and wraps the result in a JeffJSString for storage in the RegExp payload.
 ///
 /// Mirrors QuickJS `lre_compile`.
-private func js_regexp_compile(
+nonisolated private func js_regexp_compile(
     ctx: JeffJSContext,
     pattern: JeffJSString?,
     flags: Int
@@ -1852,7 +1852,7 @@ private func js_regexp_compile(
 /// Whether slot 0 of a RegExp is its own `lastIndex` data property (every RegExp
 /// instance gets it first, non-configurable, so it stays there), and writable.
 @inline(__always)
-private func js_regexp_lastIndexSlot(_ obj: JeffJSObject, writable: Bool) -> Bool {
+nonisolated private func js_regexp_lastIndexSlot(_ obj: JeffJSObject, writable: Bool) -> Bool {
     guard obj.propValues.count > 0, let sh = obj.shape, !sh.prop.isEmpty,
           sh.prop[0].atom == JeffJSAtomID.JS_ATOM_lastIndex.rawValue,
           !sh.prop[0].flags.isGetSet, obj.extra(at: 0) == nil else { return false }
@@ -1864,7 +1864,7 @@ private func js_regexp_lastIndexSlot(_ obj: JeffJSObject, writable: Bool) -> Boo
 ///
 /// The fast path reads slot 0 (QuickJS keeps lastIndex as the first property); a value
 /// that is not a number goes through ToNumber — `re.lastIndex = "1"` was read as 0.
-private func js_regexp_getLastIndex(_ ctx: JeffJSContext, _ obj: JeffJSObject) -> Int? {
+nonisolated private func js_regexp_getLastIndex(_ ctx: JeffJSContext, _ obj: JeffJSObject) -> Int? {
     if js_regexp_lastIndexSlot(obj, writable: false) {
         let v = obj.propValues[0]
         // `Int(d)` trapped on `re.lastIndex = Infinity` / 1e20.
@@ -1888,7 +1888,7 @@ private func js_regexp_getLastIndex(_ ctx: JeffJSContext, _ obj: JeffJSObject) -
 /// checking that the property was writable, and appended a slot with no shape entry
 /// when the object had none.
 @discardableResult
-private func js_regexp_setLastIndex(_ ctx: JeffJSContext, _ obj: JeffJSObject, value: Int) -> Bool {
+nonisolated private func js_regexp_setLastIndex(_ ctx: JeffJSContext, _ obj: JeffJSObject, value: Int) -> Bool {
     // `Int32(value)` trapped past 2^31 (a lastIndex advanced from 2^53).
     let v = value >= Int(Int32.min) && value <= Int(Int32.max)
         ? JeffJSValue.newInt32(Int32(value)) : JeffJSValue.newFloat64(Double(value))
@@ -1905,7 +1905,7 @@ private func js_regexp_setLastIndex(_ ctx: JeffJSContext, _ obj: JeffJSObject, v
 /// when the `unicode` flag is set.
 ///
 /// Mirrors QuickJS `js_regexp_advance_string_index`.
-private func js_regexp_advanceIndex(
+nonisolated private func js_regexp_advanceIndex(
     _ str: JeffJSString,
     index: Int,
     unicode: Bool
@@ -1943,7 +1943,7 @@ private func js_regexp_advanceIndex(
 /// `makeString(s.retain())` wraps took an ARC retain that nothing released.
 /// Internal exec calls pass `value` (never a borrowed flat string, which has
 /// no JS owner of its own once its rope is gone).
-private func js_regexp_coerceInput(
+nonisolated private func js_regexp_coerceInput(
     ctx: JeffJSContext,
     val: JeffJSValue
 ) -> (value: JeffJSValue, str: JeffJSString)? {
@@ -1958,7 +1958,7 @@ private func js_regexp_coerceInput(
 }
 
 /// Capture group result from the regex engine.
-struct JSRegExpCapture {
+nonisolated struct JSRegExpCapture {
     var start: Int
     var end: Int
 }
@@ -1972,9 +1972,9 @@ struct JSRegExpCapture {
 ///
 /// Mirrors QuickJS `lre_exec`.
 /// `JEFFJS_REGEX_WATCH=1` (diagnostic, see `js_regexp_execInternal`).
-let jeffJSRegexWatch = ProcessInfo.processInfo.environment["JEFFJS_REGEX_WATCH"] == "1"
+nonisolated(unsafe) let jeffJSRegexWatch = ProcessInfo.processInfo.environment["JEFFJS_REGEX_WATCH"] == "1"
 
-func jeffJSRegexWatchReport(_ ctx: JeffJSContext, _ obj: JeffJSObject, flags: Int, inputLength: Int, tried: Int, ms: Double, done: Bool, input: [UInt32] = []) {
+nonisolated func jeffJSRegexWatchReport(_ ctx: JeffJSContext, _ obj: JeffJSObject, flags: Int, inputLength: Int, tried: Int, ms: Double, done: Bool, input: [UInt32] = []) {
     var source = "?"
     if case .regexp(let pattern, _) = obj.payload, let p = pattern { source = p.toSwiftString() }
     if source.count > 300 { source = String(source.prefix(300)) + "…" }
@@ -1987,7 +1987,7 @@ func jeffJSRegexWatchReport(_ ctx: JeffJSContext, _ obj: JeffJSObject, flags: In
     print(line, terminator: "")
 }
 
-private func js_regexp_execInternal(
+nonisolated private func js_regexp_execInternal(
     ctx: JeffJSContext,
     obj: JeffJSObject,
     inputStr: JeffJSString,
@@ -2114,7 +2114,7 @@ private func js_regexp_execInternal(
 /// unmatched captures.
 ///
 /// Mirrors QuickJS `js_regexp_build_indices`.
-private func js_regexp_buildIndicesArray(
+nonisolated private func js_regexp_buildIndicesArray(
     ctx: JeffJSContext,
     captures: [JSRegExpCapture]
 ) -> JeffJSObject {
@@ -2161,7 +2161,7 @@ private func js_regexp_buildIndicesArray(
 ///   - `$<name>` -> named capture group
 ///
 /// Mirrors QuickJS `js_get_substitution`.
-private func js_getSubstitution(
+nonisolated private func js_getSubstitution(
     ctx: JeffJSContext,
     matched: JeffJSString?,
     input: JeffJSString,
@@ -2284,7 +2284,7 @@ private func js_getSubstitution(
 /// Create an iterator result object { value: val, done: isDone }.
 ///
 /// Mirrors QuickJS `js_create_iterator_result`.
-private func js_createIteratorResult(
+nonisolated private func js_createIteratorResult(
     ctx: JeffJSContext,
     value: JeffJSValue,
     done: Bool
@@ -2311,7 +2311,7 @@ private func js_createIteratorResult(
 
 /// Function list for `RegExp.prototype`.
 /// Mirrors QuickJS `js_regexp_proto_funcs`.
-let js_regexp_proto_funcs: [(name: String, func_: JSCFunctionType, length: Int)] = [
+nonisolated(unsafe) let js_regexp_proto_funcs: [(name: String, func_: JSCFunctionType, length: Int)] = [
     ("exec", .generic({ ctx, this, argv in
         js_regexp_exec(ctx: ctx, this: this, argv: argv)
     }), 1),
@@ -2328,7 +2328,7 @@ let js_regexp_proto_funcs: [(name: String, func_: JSCFunctionType, length: Int)]
 
 /// Getter list for `RegExp.prototype`.
 /// Mirrors QuickJS `js_regexp_proto_getters`.
-let js_regexp_proto_getters: [(name: String, getter: JSCFunctionType)] = [
+nonisolated(unsafe) let js_regexp_proto_getters: [(name: String, getter: JSCFunctionType)] = [
     ("global",      .getter({ ctx, this in js_regexp_get_global(ctx: ctx, this: this) })),
     ("ignoreCase",  .getter({ ctx, this in js_regexp_get_ignoreCase(ctx: ctx, this: this) })),
     ("multiline",   .getter({ ctx, this in js_regexp_get_multiline(ctx: ctx, this: this) })),
@@ -2346,7 +2346,7 @@ let js_regexp_proto_getters: [(name: String, getter: JSCFunctionType)] = [
 /// Register the RegExp class and install the constructor and prototype.
 ///
 /// Mirrors QuickJS `JS_AddIntrinsicRegExp`.
-func js_addIntrinsicRegExp(rt: JeffJSRuntime) {
+nonisolated func js_addIntrinsicRegExp(rt: JeffJSRuntime) {
     // Register JS_CLASS_REGEXP.
     let regexpClassIdx = Int(JSClassID.JS_CLASS_REGEXP.rawValue)
     while rt.classArray.count <= regexpClassIdx {
@@ -2376,7 +2376,7 @@ func js_addIntrinsicRegExp(rt: JeffJSRuntime) {
 ///   3. Set RegExp[@@species].
 ///   4. Install RegExp on the global object.
 ///   5. Create %RegExpStringIteratorPrototype% with next().
-func js_initRegExp(ctx: JeffJSContext) {
+nonisolated func js_initRegExp(ctx: JeffJSContext) {
     // The plumbing for JS_NewCFunction2 / JS_SetConstructor /
     // JS_DefinePropertyValueStr does not yet exist in JeffJS, so we
     // record the intent here and the setup will be completed when the
@@ -2386,7 +2386,7 @@ func js_initRegExp(ctx: JeffJSContext) {
 
 // MARK: - %RegExpStringIteratorPrototype%
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
     /// The RegExp String Iterator prototype, created on first use and cached in
     /// `classProto[JS_CLASS_REGEXP_STRING_ITERATOR]`. It inherits
     /// %IteratorPrototype% (for the `map`/`filter`/... helpers) and carries

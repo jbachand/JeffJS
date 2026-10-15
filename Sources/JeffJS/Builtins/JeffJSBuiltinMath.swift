@@ -14,7 +14,7 @@ import Foundation
 /// Math methods take Numbers only: ToNumber(BigInt) is a TypeError, and the
 /// per-argument conversion cannot report it (it returns a Double), so the
 /// check lives at the call boundary.
-private func defineMathFunc(ctx: JeffJSContext, obj: JeffJSObject,
+nonisolated private func defineMathFunc(ctx: JeffJSContext, obj: JeffJSObject,
                             name: String, length: Int,
                             func cfunc: @escaping (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue) {
     jeffJS_defineBuiltinFunc(ctx: ctx, obj: obj, name: name, length: length) { c, t, argv in
@@ -25,7 +25,7 @@ private func defineMathFunc(ctx: JeffJSContext, obj: JeffJSObject,
     }
 }
 
-func jeffJS_initMath(ctx: JeffJSContext, globalObj: JeffJSObject) {
+nonisolated func jeffJS_initMath(ctx: JeffJSContext, globalObj: JeffJSObject) {
     let mathObj = jeffJS_createObject(ctx: ctx, proto: nil, classID: UInt16(JeffJSClassID.object.rawValue))
     mathObj.extensible = true
 
@@ -147,7 +147,7 @@ func jeffJS_initMath(ctx: JeffJSContext, globalObj: JeffJSObject) {
 
 /// Convert argument at `index` to a Double, returning NaN if not provided
 /// or not convertible. Mirrors `JS_ToFloat64` in QuickJS.
-private func toFloat64Arg(_ ctx: JeffJSContext, _ argv: [JeffJSValue], _ index: Int) -> Double {
+nonisolated private func toFloat64Arg(_ ctx: JeffJSContext, _ argv: [JeffJSValue], _ index: Int) -> Double {
     guard index < argv.count else { return Double.nan }
     let v = argv[index]
     if v.isBigInt {
@@ -181,7 +181,7 @@ private func toFloat64Arg(_ ctx: JeffJSContext, _ argv: [JeffJSValue], _ index: 
 }
 
 /// Convert argument to Int32 (ToInt32 abstract op).
-private func toInt32Arg(_ ctx: JeffJSContext, _ argv: [JeffJSValue], _ index: Int) -> Int32 {
+nonisolated private func toInt32Arg(_ ctx: JeffJSContext, _ argv: [JeffJSValue], _ index: Int) -> Int32 {
     let d = toFloat64Arg(ctx, argv, index)
     if d.isNaN || d.isInfinite || d == 0 { return 0 }
     // ECMA-262 sec 7.1.6 — modulo 2^32, then treat as signed
@@ -194,68 +194,68 @@ private func toInt32Arg(_ ctx: JeffJSContext, _ argv: [JeffJSValue], _ index: In
 // MARK: - Math Methods
 
 /// Math.abs(x)
-private func jsMath_abs(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_abs(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Swift.abs(x))
 }
 
 /// Math.acos(x)
-private func jsMath_acos(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_acos(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.acos(x))
 }
 
 /// Math.acosh(x)
-private func jsMath_acosh(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_acosh(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.acosh(x))
 }
 
 /// Math.asin(x)
-private func jsMath_asin(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_asin(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.asin(x))
 }
 
 /// Math.asinh(x)
-private func jsMath_asinh(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_asinh(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.asinh(x))
 }
 
 /// Math.atan(x)
-private func jsMath_atan(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_atan(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.atan(x))
 }
 
 /// Math.atanh(x)
-private func jsMath_atanh(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_atanh(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.atanh(x))
 }
 
 /// Math.atan2(y, x)
-private func jsMath_atan2(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_atan2(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let y = toFloat64Arg(ctx, argv, 0)
     let x = toFloat64Arg(ctx, argv, 1)
     return .newFloat64(Darwin.atan2(y, x))
 }
 
 /// Math.cbrt(x)
-private func jsMath_cbrt(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_cbrt(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.cbrt(x))
 }
 
 /// Math.ceil(x)
-private func jsMath_ceil(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_ceil(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.ceil(x))
 }
 
 /// Math.clz32(x) -- Count Leading Zeros of the 32-bit integer representation.
-private func jsMath_clz32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_clz32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let n = toInt32Arg(ctx, argv, 0)
     let u = UInt32(bitPattern: n)
     let result = u == 0 ? 32 : u.leadingZeroBitCount
@@ -263,37 +263,37 @@ private func jsMath_clz32(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: 
 }
 
 /// Math.cos(x)
-private func jsMath_cos(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_cos(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.cos(x))
 }
 
 /// Math.cosh(x)
-private func jsMath_cosh(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_cosh(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.cosh(x))
 }
 
 /// Math.exp(x)
-private func jsMath_exp(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_exp(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.exp(x))
 }
 
 /// Math.expm1(x) -- e^x - 1, more precise for small x.
-private func jsMath_expm1(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_expm1(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.expm1(x))
 }
 
 /// Math.floor(x)
-private func jsMath_floor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_floor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.floor(x))
 }
 
 /// Math.fround(x) -- Round to nearest float32.
-private func jsMath_fround(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_fround(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     let f32 = Float(x)
     return .newFloat64(Double(f32))
@@ -301,7 +301,7 @@ private func jsMath_fround(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
 
 /// Math.f16round(x) -- Round to nearest float16 (IEEE 754 binary16).
 /// Implemented via manual conversion since Swift Float16 availability varies.
-private func jsMath_f16round(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_f16round(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     if x.isNaN { return .newFloat64(Double.nan) }
     if x.isInfinite { return .newFloat64(x) }
@@ -364,7 +364,7 @@ private func jsMath_f16round(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ arg
 }
 
 /// Math.hypot(...values)
-private func jsMath_hypot(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_hypot(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     if argv.isEmpty { return .newFloat64(0.0) }
 
     // Check for Infinity first (spec requires it returns +Infinity even if NaN present)
@@ -398,7 +398,7 @@ private func jsMath_hypot(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: 
 }
 
 /// Math.imul(a, b) -- 32-bit integer multiply.
-private func jsMath_imul(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_imul(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let a = toInt32Arg(ctx, argv, 0)
     let b = toInt32Arg(ctx, argv, 1)
     let result = a &* b
@@ -406,31 +406,31 @@ private func jsMath_imul(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [
 }
 
 /// Math.log(x)
-private func jsMath_log(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_log(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.log(x))
 }
 
 /// Math.log1p(x) -- log(1+x), more precise for small x.
-private func jsMath_log1p(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_log1p(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.log1p(x))
 }
 
 /// Math.log10(x)
-private func jsMath_log10(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_log10(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.log10(x))
 }
 
 /// Math.log2(x)
-private func jsMath_log2(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_log2(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.log2(x))
 }
 
 /// Math.max(...values)
-private func jsMath_max(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_max(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     if argv.isEmpty { return .newFloat64(-Double.infinity) }
 
     var result = -Double.infinity
@@ -452,7 +452,7 @@ private func jsMath_max(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [J
 }
 
 /// Math.min(...values)
-private func jsMath_min(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_min(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     if argv.isEmpty { return .newFloat64(Double.infinity) }
 
     var result = Double.infinity
@@ -472,14 +472,14 @@ private func jsMath_min(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [J
 }
 
 /// Math.pow(base, exponent)
-private func jsMath_pow(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_pow(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let base = toFloat64Arg(ctx, argv, 0)
     let exponent = toFloat64Arg(ctx, argv, 1)
     return .newFloat64(Darwin.pow(base, exponent))
 }
 
 /// Math.random() -- Returns a pseudo-random number in [0, 1).
-private func jsMath_random(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_random(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     // Use a xoshiro128** PRNG for reproducibility and speed,
     // seeded from system entropy on first call.
     let value = jeffJS_mathRandomNext()
@@ -487,7 +487,7 @@ private func jsMath_random(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv:
 }
 
 /// Math.round(x) -- Round to nearest integer, with ties going to +Infinity.
-private func jsMath_round(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_round(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     if x.isNaN || x.isInfinite || x == 0 { return .newFloat64(x) }
     // ECMA-262: Math.round(x) = floor(x + 0.5), except for the range (-0.5, 0)
@@ -503,7 +503,7 @@ private func jsMath_round(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: 
 }
 
 /// Math.sign(x)
-private func jsMath_sign(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_sign(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     if x.isNaN { return .newFloat64(Double.nan) }
     if x == 0 { return .newFloat64(x) } // preserve sign of zero
@@ -511,37 +511,37 @@ private func jsMath_sign(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [
 }
 
 /// Math.sin(x)
-private func jsMath_sin(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_sin(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.sin(x))
 }
 
 /// Math.sinh(x)
-private func jsMath_sinh(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_sinh(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.sinh(x))
 }
 
 /// Math.sqrt(x)
-private func jsMath_sqrt(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_sqrt(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.sqrt(x))
 }
 
 /// Math.tan(x)
-private func jsMath_tan(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_tan(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.tan(x))
 }
 
 /// Math.tanh(x)
-private func jsMath_tanh(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_tanh(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.tanh(x))
 }
 
 /// Math.trunc(x) -- Remove fractional digits.
-private func jsMath_trunc(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_trunc(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     let x = toFloat64Arg(ctx, argv, 0)
     return .newFloat64(Darwin.trunc(x))
 }
@@ -549,7 +549,7 @@ private func jsMath_trunc(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: 
 /// Math.sumPrecise(iterable) -- Sums numbers from an iterable with exact precision.
 /// Uses Neumaier compensated summation (an improvement on Kahan summation).
 /// Spec: TC39 proposal Math.sumPrecise.
-private func jsMath_sumPrecise(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
+nonisolated private func jsMath_sumPrecise(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ argv: [JeffJSValue]) -> JeffJSValue {
     guard argv.count >= 1, argv[0].isObject else {
         return ctx.throwTypeError("Math.sumPrecise requires an iterable")
     }
@@ -611,7 +611,7 @@ private func jsMath_sumPrecise(_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ a
 
 /// Internal PRNG state for Math.random(), seeded lazily from system entropy.
 /// Uses xoshiro256** algorithm for high-quality randomness.
-private var prngState: (UInt64, UInt64, UInt64, UInt64) = {
+nonisolated(unsafe) private var prngState: (UInt64, UInt64, UInt64, UInt64) = {
     var s0: UInt64 = 0
     var s1: UInt64 = 0
     var s2: UInt64 = 0
@@ -631,12 +631,12 @@ private var prngState: (UInt64, UInt64, UInt64, UInt64) = {
 
 /// Rotate left helper for xoshiro.
 @inline(__always)
-private func rotl(_ x: UInt64, _ k: Int) -> UInt64 {
+nonisolated private func rotl(_ x: UInt64, _ k: Int) -> UInt64 {
     return (x << k) | (x >> (64 - k))
 }
 
 /// Generate the next random Double in [0, 1) using xoshiro256**.
-private func jeffJS_mathRandomNext() -> Double {
+nonisolated private func jeffJS_mathRandomNext() -> Double {
     let result = rotl(prngState.1 &* 5, 7) &* 9
     let t = prngState.1 << 17
 
@@ -655,7 +655,7 @@ private func jeffJS_mathRandomNext() -> Double {
 // MARK: - Property Definition Helpers
 
 /// Define a double-valued non-writable, non-enumerable, non-configurable property.
-private func jeffJS_definePropertyValueDouble(ctx: JeffJSContext, obj: JeffJSObject,
+nonisolated private func jeffJS_definePropertyValueDouble(ctx: JeffJSContext, obj: JeffJSObject,
                                               atom: UInt32, value: Double) {
     // not writable, not enumerable, not configurable
     ctx.defineOrReplaceOwnProperty(.borrowedObject(obj), atom: atom, value: .newFloat64(value),
@@ -663,7 +663,7 @@ private func jeffJS_definePropertyValueDouble(ctx: JeffJSContext, obj: JeffJSObj
 }
 
 /// Define a string-valued non-writable, non-enumerable, configurable property.
-private func jeffJS_definePropertyValueStr(ctx: JeffJSContext, obj: JeffJSObject,
+nonisolated private func jeffJS_definePropertyValueStr(ctx: JeffJSContext, obj: JeffJSObject,
                                            atom: UInt32, value: String) {
     ctx.defineOrReplaceOwnPropertyFree(.borrowedObject(obj), atom: atom,
                                        value: .makeString(JeffJSString(swiftString: value)),
@@ -673,7 +673,7 @@ private func jeffJS_definePropertyValueStr(ctx: JeffJSContext, obj: JeffJSObject
 /// Define a built-in native function property on an object.
 /// Creates a C function object and installs it as a named property using
 /// the atom-based shape system so that property lookup works correctly.
-func jeffJS_defineBuiltinFunc(ctx: JeffJSContext, obj: JeffJSObject,
+nonisolated func jeffJS_defineBuiltinFunc(ctx: JeffJSContext, obj: JeffJSObject,
                                       name: String, length: Int,
                                       func cfunc: @escaping (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue) {
     // Create the function value through the context's proper API.
@@ -702,7 +702,7 @@ func jeffJS_defineBuiltinFunc(ctx: JeffJSContext, obj: JeffJSObject,
 /// old code never changed a named property that already existed either — it
 /// only clobbered the last slot. Replacing them installed jeffJS_initDate's
 /// `Date`, which has no `getYear` (apple.com's ac-analytics threw).
-func jeffJS_setPropertyStr(ctx: JeffJSContext, obj: JeffJSObject,
+nonisolated func jeffJS_setPropertyStr(ctx: JeffJSContext, obj: JeffJSObject,
                            name: String, value: JeffJSValue) {
     let atom = ctx.rt.findAtom(name)
     if jeffJS_findOwnPropertyIndex(obj: obj, atom: atom) >= 0 {
@@ -719,7 +719,7 @@ func jeffJS_setPropertyStr(ctx: JeffJSContext, obj: JeffJSObject,
 
 // MARK: - Double.eulersNumber (convenience)
 
-private extension Double {
+nonisolated private extension Double {
     /// Euler's number e, matching Math.E exactly.
     static let eulersNumber: Double = 2.718281828459045
 }

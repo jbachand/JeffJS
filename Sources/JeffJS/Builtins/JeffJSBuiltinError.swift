@@ -15,7 +15,7 @@ import Foundation
 
 /// Implements the Error built-in and all native error subtypes for JeffJS.
 /// Mirrors QuickJS `js_error_class` and `js_error_constructor` from quickjs.c.
-struct JeffJSBuiltinError {
+nonisolated struct JeffJSBuiltinError {
 
     // MARK: - Native Error Type Descriptors
 

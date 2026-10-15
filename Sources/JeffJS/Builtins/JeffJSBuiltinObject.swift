@@ -12,13 +12,13 @@ import Foundation
 /// The integer-indexed exotic object classes: every `%TypedArray%` view.
 /// `DataView` is deliberately not one of them — it has no indexed elements.
 @inline(__always)
-func jeffJS_isTypedArrayClass<T: BinaryInteger>(_ classID: T) -> Bool {
+nonisolated func jeffJS_isTypedArrayClass<T: BinaryInteger>(_ classID: T) -> Bool {
     let id = Int(classID)
     return id >= Int(JeffJSClassID.uint8cArray.rawValue) &&
         id <= Int(JeffJSClassID.float64Array.rawValue)
 }
 
-extension JeffJSContext {
+nonisolated extension JeffJSContext {
     /// Object.prototype convenience accessor.
     var objectPrototype: JeffJSValue {
         if JSClassID.JS_CLASS_OBJECT.rawValue < classProto.count {
@@ -897,11 +897,11 @@ extension JeffJSContext {
 
 // MARK: - Max array length constant (2^32 - 1)
 
-private let JS_MAX_ARRAY_LENGTH: UInt32 = 0xFFFF_FFFE
+nonisolated(unsafe) private let JS_MAX_ARRAY_LENGTH: UInt32 = 0xFFFF_FFFE
 
 // MARK: - JeffJSBuiltinObject
 
-struct JeffJSBuiltinObject {
+nonisolated struct JeffJSBuiltinObject {
 
     // MARK: - Intrinsic registration
 
@@ -2014,7 +2014,7 @@ struct JeffJSBuiltinObject {
 // MARK: - Integrity level enum
 
 /// Integrity levels for freeze/seal operations.
-enum JeffJSIntegrityLevel {
+nonisolated enum JeffJSIntegrityLevel {
     case sealed
     case frozen
 }
@@ -2025,7 +2025,7 @@ enum JeffJSIntegrityLevel {
 /// They mirror the internal helper functions in QuickJS that are called by the
 /// Object methods. The actual JeffJSContext class will provide implementations;
 /// these are declared as protocol extensions to define the interface.
-protocol JeffJSContextObjectOps {
+nonisolated protocol JeffJSContextObjectOps {
     // Object creation
     var objectPrototype: JeffJSValue { get }
     func newPlainObject() -> JeffJSValue

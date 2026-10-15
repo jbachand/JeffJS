@@ -23,7 +23,7 @@
 import Foundation
 
 /// An immutable block of bytes with an owner that keeps it valid.
-public protocol JeffJSMappedBytes: AnyObject {
+nonisolated public protocol JeffJSMappedBytes: AnyObject {
     /// First byte (valid for `count` bytes while the object lives).
     var baseAddress: UnsafeRawPointer { get }
     var count: Int { get }

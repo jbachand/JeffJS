@@ -14,13 +14,13 @@ import Foundation
 // =============================================================================
 
 /// Variable scope descriptor used during parsing to track lexical scope chains.
-struct JeffJSVarScope {
+nonisolated struct JeffJSVarScope {
     var parent: Int = -1             // index of parent scope (-1 = none)
     var first: Int = -1              // first variable index in this scope
 }
 
 /// Block environment tracking for break/continue label targets.
-struct JeffJSBlockEnv {
+nonisolated struct JeffJSBlockEnv {
     var breakLabel: Int = -1         // label for break
     var continueLabel: Int = -1      // label for continue
     var labelName: JSAtom = 0        // named label (0 = anonymous)
@@ -34,7 +34,7 @@ struct JeffJSBlockEnv {
 }
 
 /// LValue kind for assignments and update expressions.
-enum LValueKind: Int {
+nonisolated enum LValueKind: Int {
     case none = 0
     case `var` = 1                   // simple variable
     case field = 2                   // object.property
@@ -46,7 +46,7 @@ enum LValueKind: Int {
 }
 
 /// Tracks the state of an LValue on the stack for compound assignments.
-struct LValueInfo {
+nonisolated struct LValueInfo {
     var kind: LValueKind = .none
     var scopeLevel: Int = 0
     var atom: JSAtom = 0
@@ -54,7 +54,7 @@ struct LValueInfo {
 }
 
 /// Assignment operator kind for compound assignments.
-enum AssignOpKind: Int {
+nonisolated enum AssignOpKind: Int {
     case plain = 0                   // =
     case add = 1                     // +=
     case sub = 2                     // -=
@@ -74,13 +74,13 @@ enum AssignOpKind: Int {
 }
 
 /// Destructuring target kind.
-enum DestructuringKind: Int {
+nonisolated enum DestructuringKind: Int {
     case binding = 0                 // let/const/var binding
     case assignment = 1              // assignment target
 }
 
 /// Property definition kind for object/class members.
-enum PropertyKind: Int {
+nonisolated enum PropertyKind: Int {
     case data = 0
     case getter = 1
     case setter = 2
@@ -94,7 +94,7 @@ enum PropertyKind: Int {
 }
 
 /// Saved tokenizer state for replaying a default parameter expression.
-struct JeffJSSavedDefaultParam {
+nonisolated struct JeffJSSavedDefaultParam {
     let argIndex: Int          // index in the childFd.args array
     let paramName: JSAtom      // atom for the parameter name
     let bufPtr: Int            // saved tokenizer bufPtr (just past '=')
@@ -115,7 +115,7 @@ struct JeffJSSavedDefaultParam {
 }
 
 /// Info about a rest parameter.
-struct JeffJSRestParamInfo {
+nonisolated struct JeffJSRestParamInfo {
     let argIndex: Int      // position in parameter list (0-based)
     let paramName: JSAtom  // atom for the rest parameter name
 }
@@ -124,7 +124,7 @@ struct JeffJSRestParamInfo {
 /// During parseFormalParameters, when we encounter `{x, y}` or `[a, b]` in
 /// parameter position, we save the tokenizer position so that parseFunctionBody
 /// can emit `get_arg(argIndex)` followed by the destructuring binding code.
-struct JeffJSSavedDestructParam {
+nonisolated struct JeffJSSavedDestructParam {
     let argIndex: Int          // index in the childFd.args array
     let bufPtr: Int            // saved tokenizer bufPtr (at the '{' or '[')
     let lineNum: Int

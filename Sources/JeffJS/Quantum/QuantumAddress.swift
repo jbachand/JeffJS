@@ -4,7 +4,7 @@
 import Foundation
 
 /// A 25-bit address in the quantum field: (vx, vy, t, offset, seed).
-struct QuantumAddress: Equatable, Hashable, CustomStringConvertible {
+nonisolated struct QuantumAddress: Equatable, Hashable, CustomStringConvertible {
     let vx:      UInt32   // 5 bits
     let vy:      UInt32   // 5 bits
     let t:       UInt32   // 5 bits
@@ -44,7 +44,7 @@ struct QuantumAddress: Equatable, Hashable, CustomStringConvertible {
 
 // MARK: - Bit Utilities
 
-enum QuantumBits {
+nonisolated enum QuantumBits {
 
     /// Count of set bits in a 25-bit value.
     @inline(__always)

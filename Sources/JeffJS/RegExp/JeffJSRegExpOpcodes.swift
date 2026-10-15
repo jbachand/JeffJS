@@ -10,7 +10,7 @@ import Foundation
 
 /// All regex bytecode opcodes from libregexp-opcode.h.
 /// Raw values are the single-byte opcode IDs emitted in compiled bytecode.
-enum JeffJSRegExpOpcode: UInt8 {
+nonisolated enum JeffJSRegExpOpcode: UInt8 {
     case invalid              = 0
     case char_                = 1   // match one 16-bit char (2-byte payload)
     case char32               = 2   // match one 32-bit char (4-byte payload)
@@ -49,7 +49,7 @@ enum JeffJSRegExpOpcode: UInt8 {
 /// Returns the total size in bytes of an instruction, including the opcode byte.
 /// Variable-length opcodes (range, range32, simpleGreedyQuant) return only their
 /// fixed-header size here; the caller must add the variable part.
-func lreOpcodeSize(_ op: JeffJSRegExpOpcode) -> Int {
+nonisolated func lreOpcodeSize(_ op: JeffJSRegExpOpcode) -> Int {
     switch op {
     case .invalid:                return 1
     case .char_:                  return 3      // 1 opcode + 2 char
@@ -87,7 +87,7 @@ func lreOpcodeSize(_ op: JeffJSRegExpOpcode) -> Int {
 // MARK: - Opcode names (for debug dumps)
 
 /// Human-readable name for each opcode.
-func lreOpcodeName(_ op: JeffJSRegExpOpcode) -> String {
+nonisolated func lreOpcodeName(_ op: JeffJSRegExpOpcode) -> String {
     switch op {
     case .invalid:                return "invalid"
     case .char_:                  return "char"

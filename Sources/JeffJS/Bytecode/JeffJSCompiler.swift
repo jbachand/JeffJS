@@ -15,7 +15,7 @@ import Foundation
 
 /// Scope variable definition used during compilation.
 /// Mirrors `JSVarDef` in QuickJS.
-struct JeffJSVarDef {
+nonisolated struct JeffJSVarDef {
     var varName: JSAtom = 0
     var scopeLevel: Int = 0
     var scopeNext: Int = -1          // next var in same scope (-1 = end)
@@ -35,7 +35,7 @@ struct JeffJSVarDef {
 
 /// Closure variable reference stored in a compiled function.
 /// Mirrors `JSClosureVar` in QuickJS.
-struct JeffJSClosureVar {
+nonisolated struct JeffJSClosureVar {
     // 16 bytes (was 24): kind and index are stored narrow behind Int accessors.
     var varName: JSAtom = 0
     var isLocal: Bool = false        // true => captured from parent's locals
@@ -69,7 +69,7 @@ struct JeffJSClosureVar {
 /// records one list per call site; the eval code, compiled at run time with
 /// no parent function definition, resolves its free names against it and
 /// binds the ones it uses as ordinary closure variables of the caller's frame.
-struct JeffJSEvalItem {
+nonisolated struct JeffJSEvalItem {
     var name: JSAtom = 0
     /// true: `idx` is a local (or, with `isArg`, an argument) slot of the
     /// calling function; false: `idx` is one of the caller's closure vars.
@@ -104,7 +104,7 @@ nonisolated final class JeffJSEvalSite {
 
 /// Label slot used during bytecode compilation.
 /// Mirrors `LabelSlot` in QuickJS.
-struct JeffJSLabelSlot {
+nonisolated struct JeffJSLabelSlot {
     var refCount: Int = 0            // number of references to this label
     var pos: Int = -1                // bytecode position (-1 if unresolved)
     var pos2: Int = -1               // secondary pos for peephole
@@ -113,7 +113,7 @@ struct JeffJSLabelSlot {
 }
 
 /// Label relocation entry.
-struct JeffJSRelocEntry {
+nonisolated struct JeffJSRelocEntry {
     var kind: RelocKind
     var pos: Int                     // offset in bytecode buffer where the reloc sits
     var next: Int                    // next reloc in linked list (-1 = end)
@@ -126,7 +126,7 @@ struct JeffJSRelocEntry {
 }
 
 /// Scope definition used during parsing/compilation.
-struct JeffJSScopeDef {
+nonisolated struct JeffJSScopeDef {
     var parent: Int = -1             // parent scope index (-1 = none)
     var first: Int = -1              // first variable in scope
     /// True for the single scope that wraps a `switch` body. Case jumps can
@@ -138,7 +138,7 @@ struct JeffJSScopeDef {
 }
 
 /// Bytecode variable definition in the final function bytecode.
-struct JeffJSBytecodeVarDef {
+nonisolated struct JeffJSBytecodeVarDef {
     var varName: JSAtom = 0
     var scopeNext: Int = -1
     var isConst: Bool = false
@@ -160,13 +160,13 @@ struct JeffJSBytecodeVarDef {
 /// The generic `Optional ==` was an out-of-line call per comparison (the
 /// peephole chain in resolveLabels runs dozens per instruction).
 @inline(__always)
-func == (lhs: JeffJSOpcode?, rhs: JeffJSOpcode) -> Bool {
+nonisolated func == (lhs: JeffJSOpcode?, rhs: JeffJSOpcode) -> Bool {
     guard let l = lhs else { return false }
     return l.rawValue == rhs.rawValue
 }
 
 @inline(__always)
-func != (lhs: JeffJSOpcode?, rhs: JeffJSOpcode) -> Bool {
+nonisolated func != (lhs: JeffJSOpcode?, rhs: JeffJSOpcode) -> Bool {
     guard let l = lhs else { return true }
     return l.rawValue != rhs.rawValue
 }
@@ -740,7 +740,7 @@ nonisolated class JeffJSFunctionBytecodeCompiled: JeffJSFunctionBytecode {
 // MARK: - JeffJSCompiler
 // =============================================================================
 
-struct JeffJSCompiler {
+nonisolated struct JeffJSCompiler {
 
     // =========================================================================
     // MARK: 1. Variable Resolution Pass (resolve_variables)
@@ -5296,7 +5296,7 @@ struct JeffJSCompiler {
 // SyntaxError.
 
 /// Counters for the host's perf summary.
-struct JeffJSLazyStats {
+nonisolated struct JeffJSLazyStats {
     var stubs = 0
     var stubSourceBytes = 0
     var compiled = 0
@@ -5326,7 +5326,7 @@ struct JeffJSLazyStats {
     }
 }
 
-extension JeffJSFunctionBytecodeCompiled {
+nonisolated extension JeffJSFunctionBytecodeCompiled {
     /// Take over the body compiled for this lazy stub from `c` (a fresh
     /// compile of the same function), so everything that already references
     /// this object runs it. The closure variables are the stub's own (the
@@ -5388,7 +5388,7 @@ extension JeffJSFunctionBytecodeCompiled {
     }
 }
 
-extension JeffJSCompiler {
+nonisolated extension JeffJSCompiler {
 
     enum LazyDecision {
         case stub(JeffJSFunctionBytecodeCompiled)
@@ -5979,7 +5979,7 @@ extension JeffJSCompiler {
 
 // MARK: - Idle reclaim of lazily compiled bodies
 
-extension JeffJSFunctionBytecodeCompiled {
+nonisolated extension JeffJSFunctionBytecodeCompiled {
     /// Give back the compiled body of this lazy function: it becomes a stub
     /// again (closure variables and seed kept) and compiles on its next call.
     /// Returns the bytecode bytes released.

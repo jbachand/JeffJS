@@ -33,7 +33,7 @@ import Synchronization
 //   `scriptNonBlocking`) is touched by the mutating thread only.
 
 /// A node in the parsed HTML document tree.
-public final class DOMNode: @unchecked Sendable, Identifiable {
+nonisolated public final class DOMNode: @unchecked Sendable, Identifiable {
     public let id = UUID()
     public let nodeType: NodeType
 
@@ -887,7 +887,7 @@ public final class DOMNode: @unchecked Sendable, Identifiable {
 ///
 /// Everything is nil/empty by default, so `:hover`/`:focus`/`:target` simply
 /// never match until the host opts in.
-public final class DOMInteractionState: @unchecked Sendable {
+nonisolated public final class DOMInteractionState: @unchecked Sendable {
     public static let shared = DOMInteractionState()
 
     private let lock = NSLock()

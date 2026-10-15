@@ -14,7 +14,7 @@ import Foundation
 /// Essential polyfills for the JeffJS environment.
 /// Static properties contain JavaScript source strings that are evaluated
 /// during environment initialization.
-public enum JeffJSPolyfills {
+nonisolated public enum JeffJSPolyfills {
 
     // MARK: - String Escaping
 
