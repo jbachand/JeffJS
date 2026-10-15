@@ -43,4 +43,38 @@ extension JeffJSTestRunner {
     mutating func testGlobalVarCache() {
         runTrueCases("GlobalVarCache", JeffJSTestRunner.globalVarCacheCases)
     }
+
+    /// Script-level let/const are global lexical bindings that shadow the
+    /// global object's properties; they only arise from separate scripts in the
+    /// same context (the way pages load several scripts). Each step is a
+    /// separate global-code eval on one context; the loops warm a get_var site
+    /// before the lexical declaration appears.
+    mutating func testGlobalLexicalCache() {
+        let (_, ctx) = makeCtx()
+        func run(_ label: String, _ js: String) -> String {
+            JeffJSStackDiag.currentLabel = "GlobalVarCache lexical: \(label)"
+            let r = ctx.eval(input: js, filename: "<GlobalLexical>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+            let out = r.isException ? "EXC" : (ctx.toSwiftString(r) ?? "?")
+            if r.isException { ctx.rt.currentException.freeValue(); ctx.rt.currentException = .null } else { r.freeValue() }
+            return out
+        }
+        func check(_ label: String, _ js: String, _ want: String) {
+            let got = run(label, js)
+            assert(got == want, "GlobalVarCache lexical: \(label) -> \(got), want \(want)")
+        }
+        let rd = { (n: String) in "function rd_\(n)(){ var s = 0; for (var i = 0; i < 400; i++) s += \(n); return s; }" }
+
+        // A script-level let/const that arrives in a LATER script does not shadow
+        // earlier scripts' global reads: this engine has no global lexical
+        // environment shared between scripts (script-level let/const are locals
+        // of their own script). Known gap, independent of the get_var cache
+        // (the cache is keyed on the global object only); not asserted here.
+
+        // const / let read through a warmed site inside the declaring script.
+        check("const warm", "const gc1 = 3; \(rd("gc1")) rd_gc1() + rd_gc1()", "2400")
+        // TDZ in the declaring script: a hoisted function reading the binding before its initialisation throws.
+        check("tdz same script", "globalThis.gt1 = 7; function rd_gt1(){ var s = 0; for (var i = 0; i < 400; i++) s += gt1; return s; } var r = 'none'; try { rd_gt1(); } catch (x) { r = x.name; } let gt1 = 2; r + ',' + rd_gt1() + ',' + globalThis.gt1", "ReferenceError,800,7")
+        // The property read through a warmed site is unaffected by an unrelated lexical of another name.
+        check("globalThis property warm", "globalThis.gl2 = 1; \(rd("gl2")) let gl9 = 2; rd_gl2() + gl9", "402")
+    }
 }
