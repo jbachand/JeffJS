@@ -1454,7 +1454,7 @@ nonisolated final class JeffJSBytecodeCache {
     //   dropped them: a cache hit lost "(evaluating '…')" and the `global code`
     //   frame name); program completion values in a hidden local, class
     //   constructors start with check_ctor, NamedEvaluation for classes.
-    static let compilerVersion: UInt64 = 17  // 2026-09-29: spans + top-level flag restored
+    static let compilerVersion: UInt64 = 18  // 2026-10-15: script-level let/const/class are global lexical bindings (get_var/put_var_init, check_define_var prefix)
 
     /// FNV-1a over the engine's bytecode-relevant sources: `Parser/*.swift`,
     /// `Bytecode/JeffJSCompiler.swift`, `Bytecode/JeffJSOpcodes.swift` and
@@ -1463,7 +1463,7 @@ nonisolated final class JeffJSBytecodeCache {
     /// blobs written by another one, even when nobody bumped
     /// `compilerVersion`. `BytecodeCacheBudgetTests.testEngineSourceHashIsCurrent`
     /// fails when it is stale; `Scripts/update_bytecode_identity.sh` rewrites it.
-    static let engineSourceHash: UInt64 = 0x1ce1a90fa1a4b411 // bytecode-identity
+    static let engineSourceHash: UInt64 = 0x04642175ed7a1ff7 // bytecode-identity
 
     /// The engine build identity: `compilerVersion`, the blob and entry
     /// layouts, `engineSourceHash`, and the opcode table the interpreter

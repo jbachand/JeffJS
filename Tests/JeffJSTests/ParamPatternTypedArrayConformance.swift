@@ -123,6 +123,7 @@ extension JeffJSTestRunner {
         let (_, ctx) = makeCtx()
         for (name, js) in cases {
             JeffJSStackDiag.currentLabel = "\(group): \(name)"
+            ctx.resetGlobalLexicalBindings()   // each case is its own page
             let result = ctx.eval(input: js, filename: "<\(group)>", evalFlags: JS_EVAL_TYPE_GLOBAL)
             if result.isException {
                 let exc = ctx.getException()

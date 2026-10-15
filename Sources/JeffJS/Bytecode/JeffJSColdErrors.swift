@@ -14,6 +14,7 @@ enum JeffJSColdError {
     case m10
     case m11
     case m12
+    case constAssign
 }
 
 @inline(never) @discardableResult
@@ -31,6 +32,7 @@ func jeffJS_coldThrow(_ ctx: JeffJSContext, _ e: JeffJSColdError) -> JeffJSValue
     case .m9: return ctx.throwReferenceError(message: "Must call super constructor before using 'this'")
     case .m10: return ctx.throwTypeError(message: "Cannot use 'in' operator to search for property in non-object")
     case .m11: return ctx.throwReferenceError(message: "must call super constructor before using 'this'")
+    case .constAssign: return ctx.throwTypeError(message: "Attempted to assign to readonly property.")
     case .m12: return ctx.throwReferenceError(message: "must call super constructor before returning from derived constructor")
     }
 }

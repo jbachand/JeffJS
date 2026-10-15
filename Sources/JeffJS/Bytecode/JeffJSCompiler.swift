@@ -25,6 +25,12 @@ struct JeffJSVarDef {
     var varKind: Int = JSVarKindEnum.JS_VAR_NORMAL.rawValue
     var funcPoolIdx: Int = -1        // for function declarations
     var isExported: Bool = false
+    /// A script-level `let`/`const`/`class` binding: it lives in the context's
+    /// global lexical record (QuickJS `global_var_obj`), not in a local slot.
+    /// The var def stays for the parser's redeclaration checks only; every
+    /// lookup that resolves names to locals/closure vars skips it, so
+    /// references compile to get_var/put_var (lexical record first).
+    var isGlobalLex: Bool = false
 }
 
 /// Closure variable reference stored in a compiled function.
@@ -786,7 +792,7 @@ struct JeffJSCompiler {
         for entryScope in [0, fd.paramScope] where entryScope >= 0 && entryScope < fd.scopes.count {
             var s0VarIdx = fd.scopes[entryScope].first
             while s0VarIdx >= 0 && s0VarIdx < fd.vars.count {
-                if fd.vars[s0VarIdx].isLexical {
+                if fd.vars[s0VarIdx].isLexical && !fd.vars[s0VarIdx].isGlobalLex {
                     scope0TdzBytes.append(UInt8(truncatingIfNeeded: JeffJSOpcode.set_loc_uninitialized.rawValue))
                     scope0TdzBytes.append(UInt8(s0VarIdx & 0xFF))
                     scope0TdzBytes.append(UInt8((s0VarIdx >> 8) & 0xFF))
@@ -1070,7 +1076,7 @@ struct JeffJSCompiler {
                 if esScopeIdx >= 0 && esScopeIdx < fd.scopes.count {
                     var esVarIdx = fd.scopes[esScopeIdx].first
                     while esVarIdx >= 0 && esVarIdx < fd.vars.count {
-                        if fd.vars[esVarIdx].isLexical {
+                        if fd.vars[esVarIdx].isLexical && !fd.vars[esVarIdx].isGlobalLex {
                             // set_loc_uninitialized(varIdx): opcode(1) + u16(2) = 3 bytes
                             tdzBytes.append(UInt8(truncatingIfNeeded: JeffJSOpcode.set_loc_uninitialized.rawValue))
                             tdzBytes.append(UInt8(esVarIdx & 0xFF))
@@ -1472,7 +1478,7 @@ struct JeffJSCompiler {
             // environment encloses the parameters and both var objects.
             guard i >= 0, i < p.vars.count, i != p.varObjIdx, i != p.argVarObjIdx,
                   i != p.funcNameVarIdx,
-                  p.vars[i].varName != 0, added.insert(i).inserted else { return }
+                  p.vars[i].varName != 0, !p.vars[i].isGlobalLex, added.insert(i).inserted else { return }
             let isWith = p.vars[i].isLexical && ctx.atomToSwiftString(p.vars[i].varName).hasPrefix("*with*")
             out.append((false, i, region, isWith))
         }
@@ -1991,7 +1997,7 @@ struct JeffJSCompiler {
             if scope == 0 { reachedVarScope = true }
             var varIdx = fd.scopes[scope].first
             while varIdx >= 0 && varIdx < fd.vars.count {
-                if fd.vars[varIdx].varName == name {
+                if fd.vars[varIdx].varName == name && !fd.vars[varIdx].isGlobalLex {
                     return (varIdx, fd.vars[varIdx])
                 }
                 varIdx = fd.vars[varIdx].scopeNext
@@ -2050,7 +2056,7 @@ struct JeffJSCompiler {
             var steps = 0
             while varIdx >= 0 && varIdx < vars.count && steps <= vars.count {
                 let key = UInt64(scope) << 32 | UInt64(vars[varIdx].varName)
-                if byScope[key] == nil { byScope[key] = Int32(varIdx) }
+                if byScope[key] == nil && !vars[varIdx].isGlobalLex { byScope[key] = Int32(varIdx) }
                 varIdx = vars[varIdx].scopeNext
                 steps += 1
             }
