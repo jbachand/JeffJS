@@ -602,8 +602,21 @@ nonisolated final class JeffJSRuntime {
         if vsEnabled, claim <= vsLimitPtr - top {
             vsTopPtr = top + claim
             let clearCount = min(initializedPrefix ?? claim, claim)
-            var i = 0
-            while i < clearCount { top[i] = .undefined; i &+= 1 }
+            // Small prefixes (the common call) as straight-line stores: the
+            // loop form compiles to a _platform_memset_pattern16 call.
+            let u = JeffJSValue.undefined
+            switch clearCount {
+            case 0: break
+            case 1: top[0] = u
+            case 2: top[0] = u; top[1] = u
+            case 3: top[0] = u; top[1] = u; top[2] = u
+            case 4: top[0] = u; top[1] = u; top[2] = u; top[3] = u
+            case 5: top[0] = u; top[1] = u; top[2] = u; top[3] = u; top[4] = u
+            case 6: top[0] = u; top[1] = u; top[2] = u; top[3] = u; top[4] = u; top[5] = u
+            default:
+                var i = 0
+                while i < clearCount { top[i] = u; i &+= 1 }
+            }
             return (top, claim)
         }
         return acquireInterpBufSlow(size: size, claim: claim, initializedPrefix: initializedPrefix)

@@ -300,6 +300,8 @@ struct JeffJSTestRunner {
             ("AssignmentPatterns", { $0.testAssignmentPatterns() }),
             ("IteratorClose", { $0.testIteratorClose() }),
             ("ArrayFromIterator", { $0.testArrayFromIterator() }),
+            ("GlobalVarCache", { $0.testGlobalVarCache() }),
+            ("GlobalLexicalCache", { $0.testGlobalLexicalCache() }),
             ("FreedValueTouches", { $0.testFreedValueTouches() }),
             ("NflConstructor", { $0.testNflConstructor() }),
             ("UnicodeIdentifiers", { $0.testUnicodeIdentifiers() }),
