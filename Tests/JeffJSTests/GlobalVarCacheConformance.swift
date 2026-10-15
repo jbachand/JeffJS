@@ -128,6 +128,12 @@ extension JeffJSTestRunner {
         check("with const is a TypeError", "var e; try { with ({}) { sc3 = 1; } } catch (x) { e = x.name; } e + ',' + sc3", "TypeError,2")
         check("with calls a lexical function", "var r; with ({}) { r = lf1(); } r", "lf10")
         check("with tdz", "var e1, e2; try { with ({}) { tdzW = 1; } } catch (x) { e1 = x.name; } try { with ({}) { tdzW; } } catch (x) { e2 = x.name; } let tdzW = 0; e1 + ',' + e2", "ReferenceError,ReferenceError")
+        // Lexical-slot inline caches (get_var / put_var sites warmed on a script-level binding).
+        check("lexical ic define", "let li1 = 1; const li2 = 5; function rdLi(){ var s = 0; for (var i = 0; i < 400; i++) s += li1 + li2; return s; } function wrLi(v){ for (var i = 0; i < 400; i++) li1 = v + i; } function wrLc(){ for (var i = 0; i < 400; i++) li2 = i; } rdLi()", "2400")
+        check("lexical ic read sees other-script writes", "li1 = 2; String(rdLi())", "2800")
+        check("lexical ic warmed put", "wrLi(10); String(li1) + ',' + rdLi()", "409,165600")
+        check("lexical ic const put still throws", "var e; try { wrLc(); } catch (x) { e = x.name; } e + ',' + li2", "TypeError,5")
+        check("lexical ic bindings added later keep slots valid", "let li3 = 1; let li4 = 2; String(rdLi()) + ',' + li3 + li4", "165600,12")
         // Eval code keeps its own lexical scope.
         check("indirect eval let is local", "(0, eval)('let ev1 = 1; ev1') + ',' + typeof ev1", "1,undefined")
         check("direct eval let is local", "eval('let ev2 = 2; ev2') + ',' + typeof ev2", "2,undefined")

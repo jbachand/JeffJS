@@ -140,6 +140,35 @@ func jeffJS_arithGeneric(_ ctx: JeffJSContext, _ ar: UInt8, _ lhs: JeffJSValue, 
     return jeffJS_arithNumeric(ar, a, b)
 }
 
+/// Marker in an inline-cache entry's `atom` field: the site's cached slot is in the
+/// global lexical record (entry.shapePtr = the record's shape), not on the global
+/// object (whose entries carry `ctx.globalLexEpoch` there).
+let jeffJSLexicalICTag: UInt32 = 0xFFFF_FFFF
+
+/// Read a script-level let/const/class binding through a lexical IC entry: nil on
+/// a shape mismatch (a binding was added) or while the slot is in its TDZ.
+@inline(__always)
+func jeffJS_lexicalICGet(_ ctx: JeffJSContext, _ entry: JeffJSICEntry) -> JeffJSValue? {
+    guard let lo = ctx.globalVarObj.obj, lo.shapeIdentity == entry.shapePtr,
+          entry.propOffset >= 0, entry.propOffset < lo.propCount else { return nil }
+    let v = lo.dataValue(at: entry.propOffset)
+    if v.isUninitialized { return nil }
+    return v.dupValue()
+}
+
+/// Store through a lexical IC entry (writable bindings only; a const's entry has
+/// `writable` false). true: `val` moved into the slot; false: nothing changed.
+@inline(__always)
+func jeffJS_lexicalICPut(_ ctx: JeffJSContext, _ entry: JeffJSICEntry, _ val: JeffJSValue) -> Bool {
+    guard entry.writable, let lo = ctx.globalVarObj.obj, lo.shapeIdentity == entry.shapePtr,
+          entry.propOffset >= 0, entry.propOffset < lo.propCount else { return false }
+    let old = lo.dataValue(at: entry.propOffset)
+    if old.isUninitialized { return false }
+    lo.asClass.propValues[entry.propOffset] = val
+    old.freeValue()
+    return true
+}
+
 /// Guarded pop for the main dispatch loop (the fallback interpreter): a
 /// bytecode sequence that pops more than it pushed returns undefined and is
 /// reported once instead of reading below the value buffer. File-scope so it
@@ -4835,6 +4864,11 @@ private func executeFastTrace(
                 resume = pc; break traceLoop // deopt: no IC table yet
             }
             let entry = ents[jeffJS_icSlot(ents, pc)]
+            if entry.pc == pc, entry.atom == jeffJSLexicalICTag, let lv = jeffJS_lexicalICGet(ctx, entry) {
+                buf[sp] = lv; sp += 1
+                pc += 5
+                continue traceLoop
+            }
             if entry.pc == pc,
                entry.shapePtr == gShapeId, entry.atom == ctx.globalLexEpoch,
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
@@ -4850,6 +4884,11 @@ private func executeFastTrace(
                 resume = pc; break traceLoop // deopt
             }
             let entry = ents[jeffJS_icSlot(ents, pc)]
+            if entry.pc == pc, entry.atom == jeffJSLexicalICTag, sp >= 1, jeffJS_lexicalICPut(ctx, entry, buf[sp - 1]) {
+                sp -= 1
+                pc += 5
+                continue traceLoop
+            }
             if entry.pc == pc,
                entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()), entry.atom == ctx.globalLexEpoch,
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
@@ -6169,6 +6208,11 @@ private func executeFastTraceLean(
                 ctx.interruptCounter = interrupt; return pc // deopt: no IC table yet
             }
             let entry = ents[jeffJS_icSlot(ents, pc)]
+            if entry.pc == pc, entry.atom == jeffJSLexicalICTag, let lv = jeffJS_lexicalICGet(ctx, entry) {
+                buf[sp] = lv; sp += 1
+                pc += 5
+                continue traceLoop
+            }
             if entry.pc == pc,
                entry.shapePtr == gShapeId, entry.atom == ctx.globalLexEpoch,
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
@@ -6184,6 +6228,11 @@ private func executeFastTraceLean(
                 ctx.interruptCounter = interrupt; return pc // deopt
             }
             let entry = ents[jeffJS_icSlot(ents, pc)]
+            if entry.pc == pc, entry.atom == jeffJSLexicalICTag, sp >= 1, jeffJS_lexicalICPut(ctx, entry, buf[sp - 1]) {
+                sp -= 1
+                pc += 5
+                continue traceLoop
+            }
             if entry.pc == pc,
                entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()), entry.atom == ctx.globalLexEpoch,
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
@@ -9978,6 +10027,11 @@ struct JeffJSInterpreter {
                 // hash lookup per read into a direct slot load.
                 if let gObj = ctx.globalObj.obj, let gShape = gObj.shape, let ic = fb.ic {
                     let entry = ic.lookup(pc)
+                    if entry.pc == pc, entry.atom == jeffJSLexicalICTag, let lv = jeffJS_lexicalICGet(ctx, entry) {
+                        buf[sp] = lv; sp += 1
+                        pc += 5
+                        continue dispatchLoop
+                    }
                     if entry.pc == pc,
                        entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()), entry.atom == ctx.globalLexEpoch,
                        entry.propOffset >= 0, entry.propOffset < gObj.propCount,
@@ -9995,7 +10049,13 @@ struct JeffJSInterpreter {
                 }
                 buf[sp] = val; sp += 1
                 // Cache plain data slots for the next read
-                if ctx.globalLexIndex(atom) < 0, let gObj = ctx.globalObj.obj, let gShape = gObj.shape {
+                let lexIdx = ctx.globalLexIndex(atom)
+                if lexIdx >= 0 {
+                    // A script-level let/const/class binding: cache its slot in the lexical record.
+                    if let lo = ctx.globalVarObj.obj, let lsh = lo.shape {
+                        fb.getIC().update(pc, shape: lsh, propOffset: lexIdx, atom: jeffJSLexicalICTag)
+                    }
+                } else if let gObj = ctx.globalObj.obj, let gShape = gObj.shape {
                     if let idx = findShapeProperty(gShape, atom), idx < gObj.propCount,
                        gShape.prop[idx].flags.isPlainData,
                        gShape.prop[idx].flags.contains(.writable) {
@@ -10010,6 +10070,10 @@ struct JeffJSInterpreter {
                 // Global-var inline cache: shape-matched writable data slot
                 if let gObj = ctx.globalObj.obj, let gShape = gObj.shape, let ic = fb.ic {
                     let entry = ic.lookup(pc)
+                    if entry.pc == pc, entry.atom == jeffJSLexicalICTag, jeffJS_lexicalICPut(ctx, entry, val) {
+                        pc += 5
+                        continue dispatchLoop
+                    }
                     if entry.pc == pc,
                        entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()), entry.atom == ctx.globalLexEpoch,
                        entry.propOffset >= 0, entry.propOffset < gObj.propCount,
@@ -10029,7 +10093,13 @@ struct JeffJSInterpreter {
                 if ctx.globalLexCount > 0 {
                     let lr = ctx.putGlobalLexical(atom: atom, val: val, isInit: false)
                     if lr < 0 { retVal = .exception; break dispatchLoop }
-                    if lr > 0 { pc += 5; continue dispatchLoop }
+                    if lr > 0 {
+                        let lexIdx = ctx.globalLexIndex(atom)
+                        if lexIdx >= 0, let lo = ctx.globalVarObj.obj, let lsh = lo.shape {
+                            fb.getIC().update(pc, shape: lsh, propOffset: lexIdx, atom: jeffJSLexicalICTag)
+                        }
+                        pc += 5; continue dispatchLoop
+                    }
                 }
                 // Strict code: assigning an unresolvable reference is a
                 // ReferenceError (ES §6.2.5.6 PutValue step 3.a); sloppy code
