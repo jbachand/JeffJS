@@ -6,7 +6,7 @@
 // compact key is persisted. This gives constant-size storage per entry
 // regardless of original data length (chunked into 25-bit keys).
 //
-// Thread safety: all public methods are @MainActor to match JeffJS conventions.
+// Thread safety: all public methods are @JeffJSHostActor to match JeffJS conventions.
 
 import Foundation
 
@@ -26,7 +26,7 @@ struct QuantumCacheEntry: Codable {
 /// let entry = cache.store("Hello, world!")
 /// let decoded = cache.retrieve(entry)  // "Hello, world!"
 /// ```
-@MainActor
+@JeffJSHostActor
 final class QuantumCache {
 
     private let encoder = QuantumEncoder()

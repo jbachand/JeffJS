@@ -55,7 +55,7 @@ final class EngineThreadingRuleTests: XCTestCase {
                     if notTypes.contains(name) { continue }
                     let mods = ns.substring(with: m.range(at: 1)).split(separator: " ").map(String.init)
                     let prev = i > 0 ? lines[i - 1] : ""
-                    if line.contains("@MainActor") || prev.contains("@MainActor") { continue }
+                    if line.contains("@MainActor") || prev.contains("@MainActor") || line.contains("@JeffJSHostActor") || prev.contains("@JeffJSHostActor") { continue }
                     checked += 1
                     if !mods.contains("nonisolated") {
                         offenders.append("\(dir)/\(url.lastPathComponent):\(i + 1): class \(name)")

@@ -77,7 +77,7 @@ extension JeffJSTestRunner {
         // JS through the DOM bridge.
         var outcomes: [(Bool, String)] = []
         let run = {
-            MainActor.assumeIsolated {
+            JeffJSHostActor.assumeIsolated {
                 let env = JeffJSEnvironment(configuration: .init(baseURL: URL(string: "https://www.example.com/")!))
                 for (name, js) in JeffJSTestRunner.selectorMatchingCacheCases {
                     switch env.eval(js, filename: "<selector-matching-cache>") {

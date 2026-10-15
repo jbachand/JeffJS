@@ -83,8 +83,8 @@ extension JeffJSTestRunner {
 
     mutating func testWebStorage() {
         var outcomes: [(Bool, String)] = []
-        func onMain(_ body: @escaping @MainActor () -> Void) {
-            if Thread.isMainThread { MainActor.assumeIsolated { body() } } else { DispatchQueue.main.sync { MainActor.assumeIsolated { body() } } }
+        func onMain(_ body: @escaping @JeffJSHostActor () -> Void) {
+            if Thread.isMainThread { JeffJSHostActor.assumeIsolated { body() } } else { DispatchQueue.main.sync { JeffJSHostActor.assumeIsolated { body() } } }
         }
         func waitForTasks() {
             if Thread.isMainThread { RunLoop.main.run(until: Date().addingTimeInterval(0.3)) } else { Thread.sleep(forTimeInterval: 0.3) }
@@ -122,7 +122,7 @@ extension JeffJSTestRunner {
         let other = JeffJSMemoryWebStorage(quotaBytes: 4096)
         var a: JeffJSEnvironment?, b: JeffJSEnvironment?, c: JeffJSEnvironment?, d: JeffJSEnvironment?, x: JeffJSEnvironment?
         onMain {
-            @MainActor func env(_ url: String, _ s: JeffJSMemoryWebStorage, _ bc: String) -> JeffJSEnvironment {
+            @JeffJSHostActor func env(_ url: String, _ s: JeffJSMemoryWebStorage, _ bc: String) -> JeffJSEnvironment {
                 JeffJSEnvironment(configuration: .init(baseURL: URL(string: url)!, webStorage: s, browsingContext: bc))
             }
             a = env("https://a.example/one.html", store, "tab1")

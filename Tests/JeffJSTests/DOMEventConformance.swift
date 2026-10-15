@@ -288,7 +288,7 @@ extension JeffJSTestRunner {
     mutating func testDOMEvents() {
         var outcomes: [(Bool, String)] = []
         let run = {
-            MainActor.assumeIsolated {
+            JeffJSHostActor.assumeIsolated {
                 let env = JeffJSEnvironment()
                 for (name, js) in JeffJSTestRunner.domEventCases {
                     switch env.eval(js, filename: "<dom-events>") {

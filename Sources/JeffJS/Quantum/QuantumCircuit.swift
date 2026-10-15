@@ -34,7 +34,7 @@ enum QuantumGate {
 /// A quantum circuit that accumulates gates and measurements against an
 /// N-qubit state vector.
 ///
-/// NOT `@MainActor` — computation runs off the main thread via Task.
+/// NOT `@JeffJSHostActor` — computation runs off the main thread via Task.
 /// Only the bridge (QuantumSimulatorBridge) is actor-confined.
 
 final class QuantumCircuit {

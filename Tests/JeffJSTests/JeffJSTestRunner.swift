@@ -418,8 +418,8 @@ struct JeffJSTestRunner {
     /// Results stream to the UI after each test group completes.
     static func runAsync(
         perTestTimeout: TimeInterval = 3.0,
-        onTestComplete: @escaping @MainActor (String, Int, Int, [String]) -> Void,
-        onAllComplete: @escaping @MainActor (Int, Int) -> Void
+        onTestComplete: @escaping @JeffJSHostActor (String, Int, Int, [String]) -> Void,
+        onAllComplete: @escaping @JeffJSHostActor (Int, Int) -> Void
     ) {
         let tests = allTests
         let totalTests = tests.count

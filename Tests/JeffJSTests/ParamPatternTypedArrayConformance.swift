@@ -184,7 +184,7 @@ extension JeffJSTestRunner {
     mutating func testHyperlinkReflection() {
         var outcomes: [(Bool, String)] = []
         let run = {
-            MainActor.assumeIsolated {
+            JeffJSHostActor.assumeIsolated {
                 let env = JeffJSEnvironment(configuration: .init(
                     baseURL: URL(string: "https://www.example.com/shop/buy/index.html")!))
                 for (name, js) in JeffJSTestRunner.hyperlinkReflectionCases {

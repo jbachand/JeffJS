@@ -17,10 +17,10 @@ extension JeffJSTestRunner {
 
     mutating func testDOMParserInsertion() {
         var outcomes: [(Bool, String)] = []
-        func onMain(_ body: @escaping @MainActor () -> Void) {
-            if Thread.isMainThread { MainActor.assumeIsolated { body() } } else { DispatchQueue.main.sync { MainActor.assumeIsolated { body() } } }
+        func onMain(_ body: @escaping @JeffJSHostActor () -> Void) {
+            if Thread.isMainThread { JeffJSHostActor.assumeIsolated { body() } } else { DispatchQueue.main.sync { JeffJSHostActor.assumeIsolated { body() } } }
         }
-        @MainActor func check(_ e: JeffJSEnvironment, _ js: String, _ name: String) {
+        @JeffJSHostActor func check(_ e: JeffJSEnvironment, _ js: String, _ name: String) {
             switch e.eval(js, filename: "<parser-insertion>") {
             case .success(let v): outcomes.append((v == "true", "DOMParserInsertion: \(name) -> \(v ?? "undefined")"))
             case .exception(let m): outcomes.append((false, "DOMParserInsertion: \(name) threw \(m)"))

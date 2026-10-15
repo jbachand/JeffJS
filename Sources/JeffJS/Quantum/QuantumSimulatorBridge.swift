@@ -4,7 +4,7 @@
 //
 // Follows the exact same patterns as JeffJSQuantumBridge.swift:
 //   - Sync functions for small/fast operations
-//   - Async functions (Task + MainActor.run + drainJobs) for heavy algorithms
+//   - Async functions (Task + JeffJSHostActor.run + drainJobs) for heavy algorithms
 //   - Stored callbacks for Promise resolution
 //
 // JS API:
@@ -28,7 +28,7 @@
 
 import Foundation
 
-@MainActor
+@JeffJSHostActor
 final class QuantumSimulatorBridge {
 
     private weak var ctx: JeffJSContext?
@@ -167,7 +167,7 @@ final class QuantumSimulatorBridge {
 
             Task.detached {
                 let result = QuantumAlgorithms.shorFactor(N)
-                await MainActor.run { [weak self] in
+                await JeffJSHostActor.run { [weak self] in
                     guard let self, let ctx = self.ctx else { return }
                     self.deliverResult(reqID: reqID, ctx: ctx) { ctx in
                         let obj = ctx.newPlainObject()
@@ -221,7 +221,7 @@ final class QuantumSimulatorBridge {
 
             Task.detached {
                 let result = QuantumAlgorithms.deutschJozsa(numInputQubits: nInput, oracle: oracle, oracleBits: oracleBits)
-                await MainActor.run { [weak self] in
+                await JeffJSHostActor.run { [weak self] in
                     guard let self, let ctx = self.ctx else { return }
                     self.deliverResult(reqID: reqID, ctx: ctx) { ctx in
                         let obj = ctx.newPlainObject()
@@ -251,7 +251,7 @@ final class QuantumSimulatorBridge {
 
             Task.detached {
                 let result = QuantumAlgorithms.bernsteinVazirani(secretString: secret)
-                await MainActor.run { [weak self] in
+                await JeffJSHostActor.run { [weak self] in
                     guard let self, let ctx = self.ctx else { return }
                     self.deliverResult(reqID: reqID, ctx: ctx) { ctx in
                         let obj = ctx.newPlainObject()
@@ -275,7 +275,7 @@ final class QuantumSimulatorBridge {
 
             Task.detached {
                 let result = QuantumAlgorithms.teleport()
-                await MainActor.run { [weak self] in
+                await JeffJSHostActor.run { [weak self] in
                     guard let self, let ctx = self.ctx else { return }
                     self.deliverResult(reqID: reqID, ctx: ctx) { ctx in
                         let obj = ctx.newPlainObject()
@@ -302,7 +302,7 @@ final class QuantumSimulatorBridge {
 
             Task.detached {
                 let result = QuantumAlgorithms.superdenseCoding(bit0: bit0, bit1: bit1)
-                await MainActor.run { [weak self] in
+                await JeffJSHostActor.run { [weak self] in
                     guard let self, let ctx = self.ctx else { return }
                     self.deliverResult(reqID: reqID, ctx: ctx) { ctx in
                         let obj = ctx.newPlainObject()
@@ -335,7 +335,7 @@ final class QuantumSimulatorBridge {
 
             Task.detached {
                 let result = QuantumAlgorithms.errorCorrection(errorQubit: errorQubit)
-                await MainActor.run { [weak self] in
+                await JeffJSHostActor.run { [weak self] in
                     guard let self, let ctx = self.ctx else { return }
                     self.deliverResult(reqID: reqID, ctx: ctx) { ctx in
                         let obj = ctx.newPlainObject()

@@ -248,7 +248,7 @@ extension RuntimeTeardownReleaseTests {
     /// JeffJSFrameRealms: DOM + event bridges per realm, one wrapper per node per
     /// realm, nodes moved between the documents, listeners, the polyfills run in
     /// both realms), torn down like a navigation: frame realm, page, runtime.
-    @MainActor
+    @JeffJSHostActor
     func testFreeWithDOMRealm() throws {
         for round in 0..<3 {
             let e = JeffJSEnvironment()
@@ -422,7 +422,7 @@ extension RuntimeTeardownReleaseTests {
 
     /// The full environment (DOM, events, Intl, web APIs, polyfills): after its
     /// teardown, nothing is left — the runtime the watch makes per page included.
-    @MainActor
+    @JeffJSHostActor
     func testFreshEnvironmentLeavesNothingBehind() throws {
         try XCTSkipIf(ProcessInfo.processInfo.environment["JEFFJS_ZOMBIES"] == "1", "zombie mode keeps every freed object allocated on purpose")
         for round in 0 ..< 2 {

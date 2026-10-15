@@ -17,7 +17,7 @@ import Foundation
 /// let bridge = JeffJSWebSocketBridge()
 /// bridge.register(on: ctx)
 /// ```
-@MainActor
+@JeffJSHostActor
 final class JeffJSWebSocketBridge {
 
     // MARK: - State
@@ -120,7 +120,7 @@ final class JeffJSWebSocketBridge {
         task.resume()
 
         // Fire open after connection establishes
-        Task { @MainActor [weak self] in
+        Task { @JeffJSHostActor [weak self] in
             guard let self, let ctx = self.ctx, let cb = self.callbacks[id] else { return }
             self.fireCallback(ctx: ctx, cb: cb, type: "open", data: nil, code: nil, reason: nil)
             self.receiveLoop(id: id)
@@ -134,7 +134,7 @@ final class JeffJSWebSocketBridge {
     private func receiveLoop(id: Int) {
         guard let task = activeSockets[id] else { return }
         task.receive { [weak self] result in
-            Task { @MainActor [weak self] in
+            Task { @JeffJSHostActor [weak self] in
                 guard let self, let ctx = self.ctx, let cb = self.callbacks[id] else { return }
                 switch result {
                 case .success(let message):
@@ -167,7 +167,7 @@ final class JeffJSWebSocketBridge {
         guard let task = activeSockets[id] else { return }
         task.send(.string(data)) { error in
             if let error {
-                Task { @MainActor [weak self] in
+                Task { @JeffJSHostActor [weak self] in
                     guard let self, let ctx = self.ctx, let cb = self.callbacks[id] else { return }
                     self.fireCallback(ctx: ctx, cb: cb, type: "error", data: error.localizedDescription, code: nil, reason: nil)
                 }
@@ -181,7 +181,7 @@ final class JeffJSWebSocketBridge {
         guard let task = activeSockets[id] else { return }
         task.cancel(with: URLSessionWebSocketTask.CloseCode(rawValue: code) ?? .normalClosure,
                     reason: reason.data(using: .utf8))
-        Task { @MainActor [weak self] in
+        Task { @JeffJSHostActor [weak self] in
             guard let self, let ctx = self.ctx, let cb = self.callbacks[id] else { return }
             self.fireCallback(ctx: ctx, cb: cb, type: "close", data: nil, code: code, reason: reason)
             self.cleanup(id: id)

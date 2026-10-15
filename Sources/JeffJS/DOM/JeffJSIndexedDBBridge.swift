@@ -20,7 +20,7 @@ import SQLite3
 /// let bridge = JeffJSIndexedDBBridge(scope: "example.com")
 /// bridge.register(on: ctx)
 /// ```
-@MainActor
+@JeffJSHostActor
 final class JeffJSIndexedDBBridge {
 
     private var db: OpaquePointer?

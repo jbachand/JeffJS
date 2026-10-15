@@ -13,7 +13,7 @@ import Foundation
 /// Protocol for providing video playback capabilities.
 /// The host app conforms to this to supply native video playback.
 /// When no provider is set, all video APIs are registered but inert.
-@MainActor
+@JeffJSHostActor
 public protocol JeffJSVideoProvider: AnyObject {
     func play(nodeID: UUID)
     func pause(nodeID: UUID)
@@ -41,7 +41,7 @@ public protocol JeffJSVideoProvider: AnyObject {
 
 /// Registers `__nativeVideo` on a JeffJS context so the JS media element
 /// API (play/pause/currentTime/etc.) can control native video instances.
-@MainActor
+@JeffJSHostActor
 final class JeffJSVideoBridge {
 
     // MARK: - State
@@ -220,7 +220,7 @@ final class JeffJSVideoBridge {
             previous?.freeValue()
 
             self.provider?.setEventCallback(nodeID: nodeID) { [weak self] eventName, detail in
-                Task { @MainActor [weak self] in
+                Task { @JeffJSHostActor [weak self] in
                     self?.fireEventCallback(nodeIDStr: idStr, eventName: eventName, detail: detail)
                 }
             }

@@ -276,7 +276,7 @@ extension JeffJSTestRunner {
 
         var outcomes: [(Bool, String)] = []
         let run = {
-            MainActor.assumeIsolated {
+            JeffJSHostActor.assumeIsolated {
                 let env = JeffJSEnvironment()
                 _ = env.eval(JeffJSTestRunner.htmlParsingPrelude, filename: "<html-parsing-prelude>")
                 for (name, js) in JeffJSTestRunner.htmlParsingCases {

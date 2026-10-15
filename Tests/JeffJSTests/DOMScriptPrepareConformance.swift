@@ -250,8 +250,8 @@ extension JeffJSTestRunner {
         for (name, body) in files { try? body.write(toFile: dir + "/" + name, atomically: true, encoding: .utf8) }
         defer { try? FileManager.default.removeItem(atPath: dir) }
 
-        func onMain(_ body: @escaping @MainActor () -> Void) {
-            if Thread.isMainThread { MainActor.assumeIsolated { body() } } else { DispatchQueue.main.sync { MainActor.assumeIsolated { body() } } }
+        func onMain(_ body: @escaping @JeffJSHostActor () -> Void) {
+            if Thread.isMainThread { JeffJSHostActor.assumeIsolated { body() } } else { DispatchQueue.main.sync { JeffJSHostActor.assumeIsolated { body() } } }
         }
         func waitForTasks() {
             if Thread.isMainThread { RunLoop.main.run(until: Date().addingTimeInterval(0.3)) } else { Thread.sleep(forTimeInterval: 0.3) }

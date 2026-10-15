@@ -388,8 +388,8 @@ extension JeffJSTestRunner {
     mutating func testDOMBridgeRung15() {
         var outcomes: [(Bool, String)] = []
         var env: JeffJSEnvironment?
-        func onMain(_ body: @escaping @MainActor () -> Void) {
-            if Thread.isMainThread { MainActor.assumeIsolated { body() } } else { DispatchQueue.main.sync { MainActor.assumeIsolated { body() } } }
+        func onMain(_ body: @escaping @JeffJSHostActor () -> Void) {
+            if Thread.isMainThread { JeffJSHostActor.assumeIsolated { body() } } else { DispatchQueue.main.sync { JeffJSHostActor.assumeIsolated { body() } } }
         }
         func waitForTasks() {
             if Thread.isMainThread {

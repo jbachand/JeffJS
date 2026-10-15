@@ -170,7 +170,7 @@ final class JeffJSRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked
 
 /// Registers fetch APIs on a JeffJS context so that JavaScript can make HTTP
 /// requests through the native networking stack.
-@MainActor
+@JeffJSHostActor
 final class JeffJSFetchBridge {
 
     // MARK: - State
@@ -185,7 +185,7 @@ final class JeffJSFetchBridge {
     /// requestID -> AbortSignal id passed by JS (`opts.signalId`).
     private var requestSignals: [Int: String] = [:]
     /// Network log callback for diagnostics.
-    var onNetworkLog: (@MainActor @Sendable (JeffJSNetworkLogEntry) -> Void)?
+    var onNetworkLog: (@JeffJSHostActor @Sendable (JeffJSNetworkLogEntry) -> Void)?
     /// Console log callback for surfacing fetch bridge diagnostics in the app's console UI.
     var onConsoleLog: ((_ level: String, _ message: String) -> Void)?
     var baseURL: URL?
@@ -410,7 +410,7 @@ final class JeffJSFetchBridge {
             if !startKeepalive(spec: spec, requestID: requestID, label: label) {
                 // Over the quota: a network error (Fetch §4.6 step 12.2.3), delivered as a task.
                 Task { [weak self] in
-                    await MainActor.run {
+                    await JeffJSHostActor.run {
                         guard let self, let cb = self.storedCallbacks[requestID], let ctx = self.ctx else { return }
                         defer { self.releaseCallback(for: requestID); self.requestSignals.removeValue(forKey: requestID) }
                         JeffJSGCObjectHeader.activeRuntime = ctx.rt
@@ -426,7 +426,7 @@ final class JeffJSFetchBridge {
         let task = Task { [weak self] in
             guard let self else { return }
             let result = await self.performFetch(spec: spec)
-            await MainActor.run {
+            await JeffJSHostActor.run {
                 defer {
                     self.releaseCallback(for: requestID)
                     self.activeTasks.removeValue(forKey: requestID)
@@ -480,7 +480,7 @@ final class JeffJSFetchBridge {
         keepaliveInflightBytes += size
         Task { [self] in
             let result = await self.performFetch(spec: spec)
-            await MainActor.run {
+            await JeffJSHostActor.run {
                 self.keepaliveInflightBytes = max(0, self.keepaliveInflightBytes - size)
                 guard let requestID else { return }
                 defer {

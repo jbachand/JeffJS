@@ -10,7 +10,7 @@
 import XCTest
 @testable import JeffJS
 
-@MainActor
+@JeffJSHostActor
 final class UnminifierTests: XCTestCase {
 
     // MARK: helpers

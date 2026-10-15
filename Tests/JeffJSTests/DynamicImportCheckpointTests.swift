@@ -11,7 +11,7 @@
 import XCTest
 @testable import JeffJS
 
-@MainActor
+@JeffJSHostActor
 final class DynamicImportCheckpointTests: XCTestCase {
 
     /// Serves every module URL as a one-line bundle exporting `v = 7`.

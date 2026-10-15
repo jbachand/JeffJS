@@ -160,7 +160,7 @@ final class CookieJarTests: XCTestCase {
         XCTAssertEqual(j.documentCookie(for: page), "a=2; b=1")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testDocumentCookieThroughTheEngine() {
         let env = JeffJSEnvironment(configuration: .init(baseURL: URL(string: "https://www.example.com/a/b.html")!,
                                                          storageScope: "jeffjs.cookietest.\(UUID().uuidString)"))
@@ -181,7 +181,7 @@ final class CookieJarTests: XCTestCase {
     /// not own properties of the document; the page document is an HTMLDocument.
     /// Akamai's sensor calls `Object.getOwnPropertyDescriptor(Document.prototype,
     /// 'cookie').get` (akamai navigation fix, 2026-09-29).
-    @MainActor
+    @JeffJSHostActor
     func testDocumentCookieIsAnAccessorOnDocumentPrototype() {
         let env = JeffJSEnvironment(configuration: .init(baseURL: URL(string: "https://www.example.com/p")!,
                                                          storageScope: "jeffjs.cookietest.\(UUID().uuidString)"))

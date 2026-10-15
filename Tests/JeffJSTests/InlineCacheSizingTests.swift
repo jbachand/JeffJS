@@ -30,7 +30,7 @@ final class InlineCacheSizingTests: XCTestCase {
 
     /// Small functions get small tables; every property read still hits its
     /// own slot (the answers and the table count prove both).
-    @MainActor
+    @JeffJSHostActor
     func testSmallFunctionsGetSmallTables() {
         let env = JeffJSEnvironment()
         let before = JeffJSEnvironment.inlineCacheStats
@@ -59,7 +59,7 @@ final class InlineCacheSizingTests: XCTestCase {
     /// A function longer than 512 bytes keeps a 512-slot table (pc & 511 folds
     /// its sites together) and stays correct, including polymorphic receivers,
     /// prototype hits, keyed and store sites.
-    @MainActor
+    @JeffJSHostActor
     func testLargeFunctionStaysCorrect() {
         let env = JeffJSEnvironment()
         var body = "var s = 0;\n"

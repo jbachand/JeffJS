@@ -109,7 +109,7 @@ extension JeffJSTestRunner {
     mutating func testElementLangDir() {
         var outcomes: [(Bool, String)] = []
         let run = {
-            MainActor.assumeIsolated {
+            JeffJSHostActor.assumeIsolated {
                 let env = JeffJSEnvironment(configuration: .init(baseURL: URL(string: "https://www.example.com/")!))
                 for (name, js) in JeffJSTestRunner.elementLangDirCases {
                     switch env.eval(js, filename: "<element-lang-dir>") {

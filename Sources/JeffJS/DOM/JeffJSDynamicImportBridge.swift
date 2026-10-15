@@ -12,7 +12,7 @@ import Foundation
 /// Protocol for providing module bundling to the dynamic import bridge.
 /// The host app (e.g. rendering engine) conforms to this to supply
 /// module fetching, bundling, and caching.
-@MainActor
+@JeffJSHostActor
 public protocol JeffJSDynamicImportDelegate: AnyObject {
     var baseURL: URL? { get }
     var userAgent: String { get }
@@ -30,7 +30,7 @@ public protocol JeffJSDynamicImportDelegate: AnyObject {
 /// let bridge = JeffJSDynamicImportBridge(delegate: myDelegate)
 /// bridge.register(on: ctx)
 /// ```
-@MainActor
+@JeffJSHostActor
 final class JeffJSDynamicImportBridge {
 
     // MARK: - State
@@ -115,7 +115,7 @@ final class JeffJSDynamicImportBridge {
 
             // Fetch, bundle, and evaluate asynchronously
             let userAgent = delegate.userAgent
-            Task { @MainActor [weak delegate] in
+            Task { @JeffJSHostActor [weak delegate] in
                 guard let delegate, let jsCtx = delegate.jsContext else {
                     resolveRef.freeValue()
                     rejectRef.freeValue()

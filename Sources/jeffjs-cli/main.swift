@@ -22,7 +22,7 @@ if let bb = args.first(where: { $0.hasPrefix("--boot-bench") }) {
     let jfbc = args.first(where: { $0.hasPrefix("--jfbc=") }).map { String($0.dropFirst(7)) }
     let bundle: [UInt8]? = jfbc.flatMap { FileManager.default.contents(atPath: $0) }.map { [UInt8]($0) }
     if jfbc != nil && bundle == nil { FileHandle.standardError.write("cannot read bundle\n".data(using: .utf8)!); exit(2) }
-    let code: Int32 = MainActor.assumeIsolated {
+    let code: Int32 = JeffJSHostActor.assumeIsolated {
         var bestRt = Double.infinity, bestCtx = Double.infinity, bestEnv = Double.infinity, bestPoly = Double.infinity
         for _ in 0..<max(1, n) {
             let (r, c) = JeffJSEnvironment.measureRuntimeAndContextInit()
@@ -75,7 +75,7 @@ let repeatCount = args.first(where: { $0.hasPrefix("--repeat=") }).flatMap { Int
 // Several files are evaluated in order in ONE environment (shared globals),
 // which mirrors how the conformance runner feeds a group of snippets to a
 // single context.
-let status: Int32 = MainActor.assumeIsolated {
+let status: Int32 = JeffJSHostActor.assumeIsolated {
     var pageURL: (url: URL, ua: String)? = nil
     if let dir = pageDir,
        let d = FileManager.default.contents(atPath: dir + "/manifest.json"),
@@ -161,7 +161,7 @@ let status: Int32 = MainActor.assumeIsolated {
     if let settle = args.first(where: { $0.hasPrefix("--settle=") }).flatMap({ Double($0.dropFirst(9)) }) {
         let sample = args.first(where: { $0.hasPrefix("--sample=") }).flatMap { Double($0.dropFirst(9)) } ?? 5
         let t0 = CFAbsoluteTimeGetCurrent()
-        @MainActor func line(_ tag: String) {
+        @JeffJSHostActor func line(_ tag: String) {
             let g = env.gcStatistics, l = env.lazyCounters
             let ic = JeffJSEnvironment.inlineCacheStats
             print(String(format: "[settle] %@ t=%.0fs footprint=%.1fMB heap=%dKB objects=%d compiled=%d compileMs=%.0f dropped=%d reclaimMs=%.1f icTables=%d icKB=%d",
@@ -262,7 +262,7 @@ let status: Int32 = MainActor.assumeIsolated {
 // the freed runtime left behind — engine instances still alive (nothing should be: the app frees a
 // page's runtime at every navigation) and the strings among them that nothing points to.
 if args.contains("--teardown-report") {
-    MainActor.assumeIsolated {
+    JeffJSHostActor.assumeIsolated {
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
         var counts: [String] = []
         for c in ["JeffJSString", "JeffJSObject", "JeffJSObjectAux", "JeffJSFunctionBytecodeCompiled",
@@ -295,7 +295,7 @@ func cliMallocInUse() -> Int {
 }
 
 /// --page: run a saved page's scripts in document order (see the flag).
-@MainActor
+@JeffJSHostActor
 func cliRunPage(env: JeffJSEnvironment, dir: String, bundlesDir: String?) -> (ran: Int, errors: Int, skipped: Int, ms: Double) {
     guard let html = try? String(contentsOfFile: dir + "/index.html", encoding: .utf8) else { return (0, 0, 0, 0) }
     // file -> original URL (error messages / filenames as the app sees them)

@@ -279,7 +279,7 @@ final class MetalGCParityTests: XCTestCase {
     /// DOM wrappers built by `JeffJSEnvironment`: a JS object with a native
     /// side, reachable through parent/child links the collector has to walk
     /// like any other property edge.
-    @MainActor
+    @JeffJSHostActor
     func testDOMWrappersThroughEnvironment() {
         guard metalReady else { XCTFail("Metal collector unavailable"); return }
         func build(metal: Bool) -> String {

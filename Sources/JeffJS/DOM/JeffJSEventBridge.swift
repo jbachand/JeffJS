@@ -149,7 +149,7 @@ private final class JeffJSEventDispatchFrame {
 /// domBridge.eventBridge = eventBridge
 /// domBridge.register(on: ctx)
 /// ```
-@MainActor
+@JeffJSHostActor
 final class JeffJSEventBridge {
 
     private let listenerStore = JeffJSEventListenerStore()

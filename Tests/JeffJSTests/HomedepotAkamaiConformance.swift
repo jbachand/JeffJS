@@ -52,8 +52,8 @@ extension JeffJSTestRunner {
 
         // DOM: wrappers without own properties; interface prototypes from the host.
         var outcomes: [(Bool, String)] = []
-        func onMain(_ body: @escaping @MainActor () -> Void) {
-            if Thread.isMainThread { MainActor.assumeIsolated { body() } } else { DispatchQueue.main.sync { MainActor.assumeIsolated { body() } } }
+        func onMain(_ body: @escaping @JeffJSHostActor () -> Void) {
+            if Thread.isMainThread { JeffJSHostActor.assumeIsolated { body() } } else { DispatchQueue.main.sync { JeffJSHostActor.assumeIsolated { body() } } }
         }
         let domCases: [(String, String)] = [
             ("a node wrapper has no own properties; identity attributes are prototype accessors", """

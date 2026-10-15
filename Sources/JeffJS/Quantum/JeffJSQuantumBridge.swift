@@ -27,13 +27,13 @@
 // The async chain methods follow `JeffJSFetchBridge`: a native function
 // takes (input, resolve, reject) callbacks; a JS shim wraps it in
 // `new Promise(...)`. Background work runs in a `Task`, then
-// `await MainActor.run` invokes the resolver and calls
+// `await JeffJSHostActor.run` invokes the resolver and calls
 // `executePendingJobs()` to flush microtasks.
 
 import Foundation
 
 /// JS bridge for the quantum subsystem. Registers `window.jeffjs.quantum`.
-@MainActor
+@JeffJSHostActor
 final class JeffJSQuantumBridge {
 
     // MARK: - State
@@ -263,7 +263,7 @@ final class JeffJSQuantumBridge {
                 let encoder = QuantumChainEncoder()
                 let key = encoder.encode(plaintext)
 
-                await MainActor.run {
+                await JeffJSHostActor.run {
                     guard let self else { return }
                     self.deliverEncodeResult(requestID: requestID, key: key)
                 }
@@ -293,7 +293,7 @@ final class JeffJSQuantumBridge {
                     plain = nil
                 }
 
-                await MainActor.run {
+                await JeffJSHostActor.run {
                     guard let self else { return }
                     self.deliverDecodeResult(requestID: requestID, plain: plain)
                 }

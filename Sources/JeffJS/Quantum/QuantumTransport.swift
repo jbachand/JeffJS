@@ -104,7 +104,7 @@ struct QuantumEnvelope: Codable {
 
 /// Encodes payloads into quantum envelopes for transmission and decodes
 /// received envelopes back into the original data.
-@MainActor
+@JeffJSHostActor
 final class QuantumTransport {
 
     private let encoder = QuantumEncoder()

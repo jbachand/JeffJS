@@ -12,7 +12,7 @@ import XCTest
 
 final class InlineCacheOrdinalTests: XCTestCase {
 
-    @MainActor
+    @JeffJSHostActor
     private func function(_ env: JeffJSEnvironment, _ name: String) -> JeffJSFunctionBytecode? {
         let ctx = env.context
         let v = ctx.getPropertyStr(obj: ctx.globalObj, name: name)
@@ -22,7 +22,7 @@ final class InlineCacheOrdinalTests: XCTestCase {
 
     /// Every IC site of a function gets its own slot, in bytecode order;
     /// offsets that are not sites map to the never-hit slot 0.
-    @MainActor
+    @JeffJSHostActor
     func testSitesGetDistinctSlots() {
         guard JeffJSConfig.icOrdinalTables, !JeffJSConfig.icTableFixed else { return }
         let env = JeffJSEnvironment()
@@ -67,7 +67,7 @@ final class InlineCacheOrdinalTests: XCTestCase {
     /// site-opcode list covers every handler that caches (named, keyed,
     /// global, `length`, string receivers, define_field, fused reads, the
     /// traces). A miss here would silently lose caching for that opcode.
-    @MainActor
+    @JeffJSHostActor
     func testNoStoreFallsOutsideTheSites() {
         guard JeffJSConfig.icOrdinalTables, !JeffJSConfig.icTableFixed else { return }
         let env = JeffJSEnvironment()
@@ -103,7 +103,7 @@ final class InlineCacheOrdinalTests: XCTestCase {
 
     /// A function with more sites than `maxOrdinalSlots` folds them onto
     /// the table and stays correct (collisions are misses).
-    @MainActor
+    @JeffJSHostActor
     func testFoldedTableStaysCorrect() {
         guard JeffJSConfig.icOrdinalTables, !JeffJSConfig.icTableFixed else { return }
         let env = JeffJSEnvironment()
@@ -130,7 +130,7 @@ final class InlineCacheOrdinalTests: XCTestCase {
 
     /// A body whose bytecode is replaced (idle reclaim + recompile) gets a
     /// new table built for the new bytecode, never the old map.
-    @MainActor
+    @JeffJSHostActor
     func testReplacedBytecodeDropsTheTable() {
         let env = JeffJSEnvironment()
         let src = """

@@ -346,9 +346,9 @@ extension JeffJSTestRunner {
         var hostOut = ""
         var intlOut: [(String, String, String)] = []
         let intlRows = Self.intrinsicAttributeTable.filter { $0.1.hasPrefix("Intl.") }
-        let hostBody: @MainActor () -> Void = {
+        let hostBody: @JeffJSHostActor () -> Void = {
             let env = JeffJSEnvironment()
-            @MainActor func run(_ js: String) -> String {
+            @JeffJSHostActor func run(_ js: String) -> String {
                 switch env.eval(js, filename: "<IntrinsicAttributes>") {
                 case .success(let v): return v ?? "undefined"
                 case .exception(let m): return "THREW " + m
@@ -361,7 +361,7 @@ extension JeffJSTestRunner {
             }
             intlOut.append(("Intl.NumberFormat still formats", run("new Intl.NumberFormat('en-US').format(1234.5)"), "1,234.5"))
         }
-        if Thread.isMainThread { MainActor.assumeIsolated { hostBody() } } else { DispatchQueue.main.sync { MainActor.assumeIsolated { hostBody() } } }
+        if Thread.isMainThread { JeffJSHostActor.assumeIsolated { hostBody() } } else { DispatchQueue.main.sync { JeffJSHostActor.assumeIsolated { hostBody() } } }
         assert(hostOut == "---W-C---/c", "IntrinsicAttributes: URL / URLSearchParams -> \(hostOut)")
         for (label, got, want) in intlOut {
             assert(got == want, "IntrinsicAttributes: \(label) is \(got), spec \(want)")

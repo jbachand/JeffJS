@@ -42,7 +42,7 @@ enum JeffJSIntlResolve<T> {
     case failed(JeffJSValue)
 }
 
-@MainActor
+@JeffJSHostActor
 final class JeffJSIntlBridge {
 
     // MARK: - Resolved option records (Swift-side, keyed by the `_k` cache key

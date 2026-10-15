@@ -50,7 +50,7 @@ final class HTMLParserTests: XCTestCase {
         node.querySelectorAll(selector).map { $0.tagName ?? "" }
     }
 
-    @MainActor
+    @JeffJSHostActor
     private func evalString(_ env: JeffJSEnvironment, _ js: String, file: StaticString = #filePath, line: UInt = #line) -> String {
         switch env.eval(js) {
         case .success(let value): return value ?? "undefined"
@@ -60,7 +60,7 @@ final class HTMLParserTests: XCTestCase {
         }
     }
 
-    @MainActor
+    @JeffJSHostActor
     private func makeEnvironment() -> JeffJSEnvironment {
         JeffJSEnvironment(configuration: .init(viewportWidth: 390, viewportHeight: 844))
     }
@@ -671,7 +671,7 @@ final class HTMLParserTests: XCTestCase {
 
     // MARK: - 5. Through JeffJSEnvironment
 
-    @MainActor
+    @JeffJSHostActor
     func testInnerHTMLUsesTheContextElement() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -700,7 +700,7 @@ final class HTMLParserTests: XCTestCase {
         """), "0,a")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testNoscriptThroughTheDOMBridge() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -714,7 +714,7 @@ final class HTMLParserTests: XCTestCase {
         """), "0,0,1,after")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testAdoptionAgencyThroughTheDOMBridge() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -728,7 +728,7 @@ final class HTMLParserTests: XCTestCase {
         """), "1,2,1,xyz")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testDocumentCompatModeIsExposed() {
         let env = makeEnvironment()
         // A synthetic document with no DOCTYPE is still standards mode here;
@@ -738,7 +738,7 @@ final class HTMLParserTests: XCTestCase {
         XCTAssertEqual(HTMLParser.parse("<!doctype html><body>x").compatMode, "CSS1Compat")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testForeignContentAttributeCaseThroughTheDOMBridge() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -750,7 +750,7 @@ final class HTMLParserTests: XCTestCase {
         """), "0 0 24 24|0 0 24 24")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testTableFosterParentingThroughTheDOMBridge() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """

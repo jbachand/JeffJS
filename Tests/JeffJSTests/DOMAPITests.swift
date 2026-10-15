@@ -13,7 +13,7 @@ final class DOMAPITests: XCTestCase {
 
     // MARK: - Helpers
 
-    @MainActor
+    @JeffJSHostActor
     private func evalString(_ env: JeffJSEnvironment, _ js: String, file: StaticString = #filePath, line: UInt = #line) -> String {
         switch env.eval(js) {
         case .success(let s): return s ?? "undefined"
@@ -23,7 +23,7 @@ final class DOMAPITests: XCTestCase {
         }
     }
 
-    @MainActor
+    @JeffJSHostActor
     private func makeEnvironment() -> JeffJSEnvironment {
         let env = JeffJSEnvironment(configuration: .init(viewportWidth: 390, viewportHeight: 844))
         _ = evalString(env, """
@@ -37,7 +37,7 @@ final class DOMAPITests: XCTestCase {
 
     // MARK: - document.implementation
 
-    @MainActor
+    @JeffJSHostActor
     func testCreateHTMLDocumentProducesRealDocument() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, "typeof document.implementation.createHTMLDocument"), "function")
@@ -53,7 +53,7 @@ final class DOMAPITests: XCTestCase {
 
     /// jQuery 3's `support.createHTMLDocument` probe: two sibling <form>s must
     /// survive as two children of the created document's body.
-    @MainActor
+    @JeffJSHostActor
     func testCreateHTMLDocumentSupportsFormProbe() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -67,7 +67,7 @@ final class DOMAPITests: XCTestCase {
 
     /// The rest of jQuery.parseHTML: a <base> appended to the created head, then
     /// a fragment built from that document.
-    @MainActor
+    @JeffJSHostActor
     func testCreateHTMLDocumentParseHTMLContext() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -86,7 +86,7 @@ final class DOMAPITests: XCTestCase {
         """), "2|2|https://example.com/a/b")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testDetachedDocumentQueriesAreScoped() {
         let env = makeEnvironment()
         // #root exists in the live page but must not leak into the new document.
@@ -102,7 +102,7 @@ final class DOMAPITests: XCTestCase {
         """), "found|scoped|hi|true")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testNativeParseHTMLDocument() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -119,7 +119,7 @@ final class DOMAPITests: XCTestCase {
 
     /// Regression: classList used to be materialised once against the shared
     /// element prototype, so every element saw the same empty object.
-    @MainActor
+    @JeffJSHostActor
     func testClassListIsPerElementAndOrdered() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -141,7 +141,7 @@ final class DOMAPITests: XCTestCase {
         """), "zz aa")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testClassListMutatorsAndSnapshot() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -160,7 +160,7 @@ final class DOMAPITests: XCTestCase {
 
     // MARK: - Element APIs
 
-    @MainActor
+    @JeffJSHostActor
     func testMatchesWorksOnDetachedElements() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -173,7 +173,7 @@ final class DOMAPITests: XCTestCase {
         """), "true|true|false")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testClosest() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -186,7 +186,7 @@ final class DOMAPITests: XCTestCase {
         """), "true|true|null")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testInsertAdjacentPositions() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -205,7 +205,7 @@ final class DOMAPITests: XCTestCase {
         """), "i,span,b|txt")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testReplaceChildrenAndOuterHTMLSetter() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -220,7 +220,7 @@ final class DOMAPITests: XCTestCase {
         """), "2|2|em|nb")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testAttributeHelpers() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -241,7 +241,7 @@ final class DOMAPITests: XCTestCase {
     /// DOM §4.9 namespaced attribute methods. React sets an SVG <use>'s
     /// `xlink:href` with setAttributeNS; the method was missing on JeffJS and
     /// the TypeError aborted target.com's commit (the whole tree unmounted).
-    @MainActor
+    @JeffJSHostActor
     func testNamespacedAttributeMethods() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -267,7 +267,7 @@ final class DOMAPITests: XCTestCase {
         """), "#icon|#icon|true||xlink:href|0 0 1 1|0 0 1 1|false||NamespaceError+NamespaceError+InvalidCharacterError|dataX")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testCompareDocumentPosition() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -283,7 +283,7 @@ final class DOMAPITests: XCTestCase {
         """), "4|2|16|8|0")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testTemplateContent() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -296,7 +296,7 @@ final class DOMAPITests: XCTestCase {
         """), "11|2|0|true")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testNodeListShapeAndConstants() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -310,7 +310,7 @@ final class DOMAPITests: XCTestCase {
         XCTAssertEqual(evalString(env, "[document.body.ELEMENT_NODE, document.body.TEXT_NODE, document.body.DOCUMENT_FRAGMENT_NODE].join(',')"), "1,3,11")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testDocumentExtras() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, "document.contains(document.querySelector('#root')) + '|' + document.contains(document.createElement('p'))"), "true|false")
@@ -328,7 +328,7 @@ final class DOMAPITests: XCTestCase {
 
     // MARK: - Proxy deleteProperty (backs `delete element.dataset.foo`)
 
-    @MainActor
+    @JeffJSHostActor
     func testProxyDeletePropertyTrap() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -349,7 +349,7 @@ final class DOMAPITests: XCTestCase {
     /// apple.com's global header reads `meta.name` / `meta.content` off every
     /// `meta[name^="globalnav-"]`; both answered undefined, so building the
     /// flyout died on `Cannot read properties of undefined (reading 'replace')`.
-    @MainActor
+    @JeffJSHostActor
     func testMetaNameAndContentReflectAttributes() {
         let env = makeEnvironment()
         _ = evalString(env, """
@@ -374,7 +374,7 @@ final class DOMAPITests: XCTestCase {
     }
 
     /// `<template>.content` must still be the DocumentFragment, not a string.
-    @MainActor
+    @JeffJSHostActor
     func testTemplateContentStillAFragment() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -386,7 +386,7 @@ final class DOMAPITests: XCTestCase {
         """), "object|11|I")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testStringReflectedElementAttributes() {
         let env = makeEnvironment()
         _ = evalString(env, """

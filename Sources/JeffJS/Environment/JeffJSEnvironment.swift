@@ -32,7 +32,7 @@ public enum JeffJSEvalResult {
 /// env.onConsoleMessage = { level, msg in print("[\(level)] \(msg)") }
 /// let result = env.eval("document.createElement('div').tagName")
 /// ```
-@MainActor
+@JeffJSHostActor
 public final class JeffJSEnvironment {
 
     // MARK: - Public Configuration
@@ -213,7 +213,7 @@ public final class JeffJSEnvironment {
                 // No Task per mutation when nobody listens (CLI, tests): an
                 // undrained main-actor queue grew ~1.5 KB per DOM change.
                 guard self?.onDOMMutation != nil else { return }
-                Task { @MainActor in
+                Task { @JeffJSHostActor in
                     self?.onDOMMutation?(mutatedNodeIDs)
                 }
             },
@@ -868,7 +868,7 @@ public final class JeffJSEnvironment {
 
         let item = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            Task { @MainActor [weak self] in
+            Task { @JeffJSHostActor [weak self] in
                 guard let self, let cb = self.timerCallbacks.removeValue(forKey: id) else { return }
                 self.timeoutItems.removeValue(forKey: id)
                 JeffJSGCObjectHeader.activeRuntime = self.context.rt
@@ -901,7 +901,7 @@ public final class JeffJSEnvironment {
         timer.schedule(deadline: .now() + .milliseconds(Int(interval)),
                        repeating: .milliseconds(Int(interval)))
         timer.setEventHandler { [weak self] in
-            Task { @MainActor [weak self] in
+            Task { @JeffJSHostActor [weak self] in
                 // Look the callback up when the task runs, not when the timer
                 // fired: a clearInterval in between has already released it.
                 guard let self, let cb = self.timerCallbacks[id] else { return }
@@ -985,7 +985,7 @@ public final class JeffJSEnvironment {
 
 /// Simple fetch-and-eval delegate for standalone use.
 /// Fetches module source via URLSession and returns it directly (no bundling).
-@MainActor
+@JeffJSHostActor
 final class DefaultDynamicImportDelegate: JeffJSDynamicImportDelegate {
     let baseURL: URL?
     let userAgent: String
@@ -1002,7 +1002,7 @@ final class DefaultDynamicImportDelegate: JeffJSDynamicImportDelegate {
 
     func buildModuleBundle(entryURL: URL, visited: Set<URL>, userAgent: String) async throws -> (bundle: String, visited: Set<URL>) {
         // Check cache
-        if let cached = await MainActor.run(body: { moduleCache[entryURL] }) {
+        if let cached = await JeffJSHostActor.run(body: { moduleCache[entryURL] }) {
             return (cached, visited.union([entryURL]))
         }
 

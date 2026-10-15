@@ -963,7 +963,7 @@ extension JeffJSDOMBridge {
 
     /// Reads computed values for one operation. Holds the host's
     /// `__nativeGetComputedStyleValue` for its lifetime.
-    @MainActor final class StyleReader {
+    @JeffJSHostActor final class StyleReader {
         private let provider: ((DOMNode, String) -> String?)?
         private let ctx: JeffJSContext
         private let hostFn: JeffJSValue

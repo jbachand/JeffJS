@@ -32,8 +32,8 @@ extension JeffJSTestRunner {
     /// Intl is installed by the environment (JeffJSWebAPIsBridge), not the bare context.
     mutating func testIntlFormatStyles() {
         var outcomes: [(Bool, String)] = []
-        func onMain(_ body: @escaping @MainActor () -> Void) {
-            if Thread.isMainThread { MainActor.assumeIsolated { body() } } else { DispatchQueue.main.sync { MainActor.assumeIsolated { body() } } }
+        func onMain(_ body: @escaping @JeffJSHostActor () -> Void) {
+            if Thread.isMainThread { JeffJSHostActor.assumeIsolated { body() } } else { DispatchQueue.main.sync { JeffJSHostActor.assumeIsolated { body() } } }
         }
         onMain {
             let e = JeffJSEnvironment()

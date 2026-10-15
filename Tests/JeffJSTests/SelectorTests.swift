@@ -27,7 +27,7 @@ final class SelectorTests: XCTestCase {
         super.tearDown()
     }
 
-    @MainActor
+    @JeffJSHostActor
     private func evalString(_ env: JeffJSEnvironment, _ js: String, file: StaticString = #filePath, line: UInt = #line) -> String {
         switch env.eval(js) {
         case .success(let s): return s ?? "undefined"
@@ -37,7 +37,7 @@ final class SelectorTests: XCTestCase {
         }
     }
 
-    @MainActor
+    @JeffJSHostActor
     private func makeEnvironment(body: String = "") -> JeffJSEnvironment {
         let env = JeffJSEnvironment(configuration: .init(viewportWidth: 390, viewportHeight: 844))
         if !body.isEmpty {
@@ -77,7 +77,7 @@ final class SelectorTests: XCTestCase {
 
     /// apple.com's globalnav writes `class="\n\tfoo\n\tbar"`. Splitting on " "
     /// alone produced one bogus token and no rule matched.
-    @MainActor
+    @JeffJSHostActor
     func testClassAttributeSplitsOnAllASCIIWhitespace() {
         let env = makeEnvironment()
         _ = evalString(env, """
@@ -125,7 +125,7 @@ final class SelectorTests: XCTestCase {
         XCTAssertTrue(node(root, id: "c").matchesSelector("[headers~='h2']"))
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testDOMTokenListSurface() {
         let env = makeEnvironment(body: "<div id='a' class='one two'></div><a id='l' rel='noopener'>x</a>")
         XCTAssertEqual(evalString(env, "typeof document.getElementById('a').classList.forEach"), "function")
@@ -165,7 +165,7 @@ final class SelectorTests: XCTestCase {
 
     // MARK: - 2. :has()
 
-    @MainActor
+    @JeffJSHostActor
     func testHasRelativeSelectorsThroughBridge() {
         let env = makeEnvironment(body: """
         <section id='s1'><p id='p1'><span class='x'>a</span></p><h2 id='h2a'>t</h2></section>
@@ -386,7 +386,7 @@ final class SelectorTests: XCTestCase {
         XCTAssertTrue(node(editable, id: "in").matchesSelector(":read-write"))
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testFormStateThroughBridge() {
         let env = makeEnvironment(body: "<input id='a' type='checkbox'><input id='b' type='text' disabled>")
         XCTAssertEqual(evalString(env, "document.querySelectorAll(':checked').length"), "0")
@@ -594,7 +594,7 @@ final class SelectorTests: XCTestCase {
 
     // MARK: - 5. Detached trees, fragments, :scope, document order
 
-    @MainActor
+    @JeffJSHostActor
     func testDetachedTreesAndFragmentsThroughBridge() {
         let env = makeEnvironment(body: "<div id='root'><a id='a1' href='#'>x</a></div>")
         // Detached element tree
@@ -666,7 +666,7 @@ final class SelectorTests: XCTestCase {
         XCTAssertEqual(ids(root, "#n5, #n2, #n6"), ["n2", "n5", "n6"])
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testQuerySelectorAllDocumentOrderThroughBridge() {
         let env = makeEnvironment(body: "<i id='a'></i><b id='b'></b><i id='c'></i>")
         XCTAssertEqual(evalString(env, """

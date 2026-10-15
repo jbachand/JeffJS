@@ -16,7 +16,7 @@ final class DOMGeometryTests: XCTestCase {
 
     // MARK: - Helpers
 
-    @MainActor
+    @JeffJSHostActor
     private func evalString(_ env: JeffJSEnvironment, _ js: String, file: StaticString = #filePath, line: UInt = #line) -> String {
         switch env.eval(js) {
         case .success(let s): return s ?? "undefined"
@@ -26,7 +26,7 @@ final class DOMGeometryTests: XCTestCase {
         }
     }
 
-    @MainActor
+    @JeffJSHostActor
     private func nodeID(_ env: JeffJSEnvironment, _ selector: String) -> UUID {
         let s = evalString(env, "document.querySelector('\(selector)').nativeNodeID")
         guard let id = UUID(uuidString: s) else {
@@ -43,7 +43,7 @@ final class DOMGeometryTests: XCTestCase {
     ///   #inner      (20,120) 200 x 900   (taller than #outer: overflow)
     ///   #leaf       (30,130)  50 x 20
     ///   #late       no rect; inline width/height only (created "after layout")
-    @MainActor
+    @JeffJSHostActor
     private func makeEnvironment() -> (JeffJSEnvironment, [String: UUID]) {
         let env = JeffJSEnvironment(configuration: .init(viewportWidth: 390, viewportHeight: 844))
         _ = evalString(env, """
@@ -73,7 +73,7 @@ final class DOMGeometryTests: XCTestCase {
 
     // MARK: - Tests
 
-    @MainActor
+    @JeffJSHostActor
     func testBoundingClientRectUsesLayoutRectsAndScrollOffset() {
         let (env, _) = makeEnvironment()
         defer { env.teardown() }
@@ -96,7 +96,7 @@ final class DOMGeometryTests: XCTestCase {
         XCTAssertEqual(evalString(env, "document.getElementById('outer').getClientRects().item(1)"), "null")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testOffsetClientScrollMetrics() {
         let (env, _) = makeEnvironment()
         defer { env.teardown() }
@@ -123,7 +123,7 @@ final class DOMGeometryTests: XCTestCase {
         XCTAssertEqual(evalString(env, "document.scrollingElement === document.documentElement"), "true")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testOffsetParentAndOffsetTopLeft() {
         let (env, _) = makeEnvironment()
         defer { env.teardown() }
@@ -149,7 +149,7 @@ final class DOMGeometryTests: XCTestCase {
                        #"{"x":0,"y":0,"width":0,"height":0,"top":0,"right":0,"bottom":0,"left":0}"#)
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testNoRectFallsBackToInlineStyleThenIncrementalSetLayoutRect() {
         let (env, ids) = makeEnvironment()
         defer { env.teardown() }
@@ -170,7 +170,7 @@ final class DOMGeometryTests: XCTestCase {
         XCTAssertEqual(evalString(env, "document.documentElement.scrollHeight"), "2560")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testScrollTopLeftStoredPerNodeAndNotifies() {
         let (env, ids) = makeEnvironment()
         defer { env.teardown() }
@@ -209,7 +209,7 @@ final class DOMGeometryTests: XCTestCase {
         XCTAssertEqual(evalString(env, "document.getElementById('inner').scrollTop"), "0")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testWindowScrollAndDocumentElementScrollTopShareScrollOffset() {
         let (env, _) = makeEnvironment()
         defer { env.teardown() }
@@ -233,7 +233,7 @@ final class DOMGeometryTests: XCTestCase {
         XCTAssertEqual(evalString(env, "document.getElementById('outer').getBoundingClientRect().top"), "-100")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testScrollIntoViewRecordsRequest() {
         let (env, ids) = makeEnvironment()
         defer { env.teardown() }
@@ -245,7 +245,7 @@ final class DOMGeometryTests: XCTestCase {
         XCTAssertEqual(env.drainScrollIntoViewRequests(), [])
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testGeometryAccessorsLiveOnThePrototype() {
         let (env, _) = makeEnvironment()
         defer { env.teardown() }

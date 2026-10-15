@@ -13,13 +13,13 @@ import XCTest
 
 final class StorageBridgeTests: XCTestCase {
 
-    @MainActor
+    @JeffJSHostActor
     private func makeEnvironment() -> JeffJSEnvironment {
         let scope = "jeffjs.test.\(UUID().uuidString)"
         return JeffJSEnvironment(configuration: .init(storageScope: scope))
     }
 
-    @MainActor
+    @JeffJSHostActor
     private func evalString(_ env: JeffJSEnvironment, _ js: String,
                             file: StaticString = #filePath, line: UInt = #line) -> String {
         switch env.eval(js) {
@@ -30,7 +30,7 @@ final class StorageBridgeTests: XCTestCase {
         }
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testMissingKeyReturnsNull() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, "String(localStorage.getItem('missing') === null)"), "true")
@@ -38,7 +38,7 @@ final class StorageBridgeTests: XCTestCase {
         XCTAssertEqual(evalString(env, "String(sessionStorage.getItem('missing') === null)"), "true")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testStoredEmptyStringIsNotNull() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -47,7 +47,7 @@ final class StorageBridgeTests: XCTestCase {
         """), "true")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testRemovedKeyReturnsNullAndKeyOutOfRangeIsNull() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -58,7 +58,7 @@ final class StorageBridgeTests: XCTestCase {
         XCTAssertEqual(evalString(env, "String(localStorage.key(999) === null && localStorage.key(-1) === null)"), "true")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testJSONParseOfEmptyStringStillThrows() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """
@@ -66,7 +66,7 @@ final class StorageBridgeTests: XCTestCase {
         """), "SyntaxError")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testRoundTripAndJSONParse() {
         let env = makeEnvironment()
         XCTAssertEqual(evalString(env, """

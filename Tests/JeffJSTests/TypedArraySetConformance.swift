@@ -65,7 +65,7 @@ extension JeffJSTestRunner {
         }
         var outcomes: [(Bool, String)] = []
         let run = {
-            MainActor.assumeIsolated {
+            JeffJSHostActor.assumeIsolated {
                 let env = JeffJSEnvironment()
                 for (name, js) in JeffJSTestRunner.getRandomValuesCases {
                     switch env.eval(js, filename: "<getRandomValues>") {

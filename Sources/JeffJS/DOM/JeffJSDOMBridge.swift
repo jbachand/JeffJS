@@ -19,7 +19,7 @@ import CoreGraphics  // CGRect/CGPoint/CGSize geometry helpers for the layout-re
 
 /// Callback invoked when JS mutates the DOM tree. The set contains UUIDs of
 /// every DOMNode that was changed, matching the JSC path's mutation observer.
-typealias JeffJSDOMMutationObserver = @MainActor @Sendable (Set<UUID>) -> Void
+typealias JeffJSDOMMutationObserver = @JeffJSHostActor @Sendable (Set<UUID>) -> Void
 
 // MARK: - JeffJSDOMBridge
 
@@ -31,7 +31,7 @@ typealias JeffJSDOMMutationObserver = @MainActor @Sendable (Set<UUID>) -> Void
 /// let bridge = JeffJSDOMBridge(root: document, baseURL: url, onMutated: { ids in ... })
 /// bridge.register(on: ctx)
 /// ```
-@MainActor
+@JeffJSHostActor
 final class JeffJSDOMBridge {
 
     // MARK: - State

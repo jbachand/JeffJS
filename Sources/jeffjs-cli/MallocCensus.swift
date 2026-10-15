@@ -439,7 +439,7 @@ func orphanRecorder(_ task: task_t, _ ctx: UnsafeMutableRawPointer?, _ type: UIn
         }
     }
 }
-@MainActor
+nonisolated
 func orphanReport(className: String, describe: (UnsafeRawPointer) -> String?) -> String {
     guard let cls = NSClassFromString(className) else { return "[Orphans] no class \(className)" }
     refTargetIsa = unsafeBitCast(cls, to: UInt.self)
@@ -473,7 +473,7 @@ func orphanReport(className: String, describe: (UnsafeRawPointer) -> String?) ->
 }
 
 /// Addresses of every live instance of `className` (zone walk, CLI only).
-@MainActor
+nonisolated
 func liveInstances(className: String) -> [UInt] {
     guard let cls = NSClassFromString(className) else { return [] }
     refTargetIsa = unsafeBitCast(cls, to: UInt.self)
@@ -506,7 +506,7 @@ func bigRecorder(_ task: task_t, _ ctx: UnsafeMutableRawPointer?, _ type: UInt32
         bigBlocks.append((UInt(ranges[i].address), Int(ranges[i].size)))
     }
 }
-@MainActor
+nonisolated
 func bigBlockReport(minBytes: Int) -> String {
     bigBlocks = []; bigBlocks.reserveCapacity(4096); bigBlockMin = minBytes
     var zonesPtr: UnsafeMutablePointer<vm_address_t>? = nil

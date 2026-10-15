@@ -84,7 +84,7 @@ final class QuantumTests: XCTestCase {
 
     // MARK: - JS bridge namespace shape (no encoder runs — just typeof probes)
 
-    @MainActor
+    @JeffJSHostActor
     func testJSBridgeNamespaceShape() {
         let env = JeffJSEnvironment()
         let probe = env.eval("""

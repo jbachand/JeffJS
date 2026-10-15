@@ -19,12 +19,12 @@ final class IntlTests: XCTestCase {
 
     // MARK: - Helpers
 
-    @MainActor
+    @JeffJSHostActor
     private func makeEnvironment() -> JeffJSEnvironment {
         return JeffJSEnvironment(configuration: .init(storageScope: "jeffjs.test.intl"))
     }
 
-    @MainActor
+    @JeffJSHostActor
     @discardableResult
     private func evalString(_ env: JeffJSEnvironment, _ js: String,
                             file: StaticString = #filePath, line: UInt = #line) -> String {
@@ -36,7 +36,7 @@ final class IntlTests: XCTestCase {
         }
     }
 
-    @MainActor
+    @JeffJSHostActor
     private func expect(_ env: JeffJSEnvironment, _ js: String, _ expected: String,
                         file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertEqual(evalString(env, js, file: file, line: line), expected,
@@ -45,7 +45,7 @@ final class IntlTests: XCTestCase {
 
     // MARK: - Presence
 
-    @MainActor
+    @JeffJSHostActor
     func testIntlIsNativeAndNotAStub() {
         let env = makeEnvironment()
         defer { env.teardown() }
@@ -65,7 +65,7 @@ final class IntlTests: XCTestCase {
 
     // MARK: - NumberFormat
 
-    @MainActor
+    @JeffJSHostActor
     func testNumberFormatBasics() {
         let env = makeEnvironment()
         defer { env.teardown() }
@@ -84,7 +84,7 @@ final class IntlTests: XCTestCase {
         expect(env, "new Intl.NumberFormat('en',{signDisplay:'always'}).format(5)", "+5")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testNumberFormatCurrency() {
         let env = makeEnvironment()
         defer { env.teardown() }
@@ -107,7 +107,7 @@ final class IntlTests: XCTestCase {
         """, "TypeError")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testNumberFormatCompactNotation() {
         let env = makeEnvironment()
         defer { env.teardown() }
@@ -119,7 +119,7 @@ final class IntlTests: XCTestCase {
         """, "999,1K,1.2K,123K,1M,1.5M,1.2M,1B,1.5T,-12K,0")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testNumberFormatPartsAndResolvedOptions() {
         let env = makeEnvironment()
         defer { env.teardown() }
@@ -147,7 +147,7 @@ final class IntlTests: XCTestCase {
 
     // MARK: - DateTimeFormat
 
-    @MainActor
+    @JeffJSHostActor
     func testDateTimeFormatComponents() {
         let env = makeEnvironment()
         defer { env.teardown() }
@@ -168,7 +168,7 @@ final class IntlTests: XCTestCase {
         """, "20/09/2026")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testDateTimeFormatResolvedOptionsHasRealTimeZone() {
         let env = makeEnvironment()
         defer { env.teardown() }
@@ -189,7 +189,7 @@ final class IntlTests: XCTestCase {
         """, "RangeError")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testDateTimeFormatPartsAndRange() {
         let env = makeEnvironment()
         defer { env.teardown() }
@@ -211,7 +211,7 @@ final class IntlTests: XCTestCase {
 
     // MARK: - Collator
 
-    @MainActor
+    @JeffJSHostActor
     func testCollatorSortsAndIsBound() {
         let env = makeEnvironment()
         defer { env.teardown() }
@@ -228,7 +228,7 @@ final class IntlTests: XCTestCase {
 
     // MARK: - PluralRules / RelativeTimeFormat / ListFormat / DisplayNames
 
-    @MainActor
+    @JeffJSHostActor
     func testPluralRules() {
         let env = makeEnvironment()
         defer { env.teardown() }
@@ -248,7 +248,7 @@ final class IntlTests: XCTestCase {
         expect(env, "new Intl.PluralRules('ja').select(1)", "other")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testRelativeTimeFormat() {
         let env = makeEnvironment()
         defer { env.teardown() }
@@ -275,7 +275,7 @@ final class IntlTests: XCTestCase {
         """, "RangeError")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testListFormatAndDisplayNames() {
         let env = makeEnvironment()
         defer { env.teardown() }
@@ -292,7 +292,7 @@ final class IntlTests: XCTestCase {
 
     // MARK: - Locale / canonicalisation / Segmenter
 
-    @MainActor
+    @JeffJSHostActor
     func testLocaleCanonicalisationAndSegmenter() {
         let env = makeEnvironment()
         defer { env.teardown() }
@@ -320,7 +320,7 @@ final class IntlTests: XCTestCase {
 
     // MARK: - Rewired builtins
 
-    @MainActor
+    @JeffJSHostActor
     func testLocaleAwareBuiltinsHonourLocalesAndOptions() {
         let env = makeEnvironment()
         defer { env.teardown() }
@@ -351,7 +351,7 @@ final class IntlTests: XCTestCase {
 
     // MARK: - crypto.subtle
 
-    @MainActor
+    @JeffJSHostActor
     func testSubtleDigestResolvesToArrayBuffer() {
         let env = makeEnvironment()
         defer { env.teardown() }
@@ -374,7 +374,7 @@ final class IntlTests: XCTestCase {
         expect(env, "LEN + ',' + IS_AB", "32,true")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testSubtleDigestAlgorithmsAndInputTypes() {
         let env = makeEnvironment()
         defer { env.teardown() }
@@ -399,7 +399,7 @@ final class IntlTests: XCTestCase {
         expect(env, "OUT.fromBuffer + ',' + OUT.fromView", "ba7816bf,ba7816bf")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testSubtleRejectsUnsupportedAndKeepsRandom() {
         let env = makeEnvironment()
         defer { env.teardown() }

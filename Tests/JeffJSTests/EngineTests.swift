@@ -396,7 +396,7 @@ final class EngineTests: XCTestCase {
     /// `print` on the global object. Any qjs-style script whose output goes
     /// through `print(...)` produced no output and exit status 0 -- it looked
     /// exactly like the engine had stopped executing mid-script.
-    @MainActor
+    @JeffJSHostActor
     func testGlobalPrintReachesConsoleSink() {
         let env = JeffJSEnvironment(configuration: .init())
         var lines: [String] = []

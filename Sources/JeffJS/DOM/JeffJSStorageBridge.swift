@@ -23,7 +23,7 @@ import Foundation
 
 // MARK: - JeffJSStorageBridge
 
-@MainActor
+@JeffJSHostActor
 final class JeffJSStorageBridge {
 
     // MARK: - Shared state
@@ -297,10 +297,8 @@ final class JeffJSStorageBridge {
         guard !targets.isEmpty else { return }
         let area = session ? "session_storage" : "local_storage"
         let url = documentURL
-        DispatchQueue.main.async {
-            MainActor.assumeIsolated {
-                for t in targets { t.deliver(area: area, key: key, oldValue: oldValue, newValue: newValue, url: url) }
-            }
+        Task { @JeffJSHostActor in
+            for t in targets { t.deliver(area: area, key: key, oldValue: oldValue, newValue: newValue, url: url) }
         }
     }
 

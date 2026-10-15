@@ -676,7 +676,7 @@ nonisolated public final class JeffJSMemoryCookieJar: JeffJSCookieJar, @unchecke
 /// HTML §3.1.3); a non-object `this` throws. Register after the DOM bridge (the
 /// document object must exist); a host polyfill guarded by
 /// `typeof document.cookie !== 'string'` then leaves it alone.
-@MainActor
+@JeffJSHostActor
 final class JeffJSCookieBridge {
     nonisolated static let debug = ProcessInfo.processInfo.environment["JEFFJS_COOKIE_DEBUG"] == "1"
     let jar: any JeffJSCookieJar

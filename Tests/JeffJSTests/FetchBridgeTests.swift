@@ -286,7 +286,7 @@ final class FetchBridgeTests: XCTestCase {
     private var base: String { "http://127.0.0.1:\(server.port)" }
     private var crossOrigin: String { "http://localhost:\(server.port)" }
 
-    @MainActor
+    @JeffJSHostActor
     private func makeEnvironment() -> JeffJSEnvironment {
         let scope = "jeffjs.fetchtest.\(UUID().uuidString)"
         return JeffJSEnvironment(configuration: .init(
@@ -296,7 +296,7 @@ final class FetchBridgeTests: XCTestCase {
 
     /// Run `js` (which must eventually set `globalThis.__out` to a string),
     /// pumping the main actor until it appears.
-    @MainActor
+    @JeffJSHostActor
     @discardableResult
     private func runJS(_ env: JeffJSEnvironment, _ js: String,
                        timeout: TimeInterval = 15,
@@ -326,7 +326,7 @@ final class FetchBridgeTests: XCTestCase {
 
     // MARK: binary
 
-    @MainActor
+    @JeffJSHostActor
     func testBinaryResponseBytes() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -339,7 +339,7 @@ final class FetchBridgeTests: XCTestCase {
         XCTAssertEqual(out, "256:0:1:255")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testBinaryRequestEchoRoundTrip() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -355,7 +355,7 @@ final class FetchBridgeTests: XCTestCase {
         XCTAssertEqual(out, "6:0,1,127,128,254,255")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testArrayBufferAndBlobBodies() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -377,7 +377,7 @@ final class FetchBridgeTests: XCTestCase {
         XCTAssertEqual(out, "9,8,7|97,98,0,255|application/x-test")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testTextDecodingCharsetAndBOM() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -397,7 +397,7 @@ final class FetchBridgeTests: XCTestCase {
         XCTAssertEqual(parts.last, "café crème", "latin1 charset decode")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testMultipartUpload() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -433,7 +433,7 @@ final class FetchBridgeTests: XCTestCase {
 
     /// The host app's own Blob/FormData polyfills use `parts` / `_entries`
     /// instead of `__blobParts` / `__formEntries`; both shapes are accepted.
-    @MainActor
+    @JeffJSHostActor
     func testHostAppBlobAndFormDataShapes() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -471,7 +471,7 @@ final class FetchBridgeTests: XCTestCase {
 
     // MARK: redirects
 
-    @MainActor
+    @JeffJSHostActor
     func testRedirectFollow() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -485,7 +485,7 @@ final class FetchBridgeTests: XCTestCase {
         XCTAssertEqual(out, "200|true|true|256")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testRedirectManualIsOpaqueRedirect() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -497,7 +497,7 @@ final class FetchBridgeTests: XCTestCase {
         XCTAssertEqual(out, "0|opaqueredirect|false")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testRedirectErrorRejects() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -511,7 +511,7 @@ final class FetchBridgeTests: XCTestCase {
 
     // MARK: CORS
 
-    @MainActor
+    @JeffJSHostActor
     func testCORSAllowedCrossOrigin() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -523,7 +523,7 @@ final class FetchBridgeTests: XCTestCase {
         XCTAssertEqual(out, "cors|200|cors-ok")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testCORSDeniedCrossOrigin() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -535,7 +535,7 @@ final class FetchBridgeTests: XCTestCase {
         XCTAssertEqual(out, "REJECTED TypeError")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testEnforceCORSFlagDisablesChecks() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -548,7 +548,7 @@ final class FetchBridgeTests: XCTestCase {
         XCTAssertEqual(out, "200|cors-ok")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testSameOriginModeRejectsCrossOrigin() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -560,7 +560,7 @@ final class FetchBridgeTests: XCTestCase {
         XCTAssertEqual(out, "REJECTED TypeError")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testNoCorsGivesOpaqueResponseButSendsRequest() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -576,7 +576,7 @@ final class FetchBridgeTests: XCTestCase {
         XCTAssertEqual(server.count("GET /cors"), before + 1, "no-cors must still send the request")
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testPreflightForNonSimpleRequestAndCache() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -592,7 +592,7 @@ final class FetchBridgeTests: XCTestCase {
         XCTAssertEqual(server.count("preflight-actual"), 2)
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testOriginHeaderIsSent() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -606,7 +606,7 @@ final class FetchBridgeTests: XCTestCase {
 
     // MARK: sendBeacon (W3C Beacon §3.2)
 
-    @MainActor
+    @JeffJSHostActor
     private func waitForBeacons(_ n: Int, timeout: TimeInterval = 10) async -> [TinyHTTPServer.Request] {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -619,7 +619,7 @@ final class FetchBridgeTests: XCTestCase {
 
     /// POST, the body's Content-Type, credentials "include" (a cross-origin cookie from the
     /// page's jar), `Origin`, no-cors for a safelisted type, nothing exposed.
-    @MainActor
+    @JeffJSHostActor
     func testSendBeaconPostsBodyWithCredentials() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -650,7 +650,7 @@ final class FetchBridgeTests: XCTestCase {
 
     /// TypeErrors for bad URLs / schemes / no arguments; false past the 64 KiB keepalive quota
     /// (one body over it, or one that does not fit next to a body still in flight).
-    @MainActor
+    @JeffJSHostActor
     func testSendBeaconErrorsAndKeepaliveQuota() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -674,7 +674,7 @@ final class FetchBridgeTests: XCTestCase {
     }
 
     /// A beacon is not cancelled by the navigation teardown (`cancelAll`), unlike a fetch.
-    @MainActor
+    @JeffJSHostActor
     func testSendBeaconSurvivesCancelAll() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -691,7 +691,7 @@ final class FetchBridgeTests: XCTestCase {
 
     // MARK: credentials
 
-    @MainActor
+    @JeffJSHostActor
     func testCredentialsIncludeSendsCookiesCrossOrigin() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -713,7 +713,7 @@ final class FetchBridgeTests: XCTestCase {
     /// One jar: a server HttpOnly cookie and a script cookie are both sent
     /// (an explicit Cookie header used to replace URLSession's stored ones),
     /// document.cookie sees only the script one, max-age=0 deletes it.
-    @MainActor
+    @JeffJSHostActor
     func testServerAndScriptCookiesShareOneJar() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -744,7 +744,7 @@ final class FetchBridgeTests: XCTestCase {
 
     /// Set-Cookie on a followed redirect is stored and sent on the next hop;
     /// the Set-Cookie header itself is not exposed to script.
-    @MainActor
+    @JeffJSHostActor
     func testRedirectSetCookieIsStoredAndSent() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -757,7 +757,7 @@ final class FetchBridgeTests: XCTestCase {
     }
 
     /// credentials: 'omit' neither sends nor stores cookies.
-    @MainActor
+    @JeffJSHostActor
     func testCredentialsOmitDoesNotStore() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -771,7 +771,7 @@ final class FetchBridgeTests: XCTestCase {
 
     // MARK: abort
 
-    @MainActor
+    @JeffJSHostActor
     func testAbortSignalRejectsWithAbortError() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -787,7 +787,7 @@ final class FetchBridgeTests: XCTestCase {
 
     // MARK: XHR
 
-    @MainActor
+    @JeffJSHostActor
     func testXHRResponseTypes() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()
@@ -815,7 +815,7 @@ final class FetchBridgeTests: XCTestCase {
 
     /// 200 sequential fetches; with JEFFJS_TRACK_RC=1 the atexit refcount
     /// report must not grow with the loop.
-    @MainActor
+    @JeffJSHostActor
     func testTwoHundredFetchesComplete() async throws {
         try skipIfNoServer()
         let env = makeEnvironment()

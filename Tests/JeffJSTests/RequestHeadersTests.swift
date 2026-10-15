@@ -235,7 +235,7 @@ final class RequestHeadersTests: XCTestCase {
         super.tearDown()
     }
 
-    @MainActor
+    @JeffJSHostActor
     private func runJS(_ env: JeffJSEnvironment, _ js: String) async -> String {
         switch env.eval("globalThis.__out = undefined;\n" + js) {
         case .exception(let msg): XCTFail("JS threw: \(msg)"); return ""
@@ -256,7 +256,7 @@ final class RequestHeadersTests: XCTestCase {
         (try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: String]) ?? [:]
     }
 
-    @MainActor
+    @JeffJSHostActor
     func testFetchAndXHRSendRefererAndFetchMetadata() async throws {
         let server = try XCTUnwrap(server, "could not bind a loopback port")
         let base = "http://127.0.0.1:\(server.port)"

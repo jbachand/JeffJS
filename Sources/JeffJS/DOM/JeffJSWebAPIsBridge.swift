@@ -17,7 +17,7 @@ import Foundation
 import Security
 import CryptoKit
 
-@MainActor
+@JeffJSHostActor
 final class JeffJSWebAPIsBridge {
 
     // MARK: - State

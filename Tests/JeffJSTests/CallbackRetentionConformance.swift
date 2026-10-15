@@ -201,7 +201,7 @@ extension JeffJSTestRunner {
         let saved = (jeffJSZombiesEnabled, jeffJS_refDebugMode, jeffJSObjectPoolDisabled)
         jeffJSZombiesEnabled = true; jeffJS_refDebugMode = true; jeffJSObjectPoolDisabled = true
         let touchesBefore = JeffJSZombieDebug.touches
-        @MainActor func check(_ e: JeffJSEnvironment, _ name: String, _ js: String) {
+        @JeffJSHostActor func check(_ e: JeffJSEnvironment, _ name: String, _ js: String) {
             switch e.eval(js, filename: "<callback-retention>") {
             case .success(let value):
                 outcomes.append((value == "true", "CallbackRetention: \(name) -> \(value ?? "undefined")"))
@@ -211,7 +211,7 @@ extension JeffJSTestRunner {
         }
 
         onMain {
-            MainActor.assumeIsolated {
+            JeffJSHostActor.assumeIsolated {
                 do {
                     let e = JeffJSEnvironment()
                     env = e
@@ -241,13 +241,13 @@ extension JeffJSTestRunner {
         for _ in 0..<100 where !fired {
             Thread.sleep(forTimeInterval: 0.02)
             onMain {
-                MainActor.assumeIsolated {
+                JeffJSHostActor.assumeIsolated {
                     if case .success(let v) = env?.eval("__cbIv.length > 0") { fired = v == "true" }
                 }
             }
         }
         onMain {
-            MainActor.assumeIsolated {
+            JeffJSHostActor.assumeIsolated {
                 do {
                     if let e = env {
                         // Give a (wrongly) surviving interval a chance to fire again.
