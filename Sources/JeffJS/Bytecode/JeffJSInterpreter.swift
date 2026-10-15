@@ -10077,6 +10077,11 @@ struct JeffJSInterpreter {
                 let atom = readU32(bc, pc + 1)
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) // ref object (unused in global mode)
+                if ctx.globalLexCount > 0 {
+                    let lr = ctx.putGlobalLexical(atom: atom, val: val, isInit: false)
+                    if lr < 0 { retVal = .exception; break dispatchLoop }
+                    if lr > 0 { pc += 5; continue dispatchLoop }
+                }
                 let ok = ctx.putGlobalVar(atom: atom, val: val, flags: JS_PROP_HAS_VALUE | JS_PROP_THROW)
                 if !ok {
                     retVal = .exception

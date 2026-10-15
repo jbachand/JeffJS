@@ -114,6 +114,20 @@ extension JeffJSTestRunner {
         check("let over a non-configurable global", "let NaN = 1;", "EXC:SyntaxError")
         check("let over a configurable builtin", "let Array = 1; String(Array) + ',' + typeof globalThis.Array", "1,function")
         check("same-script duplicates", "let d1 = 1; let d1 = 2;", "EXC:SyntaxError")
+        // Strict code assigning another script's bindings, through a warmed put_var site too.
+        check("strict define", "let sl1 = 1; const sc3 = 2; function lf1() { return 'lf' + sl1; }", "undefined")
+        check("strict assign hits the lexical", "'use strict'; for (var i = 0; i < 400; i++) sl1 = i; String(sl1) + ',' + globalThis.sl1", "399,undefined")
+        check("strict const is a TypeError", "'use strict'; var e; try { for (var i = 0; i < 400; i++) sc3 = i; } catch (x) { e = x.name; } e + ',' + sc3", "TypeError,2")
+        check("strict undeclared is a ReferenceError", "'use strict'; var e; try { undeclaredStrictName = 1; } catch (x) { e = x.name; } e + ',' + typeof undeclaredStrictName", "ReferenceError,undefined")
+        check("strict tdz assignment", "'use strict'; var e; try { tdzS = 1; } catch (x) { e = x.name; } let tdzS = 0; e", "ReferenceError")
+        // `with` over an object that lacks the name falls through to the lexical.
+        check("with miss reads the lexical", "var r; with ({}) { r = sl1; } String(r)", "399")
+        check("with miss assigns the lexical", "with ({}) { sl1 = 7; } String(sl1) + ',' + globalThis.sl1", "7,undefined")
+        check("with hit assigns the object", "var o = { sl1: 1 }; with (o) { sl1 = 9; } String(o.sl1) + ',' + sl1", "9,7")
+        check("with compound assignment", "with ({}) { sl1++; sl1 += 2; } String(sl1)", "10")
+        check("with const is a TypeError", "var e; try { with ({}) { sc3 = 1; } } catch (x) { e = x.name; } e + ',' + sc3", "TypeError,2")
+        check("with calls a lexical function", "var r; with ({}) { r = lf1(); } r", "lf10")
+        check("with tdz", "var e1, e2; try { with ({}) { tdzW = 1; } } catch (x) { e1 = x.name; } try { with ({}) { tdzW; } } catch (x) { e2 = x.name; } let tdzW = 0; e1 + ',' + e2", "ReferenceError,ReferenceError")
         // Eval code keeps its own lexical scope.
         check("indirect eval let is local", "(0, eval)('let ev1 = 1; ev1') + ',' + typeof ev1", "1,undefined")
         check("direct eval let is local", "eval('let ev2 = 2; ev2') + ',' + typeof ev2", "2,undefined")
