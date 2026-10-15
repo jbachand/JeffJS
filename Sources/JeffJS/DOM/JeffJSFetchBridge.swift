@@ -55,7 +55,7 @@ import Foundation
 // MARK: - Network Log Entry
 
 /// Log entry for fetch request diagnostics.
-public struct JeffJSNetworkLogEntry: Sendable {
+nonisolated public struct JeffJSNetworkLogEntry: Sendable {
     public let method: String
     public let url: String
     public let statusCode: Int
