@@ -439,7 +439,9 @@ extension JeffJSParser {
 
         if !isExpression && className != 0 {
             checkLexicalDeclaration(className, kind: .classDecl)
-            let varIdx = defineVar(className, isConst: true, isLexical: true)
+            // A script-level class declaration is a global lexical binding
+            // (writable, like `let`); anywhere else the outer binding stays local.
+            let varIdx = defineLexicalBinding(className, isConst: !declaresGlobalLexical)
             emitScopePutVarInit(className, scopeLevel: fd.curScope)
             _ = varIdx
         }

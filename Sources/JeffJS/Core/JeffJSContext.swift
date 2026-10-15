@@ -412,6 +412,18 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// The global variable object. In browsers, this is the same as globalObj.
     /// In QuickJS, it can differ when using scoped globals.
     var globalVarObj: JeffJSValue
+    /// Script-level `let`/`const`/`class` bindings (QuickJS `global_var_obj`): a
+    /// null-prototype object whose data properties are the bindings, an
+    /// uninitialised slot being a binding in its TDZ. Consulted before the
+    /// global object by every global-variable access.
+    var globalLexCount: Int = 0
+    /// Bumped whenever a lexical binding is created. Global-variable inline
+    /// cache entries record it (in their `atom` field, unused at those sites) and
+    /// only hit while it is unchanged: a new lexical binding may shadow a
+    /// cached global-object property.
+    var globalLexEpoch: UInt32 = 1
+    static let defineGlobalLexVar = 1 << 7      // QuickJS DEFINE_GLOBAL_LEX_VAR
+    static let defineGlobalFuncVar = 1 << 6     // QuickJS DEFINE_GLOBAL_FUNC_VAR
 
     // MARK: - Random State
 
@@ -3729,7 +3741,12 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         obj.shape = createShape(self, proto: nil, hashSize: JS_PROP_INITIAL_HASH_SIZE, propSize: JS_PROP_INITIAL_SIZE)
         obj.clearProps()
         globalObj = JeffJSValue.makeObject(obj)
-        globalVarObj = globalObj.dupValue()
+        let lex = JeffJSObject()
+        lex.classID = JSClassID.JS_CLASS_OBJECT.rawValue
+        lex.extensible = true
+        lex.shape = createShape(self, proto: nil, hashSize: JS_PROP_INITIAL_HASH_SIZE, propSize: JS_PROP_INITIAL_SIZE)
+        lex.clearProps()
+        globalVarObj = JeffJSValue.makeObject(lex)
         // Register as protected: freeObject reports loudly if the global
         // object is ever over-released mid-run (UAF tripwire).
         rt.protectedGlobals.insert(ObjectIdentifier(obj))

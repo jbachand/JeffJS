@@ -140,6 +140,35 @@ func jeffJS_arithGeneric(_ ctx: JeffJSContext, _ ar: UInt8, _ lhs: JeffJSValue, 
     return jeffJS_arithNumeric(ar, a, b)
 }
 
+/// Marker in an inline-cache entry's `atom` field: the site's cached slot is in the
+/// global lexical record (entry.shapePtr = the record's shape), not on the global
+/// object (whose entries carry `ctx.globalLexEpoch` there).
+let jeffJSLexicalICTag: UInt32 = 0xFFFF_FFFF
+
+/// Read a script-level let/const/class binding through a lexical IC entry: nil on
+/// a shape mismatch (a binding was added) or while the slot is in its TDZ.
+@inline(__always)
+func jeffJS_lexicalICGet(_ ctx: JeffJSContext, _ entry: JeffJSICEntry) -> JeffJSValue? {
+    guard let lo = ctx.globalVarObj.obj, lo.shapeIdentity == entry.shapePtr,
+          entry.propOffset >= 0, entry.propOffset < lo.propCount else { return nil }
+    let v = lo.dataValue(at: entry.propOffset)
+    if v.isUninitialized { return nil }
+    return v.dupValue()
+}
+
+/// Store through a lexical IC entry (writable bindings only; a const's entry has
+/// `writable` false). true: `val` moved into the slot; false: nothing changed.
+@inline(__always)
+func jeffJS_lexicalICPut(_ ctx: JeffJSContext, _ entry: JeffJSICEntry, _ val: JeffJSValue) -> Bool {
+    guard entry.writable, let lo = ctx.globalVarObj.obj, lo.shapeIdentity == entry.shapePtr,
+          entry.propOffset >= 0, entry.propOffset < lo.propCount else { return false }
+    let old = lo.dataValue(at: entry.propOffset)
+    if old.isUninitialized { return false }
+    lo.asClass.propValues[entry.propOffset] = val
+    old.freeValue()
+    return true
+}
+
 /// Guarded pop for the main dispatch loop (the fallback interpreter): a
 /// bytecode sequence that pops more than it pushed returns undefined and is
 /// reported once instead of reading below the value buffer. File-scope so it
@@ -2258,7 +2287,85 @@ extension JeffJSContext {
 
     /// Checks if a global variable exists.
     func checkGlobalVar(atom: UInt32) -> Bool {
+        if globalLexIndex(atom) >= 0 { return true }
         return hasProperty(obj: globalObj, atom: atom)
+    }
+
+    // MARK: Global lexical environment (QuickJS global_var_obj)
+
+    /// Slot of `atom` in the global lexical record, or -1. O(1) when no script
+    /// declared a top-level let/const/class.
+    @inline(__always)
+    func globalLexIndex(_ atom: UInt32) -> Int {
+        guard globalLexCount > 0, let lo = globalVarObj.toObject() else { return -1 }
+        return jeffJS_findOwnPropertyIndex(obj: lo, atom: atom)
+    }
+
+    /// Drop every script-level let/const/class binding (a fresh, empty record).
+    /// For hosts and test harnesses that evaluate unrelated snippets in one
+    /// context as if each were its own page; not part of any script-visible API.
+    func resetGlobalLexicalBindings() {
+        guard globalLexCount > 0 else { return }
+        let lex = JeffJSObject()
+        lex.classID = JSClassID.JS_CLASS_OBJECT.rawValue
+        lex.extensible = true
+        lex.shape = createShape(self, proto: nil, hashSize: JS_PROP_INITIAL_HASH_SIZE, propSize: JS_PROP_INITIAL_SIZE)
+        lex.clearProps()
+        let old = globalVarObj
+        globalVarObj = JeffJSValue.makeObject(lex)
+        old.freeValue()
+        globalLexCount = 0
+        globalLexEpoch &+= 1
+    }
+
+    /// TDZ read: ReferenceError while the binding is uninitialised.
+    func throwGlobalLexicalTDZ(_ atom: UInt32) {
+        jeffJS_coldThrow(self, .m8)
+    }
+
+    /// JS_DefineGlobalVar with DEFINE_GLOBAL_LEX_VAR: create the binding
+    /// uninitialised in the lexical record (const bindings are read-only).
+    func defineGlobalLexical(atom: UInt32, isConst: Bool) -> Bool {
+        guard globalVarObj.isObject else { return false }
+        let flags = JS_PROP_ENUMERABLE | (isConst ? 0 : JS_PROP_WRITABLE)
+        let ok = definePropertyValue(obj: globalVarObj, atom: atom, value: .uninitialized, flags: flags) >= 0
+        if ok { globalLexCount += 1; globalLexEpoch &+= 1 }
+        return ok
+    }
+
+    /// Lexical-first read: nil when `atom` is not a lexical binding.
+    /// A returned `.exception` means the binding is in its TDZ (thrown).
+    @inline(__always)
+    func getGlobalLexical(_ atom: UInt32) -> JeffJSValue? {
+        let idx = globalLexIndex(atom)
+        if idx < 0 { return nil }
+        guard let lo = globalVarObj.toObject(), idx < lo.propCount else { return nil }
+        let v = lo.propValues[idx]
+        if v.isUninitialized { throwGlobalLexicalTDZ(atom); return .exception }
+        return v.dupValue()
+    }
+
+    /// Lexical-first assignment (PutValue to a script-level binding). Returns
+    /// 0 when `atom` is not lexical (the value is untouched), 1 when stored
+    /// (value consumed), -1 on a pending exception (value consumed): TDZ is a
+    /// ReferenceError, a const binding a TypeError. `isInit` skips both checks
+    /// (the declaration's own initialisation).
+    func putGlobalLexical(atom: UInt32, val: JeffJSValue, isInit: Bool) -> Int {
+        let idx = globalLexIndex(atom)
+        if idx < 0 { return 0 }
+        guard let lo = globalVarObj.toObject(), idx < lo.propCount, let shape = lo.shape else { return 0 }
+        if !isInit {
+            if lo.propValues[idx].isUninitialized {
+                val.freeValue(); throwGlobalLexicalTDZ(atom); return -1
+            }
+            if !shape.prop[idx].flags.contains(.writable) {
+                val.freeValue(); jeffJS_coldThrow(self, .constAssign); return -1
+            }
+        }
+        let old = lo.propValues[idx]
+        lo.propValues[idx] = val
+        old.freeValue()
+        return 1
     }
 
     /// Gets a global variable value.
@@ -2270,6 +2377,9 @@ extension JeffJSContext {
     /// object (including its prototype chain).  Only throw ReferenceError when
     /// the property does not exist at all.
     func getGlobalVar(atom: UInt32, throwRefError: Bool) -> JeffJSValue {
+        // Script-level let/const/class shadow the global object (GetBindingValue
+        // on the global Environment Record: the declarative record first).
+        if globalLexCount > 0, let lv = getGlobalLexical(atom) { return lv }
         // Fast path: plain data property on the global object itself.
         // One hash probe; covers the overwhelming majority of global reads
         // (top-level `var`s and builtins). Existence is established by the
@@ -2332,6 +2442,10 @@ extension JeffJSContext {
     /// define_var every iteration, and redefining the slot with `undefined`
     /// would drop the previous value without releasing it.
     func defineGlobalVar(atom: UInt32, flags: Int) -> Bool {
+        if globalLexCount > 0, globalLexIndex(atom) >= 0 {
+            _ = throwSyntaxError(message: "Identifier '\(rt.atomToString(atom) ?? "")' has already been declared")
+            return false
+        }
         if let gObj = globalObj.toObject(), gObj.shape != nil,
            jeffJS_findOwnPropertyIndex(obj: gObj, atom: atom) >= 0 {
             return true
@@ -2342,12 +2456,33 @@ extension JeffJSContext {
     /// Checks if a global variable can be defined.
     /// Returns false if the global object is not extensible and the property doesn't exist.
     func checkDefineGlobalVar(atom: UInt32, flags: Int) -> Bool {
-        // If the property already exists, it can be redefined (subject to other checks)
-        if hasProperty(obj: globalObj, atom: atom) { return true }
-        // If the global object is not extensible, can't add new properties
-        if let obj = globalObj.toObject(), !obj.extensible {
-            _ = throwTypeError(message: "Cannot define property on non-extensible object")
+        // JS_CheckDefineGlobalVar (GlobalDeclarationInstantiation steps 3-9).
+        func redeclared() -> Bool {
+            _ = throwSyntaxError(message: "Identifier '\(rt.atomToString(atom) ?? "")' has already been declared")
             return false
+        }
+        // Already a lexical binding (a let/const/class of an earlier script).
+        if globalLexIndex(atom) >= 0 { return redeclared() }
+        var idx = -1
+        var propFlags: JeffJSPropertyFlags? = nil
+        if let g = globalObj.toObject(), let shape = g.shape {
+            idx = jeffJS_findOwnPropertyIndex(obj: g, atom: atom)
+            if idx >= 0, idx < shape.prop.count { propFlags = shape.prop[idx].flags }
+        }
+        let extensible = globalObj.toObject()?.extensible ?? true
+        if flags & JeffJSContext.defineGlobalLexVar != 0 {
+            // HasRestrictedGlobalProperty: a non-configurable own property.
+            if let f = propFlags, !f.contains(.configurable) { return redeclared() }
+        } else {
+            if propFlags == nil && !extensible {
+                _ = throwTypeError(message: "Cannot define variable '\(rt.atomToString(atom) ?? "")': the global object is not extensible")
+                return false
+            }
+            if flags & JeffJSContext.defineGlobalFuncVar != 0, let f = propFlags, !f.contains(.configurable),
+               f.isGetSet || !(f.contains(.writable) && f.contains(.enumerable)) {
+                _ = throwTypeError(message: "Cannot define variable '\(rt.atomToString(atom) ?? "")'")
+                return false
+            }
         }
         return true
     }
@@ -2362,6 +2497,10 @@ extension JeffJSContext {
     /// attributes and all (`definePropertyValue` never refuses). `flags`: enumerable,
     /// plus configurable for eval code (the define_func site); writable is added here.
     func defineGlobalFunc(atom: UInt32, val: JeffJSValue, flags: Int) -> Bool {
+        if globalLexCount > 0, globalLexIndex(atom) >= 0 {
+            _ = throwSyntaxError(message: "Identifier '\(rt.atomToString(atom) ?? "")' has already been declared")
+            return false
+        }
         if let g = globalObj.toObject(), let shape = g.shape {
             let idx = jeffJS_findOwnPropertyIndex(obj: g, atom: atom)
             if idx >= 0, idx < shape.prop.count, !shape.prop[idx].flags.contains(.configurable) {
@@ -2380,6 +2519,7 @@ extension JeffJSContext {
 
     /// Deletes a global variable.
     func deleteGlobalVar(atom: UInt32) -> Bool {
+        if globalLexIndex(atom) >= 0 { return false }   // lexical bindings are not deletable
         return deleteProperty(obj: globalObj, atom: atom)
     }
 
@@ -3069,6 +3209,7 @@ extension JeffJSContext {
 
     /// Creates a global variable reference.
     func makeGlobalVarRef(atom: UInt32) -> (JeffJSValue, JeffJSValue) {
+        if globalLexIndex(atom) >= 0 { return (globalVarObj.dupValue(), atomToString(atom)) }
         return (globalObj.dupValue(), atomToString(atom))
     }
 
@@ -4723,8 +4864,13 @@ private func executeFastTrace(
                 resume = pc; break traceLoop // deopt: no IC table yet
             }
             let entry = ents[jeffJS_icSlot(ents, pc)]
+            if entry.pc == pc, entry.atom == jeffJSLexicalICTag, let lv = jeffJS_lexicalICGet(ctx, entry) {
+                buf[sp] = lv; sp += 1
+                pc += 5
+                continue traceLoop
+            }
             if entry.pc == pc,
-               entry.shapePtr == gShapeId,
+               entry.shapePtr == gShapeId, entry.atom == ctx.globalLexEpoch,
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
                gObj.extra(at: entry.propOffset) == nil {
                 buf[sp] = gObj.dataValue(at: entry.propOffset).dupValue(); sp += 1
@@ -4738,8 +4884,13 @@ private func executeFastTrace(
                 resume = pc; break traceLoop // deopt
             }
             let entry = ents[jeffJS_icSlot(ents, pc)]
+            if entry.pc == pc, entry.atom == jeffJSLexicalICTag, sp >= 1, jeffJS_lexicalICPut(ctx, entry, buf[sp - 1]) {
+                sp -= 1
+                pc += 5
+                continue traceLoop
+            }
             if entry.pc == pc,
-               entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
+               entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()), entry.atom == ctx.globalLexEpoch,
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
                entry.propOffset < gShape.prop.count,
                gShape.prop[entry.propOffset].flags.contains(.writable),
@@ -6057,8 +6208,13 @@ private func executeFastTraceLean(
                 ctx.interruptCounter = interrupt; return pc // deopt: no IC table yet
             }
             let entry = ents[jeffJS_icSlot(ents, pc)]
+            if entry.pc == pc, entry.atom == jeffJSLexicalICTag, let lv = jeffJS_lexicalICGet(ctx, entry) {
+                buf[sp] = lv; sp += 1
+                pc += 5
+                continue traceLoop
+            }
             if entry.pc == pc,
-               entry.shapePtr == gShapeId,
+               entry.shapePtr == gShapeId, entry.atom == ctx.globalLexEpoch,
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
                gObj.extra(at: entry.propOffset) == nil {
                 buf[sp] = gObj.dataValue(at: entry.propOffset).dupValue(); sp += 1
@@ -6072,8 +6228,13 @@ private func executeFastTraceLean(
                 ctx.interruptCounter = interrupt; return pc // deopt
             }
             let entry = ents[jeffJS_icSlot(ents, pc)]
+            if entry.pc == pc, entry.atom == jeffJSLexicalICTag, sp >= 1, jeffJS_lexicalICPut(ctx, entry, buf[sp - 1]) {
+                sp -= 1
+                pc += 5
+                continue traceLoop
+            }
             if entry.pc == pc,
-               entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
+               entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()), entry.atom == ctx.globalLexEpoch,
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
                entry.propOffset < gShape.prop.count,
                gShape.prop[entry.propOffset].flags.contains(.writable),
@@ -9866,8 +10027,13 @@ struct JeffJSInterpreter {
                 // hash lookup per read into a direct slot load.
                 if let gObj = ctx.globalObj.obj, let gShape = gObj.shape, let ic = fb.ic {
                     let entry = ic.lookup(pc)
+                    if entry.pc == pc, entry.atom == jeffJSLexicalICTag, let lv = jeffJS_lexicalICGet(ctx, entry) {
+                        buf[sp] = lv; sp += 1
+                        pc += 5
+                        continue dispatchLoop
+                    }
                     if entry.pc == pc,
-                       entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
+                       entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()), entry.atom == ctx.globalLexEpoch,
                        entry.propOffset >= 0, entry.propOffset < gObj.propCount,
                        gObj.extra(at: entry.propOffset) == nil {
                         buf[sp] = gObj.dataValue(at: entry.propOffset).dupValue(); sp += 1
@@ -9883,11 +10049,17 @@ struct JeffJSInterpreter {
                 }
                 buf[sp] = val; sp += 1
                 // Cache plain data slots for the next read
-                if let gObj = ctx.globalObj.obj, let gShape = gObj.shape {
+                let lexIdx = ctx.globalLexIndex(atom)
+                if lexIdx >= 0 {
+                    // A script-level let/const/class binding: cache its slot in the lexical record.
+                    if let lo = ctx.globalVarObj.obj, let lsh = lo.shape {
+                        fb.getIC().update(pc, shape: lsh, propOffset: lexIdx, atom: jeffJSLexicalICTag)
+                    }
+                } else if let gObj = ctx.globalObj.obj, let gShape = gObj.shape {
                     if let idx = findShapeProperty(gShape, atom), idx < gObj.propCount,
                        gShape.prop[idx].flags.isPlainData,
                        gShape.prop[idx].flags.contains(.writable) {
-                        fb.getIC().update(pc, shape: gShape, propOffset: idx)
+                        fb.getIC().update(pc, shape: gShape, propOffset: idx, atom: ctx.globalLexEpoch)
                     }
                 }
                 pc += 5
@@ -9898,8 +10070,12 @@ struct JeffJSInterpreter {
                 // Global-var inline cache: shape-matched writable data slot
                 if let gObj = ctx.globalObj.obj, let gShape = gObj.shape, let ic = fb.ic {
                     let entry = ic.lookup(pc)
+                    if entry.pc == pc, entry.atom == jeffJSLexicalICTag, jeffJS_lexicalICPut(ctx, entry, val) {
+                        pc += 5
+                        continue dispatchLoop
+                    }
                     if entry.pc == pc,
-                       entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()),
+                       entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()), entry.atom == ctx.globalLexEpoch,
                        entry.propOffset >= 0, entry.propOffset < gObj.propCount,
                        entry.propOffset < gShape.prop.count,
                        gShape.prop[entry.propOffset].flags.contains(.writable),
@@ -9910,6 +10086,19 @@ struct JeffJSInterpreter {
                         old.freeValue()
                         pc += 5
                         continue dispatchLoop
+                    }
+                }
+                // A script-level let/const/class binding shadows the global
+                // object (TDZ ReferenceError, const TypeError).
+                if ctx.globalLexCount > 0 {
+                    let lr = ctx.putGlobalLexical(atom: atom, val: val, isInit: false)
+                    if lr < 0 { retVal = .exception; break dispatchLoop }
+                    if lr > 0 {
+                        let lexIdx = ctx.globalLexIndex(atom)
+                        if lexIdx >= 0, let lo = ctx.globalVarObj.obj, let lsh = lo.shape {
+                            fb.getIC().update(pc, shape: lsh, propOffset: lexIdx, atom: jeffJSLexicalICTag)
+                        }
+                        pc += 5; continue dispatchLoop
                     }
                 }
                 // Strict code: assigning an unresolvable reference is a
@@ -9929,11 +10118,11 @@ struct JeffJSInterpreter {
                     retVal = .exception
                     break dispatchLoop
                 }
-                if let gObj = ctx.globalObj.obj, let gShape = gObj.shape {
+                if ctx.globalLexIndex(atom) < 0, let gObj = ctx.globalObj.obj, let gShape = gObj.shape {
                     if let idx = findShapeProperty(gShape, atom), idx < gObj.propCount,
                        gShape.prop[idx].flags.isPlainData,
                        gShape.prop[idx].flags.contains(.writable) {
-                        fb.getIC().update(pc, shape: gShape, propOffset: idx)
+                        fb.getIC().update(pc, shape: gShape, propOffset: idx, atom: ctx.globalLexEpoch)
                     }
                 }
                 pc += 5
@@ -9941,6 +10130,12 @@ struct JeffJSInterpreter {
             case .put_var_init:
                 let atom = readU32(bc, pc + 1)
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                if ctx.globalLexCount > 0 {
+                    // Initialisation of a script-level let/const/class binding.
+                    let lr = ctx.putGlobalLexical(atom: atom, val: val, isInit: true)
+                    if lr < 0 { retVal = .exception; break dispatchLoop }
+                    if lr > 0 { pc += 5; continue dispatchLoop }
+                }
                 let ok = ctx.putGlobalVar(atom: atom, val: val, flags: JS_PROP_CONFIGURABLE)
                 if !ok {
                     retVal = .exception
@@ -9952,6 +10147,11 @@ struct JeffJSInterpreter {
                 let atom = readU32(bc, pc + 1)
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) // ref object (unused in global mode)
+                if ctx.globalLexCount > 0 {
+                    let lr = ctx.putGlobalLexical(atom: atom, val: val, isInit: false)
+                    if lr < 0 { retVal = .exception; break dispatchLoop }
+                    if lr > 0 { pc += 5; continue dispatchLoop }
+                }
                 let ok = ctx.putGlobalVar(atom: atom, val: val, flags: JS_PROP_HAS_VALUE | JS_PROP_THROW)
                 if !ok {
                     retVal = .exception
@@ -9993,6 +10193,17 @@ struct JeffJSInterpreter {
                 // configurable: D } with D true only for eval code (§19.2.1.3 step
                 // 16.b.i.2 / §16.1.7 step 17: a script's `var` is non-deletable). The
                 // operand (C|W, from the parser and every cached blob) is not used.
+                let defOperand = Int(readU8(bc, pc + 5))
+                if defOperand & JeffJSContext.defineGlobalLexVar != 0 {
+                    // GlobalDeclarationInstantiation step 17: a lexical binding of the
+                    // global lexical record, uninitialised until its declaration runs.
+                    if !ctx.defineGlobalLexical(atom: atom, isConst: defOperand & JS_PROP_WRITABLE == 0) {
+                        retVal = .exception
+                        break dispatchLoop
+                    }
+                    pc += 6
+                    continue dispatchLoop
+                }
                 let defFlags = JS_PROP_WRITABLE | JS_PROP_ENUMERABLE
                     | (fb.isDirectOrIndirectEval ? JS_PROP_CONFIGURABLE : 0)
                 let ok = ctx.defineGlobalVar(atom: atom, flags: defFlags)

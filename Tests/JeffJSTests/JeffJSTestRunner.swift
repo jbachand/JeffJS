@@ -68,6 +68,7 @@ struct JeffJSQuickVerify {
         let ctx = rt.newContext()
         var pass = 0, fail = 0
         func check(_ code: String, _ expected: String) {
+            ctx.resetGlobalLexicalBindings()
             let r = ctx.eval(input: code, filename: "<v>", evalFlags: 0)
             let got = ctx.toSwiftString(r) ?? (r.isUndefined ? "undefined" : r.isNull ? "null" : "?\(r.debugDescription)")
             if got == expected { pass += 1 }
@@ -520,6 +521,7 @@ struct JeffJSTestRunner {
     /// Evaluate JS code and check the result is the expected Int32.
     mutating func evalCheck(_ ctx: JeffJSContext, _ code: String, expectInt: Int32) {
         JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
+        ctx.resetGlobalLexicalBindings()   // each snippet is its own page: script-level let/const are shared per context
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException {
@@ -539,6 +541,7 @@ struct JeffJSTestRunner {
     /// Evaluate JS code and check the result converts to the expected Double.
     mutating func evalCheckDouble(_ ctx: JeffJSContext, _ code: String, expect: Double, tolerance: Double = 1e-10) {
         JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
+        ctx.resetGlobalLexicalBindings()   // each snippet is its own page: script-level let/const are shared per context
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException {
@@ -564,6 +567,7 @@ struct JeffJSTestRunner {
     /// Evaluate JS code and check the result is the expected Bool.
     mutating func evalCheckBool(_ ctx: JeffJSContext, _ code: String, expect: Bool) {
         JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
+        ctx.resetGlobalLexicalBindings()   // each snippet is its own page: script-level let/const are shared per context
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException {
@@ -579,6 +583,7 @@ struct JeffJSTestRunner {
     /// Evaluate JS code and check the result is the expected String.
     mutating func evalCheckStr(_ ctx: JeffJSContext, _ code: String, expect: String) {
         JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
+        ctx.resetGlobalLexicalBindings()   // each snippet is its own page: script-level let/const are shared per context
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException {
@@ -597,6 +602,7 @@ struct JeffJSTestRunner {
     /// Evaluate JS code and check that it throws an exception.
     mutating func evalCheckException(_ ctx: JeffJSContext, _ code: String) {
         JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
+        ctx.resetGlobalLexicalBindings()   // each snippet is its own page: script-level let/const are shared per context
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         assert(result.isException, "\(code) => expected exception, got non-exception")
@@ -606,6 +612,7 @@ struct JeffJSTestRunner {
     /// Evaluate JS code and check that the result is undefined.
     mutating func evalCheckUndefined(_ ctx: JeffJSContext, _ code: String) {
         JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
+        ctx.resetGlobalLexicalBindings()   // each snippet is its own page: script-level let/const are shared per context
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException {
@@ -619,6 +626,7 @@ struct JeffJSTestRunner {
     /// Evaluate JS code and check that the result is null.
     mutating func evalCheckNull(_ ctx: JeffJSContext, _ code: String) {
         JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
+        ctx.resetGlobalLexicalBindings()   // each snippet is its own page: script-level let/const are shared per context
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException {
@@ -633,6 +641,7 @@ struct JeffJSTestRunner {
     /// Used for tests where the engine's current behavior differs from spec.
     mutating func evalCheckAnyInt(_ ctx: JeffJSContext, _ code: String, accept values: [Int32]) {
         JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
+        ctx.resetGlobalLexicalBindings()   // each snippet is its own page: script-level let/const are shared per context
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException {
@@ -654,6 +663,7 @@ struct JeffJSTestRunner {
     /// and we just want to verify it doesn't crash.
     mutating func evalCheckAcceptAny(_ ctx: JeffJSContext, _ code: String) {
         JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
+        ctx.resetGlobalLexicalBindings()   // each snippet is its own page: script-level let/const are shared per context
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException { _ = ctx.getException() }
@@ -663,6 +673,7 @@ struct JeffJSTestRunner {
     /// Evaluate JS code and accept any of the given string values (or exception).
     mutating func evalCheckAnyStr(_ ctx: JeffJSContext, _ code: String, accept values: [String]) {
         JeffJSStackDiag.currentLabel = String(code.prefix(60)).replacingOccurrences(of: "\n", with: " ")
+        ctx.resetGlobalLexicalBindings()   // each snippet is its own page: script-level let/const are shared per context
         let result = ctx.eval(input: code, filename: "<test>", evalFlags: JS_EVAL_TYPE_GLOBAL)
         defer { result.freeValue() }
         if result.isException {
@@ -1309,7 +1320,7 @@ extension JeffJSTestRunner {
             """, expectInt: 3)
 
         // const
-        evalCheck(ctx, "const x = 42; x", expectInt: 42)
+        evalCheck(ctx, "const xk42 = 42; xk42", expectInt: 42)
         // const reassignment — throws TypeError per spec
         evalCheckException(ctx, "const x = 1; x = 2; x")
 
@@ -3679,9 +3690,9 @@ extension JeffJSTestRunner {
             new P('h', ...['x', 'y']).n
             """, expectInt: 3)
         evalCheckStr(ctx, """
-            class P { constructor(...a) { this.s = a.join(','); } }
-            class D extends P { constructor(x, ...r) { super(x, ...r, 'd'); } }
-            new D('h', 'x').s
+            class PSp { constructor(...a) { this.s = a.join(','); } }
+            class DSp extends PSp { constructor(x, ...r) { super(x, ...r, 'd'); } }
+            new DSp('h', 'x').s
             """, expect: "h,x,d")
         evalCheck(ctx, "Math.max(1, ...[5, 3])", expectInt: 5)
         evalCheckStr(ctx, """
@@ -4700,12 +4711,12 @@ extension JeffJSTestRunner {
         evalCheck(ctx, "var a = 10, b = 20, c = 30; a + b + c", expectInt: 60)
 
         // let declaration and read
-        evalCheck(ctx, "let c = 10; c * 2", expectInt: 20)
-        evalCheck(ctx, "let x = 5, y = 3; x - y", expectInt: 2)
+        evalCheck(ctx, "let cL10 = 10; cL10 * 2", expectInt: 20)
+        evalCheck(ctx, "let xL5 = 5, yL3 = 3; xL5 - yL3", expectInt: 2)
 
         // const declaration and read
         evalCheck(ctx, "const PI = 3; PI", expectInt: 3)
-        evalCheck(ctx, "const a = 1, b = 2; a + b", expectInt: 3)
+        evalCheck(ctx, "const aC1 = 1, bC2 = 2; aC1 + bC2", expectInt: 3)
 
         // variable reassignment
         evalCheck(ctx, "var x = 1; x = 2; x", expectInt: 2)
@@ -9796,6 +9807,7 @@ extension JeffJSTestRunner {
     mutating func evalTest262(_ ctx: JeffJSContext, _ code: String, name: String) {
         fflush(stdout)
         let fullCode = Self.test262AssertShim + "\n" + code
+        ctx.resetGlobalLexicalBindings()   // each test262 case is its own realm
         let result = ctx.eval(input: fullCode, filename: name, evalFlags: JS_EVAL_TYPE_GLOBAL)
         if result.isException {
             let exc = ctx.getException()
@@ -9998,11 +10010,11 @@ extension JeffJSTestRunner {
         evalTest262(ctx, """
             var probe;
             {
-              let x = 'inside';
-              probe = function() { return x; };
+              let xlc = 'inside';
+              probe = function() { return xlc; };
             }
-            let x = 'outside';
-            assert.sameValue(x, 'outside');
+            let xlc = 'outside';
+            assert.sameValue(xlc, 'outside');
             assert.sameValue(probe(), 'inside');
             """, name: "test262/block/scope-lex-close")
 

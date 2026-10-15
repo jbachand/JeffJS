@@ -1651,6 +1651,35 @@ nonisolated final class JeffJSParser {
         return idx
     }
 
+    /// True when a `let`/`const`/`class` declared now is a script-level
+    /// binding: it goes to the context's global lexical record (QuickJS
+    /// `global_var_obj`), shared by every script of the context. Indirect and
+    /// direct eval code, modules and function bodies keep local bindings.
+    var declaresGlobalLexical: Bool {
+        return fd.parent == nil && fd.isProgramCode && fd.curScope == 0
+            && fd.evalSite == nil && !fd.isDirectOrIndirectEval && !s.isModule
+    }
+
+    /// Declare a `let`/`const`/`class` binding in the current scope (a global
+    /// lexical one at a script's top level). Returns the var index.
+    @discardableResult
+    func defineLexicalBinding(_ name: JSAtom, isConst: Bool) -> Int {
+        let idx = defineVar(name, isConst: isConst, isLexical: true)
+        if declaresGlobalLexical { fd.vars[idx].isGlobalLex = true }
+        return idx
+    }
+
+    /// Initialise a binding made by `defineLexicalBinding` with the value on
+    /// top of the stack (put_loc_check_init, or put_var_init for a global one).
+    func emitLexicalInit(_ varIdx: Int) {
+        if fd.vars[varIdx].isGlobalLex {
+            emitScopePutVarInit(fd.vars[varIdx].varName, scopeLevel: fd.curScope)
+        } else {
+            emitOp(.put_loc_check_init)
+            emitU16(UInt16(varIdx))
+        }
+    }
+
     /// Where the top-level `var` and function declarations of the script
     /// being parsed go (only meaningful while `fd.parent == nil`).
     enum ProgramVarMode {
@@ -2158,9 +2187,28 @@ nonisolated final class JeffJSParser {
             fd.hoistedFuncDeclRanges = fd.hoistedFuncDeclRanges.map {
                 ($0.0 + prefix.count, $0.1 + prefix.count)
             }
-        } else if !fd.hoistedGlobalVarAtoms.isEmpty {
-            // Build the define_var bytes for each atom
+        } else if !fd.hoistedGlobalVarAtoms.isEmpty || fd.vars.contains(where: { $0.isGlobalLex }) {
+            // GlobalDeclarationInstantiation (ES §16.1.7), QuickJS
+            // add_global_var + OP_check_define_var / OP_define_var: every name
+            // is checked first (a redeclaration is a SyntaxError before any
+            // binding exists), then the script's lexical bindings are created
+            // uninitialised (TDZ) and its `var`s as undefined properties.
             var prefix = [UInt8]()
+            func appendDefine(_ op: JeffJSOpcode, _ atom: JSAtom, _ flags: UInt8) {
+                prefix.append(UInt8(truncatingIfNeeded: op.rawValue))
+                prefix.append(UInt8(truncatingIfNeeded: atom & 0xFF))
+                prefix.append(UInt8(truncatingIfNeeded: (atom >> 8) & 0xFF))
+                prefix.append(UInt8(truncatingIfNeeded: (atom >> 16) & 0xFF))
+                prefix.append(UInt8(truncatingIfNeeded: (atom >> 24) & 0xFF))
+                prefix.append(flags)
+            }
+            let lexDecls = fd.vars.filter { $0.isGlobalLex }
+            for v in lexDecls { appendDefine(.check_define_var, v.varName, UInt8(JeffJSContext.defineGlobalLexVar)) }
+            for atom in fd.hoistedGlobalVarAtoms { appendDefine(.check_define_var, atom, 0) }
+            for v in lexDecls {
+                appendDefine(.define_var, v.varName,
+                             UInt8(JeffJSContext.defineGlobalLexVar | (v.isConst ? 0 : JS_PROP_WRITABLE)))
+            }
             for atom in fd.hoistedGlobalVarAtoms {
                 prefix.append(UInt8(truncatingIfNeeded: JeffJSOpcode.define_var.rawValue))
                 prefix.append(UInt8(truncatingIfNeeded: atom & 0xFF))
@@ -3659,7 +3707,7 @@ nonisolated final class JeffJSParser {
             // No initializer: variable is already undefined on global object
         } else {
             if isLexical { checkLexicalDeclaration(varName, kind: isConst ? .constDecl : .letDecl) }
-            let varIdx = isLexical ? defineVar(varName, isConst: isConst, isLexical: true)
+            let varIdx = isLexical ? defineLexicalBinding(varName, isConst: isConst)
                                    : declareVarBinding(varName)
 
             if tok == 0x3D { // '='
@@ -3668,8 +3716,7 @@ nonisolated final class JeffJSParser {
                 emitNamedEvaluation(varName)
 
                 if isLexical {
-                    emitOp(.put_loc_check_init)
-                    emitU16(UInt16(varIdx))
+                    emitLexicalInit(varIdx)
                 } else {
                     // A reference, not an initialisation: the name may be a
                     // parameter or a catch parameter (B.3.4) as well as the var.
@@ -3686,8 +3733,7 @@ nonisolated final class JeffJSParser {
                 // undefined so get_loc_check no longer throws.
                 if isLexical {
                     emitOp(.undefined)
-                    emitOp(.put_loc_check_init)
-                    emitU16(UInt16(varIdx))
+                    emitLexicalInit(varIdx)
                 }
             }
         }
@@ -8234,19 +8280,28 @@ nonisolated final class JeffJSParser {
                 // for a `var` name, which is stored by name once filled)
                 let restVarIdx: Int
                 let restBindsVarByName = !restIsNestedPattern && !isLexical
+                // A script-level `let [...r]`: the array is built in a temp and
+                // stored to the global lexical binding once filled.
+                var restGlobalLexIdx = -1
                 if restIsNestedPattern || restBindsVarByName {
                     // Use anonymous temp var for nested destructuring
                     restVarIdx = defineVar(0, isConst: false, isLexical: false)
                     if restBindsVarByName { declareVarBinding(restVarName) }
                 } else {
                     if isLexical { checkLexicalDeclaration(restVarName, kind: isConst ? .constDecl : .letDecl) }
-                    restVarIdx = defineVar(restVarName, isConst: isConst, isLexical: isLexical)
+                    let bindIdx = defineLexicalBinding(restVarName, isConst: isConst)
+                    if fd.vars[bindIdx].isGlobalLex {
+                        restGlobalLexIdx = bindIdx
+                        restVarIdx = defineVar(0, isConst: false, isLexical: false)
+                    } else {
+                        restVarIdx = bindIdx
+                    }
                 }
 
                 // Create an empty array and store it in the rest variable
                 emitOp(.array_from)
                 emitU16(0)
-                if isLexical && !restIsNestedPattern {
+                if isLexical && !restIsNestedPattern && restGlobalLexIdx < 0 {
                     emitOp(.put_loc_check_init)
                 } else {
                     emitOp(.put_loc)
@@ -8284,6 +8339,11 @@ nonisolated final class JeffJSParser {
                     emitOp(.get_loc)
                     emitU16(UInt16(restVarIdx))
                     emitScopePutVar(restVarName, scopeLevel: fd.curScope)
+                }
+                if restGlobalLexIdx >= 0 {
+                    emitOp(.get_loc)
+                    emitU16(UInt16(restVarIdx))
+                    emitLexicalInit(restGlobalLexIdx)
                 }
 
                 // For nested destructuring patterns, apply them to the rest array
@@ -8341,9 +8401,8 @@ nonisolated final class JeffJSParser {
                 } else {
                     if isLexical {
                         checkLexicalDeclaration(varName, kind: isConst ? .constDecl : .letDecl)
-                        let varIdx = defineVar(varName, isConst: isConst, isLexical: true)
-                        emitOp(.put_loc_check_init)
-                        emitU16(UInt16(varIdx))
+                        let varIdx = defineLexicalBinding(varName, isConst: isConst)
+                        emitLexicalInit(varIdx)
                     } else {
                         declareVarBinding(varName)   // function-scoped; stored by name
                         emitScopePutVar(varName, scopeLevel: fd.curScope)
@@ -8434,9 +8493,8 @@ nonisolated final class JeffJSParser {
                 } else {
                     if isLexical {
                         checkLexicalDeclaration(varName, kind: isConst ? .constDecl : .letDecl)
-                        let varIdx = defineVar(varName, isConst: isConst, isLexical: true)
-                        emitOp(.put_loc_check_init)
-                        emitU16(UInt16(varIdx))
+                        let varIdx = defineLexicalBinding(varName, isConst: isConst)
+                        emitLexicalInit(varIdx)
                     } else {
                         declareVarBinding(varName)   // function-scoped; stored by name
                         emitScopePutVar(varName, scopeLevel: fd.curScope)
@@ -8550,9 +8608,8 @@ nonisolated final class JeffJSParser {
                     } else {
                         if isLexical {
                             checkLexicalDeclaration(varName, kind: isConst ? .constDecl : .letDecl)
-                            let varIdx = defineVar(varName, isConst: isConst, isLexical: true)
-                            emitOp(.put_loc_check_init)
-                            emitU16(UInt16(varIdx))
+                            let varIdx = defineLexicalBinding(varName, isConst: isConst)
+                            emitLexicalInit(varIdx)
                         } else {
                             declareVarBinding(varName)   // function-scoped; stored by name
                             emitScopePutVar(varName, scopeLevel: fd.curScope)
@@ -8591,9 +8648,8 @@ nonisolated final class JeffJSParser {
                 } else {
                     if isLexical {
                         checkLexicalDeclaration(propAtom, kind: isConst ? .constDecl : .letDecl)
-                        let varIdx = defineVar(propAtom, isConst: isConst, isLexical: true)
-                        emitOp(.put_loc_check_init)
-                        emitU16(UInt16(varIdx))
+                        let varIdx = defineLexicalBinding(propAtom, isConst: isConst)
+                        emitLexicalInit(varIdx)
                     } else {
                         declareVarBinding(propAtom)   // function-scoped; stored by name
                         emitScopePutVar(propAtom, scopeLevel: fd.curScope)

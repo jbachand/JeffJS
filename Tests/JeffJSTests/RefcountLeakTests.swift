@@ -33,6 +33,9 @@ final class RefcountLeakTests: XCTestCase {
                             filename: "<leak-warmup>", evalFlags: 0)
         XCTAssertFalse(warm.isException, "\(name): warmup threw")
         warm.freeValue()
+        // The loop snippet may declare top-level let/const/class; the warm-up declared them
+        // already in this context, so start the measured run from a clean lexical record.
+        ctx.resetGlobalLexicalBindings()
         let before = liveObjects(rt)
         let r = ctx.eval(input: source.replacingOccurrences(of: "$N", with: String(iterations)),
                          filename: "<leak-loop>", evalFlags: 0)
