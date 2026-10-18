@@ -4247,6 +4247,14 @@ extension JeffJSTestRunner {
         // Date from string
         evalCheckBool(ctx, "!isNaN(new Date('2024-01-15').getTime())", expect: true)
 
+        // atob is HTML's forgiving-base64 decode: padding optional, ASCII
+        // whitespace ignored, a length of 4n+1 or a non-alphabet char throws.
+        evalCheckStr(ctx, """
+            var r = [atob('YQ'), atob('YWI'), atob(' YW I= '), atob('YWJj'), atob('')];
+            ['Y', 'YQ=', 'Y-8', 'YQ==='].forEach(function (s) { try { atob(s); r.push('ok'); } catch (e) { r.push('x'); } });
+            r.join()
+            """, expect: "a,ab,ab,abc,,x,x,x,x")
+
         // Constructor / Date.UTC arguments go through ToNumber / ToPrimitive
         // (QuickJS js_date_constructor, js_Date_UTC): DuckDuckGo builds result
         // dates with `new Date(r[1], parseInt(r[2], 10) - 1, r[3])`.

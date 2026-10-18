@@ -1702,10 +1702,27 @@ nonisolated struct JeffJSStdLib {
             }
         }
 
-        // Strip whitespace (matching browser behavior)
-        let stripped = swiftStr.filter { !$0.isWhitespace }
-
-        guard let data = Data(base64Encoded: stripped) else {
+        // HTML "forgiving-base64 decode" (§2.3.6, WebKit's
+        // base64Decode(ValidatePadding::No)): ASCII whitespace removed, the
+        // `=` padding optional — a JWT's unpadded base64url segments go
+        // through `atob` after the `-`/`_` swap (MapKit JS checks DuckDuckGo's
+        // map token that way and warned "Authorization token is invalid").
+        var chars = Array(swiftStr.unicodeScalars.filter {
+            !($0 == "\t" || $0 == "\n" || $0 == "\u{0C}" || $0 == "\r" || $0 == " ")
+        })
+        if chars.count % 4 == 0, chars.last == "=" {
+            chars.removeLast()
+            if chars.last == "=" { chars.removeLast() }
+        }
+        let alphabetOK = chars.allSatisfy { c in
+            (c >= "A" && c <= "Z") || (c >= "a" && c <= "z") || (c >= "0" && c <= "9") || c == "+" || c == "/"
+        }
+        guard chars.count % 4 != 1, alphabetOK else {
+            return ctx.throwTypeError("The string to be decoded is not correctly encoded")
+        }
+        var padded = String(String.UnicodeScalarView(chars))
+        padded += String(repeating: "=", count: (4 - chars.count % 4) % 4)
+        guard let data = Data(base64Encoded: padded) else {
             return ctx.throwTypeError("The string to be decoded is not correctly encoded")
         }
 
