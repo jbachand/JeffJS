@@ -368,6 +368,7 @@ struct JeffJSTestRunner {
             ("IntrinsicAttributes", { $0.testIntrinsicAttributes() }),
             ("DefineOverExisting", { $0.testDefineOverExisting() }),
             ("EngineMisc", { $0.testEngineMisc() }),
+            ("ArrayReduceRight", { $0.testArrayReduceRight() }),
             ("RefcountLeftovers", { $0.testRefcountLeftovers() }),
         ]
     }

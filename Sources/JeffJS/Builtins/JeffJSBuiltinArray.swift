@@ -1590,6 +1590,13 @@ nonisolated struct JeffJSBuiltinArray {
     }
 
     /// `Array.prototype.reduceRight(callback, initialValue?)`
+    /// Mirrors `js_array_reduce` (special_reduceRight) in QuickJS, with the
+    /// ownership rules of `reduce` above: the initial value is borrowed until a
+    /// callback has returned an owned accumulator, each element read is owned,
+    /// and the result is always a new reference. (It used to return a borrowed
+    /// initial value — `[].reduceRight(f, [])` gave the caller an over-released
+    /// array: instagram.com's CometAppViewStack crashed the app — and leaked every
+    /// element and replaced accumulator.)
     static func reduceRight(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
@@ -1604,18 +1611,19 @@ nonisolated struct JeffJSBuiltinArray {
         }
 
         var k = len - 1
-        var accumulator: JeffJSValue = .undefined
+        var acc: JeffJSValue = .undefined
+        var accOwned = false
 
         if args.count >= 2 {
-            accumulator = args[1]
+            acc = args[1]
         } else {
             var kPresent = false
             while k >= 0 {
                 let has = ctx.hasPropertyByIndex(obj: obj, index64: Int64(k))
-
                 if has {
-                    accumulator = ctx.getPropertyByIndex(obj: obj, index64: Int64(k))
-                    if accumulator.isException { return accumulator }
+                    acc = ctx.getPropertyByIndex(obj: obj, index64: Int64(k))
+                    if acc.isException { return acc }
+                    accOwned = true
                     kPresent = true
                     k -= 1
                     break
@@ -1628,20 +1636,20 @@ nonisolated struct JeffJSBuiltinArray {
         }
 
         while k >= 0 {
-            let has = ctx.hasPropertyByIndex(obj: obj, index64: Int64(k))
-
-            if has {
+            if ctx.hasPropertyByIndex(obj: obj, index64: Int64(k)) {
                 let val = ctx.getPropertyByIndex(obj: obj, index64: Int64(k))
-                if val.isException { return val }
-
-                let kVal = ctx.newInt64(k)
-                accumulator = ctx.call(callbackFn, this: .undefined, args: [accumulator, val, kVal, obj])
-                if accumulator.isException { return accumulator }
+                if val.isException { if accOwned { acc.freeValue() }; return val }
+                let r = ctx.call(callbackFn, this: .undefined, args: [acc, val, ctx.newInt64(k), obj])
+                val.freeValue()
+                if accOwned { acc.freeValue() }   // the callback returned its own reference
+                if r.isException { return r }
+                acc = r
+                accOwned = true
             }
             k -= 1
         }
 
-        return accumulator
+        return accOwned ? acc : acc.dupValue()
     }
 
     // MARK: - ES2023 immutable methods
