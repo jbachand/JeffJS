@@ -944,14 +944,20 @@ nonisolated func markObject(_ rt: JeffJSRuntime,
             // The var-refs its closures hold stay live (they read the
             // buffer), so they are not GC-list nodes while it is suspended.
         }
-        for vr in gd.asyncState.frame.liveVarRefs where vr.gcListIndex != -1 { markFunc(rt, vr) }
+        gd.asyncState.frame.liveVarRefs.forEach { u in
+            let vr = u.takeUnretainedValue()
+            if vr.gcListIndex != -1 { markFunc(rt, vr) }
+        }
     case .asyncFunctionData(let st):
         // A parked `await` keeps its whole frame; the var-refs its closures
         // captured are detached (the frame's buffer was released at the
         // suspend point) and nothing else on the GC graph points at them, so
         // without this edge the collector treats them as unreferenced and
         // clears the locals the continuation is going to read.
-        for vr in st.frame.liveVarRefs where vr.gcListIndex != -1 { markFunc(rt, vr) }
+        st.frame.liveVarRefs.forEach { u in
+            let vr = u.takeUnretainedValue()
+            if vr.gcListIndex != -1 { markFunc(rt, vr) }
+        }
     case .proxyData(let pd):
         // A proxy owns its target and handler (released by freeObject).
         if let c = pd.target.toGCObjectHeader() { markFunc(rt, c) }

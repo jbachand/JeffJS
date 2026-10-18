@@ -381,6 +381,9 @@ nonisolated final class JeffJSRuntime {
     /// Set to true after context init completes. Enables object freeing in freeValue().
     /// During init, objects are context-scoped and freed by context.free().
     var initComplete: Bool = false
+    /// Cleared by drainObjectPool: teardown parks no var-ref (next to
+    /// the other flags: a new 8-byte slot mid-class moved every later field).
+    var varRefPoolOpen: Bool = true
     /// Byte threshold for triggering a GC cycle.
     var mallocGCThreshold: Int
     /// Linked list of weak references for cleanup during GC.
@@ -425,10 +428,11 @@ nonisolated final class JeffJSRuntime {
     /// Parked bytecode-function objects with their side boxes
     /// (jeffJS_recycleFunction); createClosure pops from it.
     var functionPool = JeffJSRawStack<JeffJSObject>(retaining: false)
-    /// interp.recycleVarRefs: live var-refs no closure held any more when
-    /// their frame went away (jeffJS_detachFrameVarRefs); createClosure
-    /// reuses them.
-    var varRefPool = JeffJSRawStack<JeffJSVarRef>(retaining: true)
+    /// interp.recycleVarRefs: var-refs nothing held any more — at their
+    /// frame's exit (jeffJS_detachFrameVarRefs) or, JEFFJS_MANUAL_MEMORY,
+    /// at their last hold (jeffJS_varRefLastDrop); createClosure reuses them.
+    /// Each entry carries the var-ref's one manual retain.
+    var varRefPool = JeffJSRawStack<JeffJSVarRef>(retaining: false)
     /// Recycled arrays (JeffJSObjectPool.swift): empty, `length` 0, no
     /// element storage, off the GC list.
     var arrayPool = JeffJSRawStack<JeffJSObject>(retaining: false)

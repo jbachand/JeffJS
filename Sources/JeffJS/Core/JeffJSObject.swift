@@ -1955,10 +1955,14 @@ nonisolated final class JeffJSGeneratorData {
         let frame = saved.frame.takeUnretainedValue()
         let buf = saved.buf
         if frame.hasLiveVarRefs {
-            for vr in frame.liveVarRefs where !vr.isDetached {
-                vr.value = vr.pvalue.dupValue()
-                vr.isDetached = true
-                vr.parentFrame = nil; vr.slot = nil
+            // The frame's holds are given back by resetForRelease below.
+            frame.liveVarRefs.forEach { u in
+                u._withUnsafeGuaranteedRef { vr in
+                    if vr.isDetached { return }
+                    vr.value = vr.pvalue.dupValue()
+                    vr.isDetached = true
+                    vr.parentFrame = nil; vr.slot = nil
+                }
             }
         }
         var i = 0
@@ -2036,11 +2040,22 @@ nonisolated struct JeffJSGlobalVarDef {
 /// When **detached** (after `close_loc`), the current value is copied
 /// into `value` and reads/writes go there instead.
 nonisolated final class JeffJSVarRef: JeffJSGCObjectHeader {
-    /// Var-refs are shared by every closure capturing the same slot and are
-    /// kept alive by their varRefs arrays (ARC); the detached value is
-    /// released when the last closure lets go. The GC path clears `value`
-    /// after releasing it, so this never double-frees.
+    /// Var-refs are shared by every closure capturing the same slot. Their
+    /// lifetime is `holdCount` (JEFFJS_MANUAL_MEMORY, JeffJSVarRefHold.swift):
+    /// a var-ref that reaches zero holds is parked or loses its one manual
+    /// retain, so this runs only for one an ARC holder (`coldHeld`) outlived,
+    /// or with the switch off. The detached value is released here then; the
+    /// GC path clears `value` after releasing it, so this never double-frees.
     deinit { if isDetached, !value.isUndefined { value.freeValue() } }
+    /// Counted holders: one per closure var-ref buffer entry, one while on
+    /// the frame's live list. See JeffJSVarRefHold.swift.
+    var holdCount: Int32 = 0
+    /// Something the count does not see holds a Swift reference (a mapped
+    /// `arguments` slot, a ref object, a generator's saved state, a payload
+    /// list): never parked, so that holder can never read a reused var-ref.
+    var coldHeld: Bool = false
+    /// JEFFJS_ZOMBIES=1: this var-ref's last hold was dropped.
+    var zombie: Bool = false
     /// A live var-ref reads through its parent frame, which is a GC root, so
     /// it takes no part in cycle detection. Detaching copies the value into
     /// `value` and the only things left holding the var-ref are closures,
@@ -2250,14 +2265,20 @@ nonisolated final class JeffJSStackFrame {
     var bufVarBase: Int               = 0  // offset where vars start (= argSlots)
     var bufSpBase: Int                = 0  // offset where value stack starts (= argSlots + varSlots)
 
-    /// All live (non-detached) var-refs that point at this frame's slots.
+    /// All live (non-detached) var-refs that point at this frame's slots,
+    /// each entry carrying one hold (JeffJSVarRefHold.swift).
     /// Populated by `fclosure`; consulted by `close_loc` to detach them.
-    var liveVarRefs: [JeffJSVarRef]   = []
+    var liveVarRefs = JeffJSVarRefList()
     /// Mirrors `!liveVarRefs.isEmpty` (Array.isEmpty was not inlined in the
     /// interpreter; this is read on every return).
     var hasLiveVarRefs: Bool = false
 
     init() {}
+
+    deinit {
+        liveVarRefs.dropAll(nil)
+        liveVarRefs.deallocate()
+    }
 
     /// Only what the next acquire does not overwrite: callInternal /
     /// enterInlineFrame set curFunc, thisVal, argCount, varCount and the buf*
@@ -2289,10 +2310,16 @@ nonisolated final class JeffJSStackFrame {
             varBuf.removeAll(keepingCapacity: true)
             bufArraysLive = false
         }
-        if hasLiveVarRefs {
-            liveVarRefs.removeAll(keepingCapacity: true)
-            hasLiveVarRefs = false
-        }
+        if hasLiveVarRefs { dropLiveVarRefs() }
+    }
+
+    /// jeffJS_detachFrameVarRefs normally emptied the list already. Out of
+    /// line: resetForRelease is inlined into every return of the interpreter
+    /// and the trace, whose code generation is sensitive to its size.
+    @inline(never)
+    final func dropLiveVarRefs() {
+        liveVarRefs.dropAll(nil)
+        hasLiveVarRefs = false
     }
 
     /// init_this: the arrows created before super() returned now see `constructed` as `this`.
@@ -2440,7 +2467,7 @@ nonisolated final class JeffJSPropertyExtra {
     }
     var varRef: JeffJSVarRef? {
         @inline(__always) get { kind == .varRef ? _a.map { unsafeDowncast($0, to: JeffJSVarRef.self) } : nil }
-        set { _a = newValue }
+        set { newValue?.coldHeld = true; _a = newValue }
     }
     var autoOpaque: Any? {
         get { kind == .autoInit ? _a.map { unsafeDowncast($0, to: OpaqueBox.self).value } : nil }
@@ -2451,6 +2478,8 @@ nonisolated final class JeffJSPropertyExtra {
         self.kind = .getset; self._a = getter; self._b = setter; self.autoRealmAndId = 0
     }
     init(varRef: JeffJSVarRef) {
+        // An ARC holder the var-ref's hold count does not see.
+        varRef.coldHeld = true
         self.kind = .varRef; self._a = varRef; self._b = nil; self.autoRealmAndId = 0
     }
     init(autoRealmAndId: UInt, opaque: Any?) {
@@ -3207,8 +3236,8 @@ nonisolated final class JeffJSObjectAux: JeffJSSideSlot {
     var fbFast: JeffJSFunctionBytecode? = nil
     /// Unretained mirror of a `.typedArray` payload (the payload owns it); set by the payload setter.
     var taU: Unmanaged<JeffJSTypedArray>? = nil
-    /// The closure's var-refs: a raw buffer that OWNS one Swift retain per non-nil entry
-    /// (released by `releaseVarRefs`, `setVarRefs`, deinit). It used to be a Swift array plus an
+    /// The closure's var-refs: a raw buffer that owns one hold per non-nil entry
+    /// (JeffJSVarRefHold.swift; given back by `releaseVarRefs`, `setVarRefs`, deinit). It used to be a Swift array plus an
     /// unretained mirror of it; the array's allocation, uniqueness checks and bridge retains
     /// were most of a closure's var-ref cost. Entries [0, varRefsRawCount) are valid.
     var varRefsRaw: UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>? = nil
@@ -3293,16 +3322,30 @@ nonisolated final class JeffJSObjectAux: JeffJSSideSlot {
     override init() {}
 
     /// Set the closure var-refs and rebuild their unmanaged raw mirror.
+    /// The new holds are taken before the old ones are dropped: the same
+    /// var-ref is often in both lists (a lazy body's first call reinstalls
+    /// its own), and dropping it first could park it.
     func setVarRefs(_ refs: [JeffJSVarRef?]) {
-        beginVarRefs(refs.count)
-        for vr in refs { appendVarRef(vr) }
+        for vr in refs { if let vr { jeffJS_varRefHold(.passUnretained(vr)) } }
+        releaseVarRefs(nil)
+        let n = refs.count
+        if n == 0 { return }
+        reserveVarRefs(n)
+        let p = varRefsRaw.unsafelyUnwrapped
+        for i in 0..<n { p[i] = refs[i].map { Unmanaged.passUnretained($0) } }
+        _varRefsRawCount = Int32(truncatingIfNeeded: n)
     }
 
-    /// Drop the current var-refs (each entry's own retain) and make room for `n` new ones; the
+    /// Drop the current var-refs (each entry's hold) and make room for `n` new ones; the
     /// buffer stays for reuse. Pair with `appendVarRef` n times.
-    func beginVarRefs(_ n: Int) {
-        releaseVarRefs()
+    func beginVarRefs(_ n: Int, _ rt: JeffJSRuntime? = nil) {
+        releaseVarRefs(rt)
         if n == 0 { return }
+        reserveVarRefs(n)
+    }
+
+    @inline(__always)
+    private func reserveVarRefs(_ n: Int) {
         if varRefsRaw == nil || Int(_varRefsRawCapacity) < n {
             varRefsRaw?.deallocate()
             let cap = max(n, 4)
@@ -3311,33 +3354,39 @@ nonisolated final class JeffJSObjectAux: JeffJSSideSlot {
         }
     }
 
-    /// Append a var-ref (takes its own retain); room made by `beginVarRefs`.
+    /// Append a var-ref (takes its own hold); room made by `beginVarRefs`.
     @inline(__always)
     func appendVarRef(_ vr: JeffJSVarRef?) {
         let n = varRefsRawCount
-        varRefsRaw.unsafelyUnwrapped[n] = vr.map { Unmanaged.passRetained($0) }
+        let u = vr.map { Unmanaged.passUnretained($0) }
+        if let u { jeffJS_varRefHold(u) }
+        varRefsRaw.unsafelyUnwrapped[n] = u
         _varRefsRawCount = Int32(truncatingIfNeeded: n + 1)
     }
     @inline(__always)
     func appendVarRefUnmanaged(_ u: Unmanaged<JeffJSVarRef>?) {
         let n = varRefsRawCount
-        if let u = u { _ = u.retain() }
+        if let u = u { jeffJS_varRefHold(u) }
         varRefsRaw.unsafelyUnwrapped[n] = u
         _varRefsRawCount = Int32(truncatingIfNeeded: n + 1)
     }
 
-    /// Release every entry; the buffer is kept (a parked closure re-captures into it).
-    func releaseVarRefs() {
+    /// Drop every entry's hold; the buffer is kept (a parked closure re-captures into it).
+    /// `rt` is the runtime when the caller has it (nil: each var-ref's own).
+    func releaseVarRefs(_ rt: JeffJSRuntime? = nil) {
         let n = varRefsRawCount
         _varRefsRawCount = 0
         if n == 0 { return }
         let p = varRefsRaw.unsafelyUnwrapped
         var i = 0
-        while i < n { p[i]?.release(); p[i] = nil; i += 1 }
+        while i < n {
+            if let u = p[i] { p[i] = nil; jeffJS_varRefDrop(u, rt) }
+            i += 1
+        }
     }
 
     /// Release the var-refs but keep the buffer (a parked closure).
-    func clearVarRefsKeepingCapacity() { releaseVarRefs() }
+    func clearVarRefsKeepingCapacity(_ rt: JeffJSRuntime? = nil) { releaseVarRefs(rt) }
 
     deinit { releaseVarRefs(); varRefsRaw?.deallocate() }
 }

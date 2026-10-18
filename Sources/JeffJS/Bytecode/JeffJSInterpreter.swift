@@ -1095,18 +1095,20 @@ nonisolated extension JeffJSContext {
     /// through these, exactly as a closure variable does; the frame epilogue
     /// detaches them (copying the value in) when the function returns.
     func jeffJS_argVarRef(_ frame: JeffJSStackFrame, _ i: Int) -> JeffJSVarRef {
-        if let existing = frame.liveVarRefs.first(where: {
-            $0.isArg && $0.varIdx == UInt16(i) && !$0.isDetached
-        }) { return existing }
-        let vr = JeffJSVarRef(isDetached: false, isArg: true, varIdx: UInt16(i), parentFrame: frame)
+        if let existing = frame.liveVarRefs.findLive(isArg: true, varIdx: UInt16(i)) {
+            return existing.takeUnretainedValue()
+        }
+        let u = jeffJS_makeVarRef(rt, isArg: true, varIdx: UInt16(i), frame: frame)
+        let vr = u.takeUnretainedValue()
         // Generator / async frames re-acquire their buffer on resume, so they
         // keep the frame-based lookup (same rule as createClosure).
         let fb = frame.curFunc.toObject()?.fbFast
         vr.argOwned = fb?.argSlotsOwned ?? false
+        vr.slot = nil
         if let b = frame.buf, i < frame.bufVarBase {
             vr.slot = b + i
         }
-        frame.liveVarRefs.append(vr)
+        frame.liveVarRefs.append(u)   // the hold jeffJS_makeVarRef took
         frame.hasLiveVarRefs = true
         return vr
     }
@@ -1439,17 +1441,21 @@ nonisolated extension JeffJSContext {
 
         // Build the child's var_ref array from its closureVars metadata.
         // interp.leanClosurePayload: the var-refs are built straight into the closure's side box
-        // (a raw buffer that owns one retain per entry; a recycled closure keeps its buffer);
+        // (a raw buffer that owns one hold per entry; a recycled closure keeps its buffer);
         // otherwise into `childVarRefs`, which is also the payload's list.
         var childVarRefs: [JeffJSVarRef?] = []
         let lean = jeffJSLeanClosurePayload
-        var leanAux: JeffJSObjectAux? = nil
+        // Unmanaged: the object owns its side box (a strong local cost a
+        // retain + release per closure).
+        var leanAux: Unmanaged<JeffJSObjectAux>? = nil
         if !innerFB.closureVarsList.isEmpty {
             let closureVars = innerFB.closureVarsList
             if lean {
-                let a = obj.ensureAux()
-                a.beginVarRefs(closureVars.count)
-                leanAux = a
+                if obj._auxU == nil { _ = obj.makeAux() }
+                let au = obj._auxU.unsafelyUnwrapped
+                let rtRef = rt
+                au._withUnsafeGuaranteedRef { $0.beginVarRefs(closureVars.count, rtRef) }
+                leanAux = au
             } else {
                 childVarRefs.reserveCapacity(closureVars.count)
             }
@@ -1458,61 +1464,40 @@ nonisolated extension JeffJSContext {
                     // The closure var references the parent's own local/arg slot.
                     // Check if we already have a live var_ref for this exact slot
                     // on the parent frame, so multiple closures share the same ref.
-                    var existingVR: JeffJSVarRef? = nil
-                    if jeffJSFastClosure {
-                        // Plain index loop (the `first { }` predicate closure
-                        // retained every element it looked at).
-                        let wantIdx = UInt16(cv.varIdx), wantArg = cv.isArg
-                        parentFrame.liveVarRefs.withUnsafeBufferPointer { lv in
-                            for i in 0..<lv.count {
-                                let v = lv[i]
-                                if v.varIdx == wantIdx && v.isArg == wantArg && !v.isDetached { existingVR = v; break }
-                            }
+                    // (A plain index loop over unmanaged entries: no retain per
+                    // element looked at.)
+                    let wantIdx = UInt16(cv.varIdx), wantArg = cv.isArg
+                    if let u = parentFrame.liveVarRefs.findLive(isArg: wantArg, varIdx: wantIdx) {
+                        if let la = leanAux { la._withUnsafeGuaranteedRef { $0.appendVarRefUnmanaged(u) } } else {
+                            let vr = u.takeUnretainedValue()
+                            vr.coldHeld = true   // the payload's list is an ARC holder
+                            childVarRefs.append(vr)
                         }
                     } else {
-                        existingVR = parentFrame.liveVarRefs.first {
-                            $0.isArg == cv.isArg &&
-                            $0.varIdx == UInt16(cv.varIdx) &&
-                            !$0.isDetached
-                        }
-                    }
-                    if let vr = existingVR {
-                        if let la = leanAux { la.appendVarRef(vr) } else { childVarRefs.append(vr) }
-                    } else {
-                        let vr: JeffJSVarRef
-                        if jeffJSRecycleVarRefs, let pv = rt.varRefPool.popLast() {
-                            // A parked var-ref (never detached: `value` is still
-                            // undefined, it is on no GC list).
-                            pv.isArg = cv.isArg
-                            pv.varIdx = UInt16(cv.varIdx)
-                            pv.parentFrame = parentFrame
-                            pv.argOwned = false
-                            pv.mark = false
-                            vr = pv
-                        } else {
-                            vr = JeffJSVarRef(
-                                isDetached: false,
-                                isArg: cv.isArg,
-                                varIdx: UInt16(cv.varIdx),
-                                parentFrame: parentFrame
-                            )
-                        }
-                        // `fb` is the parent's: a parameter slot it lets a
-                        // closure capture is one it owns (argSlotsOwned).
-                        if cv.isArg { vr.argOwned = fb.argSlotsOwned }
-                        // Direct slot pointer (see JeffJSVarRef.slot). Generator /
-                        // async frames re-acquire their buffer on resume, so they
-                        // keep the frame-based lookup.
-                        if let b = parentFrame.buf {
-                            if cv.isArg {
-                                if cv.varIdx < parentFrame.bufVarBase { vr.slot = b + cv.varIdx }
-                            } else {
-                                vr.slot = b + parentFrame.bufVarBase + cv.varIdx
+                        let u = jeffJS_makeVarRef(rt, isArg: wantArg, varIdx: wantIdx, frame: parentFrame)
+                        u._withUnsafeGuaranteedRef { vr in
+                            // `fb` is the parent's: a parameter slot it lets a
+                            // closure capture is one it owns (argSlotsOwned).
+                            if cv.isArg { vr.argOwned = fb.argSlotsOwned }
+                            // Direct slot pointer (see JeffJSVarRef.slot). Generator /
+                            // async frames re-acquire their buffer on resume, so they
+                            // keep the frame-based lookup.
+                            vr.slot = nil
+                            if let b = parentFrame.buf {
+                                if cv.isArg {
+                                    if cv.varIdx < parentFrame.bufVarBase { vr.slot = b + cv.varIdx }
+                                } else {
+                                    vr.slot = b + parentFrame.bufVarBase + cv.varIdx
+                                }
                             }
                         }
-                        parentFrame.liveVarRefs.append(vr)
+                        parentFrame.liveVarRefs.append(u)   // the hold jeffJS_makeVarRef took
                         parentFrame.hasLiveVarRefs = true
-                        if let la = leanAux { la.appendVarRef(vr) } else { childVarRefs.append(vr) }
+                        if let la = leanAux { la._withUnsafeGuaranteedRef { $0.appendVarRefUnmanaged(u) } } else {
+                            let vr = u.takeUnretainedValue()
+                            vr.coldHeld = true
+                            childVarRefs.append(vr)
+                        }
                     }
                 } else {
                     // The closure var references the parent's own closure var
@@ -1520,16 +1505,17 @@ nonisolated extension JeffJSContext {
                     let parentIdx = cv.varIdx
                     if parentRawCount >= 0 {
                         if let la = leanAux {
-                            la.appendVarRefUnmanaged(parentIdx < parentRawCount ? parentRaw![parentIdx] : nil)
+                            let pu = parentIdx < parentRawCount ? parentRaw![parentIdx] : nil
+                            la._withUnsafeGuaranteedRef { $0.appendVarRefUnmanaged(pu) }
                         } else if parentIdx < parentRawCount, let u = parentRaw![parentIdx] {
                             childVarRefs.append(u.takeUnretainedValue())
                         } else {
                             childVarRefs.append(nil)
                         }
                     } else if parentIdx < varRefs.count {
-                        if let la = leanAux { la.appendVarRef(varRefs[parentIdx]) } else { childVarRefs.append(varRefs[parentIdx]) }
+                        if let la = leanAux { la._withUnsafeGuaranteedRef { $0.appendVarRef(varRefs[parentIdx]) } } else { childVarRefs.append(varRefs[parentIdx]) }
                     } else {
-                        if let la = leanAux { la.appendVarRef(nil) } else { childVarRefs.append(nil) }
+                        if let la = leanAux { la._withUnsafeGuaranteedRef { $0.appendVarRef(nil) } } else { childVarRefs.append(nil) }
                     }
                 }
             }
@@ -1568,6 +1554,8 @@ nonisolated extension JeffJSContext {
             // jeffJS_recycleFunction released them.
             if leanAux != nil { obj._flags |= JeffJSObject.flagHasVarRefs } else { obj._flags &= ~JeffJSObject.flagHasVarRefs }
         } else {
+            // The payload's list is an ARC holder the hold count does not see.
+            for vr in childVarRefs { vr?.coldHeld = true }
             obj.varRefsFast = childVarRefs
         }
 
@@ -2220,13 +2208,13 @@ nonisolated extension JeffJSContext {
                 refs.append(cv.varIdx < callerRefs.count ? callerRefs[cv.varIdx] : nil)
                 continue
             }
-            if let vr = frame.liveVarRefs.first(where: {
-                $0.isArg == cv.isArg && $0.varIdx == UInt16(cv.varIdx) && !$0.isDetached }) {
-                refs.append(vr)
+            if let u = frame.liveVarRefs.findLive(isArg: cv.isArg, varIdx: UInt16(cv.varIdx)) {
+                refs.append(u.takeUnretainedValue())
                 continue
             }
-            let vr = JeffJSVarRef(isDetached: false, isArg: cv.isArg,
-                                  varIdx: UInt16(cv.varIdx), parentFrame: frame)
+            let u = jeffJS_makeVarRef(rt, isArg: cv.isArg, varIdx: UInt16(cv.varIdx), frame: frame)
+            let vr = u.takeUnretainedValue()
+            vr.slot = nil
             if cv.isArg { vr.argOwned = callerFB.argSlotsOwned }
             if let b = frame.buf {
                 if cv.isArg {
@@ -2235,10 +2223,12 @@ nonisolated extension JeffJSContext {
                     vr.slot = b + frame.bufVarBase + cv.varIdx
                 }
             }
-            frame.liveVarRefs.append(vr)
+            frame.liveVarRefs.append(u)   // the hold jeffJS_makeVarRef took
             frame.hasLiveVarRefs = true
             refs.append(vr)
         }
+        // The payload's list is an ARC holder the hold count does not see.
+        for vr in refs { vr?.coldHeld = true }
         obj.payload = .bytecodeFunc(functionBytecode: fb, varRefs: refs, homeObject: home)
         obj.realmIndex = realmIndex
         fb.liveClosures &+= 1   // perf/memory-census (uncounted in freeObject)
@@ -3189,24 +3179,31 @@ nonisolated extension JeffJSContext {
         // Detach every live var-ref that targets this local slot, and drop
         // detached refs from the list: it used to grow by one per closure
         // created in a loop and was scanned on every close_loc (quadratic).
+        // Removing an entry gives back the frame list's hold; a var-ref that
+        // nothing else holds any more is parked rather than detached into a
+        // copy nobody can read (as at frame exit, jeffJS_detachFrameVarRefs).
         var i = 0
-        var n = frame.liveVarRefs.count
-        while i < n {
-            let vr = frame.liveVarRefs[i]
-            if !vr.isDetached && !vr.isArg && Int(vr.varIdx) == idx {
-                vr.value = val.dupValue()
-                vr.isDetached = true
-                vr.parentFrame = nil; vr.slot = nil
+        while i < frame.liveVarRefs.count {
+            let u = frame.liveVarRefs[i]
+            let remove = u._withUnsafeGuaranteedRef { vr -> Bool in
+                if !vr.isDetached && !vr.isArg && Int(vr.varIdx) == idx {
+                    if !jeffJS_varRefOnlyFrameHeld(vr) {
+                        vr.value = val.dupValue()
+                        vr.isDetached = true
+                    }
+                    vr.parentFrame = nil; vr.slot = nil
+                    return true
+                }
+                return vr.isDetached
             }
-            if vr.isDetached {
-                n -= 1
-                if i != n { frame.liveVarRefs.swapAt(i, n) }
+            if remove {
+                _ = frame.liveVarRefs.swapRemove(at: i)
+                jeffJS_varRefDrop(u, rt)
             } else {
                 i += 1
             }
         }
-        if n < frame.liveVarRefs.count { frame.liveVarRefs.removeLast(frame.liveVarRefs.count - n) }
-        if n == 0 { frame.hasLiveVarRefs = false }
+        if frame.liveVarRefs.count == 0 { frame.hasLiveVarRefs = false }
     }
 
     /// Converts a value to a property key (string or symbol).
@@ -3232,6 +3229,7 @@ nonisolated extension JeffJSContext {
     func makeLocalRef(frame: JeffJSStackFrame, idx: Int) -> JeffJSObject {
         let vr = JeffJSVarRef(isDetached: false, isArg: false, varIdx: UInt16(idx),
                               parentFrame: frame)
+        vr.coldHeld = true   // owned by the payload (ARC), outside the hold count
         let obj = JeffJSObject()
         obj.payload = .opaque(vr)
         return obj
@@ -3243,6 +3241,7 @@ nonisolated extension JeffJSContext {
         let vr = JeffJSVarRef(isDetached: false, isArg: true, varIdx: UInt16(idx),
                               parentFrame: frame)
         vr.argOwned = frame.curFunc.toObject()?.fbFast?.argSlotsOwned ?? false
+        vr.coldHeld = true   // owned by the payload (ARC), outside the hold count
         let obj = JeffJSObject()
         obj.payload = .opaque(vr)
         return obj
@@ -14642,8 +14641,10 @@ nonisolated private func jeffJS_suspendActivation(
         var i = sp
         while i < cap { own[i] = .undefined; i += 1 }
         if frame.hasLiveVarRefs {
-            for vr in frame.liveVarRefs where !vr.isDetached {
-                if let s = vr.slot { vr.slot = own + (s - buf) }
+            frame.liveVarRefs.forEach { u in
+                u._withUnsafeGuaranteedRef { vr in
+                    if !vr.isDetached, let s = vr.slot { vr.slot = own + (s - buf) }
+                }
             }
         }
         frame.buf = own
@@ -14662,10 +14663,14 @@ nonisolated private func jeffJS_suspendActivation(
 nonisolated private func jeffJS_retireOwnFrame(_ rt: JeffJSRuntime, _ frame: JeffJSStackFrame,
                                                _ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: Int) {
     if frame.hasLiveVarRefs {
-        for vr in frame.liveVarRefs where !vr.isDetached {
-            vr.value = vr.pvalue.dupValue()
-            vr.isDetached = true
-            vr.parentFrame = nil; vr.slot = nil
+        // The frame's holds are given back by resetForRelease (releaseFrameU).
+        frame.liveVarRefs.forEach { u in
+            u._withUnsafeGuaranteedRef { vr in
+                if vr.isDetached { return }
+                vr.value = vr.pvalue.dupValue()
+                vr.isDetached = true
+                vr.parentFrame = nil; vr.slot = nil
+            }
         }
     }
     var i = 0

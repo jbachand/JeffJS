@@ -38,6 +38,24 @@ nonisolated struct JeffJSRawStack<T: AnyObject> {
         return retaining ? u.takeRetainedValue() : u.takeUnretainedValue()
     }
 
+    /// Push an entry as is: the caller hands over whatever reference `u`
+    /// carries (JEFFJS_MANUAL_MEMORY: the var-ref pool's entries each ride
+    /// their own manual retain, so parking and reuse cost no ARC).
+    @inline(__always)
+    mutating func appendUnmanaged(_ u: Unmanaged<T>) {
+        if count == capacity { grow() }
+        base.unsafelyUnwrapped[count] = u
+        count += 1
+    }
+
+    /// Pop an entry as is (the reference it carries goes to the caller).
+    @inline(__always)
+    mutating func popLastUnmanaged() -> Unmanaged<T>? {
+        if count == 0 { return nil }
+        count -= 1
+        return base.unsafelyUnwrapped[count]
+    }
+
     /// Calls `body` with each parked entry, oldest first (no retain).
     func forEachUnretained(_ body: (Unmanaged<T>) -> Void) {
         var i = 0

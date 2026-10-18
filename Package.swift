@@ -1,5 +1,13 @@
 // swift-tools-version: 5.9
 import PackageDescription
+import Foundation
+
+// Build-time switch for the manual-memory core (JeffJS issue #1): engine
+// records leave Swift ARC under the compilation condition
+// `JEFFJS_MANUAL_MEMORY`. Off by default; `JEFFJS_MANUAL_MEMORY=1 swift build
+// --scratch-path .build-mm` builds the other side for an A/B.
+let manualMemory: [SwiftSetting] =
+    ProcessInfo.processInfo.environment["JEFFJS_MANUAL_MEMORY"] == "1" ? [.define("JEFFJS_MANUAL_MEMORY")] : []
 
 let package = Package(
     name: "JeffJS",
@@ -86,7 +94,7 @@ let package = Package(
                 // apps). Remove this block to restore remote-dependency eligibility
                 // at a 1.5–2.3x speed cost.
                 .unsafeFlags(["-enforce-exclusivity=unchecked"], .when(configuration: .release)),
-            ]
+            ] + manualMemory
         ),
         .executableTarget(
             name: "jeffjs-cli",

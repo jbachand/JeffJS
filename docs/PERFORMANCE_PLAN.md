@@ -1306,3 +1306,50 @@ with extra keys.
 chains, `super` reads), rest-spread 3.0x, map-set / proxy (builtin call + callback overhead), large-object-keys
 (`"key" + i` then `findAtom` per read), regex-tokenize 7x (the matcher loop itself); then the non-VM items
 (library-aware substitution, heap snapshots of pure modules, lane batching), which need their CONTRIBUTING issues.
+### perf/arcless-varrefs — closure var-refs off Swift ARC (2026-10-18, issue #1 step 1)
+
+**Change** (`Core/JeffJSVarRefHold.swift`; quickjs `js_closure2` / `close_var_refs` / `free_var_ref`). A var-ref is
+still a `JeffJSVarRef` — a GC header, so both collectors, the class census and the zombie tooling see the same object —
+but its lifetime is a manual `holdCount`: one per entry of a closure's var-ref buffer (`varRefsRaw`, now holding
+unmanaged entries) and one while it is on its frame's live list (`JeffJSStackFrame.liveVarRefs`, an unmanaged raw list,
+was `[JeffJSVarRef]`). The object rides one manual retain taken when the count leaves zero and given back — or handed to
+`rt.varRefPool` — when it returns to zero, so capture, `get/put_var_ref`, `close_loc`, frame exit and closure free do no
+`swift_retain`/`release`, and a var-ref that dies, live *or detached*, is parked and reused (a detached one used to cost
+a malloc, the GC-list insert and removal, the value release and a free through `deinit`). `close_loc` parks a binding
+no closure holds any more instead of detaching it, as frame exit already did. Holders the count does not see keep their
+Swift references and mark the var-ref `coldHeld` (never parked; the last ARC holder's release runs `deinit` as before):
+a mapped `arguments` slot, a `make_loc_ref` object, a generator / async function's saved `capturedVarRefs`, a
+`.bytecodeFunc` payload list (eval code; `leanClosurePayload` off). `refCount` stays the collector's scratch count
+(`gcSeedVarRefs`), so neither collector changed. No parking during a collection, after `drainObjectPool`
+(`rt.varRefPoolOpen`), under `JEFFJS_NO_POOL`, or under `JEFFJS_ZOMBIES` (a dead var-ref's shell is kept and flagged; a
+hold or drop through it is reported as `[ZOMBIE-VARREF-HOLD/DROP]`). A/B: `JEFFJS_INTERP_ARCLESSVARREFS=0` makes every
+hold a Swift retain and every drop a release on the same raw lists (the base build's lifetime; parking at frame exit
+only). createClosure also fills the closure's buffer through an unretained side box (a retain + release per capturing
+closure), behaviour-identical, no switch.
+
+**Results.** Instructions retired / cycles (CLI, Mac, median of 3; base = `83e6395`; the Mac was loaded by other
+builds, so cycles are ±2 %):
+
+| bench | base | arcless | `ARCLESSVARREFS=0` |
+|---|---:|---:|---:|
+| watch_deepmerge | 34.48 G / 8.07 G | 33.50 G / 7.73 G (−2.8 % / −4.2 %) | 33.49 G / 7.72 G |
+| watch_callbacks | 31.71 G / 6.10 G | 31.57 G / 6.13 G (−0.5 %) | 31.58 G / 6.13 G |
+| kernels | 53.65 G / 9.97 G | 54.03 G / 10.11 G (+0.7 %) | 54.02 G / 10.11 G |
+| realworld | 173.32 G / 36.73 G | 173.33 G / 36.79 G (0.0 %) | 173.30 G / 36.83 G |
+| closure create/free micro (5 M closures) | 34.21 G / 7.45 G | 27.43 G / 5.59 G (−19.8 % / −24.9 %) | 31.52 G / 6.62 G |
+
+QuickJS (`/opt/homebrew/bin/qjs`) on watch_deepmerge: 17.27 G / 3.27 G — JeffJS 2.00× → 1.94× instructions.
+Swift ARC calls on watch_deepmerge (bench/arc/interpose): 421 M → 411 M; `detachFrameVarRefs`, `releaseVarRefs`, the
+var-ref `deinit` and the `isDetached` GC-list insert left the top 400 sites. On deepmerge the switch-off build is as fast
+as the arcless one: its gain is the unmanaged lists (same work either way); the hold count itself pays on code that
+creates and drops capturing closures (the micro: −13 % against switch-off). kernels: `method-call` +1.8 %,
+`closure` +1.6 % — no ARC difference (identical counts); `executeFastTrace` came out 42.0 → 44.9 KB with two extra
+register moves on most dispatch back-edges (register allocation of the trace loop, not a code path this change runs).
+Conformance 4530/0 (= base), probes 562/0 in default, switch-off, `NO_POOL` and `ZOMBIES` modes, `bench/arc/check.sh`
+clean in both switch modes (new case `leaks/varrefs.js`), `swift test` under both collectors: only the 9 failures the
+base commit has too (HTMLParser ×2, Intl, Selector). Tests: `ArclessVarRefTests`.
+
+**Left.** The remaining closure lifecycle ARC is the closure *object*'s (payload enum copy in `jeffJS_recycleFunction`,
+`addGCObject`'s `ownerRuntime` store, the shape/proto setters: ~15 ARC ops per closure in createClosure + recycle) —
+step 4 of the issue. Mapped-`arguments` var-refs (`coldHeld`, ~234 k per deepmerge run) still allocate and free through
+ARC; counting the `JeffJSPropertyExtra` holder would let them park too.

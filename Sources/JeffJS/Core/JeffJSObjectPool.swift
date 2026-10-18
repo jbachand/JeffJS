@@ -127,7 +127,7 @@ nonisolated func jeffJS_recycleFunction(_ o: JeffJSObject) -> Bool {
     if (o._flags & JeffJSObject.flagHasVarRefs) != 0 {
         // interp.leanClosurePayload: keep the array's storage for the next
         // closure built on this object (createClosure fills it in place).
-        if jeffJSLeanClosurePayload { a.clearVarRefsKeepingCapacity() } else { a.setVarRefs([]) }
+        if jeffJSLeanClosurePayload { a.clearVarRefsKeepingCapacity(rt) } else { a.setVarRefs([]) }
     }
     if let shape = o.shape {
         o.shape = nil
@@ -217,7 +217,11 @@ nonisolated extension JeffJSRuntime {
         functionPool.forEachUnretained { $0.release() }
         functionPool.removeAll()
         arrayStoragePool.removeAll()
-        varRefPool.removeAll()   // parked var-refs hold the runtime (ownerRuntime)
+        // Parked var-refs hold the runtime (ownerRuntime); each rides its own
+        // manual retain. Nothing is parked after this (teardown).
+        varRefPoolOpen = false
+        varRefPool.forEachUnretained { $0.release() }
+        varRefPool.removeAll()
     }
 }
 
@@ -230,30 +234,62 @@ nonisolated(unsafe) let jeffJSVarRefPoolCapacity = 1024
 /// createClosure. A detached copy of a value nobody can read cost a dup, a
 /// GC-list insertion and, at deallocation, the list removal, the value's
 /// release and a free. Callers sync the frame first when they need to
-/// (jeffJS_syncForDetach).
+/// (jeffJS_syncForDetach). Empties the list, giving back the frame's holds
+/// (quickjs `close_var_refs`); `park: false` always detaches (generator
+/// early exits, as before).
 @inline(never)
-nonisolated func jeffJS_detachFrameVarRefs(_ frame: JeffJSStackFrame, _ rt: JeffJSRuntime) {
-    if !jeffJSRecycleVarRefs {
-        for vr in frame.liveVarRefs where !vr.isDetached {
+nonisolated func jeffJS_detachFrameVarRefs(_ frame: JeffJSStackFrame, _ rt: JeffJSRuntime,
+                                           park: Bool = true) {
+    let n = frame.liveVarRefs.count
+    guard n > 0 else { frame.hasLiveVarRefs = false; return }
+    let canPark = park && jeffJSRecycleVarRefs && !jeffJSObjectPoolDisabled
+    for i in 0..<n {
+        let u = frame.liveVarRefs[i]
+        let parkIt = u._withUnsafeGuaranteedRef { vr -> Bool in
+            if vr.isDetached { return false }
+            if canPark, jeffJS_varRefParkableAtFrameExit(u, vr, rt) {
+                vr.parentFrame = nil; vr.slot = nil
+                return true
+            }
             vr.value = vr.pvalue.dupValue()
             vr.isDetached = true
             vr.parentFrame = nil; vr.slot = nil
+            return false
         }
-        return
-    }
-    frame.liveVarRefs.withUnsafeMutableBufferPointer { b in
-        for i in 0..<b.count {
-            if b[i].isDetached { continue }
-            if isKnownUniquelyReferenced(&b[i]), rt.varRefPool.count < jeffJSVarRefPoolCapacity {
-                let vr = b[i]
-                vr.parentFrame = nil; vr.slot = nil
-                rt.varRefPool.append(vr)
-            } else {
-                let vr = b[i]
-                vr.value = vr.pvalue.dupValue()
-                vr.isDetached = true
-                vr.parentFrame = nil; vr.slot = nil
-            }
+        if parkIt && !jeffJSArclessVarRefs {
+            // ARC lifetime: the frame list's retain becomes the pool's.
+            rt.varRefPool.appendUnmanaged(u)
+        } else {
+            // Arcless: the last drop parks it (not detached, so no copy).
+            jeffJS_varRefDrop(u, rt)
         }
     }
+    frame.liveVarRefs.removeAllKeepingHolds()
+    frame.hasLiveVarRefs = false
+}
+
+/// Nothing but the frame list holds `vr`, so the frame's exit can park it.
+@inline(__always)
+nonisolated func jeffJS_varRefParkableAtFrameExit(_ u: Unmanaged<JeffJSVarRef>, _ vr: JeffJSVarRef,
+                                                  _ rt: JeffJSRuntime) -> Bool {
+    if jeffJSArclessVarRefs { return jeffJS_varRefOnlyFrameHeld(vr) }
+    // ARC lifetime: the base build's test (only the frame's reference left).
+    guard rt.varRefPool.count < jeffJSVarRefPoolCapacity else { return false }
+    return jeffJS_isUniquelyReferenced(u)
+}
+
+/// JEFFJS_MANUAL_MEMORY: the frame list's hold is the only one and no ARC
+/// holder may read the var-ref, so dropping it parks the var-ref.
+@inline(__always)
+nonisolated func jeffJS_varRefOnlyFrameHeld(_ vr: JeffJSVarRef) -> Bool {
+    jeffJSArclessVarRefs && vr.holdCount == 1 && !vr.coldHeld
+}
+
+/// `isKnownUniquelyReferenced` on an entry that owns one Swift retain.
+@inline(__always)
+nonisolated func jeffJS_isUniquelyReferenced(_ u: Unmanaged<JeffJSVarRef>) -> Bool {
+    var strong = u.takeRetainedValue()
+    let unique = isKnownUniquelyReferenced(&strong)
+    _ = Unmanaged.passRetained(strong)
+    return unique
 }
