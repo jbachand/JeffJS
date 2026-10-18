@@ -1236,7 +1236,7 @@ nonisolated final class JeffJSParser {
         while pos < end {
             guard let op = peekOpcodeAt(pos) else { break }
             if op == .scope_get_var || op == .get_field || op == .get_array_el ||
-               op == .scope_get_private_field {
+               op == .scope_get_private_field || op == .get_super_value {
                 lastGetOp = op
                 lastGetPos = pos
             }
@@ -1288,7 +1288,7 @@ nonisolated final class JeffJSParser {
             case .get_loc, .get_loc0, .get_loc1, .get_loc2, .get_loc3, .get_loc8,
                  .get_arg, .get_arg0, .get_arg1, .get_arg2, .get_arg3,
                  .get_var_ref, .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3,
-                 .scope_get_var, .get_var, .get_field, .get_array_el:
+                 .scope_get_var, .get_var, .get_field, .get_array_el, .get_super_value:
                 lastOp = op
                 lastPos = pos
             default: break
@@ -1366,6 +1366,17 @@ nonisolated final class JeffJSParser {
             emitOp(.dup)             // [obj, key, new, new]
             emitOp(.perm4)           // [new, obj, key, new]
             emitOp(.put_array_el)    // [new]
+        case .get_super_value:
+            // ++super.x: ..., get_super_value, inc/dec; stack [this, proto, key]
+            let incDecByte = fd.byteCode.buf[lpos + (wide ? 2 : 1)]
+            let incDecOp = JeffJSOpcode(rawValue: UInt16(incDecByte)) ?? .inc
+            fd.byteCode.len = lpos
+            emitOp(.dup3)            // [this, proto, key, this, proto, key]
+            emitOp(.get_super_value) // [this, proto, key, value]
+            emitOp(incDecOp)         // [this, proto, key, new]
+            emitOp(.dup)             // [this, proto, key, new, new]
+            emitOp(.perm5)           // [new, this, proto, key, new]
+            emitOp(.put_super_value) // [new]
         default: break
         }
     }
@@ -2797,6 +2808,8 @@ nonisolated final class JeffJSParser {
             emitOp(.swap)
         } else if ref.depth == 2 {
             emitOp(.rot3l)
+        } else if ref.depth == 3 {
+            emitOp(.rot4l)
         }
         emitAssignTargetPut(ref)
     }
@@ -5117,6 +5130,13 @@ nonisolated final class JeffJSParser {
                 emitOp(.perm3)           // [val, obj, val]  (rotate: TOS-2 goes to TOS)
                 emitExprSpan(lhsSrcStart, s.lastPtr)
                 emitPutField(atom)       // pops [obj, val]; stack: [val]
+            } else if lastGetOp == .get_super_value, let pos = lastGetPos {
+                // super.x = v (QuickJS OP_put_super_value): [this, proto, key]
+                fd.byteCode.len = pos
+                parseAssignExpr()        // [this, proto, key, val]
+                emitOp(.dup)             // [this, proto, key, val, val]
+                emitOp(.perm5)           // [val, this, proto, key, val]
+                emitOp(.put_super_value) // [val]
             } else if lastGetOp == .get_array_el, let pos = lastGetPos {
                 fd.byteCode.len = pos   // rewind; stack: [obj, index]
                 parseAssignExpr()        // stack: [obj, index, val]
@@ -5196,6 +5216,22 @@ nonisolated final class JeffJSParser {
                 emitGoto(doneLabel)
                 emitLabel(endLabel)                         // [obj, old]
                 emitOp(.nip)                                // [old]
+                emitLabel(doneLabel)
+            } else if logGetOp == .get_super_value, let pos = logGetPos {
+                // super.x ??= y: the reference [this, proto, key] is evaluated once.
+                let doneLabel = newLabel()
+                fd.byteCode.len = pos                       // [this, proto, key]
+                emitOp(.dup3)
+                emitOp(.get_super_value)                    // [this, proto, key, old]
+                emitLogicalAssignShortCircuit(assignOp, to: endLabel)
+                emitOp(.drop)                               // [this, proto, key]
+                parseAssignExpr()                           // [this, proto, key, val]
+                emitOp(.dup)
+                emitOp(.perm5)                              // [val, this, proto, key, val]
+                emitOp(.put_super_value)                    // [val]
+                emitGoto(doneLabel)
+                emitLabel(endLabel)                         // [this, proto, key, old]
+                emitOp(.nip); emitOp(.nip); emitOp(.nip)    // [old]
                 emitLabel(doneLabel)
             } else if logGetOp == .get_array_el, let pos = logGetPos {
                 // obj[key] ??= y: obj and key evaluated once.
@@ -5307,6 +5343,16 @@ nonisolated final class JeffJSParser {
                     emitOp(.dup)                                 // [obj, new, new]
                     emitOp(.perm3)                               // [new, obj, new]
                     emitScopePutPrivateField(atom, scopeLevel: scopeLevel)  // [new]
+                } else if compOp == .get_super_value, let pos = compPos {
+                    // super.x op= rhs
+                    fd.byteCode.len = pos      // [this, proto, key]
+                    emitOp(.dup3)
+                    emitOp(.get_super_value)   // [this, proto, key, old]
+                    parseAssignExpr()
+                    emitBinaryOp(forAssignOp: assignOp) // [this, proto, key, new]
+                    emitOp(.dup)
+                    emitOp(.perm5)             // [new, this, proto, key, new]
+                    emitOp(.put_super_value)   // [new]
                 } else if compOp == .get_array_el, let pos = compPos {
                     fd.byteCode.len = pos     // rewind past get_array_el; stack: [obj, key]
                     emitOp(.dup2)              // [obj, key, obj, key]
@@ -5728,6 +5774,14 @@ nonisolated final class JeffJSParser {
                 fd.byteCode.len = pos  // rewind: stack has [obj, key]
                 emitExprSpan(deleteSrcStart, s.lastPtr)
                 emitOp(.delete_)
+            } else if lastOp == .get_super_value, let pos = lastPos {
+                // `delete super.x` evaluates the reference, then throws a
+                // ReferenceError (ES §13.5.1.2 step 5.a; QuickJS
+                // JS_THROW_ERROR_DELETE_SUPER).
+                fd.byteCode.len = pos  // [this, proto, key]
+                emitOp(.drop); emitOp(.drop) // one slot left where delete's result goes
+                emitThrowError(getAtom("Cannot delete a super property"),
+                               errorType: UInt8(ThrowErrorType.deleteSuperProperty.rawValue))
             } else if lastOp == .scope_get_private_field {
                 // `delete obj.#x` is an early SyntaxError.
                 syntaxError("cannot delete a private member")
@@ -5826,6 +5880,15 @@ nonisolated final class JeffJSParser {
                     emitOp(.rot3l)     // [obj, old, new] → [old, new, obj]
                     emitOp(.swap)      // [old, new, obj] → [old, obj, new]
                     emitPutField(atom) // pops new + obj, stores → [old]
+                } else if lastGetOp == .get_super_value, let pos = lastGetPos {
+                    // super.x++: rewind past get_super_value + post_inc/dec.
+                    fd.byteCode.len = pos  // [this, proto, key]
+                    emitOp(.dup3)
+                    emitOp(.get_super_value)               // [this, proto, key, value]
+                    emitOp(isInc ? .post_inc : .post_dec)  // [this, proto, key, old, new]
+                    emitOp(.swap)                          // [this, proto, key, new, old]
+                    emitOp(.perm5)                         // [old, this, proto, key, new]
+                    emitOp(.put_super_value)               // [old]
                 } else if lastGetOp == .get_array_el, let pos = lastGetPos {
                     // For obj[key]++:
                     // Bytecode so far: ..., <obj>, <key>, get_array_el, post_inc
@@ -6052,14 +6115,17 @@ nonisolated final class JeffJSParser {
         let superBase = lastExprWasSuperProp
         lastExprWasSuperProp = false
         next()
+        if superBase {
+            // super[key] (ES §13.3.7.1): `this` is taken before the key
+            // expression runs. [homeProto] -> [this, homeProto]
+            emitOp(.push_this); emitOp(.swap)
+        }
         parseExpression()
         expect(0x5D) // ']'
         if superBase {
-            // [homeProto, key] -> value; a following call gets `this`.
-            emitOp(.get_array_el)
-            if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
-                emitOp(.push_this); emitOp(.swap); pendingMethodCall = true
-            }
+            // [this, homeProto, key] -> value, read with `this` as the
+            // receiver (QuickJS OP_get_super_value); a call gets `this`.
+            emitSuperRead()
         } else if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue
                     || (tok == JSTokenType.TOK_OPTIONAL_CHAIN.rawValue
                         && s.simpleNextToken() == 0x28) {
@@ -6074,6 +6140,19 @@ nonisolated final class JeffJSParser {
             let pos = fd.byteCode.len
             emitOp(.get_array_el)
             noteMemberGet(at: pos)
+        }
+    }
+
+    /// `[this, homeProto, key]` -> the super property's value. A following
+    /// call (`super.m(...)`) gets `this` under the callee. The assignment /
+    /// update / delete paths find the get_super_value through
+    /// findLastGetOpcode and turn it into put_super_value with the
+    /// reference ([this, homeProto, key]) kept.
+    private func emitSuperRead() {
+        emitOp(.get_super_value)
+        if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
+            emitOp(.push_this); emitOp(.swap)
+            pendingMethodCall = true
         }
     }
 
@@ -6131,11 +6210,15 @@ nonisolated final class JeffJSParser {
             next()
         }
         if let fieldAtom = fieldAtomOpt {
-            if superBase && (tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue) {
-                // super.m(...): [homeProto] -> [this, homeProto] -> [this, m]
+            if superBase {
+                // super.x / super.m(...): [homeProto] -> [this, homeProto, "x"]
+                // -> value, read with `this` as the receiver (QuickJS
+                // OP_get_super_value: a getter on the super chain runs with
+                // the method's `this`, not the prototype).
                 emitOp(.push_this); emitOp(.swap)
-                pendingMethodCall = true
-                emitGetField(fieldAtom)
+                emitOp(.push_atom_value)
+                emitAtom(fieldAtom)
+                emitSuperRead()
             } else if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue
                         || (tok == JSTokenType.TOK_OPTIONAL_CHAIN.rawValue
                             && s.simpleNextToken() == 0x28) {
@@ -8104,11 +8187,18 @@ nonisolated final class JeffJSParser {
     /// the object and key for an element — and emitAssignTargetPut stores
     /// the value sitting on top of them.
     struct AssignTargetRef {
-        enum Kind { case variable, field, element, privateField }
+        enum Kind { case variable, field, element, privateField, superProperty }
         let kind: Kind
         let atom: JSAtom
         let scopeLevel: Int
-        var depth: Int { kind == .variable ? 0 : (kind == .element ? 2 : 1) }
+        var depth: Int {
+            switch kind {
+            case .variable: return 0
+            case .field, .privateField: return 1
+            case .element: return 2
+            case .superProperty: return 3 // [this, homeProto, key]
+            }
+        }
     }
 
     func parseAssignTargetRef() -> AssignTargetRef? {
@@ -8144,6 +8234,8 @@ nonisolated final class JeffJSParser {
             ref = AssignTargetRef(kind: .field,
                                   atom: readU32FromBuf(fd.byteCode.buf, pos + opcodeSize),
                                   scopeLevel: 0)
+        case .get_super_value:
+            ref = AssignTargetRef(kind: .superProperty, atom: 0, scopeLevel: 0)
         default: // .get_array_el
             ref = AssignTargetRef(kind: .element, atom: 0, scopeLevel: 0)
         }
@@ -8159,6 +8251,7 @@ nonisolated final class JeffJSParser {
         case .field:        emitPutField(ref.atom)
         case .element:      emitOp(.put_array_el)
         case .privateField: emitScopePutPrivateField(ref.atom, scopeLevel: ref.scopeLevel)
+        case .superProperty: emitOp(.put_super_value)
         }
     }
 

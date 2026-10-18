@@ -1754,6 +1754,45 @@ extension JeffJSTestRunner {
             };
             new MyClass(42).get()
             """, expectInt: 42)
+
+        // super.x runs an inherited getter / setter with the method's `this`
+        // as the receiver (QuickJS OP_get_super_value / OP_put_super_value);
+        // the getter used to run on the prototype (Ajv's `get names(){
+        // const e = super.names; ... }` on DuckDuckGo).
+        evalCheckStr(ctx, """
+            class SA { constructor(){ this.n = 1; } get x(){ return this.n; } set x(v){ this.n = v * 10; } m(){ return this === sb; } }
+            class SB extends SA {
+                get x(){ return super.x + 100; } set x(v){ super.x = v; }
+                k(key){ return super[key]; } call(){ return super.m(); }
+                arrow(){ return (() => super.x)(); }
+            }
+            var sb = new SB();
+            var r = [sb.x, sb.k('x'), sb.call(), sb.arrow()];
+            sb.x = 2; r.push(sb.n);
+            r.join()
+            """, expect: "101,1,true,1,20")
+        // Assignment forms through super: update, compound, logical,
+        // destructuring and for-of targets, delete (ReferenceError), and a
+        // write with no setter lands on `this`, not on the prototype.
+        evalCheckStr(ctx, """
+            class SC { constructor(){ this.n = 1; } get x(){ return this.n; } set x(v){ this.n = v * 10; } }
+            class SD extends SC {
+                inc(){ super.x++; return this.n; } pre(){ return ++super.x; } add(){ super.x += 2; return this.n; }
+                log(){ super.x ??= 5; return this.n; }
+                del(){ try { delete super.x; return 'no'; } catch (e) { return e.constructor.name + ':' + e.message; } }
+                ds(){ [super.x] = [7]; return this.n; } fo(){ for (super.x of [3]); return this.n; }
+                plain(){ super.y = 9; return Object.prototype.hasOwnProperty.call(this, 'y') && !('y' in SC.prototype); }
+            }
+            var sd = new SD();
+            [sd.inc(), sd.pre(), sd.add(), sd.log(), sd.del(), sd.ds(), sd.fo(), sd.plain()].join()
+            """, expect: "20,21,2120,2120,ReferenceError:Cannot delete a super property,70,30,true")
+        evalCheckStr(ctx, """
+            class SE { static s(){ return this.tag; } }
+            class SF extends SE { static s(){ return super.s() + '!'; } }
+            SE.tag = 'E'; SF.tag = 'F';
+            var lit = { __proto__: { get g(){ return this.v; } }, v: 42, h(){ return super.g; } };
+            SF.s() + lit.h()
+            """, expect: "F!42")
     }
 
     // MARK: - Iterators
@@ -4207,7 +4246,6 @@ extension JeffJSTestRunner {
 
         // Date from string
         evalCheckBool(ctx, "!isNaN(new Date('2024-01-15').getTime())", expect: true)
-
         // Date from components
         evalCheck(ctx, "new Date(2024, 0, 15).getFullYear()", expectInt: 2024)
         evalCheck(ctx, "new Date(2024, 0, 15).getMonth()", expectInt: 0) // 0-indexed

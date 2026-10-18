@@ -2741,17 +2741,43 @@ nonisolated extension JeffJSContext {
     /// Gets a property via the super binding.
     /// Per spec: reads from the super class's prototype (obj) but uses thisObj as receiver.
     func getSuperProperty(thisObj: JeffJSValue, obj: JeffJSValue, key: JeffJSValue) -> JeffJSValue {
-        // Super property access reads from the super prototype chain.
-        // The receiver (thisObj) is used for getter `this` binding.
-        return getPropertyValue(obj: obj, prop: key)
+        // Mirrors OP_get_super_value: JS_GetPropertyInternal(ctx, obj, atom,
+        // this_obj, FALSE). The lookup starts at the home object's prototype
+        // but a getter found there runs with the receiver (`this` of the
+        // method) as its `this` (ES §13.3.7.1 MakeSuperPropertyReference +
+        // GetValue step 3.c). It used to run with `obj` as `this`, so
+        // `get x() { return super.x }` read the prototype's fields (Ajv's
+        // codegen `get names(){ const e = super.names; … }`: "undefined is not
+        // an object (evaluating 'this.nodes.reduce')" on DuckDuckGo results).
+        return getPropertyWithReceiver(obj: obj, key: key, receiver: thisObj)
     }
 
     /// Sets a property via the super binding.
-    /// Per spec: writes to thisObj (the actual instance) not the super prototype.
+    /// Mirrors OP_put_super_value: JS_SetPropertyInternal(ctx, obj, atom, val,
+    /// this_obj, JS_PROP_THROW_STRICT) — OrdinarySet from the home object's
+    /// prototype with the method's `this` as the receiver: a setter found on
+    /// the super chain runs with `this`, otherwise the value lands on `this`.
+    /// It used to write `this[key]` directly, which ran the *subclass's*
+    /// accessor (`set x(v) { super.x = v }` recursed until the stack ran out).
+    /// Consumes `val`.
     func putSuperProperty(thisObj: JeffJSValue, obj: JeffJSValue, key: JeffJSValue,
                           val: JeffJSValue) -> Bool {
-        // Super property set writes to the receiver (thisObj), not the super prototype.
-        return setPropertyValue(obj: thisObj, prop: key, val: val)
+        defer { val.freeValue() }
+        guard obj.isObject else {
+            _ = throwTypeError(message: "super is not an object")
+            return false
+        }
+        guard let (atom, owned) = propertyKeyAtom(key) else { return false }
+        defer { if owned { rt.freeAtom(atom) } }
+        let k = proxyTrapKey(atom)
+        defer { k.freeValue() }
+        let r = reflectSet(obj, key: k, atom: atom, value: val, receiver: thisObj)
+        if r < 0 { return false }
+        if r == 0 {
+            _ = throwTypeError(message: "Attempted to assign to readonly property.")
+            return false
+        }
+        return true
     }
 
     // MARK: - Object/Class Definition Stubs
@@ -10714,6 +10740,7 @@ nonisolated struct JeffJSInterpreter {
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let thisObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let val = ctx.getSuperProperty(thisObj: thisObj, obj: obj, key: key)
+                key.freeValue(); obj.freeValue(); thisObj.freeValue()
                 if val.isException {
                     retVal = .exception
                     break dispatchLoop
@@ -10727,6 +10754,7 @@ nonisolated struct JeffJSInterpreter {
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let thisObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let ok = ctx.putSuperProperty(thisObj: thisObj, obj: obj, key: key, val: val)
+                key.freeValue(); obj.freeValue(); thisObj.freeValue()
                 if !ok {
                     retVal = .exception
                     break dispatchLoop

@@ -1296,6 +1296,15 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         return (rt.findAtom(jsString: s), true)
     }
 
+    /// `obj[key]` with an explicit receiver (the `this` of a getter found on
+    /// the chain): Reflect.get / super property reads.
+    /// Mirrors `JS_GetPropertyInternal(ctx, obj, atom, this_obj, FALSE)`.
+    func getPropertyWithReceiver(obj: JeffJSValue, key: JeffJSValue, receiver: JeffJSValue) -> JeffJSValue {
+        guard let (atom, owned) = propertyKeyAtom(key) else { return .exception }
+        defer { if owned { rt.freeAtom(atom) } }
+        return getPropertyInternal(obj: obj, atom: atom, receiver: receiver)
+    }
+
     /// Gets a property from an object using an atom key.
     /// Mirrors `JS_GetProperty()` from QuickJS.
     ///
