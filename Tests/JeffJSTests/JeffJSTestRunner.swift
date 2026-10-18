@@ -4246,6 +4246,16 @@ extension JeffJSTestRunner {
 
         // Date from string
         evalCheckBool(ctx, "!isNaN(new Date('2024-01-15').getTime())", expect: true)
+
+        // Constructor / Date.UTC arguments go through ToNumber / ToPrimitive
+        // (QuickJS js_date_constructor, js_Date_UTC): DuckDuckGo builds result
+        // dates with `new Date(r[1], parseInt(r[2], 10) - 1, r[3])`.
+        evalCheckStr(ctx, """
+            [new Date("2026", 0, "22").getDate(), new Date(true).getTime(), new Date(new Date(5)).getTime(),
+             new Date({ valueOf(){ return 7; } }).getTime(), Date.UTC("2020", "1"), isNaN(new Date(2020, undefined).getTime()),
+             new Date(2020, null, 1).getMonth()].join()
+            """, expect: "22,1,5,7,1580515200000,true,0")
+
         // Date from components
         evalCheck(ctx, "new Date(2024, 0, 15).getFullYear()", expectInt: 2024)
         evalCheck(ctx, "new Date(2024, 0, 15).getMonth()", expectInt: 0) // 0-indexed

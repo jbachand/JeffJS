@@ -669,29 +669,33 @@ nonisolated func jsDate_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue
         // new Date() — current time
         tv = Date().timeIntervalSince1970 * 1000.0
     } else if argv.count == 1 {
+        // ES §21.4.2.1 step 4: a Date's time value, else ToPrimitive(value);
+        // a string is parsed, anything else goes through ToNumber
+        // (QuickJS js_date_constructor). `new Date(true)`, `new Date(date)`
+        // and `new Date({valueOf})` were NaN.
         let v = argv[0]
-        if v.isString, let s = v.stringValue {
-            // new Date(dateString)
-            tv = jsDateParse(s.toSwiftString())
+        if let o = v.toObject(), o.classID == JeffJSClassID.date.rawValue {
+            tv = getDateValue(v)
         } else {
-            // new Date(value) — milliseconds since epoch
-            if v.isInt {
-                tv = Double(v.toInt32())
-            } else if v.isFloat64 {
-                tv = v.toFloat64()
+            let prim = v.isObject ? JeffJSTypeConvert.toPrimitive(ctx: ctx, val: v, hint: HINT_NONE) : v
+            if prim.isException { return .exception }
+            if prim.isString, let s = prim.stringValue {
+                tv = jsDateParse(s.toSwiftString())
             } else {
-                tv = Double.nan
+                let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: prim)
+                if !ok { return .exception }
+                tv = d
             }
+            if v.isObject { prim.freeValue() }
         }
     } else {
-        // new Date(year, monthIndex, ...)
+        // new Date(year, monthIndex, ...): every present argument goes through
+        // ToNumber (ES §21.4.2.1 step 5; QuickJS js_date_constructor) —
+        // `new Date("2026", 0, "22")` was NaN (DuckDuckGo's result dates
+        // printed "Invalid Date").
+        guard let nums = dateNumberArgs(ctx, argv) else { return .exception }
         func argToDouble(_ i: Int, _ def: Double) -> Double {
-            guard i < argv.count else { return def }
-            let v = argv[i]
-            if v.isInt { return Double(v.toInt32()) }
-            if v.isFloat64 { return v.toFloat64() }
-            if v.isUndefined { return def }
-            return Double.nan
+            return i < nums.count ? nums[i] : def
         }
 
         var y = argToDouble(0, Double.nan)
@@ -719,6 +723,20 @@ nonisolated func jsDate_constructor(_ ctx: JeffJSContext, _ thisVal: JeffJSValue
     return .makeObject(obj)
 }
 
+/// ToNumber of the first seven arguments, in order (the Date constructor's
+/// and Date.UTC's year…ms). nil when a conversion threw.
+nonisolated private func dateNumberArgs(_ ctx: JeffJSContext, _ argv: [JeffJSValue]) -> [Double]? {
+    var out: [Double] = []
+    for v in argv.prefix(7) {
+        if v.isInt { out.append(Double(v.toInt32())); continue }
+        if v.isFloat64 { out.append(v.toFloat64()); continue }
+        let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: v)
+        if !ok { return nil }
+        out.append(d)
+    }
+    return out
+}
+
 // MARK: - Date Static Methods
 
 /// Date.now() — returns current time in milliseconds since epoch.
@@ -740,12 +758,9 @@ nonisolated func jsDate_parse(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
 /// Date.UTC(year, month, ...) — returns time value for UTC date.
 nonisolated func jsDate_UTC(_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
                 _ argv: [JeffJSValue]) -> JeffJSValue {
+    guard let nums = dateNumberArgs(ctx, argv) else { return .exception }
     func argToDouble(_ i: Int, _ def: Double) -> Double {
-        guard i < argv.count else { return def }
-        let v = argv[i]
-        if v.isInt { return Double(v.toInt32()) }
-        if v.isFloat64 { return v.toFloat64() }
-        return Double.nan
+        return i < nums.count ? nums[i] : def
     }
 
     var y = argToDouble(0, Double.nan)
@@ -887,6 +902,11 @@ nonisolated private func optArg(_ argv: [JeffJSValue], _ i: Int) -> Double? {
     if v.isUndefined { return nil }
     if v.isInt { return Double(v.toInt32()) }
     if v.isFloat64 { return v.toFloat64() }
+    // ToNumber of a primitive (`d.setFullYear("2026")`); objects stay NaN
+    // here (no context to run valueOf).
+    if v.isString, let s = v.stringValue { return JeffJSTypeConvert.stringToNumber(s) }
+    if v.isBool { return v.toBool() ? 1 : 0 }
+    if v.isNull { return 0 }
     return Double.nan
 }
 
