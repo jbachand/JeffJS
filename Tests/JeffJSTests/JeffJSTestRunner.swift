@@ -4249,6 +4249,7 @@ extension JeffJSTestRunner {
 
         // atob is HTML's forgiving-base64 decode: padding optional, ASCII
         // whitespace ignored, a length of 4n+1 or a non-alphabet char throws.
+        JeffJSStdLib.addBase64(ctx: ctx)
         evalCheckStr(ctx, """
             var r = [atob('YQ'), atob('YWI'), atob(' YW I= '), atob('YWJj'), atob('')];
             ['Y', 'YQ=', 'Y-8', 'YQ==='].forEach(function (s) { try { atob(s); r.push('ok'); } catch (e) { r.push('x'); } });
