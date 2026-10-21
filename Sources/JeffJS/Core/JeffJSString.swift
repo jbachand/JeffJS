@@ -150,6 +150,43 @@ nonisolated final class JeffJSString: JeffJSStringBase {
         }
     }
 
+    /// Appends `other`'s code units to this string's own array. Only for a
+    /// string nothing else references (jeffJS_concatStrings' ownedRefs proof):
+    /// a string value must never change under another holder. Not for an
+    /// interned string (atoms are keyed by content; the table holds a
+    /// reference, so the proof excludes them anyway). The cached hash is
+    /// dropped.
+    final func appendInPlace(_ other: JeffJSString) {
+        let n2 = other.len
+        if n2 == 0 { return }
+        switch _chars {
+        case .c8(var a):
+            _chars = .c8([])   // keep `a` uniquely referenced
+            if !other.isWideChar, case .str8(let b) = other.storage {
+                a.append(contentsOf: b)
+                _chars = .c8(a)
+            } else {
+                var w = ContiguousArray<UInt16>()
+                w.reserveCapacity(a.count + n2)
+                for c in a { w.append(UInt16(c)) }
+                if case .str16(let b) = other.storage { w.append(contentsOf: b) }
+                _chars = .c16(w)
+                isWideChar = true
+            }
+        case .c16(var w):
+            _chars = .c16([])
+            if other.isWideChar, case .str16(let b) = other.storage {
+                w.append(contentsOf: b)
+            } else if case .str8(let b) = other.storage {
+                w.reserveCapacity(w.count + n2)
+                for c in b { w.append(UInt16(c)) }
+            }
+            _chars = .c16(w)
+        }
+        _len = UInt32(truncatingIfNeeded: Int(_len) + n2)
+        hash = 0
+    }
+
     // -- Convenience accessors -----------------------------------------------
 
     /// Returns the raw UInt8 buffer (only valid when `isWideChar == false`).
@@ -636,6 +673,21 @@ nonisolated func jeffJS_concatStrings(s1: JeffJSValue, s2: JeffJSValue, ownedRef
             let nb = b1.handOff()
             nb.concatValue(s2)
             return JeffJSValue.mkPtr(tag: .string, ptr: nb)
+        }
+    }
+
+    // A flat left operand the caller holds every reference to (a temporary
+    // from the previous `+`, or the local `l` of `l = l + x`): append into
+    // its own array (amortised O(1), ContiguousArray growth) instead of
+    // allocating a new string per `+`. `"<tr>" + a + "</td>" + b + …` built
+    // six strings per row (template-html / template-literals 5.5x QuickJS,
+    // which appends in place in js_concat_string the same way).
+    if ownedRefs > 0, let sb = s1.stringBase, sb.kind == JeffJSStringBase.kindFlat,
+       sb.refCount <= ownedRefs, s2.stringBase !== sb {
+        let f1 = unsafeDowncast(sb, to: JeffJSString.self)
+        if f1.cachedAtom == 0, f1.atomType == 0, !f1.freeMark, let f2 = s2.stringValue, f2.len > 0 {
+            f1.appendInPlace(f2)
+            return s1.dupValue()
         }
     }
 
