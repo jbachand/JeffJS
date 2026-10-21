@@ -1906,10 +1906,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         if jsObj.fastArray || jsObj.classID == JeffJSClassID.array.rawValue {
             if rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom) {
                 // A hole (from `delete a[i]`) is *absent*: `1 in a` is false.
-                if let storage = jsObj._fastArrayValues {
-                    if idx < storage.count && Int(idx) < storage.values.count {
-                        return storage.values[Int(idx)].isUninitialized ? 0 : 1
-                    }
+                if let stU = jsObj._fastArrayValuesU {
+                    if let r = stU._withUnsafeGuaranteedRef({ storage -> Int? in
+                        idx < storage.count && Int(idx) < storage.values.count ? (storage.values[Int(idx)].isUninitialized ? 0 : 1) : nil }) { return r }
                 } else if let snap = jsObj.arraySnapshot() {
                     if Int(idx) < snap.count && Int(idx) < snap.values.count {
                         return snap.values[Int(idx)].isUninitialized ? 0 : 1
@@ -5432,12 +5431,16 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // Fast path for array integer-indexed access
         if jsObj.fastArray || jsObj.classID == JeffJSClassID.array.rawValue {
             if rt.atomIsArrayIndex(atom), let idx = rt.atomToUInt32(atom) {
-                // Check ref-type fast storage first (populated by push fast path)
-                if let storage = jsObj._fastArrayValues {
-                    if idx < storage.count, Int(idx) < storage.values.count {
-                        return storage.values[Int(idx)].arrayHoleAsUndefined.dupValue()
+                // Check ref-type fast storage first (populated by push fast
+                // path), through the unretained handle: the strong read was a
+                // retain/release pair per element read.
+                if let stU = jsObj._fastArrayValuesU {
+                    return stU._withUnsafeGuaranteedRef { storage in
+                        if idx < storage.count, Int(idx) < storage.values.count {
+                            return storage.values[Int(idx)].arrayHoleAsUndefined.dupValue()
+                        }
+                        return .JS_UNDEFINED
                     }
-                    return .JS_UNDEFINED
                 }
                 if case .array(_, let vals, let count) = jsObj.payload {
                     if idx < count, Int(idx) < vals.count {

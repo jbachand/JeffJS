@@ -603,13 +603,13 @@ nonisolated extension JeffJSContext {
             // above.) The shape and its key cache are read without retains,
             // the keys through the list's raw buffer.
             if jeffJSFastSpecies {
-                let list: JeffJSForInKeyList
-                if let c = shU._withUnsafeGuaranteedRef({ $0.enumKeyCache }) { list = c }
-                else { list = shapeEnumKeys(shU.takeUnretainedValue()) }
+                // The cache's buffer and count without retaining the list
+                // (the shape owns it; a strong `list` was a pair per call).
+                var lU = shU._withUnsafeGuaranteedRef { unsafeBitCast($0.enumKeyCache, to: UnsafeRawPointer?.self) }
+                if lU == nil { lU = unsafeBitCast(shapeEnumKeys(shU.takeUnretainedValue()), to: UnsafeRawPointer?.self) }
+                let (b, n) = Unmanaged<JeffJSForInKeyList>.fromOpaque(lU.unsafelyUnwrapped)._withUnsafeGuaranteedRef { ($0.keysPtr, $0.keysCount) }
                 // The cached keys straight into the new array's element store.
-                let n = list.keysCount
                 if n == 0 { return newArray() }
-                let b = list.keysPtr
                 for i in 0..<n { _ = b[i].dupValue() }
                 return newArrayFromSlots(b, n)
             }

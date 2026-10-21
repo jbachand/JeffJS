@@ -1471,8 +1471,10 @@ nonisolated extension JeffJSContext {
                         // per closure); entries are read through unretained
                         // handles.
                         parentFrame.liveVarRefs.withUnsafeMutableBufferPointer { lv in
+                            guard let base = lv.baseAddress else { return }
+                            let raw = UnsafeRawPointer(base)
                             for i in 0..<lv.count {
-                                let u = Unmanaged.passUnretained(lv[i])
+                                let u = Unmanaged<JeffJSVarRef>.fromOpaque(raw.load(fromByteOffset: i * MemoryLayout<JeffJSVarRef>.stride, as: UnsafeRawPointer.self))
                                 if u._withUnsafeGuaranteedRef({ $0.varIdx == wantIdx && $0.isArg == wantArg && !$0.isDetached }) { existingVR = lv[i]; break }
                             }
                         }

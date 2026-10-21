@@ -257,14 +257,17 @@ nonisolated func jeffJS_detachFrameVarRefs(_ frame: JeffJSStackFrame, _ rt: Jeff
         return
     }
     frame.liveVarRefs.withUnsafeMutableBufferPointer { b in
+        guard let base = b.baseAddress else { return }
+        let raw = UnsafeRawPointer(base)
         for i in 0..<b.count {
-            // Through the unretained handle: `let vr = b[i]` was a retain and
-            // a release per var-ref on every frame exit.
-            let u = Unmanaged.passUnretained(b[i])
+            // Through the unretained handle, loaded as raw bits: `let vr =
+            // b[i]` (and `Unmanaged.passUnretained(b[i])`) loaded a strong
+            // temporary, a retain and a release per var-ref on every frame exit.
+            let u = Unmanaged<JeffJSVarRef>.fromOpaque(raw.load(fromByteOffset: i * MemoryLayout<JeffJSVarRef>.stride, as: UnsafeRawPointer.self))
             if u._withUnsafeGuaranteedRef({ $0.isDetached }) { continue }
             if isKnownUniquelyReferenced(&b[i]), rt.varRefPool.count < jeffJSVarRefPoolCapacity {
                 u._withUnsafeGuaranteedRef { $0.parentFrame = nil; $0.slot = nil }
-                rt.varRefPool.append(b[i])
+                rt.varRefPool.appendRetaining(u)
             } else {
                 u._withUnsafeGuaranteedRef { vr in
                     vr.value = vr.pvalue.dupValue()
