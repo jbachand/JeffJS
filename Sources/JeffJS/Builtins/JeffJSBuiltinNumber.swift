@@ -1056,43 +1056,59 @@ nonisolated struct JeffJSBuiltinBigInt {
 /// the exponent written without zero padding). Swift's own layout differs:
 /// "1e-07" for 1e-7, "1e+20" for 1e20 (JS: "100000000000000000000").
 nonisolated func jeffJS_formatDoubleJS(_ d: Double) -> String {
+    // One pass over the description's UTF-8 bytes into one byte buffer (the
+    // Character arrays, Substrings and concatenations this replaced were
+    // most of String(x) for a non-integer: date-number-format 4.3x QuickJS).
     let negative = d < 0
-    let s = "\(Swift.abs(d))"
-    var mant = Substring(s)
+    let s = Swift.abs(d).description
+    var digits: [UInt8] = []          // significant digits, no point
+    digits.reserveCapacity(24)
+    var pointPos = 0                  // digits before the decimal point (as written)
     var exp10 = 0
-    if let ei = s.firstIndex(where: { $0 == "e" || $0 == "E" }) {
-        mant = s[s.startIndex..<ei]
-        exp10 = Int(s[s.index(after: ei)...]) ?? 0
+    var seenPoint = false
+    var inExp = false
+    var expNeg = false
+    for b in s.utf8 {
+        if inExp {
+            if b == 0x2D { expNeg = true } else if b >= 0x30 && b <= 0x39 { exp10 = exp10 * 10 + Int(b - 0x30) }
+            continue
+        }
+        switch b {
+        case 0x2E: seenPoint = true
+        case 0x65, 0x45: inExp = true
+        default:
+            digits.append(b)
+            if !seenPoint { pointPos += 1 }
+        }
     }
-    var digits: [Character]
-    var pointPos: Int
-    if let dot = mant.firstIndex(of: ".") {
-        let intPart = mant[mant.startIndex..<dot]
-        let frac = mant[mant.index(after: dot)...]
-        digits = Array(intPart) + Array(frac)
-        pointPos = intPart.count
-    } else {
-        digits = Array(mant)
-        pointPos = digits.count
-    }
-    while digits.count > 1 && digits.first == "0" { digits.removeFirst(); pointPos -= 1 }
-    while digits.count > 1 && digits.last == "0" { digits.removeLast() }
+    if expNeg { exp10 = -exp10 }
+    var lead = 0
+    while digits.count - lead > 1 && digits[lead] == 0x30 { lead += 1; pointPos -= 1 }
+    if lead > 0 { digits.removeFirst(lead) }
+    while digits.count > 1 && digits[digits.count - 1] == 0x30 { digits.removeLast() }
     let n = pointPos + exp10
     let k = digits.count
-    var out = ""
+    var out: [UInt8] = []
+    out.reserveCapacity(k + 8)
+    if negative { out.append(0x2D) }
     if k <= n && n <= 21 {
-        out = String(digits) + String(repeating: "0", count: n - k)
+        out.append(contentsOf: digits)
+        for _ in 0 ..< (n - k) { out.append(0x30) }
     } else if 0 < n && n <= 21 {
-        out = String(digits[0..<n]) + "." + String(digits[n...])
+        out.append(contentsOf: digits[0 ..< n]); out.append(0x2E); out.append(contentsOf: digits[n...])
     } else if -6 < n && n <= 0 {
-        out = "0." + String(repeating: "0", count: -n) + String(digits)
+        out.append(0x30); out.append(0x2E)
+        for _ in 0 ..< (-n) { out.append(0x30) }
+        out.append(contentsOf: digits)
     } else {
         let e = n - 1
-        let expStr = (e >= 0 ? "+" : "-") + String(Swift.abs(e))
-        out = k == 1 ? String(digits) + "e" + expStr
-                     : String(digits[0]) + "." + String(digits[1...]) + "e" + expStr
+        out.append(digits[0])
+        if k > 1 { out.append(0x2E); out.append(contentsOf: digits[1...]) }
+        out.append(0x65)
+        out.append(e >= 0 ? 0x2B : 0x2D)
+        out.append(contentsOf: Array(String(Swift.abs(e)).utf8))
     }
-    return negative ? "-" + out : out
+    return String(decoding: out, as: UTF8.self)
 }
 
 
