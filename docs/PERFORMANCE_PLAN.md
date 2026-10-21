@@ -1322,8 +1322,10 @@ array recycling (5 pairs per array), closure creation + recycling (~15 pairs per
 | c6e9d07 | `installFastArrayValues` fills a recycled array's kept store in place (a store alloc + free + both ARC pairs per `filter`/`map` result) | 35 326 → 34 452 M | 8 330 → 8 019 M | |
 | dec5761 | recycle paths / createClosure / Object.keys / findHashedShape / side-box rare fields read through unretained handles; parked arrays keep their shape; addGCObject keeps an unchanged owner; inline return reads the var-ref count from the function object | → 32 564 M | → 7 483 M | 420 → 336 M |
 
-Total: **−7.8 % instructions, −10.2 % cycles** on deepmerge; `realworld.js` 141 008 → 140 380 M (−0.4 %); benchmark
-checksums identical to the base binary.
+| (third) | array element reads, var-ref parking (`JeffJSRawStack.appendRetaining`) and the Object.keys cache through unretained handles | → 32 434 M | → 7 517 M | → 330 M |
+
+Total: **−8.2 % instructions, −9.8 % cycles** on deepmerge; `realworld.js` 141 008 → 140 301 M (−0.5 %); benchmark
+checksums identical to the base binary; `swift test -c release` 392 tests, the 4 known failing cases only.
 
 **Measured dead ends (this round).**
 - `final` on the members of the subclassed classes (`JeffJSFunctionBytecode`, the GC header, string base): no change
