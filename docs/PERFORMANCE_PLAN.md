@@ -1285,7 +1285,7 @@ thread's scratchpad: 14–8 000 cases each, identical output except where JSC's 
 | " | toFixed via libc `%.*f` unless an exact tie is possible; `Number::toString` over UTF-8 bytes; local zone offset memoised per UTC minute | date-number-format | 391 → 269 (91) |
 | " | `jeffJS_concatStrings` appends in place into a flat left operand the caller owns every reference to (`ownedRefs`), as `js_concat_string` does | template-html / template-literals | 234 → 190 / 188 → 158 (43 / 34) |
 
-Suite total 6488 → ~5000 ms (3.7x → 2.9x QuickJS); `watch_deepmerge` 1407 → 1200 ms (QuickJS 520).
+Suite total 6488 → 4778 ms (3.7x → 2.7x QuickJS); `watch_deepmerge` 1407 → 1141 ms (QuickJS 520).
 
 **Measured dead ends.** PGO (`-profile-generate` → `-profile-use`): swiftc 6.2.4 aborts
 (`Assertion failed: (takenProbability >= 0), inferFromEdgeProfile at ColdBlockInfo.cpp:265`, EarlyPerfInliner on
