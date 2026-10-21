@@ -867,7 +867,31 @@ final class JeffJSFetchBridge {
 
     // MARK: - Networking
 
+    /// Host hook (Service Workers §"handle fetch"): a controlled document's fetch/XHR is offered to its
+    /// service worker before the network. The host gets the request as it would go out (method, headers,
+    /// body, Referer) plus the request's mode / credentials / destination, and returns the worker's
+    /// response, a network error (`.failure`), or nil when no worker handles it (the network path runs).
+    /// Set once by the host; called from any thread.
+    nonisolated(unsafe) static var hostServiceWorkerFetch:
+        (@Sendable (_ request: URLRequest, _ mode: String, _ credentials: String) async -> Result<JeffJSFetchResult, Error>?)?
+
     private func performFetch(spec: JeffJSFetchSpec) async -> Result<JeffJSFetchResult, Error> {
+        if let hook = Self.hostServiceWorkerFetch, let url = resolveURL(spec.urlString), url.scheme == "http" || url.scheme == "https" {
+            var request = URLRequest(url: url)
+            request.httpMethod = spec.method.isEmpty ? "GET" : spec.method.uppercased()
+            for (name, value) in spec.headers { request.setValue(value, forHTTPHeaderField: name) }
+            applyRequestMetadata(spec: spec, to: &request)
+            if let body = spec.body {
+                request.httpBody = Data(body)
+                if let ct = spec.bodyContentType, request.value(forHTTPHeaderField: "Content-Type") == nil {
+                    request.setValue(ct, forHTTPHeaderField: "Content-Type")
+                }
+            }
+            if let handled = await hook(request, spec.mode.isEmpty ? "cors" : spec.mode,
+                                        spec.credentials.isEmpty ? "same-origin" : spec.credentials) {
+                return handled
+            }
+        }
         guard let targetURL = resolveURL(spec.urlString) else {
             let reason = baseURL == nil ? "baseURL is nil" : "cannot resolve \"\(spec.urlString)\""
             onConsoleLog?("error", "[JeffJS Fetch] Relative URL resolution failed for '\(spec.urlString)': \(reason)")

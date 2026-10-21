@@ -324,6 +324,29 @@ final class FetchBridgeTests: XCTestCase {
         try XCTSkipIf(server == nil, "could not bind a local port for the test HTTP server")
     }
 
+    // MARK: service worker hook
+
+    /// `hostServiceWorkerFetch` answers before the network (the server is never asked), and a nil
+    /// answer falls through to the network.
+    @JeffJSHostActor
+    func testServiceWorkerHookAnswersFirst() async throws {
+        try skipIfNoServer()
+        JeffJSFetchBridge.hostServiceWorkerFetch = { request, mode, _ in
+            guard request.url?.path == "/bin" else { return nil }
+            return .success(JeffJSFetchResult(status: 203, statusText: "", url: request.url!.absoluteString, redirected: false,
+                                              type: "basic", headers: ["content-type": "text/plain", "x-sw": mode],
+                                              bytes: Array("from-sw".utf8), mimeType: "text/plain", charset: nil))
+        }
+        defer { JeffJSFetchBridge.hostServiceWorkerFetch = nil }
+        let env = makeEnvironment()
+        let out = await runJS(env, """
+        Promise.all([fetch('\(base)/bin').then(function(r){ return r.text().then(function(t){ return r.status + ':' + r.headers.get('x-sw') + ':' + t; }); }),
+                     fetch('\(base)/bin2').then(function(r){ return String(r.status); }, function(){ return 'net'; })])
+          .then(function(a){ globalThis.__out = a.join('|'); }).catch(function(e){ globalThis.__out = 'ERR ' + e; });
+        """)
+        XCTAssertTrue(out.hasPrefix("203:cors:from-sw|"), out)
+    }
+
     // MARK: binary
 
     @JeffJSHostActor
