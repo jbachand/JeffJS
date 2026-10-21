@@ -3792,6 +3792,21 @@ nonisolated extension JeffJSObject {
     /// Bulk-installs `values` as this array's elements, taking ownership of
     /// each. Only valid on a fast array that has no elements yet.
     func installFastArrayValues(_ values: ContiguousArray<JeffJSValue>) {
+        // A recycled array (jeffJS_recycleArray) keeps its emptied element
+        // store: fill that one. Replacing it allocated a new store and freed
+        // the pooled one on every `filter` / `map` result (deepmerge's
+        // `getOwnPropertySymbols(e).filter(...)` per object: an alloc + a
+        // free + the ARC of both for an empty result).
+        if let st = _fastArrayValues, st.count == 0, st.values.isEmpty, st.attrs == nil, !st.checked {
+            if values.isEmpty { return }
+            if st.values.capacity >= values.count {
+                st.values.append(contentsOf: values)   // small: keep the pooled capacity
+            } else {
+                st.values = values                      // large: take the buffer, no copy
+            }
+            st.count = UInt32(values.count)
+            return
+        }
         _fastArrayValues = JeffJSFastArrayStorage(values: values,
                                                   count: UInt32(values.count))
     }
