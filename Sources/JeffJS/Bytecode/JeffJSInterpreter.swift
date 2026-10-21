@@ -4776,6 +4776,7 @@ nonisolated private func executeFastTrace(
             let entry = ents[jeffJS_icSlot(ents, pc)]
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
+            if icHit == nil, entry.pc == pc, entry.polyState == 1, let ph = jeffJS_icPolyRead(ents, pc, jsObj._obj), case .value(let v) = ph { icHit = v }
             if let hv = icHit {
                 #if JEFFJS_JSPROF
                 jeffJS_icCount(2)
@@ -4805,6 +4806,7 @@ nonisolated private func executeFastTrace(
             let entry = ents[jeffJS_icSlot(ents, pc)]
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
+            if icHit == nil, entry.pc == pc, entry.polyState == 1, let ph = jeffJS_icPolyRead(ents, pc, jsObj._obj), case .value(let v) = ph { icHit = v }
             if icHit == nil, jsObj.classID == JeffJSClassID.array.rawValue,
                readU32(bc, pc + 1) == JSPredefinedAtom.push.rawValue, ctx.arrayPushIsIntrinsic(jsObj) {
                 // `arr.push`: exotic receivers never fill the IC; the
@@ -6166,6 +6168,7 @@ nonisolated private func executeFastTraceLean(
             let entry = ents[jeffJS_icSlot(ents, pc)]
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
+            if icHit == nil, entry.pc == pc, entry.polyState == 1, let ph = jeffJS_icPolyRead(ents, pc, jsObj._obj), case .value(let v) = ph { icHit = v }
             if let hv = icHit {
                 #if JEFFJS_JSPROF
                 jeffJS_icCount(2)
@@ -6189,6 +6192,7 @@ nonisolated private func executeFastTraceLean(
             let entry = ents[jeffJS_icSlot(ents, pc)]
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
+            if icHit == nil, entry.pc == pc, entry.polyState == 1, let ph = jeffJS_icPolyRead(ents, pc, jsObj._obj), case .value(let v) = ph { icHit = v }
             if let hv = icHit {
                 #if JEFFJS_JSPROF
                 jeffJS_icCount(2)
@@ -6237,6 +6241,7 @@ nonisolated private func executeFastTraceLean(
             let entry = ents[jeffJS_icSlot(ents, pc)]
             var icHit: JeffJSValue? = nil
             if entry.pc == pc { icHit = jeffJS_icRead(jsObj._ptr, entry) }
+            if icHit == nil, entry.pc == pc, entry.polyState == 1, let ph = jeffJS_icPolyRead(ents, pc, jsObj._obj), case .value(let v) = ph { icHit = v }
             if let hv = icHit {
                 #if JEFFJS_JSPROF
                 jeffJS_icCount(2)
@@ -10359,6 +10364,12 @@ nonisolated struct JeffJSInterpreter {
                                 }
                             }
                         }
+                        if icHit == nil, icGetter == nil, entry.pc == pc, entry.polyState == 1, let ph = jeffJS_icPolyRead(ents, pc, jsObj._obj) {
+                            switch ph {   // polymorphic site / deeper prototype
+                            case .value(let v): icHit = v
+                            case .getter(let g): icGetter = g
+                            }
+                        }
                         if let hv = icHit {
                             #if JEFFJS_JSPROF
                             jeffJS_icCount(0)
@@ -10510,6 +10521,18 @@ nonisolated struct JeffJSInterpreter {
                     }
                     continue dispatchLoop
                         }
+                        // A cached getter the inline path cannot take (native,
+                        // another realm, generator): call it directly rather
+                        // than re-running the lookup and re-filling the cache.
+                        if let gObj = icGetter {
+                            frame.curPC = pc
+                            let r = ctx.callFunction(JeffJSValue.borrowedObject(gObj), thisVal: obj, args: [])
+                            obj.freeValue()
+                            if r.isException { retVal = .exception; break dispatchLoop }
+                            buf[sp] = r; sp += 1
+                            pc += 5
+                            continue dispatchLoop
+                        }
                     }
                     // `ta.length` (the %TypedArray%.prototype getter, two
                     // prototypes up: never an IC entry).
@@ -10536,6 +10559,8 @@ nonisolated struct JeffJSInterpreter {
                             // A data slot, or an accessor (the hit path runs its getter).
                             fb.getIC().updateProto(pc, receiverShape: shape, holder: holder,
                                                    holderShape: hs, propOffset: hIdx)
+                        } else {
+                            jeffJS_icFillDeep(fb, pc, jsObj._obj, atom)
                         }
                     }
                     obj.freeValue()
@@ -10674,6 +10699,18 @@ nonisolated struct JeffJSInterpreter {
                                 icHit = jsObj.dataValue(at: entry.propOffset)
                             }
                         }
+                        var icGetter2: JeffJSObject? = nil
+                        if icHit == nil, entry.pc == pc, entry.shapePtr == jsObj.shapeIdentity {
+                            if entry.holderPtr != nil { icGetter2 = jeffJS_icProtoGetter(entry) }
+                            else if entry.propOffset >= 0, entry.propOffset < jsObj.propCount,
+                                    let ex = jsObj.extra(at: entry.propOffset), ex.kind == .getset { icGetter2 = ex.getter }
+                        }
+                        if icHit == nil, icGetter2 == nil, entry.pc == pc, entry.polyState == 1, let ph = jeffJS_icPolyRead(ents, pc, jsObj._obj) {
+                            switch ph {   // polymorphic site / deeper prototype (methods through `extends`)
+                            case .value(let v): icHit = v
+                            case .getter(let g): icGetter2 = g
+                            }
+                        }
                         if let hv = icHit {
                             #if JEFFJS_JSPROF
                             jeffJS_icCount(0)
@@ -10683,6 +10720,15 @@ nonisolated struct JeffJSInterpreter {
                                 pc += 5
                                 continue dispatchLoop
                             }
+                        }
+                        if let gObj = icGetter2 {
+                            // A cached getter: call it (the receiver stays / is not on the stack here).
+                            frame.curPC = pc
+                            let r = ctx.callFunction(JeffJSValue.borrowedObject(gObj), thisVal: obj, args: [])
+                            if r.isException { retVal = .exception; break dispatchLoop }
+                            buf[sp] = r; sp += 1
+                            pc += 5
+                            continue dispatchLoop
                         }
                     }
                     // IC miss: full lookup + cache update
@@ -10700,6 +10746,8 @@ nonisolated struct JeffJSInterpreter {
                                   hIdx < holder.propValues.count, holder.extra(at: hIdx) == nil {
                             fb.getIC().updateProto(pc, receiverShape: shape, holder: holder,
                                                    holderShape: hs, propOffset: hIdx)
+                        } else {
+                            jeffJS_icFillDeep(fb, pc, jsObj._obj, atom)
                         }
                     }
                 } else {
@@ -13785,12 +13833,23 @@ nonisolated struct JeffJSInterpreter {
                     if let ents = fb.icEntries {
                         let entry = ents[jeffJS_icSlot(ents, pc)]
                         var icHit: JeffJSValue? = nil
+                        var icGetter: JeffJSObject? = nil
                         if entry.pc == pc, entry.shapePtr == jsObj.shapeIdentity {
                             if entry.holderPtr != nil {
                                 icHit = jeffJS_icProtoHit(entry)     // prototype method/field
-                            } else if entry.propOffset >= 0, entry.propOffset < jsObj.propCount,
-                                      jsObj.extra(at: entry.propOffset) == nil {
-                                icHit = jsObj.dataValue(at: entry.propOffset)
+                                if icHit == nil { icGetter = jeffJS_icProtoGetter(entry) }
+                            } else if entry.propOffset >= 0, entry.propOffset < jsObj.propCount {
+                                if let ex = jsObj.extra(at: entry.propOffset) {
+                                    if ex.kind == .getset { icGetter = ex.getter }
+                                } else {
+                                    icHit = jsObj.dataValue(at: entry.propOffset)
+                                }
+                            }
+                        }
+                        if icHit == nil, icGetter == nil, entry.pc == pc, entry.polyState == 1, let ph = jeffJS_icPolyRead(ents, pc, jsObj._obj) {
+                            switch ph {   // polymorphic site / deeper prototype
+                            case .value(let v): icHit = v
+                            case .getter(let g): icGetter = g
                             }
                         }
                         if let hv = icHit {
@@ -13802,6 +13861,150 @@ nonisolated struct JeffJSInterpreter {
                                 pc += 6
                                 continue dispatchLoop
                             }
+                        }
+                        // A cached getter (own accessor, prototype `get x()`, or a
+                        // side-list hit): run it as an inline call with the receiver
+                        // as `this`; its return lands where the property value goes.
+                        if inlineCallsEnabled, let gObj = icGetter, gObj.realmIndex == ctxRealm,
+                           let gFb = gObj.fbFast, !gFb.isGenerator, !gFb.isAsyncFunc,
+                           rt.inlineStackTop - inlineBase <= 10000, sp + 2 <= bufCapacity {
+                            let gThisSlot = sp
+                            let gCalleeSlot = sp + 1
+                            buf[gThisSlot] = obj.dupValue()                               // the local, borrowed: the frame takes its own ref
+                            buf[gCalleeSlot] = JeffJSValue.borrowedObject(gObj).dupValue()
+                    do { // inline call (expanded; no nested-function capture of hot locals)
+                        let e_fastFb = gFb
+                        let e_callObj = gObj
+                        let e_funcVal = buf[gCalleeSlot]
+                        let e_argc = 0
+                        let e_calleeSlot = gCalleeSlot
+                        let e_restoreSp = gThisSlot
+                        let e_thisVal = buf[gThisSlot]
+                        let e_instrSize = 6
+                        let argStart = e_calleeSlot + 1
+                        rt.inlinePush(InlineCallFrame(
+                            pc: pc + e_instrSize, sp: e_restoreSp, spTop: sp,
+                            buf: buf, bufCapacity: bufCapacity,
+                            varBase: varBase, spBase: spBase,
+                            bc: bc, bcLen: bcLen, fb: fb,
+                            frame: frame,
+                            funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned))
+                        fb = e_fastFb
+                        bc = e_fastFb.bcPtrFast ?? e_fastFb.bytecodePtr
+                        bcLen = e_fastFb.bytecodeLen
+                        // Only functions with closure variables need their varRefs
+                        // array (a retain/release pair per assignment otherwise).
+                        if e_fastFb.closureVarCount > 0 {
+                            vrRaw = e_callObj.varRefsRaw; vrCount = e_callObj.varRefsRawCount
+                            varRefsLoaded = true
+                        } else if varRefsLoaded {
+                            vrRaw = nil; vrCount = 0
+                            varRefsLoaded = false
+                        }
+                        mFuncObj = e_funcVal
+                        mFlags = 0
+                        unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
+                        newFrame.prevFrame = ctx.currentFrame
+                        newFrame.curFunc = e_funcVal
+                        if e_fastFb.isArrow, let arrowThis = e_callObj.arrowThisVal {
+                            newFrame.thisVal = arrowThis
+                        } else if !e_fastFb.isStrictMode && e_thisVal.isNullOrUndefined {
+                            // ES §10.2.1.2: sloppy callees see the global object.
+                            newFrame.thisVal = ctx.globalObj
+                        } else {
+                            newFrame.thisVal = e_thisVal
+                        }
+                        newFrame.argCount = e_argc
+                        let newVarCount = Int(e_fastFb.varCount)
+                        newFrame.varCount = newVarCount
+                        let fbArgCount = Int(e_fastFb.argCount); let newArgSlots = fbArgCount > e_argc ? fbArgCount : e_argc
+                        let fbStack = Int(e_fastFb.stackSize); let newStackSlots = (fbStack > 4 ? fbStack : 4) + 32
+                        let newTotalSlots = newArgSlots + newVarCount + newStackSlots
+                        let newBuf: UnsafeMutablePointer<JeffJSValue>
+                        let newBufCap: Int
+                        if argStart + newTotalSlots <= bufCapacity {
+                            newBuf = buf + argStart
+                            newBufCap = bufCapacity - argStart
+                            // Args are already in place; pad missing args + locals.
+                            // Straight-line stores for the common small counts: the loop
+                            // form was turned into a memset_pattern16 call per call.
+                            let prefix = newArgSlots + newVarCount
+                            let pad = prefix - e_argc
+                            if pad > 0 {
+                                newBuf[e_argc] = .undefined
+                                if pad > 1 { newBuf[e_argc + 1] = .undefined }
+                                if pad > 2 { newBuf[e_argc + 2] = .undefined }
+                                if pad > 3 {
+                                    var i = e_argc + 3
+                                    while i < prefix { newBuf[i] = .undefined; i += 1 }
+                                }
+                            }
+                            bufOwned = false
+                        } else {
+                            (newBuf, newBufCap) = rt.acquireInterpBuf(size: newTotalSlots,
+                                                                      initializedPrefix: newArgSlots + newVarCount)
+                            // Own buffer: borrow the caller's argument slots, or
+                            // take copies when the callee owns its slots.
+                            if e_fastFb.copiesArgs {
+                                for i in 0..<e_argc { newBuf[i] = buf[argStart + i].dupValue() }
+                            } else {
+                                for i in 0..<e_argc { newBuf[i] = buf[argStart + i] }
+                            }
+                            bufOwned = true
+                        }
+                        frame = newFrame
+                        ctx.currentFrame = frame
+                        frame.spBase = 0
+                        buf = newBuf
+                        bufCapacity = newBufCap
+                        varBase = newArgSlots
+                        spBase = newArgSlots + newVarCount
+                        sp = spBase
+                        // Named function expression self-reference (ES §15.2.4).
+                        if e_fastFb.selfRefVarIdx >= 0 {
+                            buf[varBase + e_fastFb.selfRefVarIdx] = e_funcVal.dupValue()
+                        }
+                        frame.buf = buf
+                        frame.bufCapacity = bufCapacity
+                        frame.bufVarBase = varBase
+                        frame.bufSpBase = spBase
+                        pc = 0
+                    }
+                    // Run the callee in the fast trace from its first instruction.
+                    if fb.traceLean {
+                        let r = executeFastTraceLean(bc: bc, bcLen: bcLen, entryPC: 0, exitPC: bcLen, startPC: pc,
+                                                     buf: buf, varBase: varBase, sp: &sp, ctx: ctx, cpool: fb.cpool,
+                                                     stackLimit: bufCapacity, icEntries: fb.icEntries)
+                        if r == -1 { retVal = .exception; break dispatchLoop }
+                        pc = r
+                        continue dispatchLoop
+                    }
+                    if fb.traceEntryEnabled {
+                        let fbIdBefore = ObjectIdentifier(fb)
+                        var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
+                        let resumePC = executeFastTrace(state: &hot, startPC: pc, ctx: ctx, rt: rt, inlineBase: inlineBase)
+                        sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
+                        bc = hot.bc; bcLen = hot.bcLen; fb = hot.fb; frame = hot.frame
+                        mFuncObj = hot.funcObj; mFlags = hot.flags; bufOwned = hot.bufOwned
+                        if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
+                        // Entry deopt accounting: an early exit still inside this function
+                        // means the trace could not run it; stop trying after a while.
+                        if hot.opsRun < 16, ObjectIdentifier(fb) == fbIdBefore {
+                            fb.traceEntryDeopts &+= 1
+                            if fb.traceEntryDeopts >= 100 { fb.traceEntryEnabled = false }
+                        }
+                        if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                        pc = resumePC
+                    }
+                    continue dispatchLoop
+                        }
+                        if let gObj = icGetter {
+                            frame.curPC = pc
+                            let r = ctx.callFunction(JeffJSValue.borrowedObject(gObj), thisVal: obj, args: [])
+                            if r.isException { retVal = .exception; break dispatchLoop }
+                            buf[sp] = r; sp += 1
+                            pc += 6
+                            continue dispatchLoop
                         }
                     }
                     let val = ctx.getProperty(obj: obj, atom: atom)
@@ -13815,6 +14018,8 @@ nonisolated struct JeffJSInterpreter {
                                   hIdx < holder.propValues.count, holder.extra(at: hIdx) == nil {
                             fb.getIC().updateProto(pc, receiverShape: shape, holder: holder,
                                                    holderShape: hs, propOffset: hIdx)
+                        } else {
+                            jeffJS_icFillDeep(fb, pc, jsObj._obj, atom)
                         }
                     }
                 } else {
@@ -13842,6 +14047,18 @@ nonisolated struct JeffJSInterpreter {
                                 icHit = jsObj.dataValue(at: entry.propOffset)
                             }
                         }
+                        var icGetter2: JeffJSObject? = nil
+                        if icHit == nil, entry.pc == pc, entry.shapePtr == jsObj.shapeIdentity {
+                            if entry.holderPtr != nil { icGetter2 = jeffJS_icProtoGetter(entry) }
+                            else if entry.propOffset >= 0, entry.propOffset < jsObj.propCount,
+                                    let ex = jsObj.extra(at: entry.propOffset), ex.kind == .getset { icGetter2 = ex.getter }
+                        }
+                        if icHit == nil, icGetter2 == nil, entry.pc == pc, entry.polyState == 1, let ph = jeffJS_icPolyRead(ents, pc, jsObj._obj) {
+                            switch ph {   // polymorphic site / deeper prototype (methods through `extends`)
+                            case .value(let v): icHit = v
+                            case .getter(let g): icGetter2 = g
+                            }
+                        }
                         if let hv = icHit {
                             #if JEFFJS_JSPROF
                             jeffJS_icCount(0)
@@ -13851,6 +14068,15 @@ nonisolated struct JeffJSInterpreter {
                                 pc += 5
                                 continue dispatchLoop
                             }
+                        }
+                        if let gObj = icGetter2 {
+                            // A cached getter: call it (the receiver stays / is not on the stack here).
+                            frame.curPC = pc
+                            let r = ctx.callFunction(JeffJSValue.borrowedObject(gObj), thisVal: obj, args: [])
+                            if r.isException { retVal = .exception; break dispatchLoop }
+                            buf[sp] = r; sp += 1
+                            pc += 5
+                            continue dispatchLoop
                         }
                     }
                     let val = ctx.getProperty(obj: obj, atom: atom)
@@ -13864,6 +14090,8 @@ nonisolated struct JeffJSInterpreter {
                                   hIdx < holder.propValues.count, holder.extra(at: hIdx) == nil {
                             fb.getIC().updateProto(pc, receiverShape: shape, holder: holder,
                                                    holderShape: hs, propOffset: hIdx)
+                        } else {
+                            jeffJS_icFillDeep(fb, pc, jsObj._obj, atom)
                         }
                     }
                 } else {
