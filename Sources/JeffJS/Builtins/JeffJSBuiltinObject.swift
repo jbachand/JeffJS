@@ -1196,11 +1196,48 @@ nonisolated struct JeffJSBuiltinObject {
 
     /// `Object.values(obj)`
     /// Returns an array of an object's own enumerable string-keyed property values.
+    /// Own enumerable string-keyed data values of a plain object, from the
+    /// shape's cached key list and the property slots (nil: not a plain
+    /// object, or a slot is not a plain data slot: the generic path reads
+    /// with [[Get]]). `withKeys` pairs each with its key for `entries`.
+    /// The generic path built a keys array, re-read every key by index and
+    /// set every result element through the indexed setter (for-in-entries
+    /// 3.2x QuickJS, mostly this churn).
+    private static func plainEnumerableValues(ctx: JeffJSContext, _ obj: JeffJSValue, withKeys: Bool) -> JeffJSValue? {
+        guard let jo = obj.toObject(), jo.classID == JeffJSClassID.object.rawValue,
+              jo._fastArrayValues == nil, (jo.lazyFlags & JeffJSObject.lazyActiveMask) == 0,
+              (jo.lazyFlags & JeffJSObject.lazyHostBit) == 0, let shape = jo.shape else { return nil }
+        let rt = ctx.rt
+        let keys = ctx.shapeEnumKeys(shape).keys
+        if keys.isEmpty { return ctx.newArray() }
+        var out: [JeffJSValue] = []
+        out.reserveCapacity(keys.count)
+        for k in keys {
+            guard let ks = k.stringValue else { for v in out { v.freeValue() }; return nil }
+            let atom = rt.findAtom(jsString: ks)
+            guard atom != 0, jo.shape === shape, let idx = findShapeProperty(shape, atom),
+                  idx < jo.propCount, jo.extra(at: idx) == nil else {
+                if atom != 0 { rt.freeAtom(atom) }
+                for v in out { v.freeValue() }
+                return nil
+            }
+            rt.freeAtom(atom)
+            let v = jo.dataValue(at: idx).dupValue()
+            if withKeys {
+                out.append(ctx.newArrayFrom([k.dupValue(), v]))
+            } else {
+                out.append(v)
+            }
+        }
+        return ctx.newArrayFrom(out)
+    }
+
     static func values(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         let arg = args.count > 0 ? args[0] : .undefined
         let obj = ctx.toObject(arg)
         if obj.isException { return obj }
         defer { ctx.freeValue(obj) }
+        if let fast = plainEnumerableValues(ctx: ctx, obj, withKeys: false) { return fast }
 
         let keysArr = ctx.getOwnPropertyNames(obj, flags: JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)
         if keysArr.isException { return keysArr }
@@ -1231,6 +1268,7 @@ nonisolated struct JeffJSBuiltinObject {
         let obj = ctx.toObject(arg)
         if obj.isException { return obj }
         defer { ctx.freeValue(obj) }
+        if let fast = plainEnumerableValues(ctx: ctx, obj, withKeys: true) { return fast }
 
         let keysArr = ctx.getOwnPropertyNames(obj, flags: JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)
         if keysArr.isException { return keysArr }
