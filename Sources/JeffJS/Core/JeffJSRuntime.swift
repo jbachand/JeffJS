@@ -462,6 +462,8 @@ nonisolated final class JeffJSRuntime {
     /// `sharedStringsCapacity`. perf/watch-object-size: homedepot kept ~10 k
     /// separate "" strings and thousands of "div"/"DIV"/"undefined".
     var sharedStrings: [String: JeffJSString] = [:]
+    /// `JeffJSBuiltinPromise.resolvePromise`'s thenable-chain depth guard.
+    var promiseResolveDepth = 0
     /// Lazy JSON payloads: buffers and object records (JeffJSLazyPayload.swift).
     let lazyPayload = JeffJSLazyPayloadState()
     /// Objects built while a context installs its intrinsics (`initComplete`

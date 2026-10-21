@@ -140,7 +140,6 @@ nonisolated struct JeffJSBuiltinPromise {
     /// step re-enters resolvePromise via PromiseResolveThenableJob. A depth
     /// limit prevents runaway chains from consuming unbounded CPU / memory.
     private static let maxResolveDepth = 10
-    private static var _resolveDepth = 0
 
     // MARK: - Intrinsic Registration
 
@@ -1127,10 +1126,12 @@ nonisolated struct JeffJSBuiltinPromise {
     static func resolvePromise(ctx: JeffJSContext, promise: JeffJSValue,
                                 resolution: JeffJSValue) {
         // --- Option 3: Recursion guard ---
-        _resolveDepth += 1
-        defer { _resolveDepth -= 1 }
+        // Per runtime: runtimes on other threads (workers) resolve their own chains.
+        let rt = ctx.rt
+        rt.promiseResolveDepth += 1
+        defer { rt.promiseResolveDepth -= 1 }
 
-        if _resolveDepth > maxResolveDepth {
+        if rt.promiseResolveDepth > maxResolveDepth {
             _ = ctx.throwTypeError("Promise resolve thenable chain too deep")
             let reason = ctx.getException()
             rejectPromise(ctx: ctx, promise: promise, reason: reason)
