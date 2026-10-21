@@ -58,6 +58,10 @@ nonisolated struct JeffJSICEntry {
     /// Cached `.writable` flag of the slot (valid while the shape matches:
     /// flag changes copy the shape, so identity covers it).
     var writable: Bool = false
+    /// Side-list state of this site (fits the struct's padding): 0 none,
+    /// 1 the site has polymorphic / deep entries (worth the lookup),
+    /// 2 megamorphic (skip it).
+    var polyState: UInt8 = 0
 
     /// Bytecode offset this cache belongs to (for collision validation).
     var pc: Int {
@@ -103,6 +107,79 @@ nonisolated func jeffJS_icProtoHit(_ entry: JeffJSICEntry) -> JeffJSValue? {
               entry.propOffset < h.propValues.count,
               h.extra(at: entry.propOffset) == nil else { return nil }
         return h.propValues[entry.propOffset]
+    }
+}
+
+/// One side-list entry of a polymorphic or deep-prototype site (see
+/// JeffJSInlineCache "Polymorphic / deep-prototype side store"). Plain
+/// pointers only (no ARC on the hit path); every one is retained for the
+/// entry's lifetime and released by `JeffJSPolySite.releaseAll`.
+nonisolated struct JeffJSPolyEntry {
+    var receiverShape: UnsafeRawPointer
+    /// The prototypes between the receiver and the holder (depth 2, 3).
+    var chain1: UnsafeRawPointer?
+    var chain2: UnsafeRawPointer?
+    var holder: UnsafeRawPointer?
+    var holderShape: UnsafeRawPointer?
+    var propOffset: Int32
+    var chainCount: UInt8
+    var writable: Bool
+    /// Never matches a receiver (a shape pointer no live shape has).
+    static let placeholder = JeffJSPolyEntry(receiverShape: UnsafeRawPointer(bitPattern: 8)!, chain1: nil, chain2: nil,
+                                             holder: nil, holderShape: nil, propOffset: -1, chainCount: 0, writable: false)
+}
+
+nonisolated final class JeffJSPolySite {
+    var entries: [JeffJSPolyEntry] = []
+    var megamorphic = false
+    @inline(__always) func has(_ rs: UnsafeRawPointer) -> Bool {
+        for e in entries where e.receiverShape == rs { return true }
+        return false
+    }
+    func releaseAll() {
+        for e in entries where e.propOffset >= 0 {
+            Unmanaged<JeffJSShape>.fromOpaque(e.receiverShape).release()
+            if let c = e.chain1 { Unmanaged<JeffJSShape>.fromOpaque(c).release() }
+            if let c = e.chain2 { Unmanaged<JeffJSShape>.fromOpaque(c).release() }
+            if let h = e.holder { Unmanaged<JeffJSObject>.fromOpaque(h).release() }
+            if let hs = e.holderShape { Unmanaged<JeffJSShape>.fromOpaque(hs).release() }
+        }
+        entries.removeAll()
+    }
+}
+
+nonisolated enum JeffJSPolyHit {
+    case value(JeffJSValue)      // borrowed
+    case getter(JeffJSObject)
+}
+
+/// Side-list read through the raw entry pointer a trace holds (slot 0
+/// carries the table).
+@inline(__always)
+nonisolated func jeffJS_icPolyRead(_ ents: UnsafeMutablePointer<JeffJSICEntry>, _ pc: Int, _ receiver: JeffJSObject) -> JeffJSPolyHit? {
+    guard let tp = ents[0].shapePtr else { return nil }
+    return Unmanaged<JeffJSInlineCache>.fromOpaque(tp)._withUnsafeGuaranteedRef { $0.polyRead(pc, receiver) }
+}
+
+/// Miss-path fill for a property found two or three prototypes up (the
+/// primary entry covers own and depth-1): walks from `receiver`.
+@inline(never)
+nonisolated func jeffJS_icFillDeep(_ fb: JeffJSFunctionBytecode, _ pc: Int, _ receiver: JeffJSObject, _ atom: UInt32) {
+    guard let rshape = receiver.shape, let p1 = rshape.proto, let s1 = p1.shape, let p2 = s1.proto else { return }
+    var chain: [JeffJSShape] = [s1]
+    var cur = p2
+    var depth = 2
+    while depth <= 3 {
+        guard let hs = cur.shape else { return }
+        if let idx = findShapeProperty(hs, atom) {
+            guard idx < cur.propValues.count else { return }
+            fb.getIC().updateDeep(pc, receiverShape: rshape, chain: chain, holder: cur, holderShape: hs, propOffset: idx)
+            return
+        }
+        guard let n = hs.proto else { return }
+        chain.append(hs)
+        cur = n
+        depth += 1
     }
 }
 
@@ -248,8 +325,152 @@ nonisolated final class JeffJSInlineCache {
         let ptr = (block + mapBytes).bindMemory(to: JeffJSICEntry.self, capacity: cap + 1)
         ptr.initialize(repeating: JeffJSICEntry(), count: cap + 1)
         entries = UnsafeMutableBufferPointer(start: ptr, count: cap + 1)
+        // The never-hit slot 0 carries the table itself (unretained), so the
+        // raw entry pointer the traces hold reaches the polymorphic side store.
+        entries[0].shapePtr = UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())
         Self.liveTables.wrappingAdd(1, ordering: .relaxed)
         Self.liveBytes.wrappingAdd(blockBytes, ordering: .relaxed)
+    }
+
+    // MARK: Polymorphic / deep-prototype side store
+    //
+    // The 40-byte primary entry of a site is monomorphic and reaches one
+    // prototype up. A site that sees several receiver shapes (`sh.area()`
+    // over three classes) or finds its property two or three prototypes up
+    // (a method inherited through `extends`) missed on every access and ran
+    // the whole lookup. Such sites get a side list of up to `polyLimit`
+    // entries, each validating the receiver shape, every prototype shape on
+    // the way and the holder's shape (all marked icCached so an in-place
+    // change copies the shape). The list is indexed by slot (no hashing) and
+    // its entries are plain pointers (no ARC on the hit path).
+
+    /// Side lists by slot, allocated on the first site that needs one.
+    var polyBySlot: [JeffJSPolySite?]? = nil
+    static let polyLimit = 8   // a linear scan of pointer compares; sites with more go megamorphic
+
+    /// 0 / 1 / 2 for `JeffJSICEntry.polyState`.
+    @inline(__always)
+    private func polyState(_ pc: Int) -> UInt8 {
+        guard let sites = polyBySlot, let s = sites[slot(pc)] else { return 0 }
+        return s.megamorphic ? 2 : (s.entries.isEmpty ? 0 : 1)
+    }
+
+    /// The site's list (created on demand); nil once it is megamorphic.
+    private func polySite(_ pc: Int) -> JeffJSPolySite? {
+        let idx = slot(pc)
+        guard idx != 0 else { return nil }
+        if polyBySlot == nil { polyBySlot = [JeffJSPolySite?](repeating: nil, count: entries.count) }
+        if let s = polyBySlot![idx] { return s.megamorphic ? nil : s }
+        let s = JeffJSPolySite()
+        polyBySlot![idx] = s
+        return s
+    }
+
+    private func polyAppend(_ e: JeffJSPolyEntry, site: JeffJSPolySite, pc: Int) {
+        if site.entries.count >= Self.polyLimit {
+            site.megamorphic = true
+        } else {
+            site.entries.append(e)
+        }
+        // The primary entry carries the state; a site whose only entries are
+        // deep ones gets a placeholder primary (pc set, no shape) so the hit
+        // path still consults the list.
+        let idx = slot(pc)
+        guard idx != 0 else { return }
+        if entries[idx].pc != pc {
+            releaseEntry(idx)
+            entries[idx] = JeffJSICEntry(shapePtr: nil, pc: pc, propOffset: -1, writable: false)
+        }
+        entries[idx].polyState = site.megamorphic ? 2 : 1
+    }
+
+    /// The primary entry at `idx` is about to be replaced for a different
+    /// receiver shape: keep a copy on the side list (own and depth-1 entries;
+    /// a define_field transition is not a read entry).
+    private func polyKeepPrimary(_ idx: Int, pc: Int, newShape: JeffJSShape) {
+        let old = entries[idx]
+        guard old.pc == pc, let rs = old.shapePtr,
+              rs != UnsafeRawPointer(Unmanaged.passUnretained(newShape).toOpaque()),
+              old.nextShapePtr == nil, old.propOffset >= 0 else { return }
+        guard let site = polySite(pc) else { return }
+        if site.has(rs) { return }
+        if site.entries.count >= Self.polyLimit { site.megamorphic = true; entries[idx].polyState = 2; return }
+        _ = Unmanaged<JeffJSShape>.fromOpaque(rs).retain()
+        var holder: UnsafeRawPointer? = nil, holderShape: UnsafeRawPointer? = nil
+        if let hp = old.holderPtr, let hs = old.holderShapePtr {
+            _ = Unmanaged<JeffJSObject>.fromOpaque(hp).retain()
+            _ = Unmanaged<JeffJSShape>.fromOpaque(hs).retain()
+            holder = hp; holderShape = hs
+        }
+        polyAppend(JeffJSPolyEntry(receiverShape: rs, chain1: nil, chain2: nil, holder: holder, holderShape: holderShape,
+                                   propOffset: Int32(truncatingIfNeeded: old.propOffset), chainCount: 0, writable: old.writable),
+                   site: site, pc: pc)
+    }
+
+    /// Cache a hit `chain.count + 1` prototypes up (chain.count ≤ 2):
+    /// receivers on `receiverShape`, through prototypes on `chain` (in order),
+    /// find the property on `holder` at `propOffset`.
+    func updateDeep(_ pc: Int, receiverShape: JeffJSShape, chain: [JeffJSShape],
+                    holder: JeffJSObject, holderShape: JeffJSShape, propOffset: Int) {
+        guard chain.count <= 2, slot(pc) != 0, !receiverShape.isLazySentinel, !holderShape.isLazySentinel else { return }
+        guard let site = polySite(pc) else { return }
+        let rs = UnsafeRawPointer(Unmanaged.passUnretained(receiverShape).toOpaque())
+        if site.has(rs) { return }
+        if site.entries.count >= Self.polyLimit { site.megamorphic = true; polyAppend(JeffJSPolyEntry.placeholder, site: site, pc: pc); return }
+        for s in chain where s.isLazySentinel { return }
+        receiverShape.icCached = true
+        holderShape.icCached = true
+        var c1: UnsafeRawPointer? = nil, c2: UnsafeRawPointer? = nil
+        if chain.count >= 1 { chain[0].icCached = true; c1 = UnsafeRawPointer(Unmanaged.passRetained(chain[0]).toOpaque()) }
+        if chain.count >= 2 { chain[1].icCached = true; c2 = UnsafeRawPointer(Unmanaged.passRetained(chain[1]).toOpaque()) }
+        _ = Unmanaged.passRetained(receiverShape)
+        polyAppend(JeffJSPolyEntry(
+            receiverShape: rs, chain1: c1, chain2: c2,
+            holder: UnsafeRawPointer(Unmanaged.passRetained(holder).toOpaque()),
+            holderShape: UnsafeRawPointer(Unmanaged.passRetained(holderShape).toOpaque()),
+            propOffset: Int32(truncatingIfNeeded: propOffset), chainCount: UInt8(chain.count), writable: false),
+            site: site, pc: pc)
+    }
+
+    /// Side-list read for `receiver` at `pc`: the data value (borrowed) or
+    /// the getter of an accessor slot; nil on no match.
+    @inline(never)
+    func polyRead(_ pc: Int, _ receiver: JeffJSObject) -> JeffJSPolyHit? {
+        guard let sites = polyBySlot, let site = sites[slot(pc)], let rsid = receiver.shapeIdentity else { return nil }
+        return site.entries.withUnsafeBufferPointer { b -> JeffJSPolyHit? in
+            var i = 0
+            let n = b.count
+            while i < n {
+                if b[i].receiverShape == rsid {
+                    let holderObj: JeffJSObject
+                    if let hp = b[i].holder {
+                        guard let rshape = receiver.shape, var cur = rshape.proto else { return nil }
+                        if let c1 = b[i].chain1 {
+                            guard cur.shapeIdentity == c1, let s = cur.shape, let next = s.proto else { return nil }
+                            cur = next
+                            if let c2 = b[i].chain2 {
+                                guard cur.shapeIdentity == c2, let s2 = cur.shape, let next2 = s2.proto else { return nil }
+                                cur = next2
+                            }
+                        }
+                        guard UnsafeRawPointer(Unmanaged.passUnretained(cur).toOpaque()) == hp,
+                              cur.shapeIdentity == b[i].holderShape else { return nil }
+                        holderObj = cur
+                    } else {
+                        holderObj = receiver
+                    }
+                    let off = Int(b[i].propOffset)
+                    guard off >= 0, off < holderObj.propCount else { return nil }
+                    if let ex = holderObj.extra(at: off) {
+                        if ex.kind == .getset, let g = ex.getter { return .getter(g) }
+                        return nil
+                    }
+                    return .value(holderObj.dataValue(at: off))
+                }
+                i += 1
+            }
+            return nil
+        }
     }
 
     @inline(__always) private func setSlot(_ pc: Int, _ slot: Int) {
@@ -285,7 +506,8 @@ nonisolated final class JeffJSInlineCache {
     deinit {
         Self.liveTables.wrappingSubtract(1, ordering: .relaxed)
         Self.liveBytes.wrappingSubtract(blockBytes, ordering: .relaxed)
-        for entry in entries {
+        if let sites = polyBySlot { for site in sites { site?.releaseAll() } }
+        for entry in entries.dropFirst() {   // slot 0 holds the table pointer, unretained
             if let old = entry.shapePtr {
                 Unmanaged<JeffJSShape>.fromOpaque(old).release()
             }
@@ -346,6 +568,7 @@ nonisolated final class JeffJSInlineCache {
     func updateProto(_ pc: Int, receiverShape: JeffJSShape, holder: JeffJSObject,
                      holderShape: JeffJSShape, propOffset: Int, atom: UInt32 = 0) {
         guard let idx = storeSlot(pc), !receiverShape.isLazySentinel, !holderShape.isLazySentinel else { return }
+        polyKeepPrimary(idx, pc: pc, newShape: receiverShape)
         receiverShape.icCached = true   // "no own property here": stale if one is appended in place
         holderShape.icCached = true     // the holder's slot: stale if deleted / re-flagged in place
         let rs = Unmanaged.passRetained(receiverShape).toOpaque()
@@ -356,11 +579,13 @@ nonisolated final class JeffJSInlineCache {
             shapePtr: UnsafeRawPointer(rs), pc: pc, propOffset: propOffset, writable: false,
             atom: atom,
             nextShapePtr: nil, holderPtr: UnsafeRawPointer(hp), holderShapePtr: UnsafeRawPointer(hs))
+        entries[idx].polyState = polyState(pc)
     }
 
     @inline(__always)
     func update(_ pc: Int, shape: JeffJSShape, propOffset: Int, atom: UInt32 = 0) {
         guard let idx = storeSlot(pc), !shape.isLazySentinel else { return }
+        polyKeepPrimary(idx, pc: pc, newShape: shape)
         // Retain the new shape before releasing the old one (handles re-caching
         // the same shape without a transient zero refcount).
         shape.icCached = true   // own slot: stale if deleted / re-flagged in place (prepareShapeUpdate)
@@ -375,6 +600,7 @@ nonisolated final class JeffJSInlineCache {
             writable: writable,
             atom: atom
         )
+        entries[idx].polyState = polyState(pc)
     }
 
     /// Cache a define_field transition: objects on `from` at `pc` move to `to`
