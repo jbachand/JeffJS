@@ -2497,6 +2497,20 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
         }
     }
 
+    /// `length` of a typed array (0 once its buffer is detached), nil for any
+    /// other object: the `ta.length` read in get_field, which is otherwise a
+    /// getter on %TypedArray%.prototype two prototypes up (never cached).
+    @inline(__always)
+    final func typedArrayLengthFast() -> Int? {
+        guard jeffJS_isTypedArrayClass(classID), let au = _auxU,
+              let tu = au._withUnsafeGuaranteedRef({ $0.taU }) else { return nil }
+        return tu._withUnsafeGuaranteedRef { ta -> Int? in
+            guard let abu = ta.abU else { return nil }
+            if abu._withUnsafeGuaranteedRef({ $0.detached }) { return 0 }
+            return ta.length
+        }
+    }
+
     /// Typed-array element store of a number (int or double). Returns 1 stored (or silently
     /// ignored: detached / out of range, as the general path does), -2 = not handled here.
     /// (1 stored, 0 silently ignored because the buffer is detached or idx is out of range; the

@@ -4783,6 +4783,12 @@ nonisolated private func executeFastTrace(
                 buf[sp - 1] = hv.dupValueFast()
                 obj.freeValueFast()
                 pc += 5
+            } else if readU32(bc, pc + 1) == JeffJSAtomID.JS_ATOM_length.rawValue,
+                      let n = jsObj._obj.typedArrayLengthFast() {
+                // `ta.length`: the %TypedArray%.prototype getter, two prototypes up.
+                buf[sp - 1] = .newInt32(Int32(truncatingIfNeeded: n))
+                obj.freeValueFast()
+                pc += 5
             } else {
                 resume = pc; break traceLoop // deopt: IC miss
             }
@@ -4952,6 +4958,15 @@ nonisolated private func executeFastTrace(
                 pc += 1
                 continue traceLoop
             }
+            if let taObj = objV.obj, jeffJS_isTypedArrayClass(taObj.classID) {
+                let tIdx = key.toInt32()
+                guard tIdx >= 0, let tv = taObj._obj.typedArrayGet(UInt32(tIdx)) else { resume = pc; break traceLoop }
+                objV.freeValueFast()
+                sp -= 1
+                buf[sp - 1] = tv
+                pc += 1
+                continue traceLoop
+            }
             guard key.isInt, let jsObj = objV.obj,
                   jsObj.classID == JeffJSClassID.array.rawValue else {
                 resume = pc; break traceLoop // deopt: non-array or non-int key
@@ -4985,6 +5000,14 @@ nonisolated private func executeFastTrace(
             let objV = buf[sp - 3]
             if !key.isInt {
                 guard jeffJS_traceKeyedPut(buf, sp, fb.icEntries, pc) else { resume = pc; break traceLoop }
+                sp -= 3
+                pc += 1
+                continue traceLoop
+            }
+            if (val.isInt || val.isFloat64), let taObj = objV.obj, jeffJS_isTypedArrayClass(taObj.classID) {
+                let tIdx = key.toInt32()
+                guard tIdx >= 0, taObj._obj.typedArraySet(UInt32(tIdx), val) >= 0 else { resume = pc; break traceLoop }
+                objV.freeValueFast()   // the popped receiver ref
                 sp -= 3
                 pc += 1
                 continue traceLoop
@@ -6150,6 +6173,11 @@ nonisolated private func executeFastTraceLean(
                 buf[sp - 1] = hv.dupValueFast()
                 obj.freeValueFast()
                 pc += 5
+            } else if readU32(bc, pc + 1) == JeffJSAtomID.JS_ATOM_length.rawValue,
+                      let n = jsObj._obj.typedArrayLengthFast() {
+                buf[sp - 1] = .newInt32(Int32(truncatingIfNeeded: n))
+                obj.freeValueFast()
+                pc += 5
             } else {
                 ctx.interruptCounter = interrupt; return pc // deopt: IC miss
             }
@@ -6288,6 +6316,15 @@ nonisolated private func executeFastTraceLean(
             guard sp >= 2 else { ctx.interruptCounter = interrupt; return pc } // deopt: stack too shallow
             let key = buf[sp - 1]
             let objV = buf[sp - 2]
+            if key.isInt, let taObj = objV.obj, jeffJS_isTypedArrayClass(taObj.classID) {
+                let tIdx = key.toInt32()
+                guard tIdx >= 0, let tv = taObj._obj.typedArrayGet(UInt32(tIdx)) else { ctx.interruptCounter = interrupt; return pc }
+                objV.freeValueFast()
+                sp -= 1
+                buf[sp - 1] = tv
+                pc += 1
+                continue traceLoop
+            }
             guard key.isInt, let jsObj = objV.obj,
                   jsObj.classID == JeffJSClassID.array.rawValue else {
                 ctx.interruptCounter = interrupt; return pc // deopt: non-array or non-int key
@@ -6319,6 +6356,14 @@ nonisolated private func executeFastTraceLean(
             let val = buf[sp - 1]
             let key = buf[sp - 2]
             let objV = buf[sp - 3]
+            if key.isInt, (val.isInt || val.isFloat64), let taObj = objV.obj, jeffJS_isTypedArrayClass(taObj.classID) {
+                let tIdx = key.toInt32()
+                guard tIdx >= 0, taObj._obj.typedArraySet(UInt32(tIdx), val) >= 0 else { ctx.interruptCounter = interrupt; return pc }
+                objV.freeValueFast()   // the popped receiver ref
+                sp -= 3
+                pc += 1
+                continue traceLoop
+            }
             guard key.isInt, let jsObj = objV.obj,
                   jsObj.classID == JeffJSClassID.array.rawValue,
                   let storage = jsObj._fastArrayValues, !storage.checked else {
@@ -10466,6 +10511,14 @@ nonisolated struct JeffJSInterpreter {
                     continue dispatchLoop
                         }
                     }
+                    // `ta.length` (the %TypedArray%.prototype getter, two
+                    // prototypes up: never an IC entry).
+                    if atom == JeffJSAtomID.JS_ATOM_length.rawValue, let n = jsObj._obj.typedArrayLengthFast() {
+                        buf[sp] = .newInt32(Int32(truncatingIfNeeded: n)); sp += 1
+                        obj.freeValue()
+                        pc += 5
+                        continue dispatchLoop
+                    }
                     // IC miss: full lookup + cache update
                     #if JEFFJS_JSPROF
                     jeffJS_icCount(1)
@@ -10909,6 +10962,18 @@ nonisolated struct JeffJSInterpreter {
             case .get_array_el:
                 let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                // Typed-array int index: straight from the buffer (QuickJS
+                // OP_get_array_el's typed_array fast path). Every `img[i]`
+                // used to build an atom and walk getPropertyInternal.
+                if key.isInt, let jsObj = obj.obj, jeffJS_isTypedArrayClass(jsObj.classID) {
+                    let idx = key.toInt32()
+                    if idx >= 0, let v = jsObj._obj.typedArrayGet(UInt32(idx)) {
+                        buf[sp] = v; sp += 1
+                        obj.freeValue()
+                        pc += 1
+                        continue dispatchLoop
+                    }
+                }
                 // Dense-array int-index fast path: skip the atom round-trip
                 // (newAtomUInt32 + getPropertyInternal + freeAtom) per element.
                 if key.isInt, let jsObj = obj.obj,
@@ -10957,6 +11022,14 @@ nonisolated struct JeffJSInterpreter {
             case .get_array_el2:
                 let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = buf[sp - 1]
+                if key.isInt, let jsObj = obj.obj, jeffJS_isTypedArrayClass(jsObj.classID) {
+                    let idx = key.toInt32()
+                    if idx >= 0, let v = jsObj._obj.typedArrayGet(UInt32(idx)) {
+                        buf[sp] = v; sp += 1
+                        pc += 1
+                        continue dispatchLoop
+                    }
+                }
                 if key.isInt, let jsObj = obj.obj,
                    jsObj.classID == JeffJSClassID.array.rawValue {
                     let idx = key.toInt32()
@@ -11001,6 +11074,18 @@ nonisolated struct JeffJSInterpreter {
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let key = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let obj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                // Typed-array int index, number value: store straight into the
+                // buffer (out of range / detached is silently ignored, as the
+                // integer-indexed exotic [[Set]] says); other values convert
+                // on the general path.
+                if key.isInt, (val.isInt || val.isFloat64), let jsObj = obj.obj, jeffJS_isTypedArrayClass(jsObj.classID) {
+                    let idx = key.toInt32()
+                    if idx >= 0, jsObj._obj.typedArraySet(UInt32(idx), val) >= 0 {
+                        obj.freeValue()   // the popped receiver ref
+                        pc += 1
+                        continue dispatchLoop
+                    }
+                }
                 // Dense-array in-bounds overwrite fast path. Growth, holes,
                 // length updates and frozen/sealed/non-extensible arrays
                 // (`storage.checked`) take the full setPropertyValue path.
