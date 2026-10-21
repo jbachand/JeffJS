@@ -1263,3 +1263,41 @@ return ~460 vs 276 instructions, a native call ~750 vs 310, closure create + fre
 without Swift objects, one native-call ABI over the VM stack instead of `[JeffJSValue]`, `fb` unretained in the main
 loop). Site-side: deepmerge with `clone: true` re-clones every data model at module evaluation; `extend()` over
 frozen DSL nodes without cloning would remove most of the work.
+
+## Round 14 — the 2026-10-20 docket (profile-driven, one branch per item)
+
+Jeff asked for the whole docket (`/mnt/project-files/jeffjs-execution-rethink.md`, section 8.7 list) after the
+execution-architecture review concluded the bytecode VM stays. Each item is its own branch off
+`perf/round5-beat-quickjs`, merged on `perf/docket-integration`; every one measured on `bench/realworld.js`
+(Mac CLI, release, QuickJS = `/opt/homebrew/bin/qjs`), `swift test -c release` green (the 4 known failing cases
+only: HTMLParser adoption/foster, Intl, SelectorTests), semantics diffed against QuickJS with a probe script per
+item (`gen_smoke`, `native_smoke`, `accessor_smoke`, `ta_smoke`, `json_smoke`, `num_smoke`, `str_smoke` in the
+thread's scratchpad: 14–8 000 cases each, identical output except where JSC's wording is kept on purpose).
+
+| branch | change | kernel | before → after (QuickJS) |
+|---|---|---|---:|
+| perf/typed-array-info | `typedArrayInfo(forClassID:)` is an indexed table, not a linear closure search per element | typed-array-image | 851 → 465 (122) |
+| perf/generator-frames | a suspended generator / async activation keeps its own frame and buffer (QuickJS `async_func_init`): yield/await record pc and sp, var-refs stay live (fixes the stale-closure-after-yield bug) | generators-iterators | 174 → 68 (18) |
+| perf/native-method-slots | `JSCFunctionType.argv` (QuickJS's `(ctx, this, argc, argv)` over the stack slots) for Math / hot Array and String builtins; the 86 intrinsic closures that captured `[weak self]` use their `ctx` parameter (a weak load + side-table retain/release per builtin call was most of the native-call gap); cold string/BigInt arms out of `toFloat64` and `strictEqual`; Math argument conversion fixed (BigInt/symbol TypeErrors, valueOf exceptions, `Math.round(-2.5)`, `±1 ** ±Infinity`), `Array.isArray(proxy)` | native-calls | 353 → 179 (100) |
+| " | accessors through the inline cache: a cached getter runs as an inline call (`get_field2 + call_method 0` shape), a setter as an inline call with `InlineCallFrame.dropResult` | getter-setter | 98 → 44 (17) |
+| " | typed-array element reads/writes and `.length` straight from the buffer in the main loop and both traces | typed-array-image | 465 → 373 (122) |
+| " | `JSON.stringify` common call (no replacer/list/gap): one code-unit buffer, values from property slots in the shape's cached key order, strings quoted from code units (`JeffJSBuiltinJSONFast.swift`); typed arrays serialize their index keys | json-stringify | 357 → 163 (91) |
+| " | toFixed via libc `%.*f` unless an exact tie is possible; `Number::toString` over UTF-8 bytes; local zone offset memoised per UTC minute | date-number-format | 391 → 269 (91) |
+| " | `jeffJS_concatStrings` appends in place into a flat left operand the caller owns every reference to (`ownedRefs`), as `js_concat_string` does | template-html / template-literals | 234 → 190 / 188 → 158 (43 / 34) |
+
+Suite total 6488 → ~5000 ms (3.7x → 2.9x QuickJS); `watch_deepmerge` 1407 → 1200 ms (QuickJS 520).
+
+**Measured dead ends.** PGO (`-profile-generate` → `-profile-use`): swiftc 6.2.4 aborts
+(`Assertion failed: (takenProbability >= 0), inferFromEdgeProfile at ColdBlockInfo.cpp:265`, EarlyPerfInliner on
+`JBigInt.magDivSmall`); not pursued. The argv ABI alone was worth little: the array-free path saved ~10 % of
+native-calls, the weak-self capture was the other 40 %.
+
+**Found, not fixed (pre-existing, QuickJS differs):** a typed array accepts `ta[-1] = v` / `ta[1.5] = v` as
+ordinary properties; `new Date(y, m, d, h)` on a DST transition day is an hour off (`utcTime`); the
+`%TypedArray%.prototype.length` getter does not throw on a non-typed-array receiver; `Object.keys` of a typed array
+with extra keys.
+
+**Left on the docket:** class-hierarchy 4.9x (polymorphic sites thrash the monomorphic IC; prototype entries are
+depth 1 only), rest-spread 3.3x, for-in / Object.assign / entries 3.2–3.5x (per-entry array and object churn),
+large-object-keys 4.9x (`"key" + i` then `findAtom` per read), regex 8.4x, proxy 5.6x, map-set 3.4x; then the
+non-VM items (library-aware substitution, heap snapshots of pure modules, lane batching).
