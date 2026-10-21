@@ -1288,7 +1288,7 @@ thread's scratchpad: 14–8 000 cases each, identical output except where JSC's 
 | " | one regex VM per pattern reused across execs; `[Symbol.split]` searches for the next match instead of a sticky probe per position (also fixes the split limit inside captures) | string-replace-regex / regex-tokenize | 230 → 113 / 60 → 52 (52 / 7) |
 | perf/polymorphic-ic | side lists per site (≤ 8 entries, slot-indexed, POD) for polymorphic receivers and prototype hits 2–3 levels up, gated by a per-entry state byte; cached getters run on the fused and method-receiver sites too | polymorphic-access / class-hierarchy | 110 → 93 / 344 → 314 (31 / 70) |
 
-Suite total 6488 → 4736 ms (3.7x → 2.7x QuickJS); `watch_deepmerge` 1407 → 1184 ms (QuickJS 520).
+Suite total 6488 → 4459 ms (3.7x → 2.55x QuickJS); `watch_deepmerge` 1407 → 1165 ms (QuickJS 520).
 
 **Measured dead ends.** PGO (`-profile-generate` → `-profile-use`): swiftc 6.2.4 aborts
 (`Assertion failed: (takenProbability >= 0), inferFromEdgeProfile at ColdBlockInfo.cpp:265`, EarlyPerfInliner on
