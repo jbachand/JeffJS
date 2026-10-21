@@ -179,3 +179,91 @@ cd ~/www/jeffjs && .build/release/jeffjs-cli bench/realworld.js & sample $! 15 -
 # dispatch microbenchmark (branch design/execution-rethink)
 swiftc -O -wmo bench/arch/dispatch_bench.swift -o /tmp/dispatch_bench && /tmp/dispatch_bench
 ```
+
+## 8. Wilder: things that are not a VM at all (added 2026-10-20, evening)
+
+Jeff's follow-up: bytecode and a VM cannot be the optimum; what about machine code, or something that has not existed, like
+2-D grid operations that trade space for time. Here is every model I can defend, ranked by how much of *our* workload it
+could move, with the loophole or the law it rests on. None has been prototyped; sizes are estimates.
+
+### 8.1 Machine code is allowed in three places, just not where we want it
+
+- **The GPU compiles code at runtime.** `MTLDevice.makeLibrary(source:)` builds a Metal shader from a string on iOS; that is
+  a JIT the system runs for us, and it is legal. So "JS to machine code at runtime" exists today for whatever can be
+  expressed as a compute kernel: typed-array loops (7x gap), canvas pixel ops, physics, bulk string scans, parallel
+  regex/NFA simulation over long inputs, JSON stage-1 tokenising. The bytecode compiler would detect a loop whose body is
+  pure arithmetic over typed arrays / numeric arrays, emit MSL, and run it with a guard and a fallback. Limits: ~0.1–0.5 ms
+  per dispatch, so only loops with ≥ 1 ms of work pay; no Metal on the watch; nothing with objects, strings or calls.
+  Size: medium (a small typed kernel compiler). Payoff: large on the few numeric kernels, zero on Instagram's feed.
+- **Accelerate / BNNS / MPSGraph build operation graphs at runtime** on the CPU's vector units and the Neural Engine. Same
+  kernel-only limit, works on the watch's CPU (vDSP). Good for `Math.*` over arrays, sort of numbers, UTF-16 search.
+- **Native code we ship with the app.** The App Store forbids *generating* code, not *carrying* it. See 8.3.
+
+### 8.2 Space for time, taken seriously (the "square of space" direction)
+
+- **Heap snapshots per bundle (the biggest watch lever I can see).** Home Depot's landing is 23 s of module evaluation on
+  the watch, almost all of it `deepmerge` building the same data models from the same literals on every visit. Treat a
+  module factory's evaluation as a function of (bundle content hash, its imports) and **cache its result graph on disk**:
+  the next visit deserialises the objects instead of recomputing them, the way V8/Node and Dart ship startup snapshots,
+  except keyed per module and built on the device. Legal (data, not code); fits the existing `.jfbc` cache (functions are
+  already serialisable, closures would carry their environment). The semantic fence is purity: a factory that touched the
+  host (DOM, timers, network, `Date.now`, `Math.random`, the global object beyond reads) is not cached; the engine already
+  has every hook to observe that. deepmerge-at-module-time is exactly the pure case. Size: large (object-graph
+  serialiser + purity tracking + invalidation by bundle hash), but contained in the engine. Payoff: warm visits skip most
+  of the 23 s; cold visits unchanged.
+- **Automatic memoisation of pure functions.** The THD memo experiment (site-specific, three WeakMap memos) gave ~32x on
+  the cart's `_client` strip and 10–20 % on page INP. The general form: bytecode analysis marks functions that only read
+  their arguments and write locals; the engine memoises them by argument identity + a heap "write generation" so any store
+  through a shape invalidates. Novel in a production JS engine (JITs don't, because they cannot assume workloads); legal;
+  risky on semantics (identity of returned objects, `===` on results) so it must only return fresh clones or frozen values.
+  Size: medium. Payoff: workload-specific, from nothing to 30x.
+- **Precomputed shapes and inline caches** are already the small version of this (the bytecode cache stores IC layouts).
+
+### 8.3 Library-aware engine: recognise code, substitute native
+
+A browser engine must be generic. We are not a browser for the whole web; we target a handful of sites, and their hot code
+is **the same npm packages everywhere**: React/ReactDOM's reconciler, Preact, deepmerge, lodash, graphql-tag, Apollo's
+cache normaliser, core-js. Minification renames identifiers but not structure, and `jeffjs-cli --bc-hash-code` already
+hashes bytecode *minus names and positions*. So: a table of `structural hash of function → native Swift implementation`,
+consulted when a function is first compiled; on a hit the function object dispatches to Swift (the "maps directly to a
+Swift method" of the original idea, but keyed by what the code *is*). Native deepmerge or a native React commit phase is
+10–50x the interpreter on that code, and the substitution is verifiable by differential testing against the interpreted
+version. Legal (shipped code), works on the watch, no JIT. Costs: each library version is its own entry (ship a table,
+refresh with app updates), and a mismatch is a correctness bug, so every native twin needs the conformance harness run
+against the real bundle. Size: medium per library, small for the lookup. Payoff: unbounded on the sites we care about;
+this is the one wild idea that can beat Safari's JIT on specific code, because it skips the code.
+
+### 8.4 Lanes: run one callback over many elements at once (the "2-D grid")
+
+`arr.map(x => x * 2 + 1)`, `filter`, `reduce`, `forEach` over numeric data run the same bytecode a million times with a call
+per element. A **lane-batched interpreter** executes the callback's bytecode once over N elements at a time: each value
+slot becomes a vector of N NaN-boxed values, each op a NEON loop, with a guard that deopts the batch to scalar on the
+first non-numeric lane, side effect, or call. This is SIMD interpretation; Truffle and the JITs don't do it (they vectorise
+after compiling). Legal, works on the watch's NEON. Semantics fight it on evaluation order (observable only through side
+effects, which the guard excludes). Size: medium (a second opcode set for ~30 numeric ops). Payoff: 3–8x on the
+`array-*`, `physics`, `typed-array` kernels; nothing on DOM-heavy code.
+
+### 8.5 Speculative parallel module evaluation
+
+Bundles evaluate thousands of module factories in sequence; most only build data. Evaluate independent factories in
+parallel on the other cores (phone 6, watch 2), each in a transactional view of the heap, commit in order, abort on
+conflict (a write seen by another factory's read). This is thread-level speculation from the 2000s CPU literature,
+applied to JS modules. Legal. Semantics: everything is shared mutable state, so the write barrier on every store and the
+versioned heap are the cost; it only pays if conflicts are rare, which the purity tracking of 8.2 would tell us. Size:
+very large. Payoff: up to core count on module evaluation, zero after load. I would not start here.
+
+### 8.6 What I would not spend time on
+
+- A GPU interpreter for JS itself (one JS thread cannot use a grid; the grid helps only inside 8.1's kernels).
+- Register bytecode, threaded code, closure trees: all variants of "a better VM" and all bounded by the 23 % dispatch
+  share (sections 3 and 6).
+- WebAssembly as a target: same JIT ban, same interpreter problem.
+
+### 8.7 Revised ranking with the wild ideas in
+
+1. **Library-aware substitution (8.3)**: first entry deepmerge, measured on the watch's Home Depot landing; a week for the
+   lookup + the first native twin, gated on the conformance harness.
+2. **Heap snapshots per pure module (8.2)**: the only idea that changes the watch's 23 s by more than a constant factor.
+3. The manual-memory core and native method slots (section 7): still the right generic work.
+4. **Lane-batched callbacks (8.4)** and **GPU kernels (8.1)**: real on numeric code, which is not where Instagram or Home
+   Depot spend their time; do after the above, or when canvas/typed-array sites matter.
