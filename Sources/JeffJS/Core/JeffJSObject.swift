@@ -1881,6 +1881,9 @@ nonisolated final class JeffJSMapRecord {
     var key: JeffJSValue = .undefined
     var value: JeffJSValue = .undefined
     var hashNext: Int = -1
+    /// `mapHashKey(key)`, kept so a chain walk compares hashes before
+    /// contents and a resize does not rehash every key.
+    var hash: UInt32 = 0
     var link: ListNode = ListNode()
     var empty: Bool = false
     /// WeakMap/WeakSet record whose key is held weakly: the record owns no

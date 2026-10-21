@@ -100,7 +100,10 @@ nonisolated private func mapHashKey(_ key: JeffJSValue) -> UInt32 {
         return 1 &* KNUTH_MULTIPLIER
     case .string:
         if let str = key.stringValue {
-            return jeffJS_computeHash(str: str) &* KNUTH_MULTIPLIER
+            // The string caches its 30-bit hash (computeHash stores it); it
+            // was recomputed over the whole string on every get/set/has.
+            let h = str.hash != 0 ? str.hash : jeffJS_computeHash(str: str)
+            return h &* KNUTH_MULTIPLIER
         }
         return 0
     case .symbol:
@@ -145,7 +148,7 @@ nonisolated private func mapStateResize(_ s: JeffJSMapState) {
     for i in 0..<s.records.count {
         let rec = s.records[i]
         if !rec.empty {
-            let h = Int(mapHashKey(rec.key) % UInt32(newSize))
+            let h = Int(rec.hash % UInt32(newSize))
             rec.hashNext = s.hashTable[h]
             s.hashTable[h] = i
         }
@@ -155,11 +158,15 @@ nonisolated private func mapStateResize(_ s: JeffJSMapState) {
 /// Find a record matching `key` in the map state. Returns the record index or -1.
 nonisolated private func mapStateFind(_ s: JeffJSMapState, key: JeffJSValue) -> Int {
     guard s.hashSize > 0 else { return -1 }
-    let h = Int(mapHashKey(key) % UInt32(s.hashSize))
+    let hk = mapHashKey(key)
+    let h = Int(hk % UInt32(s.hashSize))
     var idx = s.hashTable[h]
     while idx >= 0 {
         let rec = s.records[idx]
-        if !rec.empty && sameValueZero(rec.key, key) {
+        // Hash first (a chain holds every key of the bucket), then the same
+        // bits (the same string object / int / object: no content compare),
+        // then SameValueZero over the contents.
+        if !rec.empty && rec.hash == hk && (rec.key.bits == key.bits || sameValueZero(rec.key, key)) {
             return idx
         }
         idx = rec.hashNext
@@ -185,7 +192,9 @@ nonisolated private func mapStateInsert(_ s: JeffJSMapState, key: JeffJSValue, v
     s.records.append(rec)
 
     // Insert into hash chain.
-    let h = Int(mapHashKey(key) % UInt32(s.hashSize))
+    let hk = mapHashKey(key)
+    rec.hash = hk
+    let h = Int(hk % UInt32(s.hashSize))
     rec.hashNext = s.hashTable[h]
     s.hashTable[h] = recIndex
 
