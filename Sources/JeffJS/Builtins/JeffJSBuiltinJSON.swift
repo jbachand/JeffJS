@@ -272,6 +272,14 @@ nonisolated struct JeffJSBuiltinJSON {
 
         let value = args[0]
 
+        // No replacer function, no property list, no indentation: the buffer
+        // serializer (JeffJSBuiltinJSONFast.swift). nil = it declined before
+        // any user code ran; the generic path below takes over.
+        if sCtx.replacerFunc == nil, sCtx.propertyList == nil, sCtx.gap.isEmpty,
+           let fast = stringifyFast(ctx: ctx, root: value) {
+            return fast
+        }
+
         // Create a wrapper object: {"": value}
         let wrapper = ctx.newPlainObject()
         ctx.setPropertyStr(obj: wrapper, name: "", value: value.dupValue())
@@ -1333,9 +1341,14 @@ nonisolated extension JeffJSContext {
         return obj.isCallable
     }
 
+    /// IsArray (ES §7.2.2): an Array exotic object, or a Proxy whose target
+    /// is one (QuickJS `JS_IsArray` looks through the proxy; a revoked proxy
+    /// is a TypeError there, answered false here).
     func isArray(_ val: JeffJSValue) -> Bool {
         guard let obj = val.toObject() else { return false }
-        return obj.isArray
+        if obj.isArray { return true }
+        if case .proxyData(let pd) = obj.payload, !pd.isRevoked { return isArray(pd.target) }
+        return false
     }
 
     func strictEqual(_ a: JeffJSValue, _ b: JeffJSValue) -> Bool {

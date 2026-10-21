@@ -106,6 +106,20 @@ nonisolated func jeffJS_icProtoHit(_ entry: JeffJSICEntry) -> JeffJSValue? {
     }
 }
 
+/// The getter of a prototype-chain entry whose holder slot is an accessor
+/// (a class `get x()` lives on the prototype), under the same shape checks
+/// as `jeffJS_icProtoHit`; nil for a data slot or a stale entry.
+@inline(__always)
+nonisolated func jeffJS_icProtoGetter(_ entry: JeffJSICEntry) -> JeffJSObject? {
+    guard let hp = entry.holderPtr, let hsp = entry.holderShapePtr else { return nil }
+    return Unmanaged<JeffJSObject>.fromOpaque(hp)._withUnsafeGuaranteedRef { h -> JeffJSObject? in
+        guard h.shapeIdentity == hsp, entry.propOffset >= 0,
+              entry.propOffset < h.propValues.count,
+              let ex = h.extra(at: entry.propOffset), ex.kind == .getset else { return nil }
+        return ex.getter
+    }
+}
+
 /// Slot of the inline-cache entry for the instruction at `pc`, read from the
 /// table's pc -> slot map (IC-site ordinal tables, perf/bytecode-paging).
 ///
@@ -1075,6 +1089,12 @@ nonisolated struct JeffJSPropertyFlags: OptionSet {
 /// Mirrors QuickJS `JSCFunctionType`.
 nonisolated enum JSCFunctionType {
     case generic( (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue )
+    /// QuickJS's own ABI: `(ctx, this_val, argc, argv)`. The arguments are the
+    /// caller's VM stack slots (borrowed, `argv[0 ..< argc]`, nil only when
+    /// argc == 0): no `[JeffJSValue]` is built, moved or released per call.
+    /// Hot builtins use it (perf/native-method-slots, 2026-10-20); the
+    /// `.generic` array form stays for everything else.
+    case argv( (JeffJSContext, JeffJSValue, UnsafePointer<JeffJSValue>?, Int) -> JeffJSValue )
     case genericMagic( (JeffJSContext, JeffJSValue, [JeffJSValue], Int) -> JeffJSValue )
     case constructor( (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue )
     case constructorOrFunc( (JeffJSContext, JeffJSValue, [JeffJSValue], Bool) -> JeffJSValue )
@@ -2512,6 +2532,20 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
                     return jeffJS_typedArrayLoad(cid, raw.baseAddress.unsafelyUnwrapped + off)
                 }
             }
+        }
+    }
+
+    /// `length` of a typed array (0 once its buffer is detached), nil for any
+    /// other object: the `ta.length` read in get_field, which is otherwise a
+    /// getter on %TypedArray%.prototype two prototypes up (never cached).
+    @inline(__always)
+    final func typedArrayLengthFast() -> Int? {
+        guard jeffJS_isTypedArrayClass(classID), let au = _auxU,
+              let tu = au._withUnsafeGuaranteedRef({ $0.taU }) else { return nil }
+        return tu._withUnsafeGuaranteedRef { ta -> Int? in
+            guard let abu = ta.abU else { return nil }
+            if abu._withUnsafeGuaranteedRef({ $0.detached }) { return 0 }
+            return ta.length
         }
     }
 
