@@ -523,11 +523,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// handed to the interpreter, which takes over the saved stack, locals and
     /// arguments; only the references this state added are dropped then.
     static func releaseAsyncEntry(_ entry: AsyncSavedEntry, keepFrame: Bool) {
-        if !keepFrame {
-            for v in entry.saved.stack { v.freeValue() }
-            for v in entry.saved.varBuf { v.freeValue() }
-            for v in entry.saved.argBuf { v.freeValue() }
-        }
+        if !keepFrame { JeffJSGeneratorData.releaseSuspendedFrame(entry.saved) }
         entry.saved.funcObj.freeValue()
         entry.saved.thisVal.freeValue()
         entry.resolve.freeValue()

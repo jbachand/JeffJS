@@ -1486,10 +1486,23 @@ nonisolated enum JeffJSGeneratorStateEnum: UInt8 {
 /// re-enter the dispatch loop at the exact point where it left off.
 nonisolated struct GeneratorSavedState {
     var pc: Int
+    /// Absolute stack pointer into `buf` (QuickJS `sf->cur_sp`).
     var sp: Int
-    var stack: [JeffJSValue]
-    var varBuf: [JeffJSValue]
-    var argBuf: [JeffJSValue]
+    /// The suspended activation's own buffer `[arg slots][var slots][value
+    /// stack]` (QuickJS `JSAsyncFunctionState.stack_frame` / `arg_buf`): the
+    /// activation moved onto it at its first suspension and runs on it for
+    /// every resumption, so locals, arguments, the value stack and the
+    /// var-refs closures hold on them stay in place across `yield` /
+    /// `await` (a closure over a generator local saw a stale copy before).
+    /// Owned by this state until `releaseSuspendedFrame` or the completing
+    /// activation deallocates it.
+    var buf: UnsafeMutablePointer<JeffJSValue>
+    var bufCapacity: Int
+    var varBase: Int
+    var spBase: Int
+    /// The activation's frame, kept out of the runtime's free list while
+    /// suspended (its `liveVarRefs` still point at `buf`).
+    var frame: Unmanaged<JeffJSStackFrame>
     /// The bytecode function object that this generator was created from.
     /// Needed to restore the bytecode array, closure var refs, etc.
     var funcObj: JeffJSValue
@@ -1500,12 +1513,6 @@ nonisolated struct GeneratorSavedState {
     /// the resume value from `.next()` should NOT be pushed onto the stack
     /// because there is no yield expression to receive it.
     var isInitialYield: Bool = false
-    /// Var-refs that closures created inside the generator hold on its
-    /// locals/arguments. The frame epilogue detaches them at every yield (the
-    /// frame's buffer is released), so they are re-attached to the fresh
-    /// buffer on resume; without that the closure and the generator body see
-    /// two different copies of the same binding after the first yield.
-    var capturedVarRefs: [JeffJSVarRef] = []
     /// For yield* delegation: the inner iterator being delegated to.
     /// When non-nil, the generator is in `suspended_yield_star` state
     /// and each .next() call should advance the inner iterator.
@@ -1587,12 +1594,37 @@ nonisolated final class JeffJSGeneratorData {
     /// stack, locals and arguments, a `yield*` delegate, and the generator's
     /// own references to its function and `this`.
     static func releaseSuspendedState(_ saved: GeneratorSavedState) {
-        for v in saved.stack { v.freeValue() }
-        for v in saved.varBuf { v.freeValue() }
-        for v in saved.argBuf { v.freeValue() }   // generator args are owned by the generator
+        releaseSuspendedFrame(saved)
         if !saved.delegatedIter.isUndefined { saved.delegatedIter.freeValue() }   // yield* delegate
         saved.thisVal.freeValue()
         saved.funcObj.freeValue()
+    }
+
+    /// Retires a suspended activation that will never resume (QuickJS
+    /// `async_func_free`): closures that captured its locals get detached
+    /// copies, every argument, local and stack value in its buffer is
+    /// released (generator / async args are owned by the activation), the
+    /// buffer is deallocated and the frame goes back to the pool.
+    static func releaseSuspendedFrame(_ saved: GeneratorSavedState) {
+        let frame = saved.frame.takeUnretainedValue()
+        let buf = saved.buf
+        if frame.hasLiveVarRefs {
+            for vr in frame.liveVarRefs where !vr.isDetached {
+                vr.value = vr.pvalue.dupValue()
+                vr.isDetached = true
+                vr.parentFrame = nil; vr.slot = nil
+            }
+        }
+        var i = 0
+        while i < saved.sp { buf[i].freeValue(); i += 1 }
+        frame.ownsBuf = false
+        frame.buf = nil
+        buf.deallocate()
+        if let rt = JeffJSGCObjectHeader.activeRuntime {
+            rt.releaseFrameU(saved.frame)
+        } else {
+            frame.resetForRelease()
+        }
     }
 }
 
@@ -1855,6 +1887,11 @@ nonisolated final class JeffJSStackFrame {
     /// frame.argBuf/varBuf are kept in sync for backward compatibility with
     /// JeffJSVarRef.pvalue, closure creation, and generator save/restore.
     var buf: UnsafeMutablePointer<JeffJSValue>? = nil
+    /// `buf` is this frame's own heap buffer (a generator / async activation
+    /// that suspended: QuickJS `async_func_init` gives the activation a frame
+    /// of its own that outlives the call). Deallocated by whoever retires
+    /// the frame (the completing activation, or the generator's release).
+    var ownsBuf: Bool = false
     var bufCapacity: Int              = 0
     var bufVarBase: Int               = 0  // offset where vars start (= argSlots)
     var bufSpBase: Int                = 0  // offset where value stack starts (= argSlots + varSlots)
@@ -1881,6 +1918,7 @@ nonisolated final class JeffJSStackFrame {
         if !newTarget.isUndefined { newTarget = .undefined }
         curPC = 0
         buf = nil
+        ownsBuf = false
         // The arrays are materialised on demand; one flag instead of two
         // array-count loads per return.
         if bufArraysLive {
