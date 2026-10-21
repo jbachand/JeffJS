@@ -2697,13 +2697,16 @@ nonisolated final class REVirtualMachine {
     let bc: [UInt8]         // full bytecode including header
     let bcStart: Int        // offset of first opcode (after header)
     let bcEnd: Int          // offset past last opcode
-    let input: [UInt32]     // input code points (or UTF-16 code units)
-    let inputLen: Int
+    private(set) var input: [UInt32]     // input code points (or UTF-16 code units)
+    private(set) var inputLen: Int
     var startPos: Int       // starting position in input (var for reuse in global match)
-    let flags: JeffJSRegExpFlags
+    private(set) var flags: JeffJSRegExpFlags
     let captureCount: Int
     /// Canonicalisation table when the regexp has the `i` flag, else nil.
-    let caseTables: LRECaseTables?
+    private(set) var caseTables: LRECaseTables?
+    /// Set while an exec runs on this VM (JeffJSRegexCaches hands a cached VM
+    /// out only when it is free: a replace callback can run the same pattern).
+    var inUse = false
 
     // Execution state
     var captures: ContiguousArray<Int>   // flat: [start0, end0, start1, end1, ...]
@@ -2794,6 +2797,20 @@ nonisolated final class REVirtualMachine {
         self.valueSnapshots = ContiguousArray<Int32>()
         self.valueFloor = 0
         self.stack.reserveCapacity(32)   // grows geometrically; 1024 entries (40 KB) per exec was the exec cost
+    }
+
+    /// Re-point a cached VM at another input / flag set (same bytecode): the
+    /// capture, backtrack and counter stacks keep their storage. One VM used
+    /// to be allocated per exec, so split / replace / a global match loop
+    /// paid four allocations and the capture setup per match.
+    func rebind(input: [UInt32], startPos: Int, flags: JeffJSRegExpFlags) {
+        self.input = input
+        self.inputLen = input.count
+        if self.flags != flags {
+            self.flags = flags
+            self.caseTables = flags.contains(.ignoreCase) ? LRECaseTables.forFlags(flags) : nil
+        }
+        reset(startPos: startPos)
     }
 
     /// Reset the VM for another match attempt at a new starting position.
