@@ -1289,7 +1289,7 @@ thread's scratchpad: 14–8 000 cases each, identical output except where JSC's 
 | " | proxy trap keys from the atom's cached string; Map/Set records keep their key hash, string keys reuse the cached string hash | proxy-reactive / map-set | 188 → 182 / 156 → 150 (32 / 50): the rest of both is builtin call and callback overhead |
 | perf/polymorphic-ic | side lists per site (≤ 8 entries, slot-indexed, POD) for polymorphic receivers and prototype hits 2–3 levels up, gated by a per-entry state byte; cached getters run on the fused and method-receiver sites too | polymorphic-access / class-hierarchy | 110 → 93 / 344 → 314 (31 / 70) |
 
-Suite total 6488 → 4459 ms (3.7x → 2.55x QuickJS); `watch_deepmerge` 1407 → 1165 ms (QuickJS 520).
+Suite total 6488 → 4408 ms (3.7x → 2.5x QuickJS); `watch_deepmerge` 1407 → 1153 ms (QuickJS 520).
 
 **Measured dead ends.** PGO (`-profile-generate` → `-profile-use`): swiftc 6.2.4 aborts
 (`Assertion failed: (takenProbability >= 0), inferFromEdgeProfile at ColdBlockInfo.cpp:265`, EarlyPerfInliner on
