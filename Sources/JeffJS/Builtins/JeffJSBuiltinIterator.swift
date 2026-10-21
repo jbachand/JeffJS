@@ -1384,6 +1384,7 @@ nonisolated struct JeffJSBuiltinIterator {
             // without running a line of the body (ES §27.6.3.8).
             if genData.state == .suspended_start && req.completionType != 0 {
                 genData.state = .completed
+                if let saved = genData.savedState { JeffJSGeneratorData.releaseSuspendedState(saved) }
                 genData.savedState = nil
                 genData.asyncQueue.removeFirst()
                 settleCompleted(ctx, req)

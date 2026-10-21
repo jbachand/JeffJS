@@ -1096,8 +1096,7 @@ nonisolated extension JeffJSContext {
         // keep the frame-based lookup (same rule as createClosure).
         let fb = frame.curFunc.toObject()?.fbFast
         vr.argOwned = fb?.argSlotsOwned ?? false
-        if let b = frame.buf, i < frame.bufVarBase,
-           !(fb?.isGenerator ?? false), !(fb?.isAsyncFunc ?? false) {
+        if let b = frame.buf, i < frame.bufVarBase {
             vr.slot = b + i
         }
         frame.liveVarRefs.append(vr)
@@ -1497,7 +1496,7 @@ nonisolated extension JeffJSContext {
                         // Direct slot pointer (see JeffJSVarRef.slot). Generator /
                         // async frames re-acquire their buffer on resume, so they
                         // keep the frame-based lookup.
-                        if !fb.isGenerator, !fb.isAsyncFunc, let b = parentFrame.buf {
+                        if let b = parentFrame.buf {
                             if cv.isArg {
                                 if cv.varIdx < parentFrame.bufVarBase { vr.slot = b + cv.varIdx }
                             } else {
@@ -2213,7 +2212,7 @@ nonisolated extension JeffJSContext {
             let vr = JeffJSVarRef(isDetached: false, isArg: cv.isArg,
                                   varIdx: UInt16(cv.varIdx), parentFrame: frame)
             if cv.isArg { vr.argOwned = callerFB.argSlotsOwned }
-            if !callerFB.isGenerator, !callerFB.isAsyncFunc, let b = frame.buf {
+            if let b = frame.buf {
                 if cv.isArg {
                     if cv.varIdx < frame.bufVarBase { vr.slot = b + cv.varIdx }
                 } else {
@@ -8069,11 +8068,15 @@ nonisolated struct JeffJSInterpreter {
         // Frames are immortal (rt.allFrames). The entry setup runs through a
         // guaranteed reference: a plain `unowned(unsafe)` local is copied
         // (retain/release) around the field stores below.
-        let frameU = rt.acquireFrameU()
+        // A resumption re-enters the suspended activation's own frame (QuickJS
+        // `async_func_resume` runs JS_CallInternal on `s->frame`): nothing on
+        // it is reset here, only the chain link.
+        let frameU = resumeState?.frame ?? rt.acquireFrameU()
         let isConstructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0
         let isDerivedCtor = isConstructor && fb.isDerivedClassConstructor
         do { unowned(unsafe) let frame: JeffJSStackFrame = frameU.takeUnretainedValue()
         frame.prevFrame = ctx.currentFrame
+        if resumeState == nil {
         frame.curFunc = funcObj
         // ES spec §10.2.1.2: For non-strict functions, coerce undefined/null this
         // to the global object. Strict mode functions receive this as-is.
@@ -8107,10 +8110,11 @@ nonisolated struct JeffJSInterpreter {
         // inline-call frames, which never set it. Storing it cost a retain
         // here plus a release and an array uniqueness check in releaseFrame
         // per native→JS call. [callInternal edit, watch-cpu 2026-10-07]
-        if !ctx.cfgLeanCallEntry || fb.isGenerator || fb.isAsyncFunc || resumeState != nil {
+        if !ctx.cfgLeanCallEntry || fb.isGenerator || fb.isAsyncFunc {
             frame.argBuf = argsArray()
             frame.bufArraysLive = true
         }
+        }   // resumeState == nil
         }
         unowned(unsafe) var frame: JeffJSStackFrame = frameU.takeUnretainedValue()
 
@@ -8122,6 +8126,25 @@ nonisolated struct JeffJSInterpreter {
         let varCount = Int(fb.varCount)
         frame.varCount = varCount
 
+        var buf: UnsafeMutablePointer<JeffJSValue>
+        var bufCapacity: Int
+        // True when `buf` was acquired from the pool by this frame and must be
+        // released on exit. Inline callees normally carve their frame out of
+        // the caller's buffer (bufOwned = false) — no allocation, no arg copy.
+        // A resumed activation runs on its frame's own heap buffer (never the
+        // pool's): see jeffJS_suspendActivation.
+        var bufOwned: Bool
+        var varBase: Int
+        var spBase: Int
+        var sp: Int  // stack pointer (absolute index into buf)
+        if let saved = resumeState {
+            buf = saved.buf
+            bufCapacity = saved.bufCapacity
+            bufOwned = false
+            varBase = saved.varBase
+            spBase = saved.spBase
+            sp = saved.sp
+        } else {
         let argSlots = max(Int(fb.argCount), argc)
 
         // Allocate contiguous unsafe buffer: [arg slots][var slots][value stack].
@@ -8130,26 +8153,23 @@ nonisolated struct JeffJSInterpreter {
         // unwind and exit cleanup only touch [spBase, sp)).
         let stackSlots = max(Int(fb.stackSize), 4) + 32
         let totalSlots = argSlots + varCount + stackSlots
-        var (buf, bufCapacity) = rt.acquireInterpBuf(size: totalSlots,
-                                                     initializedPrefix: argSlots + varCount)
-        // True when `buf` was acquired from the pool by this frame and must be
-        // released on exit. Inline callees normally carve their frame out of
-        // the caller's buffer (bufOwned = false) — no allocation, no arg copy.
-        var bufOwned = true
-        var varBase = argSlots
-        var spBase = argSlots + varCount
+        (buf, bufCapacity) = rt.acquireInterpBuf(size: totalSlots,
+                                                 initializedPrefix: argSlots + varCount)
+        bufOwned = true
+        varBase = argSlots
+        spBase = argSlots + varCount
 
         // Copy args into buffer at offset 0: borrowed from the caller, or
         // owned copies when the function can store into its parameters (see
         // "Argument slots"; released in the epilogue).
-        if fb.copiesArgs && resumeState == nil {
+        if fb.copiesArgs {
             for i in 0..<argc { buf[i] = argv.unsafelyUnwrapped[i].dupValue() }
         } else {
             for i in 0..<argc { buf[i] = argv.unsafelyUnwrapped[i] }
         }
         // Remaining arg slots (padding) are already .undefined from initialization
 
-        var sp = spBase  // stack pointer (absolute index into buf)
+        sp = spBase
 
         // Store buf info on frame for potential external access
         frame.buf = buf
@@ -8162,6 +8182,7 @@ nonisolated struct JeffJSInterpreter {
         if fb.selfRefVarIdx >= 0 {
             buf[varBase + fb.selfRefVarIdx] = funcObj.dupValue()
         }
+        }   // resumeState == nil
 
         // Push frame
         ctx.currentFrame = frame
@@ -8175,6 +8196,10 @@ nonisolated struct JeffJSInterpreter {
         // and arguments moved into the saved async state, so the epilogue must
         // not free them (a nested resume can clobber ctx._asyncSuspended).
         var asyncSuspendedHere = false
+        // Set by every suspension (yield / initial_yield / await): the
+        // activation parked on its own frame and buffer, which its generator
+        // or async state now owns, so the epilogue leaves them alone.
+        var suspendedHere = false
 
         // Mutable copies of parameters for inline call state swapping
         var mFuncObj = funcObj
@@ -8216,51 +8241,10 @@ nonisolated struct JeffJSInterpreter {
 
         // ---- Generator resumption: restore saved state ----
         if let saved = resumeState {
+            // The frame, its buffer, locals, arguments, value stack and the
+            // var-refs closures hold on them are all still in place (the
+            // activation suspended on its own buffer); only the pc moves.
             pc = saved.pc
-            // Restore varBuf/argBuf from saved state
-            frame.varBuf = saved.varBuf
-            frame.bufArraysLive = true
-            frame.varCount = saved.varBuf.count
-            frame.argBuf = saved.argBuf
-            frame.argCount = saved.argBuf.count
-
-            // Copy saved stack into buf's value-stack region
-            for i in 0..<saved.stack.count {
-                if spBase + i < bufCapacity {
-                    buf[spBase + i] = saved.stack[i]
-                }
-            }
-            sp = spBase + saved.sp
-
-            // Sync restored frame arrays into buf
-            jeffJS_syncFrameToBuf(frame, buf, varBase)
-
-            // Re-attach the var-refs closures took on this generator's slots.
-            if !saved.capturedVarRefs.isEmpty {
-                for vr in saved.capturedVarRefs {
-                    guard vr.isDetached else { continue }
-                    let idx = Int(vr.varIdx)
-                    let slot: Int
-                    if vr.isArg {
-                        guard idx < varBase else { continue }
-                        slot = idx
-                    } else {
-                        slot = varBase + idx
-                    }
-                    guard slot >= 0, slot < bufCapacity else { continue }
-                    // A write through the detached ref while the generator was
-                    // suspended wins over the value restored from the saved
-                    // frame arrays; both hold a reference, so free the loser.
-                    buf[slot].freeValue()
-                    buf[slot] = vr.value
-                    vr.value = .undefined
-                    vr.isDetached = false
-                    vr.parentFrame = frame
-                    vr.slot = nil   // generator frames re-acquire their buffer
-                    frame.liveVarRefs.append(vr)
-                    frame.hasLiveVarRefs = true
-                }
-            }
 
             // Result object produced by advancing a `yield*` delegated
             // iterator (next/throw forwarded from the outer generator's
@@ -8330,19 +8314,11 @@ nonisolated struct JeffJSInterpreter {
                     }
                 } else {
                     retVal = resumeValue
-                    // Early exit: same teardown as the epilogue (detach captured
-                    // locals, return the frame to its pool).
-                    if frame.hasLiveVarRefs {
-                        jeffJS_syncForDetach(frame, buf, varBase)
-                        for vr in frame.liveVarRefs where !vr.isDetached {
-                            vr.value = vr.pvalue.dupValue()
-                            vr.isDetached = true
-                            vr.parentFrame = nil; vr.slot = nil
-                        }
-                    }
+                    // Early exit: the activation completes here, so retire its
+                    // frame as the epilogue would (closures get detached
+                    // copies; arguments, locals and stack values released).
                     ctx.currentFrame = frame.prevFrame
-                    if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
-                    rt.releaseFrameU(Unmanaged.passUnretained(frame))
+                    jeffJS_retireOwnFrame(rt, frame, buf, sp)
                     rt.inlineStackTop = inlineBase
                     return retVal
                 }
@@ -8415,19 +8391,15 @@ nonisolated struct JeffJSInterpreter {
                 case .park(let promise):
                     if let genObj = generatorObject.toObject(),
                        case .generatorData(let gd) = genObj.payload {
-                        var st = GeneratorSavedState(
-                            pc: saved.pc, sp: saved.sp, stack: saved.stack,
-                            varBuf: saved.varBuf, argBuf: saved.argBuf,
-                            funcObj: saved.funcObj, thisVal: saved.thisVal,
-                            capturedVarRefs: saved.capturedVarRefs)
+                        var st = jeffJS_suspendActivation(rt, frame, fb, buf, varBase, spBase, sp,
+                                                          pc: saved.pc, funcObj: saved.funcObj, thisVal: saved.thisVal)
                         st.delegatedIter = saved.delegatedIter
                         gd.savedState = st
                         gd.state = .suspended_yield_star
                         gd.awaitedPromise = promise
                         gd.delegateAwaitPending = true
+                        // Parked again on its own frame: nothing to release.
                         ctx.currentFrame = frame.prevFrame
-                        if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
-                        rt.releaseFrameU(Unmanaged.passUnretained(frame))
                         rt.inlineStackTop = inlineBase
                         return .undefined
                     }
@@ -8460,37 +8432,15 @@ nonisolated struct JeffJSInterpreter {
                         // More values — yield this one and re-suspend.
                         if let genObj = generatorObject.toObject(),
                            case .generatorData(let genData) = genObj.payload {
-                            jeffJS_syncBufToFrame(frame, buf, varBase)
-                            let stackCount = sp - spBase
-                            var savedStack = [JeffJSValue](repeating: .undefined, count: stackCount)
-                            for i in 0..<stackCount { savedStack[i] = buf[spBase + i]; buf[spBase + i] = .undefined }  // move: the saved state owns them now
-                            var newSaved = GeneratorSavedState(
-                                pc: pc,
-                                sp: stackCount,
-                                stack: savedStack,
-                                varBuf: frame.varBuf,
-                                argBuf: frame.argBuf,
-                                funcObj: mFuncObj,
-                                thisVal: thisVal,
-                                capturedVarRefs: frame.liveVarRefs)
+                            var newSaved = jeffJS_suspendActivation(rt, frame, fb, buf, varBase, spBase, sp,
+                                                                    pc: pc, funcObj: mFuncObj, thisVal: thisVal)
                             newSaved.delegatedIter = iter
                             genData.savedState = newSaved
                             genData.state = .suspended_yield_star
                         }
                         retVal = value
-                        // Early exit: same teardown as the epilogue (detach
-                        // captured locals, return the frame to its pool).
-                        if frame.hasLiveVarRefs {
-                            jeffJS_syncForDetach(frame, buf, varBase)
-                            for vr in frame.liveVarRefs where !vr.isDetached {
-                                vr.value = vr.pvalue.dupValue()
-                                vr.isDetached = true
-                                vr.parentFrame = nil; vr.slot = nil
-                            }
-                        }
+                        // Parked again on its own frame: nothing to release.
                         ctx.currentFrame = frame.prevFrame
-                        if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
-                        rt.releaseFrameU(Unmanaged.passUnretained(frame))
                         rt.inlineStackTop = inlineBase
                         return retVal
                     }
@@ -12231,25 +12181,15 @@ nonisolated struct JeffJSInterpreter {
                         for i in formalCount ..< varBase { buf[i].freeValue(); buf[i] = .undefined }
                     }
                     frame.argCount = formalCount
-                    // Sync buf → frame for saved state
-                    jeffJS_syncBufToFrame(frame, buf, varBase)
-                    // Save value-stack region
-                    let stackCount = sp - spBase
-                    var savedStack = [JeffJSValue](repeating: .undefined, count: stackCount)
-                    for i in 0..<stackCount { savedStack[i] = buf[spBase + i]; buf[spBase + i] = .undefined }  // move: the saved state owns them now
                     // The pc saved points to the instruction *after* initial_yield
                     // so that when we resume, we continue with the next opcode.
-                    genData.savedState = GeneratorSavedState(
-                        pc: pc + 1,
-                        sp: stackCount,
-                        stack: savedStack,
-                        varBuf: frame.varBuf,
-                        argBuf: frame.argBuf,
-                        funcObj: mFuncObj,
-                        thisVal: thisVal,
-                        isInitialYield: true,
-                        capturedVarRefs: frame.liveVarRefs)
+                    var st = jeffJS_suspendActivation(rt, frame, fb, buf, varBase, spBase, sp,
+                                                      pc: pc + 1, funcObj: mFuncObj, thisVal: thisVal)
+                    st.isInitialYield = true
+                    genData.savedState = st
                     genData.state = .suspended_start
+                    sp = spBase   // the value stack lives on in the parked frame
+                    suspendedHere = true
                 }
                 // Return undefined to the callFunction that initiated the generator.
                 // The caller (callFunction) returns the generator object, not this value.
@@ -12263,24 +12203,15 @@ nonisolated struct JeffJSInterpreter {
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 if let genObj = generatorObject.toObject(),
                    case .generatorData(let genData) = genObj.payload {
-                    // Sync buf → frame for saved state
-                    jeffJS_syncBufToFrame(frame, buf, varBase)
-                    // Save value-stack region as an array for GeneratorSavedState
-                    let stackCount = sp - spBase
-                    var savedStack = [JeffJSValue](repeating: .undefined, count: stackCount)
-                    for i in 0..<stackCount { savedStack[i] = buf[spBase + i]; buf[spBase + i] = .undefined }  // move: the saved state owns them now
-                    // Save state for resumption. pc + 1 points past the yield_
-                    // opcode so resumption continues with the next instruction.
-                    genData.savedState = GeneratorSavedState(
-                        pc: pc + 1,
-                        sp: stackCount,
-                        stack: savedStack,
-                        varBuf: frame.varBuf,
-                        argBuf: frame.argBuf,
-                        funcObj: mFuncObj,
-                        thisVal: thisVal,
-                        capturedVarRefs: frame.liveVarRefs)
+                    // Park the activation on its own frame (QuickJS: the
+                    // generator's JSAsyncFunctionState keeps sf alive; a
+                    // `yield` only records cur_pc / cur_sp). pc + 1 points past
+                    // the yield_ opcode so resumption continues after it.
+                    genData.savedState = jeffJS_suspendActivation(rt, frame, fb, buf, varBase, spBase, sp,
+                                                                  pc: pc + 1, funcObj: mFuncObj, thisVal: thisVal)
                     genData.state = .suspended_yield
+                    sp = spBase   // the value stack lives on in the parked frame
+                    suspendedHere = true
                 }
                 retVal = val
                 break dispatchLoop
@@ -12323,18 +12254,10 @@ nonisolated struct JeffJSInterpreter {
                             // Park the delegating generator on the delegate's
                             // pending result, keeping the delegation state; the
                             // driver resumes with the settled iterator result.
-                            jeffJS_syncBufToFrame(frame, buf, varBase)
-                            let stackCount = sp - spBase
-                            var savedStack = [JeffJSValue](repeating: .undefined, count: stackCount)
-                            for i in 0..<stackCount {
-                                savedStack[i] = buf[spBase + i]; buf[spBase + i] = .undefined
-                            }
-                            sp = spBase
-                            var st = GeneratorSavedState(
-                                pc: pc, sp: stackCount, stack: savedStack,
-                                varBuf: frame.varBuf, argBuf: frame.argBuf,
-                                funcObj: mFuncObj, thisVal: thisVal,
-                                capturedVarRefs: frame.liveVarRefs)
+                            var st = jeffJS_suspendActivation(rt, frame, fb, buf, varBase, spBase, sp,
+                                                              pc: pc, funcObj: mFuncObj, thisVal: thisVal)
+                            sp = spBase   // the value stack lives on in the parked frame
+                            suspendedHere = true
                             st.delegatedIter = iter
                             genData.savedState = st
                             genData.state = .suspended_yield_star
@@ -12360,19 +12283,11 @@ nonisolated struct JeffJSInterpreter {
                     } else {
                         // Yield this value and save state for lazy resumption.
                         // On resume, we'll continue iterating the inner iterator.
-                        jeffJS_syncBufToFrame(frame, buf, varBase)
-                        let stackCount = sp - spBase
-                        var savedStack = [JeffJSValue](repeating: .undefined, count: stackCount)
-                        for i in 0..<stackCount { savedStack[i] = buf[spBase + i]; buf[spBase + i] = .undefined }  // move: the saved state owns them now
-                        var saved = GeneratorSavedState(
-                            pc: pc,  // resume at this same yield_star opcode
-                            sp: stackCount,
-                            stack: savedStack,
-                            varBuf: frame.varBuf,
-                            argBuf: frame.argBuf,
-                            funcObj: mFuncObj,
-                            thisVal: thisVal,
-                            capturedVarRefs: frame.liveVarRefs)
+                        // Resume at this same yield_star opcode.
+                        var saved = jeffJS_suspendActivation(rt, frame, fb, buf, varBase, spBase, sp,
+                                                             pc: pc, funcObj: mFuncObj, thisVal: thisVal)
+                        sp = spBase   // the value stack lives on in the parked frame
+                        suspendedHere = true
                         saved.delegatedIter = iter
                         genData.savedState = saved
                         genData.state = .suspended_yield_star
@@ -12503,22 +12418,10 @@ nonisolated struct JeffJSInterpreter {
                         if fb.isGenerator, fb.isAsyncFunc,
                            let genObj = generatorObject.toObject(),
                            case .generatorData(let genData) = genObj.payload {
-                            jeffJS_syncBufToFrame(frame, buf, varBase)
-                            let stackCount = sp - spBase
-                            var savedStack = [JeffJSValue](repeating: .undefined, count: stackCount)
-                            for i in 0..<stackCount {
-                                savedStack[i] = buf[spBase + i]; buf[spBase + i] = .undefined
-                            }
-                            sp = spBase
-                            genData.savedState = GeneratorSavedState(
-                                pc: pc + 1,
-                                sp: stackCount,
-                                stack: savedStack,
-                                varBuf: frame.varBuf,
-                                argBuf: frame.argBuf,
-                                funcObj: mFuncObj,
-                                thisVal: thisVal,
-                                capturedVarRefs: frame.liveVarRefs)
+                            genData.savedState = jeffJS_suspendActivation(rt, frame, fb, buf, varBase, spBase, sp,
+                                                                          pc: pc + 1, funcObj: mFuncObj, thisVal: thisVal)
+                            sp = spBase   // the value stack lives on in the parked frame
+                            suspendedHere = true
                             genData.state = .suspended_yield
                             genData.awaitedPromise = val   // moves the popped reference in
                             retVal = .undefined
@@ -12557,16 +12460,6 @@ nonisolated struct JeffJSInterpreter {
                         // sp rewound): the frame epilogue below frees whatever is
                         // still on the stack, which used to free the temporaries
                         // the suspended state kept pointing at (`out.push(await p)`).
-                        let stackCount = sp - spBase
-                        var stackSnap = [JeffJSValue](repeating: .undefined, count: stackCount)
-                        for i in 0..<stackCount { stackSnap[i] = buf[spBase + i]; buf[spBase + i] = .undefined }
-                        sp = spBase
-                        var varSnap = [JeffJSValue]()
-                        for i in 0..<frame.varCount { varSnap.append(buf[varBase + i]) }
-                        var argSnap = [JeffJSValue]()
-                        for i in 0..<min(varBase, bufCapacity) { argSnap.append(buf[i]) }
-                        jeffJS_syncBufToFrame(frame, buf, varBase)
-
                         // The saved state OWNS the function object and `this`
                         // (QuickJS: async_func_init dups func_obj/this_obj into
                         // js_async_function_state). Nothing else keeps them alive
@@ -12574,12 +12467,11 @@ nonisolated struct JeffJSInterpreter {
                         // drops the caller's only reference as soon as the call
                         // returns the promise, so resuming touched a freed (and
                         // possibly pool-recycled) function object.
-                        let saved = GeneratorSavedState(
-                            pc: pc + 1, sp: stackCount,
-                            stack: stackSnap, varBuf: varSnap,
-                            argBuf: argSnap, funcObj: mFuncObj.dupValue(),
-                            thisVal: frame.thisVal.dupValue(),
-                            capturedVarRefs: frame.liveVarRefs)
+                        let saved = jeffJS_suspendActivation(rt, frame, fb, buf, varBase, spBase, sp,
+                                                             pc: pc + 1, funcObj: mFuncObj.dupValue(),
+                                                             thisVal: frame.thisVal.dupValue())
+                        sp = spBase   // the value stack lives on in the parked frame
+                        suspendedHere = true
 
                         // The awaited promise moves into the state too: its only
                         // reference may be the stack temporary popped above, and
@@ -13905,7 +13797,7 @@ nonisolated struct JeffJSInterpreter {
         // every local and argument of such a frame on this path).
         // Skipped entirely for the common case (no captures): the sync loops
         // and detach walk cost real time at 250k calls/sec.
-        if frame.hasLiveVarRefs {
+        if frame.hasLiveVarRefs, !suspendedHere {
             jeffJS_syncForDetach(frame, buf, varBase)
             jeffJS_detachFrameVarRefs(frame, rt)
         }
@@ -13976,9 +13868,21 @@ nonisolated struct JeffJSInterpreter {
         // Release the contiguous buffer to pool
         if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
 
-        // Return frame to pool for reuse (only if no live closures reference it,
-        // since closures have already been detached above and copied their values)
-        rt.releaseFrameU(Unmanaged.passUnretained(frame))
+        if suspendedHere {
+            // Parked: the generator / async state owns the frame and its
+            // buffer until it resumes or is dropped (releaseSuspendedFrame).
+        } else {
+            // A completed activation that had suspended before runs on its
+            // own heap buffer: give it back (QuickJS async_func_free).
+            if baseFrame.ownsBuf, let own = baseFrame.buf {
+                baseFrame.ownsBuf = false
+                baseFrame.buf = nil
+                own.deallocate()
+            }
+            // Return frame to pool for reuse (only if no live closures reference it,
+            // since closures have already been detached above and copied their values)
+            rt.releaseFrameU(Unmanaged.passUnretained(frame))
+        }
 
         // Abandon any inline frames left by an abrupt exit (uncatchable
         // interrupt termination) so the next activation starts clean.
@@ -14023,6 +13927,69 @@ nonisolated private func jeffJS_closeIteratorForUnwind(_ ctx: JeffJSContext, _ i
 nonisolated private func jeffJS_syncForDetach(_ frame: JeffJSStackFrame, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {
     if JeffJSRuntime.fastCallEntry, frame.buf != nil { return }
     jeffJS_syncBufToFrame(frame, buf, varBase)
+}
+
+/// QuickJS `async_func_init`: a suspending activation (generator `yield` /
+/// `initial_yield`, async `await`) moves its frame onto a heap buffer of its
+/// own, sized for the function, and keeps it for every later resumption.
+/// Arguments, locals and the value stack are moved (not copied: the pool
+/// buffer is released without releasing them), the var-refs closures hold on
+/// the frame are re-pointed at the new slots so they stay live across the
+/// suspension, and the frame itself stays out of the free list. An
+/// activation that already runs on its own buffer (a resumption) only
+/// records pc and sp. The value stack region `[spBase, sp)` lives on in the
+/// buffer: the caller sets `sp = spBase` so the epilogue does not release it.
+@inline(never)
+nonisolated private func jeffJS_suspendActivation(
+    _ rt: JeffJSRuntime, _ frame: JeffJSStackFrame, _ fb: JeffJSFunctionBytecode,
+    _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int, _ spBase: Int, _ sp: Int,
+    pc: Int, funcObj: JeffJSValue, thisVal: JeffJSValue) -> GeneratorSavedState {
+    let own: UnsafeMutablePointer<JeffJSValue>
+    let cap: Int
+    if frame.ownsBuf, let b = frame.buf {
+        own = b
+        cap = frame.bufCapacity
+    } else {
+        cap = max(spBase + max(Int(fb.stackSize), 4) + 32, sp)
+        own = UnsafeMutablePointer<JeffJSValue>.allocate(capacity: cap)
+        own.initialize(from: buf, count: sp)   // moves the references
+        var i = sp
+        while i < cap { own[i] = .undefined; i += 1 }
+        if frame.hasLiveVarRefs {
+            for vr in frame.liveVarRefs where !vr.isDetached {
+                if let s = vr.slot { vr.slot = own + (s - buf) }
+            }
+        }
+        frame.buf = own
+        frame.bufCapacity = cap
+        frame.ownsBuf = true
+    }
+    return GeneratorSavedState(pc: pc, sp: sp, buf: own, bufCapacity: cap, varBase: varBase, spBase: spBase,
+                               frame: Unmanaged.passUnretained(frame), funcObj: funcObj, thisVal: thisVal)
+}
+
+/// Retires a resumed activation's own frame from inside the dispatch (an
+/// early completion on resume): closures get detached copies, every
+/// argument, local and stack value `[0, sp)` is released, the buffer is
+/// deallocated and the frame returns to the pool (QuickJS `async_func_free`).
+@inline(never)
+nonisolated private func jeffJS_retireOwnFrame(_ rt: JeffJSRuntime, _ frame: JeffJSStackFrame,
+                                               _ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: Int) {
+    if frame.hasLiveVarRefs {
+        for vr in frame.liveVarRefs where !vr.isDetached {
+            vr.value = vr.pvalue.dupValue()
+            vr.isDetached = true
+            vr.parentFrame = nil; vr.slot = nil
+        }
+    }
+    var i = 0
+    while i < sp { buf[i].freeValue(); i += 1 }
+    if frame.ownsBuf {
+        frame.ownsBuf = false
+        frame.buf = nil
+        buf.deallocate()
+    }
+    rt.releaseFrameU(Unmanaged.passUnretained(frame))
 }
 
 nonisolated private func jeffJS_syncBufToFrame(_ frame: JeffJSStackFrame, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {

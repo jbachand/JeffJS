@@ -931,13 +931,18 @@ nonisolated func markObject(_ rt: JeffJSRuntime,
         // releases exactly these), and holds the var-refs its own closures
         // captured.
         if let saved = gd.savedState {
-            for v in saved.stack { if let c = v.toGCObjectHeader() { markFunc(rt, c) } }
-            for v in saved.varBuf { if let c = v.toGCObjectHeader() { markFunc(rt, c) } }
-            for v in saved.argBuf { if let c = v.toGCObjectHeader() { markFunc(rt, c) } }
+            // Its frame buffer: arguments, locals and the value stack
+            // (QuickJS `async_func_mark` walks sf->arg_buf ... sf->cur_sp).
+            var i = 0
+            while i < saved.sp {
+                if let c = saved.buf[i].toGCObjectHeader() { markFunc(rt, c) }
+                i += 1
+            }
             if let c = saved.delegatedIter.toGCObjectHeader() { markFunc(rt, c) }
             if let c = saved.thisVal.toGCObjectHeader() { markFunc(rt, c) }
             if let c = saved.funcObj.toGCObjectHeader() { markFunc(rt, c) }
-            for vr in saved.capturedVarRefs where vr.gcListIndex != -1 { markFunc(rt, vr) }
+            // The var-refs its closures hold stay live (they read the
+            // buffer), so they are not GC-list nodes while it is suspended.
         }
         for vr in gd.asyncState.frame.liveVarRefs where vr.gcListIndex != -1 { markFunc(rt, vr) }
     case .asyncFunctionData(let st):
