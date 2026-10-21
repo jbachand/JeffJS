@@ -1286,6 +1286,7 @@ thread's scratchpad: 14–8 000 cases each, identical output except where JSC's 
 | " | `jeffJS_concatStrings` appends in place into a flat left operand the caller owns every reference to (`ownedRefs`), as `js_concat_string` does | template-html / template-literals | 234 → 190 / 188 → 158 (43 / 34) |
 | perf/spread-entries | `Object.entries` / `Object.values` / `Object.assign` from the shape's key list and the property slots; `f(...arr)` through the frame's stack slots (no owned array) | for-in-entries / object-assign / rest-spread | 266 → 225 / 258 → 127 / 365 → 339 (85 / 72 / 113) |
 | " | one regex VM per pattern reused across execs; `[Symbol.split]` searches for the next match instead of a sticky probe per position (also fixes the split limit inside captures) | string-replace-regex / regex-tokenize | 230 → 113 / 60 → 52 (52 / 7) |
+| " | proxy trap keys from the atom's cached string; Map/Set records keep their key hash, string keys reuse the cached string hash | proxy-reactive / map-set | 188 → 182 / 156 → 150 (32 / 50): the rest of both is builtin call and callback overhead |
 | perf/polymorphic-ic | side lists per site (≤ 8 entries, slot-indexed, POD) for polymorphic receivers and prototype hits 2–3 levels up, gated by a per-entry state byte; cached getters run on the fused and method-receiver sites too | polymorphic-access / class-hierarchy | 110 → 93 / 344 → 314 (31 / 70) |
 
 Suite total 6488 → 4459 ms (3.7x → 2.55x QuickJS); `watch_deepmerge` 1407 → 1165 ms (QuickJS 520).
@@ -1300,7 +1301,8 @@ ordinary properties; `new Date(y, m, d, h)` on a DST transition day is an hour o
 `%TypedArray%.prototype.length` getter does not throw on a non-typed-array receiver; `Object.keys` of a typed array
 with extra keys.
 
-**Left on the docket:** class-hierarchy 4.5x (what remains is `instanceof` without a cache, constructor chains and
-`super` property reads), rest-spread 3.3x, for-in / Object.assign / entries 3.2–3.5x (per-entry array and object churn),
-large-object-keys 4.9x (`"key" + i` then `findAtom` per read), regex 8.4x, proxy 5.6x, map-set 3.4x; then the
-non-VM items (library-aware substitution, heap snapshots of pure modules, lane batching).
+**Left on the docket:** the architecture-sized items — the manual-memory core (issue #1, step 4 first), lazy frames
+(issue #1 step 2), vector string/JSON — and what they would move: class-hierarchy 4.5x (`instanceof`, constructor
+chains, `super` reads), rest-spread 3.0x, map-set / proxy (builtin call + callback overhead), large-object-keys
+(`"key" + i` then `findAtom` per read), regex-tokenize 7x (the matcher loop itself); then the non-VM items
+(library-aware substitution, heap snapshots of pure modules, lane batching), which need their CONTRIBUTING issues.
