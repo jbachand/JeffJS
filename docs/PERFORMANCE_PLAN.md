@@ -1284,8 +1284,9 @@ thread's scratchpad: 14–8 000 cases each, identical output except where JSC's 
 | " | `JSON.stringify` common call (no replacer/list/gap): one code-unit buffer, values from property slots in the shape's cached key order, strings quoted from code units (`JeffJSBuiltinJSONFast.swift`); typed arrays serialize their index keys | json-stringify | 357 → 163 (91) |
 | " | toFixed via libc `%.*f` unless an exact tie is possible; `Number::toString` over UTF-8 bytes; local zone offset memoised per UTC minute | date-number-format | 391 → 269 (91) |
 | " | `jeffJS_concatStrings` appends in place into a flat left operand the caller owns every reference to (`ownedRefs`), as `js_concat_string` does | template-html / template-literals | 234 → 190 / 188 → 158 (43 / 34) |
+| perf/polymorphic-ic | side lists per site (≤ 8 entries, slot-indexed, POD) for polymorphic receivers and prototype hits 2–3 levels up, gated by a per-entry state byte; cached getters run on the fused and method-receiver sites too | polymorphic-access / class-hierarchy | 110 → 93 / 344 → 314 (31 / 70) |
 
-Suite total 6488 → 4778 ms (3.7x → 2.7x QuickJS); `watch_deepmerge` 1407 → 1141 ms (QuickJS 520).
+Suite total 6488 → 4736 ms (3.7x → 2.7x QuickJS); `watch_deepmerge` 1407 → 1184 ms (QuickJS 520).
 
 **Measured dead ends.** PGO (`-profile-generate` → `-profile-use`): swiftc 6.2.4 aborts
 (`Assertion failed: (takenProbability >= 0), inferFromEdgeProfile at ColdBlockInfo.cpp:265`, EarlyPerfInliner on
@@ -1297,7 +1298,7 @@ ordinary properties; `new Date(y, m, d, h)` on a DST transition day is an hour o
 `%TypedArray%.prototype.length` getter does not throw on a non-typed-array receiver; `Object.keys` of a typed array
 with extra keys.
 
-**Left on the docket:** class-hierarchy 4.9x (polymorphic sites thrash the monomorphic IC; prototype entries are
-depth 1 only), rest-spread 3.3x, for-in / Object.assign / entries 3.2–3.5x (per-entry array and object churn),
+**Left on the docket:** class-hierarchy 4.5x (what remains is `instanceof` without a cache, constructor chains and
+`super` property reads), rest-spread 3.3x, for-in / Object.assign / entries 3.2–3.5x (per-entry array and object churn),
 large-object-keys 4.9x (`"key" + i` then `findAtom` per read), regex 8.4x, proxy 5.6x, map-set 3.4x; then the
 non-VM items (library-aware substitution, heap snapshots of pure modules, lane batching).
