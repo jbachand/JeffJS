@@ -38,8 +38,10 @@ nonisolated extension JeffJSContext {
         if rt.atomIsSymbol(atom), let sym = rt.symbolStringForAtom(atom) {
             return JeffJSValue.borrowedSymbol(sym).dupValue()
         }
-        if let name = rt.atomToString(atom) { return newStringValue(name) }
-        return .undefined
+        // The atom's own cached string (it carries the atom): the trap's
+        // `target[key]` then hits the keyed caches without re-interning. A
+        // fresh string from the Swift name was built per trap call before.
+        return atomToString(atom)
     }
 
     /// A Property Descriptor record (ES §6.2.6); present fields only. Values are owned.
