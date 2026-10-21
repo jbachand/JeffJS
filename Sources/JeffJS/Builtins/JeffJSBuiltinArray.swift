@@ -28,7 +28,7 @@ nonisolated struct JeffJSBuiltinArray {
         let arrayProto = ctx.arrayPrototype
 
         // Mutation methods
-        ctx.setPropertyFunc(obj: arrayProto, name: "push", fn: push, length: 1)
+        ctx.setPropertyFuncArgv(obj: arrayProto, name: "push", fn: { c, t, p, n in push(ctx: c, this: t, args: UnsafeBufferPointer(start: p, count: n)) }, length: 1)
         // Cache the push function object for the interpreter fast-path.
         // The object is looked up via the "push" atom on Array.prototype.
         let pushAtom = ctx.rt.findAtom("push")
@@ -36,7 +36,7 @@ nonisolated struct JeffJSBuiltinArray {
         ctx.arrayProtoPushObj = pushVal.toObject()
         ctx.arrayProtoPushVal = pushVal
         ctx.rt.freeAtom(pushAtom)
-        ctx.setPropertyFunc(obj: arrayProto, name: "pop", fn: pop, length: 0)
+        ctx.setPropertyFuncArgv(obj: arrayProto, name: "pop", fn: { c, t, p, n in pop(ctx: c, this: t, args: UnsafeBufferPointer(start: p, count: n)) }, length: 0)
         ctx.setPropertyFunc(obj: arrayProto, name: "shift", fn: shift, length: 0)
         ctx.setPropertyFunc(obj: arrayProto, name: "unshift", fn: unshift, length: 1)
         ctx.setPropertyFunc(obj: arrayProto, name: "splice", fn: splice, length: 2)
@@ -49,9 +49,9 @@ nonisolated struct JeffJSBuiltinArray {
         ctx.setPropertyFunc(obj: arrayProto, name: "concat", fn: concat, length: 1)
         ctx.setPropertyFunc(obj: arrayProto, name: "join", fn: join, length: 1)
         ctx.setPropertyFunc(obj: arrayProto, name: "slice", fn: slice, length: 2)
-        ctx.setPropertyFunc(obj: arrayProto, name: "indexOf", fn: indexOf, length: 1)
+        ctx.setPropertyFuncArgv(obj: arrayProto, name: "indexOf", fn: { c, t, p, n in indexOf(ctx: c, this: t, args: UnsafeBufferPointer(start: p, count: n)) }, length: 1)
         ctx.setPropertyFunc(obj: arrayProto, name: "lastIndexOf", fn: lastIndexOf, length: 1)
-        ctx.setPropertyFunc(obj: arrayProto, name: "includes", fn: includes, length: 1)
+        ctx.setPropertyFuncArgv(obj: arrayProto, name: "includes", fn: { c, t, p, n in includes(ctx: c, this: t, args: UnsafeBufferPointer(start: p, count: n)) }, length: 1)
         ctx.setPropertyFunc(obj: arrayProto, name: "flat", fn: flat, length: 0)
         ctx.setPropertyFunc(obj: arrayProto, name: "flatMap", fn: flatMap, length: 1)
 
@@ -101,7 +101,7 @@ nonisolated struct JeffJSBuiltinArray {
         let arrayCtor = ctx.newConstructorFunc(name: "Array", fn: arrayConstructor, length: 1, proto: arrayProto)
 
         // Static methods
-        ctx.setPropertyFunc(obj: arrayCtor, name: "isArray", fn: isArray, length: 1)
+        ctx.setPropertyFuncArgv(obj: arrayCtor, name: "isArray", fn: { c, t, p, n in isArray(ctx: c, this: t, args: UnsafeBufferPointer(start: p, count: n)) }, length: 1)
         ctx.setPropertyFunc(obj: arrayCtor, name: "from", fn: from, length: 1)
         ctx.setPropertyFunc(obj: arrayCtor, name: "of", fn: of_, length: 0)
 
@@ -160,7 +160,7 @@ nonisolated struct JeffJSBuiltinArray {
 
     /// `Array.isArray(arg)`
     /// Determines whether the passed value is an Array.
-    static func isArray(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+    static func isArray(ctx: JeffJSContext, this: JeffJSValue, args: UnsafeBufferPointer<JeffJSValue>) -> JeffJSValue {
         let arg = args.count > 0 ? args[0] : .undefined
         return ctx.isArray(arg) ? JeffJSValue.JS_TRUE : JeffJSValue.JS_FALSE
     }
@@ -383,7 +383,7 @@ nonisolated struct JeffJSBuiltinArray {
 
     /// `Array.prototype.push(...items)`
     /// Adds one or more elements to the end of an array and returns the new length.
-    static func push(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+    static func push(ctx: JeffJSContext, this: JeffJSValue, args: UnsafeBufferPointer<JeffJSValue>) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
         defer { ctx.freeValue(obj) }
@@ -409,7 +409,7 @@ nonisolated struct JeffJSBuiltinArray {
 
     /// `Array.prototype.pop()`
     /// Removes the last element from an array and returns that element.
-    static func pop(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+    static func pop(ctx: JeffJSContext, this: JeffJSValue, args: UnsafeBufferPointer<JeffJSValue>) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
         defer { ctx.freeValue(obj) }
@@ -1012,7 +1012,7 @@ nonisolated struct JeffJSBuiltinArray {
     /// `Array.prototype.indexOf(searchElement, fromIndex?)`
     /// Returns the first index at which a given element can be found.
     /// Uses Strict Equality Comparison (===) per ES spec.
-    static func indexOf(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+    static func indexOf(ctx: JeffJSContext, this: JeffJSValue, args: UnsafeBufferPointer<JeffJSValue>) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
         defer { ctx.freeValue(obj) }
@@ -1093,7 +1093,7 @@ nonisolated struct JeffJSBuiltinArray {
     /// `Array.prototype.includes(searchElement, fromIndex?)`
     /// Determines whether an array includes a certain value.
     /// Uses SameValueZero comparison (NaN === NaN, +0 === -0).
-    static func includes(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+    static func includes(ctx: JeffJSContext, this: JeffJSValue, args: UnsafeBufferPointer<JeffJSValue>) -> JeffJSValue {
         let obj = ctx.toObject(this)
         if obj.isException { return obj }
         defer { ctx.freeValue(obj) }
@@ -2176,10 +2176,20 @@ nonisolated struct JeffJSBuiltinArray {
         // Numbers: both int and float representations are JS "number" type.
         // Try numeric comparison first (handles int vs float cross-tag).
         // Use IEEE comparison so NaN !== NaN.
+        if a.isInt && b.isInt { return a.toInt32() == b.toInt32() }
         if a.isNumber && b.isNumber {
             guard let da = ctx.extractFloat64(a), let db = ctx.extractFloat64(b) else { return false }
             return da == db  // IEEE: NaN != NaN, +0 == -0
         }
+        // Objects: reference identity (the common indexOf case after ints).
+        if a.isObject && b.isObject { return a.bits == b.bits }   // same pointer
+        return strictEqualSlow(ctx: ctx, a, b)
+    }
+
+    /// The BigInt and string arms, out of line: inlined into the per-element
+    /// loop of indexOf they gave it a frame the stack probe had to walk.
+    @inline(never)
+    private static func strictEqualSlow(ctx: JeffJSContext, _ a: JeffJSValue, _ b: JeffJSValue) -> Bool {
         if a.isBigInt || b.isBigInt {
             return a.isBigInt && b.isBigInt && JeffJSBigIntOps.equal(a, b)
         }

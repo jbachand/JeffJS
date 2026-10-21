@@ -306,6 +306,8 @@ nonisolated func jeffJS_traceThisKeyedGet(_ ents: UnsafeMutablePointer<JeffJSICE
 nonisolated func jeffJS_nativeCallFromSlots(_ ctx: JeffJSContext, _ rt: JeffJSRuntime, _ cf: JSCFunctionType,
                                 _ thisVal: JeffJSValue, _ argp: UnsafeMutablePointer<JeffJSValue>,
                                 _ argc: Int, _ magic: Int) -> JeffJSValue {
+    // The argv ABI takes the stack slots as they are.
+    if case .argv(let fn) = cf { return fn(ctx, thisVal, argc == 0 ? nil : UnsafePointer(argp), argc) }
     // interp.leanNativeArgs: one reused array per argument count (1–4),
     // written in place; no arguments = the shared empty array. A nested
     // native call with the same count finds the slot empty and allocates.
@@ -665,6 +667,7 @@ nonisolated extension JeffJSContext {
                                   _ thisVal: JeffJSValue, _ args: [JeffJSValue], _ magic: Int) -> JeffJSValue {
         switch cFunction {
         case .generic(let fn): return fn(ctx, thisVal, args)
+        case .argv(let fn): return args.withUnsafeBufferPointer { fn(ctx, thisVal, $0.baseAddress, $0.count) }
         case .genericMagic(let fn): return fn(ctx, thisVal, args, magic)
         case .constructor(let fn): return fn(ctx, thisVal, args)
         case .constructorOrFunc(let fn): return fn(ctx, thisVal, args, false)
@@ -839,6 +842,8 @@ nonisolated extension JeffJSContext {
             switch cFunction {
             case .generic(let fn):
                 return fn(self, thisVal, args)
+            case .argv(let fn):
+                return args.withUnsafeBufferPointer { fn(self, thisVal, $0.baseAddress, $0.count) }
             case .genericMagic(let fn):
                 return fn(self, thisVal, args, Int(magic))
             case .constructor(let fn):
@@ -8002,6 +8007,7 @@ nonisolated struct JeffJSInterpreter {
             if case .cFunc(_, let cFunction, _, _, let magic) = obj.payload {
                 switch cFunction {
                 case .generic(let fn): return fn(ctx, thisVal, args)
+                case .argv(let fn): return fn(ctx, thisVal, argc == 0 ? nil : argv, argc)
                 case .genericMagic(let fn): return fn(ctx, thisVal, args, Int(magic))
                 case .constructor(let fn): return fn(ctx, thisVal, args)
                 case .constructorOrFunc(let fn): return fn(ctx, thisVal, args, false)

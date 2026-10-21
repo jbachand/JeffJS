@@ -1075,6 +1075,12 @@ nonisolated struct JeffJSPropertyFlags: OptionSet {
 /// Mirrors QuickJS `JSCFunctionType`.
 nonisolated enum JSCFunctionType {
     case generic( (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue )
+    /// QuickJS's own ABI: `(ctx, this_val, argc, argv)`. The arguments are the
+    /// caller's VM stack slots (borrowed, `argv[0 ..< argc]`, nil only when
+    /// argc == 0): no `[JeffJSValue]` is built, moved or released per call.
+    /// Hot builtins use it (perf/native-method-slots, 2026-10-20); the
+    /// `.generic` array form stays for everything else.
+    case argv( (JeffJSContext, JeffJSValue, UnsafePointer<JeffJSValue>?, Int) -> JeffJSValue )
     case genericMagic( (JeffJSContext, JeffJSValue, [JeffJSValue], Int) -> JeffJSValue )
     case constructor( (JeffJSContext, JeffJSValue, [JeffJSValue]) -> JeffJSValue )
     case constructorOrFunc( (JeffJSContext, JeffJSValue, [JeffJSValue], Bool) -> JeffJSValue )

@@ -1158,12 +1158,26 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         name: String,
         length: Int
     ) -> JeffJSValue {
+        newCFunctionObject(.generic(function), name: name, length: length)
+    }
+
+    /// `newCFunction` for a builtin over the argument slots (see
+    /// `JSCFunctionType.argv`).
+    func newCFunctionArgv(
+        _ function: @escaping JeffJSNativeArgvFunc,
+        name: String,
+        length: Int
+    ) -> JeffJSValue {
+        newCFunctionObject(.argv(function), name: name, length: length)
+    }
+
+    private func newCFunctionObject(_ cFunction: JSCFunctionType, name: String, length: Int) -> JeffJSValue {
         let obj = JeffJSObject()
         obj.classID = JSClassID.JS_CLASS_C_FUNCTION.rawValue
         obj.extensible = true
         obj.payload = .cFunc(
             realm: self,
-            cFunction: .generic(function),
+            cFunction: cFunction,
             length: UInt8(min(length, Int(UInt8.max))),
             cproto: UInt8(JS_CFUNC_GENERIC),
             magic: 0
@@ -2243,6 +2257,12 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     ///
     /// - Parameter val: The value to convert.
     /// - Returns: The Double result, or nil on exception.
+    /// The numeric cases inline; everything else (strings, objects) goes
+    /// through the out-of-line slow path, so a builtin's hot call (Math.abs
+    /// on a number) does not carry the string branch's frame: the inlined
+    /// `trimmingCharacters` / `Double(String)` made every caller probe a
+    /// multi-KB stack frame (`___chkstk_darwin` on the native-call profile).
+    @inline(__always)
     func toFloat64(_ val: JeffJSValue) -> Double? {
         if val.isFloat64 {
             return val.toFloat64()
@@ -2250,6 +2270,71 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         if val.isInt {
             return Double(val.toInt32())
         }
+        return toFloat64Slow(val)
+    }
+
+    /// ToNumber for a Math argument (QuickJS `JS_ToFloat64` as the Math
+    /// builtins use it): a BigInt or a symbol throws (JSC's wording) and an
+    /// exception from an object's valueOf stays pending; nil = exception.
+    @inline(__always)
+    func mathArg(_ val: JeffJSValue) -> Double? {
+        if val.isInt { return Double(val.toInt32()) }
+        if val.isFloat64 { return val.toFloat64() }
+        return mathArgSlow(val)
+    }
+
+    @inline(never)
+    func mathArgSlow(_ val: JeffJSValue) -> Double? {
+        if val.isBigInt {
+            _ = throwTypeError(message: "Cannot convert a BigInt value to a number")
+            return nil
+        }
+        if val.isSymbol {
+            _ = throwTypeError(message: "Cannot convert a symbol to a number")
+            return nil
+        }
+        if val.isObject {
+            let prim = toPrimitive(val, preferredType: "number")
+            if prim.isException { return nil }
+            defer { prim.freeValue() }
+            return mathArg(prim)
+        }
+        return toFloat64Slow(val)
+    }
+
+    /// QuickJS `js_math_round`: round half toward +∞ on the bit pattern
+    /// (`floor(x + 0.5)` is wrong for 0.49999999999999994 and for the
+    /// half-way cases above 2^52), -0 for (-0.5, 0).
+    static func jsMathRound(_ a: Double) -> Double {
+        var u = a.bitPattern
+        let e = Int((u >> 52) & 0x7ff)
+        if e < 1023 {
+            // |a| < 1
+            if e == 1023 - 1 && u != 0xbfe0_0000_0000_0000 {
+                // 0.5 <= |a| < 1 and a != -0.5 → ±1
+                u = (u & (UInt64(1) << 63)) | (UInt64(1023) << 52)
+            } else {
+                u &= UInt64(1) << 63   // ±0
+            }
+        } else if e < 1023 + 52 {
+            let s = u >> 63
+            let one = UInt64(1) << UInt64(1023 + 52 - e)
+            let fracMask = one - 1
+            u = u &+ ((one >> 1) &- s)
+            u &= ~fracMask
+        }
+        return Double(bitPattern: u)
+    }
+
+    /// QuickJS `js_pow`: ES Number::exponentiate — `±1 ** ±Infinity` is NaN
+    /// (C pow gives 1).
+    static func jsMathPow(_ a: Double, _ b: Double) -> Double {
+        if b.isInfinite && Swift.abs(a) == 1 { return Double.nan }
+        return Foundation.pow(a, b)
+    }
+
+    @inline(never)
+    func toFloat64Slow(_ val: JeffJSValue) -> Double? {
         if val.isBool {
             return val.toBool() ? 1.0 : 0.0
         }
@@ -2570,18 +2655,16 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         funcProtoVal.freeValue()  // Release the local variable's reference (5 dupValue'd copies own theirs)
 
         // --- Object constructor ---
-        let objectCtor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let objectCtor = newCFunction({ ctx, thisVal, args in
             if args.isEmpty || args[0].isNullOrUndefined {
-                return self.newObject()
+                return ctx.newObject()
             }
-            return self.toObject(args[0])
+            return ctx.toObject(args[0])
         }, name: "Object", length: 1)
         _ = setPropertyStr(obj: globalObj, name: "Object", value: objectCtor.dupValue())
 
         // --- Function constructor ---
-        functionCtor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        functionCtor = newCFunction({ ctx, thisVal, args in
             // ES spec: new Function(p1, p2, ..., pN, body)
             // Last argument is the body, all preceding are parameter names.
             // With zero args: new Function() => empty function.
@@ -2592,20 +2675,20 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 body = ""
             } else if args.count == 1 {
                 // Single argument is the body
-                guard let bodyStr = self.toSwiftString(args[0]) else {
-                    return self.throwTypeError(message: "Function body must be a string")
+                guard let bodyStr = ctx.toSwiftString(args[0]) else {
+                    return ctx.throwTypeError(message: "Function body must be a string")
                 }
                 body = bodyStr
             } else {
                 // Last arg is body, rest are parameter names
                 for i in 0..<(args.count - 1) {
-                    guard let paramStr = self.toSwiftString(args[i]) else {
-                        return self.throwTypeError(message: "Function parameter name must be a string")
+                    guard let paramStr = ctx.toSwiftString(args[i]) else {
+                        return ctx.throwTypeError(message: "Function parameter name must be a string")
                     }
                     params.append(paramStr)
                 }
-                guard let bodyStr = self.toSwiftString(args[args.count - 1]) else {
-                    return self.throwTypeError(message: "Function body must be a string")
+                guard let bodyStr = ctx.toSwiftString(args[args.count - 1]) else {
+                    return ctx.throwTypeError(message: "Function body must be a string")
                 }
                 body = bodyStr
             }
@@ -2614,7 +2697,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             // Byte-for-byte the header QuickJS synthesizes, so the result's
             // `toString()` reads `function anonymous(a\n) {\n<body>\n}`.
             let source = "(function anonymous(\(paramList)\n) {\n\(body)\n})"
-            let result = self.eval(input: source, filename: "<Function>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+            let result = ctx.eval(input: source, filename: "<Function>", evalFlags: JS_EVAL_TYPE_GLOBAL)
             return result
         }, name: "Function", length: 1)
         if let funcCtorObj = functionCtor.toObject() {
@@ -2647,9 +2730,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         addBigIntIntrinsic()
 
         // --- ThrowTypeError function (used in strict arguments, etc.) ---
-        throwTypeError = newCFunction({ [weak self] ctx, thisVal, args in
-            return self?.throwTypeError(message: "'caller', 'callee', and 'arguments' properties "
-                + "may not be accessed on strict mode functions") ?? .exception
+        throwTypeError = newCFunction({ ctx, thisVal, args in
+            return ctx.throwTypeError(message: "'caller', 'callee', and 'arguments' properties "
+                + "may not be accessed on strict mode functions")
         }, name: "", length: 0)
 
         // --- Wire the global object's [[Prototype]] to Object.prototype ---
@@ -2679,20 +2762,18 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
 
         // Wire up the compileRegexp closure so that the `regexp` opcode
         // (and `new RegExp(...)` from JS) can create real RegExp objects.
-        compileRegexp = { [weak self] (ctx: JeffJSContext, patternVal: JeffJSValue, flagsVal: JeffJSValue) -> JeffJSValue in
-            guard let self = self else { return .exception }
-            return js_regexp_constructor(ctx: self,
-                                         newTarget: self.regexpCtor,
+        compileRegexp = { (ctx: JeffJSContext, patternVal: JeffJSValue, flagsVal: JeffJSValue) -> JeffJSValue in
+            return js_regexp_constructor(ctx: ctx,
+                                         newTarget: ctx.regexpCtor,
                                          this: .JS_UNDEFINED,
                                          argv: [patternVal, flagsVal])
         }
 
-        regexpCtor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        regexpCtor = newCFunction({ ctx, thisVal, args in
             let pattern = args.count >= 1 ? args[0] : .JS_UNDEFINED
             let flags = args.count >= 2 ? args[1] : .JS_UNDEFINED
-            return js_regexp_constructor(ctx: self,
-                                         newTarget: self.regexpCtor,
+            return js_regexp_constructor(ctx: ctx,
+                                         newTarget: ctx.regexpCtor,
                                          this: thisVal,
                                          argv: [pattern, flags])
         }, name: "RegExp", length: 2)
@@ -2716,17 +2797,17 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         let jsonObj = newObject()
 
         // JSON.parse
-        let parseFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, !args.isEmpty else { return .JS_UNDEFINED }
-            guard let text = self.toSwiftString(args[0]) else { return .exception }
-            return self.jsonParse(text: text)
+        let parseFunc = newCFunction({ ctx, thisVal, args in
+            guard !args.isEmpty else { return .JS_UNDEFINED }
+            guard let text = ctx.toSwiftString(args[0]) else { return .exception }
+            return ctx.jsonParse(text: text)
         }, name: "parse", length: 2)
         _ = setPropertyStr(obj: jsonObj, name: "parse", value: parseFunc)
 
         // JSON.stringify
-        let stringifyFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, !args.isEmpty else { return .JS_UNDEFINED }
-            return self.jsonStringify(value: args[0],
+        let stringifyFunc = newCFunction({ ctx, thisVal, args in
+            guard !args.isEmpty else { return .JS_UNDEFINED }
+            return ctx.jsonStringify(value: args[0],
                                       replacer: args.count > 1 ? args[1] : .JS_UNDEFINED,
                                       space: args.count > 2 ? args[2] : .JS_UNDEFINED)
         }, name: "stringify", length: 3)
@@ -2749,23 +2830,22 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         proxyCtorObj.isConstructor = true
         proxyCtorObj.payload = .cFunc(
             realm: self,
-            cFunction: .constructorOrFunc({ [weak self] ctx, thisVal, args, isNew in
-                guard let self = self else { return .exception }
+            cFunction: .constructorOrFunc({ ctx, thisVal, args, isNew in
                 guard isNew else {
-                    return self.throwTypeError(message: "Constructor Proxy requires 'new'")
+                    return ctx.throwTypeError(message: "Constructor Proxy requires 'new'")
                 }
                 guard args.count >= 2 else {
-                    return self.throwTypeError(message: "Cannot create proxy with a non-object as target or handler")
+                    return ctx.throwTypeError(message: "Cannot create proxy with a non-object as target or handler")
                 }
                 let target = args[0]
                 let handler = args[1]
                 guard target.isObject else {
-                    return self.throwTypeError(message: "Cannot create proxy with a non-object as target or handler")
+                    return ctx.throwTypeError(message: "Cannot create proxy with a non-object as target or handler")
                 }
                 guard handler.isObject else {
-                    return self.throwTypeError(message: "Cannot create proxy with a non-object as target or handler")
+                    return ctx.throwTypeError(message: "Cannot create proxy with a non-object as target or handler")
                 }
-                return self.createProxyObject(target: target, handler: handler)
+                return ctx.createProxyObject(target: target, handler: handler)
             }),
             length: 2,
             cproto: UInt8(JS_CFUNC_CONSTRUCTOR_OR_FUNC),
@@ -2784,20 +2864,19 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         _ = definePropertyValue(obj: proxyCtor, atom: JeffJSAtomID.JS_ATOM_length.rawValue, value: .newInt32(2), flags: JS_PROP_CONFIGURABLE)
 
         // Proxy.revocable(target, handler) -- static method
-        let revocableFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let revocableFunc = newCFunction({ ctx, thisVal, args in
             guard args.count >= 2 else {
-                return self.throwTypeError(message: "Proxy.revocable requires target and handler")
+                return ctx.throwTypeError(message: "Proxy.revocable requires target and handler")
             }
             let target = args[0]
             let handler = args[1]
             guard target.isObject else {
-                return self.throwTypeError(message: "Cannot create proxy with a non-object as target or handler")
+                return ctx.throwTypeError(message: "Cannot create proxy with a non-object as target or handler")
             }
             guard handler.isObject else {
-                return self.throwTypeError(message: "Cannot create proxy with a non-object as target or handler")
+                return ctx.throwTypeError(message: "Cannot create proxy with a non-object as target or handler")
             }
-            let proxyVal = self.createProxyObject(target: target, handler: handler)
+            let proxyVal = ctx.createProxyObject(target: target, handler: handler)
             if proxyVal.isException { return proxyVal }
 
             // Create revoke function that captures the proxy
@@ -2810,13 +2889,12 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             // `'x' in revokedProxy` answered `false` instead of throwing.
             // This weak box is how the body reaches its own function object.
             let revokeSelf = JeffJSWeakObjectBox()
-            let revokeFunc = self.newCFunction({ [weak self] ctx, thisVal, revokeArgs in
-                guard let self = self else { return .JS_UNDEFINED }
+            let revokeFunc = ctx.newCFunction({ ctx, thisVal, revokeArgs in
                 guard let fnObj = revokeSelf.obj else { return .JS_UNDEFINED }
                 let fnVal = JeffJSValue.borrowedObject(fnObj)
-                let proxyRefAtom = self.rt.findAtom("__proxyRef__")
-                let proxyRef = self.getPropertyInternal(obj: fnVal, atom: proxyRefAtom, receiver: fnVal)
-                self.rt.freeAtom(proxyRefAtom)
+                let proxyRefAtom = ctx.rt.findAtom("__proxyRef__")
+                let proxyRef = ctx.getPropertyInternal(obj: fnVal, atom: proxyRefAtom, receiver: fnVal)
+                ctx.rt.freeAtom(proxyRefAtom)
                 defer { proxyRef.freeValue() }
                 guard let proxyObj = proxyRef.toObject(),
                       proxyObj.classID == JeffJSClassID.proxy.rawValue || proxyObj.classID == JSClassID.JS_CLASS_PROXY.rawValue,
@@ -2838,14 +2916,14 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             revokeSelf.obj = revokeFunc.toObject()
 
             // Store the proxy reference on the revoke function
-            let proxyRefAtom = self.rt.findAtom("__proxyRef__")
-            _ = self.setPropertyInternal(obj: revokeFunc, atom: proxyRefAtom, value: proxyVal.dupValue(), flags: 0)
-            self.rt.freeAtom(proxyRefAtom)
+            let proxyRefAtom = ctx.rt.findAtom("__proxyRef__")
+            _ = ctx.setPropertyInternal(obj: revokeFunc, atom: proxyRefAtom, value: proxyVal.dupValue(), flags: 0)
+            ctx.rt.freeAtom(proxyRefAtom)
 
             // Build result: { proxy, revoke }
-            let resultObj = self.newObject()
-            _ = self.setPropertyStr(obj: resultObj, name: "proxy", value: proxyVal)
-            _ = self.setPropertyStr(obj: resultObj, name: "revoke", value: revokeFunc)
+            let resultObj = ctx.newObject()
+            _ = ctx.setPropertyStr(obj: resultObj, name: "proxy", value: proxyVal)
+            _ = ctx.setPropertyStr(obj: resultObj, name: "revoke", value: revokeFunc)
             return resultObj
         }, name: "revocable", length: 2)
         _ = setPropertyStr(obj: proxyCtor, name: "revocable", value: revocableFunc)
@@ -2908,9 +2986,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // Map
         let mapProto = newObjectClass(classID: JSClassID.JS_CLASS_OBJECT.rawValue)
         classProto[JSClassID.JS_CLASS_MAP.rawValue] = mapProto
-        let mapCtor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return self.newMapOrSetObject(classID: JSClassID.JS_CLASS_MAP.rawValue, isWeak: false)
+        let mapCtor = newCFunction({ ctx, thisVal, args in
+            return ctx.newMapOrSetObject(classID: JSClassID.JS_CLASS_MAP.rawValue, isWeak: false)
         }, name: "Map", length: 0)
         // Wire Map.prototype <-> Map constructor
         defineIntrinsicPrototypeLink(ctor: mapCtor, proto: mapProto)
@@ -2919,9 +2996,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // Set
         let setProto = newObjectClass(classID: JSClassID.JS_CLASS_OBJECT.rawValue)
         classProto[JSClassID.JS_CLASS_SET.rawValue] = setProto
-        let setCtor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return self.newMapOrSetObject(classID: JSClassID.JS_CLASS_SET.rawValue, isWeak: false)
+        let setCtor = newCFunction({ ctx, thisVal, args in
+            return ctx.newMapOrSetObject(classID: JSClassID.JS_CLASS_SET.rawValue, isWeak: false)
         }, name: "Set", length: 0)
         // Wire Set.prototype <-> Set constructor
         defineIntrinsicPrototypeLink(ctor: setCtor, proto: setProto)
@@ -2930,9 +3006,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // WeakMap
         let weakMapProto = newObjectClass(classID: JSClassID.JS_CLASS_OBJECT.rawValue)
         classProto[JSClassID.JS_CLASS_WEAKMAP.rawValue] = weakMapProto
-        let weakMapCtor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return self.newMapOrSetObject(classID: JSClassID.JS_CLASS_WEAKMAP.rawValue, isWeak: true)
+        let weakMapCtor = newCFunction({ ctx, thisVal, args in
+            return ctx.newMapOrSetObject(classID: JSClassID.JS_CLASS_WEAKMAP.rawValue, isWeak: true)
         }, name: "WeakMap", length: 0)
         // Wire WeakMap.prototype <-> WeakMap constructor
         defineIntrinsicPrototypeLink(ctor: weakMapCtor, proto: weakMapProto)
@@ -2941,9 +3016,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // WeakSet
         let weakSetProto = newObjectClass(classID: JSClassID.JS_CLASS_OBJECT.rawValue)
         classProto[JSClassID.JS_CLASS_WEAKSET.rawValue] = weakSetProto
-        let weakSetCtor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return self.newMapOrSetObject(classID: JSClassID.JS_CLASS_WEAKSET.rawValue, isWeak: true)
+        let weakSetCtor = newCFunction({ ctx, thisVal, args in
+            return ctx.newMapOrSetObject(classID: JSClassID.JS_CLASS_WEAKSET.rawValue, isWeak: true)
         }, name: "WeakSet", length: 0)
         // Wire WeakSet.prototype <-> WeakSet constructor
         defineIntrinsicPrototypeLink(ctor: weakSetCtor, proto: weakSetProto)
@@ -2980,18 +3054,16 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         let abProto = newObjectClass(classID: JSClassID.JS_CLASS_OBJECT.rawValue)
         classProto[JSClassID.JS_CLASS_ARRAY_BUFFER.rawValue] = abProto
 
-        let abCtor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return jsArrayBuffer_constructor(self, thisVal, args)
+        let abCtor = newCFunction({ ctx, thisVal, args in
+            return jsArrayBuffer_constructor(ctx, thisVal, args)
         }, name: "ArrayBuffer", length: 1)
         defineIntrinsicPrototype(ctor: abCtor, proto: abProto)
         _ = definePropertyValue(obj: abProto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
                                 value: abCtor.dupValue(), flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
 
         // ArrayBuffer.isView(arg) — static method
-        let abIsViewFn = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return jsArrayBuffer_isView(self, thisVal, args)
+        let abIsViewFn = newCFunction({ ctx, thisVal, args in
+            return jsArrayBuffer_isView(ctx, thisVal, args)
         }, name: "isView", length: 1)
         _ = setPropertyStr(obj: abCtor, name: "isView", value: abIsViewFn)
 
@@ -3036,9 +3108,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         let sabProto = newObjectClass(classID: JSClassID.JS_CLASS_OBJECT.rawValue)
         classProto[JSClassID.JS_CLASS_SHARED_ARRAY_BUFFER.rawValue] = sabProto
 
-        let sabCtor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return jsSharedArrayBuffer_constructor(self, thisVal, args)
+        let sabCtor = newCFunction({ ctx, thisVal, args in
+            return jsSharedArrayBuffer_constructor(ctx, thisVal, args)
         }, name: "SharedArrayBuffer", length: 1)
         defineIntrinsicPrototype(ctor: sabCtor, proto: sabProto)
         _ = definePropertyValue(obj: sabProto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
@@ -3068,9 +3139,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         let dvProto = newObjectClass(classID: JSClassID.JS_CLASS_OBJECT.rawValue)
         classProto[JSClassID.JS_CLASS_DATAVIEW.rawValue] = dvProto
 
-        let dvCtor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return jsDataView_constructor(self, thisVal, args)
+        let dvCtor = newCFunction({ ctx, thisVal, args in
+            return jsDataView_constructor(ctx, thisVal, args)
         }, name: "DataView", length: 1)
         defineIntrinsicPrototype(ctor: dvCtor, proto: dvProto)
         _ = definePropertyValue(obj: dvProto, atom: JeffJSAtomID.JS_ATOM_constructor.rawValue,
@@ -3257,9 +3327,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             classProto[jsClassID.rawValue] = proto
 
             let capturedJeffClassID = jeffClassID
-            let ctor = newCFunction({ [weak self] ctx, thisVal, args in
-                guard let self = self else { return .exception }
-                return jsTypedArray_constructor(self, thisVal, args, classID: capturedJeffClassID)
+            let ctor = newCFunction({ ctx, thisVal, args in
+                return jsTypedArray_constructor(ctx, thisVal, args, classID: capturedJeffClassID)
             }, name: name, length: 3)
             // Float32Array.__proto__ === %TypedArray%
             setPrototypeOf(ctor, proto: taCtor)
@@ -3294,12 +3363,11 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         let promiseProto = newObjectClass(classID: JSClassID.JS_CLASS_OBJECT.rawValue)
         classProto[JSClassID.JS_CLASS_PROMISE.rawValue] = promiseProto
 
-        promiseCtor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        promiseCtor = newCFunction({ ctx, thisVal, args in
             guard !args.isEmpty && args[0].isObject else {
-                return self.throwTypeError(message: "Promise resolver is not a function")
+                return ctx.throwTypeError(message: "Promise resolver is not a function")
             }
-            let promiseObj = self.newObjectClass(classID: JSClassID.JS_CLASS_PROMISE.rawValue)
+            let promiseObj = ctx.newObjectClass(classID: JSClassID.JS_CLASS_PROMISE.rawValue)
             // In a full implementation, would set up resolve/reject callbacks
             // and call the executor
             return promiseObj
@@ -3326,16 +3394,14 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         _ = setPropertyStr(obj: promiseProto, name: "finally", value: finallyFunc)
 
         // Promise.resolve, Promise.reject, Promise.all, Promise.race, etc.
-        let resolveFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            let promise = self.newObjectClass(classID: JSClassID.JS_CLASS_PROMISE.rawValue)
+        let resolveFunc = newCFunction({ ctx, thisVal, args in
+            let promise = ctx.newObjectClass(classID: JSClassID.JS_CLASS_PROMISE.rawValue)
             return promise
         }, name: "resolve", length: 1)
         _ = setPropertyStr(obj: promiseCtor, name: "resolve", value: resolveFunc)
 
-        let rejectFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            let promise = self.newObjectClass(classID: JSClassID.JS_CLASS_PROMISE.rawValue)
+        let rejectFunc = newCFunction({ ctx, thisVal, args in
+            let promise = ctx.newObjectClass(classID: JSClassID.JS_CLASS_PROMISE.rawValue)
             return promise
         }, name: "reject", length: 1)
         _ = setPropertyStr(obj: promiseCtor, name: "reject", value: rejectFunc)
@@ -3380,8 +3446,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// Adds the eval() function.
     /// Mirrors `JS_AddIntrinsicEval()` from QuickJS.
     func addIntrinsicEval() {
-        evalObj = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, !args.isEmpty else { return .JS_UNDEFINED }
+        evalObj = newCFunction({ ctx, thisVal, args in
+            guard !args.isEmpty else { return .JS_UNDEFINED }
             guard args[0].isString else {
                 // If the argument is not a string, return it unchanged (per spec)
                 return args[0].dupValue()
@@ -3389,7 +3455,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             guard let code = args[0].stringValue?.toSwiftString() else { return .JS_UNDEFINED }
             // Indirect eval (ES §19.2.1.1 PerformEval, direct = false): global scope,
             // but eval code — its `var`s and functions are configurable.
-            return self.eval(input: code, filename: "<eval>", evalFlags: JS_EVAL_TYPE_INDIRECT)
+            return ctx.eval(input: code, filename: "<eval>", evalFlags: JS_EVAL_TYPE_INDIRECT)
         }, name: "eval", length: 1)
         _ = setPropertyStr(obj: globalObj, name: "eval", value: evalObj.dupValue())
 
@@ -3775,47 +3841,45 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
 
     private func addObjectProtoMethods(_ proto: JeffJSValue) {
         // Object.prototype.toString
-        let toStringFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let toStringFunc = newCFunction({ ctx, thisVal, args in
             if thisVal.isNull {
-                return self.newStringValue("[object Null]")
+                return ctx.newStringValue("[object Null]")
             }
             if thisVal.isUndefined {
-                return self.newStringValue("[object Undefined]")
+                return ctx.newStringValue("[object Undefined]")
             }
             // For objects, get the class name
             if let obj = thisVal.toObject() {
                 let classID = obj.classID
-                if classID < self.rt.classCount {
-                    let nameAtom = self.rt.classArray[classID].classNameAtom
-                    if let name = self.rt.atomToString(nameAtom) {
-                        return self.newStringValue("[object \(name)]")
+                if classID < ctx.rt.classCount {
+                    let nameAtom = ctx.rt.classArray[classID].classNameAtom
+                    if let name = ctx.rt.atomToString(nameAtom) {
+                        return ctx.newStringValue("[object \(name)]")
                     }
                 }
             }
-            return self.newStringValue("[object Object]")
+            return ctx.newStringValue("[object Object]")
         }, name: "toString", length: 0)
         setNonEnumerableProperty(obj: proto, name: "toString", value: toStringFunc)
 
         // Object.prototype.valueOf
-        let valueOfFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return self.toObject(thisVal)
+        let valueOfFunc = newCFunction({ ctx, thisVal, args in
+            return ctx.toObject(thisVal)
         }, name: "valueOf", length: 0)
         setNonEnumerableProperty(obj: proto, name: "valueOf", value: valueOfFunc)
 
         // Object.prototype.hasOwnProperty
-        let hasOwnFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, !args.isEmpty else { return .JS_FALSE }
-            guard let propName = self.toSwiftString(args[0]) else { return .exception }
-            let atom = self.rt.findAtom(propName)
-            let obj = self.toObject(thisVal)
+        let hasOwnFunc = newCFunction({ ctx, thisVal, args in
+            guard !args.isEmpty else { return .JS_FALSE }
+            guard let propName = ctx.toSwiftString(args[0]) else { return .exception }
+            let atom = ctx.rt.findAtom(propName)
+            let obj = ctx.toObject(thisVal)
             if obj.isException {
-                self.rt.freeAtom(atom)
+                ctx.rt.freeAtom(atom)
                 return .exception
             }
-            let has = self.getOwnProperty(obj: obj, atom: atom) != nil
-            self.rt.freeAtom(atom)
+            let has = ctx.getOwnProperty(obj: obj, atom: atom) != nil
+            ctx.rt.freeAtom(atom)
             obj.freeValue()
             return .newBool(has)
         }, name: "hasOwnProperty", length: 1)
@@ -3834,10 +3898,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         setNonEnumerableProperty(obj: proto, name: "propertyIsEnumerable", value: propIsEnumFunc)
 
         // Object.prototype.toLocaleString
-        let toLocaleStringFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let toLocaleStringFunc = newCFunction({ ctx, thisVal, args in
             // Default: call toString()
-            return self.toString(thisVal)
+            return ctx.toString(thisVal)
         }, name: "toLocaleString", length: 0)
         setNonEnumerableProperty(obj: proto, name: "toLocaleString", value: toLocaleStringFunc)
     }
@@ -3864,9 +3927,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         _ = setPropertyStr(obj: proto, name: "bind", value: bindFunc)
 
         // Function.prototype.toString
-        let toStringFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return self.newStringValue("function () {\n    [native code]\n}")
+        let toStringFunc = newCFunction({ ctx, thisVal, args in
+            return ctx.newStringValue("function () {\n    [native code]\n}")
         }, name: "toString", length: 0)
         _ = setPropertyStr(obj: proto, name: "toString", value: toStringFunc)
 
@@ -3977,18 +4039,17 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
 
         // Error.prototype.toString (first: JSC's own-key order is toString, name, message,
         // constructor — google on JeffJS, 2026-10-06)
-        let errToStringFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            let name = self.getPropertyStr(obj: thisVal, name: "name")
-            let msg = self.getPropertyStr(obj: thisVal, name: "message")
-            let nameStr = self.toSwiftString(name) ?? "Error"
-            let msgStr = self.toSwiftString(msg) ?? ""
+        let errToStringFunc = newCFunction({ ctx, thisVal, args in
+            let name = ctx.getPropertyStr(obj: thisVal, name: "name")
+            let msg = ctx.getPropertyStr(obj: thisVal, name: "message")
+            let nameStr = ctx.toSwiftString(name) ?? "Error"
+            let msgStr = ctx.toSwiftString(msg) ?? ""
             name.freeValue()
             msg.freeValue()
             if msgStr.isEmpty {
-                return self.newStringValue(nameStr)
+                return ctx.newStringValue(nameStr)
             }
-            return self.newStringValue("\(nameStr): \(msgStr)")
+            return ctx.newStringValue("\(nameStr): \(msgStr)")
         }, name: "toString", length: 0)
         _ = setPropertyStr(obj: errorProto, name: "toString", value: errToStringFunc)
         // Error.prototype.name = "Error"
@@ -3997,10 +4058,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         _ = setPropertyStr(obj: errorProto, name: "message", value: newStringValue(""))
 
         // Error constructor
-        let errorCtor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            let errObj = self.newObjectClass(classID: JSClassID.JS_CLASS_ERROR.rawValue)
-            guard let msgStr = self.initErrorObject(errObj, message: args.count > 0 ? args[0] : .undefined,
+        let errorCtor = newCFunction({ ctx, thisVal, args in
+            let errObj = ctx.newObjectClass(classID: JSClassID.JS_CLASS_ERROR.rawValue)
+            guard let msgStr = ctx.initErrorObject(errObj, message: args.count > 0 ? args[0] : .undefined,
                                                     options: args.count > 1 ? args[1] : .undefined) else {
                 errObj.freeValue()
                 return .exception
@@ -4008,7 +4068,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             // `stack` carries the call site: header + one "at fn (file:line:col)"
             // line per live interpreter frame. The frames are captured now and
             // the string is built on first read.
-            self.attachPendingStack(errObj, errorName: "Error", message: msgStr, fromConstructor: true)
+            ctx.attachPendingStack(errObj, errorName: "Error", message: msgStr, fromConstructor: true)
             return errObj
         }, name: "Error", length: 1)
         // Set Error.prototype on constructor and Error.prototype.constructor = Error
@@ -4046,9 +4106,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             let capturedName = name
             let capturedProto = nativeProto
             let isAggregate = errorEnum == .JS_AGGREGATE_ERROR
-            let ctor = newCFunction({ [weak self] ctx, thisVal, args in
-                guard let self = self else { return .exception }
-                let errObj = self.newObjectClass(classID: JSClassID.JS_CLASS_ERROR.rawValue)
+            let ctor = newCFunction({ ctx, thisVal, args in
+                let errObj = ctx.newObjectClass(classID: JSClassID.JS_CLASS_ERROR.rawValue)
                 // Set the instance's prototype to the NativeError.prototype
                 // so that instanceof NativeError and instanceof Error both work
                 if let errJSObj = errObj.toObject(), let nativeProtoObj = capturedProto.toObject() {
@@ -4057,7 +4116,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 // NativeError(message, options) (ES §20.5.6.1.1);
                 // AggregateError(errors, message, options) (§20.5.7.1.1).
                 let base = isAggregate ? 1 : 0
-                guard let msgStr = self.initErrorObject(errObj,
+                guard let msgStr = ctx.initErrorObject(errObj,
                                                         message: args.count > base ? args[base] : .undefined,
                                                         options: args.count > base + 1 ? args[base + 1] : .undefined) else {
                     errObj.freeValue()
@@ -4066,16 +4125,16 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 if isAggregate {
                     // errorsList = IterableToList(errors); "errors" is a
                     // non-enumerable own data property (step 5-6).
-                    guard let list = self.iterableToList(args.count > 0 ? args[0] : .undefined) else {
+                    guard let list = ctx.iterableToList(args.count > 0 ? args[0] : .undefined) else {
                         errObj.freeValue()
                         return .exception
                     }
-                    let arr = self.newArrayFrom(list)
-                    _ = self.definePropertyValue(obj: errObj, atom: JeffJSAtomID.JS_ATOM_errors.rawValue,
+                    let arr = ctx.newArrayFrom(list)
+                    _ = ctx.definePropertyValue(obj: errObj, atom: JeffJSAtomID.JS_ATOM_errors.rawValue,
                                                  value: arr, flags: JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)
                     arr.freeValue()   // definePropertyValue dups (the errors array leaked)
                 }
-                self.attachPendingStack(errObj, errorName: capturedName, message: msgStr, fromConstructor: true)
+                ctx.attachPendingStack(errObj, errorName: capturedName, message: msgStr, fromConstructor: true)
                 return errObj
             }, name: name, length: isAggregate ? 2 : 1)
             // Every NativeError constructor's [[Prototype]] is %Error% (§20.5.6.2, §20.5.7.2).
@@ -4101,9 +4160,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             arrayProtoObj.proto = objProtoObj
         }
 
-        arrayCtor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return self.newArray()
+        arrayCtor = newCFunction({ ctx, thisVal, args in
+            return ctx.newArray()
         }, name: "Array", length: 1)
         _ = setPropertyStr(obj: globalObj, name: "Array", value: arrayCtor.dupValue())
 
@@ -4165,12 +4223,11 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         classProto[JSClassID.JS_CLASS_NUMBER.rawValue] = numberProto.dupValue()
         inheritFromObjectPrototype(numberProto)
 
-        let numberCtor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let numberCtor = newCFunction({ ctx, thisVal, args in
             if args.isEmpty {
                 return .newInt32(0)
             }
-            if let d = self.toFloat64(args[0]) {
+            if let d = ctx.toFloat64(args[0]) {
                 // Int32(exactly:) rejects non-integral and out-of-range
                 // values; Int32(d) traps on them.
                 if let i32 = Int32(exactly: d) {
@@ -4236,78 +4293,81 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         defineIntrinsicConstant(mathObj, name: "SQRT1_2", value: .newFloat64(sqrt(0.5)))
         defineIntrinsicConstant(mathObj, name: "SQRT2", value: .newFloat64(sqrt(2.0)))
 
-        // Math functions
-        let mathAbs = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, !args.isEmpty, let d = self.toFloat64(args[0]) else {
-                return .newFloat64(Double.nan)
-            }
+        // Math functions. `mathArg` is ToNumber for a Math argument: a BigInt
+        // or a symbol is a TypeError (JSC's texts) and an exception from an
+        // object's valueOf propagates (nil = exception pending; the closures
+        // return `.exception`). The old closures returned NaN for all three.
+        let mathAbs = newCFunctionArgv({ ctx, thisVal, argp, argc in
+            let args = UnsafeBufferPointer(start: argp, count: argc)
+            if args.isEmpty { return .newFloat64(Double.nan) }
+            guard let d = ctx.mathArg(args[0]) else { return .exception }
             return .newFloat64(abs(d))
         }, name: "abs", length: 1)
         _ = setPropertyStr(obj: mathObj, name: "abs", value: mathAbs)
 
-        let mathFloor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, !args.isEmpty, let d = self.toFloat64(args[0]) else {
-                return .newFloat64(Double.nan)
-            }
+        let mathFloor = newCFunctionArgv({ ctx, thisVal, argp, argc in
+            let args = UnsafeBufferPointer(start: argp, count: argc)
+            if args.isEmpty { return .newFloat64(Double.nan) }
+            guard let d = ctx.mathArg(args[0]) else { return .exception }
             return .newFloat64(floor(d))
         }, name: "floor", length: 1)
         _ = setPropertyStr(obj: mathObj, name: "floor", value: mathFloor)
 
-        let mathCeil = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, !args.isEmpty, let d = self.toFloat64(args[0]) else {
-                return .newFloat64(Double.nan)
-            }
+        let mathCeil = newCFunctionArgv({ ctx, thisVal, argp, argc in
+            let args = UnsafeBufferPointer(start: argp, count: argc)
+            if args.isEmpty { return .newFloat64(Double.nan) }
+            guard let d = ctx.mathArg(args[0]) else { return .exception }
             return .newFloat64(ceil(d))
         }, name: "ceil", length: 1)
         _ = setPropertyStr(obj: mathObj, name: "ceil", value: mathCeil)
 
-        let mathRound = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, !args.isEmpty, let d = self.toFloat64(args[0]) else {
-                return .newFloat64(Double.nan)
-            }
-            return .newFloat64(Foundation.round(d))
+        let mathRound = newCFunctionArgv({ ctx, thisVal, argp, argc in
+            let args = UnsafeBufferPointer(start: argp, count: argc)
+            if args.isEmpty { return .newFloat64(Double.nan) }
+            guard let d = ctx.mathArg(args[0]) else { return .exception }
+            return .newFloat64(JeffJSContext.jsMathRound(d))
         }, name: "round", length: 1)
         _ = setPropertyStr(obj: mathObj, name: "round", value: mathRound)
 
-        let mathRandom = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .newFloat64(0) }
+        let mathRandom = newCFunctionArgv({ ctx, thisVal, argp, argc in
+            let args = UnsafeBufferPointer(start: argp, count: argc)
             // xorshift64*
-            var x = self.randomState
+            var x = ctx.randomState
             x ^= x >> 12
             x ^= x << 25
             x ^= x >> 27
-            self.randomState = x
+            ctx.randomState = x
             let result = Double(x &* 0x2545F4914F6CDD1D >> 11) / Double(1 << 53)
             return .newFloat64(result)
         }, name: "random", length: 0)
         _ = setPropertyStr(obj: mathObj, name: "random", value: mathRandom)
 
         // Math.max, Math.min
-        let mathMax = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .newFloat64(-Double.infinity) }
+        let mathMax = newCFunctionArgv({ ctx, thisVal, argp, argc in
+            let args = UnsafeBufferPointer(start: argp, count: argc)
             if args.isEmpty { return .newFloat64(-Double.infinity) }
             var result = -Double.infinity
+            var sawNaN = false
             for arg in args {
-                if let d = self.toFloat64(arg) {
-                    if d.isNaN { return .newFloat64(Double.nan) }
-                    if d > result { result = d }
-                }
+                guard let d = ctx.mathArg(arg) else { return .exception }
+                if d.isNaN { sawNaN = true }
+                else if d > result || (d == 0 && result == 0 && result.sign == .minus) { result = d }
             }
-            return .newFloat64(result)
+            return .newFloat64(sawNaN ? Double.nan : result)
         }, name: "max", length: 2)
         _ = setPropertyStr(obj: mathObj, name: "max", value: mathMax)
 
-        let mathMin = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .newFloat64(Double.infinity) }
+        let mathMin = newCFunctionArgv({ ctx, thisVal, argp, argc in
+            let args = UnsafeBufferPointer(start: argp, count: argc)
             if args.isEmpty { return .newFloat64(Double.infinity) }
             var result = Double.infinity
+            var sawNaN = false
             for arg in args {
-                if let d = self.toFloat64(arg) {
-                    if d.isNaN { return .newFloat64(Double.nan) }
-                    if d < result { result = d }
-                }
+                guard let d = ctx.mathArg(arg) else { return .exception }
+                if d.isNaN { sawNaN = true }
+                else if d < result || (d == 0 && result == 0 && d.sign == .minus) { result = d }
             }
-            return .newFloat64(result)
+            return .newFloat64(sawNaN ? Double.nan : result)
         }, name: "min", length: 2)
         _ = setPropertyStr(obj: mathObj, name: "min", value: mathMin)
 
@@ -4325,50 +4385,44 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         ]
         for (name, mathFn) in mathUnaryFuncs {
             let capturedFn = mathFn
-            let fn = newCFunction({ [weak self] ctx, thisVal, args in
-                guard let self = self, !args.isEmpty, let d = self.toFloat64(args[0]) else {
-                    return .newFloat64(Double.nan)
-                }
+            let fn = newCFunctionArgv({ ctx, thisVal, argp, argc in
+            let args = UnsafeBufferPointer(start: argp, count: argc)
+                if args.isEmpty { return .newFloat64(Double.nan) }
+                guard let d = ctx.mathArg(args[0]) else { return .exception }
                 return .newFloat64(capturedFn(d))
             }, name: name, length: 1)
             _ = setPropertyStr(obj: mathObj, name: name, value: fn)
         }
 
         // Math.pow, Math.atan2, Math.hypot, Math.imul, Math.clz32
-        let mathPow = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, args.count >= 2,
-                  let b = self.toFloat64(args[0]), let e = self.toFloat64(args[1]) else {
-                return .newFloat64(Double.nan)
-            }
-            return .newFloat64(Foundation.pow(b, e))
+        let mathPow = newCFunctionArgv({ ctx, thisVal, argp, argc in
+            let args = UnsafeBufferPointer(start: argp, count: argc)
+            let bv = args.count > 0 ? args[0] : .undefined, ev = args.count > 1 ? args[1] : .undefined
+            guard let b = ctx.mathArg(bv), let e = ctx.mathArg(ev) else { return .exception }
+            return .newFloat64(JeffJSContext.jsMathPow(b, e))
         }, name: "pow", length: 2)
         _ = setPropertyStr(obj: mathObj, name: "pow", value: mathPow)
 
-        let mathAtan2 = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, args.count >= 2,
-                  let y = self.toFloat64(args[0]), let x = self.toFloat64(args[1]) else {
-                return .newFloat64(Double.nan)
-            }
+        let mathAtan2 = newCFunctionArgv({ ctx, thisVal, argp, argc in
+            let args = UnsafeBufferPointer(start: argp, count: argc)
+            let yv = args.count > 0 ? args[0] : .undefined, xv = args.count > 1 ? args[1] : .undefined
+            guard let y = ctx.mathArg(yv), let x = ctx.mathArg(xv) else { return .exception }
             return .newFloat64(atan2(y, x))
         }, name: "atan2", length: 2)
         _ = setPropertyStr(obj: mathObj, name: "atan2", value: mathAtan2)
 
         // Math.hypot(...values)
-        let mathHypot = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .newFloat64(0.0) }
+        let mathHypot = newCFunctionArgv({ ctx, thisVal, argp, argc in
+            let args = UnsafeBufferPointer(start: argp, count: argc)
             if args.isEmpty { return .newFloat64(0.0) }
             var hasNaN = false
             var values = [Double]()
             values.reserveCapacity(args.count)
             for arg in args {
-                if let d = self.toFloat64(arg) {
-                    if d.isInfinite { return .newFloat64(Double.infinity) }
-                    if d.isNaN { hasNaN = true }
-                    values.append(d)
-                } else {
-                    hasNaN = true
-                    values.append(Double.nan)
-                }
+                guard let d = ctx.mathArg(arg) else { return .exception }
+                if d.isInfinite { return .newFloat64(Double.infinity) }
+                if d.isNaN { hasNaN = true }
+                values.append(d)
             }
             if hasNaN { return .newFloat64(Double.nan) }
             var maxVal = 0.0
@@ -4387,14 +4441,16 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         _ = setPropertyStr(obj: mathObj, name: "hypot", value: mathHypot)
 
         // Math.imul(a, b)
-        let mathImul = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .newInt32(0) }
+        let mathImul = newCFunctionArgv({ ctx, thisVal, argp, argc in
+            let args = UnsafeBufferPointer(start: argp, count: argc)
             let a: Int32
             let b: Int32
-            if args.count >= 1, let d = self.toFloat64(args[0]) {
+            if args.count >= 1 {
+                guard let d = ctx.mathArg(args[0]) else { return .exception }
                 a = JeffJSTypeConvert.doubleToInt32(d)
             } else { a = 0 }
-            if args.count >= 2, let d = self.toFloat64(args[1]) {
+            if args.count >= 2 {
+                guard let d = ctx.mathArg(args[1]) else { return .exception }
                 b = JeffJSTypeConvert.doubleToInt32(d)
             } else { b = 0 }
             return .newInt32(a &* b)
@@ -4402,10 +4458,11 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         _ = setPropertyStr(obj: mathObj, name: "imul", value: mathImul)
 
         // Math.clz32(x)
-        let mathClz32 = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .newInt32(32) }
+        let mathClz32 = newCFunctionArgv({ ctx, thisVal, argp, argc in
+            let args = UnsafeBufferPointer(start: argp, count: argc)
             let n: Int32
-            if args.count >= 1, let d = self.toFloat64(args[0]) {
+            if args.count >= 1 {
+                guard let d = ctx.mathArg(args[0]) else { return .exception }
                 n = JeffJSTypeConvert.doubleToInt32(d)
             } else { n = 0 }
             let u = UInt32(bitPattern: n)
@@ -4413,30 +4470,6 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         }, name: "clz32", length: 1)
         _ = setPropertyStr(obj: mathObj, name: "clz32", value: mathClz32)
 
-        // Math takes Numbers only — ToNumber(BigInt) is a TypeError. These
-        // builtins all funnel through `toFloat64`, which can only answer with
-        // a Double, so the check goes at the call boundary.
-        for name in ["abs", "floor", "ceil", "round", "max", "min", "pow",
-                     "atan2", "hypot", "imul", "clz32", "sqrt", "sin", "cos",
-                     "tan", "log", "log2", "log10", "exp", "trunc", "sign",
-                     "cbrt", "atan", "asin", "acos", "fround", "expm1",
-                     "log1p", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh"] {
-            let fn = getPropertyStr(obj: mathObj, name: name)
-            guard let fnObj = fn.toObject(),
-                  case .cFunc(_, .generic(let inner), let len, _, _) = fnObj.payload else {
-                fn.freeValue(); continue
-            }
-            // Re-wrap the underlying closure, not the function object: the
-            // guard costs one tag test, no extra JS call.
-            let guarded = newCFunction({ ctx, thisVal, args in
-                for v in args where v.isBigInt {
-                    return ctx.throwTypeError(message: "Cannot convert a BigInt value to a number")
-                }
-                return inner(ctx, thisVal, args)
-            }, name: name, length: Int(len))
-            fn.freeValue()
-            _ = setPropertyStr(obj: mathObj, name: name, value: guarded)
-        }
     }
 
     /// Adds String constructor and prototype methods.
@@ -4445,26 +4478,24 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         classProto[JSClassID.JS_CLASS_STRING.rawValue] = stringProto.dupValue()
         inheritFromObjectPrototype(stringProto)
 
-        let stringCtor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let stringCtor = newCFunction({ ctx, thisVal, args in
             if args.isEmpty {
-                return self.newStringValue("")
+                return ctx.newStringValue("")
             }
-            return self.toString(args[0])
+            return ctx.toString(args[0])
         }, name: "String", length: 1)
         _ = setPropertyStr(obj: globalObj, name: "String", value: stringCtor)
 
         // String.fromCharCode
-        let fromCharCodeFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let fromCharCodeFunc = newCFunction({ ctx, thisVal, args in
             var result = ""
             for arg in args {
-                if let n = self.toInt32(arg) {
+                if let n = ctx.toInt32(arg) {
                     let codeUnit = UInt16(truncatingIfNeeded: n)
                     result += String(UnicodeScalar(UInt32(codeUnit)) ?? UnicodeScalar(0xFFFD)!)
                 }
             }
-            return self.newStringValue(result)
+            return ctx.newStringValue(result)
         }, name: "fromCharCode", length: 1)
         _ = setPropertyStr(obj: stringCtor, name: "fromCharCode", value: fromCharCodeFunc)
 
@@ -4539,9 +4570,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         classProto[JSClassID.JS_CLASS_BOOLEAN.rawValue] = boolProto.dupValue()
         inheritFromObjectPrototype(boolProto)
 
-        let boolCtor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            let val = args.isEmpty ? false : self.toBool(args[0])
+        let boolCtor = newCFunction({ ctx, thisVal, args in
+            let val = args.isEmpty ? false : ctx.toBool(args[0])
             return .newBool(val)
         }, name: "Boolean", length: 1)
         _ = setPropertyStr(obj: globalObj, name: "Boolean", value: boolCtor)
@@ -4554,46 +4584,43 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         inheritFromObjectPrototype(symbolProto)
 
         // Symbol.prototype.toString()
-        let symToString = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let symToString = newCFunction({ ctx, thisVal, args in
             let desc: String
             if thisVal.isSymbol {
                 desc = getSymbolDescription(thisVal)
             } else if let inner = jeffJS_unwrapSymbolObject(thisVal) {
                 desc = getSymbolDescription(inner)
             } else {
-                return self.throwTypeError(message: "Symbol.prototype.toString requires a Symbol value")
+                return ctx.throwTypeError(message: "Symbol.prototype.toString requires a Symbol value")
             }
-            return self.newStringValue("Symbol(\(desc))")
+            return ctx.newStringValue("Symbol(\(desc))")
         }, name: "toString", length: 0)
         _ = setPropertyStr(obj: symbolProto, name: "toString", value: symToString)
 
         // Symbol.prototype.valueOf()
-        let symValueOf = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let symValueOf = newCFunction({ ctx, thisVal, args in
             if thisVal.isSymbol {
                 return thisVal.dupValue()
             }
             if let inner = jeffJS_unwrapSymbolObject(thisVal) {
                 return inner.dupValue()
             }
-            return self.throwTypeError(message: "Symbol.prototype.valueOf requires a Symbol value")
+            return ctx.throwTypeError(message: "Symbol.prototype.valueOf requires a Symbol value")
         }, name: "valueOf", length: 0)
         _ = setPropertyStr(obj: symbolProto, name: "valueOf", value: symValueOf)
 
         // Symbol.prototype.description getter
-        let symDescGetter = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let symDescGetter = newCFunction({ ctx, thisVal, args in
             let desc: String
             if thisVal.isSymbol {
                 desc = getSymbolDescription(thisVal)
             } else if let inner = jeffJS_unwrapSymbolObject(thisVal) {
                 desc = getSymbolDescription(inner)
             } else {
-                return self.throwTypeError(message: "Symbol.prototype.description getter requires a Symbol value")
+                return ctx.throwTypeError(message: "Symbol.prototype.description getter requires a Symbol value")
             }
             if desc.isEmpty { return .JS_UNDEFINED }
-            return self.newStringValue(desc)
+            return ctx.newStringValue(desc)
         }, name: "get description", length: 0)
         setPropertyGetSet(obj: symbolProto, name: "description", getter: symDescGetter, setter: nil)
 
@@ -4604,12 +4631,11 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         symCtorObj.isConstructor = false  // Symbol cannot be used with `new`
         symCtorObj.payload = .cFunc(
             realm: self,
-            cFunction: .constructorOrFunc({ [weak self] ctx, thisVal, args, isNew in
-                guard let self = self else { return .exception }
+            cFunction: .constructorOrFunc({ ctx, thisVal, args, isNew in
                 if isNew {
-                    return self.throwTypeError(message: "Symbol is not a constructor")
+                    return ctx.throwTypeError(message: "Symbol is not a constructor")
                 }
-                let desc = (!args.isEmpty && !args[0].isUndefined) ? (self.toSwiftString(args[0]) ?? "") : ""
+                let desc = (!args.isEmpty && !args[0].isUndefined) ? (ctx.toSwiftString(args[0]) ?? "") : ""
                 let symStr = JeffJSString(swiftString: desc)
                 symStr.atomType = JSAtomType.symbol.rawValue
                 return JeffJSValue.mkPtr(tag: .symbol, ptr: symStr)
@@ -4758,15 +4784,14 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         bigIntCtorObj.isConstructor = false
         bigIntCtorObj.payload = .cFunc(
             realm: self,
-            cFunction: .constructorOrFunc({ [weak self] ctx, thisVal, args, isNew in
-                guard let self = self else { return .exception }
+            cFunction: .constructorOrFunc({ ctx, thisVal, args, isNew in
                 if isNew {
-                    return self.throwTypeError(message: "BigInt is not a constructor")
+                    return ctx.throwTypeError(message: "BigInt is not a constructor")
                 }
                 if args.isEmpty {
-                    return self.throwTypeError(message: "Cannot convert undefined to a BigInt")
+                    return ctx.throwTypeError(message: "Cannot convert undefined to a BigInt")
                 }
-                return self.bigIntConstructorValue(args[0])
+                return ctx.bigIntConstructorValue(args[0])
             }),
             length: 1,
             cproto: UInt8(JS_CFUNC_CONSTRUCTOR_OR_FUNC),
@@ -4795,16 +4820,14 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         }
 
         // BigInt.asIntN(bits, bigint) — static method
-        let asIntNFn = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return JeffJSBuiltinBigInt.asIntN(ctx: self, this: thisVal, args: args)
+        let asIntNFn = newCFunction({ ctx, thisVal, args in
+            return JeffJSBuiltinBigInt.asIntN(ctx: ctx, this: thisVal, args: args)
         }, name: "asIntN", length: 2)
         _ = setPropertyStr(obj: bigIntCtor, name: "asIntN", value: asIntNFn)
 
         // BigInt.asUintN(bits, bigint) — static method
-        let asUintNFn = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return JeffJSBuiltinBigInt.asUintN(ctx: self, this: thisVal, args: args)
+        let asUintNFn = newCFunction({ ctx, thisVal, args in
+            return JeffJSBuiltinBigInt.asUintN(ctx: ctx, this: thisVal, args: args)
         }, name: "asUintN", length: 2)
         _ = setPropertyStr(obj: bigIntCtor, name: "asUintN", value: asUintNFn)
 
@@ -4818,9 +4841,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// Wires each method to its implementation in JeffJSBuiltinRegExp.swift.
     private func addRegExpProtoMethods(_ proto: JeffJSValue) {
         // exec
-        let execFn = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return js_regexp_exec(ctx: self, this: thisVal, argv: Array(args))
+        let execFn = newCFunction({ ctx, thisVal, args in
+            return js_regexp_exec(ctx: ctx, this: thisVal, argv: Array(args))
         }, name: "exec", length: 1)
         // Marked so RegExpExec can tell the intrinsic from a page's `exec`.
         if let o = execFn.toObject(), case .cFunc(let realm, let cf, let len, let cproto, _) = o.payload {
@@ -4829,58 +4851,50 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         _ = setPropertyStr(obj: proto, name: "exec", value: execFn)
 
         // test
-        let testFn = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return js_regexp_test(ctx: self, this: thisVal, argv: Array(args))
+        let testFn = newCFunction({ ctx, thisVal, args in
+            return js_regexp_test(ctx: ctx, this: thisVal, argv: Array(args))
         }, name: "test", length: 1)
         _ = setPropertyStr(obj: proto, name: "test", value: testFn)
 
         // toString
-        let toStringFn = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return js_regexp_toString(ctx: self, this: thisVal, argv: Array(args))
+        let toStringFn = newCFunction({ ctx, thisVal, args in
+            return js_regexp_toString(ctx: ctx, this: thisVal, argv: Array(args))
         }, name: "toString", length: 0)
         _ = setPropertyStr(obj: proto, name: "toString", value: toStringFn)
 
         // compile (legacy Annex B)
-        let compileFn = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return js_regexp_compile(ctx: self, this: thisVal, argv: Array(args))
+        let compileFn = newCFunction({ ctx, thisVal, args in
+            return js_regexp_compile(ctx: ctx, this: thisVal, argv: Array(args))
         }, name: "compile", length: 2)
         _ = setPropertyStr(obj: proto, name: "compile", value: compileFn)
 
         // Symbol.match
-        let matchFn = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return js_regexp_Symbol_match(ctx: self, this: thisVal, argv: Array(args))
+        let matchFn = newCFunction({ ctx, thisVal, args in
+            return js_regexp_Symbol_match(ctx: ctx, this: thisVal, argv: Array(args))
         }, name: "[Symbol.match]", length: 1)
         _ = setProperty(obj: proto, atom: JSPredefinedAtom.Symbol_match.rawValue, value: matchFn)
 
         // Symbol.matchAll
-        let matchAllFn = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return js_regexp_Symbol_matchAll(ctx: self, this: thisVal, argv: Array(args))
+        let matchAllFn = newCFunction({ ctx, thisVal, args in
+            return js_regexp_Symbol_matchAll(ctx: ctx, this: thisVal, argv: Array(args))
         }, name: "[Symbol.matchAll]", length: 1)
         _ = setProperty(obj: proto, atom: JSPredefinedAtom.Symbol_matchAll.rawValue, value: matchAllFn)
 
         // Symbol.replace
-        let replaceFn = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return js_regexp_Symbol_replace(ctx: self, this: thisVal, argv: Array(args))
+        let replaceFn = newCFunction({ ctx, thisVal, args in
+            return js_regexp_Symbol_replace(ctx: ctx, this: thisVal, argv: Array(args))
         }, name: "[Symbol.replace]", length: 2)
         _ = setProperty(obj: proto, atom: JSPredefinedAtom.Symbol_replace.rawValue, value: replaceFn)
 
         // Symbol.search
-        let searchFn = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return js_regexp_Symbol_search(ctx: self, this: thisVal, argv: Array(args))
+        let searchFn = newCFunction({ ctx, thisVal, args in
+            return js_regexp_Symbol_search(ctx: ctx, this: thisVal, argv: Array(args))
         }, name: "[Symbol.search]", length: 1)
         _ = setProperty(obj: proto, atom: JSPredefinedAtom.Symbol_search.rawValue, value: searchFn)
 
         // Symbol.split
-        let splitFn = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
-            return js_regexp_Symbol_split(ctx: self, this: thisVal, argv: Array(args))
+        let splitFn = newCFunction({ ctx, thisVal, args in
+            return js_regexp_Symbol_split(ctx: ctx, this: thisVal, argv: Array(args))
         }, name: "[Symbol.split]", length: 2)
         _ = setProperty(obj: proto, atom: JSPredefinedAtom.Symbol_split.rawValue, value: splitFn)
 
@@ -4900,9 +4914,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         ]
 
         for (name, getterImpl) in flagGetters {
-            let getterFn = newCFunction({ [weak self] ctx, thisVal, args in
-                guard let self = self else { return .exception }
-                return getterImpl(self, thisVal)
+            let getterFn = newCFunction({ ctx, thisVal, args in
+                return getterImpl(ctx, thisVal)
             }, name: "get \(name)", length: 0)
             getterFn.toObject()?.nativeNameKeepsAccessorPrefix = true
             setPropertyGetSet(obj: proto, name: name, getter: getterFn, setter: nil)
@@ -4912,71 +4925,68 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// Adds Reflect object methods.
     private func addReflectMethods(_ reflectObj: JeffJSValue) {
         // Reflect.apply(target, thisArg, argumentsList)
-        let reflApply = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let reflApply = newCFunction({ ctx, thisVal, args in
             guard args.count >= 3 else {
-                return self.throwTypeError(message: "Reflect.apply requires 3 arguments")
+                return ctx.throwTypeError(message: "Reflect.apply requires 3 arguments")
             }
             let target = args[0]
             let thisArg = args[1]
             let argList = args[2]
             guard let targetObj = target.toObject(), targetObj.isCallable else {
-                return self.throwTypeError(message: "Reflect.apply: target is not callable")
+                return ctx.throwTypeError(message: "Reflect.apply: target is not callable")
             }
             var callArgs: [JeffJSValue] = []
             if let arrObj = argList.toObject() {
-                let lenVal = self.getProperty(obj: argList, atom: JeffJSAtomID.JS_ATOM_length.rawValue)
+                let lenVal = ctx.getProperty(obj: argList, atom: JeffJSAtomID.JS_ATOM_length.rawValue)
                 let len = max(0, lenVal.isInt ? Int(lenVal.toInt32()) : 0)
                 for i in 0..<len {
-                    let elem = self.getPropertyByIndex(obj: argList, index: UInt32(i))
+                    let elem = ctx.getPropertyByIndex(obj: argList, index: UInt32(i))
                     callArgs.append(elem)
                 }
                 _ = arrObj // suppress warning
             }
             // getPropertyByIndex returned owned values; the call borrows them.
-            let result = self.callFunction(target, thisVal: thisArg, args: callArgs)
+            let result = ctx.callFunction(target, thisVal: thisArg, args: callArgs)
             for a in callArgs { a.freeValue() }
             return result
         }, name: "apply", length: 3)
         _ = setPropertyStr(obj: reflectObj, name: "apply", value: reflApply)
 
         // Reflect.construct(target, argumentsList [, newTarget])
-        let reflConstruct = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let reflConstruct = newCFunction({ ctx, thisVal, args in
             guard args.count >= 2 else {
-                return self.throwTypeError(message: "Reflect.construct requires at least 2 arguments")
+                return ctx.throwTypeError(message: "Reflect.construct requires at least 2 arguments")
             }
             let target = args[0]
-            guard self.isConstructorLike(target) else {
-                return self.throwTypeError(message: "Reflect.construct: target is not a constructor")
+            guard ctx.isConstructorLike(target) else {
+                return ctx.throwTypeError(message: "Reflect.construct: target is not a constructor")
             }
             let argList = args[1]
             var callArgs: [JeffJSValue] = []
-            let lenVal = self.getProperty(obj: argList, atom: JeffJSAtomID.JS_ATOM_length.rawValue)
+            let lenVal = ctx.getProperty(obj: argList, atom: JeffJSAtomID.JS_ATOM_length.rawValue)
             let len = max(0, lenVal.isInt ? Int(lenVal.toInt32()) : 0)
             for i in 0..<len {
-                callArgs.append(self.getPropertyByIndex(obj: argList, index: UInt32(i)))
+                callArgs.append(ctx.getPropertyByIndex(obj: argList, index: UInt32(i)))
             }
             defer { for a in callArgs { a.freeValue() } }   // owned copies; the callee borrows
             var newTarget = target
             if args.count >= 3 {
                 newTarget = args[2]
-                guard self.isConstructorLike(newTarget) else {
-                    return self.throwTypeError(message: "Reflect.construct: newTarget is not a constructor")
+                guard ctx.isConstructorLike(newTarget) else {
+                    return ctx.throwTypeError(message: "Reflect.construct: newTarget is not a constructor")
                 }
             }
-            return self.callConstructor(target, newTarget: newTarget, args: callArgs)
+            return ctx.callConstructor(target, newTarget: newTarget, args: callArgs)
         }, name: "construct", length: 2)
         _ = setPropertyStr(obj: reflectObj, name: "construct", value: reflConstruct)
 
         // Reflect.defineProperty(target, propertyKey, attributes)
-        let reflDefineProperty = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let reflDefineProperty = newCFunction({ ctx, thisVal, args in
             guard args.count >= 3 else {
-                return self.throwTypeError(message: "Reflect.defineProperty requires 3 arguments")
+                return ctx.throwTypeError(message: "Reflect.defineProperty requires 3 arguments")
             }
             guard args[0].isObject else {
-                return self.throwTypeError(message: "Reflect.defineProperty: target must be an object")
+                return ctx.throwTypeError(message: "Reflect.defineProperty: target must be an object")
             }
             let target = args[0]
             let key = args[1]
@@ -4986,12 +4996,12 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             // attributes to true instead of false, and accepted a non-object
             // descriptor. It also stringified the key, so symbol keys landed
             // on the atom of their description.
-            let keyVal = self.toPropertyKey(key)
+            let keyVal = ctx.toPropertyKey(key)
             if keyVal.isException { return keyVal }
-            defer { self.freeValue(keyVal) }
+            defer { ctx.freeValue(keyVal) }
             // A bad descriptor still throws (ES2023 28.1.3); a refused
             // definition (non-configurable / non-extensible) answers false.
-            let result = self.definePropertyFromDescriptor(target, key: keyVal, desc: desc,
+            let result = ctx.definePropertyFromDescriptor(target, key: keyVal, desc: desc,
                                                            shouldThrow: false)
             if result.isException { return .exception }
             return .newBool(!result.isBool || result.toBool())
@@ -4999,61 +5009,57 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         _ = setPropertyStr(obj: reflectObj, name: "defineProperty", value: reflDefineProperty)
 
         // Reflect.deleteProperty(target, propertyKey)
-        let reflDeleteProperty = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let reflDeleteProperty = newCFunction({ ctx, thisVal, args in
             guard args.count >= 2 else {
-                return self.throwTypeError(message: "Reflect.deleteProperty requires 2 arguments")
+                return ctx.throwTypeError(message: "Reflect.deleteProperty requires 2 arguments")
             }
             guard args[0].isObject else {
-                return self.throwTypeError(message: "Reflect.deleteProperty: target must be an object")
+                return ctx.throwTypeError(message: "Reflect.deleteProperty: target must be an object")
             }
-            guard let (atom, owned) = self.propertyKeyAtom(args[1]) else { return .exception }
-            defer { if owned { self.rt.freeAtom(atom) } }
+            guard let (atom, owned) = ctx.propertyKeyAtom(args[1]) else { return .exception }
+            defer { if owned { ctx.rt.freeAtom(atom) } }
             // The result is [[Delete]]'s answer: a non-configurable property
             // stays and Reflect.deleteProperty reports false; a missing one is
             // true. Through deleteProperty(obj:) so a Proxy's trap runs (the
             // shape-level delete used here never reached it, and answered
             // false for a property that was not there).
-            let ok = self.deleteProperty(obj: args[0], atom: atom, flags: 0)
-            if !ok && !self.rt.currentException.isNull { return .exception }
+            let ok = ctx.deleteProperty(obj: args[0], atom: atom, flags: 0)
+            if !ok && !ctx.rt.currentException.isNull { return .exception }
             return .newBool(ok)
         }, name: "deleteProperty", length: 2)
         _ = setPropertyStr(obj: reflectObj, name: "deleteProperty", value: reflDeleteProperty)
 
         // Reflect.get(target, propertyKey [, receiver])
-        let reflGet = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let reflGet = newCFunction({ ctx, thisVal, args in
             guard args.count >= 2 else {
-                return self.throwTypeError(message: "Reflect.get requires at least 2 arguments")
+                return ctx.throwTypeError(message: "Reflect.get requires at least 2 arguments")
             }
             guard args[0].isObject else {
-                return self.throwTypeError(message: "Reflect.get: target must be an object")
+                return ctx.throwTypeError(message: "Reflect.get: target must be an object")
             }
             let receiver = args.count >= 3 ? args[2] : args[0]
-            guard let (atom, owned) = self.propertyKeyAtom(args[1]) else { return .exception }
-            defer { if owned { self.rt.freeAtom(atom) } }
-            return self.getPropertyInternal(obj: args[0], atom: atom, receiver: receiver)
+            guard let (atom, owned) = ctx.propertyKeyAtom(args[1]) else { return .exception }
+            defer { if owned { ctx.rt.freeAtom(atom) } }
+            return ctx.getPropertyInternal(obj: args[0], atom: atom, receiver: receiver)
         }, name: "get", length: 2)
         _ = setPropertyStr(obj: reflectObj, name: "get", value: reflGet)
 
         // Reflect.getOwnPropertyDescriptor(target, propertyKey)
-        let reflGetOwnPropertyDescriptor = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let reflGetOwnPropertyDescriptor = newCFunction({ ctx, thisVal, args in
             guard args.count >= 2 else {
-                return self.throwTypeError(message: "Reflect.getOwnPropertyDescriptor requires 2 arguments")
+                return ctx.throwTypeError(message: "Reflect.getOwnPropertyDescriptor requires 2 arguments")
             }
             guard args[0].isObject else {
-                return self.throwTypeError(message: "Reflect.getOwnPropertyDescriptor: target must be an object")
+                return ctx.throwTypeError(message: "Reflect.getOwnPropertyDescriptor: target must be an object")
             }
-            return self.getOwnPropertyDescriptor(args[0], key: args[1])
+            return ctx.getOwnPropertyDescriptor(args[0], key: args[1])
         }, name: "getOwnPropertyDescriptor", length: 2)
         _ = setPropertyStr(obj: reflectObj, name: "getOwnPropertyDescriptor", value: reflGetOwnPropertyDescriptor)
 
         // Reflect.getPrototypeOf(target)
-        let reflGetPrototypeOf = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let reflGetPrototypeOf = newCFunction({ ctx, thisVal, args in
             guard !args.isEmpty, args[0].isObject else {
-                return self.throwTypeError(message: "Reflect.getPrototypeOf: target must be an object")
+                return ctx.throwTypeError(message: "Reflect.getPrototypeOf: target must be an object")
             }
             guard let targetObj = args[0].toObject() else { return .null }
             if let p = targetObj.proto {
@@ -5064,27 +5070,25 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         _ = setPropertyStr(obj: reflectObj, name: "getPrototypeOf", value: reflGetPrototypeOf)
 
         // Reflect.has(target, propertyKey) -- equivalent to `key in target`
-        let reflHas = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let reflHas = newCFunction({ ctx, thisVal, args in
             guard args.count >= 2 else {
-                return self.throwTypeError(message: "Reflect.has requires 2 arguments")
+                return ctx.throwTypeError(message: "Reflect.has requires 2 arguments")
             }
             guard args[0].isObject else {
-                return self.throwTypeError(message: "Reflect.has: target must be an object")
+                return ctx.throwTypeError(message: "Reflect.has: target must be an object")
             }
-            guard let (atom, owned) = self.propertyKeyAtom(args[1]) else { return .exception }
-            defer { if owned { self.rt.freeAtom(atom) } }
+            guard let (atom, owned) = ctx.propertyKeyAtom(args[1]) else { return .exception }
+            defer { if owned { ctx.rt.freeAtom(atom) } }
             // -1: the `has` trap threw. Reporting `false` here swallowed it.
-            let r = self.hasPropertyEx(obj: args[0], atom: atom)
+            let r = ctx.hasPropertyEx(obj: args[0], atom: atom)
             return r < 0 ? .exception : .newBool(r > 0)
         }, name: "has", length: 2)
         _ = setPropertyStr(obj: reflectObj, name: "has", value: reflHas)
 
         // Reflect.isExtensible(target)
-        let reflIsExtensible = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let reflIsExtensible = newCFunction({ ctx, thisVal, args in
             guard !args.isEmpty, args[0].isObject else {
-                return self.throwTypeError(message: "Reflect.isExtensible: target must be an object")
+                return ctx.throwTypeError(message: "Reflect.isExtensible: target must be an object")
             }
             guard let targetObj = args[0].toObject() else { return .JS_TRUE }
             return .newBool(targetObj.extensible)
@@ -5096,21 +5100,20 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // 1. Integer indices in ascending numeric order
         // 2. String keys in insertion order
         // 3. Symbol keys in insertion order
-        let reflOwnKeys = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let reflOwnKeys = newCFunction({ ctx, thisVal, args in
             guard !args.isEmpty, args[0].isObject else {
-                return self.throwTypeError(message: "Reflect.ownKeys: target must be an object")
+                return ctx.throwTypeError(message: "Reflect.ownKeys: target must be an object")
             }
             guard let targetObj = args[0].toObject() else { return .exception }
             if targetObj.classID == JeffJSClassID.proxy.rawValue {
-                guard let keys = jeffJS_proxyOwnKeys(self, targetObj, strings: true, symbols: true,
+                guard let keys = jeffJS_proxyOwnKeys(ctx, targetObj, strings: true, symbols: true,
                                                      enumerableOnly: false) else { return .exception }
-                return self.newArrayFrom(keys)
+                return ctx.newArrayFrom(keys)
             }
-            if (targetObj.lazyFlags & JeffJSObject.lazyHostBit) != 0 { self.materializeHostLazyProps(targetObj) }
+            if (targetObj.lazyFlags & JeffJSObject.lazyHostBit) != 0 { ctx.materializeHostLazyProps(targetObj) }
             targetObj.ensureLazyMaterialized()
-            if targetObj.needsLazyNameLength { self.materializeFunctionNameLength(targetObj) }
-            if targetObj.needsLazyPrototype { self.materializeFunctionPrototype(targetObj) }
+            if targetObj.needsLazyNameLength { ctx.materializeFunctionNameLength(targetObj) }
+            if targetObj.needsLazyPrototype { ctx.materializeFunctionPrototype(targetObj) }
             var intKeys: [(UInt32, JeffJSValue)] = []
             var stringKeys: [JeffJSValue] = []
             var symbolKeys: [JeffJSValue] = []
@@ -5118,24 +5121,24 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                 for prop in shape.prop {
                     let atom = prop.atom
                     if atom == 0 || prop.flags.contains(.hidden) { continue }   // hidden: JeffJSOwnPropertyOrder
-                    if self.rt.atomIsArrayIndex(atom) {
-                        if let idx = self.rt.atomToUInt32(atom) {
-                            intKeys.append((idx, self.newStringValue(String(idx))))
+                    if ctx.rt.atomIsArrayIndex(atom) {
+                        if let idx = ctx.rt.atomToUInt32(atom) {
+                            intKeys.append((idx, ctx.newStringValue(String(idx))))
                         }
-                    } else if let entry = self.rt.atomArray[Int(atom)] {
+                    } else if let entry = ctx.rt.atomArray[Int(atom)] {
                         // Class private names (`#x`) are not own keys.
                         if entry.atomType == .JS_ATOM_TYPE_PRIVATE { continue }
                         let isSymbol = entry.atomType == .JS_ATOM_TYPE_SYMBOL ||
                                        entry.atomType == .JS_ATOM_TYPE_GLOBAL_SYMBOL
                         if isSymbol {
                             // Real symbol values, not their descriptions.
-                            if let symStr = self.rt.symbolStringForAtom(atom) {
+                            if let symStr = ctx.rt.symbolStringForAtom(atom) {
                                 symbolKeys.append(JeffJSValue.borrowedSymbol(symStr).dupValue())
                             } else {
-                                symbolKeys.append(self.newStringValue(entry.str))
+                                symbolKeys.append(ctx.newStringValue(entry.str))
                             }
                         } else {
-                            stringKeys.append(self.newStringValue(entry.str))
+                            stringKeys.append(ctx.newStringValue(entry.str))
                         }
                     }
                 }
@@ -5146,33 +5149,31 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             for (_, val) in intKeys { keys.append(val) }
             keys.append(contentsOf: stringKeys)
             keys.append(contentsOf: symbolKeys)
-            return self.newArrayFrom(keys)
+            return ctx.newArrayFrom(keys)
         }, name: "ownKeys", length: 1)
         _ = setPropertyStr(obj: reflectObj, name: "ownKeys", value: reflOwnKeys)
 
         // Reflect.preventExtensions(target)
-        let reflPreventExtensions = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let reflPreventExtensions = newCFunction({ ctx, thisVal, args in
             guard !args.isEmpty, args[0].isObject else {
-                return self.throwTypeError(message: "Reflect.preventExtensions: target must be an object")
+                return ctx.throwTypeError(message: "Reflect.preventExtensions: target must be an object")
             }
             guard args[0].toObject() != nil else { return .JS_FALSE }
-            _ = self.preventExtensions(args[0])
+            _ = ctx.preventExtensions(args[0])
             return .JS_TRUE
         }, name: "preventExtensions", length: 1)
         _ = setPropertyStr(obj: reflectObj, name: "preventExtensions", value: reflPreventExtensions)
 
         // Reflect.set(target, propertyKey, value [, receiver])
-        let reflSet = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let reflSet = newCFunction({ ctx, thisVal, args in
             guard args.count >= 3 else {
-                return self.throwTypeError(message: "Reflect.set requires at least 3 arguments")
+                return ctx.throwTypeError(message: "Reflect.set requires at least 3 arguments")
             }
             guard args[0].isObject else {
-                return self.throwTypeError(message: "Reflect.set: target must be an object")
+                return ctx.throwTypeError(message: "Reflect.set: target must be an object")
             }
-            guard let (atom, owned) = self.propertyKeyAtom(args[1]) else { return .exception }
-            defer { if owned { self.rt.freeAtom(atom) } }
+            guard let (atom, owned) = ctx.propertyKeyAtom(args[1]) else { return .exception }
+            defer { if owned { ctx.rt.freeAtom(atom) } }
             // setPropertyInternal answers 1 = written, 0 = refused (no throw
             // without JS_PROP_THROW), -1 = error. Reflect.set reports the
             // refusal as false rather than swallowing it.
@@ -5181,35 +5182,34 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             // writes the receiver's own property through its [[GetOwnProperty]]
             // and [[DefineOwnProperty]]; the receiver used to be ignored.
             if args.count >= 4, !(args[3].isObject && args[3].toObject() === args[0].toObject()) {
-                let key = self.proxyTrapKey(atom)
+                let key = ctx.proxyTrapKey(atom)
                 defer { key.freeValue() }
-                let r = self.reflectSet(args[0], key: key, atom: atom, value: args[2], receiver: args[3])
+                let r = ctx.reflectSet(args[0], key: key, atom: atom, value: args[2], receiver: args[3])
                 if r < 0 { return .exception }
                 return .newBool(r > 0)
             }
-            let result = self.setPropertyInternal(obj: args[0], atom: atom,
+            let result = ctx.setPropertyInternal(obj: args[0], atom: atom,
                                                   value: args[2].dupValue(), flags: 0)
-            if result < 0 { return self.rt.currentException.isNull ? .JS_FALSE : .exception }
+            if result < 0 { return ctx.rt.currentException.isNull ? .JS_FALSE : .exception }
             return .newBool(result > 0)
         }, name: "set", length: 3)
         _ = setPropertyStr(obj: reflectObj, name: "set", value: reflSet)
 
         // Reflect.setPrototypeOf(target, proto)
-        let reflSetPrototypeOf = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self else { return .exception }
+        let reflSetPrototypeOf = newCFunction({ ctx, thisVal, args in
             guard args.count >= 2 else {
-                return self.throwTypeError(message: "Reflect.setPrototypeOf requires 2 arguments")
+                return ctx.throwTypeError(message: "Reflect.setPrototypeOf requires 2 arguments")
             }
             guard args[0].isObject else {
-                return self.throwTypeError(message: "Reflect.setPrototypeOf: target must be an object")
+                return ctx.throwTypeError(message: "Reflect.setPrototypeOf: target must be an object")
             }
             let proto = args[1]
             if !proto.isObject && !proto.isNull {
-                return self.throwTypeError(message: "prototype must be an object or null")
+                return ctx.throwTypeError(message: "prototype must be an object or null")
             }
             // [[SetPrototypeOf]] (ES §10.1.2): false for a cycle, a non-extensible
             // target or Object.prototype, never a throw.
-            return self.setPrototypeOf(args[0], proto: proto) ? .JS_TRUE : .JS_FALSE
+            return ctx.setPrototypeOf(args[0], proto: proto) ? .JS_TRUE : .JS_FALSE
         }, name: "setPrototypeOf", length: 2)
         _ = setPropertyStr(obj: reflectObj, name: "setPrototypeOf", value: reflSetPrototypeOf)
     }
@@ -5217,13 +5217,13 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// Adds global functions: parseInt, parseFloat, isNaN, isFinite, etc.
     private func addGlobalFunctions() {
         // parseInt
-        let parseIntFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, !args.isEmpty else { return .newFloat64(Double.nan) }
-            guard let str = self.toSwiftString(args[0]) else { return .newFloat64(Double.nan) }
+        let parseIntFunc = newCFunction({ ctx, thisVal, args in
+            guard !args.isEmpty else { return .newFloat64(Double.nan) }
+            guard let str = ctx.toSwiftString(args[0]) else { return .newFloat64(Double.nan) }
             let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
             let radix: Int
             if args.count > 1 {
-                radix = Int(self.toInt32(args[1]) ?? 10)
+                radix = Int(ctx.toInt32(args[1]) ?? 10)
             } else {
                 radix = trimmed.hasPrefix("0x") || trimmed.hasPrefix("0X") ? 16 : 10
             }
@@ -5236,9 +5236,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         _ = setPropertyStr(obj: globalObj, name: "parseInt", value: parseIntFunc)
 
         // parseFloat
-        let parseFloatFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, !args.isEmpty else { return .newFloat64(Double.nan) }
-            guard let str = self.toSwiftString(args[0]) else { return .newFloat64(Double.nan) }
+        let parseFloatFunc = newCFunction({ ctx, thisVal, args in
+            guard !args.isEmpty else { return .newFloat64(Double.nan) }
+            guard let str = ctx.toSwiftString(args[0]) else { return .newFloat64(Double.nan) }
             let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
             if let d = Double(trimmed) {
                 return .newFloat64(d)
@@ -5248,9 +5248,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         _ = setPropertyStr(obj: globalObj, name: "parseFloat", value: parseFloatFunc)
 
         // isNaN
-        let isNaNFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, !args.isEmpty else { return .JS_TRUE }
-            if let d = self.toFloat64(args[0]) {
+        let isNaNFunc = newCFunction({ ctx, thisVal, args in
+            guard !args.isEmpty else { return .JS_TRUE }
+            if let d = ctx.toFloat64(args[0]) {
                 return .newBool(d.isNaN)
             }
             return .JS_TRUE
@@ -5258,9 +5258,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         _ = setPropertyStr(obj: globalObj, name: "isNaN", value: isNaNFunc)
 
         // isFinite
-        let isFiniteFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, !args.isEmpty else { return .JS_FALSE }
-            if let d = self.toFloat64(args[0]) {
+        let isFiniteFunc = newCFunction({ ctx, thisVal, args in
+            guard !args.isEmpty else { return .JS_FALSE }
+            if let d = ctx.toFloat64(args[0]) {
                 return .newBool(d.isFinite)
             }
             return .JS_FALSE
@@ -5268,40 +5268,40 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         _ = setPropertyStr(obj: globalObj, name: "isFinite", value: isFiniteFunc)
 
         // encodeURI, decodeURI, encodeURIComponent, decodeURIComponent
-        let encodeURIFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, !args.isEmpty, let str = self.toSwiftString(args[0]) else {
+        let encodeURIFunc = newCFunction({ ctx, thisVal, args in
+            guard !args.isEmpty, let str = ctx.toSwiftString(args[0]) else {
                 return .JS_UNDEFINED
             }
             let encoded = str.addingPercentEncoding(withAllowedCharacters:
                 .urlQueryAllowed.union(.urlPathAllowed).union(.urlHostAllowed)
                     .union(.urlFragmentAllowed)) ?? str
-            return self.newStringValue(encoded)
+            return ctx.newStringValue(encoded)
         }, name: "encodeURI", length: 1)
         _ = setPropertyStr(obj: globalObj, name: "encodeURI", value: encodeURIFunc)
 
-        let decodeURIFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, !args.isEmpty, let str = self.toSwiftString(args[0]) else {
+        let decodeURIFunc = newCFunction({ ctx, thisVal, args in
+            guard !args.isEmpty, let str = ctx.toSwiftString(args[0]) else {
                 return .JS_UNDEFINED
             }
-            return self.newStringValue(str.removingPercentEncoding ?? str)
+            return ctx.newStringValue(str.removingPercentEncoding ?? str)
         }, name: "decodeURI", length: 1)
         _ = setPropertyStr(obj: globalObj, name: "decodeURI", value: decodeURIFunc)
 
-        let encodeURIComponentFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, !args.isEmpty, let str = self.toSwiftString(args[0]) else {
+        let encodeURIComponentFunc = newCFunction({ ctx, thisVal, args in
+            guard !args.isEmpty, let str = ctx.toSwiftString(args[0]) else {
                 return .JS_UNDEFINED
             }
             let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_.!~*'()"))
             let encoded = str.addingPercentEncoding(withAllowedCharacters: allowed) ?? str
-            return self.newStringValue(encoded)
+            return ctx.newStringValue(encoded)
         }, name: "encodeURIComponent", length: 1)
         _ = setPropertyStr(obj: globalObj, name: "encodeURIComponent", value: encodeURIComponentFunc)
 
-        let decodeURIComponentFunc = newCFunction({ [weak self] ctx, thisVal, args in
-            guard let self = self, !args.isEmpty, let str = self.toSwiftString(args[0]) else {
+        let decodeURIComponentFunc = newCFunction({ ctx, thisVal, args in
+            guard !args.isEmpty, let str = ctx.toSwiftString(args[0]) else {
                 return .JS_UNDEFINED
             }
-            return self.newStringValue(str.removingPercentEncoding ?? str)
+            return ctx.newStringValue(str.removingPercentEncoding ?? str)
         }, name: "decodeURIComponent", length: 1)
         _ = setPropertyStr(obj: globalObj, name: "decodeURIComponent", value: decodeURIComponentFunc)
     }
@@ -6736,6 +6736,10 @@ nonisolated extension JeffJSObject {
 
 /// Type alias for native JS functions (matches the pattern used in newCFunction)
 typealias JeffJSNativeFunc = (_ ctx: JeffJSContext, _ thisVal: JeffJSValue, _ args: [JeffJSValue]) -> JeffJSValue
+/// A builtin over the caller's argument slots (QuickJS `JSCFunction`:
+/// `(ctx, this_val, argc, argv)`); `argv[0 ..< argc]` are borrowed.
+typealias JeffJSNativeArgvFunc = (_ ctx: JeffJSContext, _ thisVal: JeffJSValue,
+                                  _ argv: UnsafePointer<JeffJSValue>?, _ argc: Int) -> JeffJSValue
 
 nonisolated extension JeffJSContext {
 
@@ -6809,6 +6813,19 @@ nonisolated extension JeffJSContext {
     /// through `defineOrReplaceOwnProperty`: an existing own `name` is
     /// replaced in place (a host stub accessor becomes the method, keeping its
     /// key position); a non-configurable one is left alone.
+    /// `setPropertyFunc` for a builtin written over the argument slots
+    /// (`JeffJSNativeArgvFunc`): the function object's payload is `.argv`,
+    /// which the interpreter's native call paths run without building an
+    /// argument array.
+    func setPropertyFuncArgv(obj: JeffJSValue, name: String, fn: @escaping JeffJSNativeArgvFunc, length: Int) {
+        let funcObj = newCFunctionArgv(fn, name: name, length: length)
+        let atom = rt.findAtom(name)
+        defineOrReplaceOwnProperty(obj, atom: atom, value: funcObj,
+                                   flags: JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE)
+        rt.freeAtom(atom)
+        funcObj.freeValue()
+    }
+
     func setPropertyFunc(obj: JeffJSValue, name: String, fn: @escaping JeffJSNativeFunc, length: Int) {
         let funcObj = newCFunction(fn, name: name, length: length)
         // Use non-enumerable so methods don't appear in for-in iteration.

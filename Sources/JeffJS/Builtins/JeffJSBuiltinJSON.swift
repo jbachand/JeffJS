@@ -1333,9 +1333,14 @@ nonisolated extension JeffJSContext {
         return obj.isCallable
     }
 
+    /// IsArray (ES §7.2.2): an Array exotic object, or a Proxy whose target
+    /// is one (QuickJS `JS_IsArray` looks through the proxy; a revoked proxy
+    /// is a TypeError there, answered false here).
     func isArray(_ val: JeffJSValue) -> Bool {
         guard let obj = val.toObject() else { return false }
-        return obj.isArray
+        if obj.isArray { return true }
+        if case .proxyData(let pd) = obj.payload, !pd.isRevoked { return isArray(pd.target) }
+        return false
     }
 
     func strictEqual(_ a: JeffJSValue, _ b: JeffJSValue) -> Bool {

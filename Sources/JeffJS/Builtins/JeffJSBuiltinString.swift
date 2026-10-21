@@ -168,19 +168,19 @@ nonisolated struct JeffJSBuiltinString {
         ctx.setConstructorProto(ctor: ctor, proto: proto)
 
         // 4. Static methods on String
-        ctx.setPropertyFunc(obj: ctor, name: "fromCharCode",     fn: fromCharCode,     length: 1)
+        ctx.setPropertyFuncArgv(obj: ctor, name: "fromCharCode", fn: { c, t, p, n in fromCharCode(ctx: c, this: t, args: UnsafeBufferPointer(start: p, count: n)) }, length: 1)
         ctx.setPropertyFunc(obj: ctor, name: "fromCodePoint",    fn: fromCodePoint,    length: 1)
         ctx.setPropertyFunc(obj: ctor, name: "raw",              fn: raw,              length: 1)
 
         // 5. Prototype methods
         // Character access
-        ctx.setPropertyFunc(obj: proto, name: "charAt",       fn: charAt,       length: 1)
-        ctx.setPropertyFunc(obj: proto, name: "charCodeAt",   fn: charCodeAt,   length: 1)
+        ctx.setPropertyFuncArgv(obj: proto, name: "charAt", fn: { c, t, p, n in charAt(ctx: c, this: t, args: UnsafeBufferPointer(start: p, count: n)) }, length: 1)
+        ctx.setPropertyFuncArgv(obj: proto, name: "charCodeAt", fn: { c, t, p, n in charCodeAt(ctx: c, this: t, args: UnsafeBufferPointer(start: p, count: n)) }, length: 1)
         ctx.setPropertyFunc(obj: proto, name: "codePointAt",  fn: codePointAt,  length: 1)
         ctx.setPropertyFunc(obj: proto, name: "at",           fn: at,           length: 1)
 
         // Search
-        ctx.setPropertyFunc(obj: proto, name: "indexOf",      fn: indexOf,      length: 1)
+        ctx.setPropertyFuncArgv(obj: proto, name: "indexOf", fn: { c, t, p, n in indexOf(ctx: c, this: t, args: UnsafeBufferPointer(start: p, count: n)) }, length: 1)
         ctx.setPropertyFunc(obj: proto, name: "lastIndexOf",  fn: lastIndexOf,  length: 1)
         ctx.setPropertyFunc(obj: proto, name: "includes",     fn: includes,     length: 1)
         ctx.setPropertyFunc(obj: proto, name: "startsWith",   fn: startsWith,   length: 1)
@@ -623,7 +623,7 @@ nonisolated struct JeffJSBuiltinString {
     // MARK: - Static Methods
 
     /// `String.fromCharCode(...codeUnits)`
-    static func fromCharCode(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+    static func fromCharCode(ctx: JeffJSContext, this: JeffJSValue, args: UnsafeBufferPointer<JeffJSValue>) -> JeffJSValue {
         var buf = [UInt16]()
         buf.reserveCapacity(args.count)
         for arg in args {
@@ -735,7 +735,7 @@ nonisolated struct JeffJSBuiltinString {
         return JeffJSValue.makeString(JeffJSString(refCount: 1, len: 1, isWideChar: true, storage: .str16([UInt16(cu)])))
     }
 
-    static func charAt(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+    static func charAt(ctx: JeffJSContext, this: JeffJSValue, args: UnsafeBufferPointer<JeffJSValue>) -> JeffJSValue {
         guard let sv = requireThisStringValue(ctx: ctx, this: this, method: "charAt") else { return .exception }
         defer { sv.freeValue() }
         guard let js = sv.stringValue else { return ctx.newStringValue("") }
@@ -754,7 +754,7 @@ nonisolated struct JeffJSBuiltinString {
     }
 
     /// `String.prototype.charCodeAt(pos)`
-    static func charCodeAt(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+    static func charCodeAt(ctx: JeffJSContext, this: JeffJSValue, args: UnsafeBufferPointer<JeffJSValue>) -> JeffJSValue {
         guard let sv = requireThisStringValue(ctx: ctx, this: this, method: "charCodeAt") else { return .exception }
         defer { sv.freeValue() }
         guard let js = sv.stringValue else { return JeffJSValue.JS_NAN }
@@ -825,7 +825,7 @@ nonisolated struct JeffJSBuiltinString {
     // MARK: - Search Methods
 
     /// `String.prototype.indexOf(searchString [, position])`
-    static func indexOf(ctx: JeffJSContext, this: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
+    static func indexOf(ctx: JeffJSContext, this: JeffJSValue, args: UnsafeBufferPointer<JeffJSValue>) -> JeffJSValue {
         guard let str = requireThisUnits(ctx: ctx, this: this, method: "indexOf") else { return .exception }
         let searchStr: CodeUnits
         if args.isEmpty {
