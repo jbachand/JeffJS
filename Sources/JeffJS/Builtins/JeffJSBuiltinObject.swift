@@ -1315,6 +1315,38 @@ nonisolated struct JeffJSBuiltinObject {
             if source.isException { return source }
             defer { ctx.freeValue(source) }
 
+            // A plain source: one shape walk, values from the slots (an accessor
+            // runs its getter), [[Set]] on the target by atom. The generic path
+            // built a keys array and converted every key back to an atom twice.
+            if let so = source.toObject(), so.classID == JeffJSClassID.object.rawValue,
+               so._fastArrayValues == nil, (so.lazyFlags & JeffJSObject.lazyActiveMask) == 0,
+               (so.lazyFlags & JeffJSObject.lazyHostBit) == 0, let shape = so.shape {
+                // The key list is snapshotted first: a getter or a target setter
+                // can reshape the source (ES §20.1.2.1 reads the keys up front).
+                var atoms: [UInt32] = []
+                atoms.reserveCapacity(shape.prop.count)
+                for prop in shape.prop where prop.atom != 0 && prop.flags.contains(.enumerable) && !prop.flags.contains(.hidden) {
+                    if ctx.rt.atomIsSymbol(prop.atom), Int(prop.atom) < ctx.rt.atomCount,
+                       ctx.rt.atomArray[Int(prop.atom)]?.atomType == .JS_ATOM_TYPE_PRIVATE { continue }
+                    atoms.append(prop.atom)
+                }
+                for atom in atoms {
+                    let val: JeffJSValue
+                    if so.shape === shape, let idx = findShapeProperty(shape, atom), idx < so.propCount, so.extra(at: idx) == nil {
+                        val = so.dataValue(at: idx).dupValue()
+                    } else {
+                        // Reshaped meanwhile, or an accessor: [[Get]], and a key
+                        // deleted meanwhile is skipped (the spec re-checks its descriptor).
+                        guard jeffJS_findOwnProperty(obj: so, atom: atom).0 != nil else { continue }
+                        val = ctx.getProperty(obj: source, atom: atom)
+                        if val.isException { return val }
+                    }
+                    let ret = ctx.setProperty(obj: to, atom: atom, value: val)
+                    if ret < 0 { return .exception }
+                }
+                continue
+            }
+
             let keysArr = ctx.getOwnPropertyNames(source, flags: JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK | JS_GPN_ENUM_ONLY)
             if keysArr.isException { return keysArr }
             defer { ctx.freeValue(keysArr) }
