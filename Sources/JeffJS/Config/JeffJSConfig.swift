@@ -385,6 +385,7 @@ nonisolated enum JeffJSConfig {
     // MARK: - Stack / Memory
 
     static let maxCallDepth        = int("stack.maxCallDepth",         default: 200)
+    static let maxInlineDepth      = int("stack.maxInlineDepth",       default: 10000)
     static let maxLocalVars        = int("stack.maxLocalVars",         default: 65534)
     static let maxStackSize        = int("stack.maxStackSize",         default: 65534)
     static let defaultStackSize    = int("stack.defaultSize",          default: 1024 * 1024)
