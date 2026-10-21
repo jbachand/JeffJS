@@ -9,6 +9,7 @@
 // as specified by ECMA-262. NaN indicates an invalid date.
 
 import Foundation
+import Synchronization
 
 // MARK: - Internal Date Constants
 
@@ -232,9 +233,22 @@ nonisolated private func timeClip(_ t: Double) -> Double {
 /// `new Date("Dec 25, 1995 13:30:00")` came out an hour before QuickJS.
 nonisolated private func localOffsetMs(atUTC t: Double) -> Double {
     if t.isNaN || t.isInfinite { return 0 }
+    // Memoised per UTC minute (zone transitions fall on minute boundaries):
+    // TimeZone.secondsFromGMT(for:) goes through ICU and was most of
+    // `new Date(ms).getHours()` (date-number-format, 2026-10-20).
+    let minute = Int((t / 60_000.0).rounded(.down))
+    let hit: Double? = jeffJS_localOffsetCache.withLock { c -> Double? in
+        c.minute == minute ? c.offsetMs : nil
+    }
+    if let h = hit { return h }
     let secs = TimeZone.current.secondsFromGMT(for: Date(timeIntervalSince1970: t / 1000.0))
-    return Double(secs) * msPerSecond
+    let ms = Double(secs) * msPerSecond
+    jeffJS_localOffsetCache.withLock { c in c.minute = minute; c.offsetMs = ms }
+    return ms
 }
+
+nonisolated private struct JeffJSLocalOffsetCache { var minute: Int = .min; var offsetMs: Double = 0 }
+nonisolated private let jeffJS_localOffsetCache = Mutex(JeffJSLocalOffsetCache())
 
 /// LocalTZA — the current local timezone offset in milliseconds
 /// (kept for callers that have no particular instant in hand).

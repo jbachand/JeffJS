@@ -396,12 +396,41 @@ nonisolated func jsFcvt1(_ d: Double, nDigits: Int, format: DtoaFormat) -> Strin
 /// `|d| < 1e21` (callers handle the rest): exactly `nDigits` fractional digits,
 /// ties rounded up (away from zero), "-" only for `d < 0` (so `-0` gives "0.00"
 /// while `-0.0001` gives "-0.00").
+/// Fractional binary digits of a finite non-zero double (0 for an integer).
+nonisolated private func jeffJS_fractionBits(_ d: Double) -> Int {
+    let a = Swift.abs(d)
+    var mant = a.significandBitPattern
+    var e2: Int
+    if a.exponentBitPattern == 0 { e2 = -1074 } else { mant |= UInt64(1) << 52; e2 = Int(a.exponentBitPattern) - 1075 }
+    e2 += mant.trailingZeroBitCount
+    return e2 < 0 ? -e2 : 0
+}
+
+/// `%.*f` of a finite |d| < 1e21 (correctly rounded by libc); `-0` keeps
+/// its sign as `"-0.00"`-style output does in Number::toString? No: ES
+/// toFixed of -0 is "0"; callers pass d != 0 only.
+nonisolated private func jeffJS_printfFixed(_ d: Double, _ f: Int) -> String {
+    return withUnsafeTemporaryAllocation(of: CChar.self, capacity: 400) { buf -> String in
+        let n = withVaList([Int32(f), d]) { va in vsnprintf(buf.baseAddress, 400, "%.*f", va) }
+        if n <= 0 || n >= 400 { return String(d) }
+        return String(cString: buf.baseAddress!)
+    }
+}
+
 nonisolated private func formatDoubleFrac(_ d: Double, nDigits: Int) -> String {
     if d.isNaN { return "NaN" }
     if d.isInfinite { return d < 0 ? "-Infinity" : "Infinity" }
     let f = max(nDigits, 0)
     if Swift.abs(d) >= 1e21 { return formatDoubleFree(d) }
 
+    // printf's %.*f is exact and correctly rounded, but rounds an exact tie
+    // to even where ES wants "the larger n" (0.5.toFixed(0) is "1"). A tie
+    // at digit f+1 needs the value's exact expansion to end there, i.e. no
+    // more than f+1 fractional binary digits; anything with more goes to
+    // printf, the rest (2.5, 0.125) keeps the exact path.
+    if d != 0, f <= 100, jeffJS_fractionBits(d) > f + 1 {
+        return jeffJS_printfFixed(d, f)
+    }
     var m: String
     if d == 0 {
         m = "0"
