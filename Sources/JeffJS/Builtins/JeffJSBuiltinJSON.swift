@@ -272,6 +272,14 @@ nonisolated struct JeffJSBuiltinJSON {
 
         let value = args[0]
 
+        // No replacer function, no property list, no indentation: the buffer
+        // serializer (JeffJSBuiltinJSONFast.swift). nil = it declined before
+        // any user code ran; the generic path below takes over.
+        if sCtx.replacerFunc == nil, sCtx.propertyList == nil, sCtx.gap.isEmpty,
+           let fast = stringifyFast(ctx: ctx, root: value) {
+            return fast
+        }
+
         // Create a wrapper object: {"": value}
         let wrapper = ctx.newPlainObject()
         ctx.setPropertyStr(obj: wrapper, name: "", value: value.dupValue())
