@@ -1284,6 +1284,8 @@ thread's scratchpad: 14–8 000 cases each, identical output except where JSC's 
 | " | `JSON.stringify` common call (no replacer/list/gap): one code-unit buffer, values from property slots in the shape's cached key order, strings quoted from code units (`JeffJSBuiltinJSONFast.swift`); typed arrays serialize their index keys | json-stringify | 357 → 163 (91) |
 | " | toFixed via libc `%.*f` unless an exact tie is possible; `Number::toString` over UTF-8 bytes; local zone offset memoised per UTC minute | date-number-format | 391 → 269 (91) |
 | " | `jeffJS_concatStrings` appends in place into a flat left operand the caller owns every reference to (`ownedRefs`), as `js_concat_string` does | template-html / template-literals | 234 → 190 / 188 → 158 (43 / 34) |
+| perf/spread-entries | `Object.entries` / `Object.values` / `Object.assign` from the shape's key list and the property slots; `f(...arr)` through the frame's stack slots (no owned array) | for-in-entries / object-assign / rest-spread | 266 → 225 / 258 → 127 / 365 → 339 (85 / 72 / 113) |
+| " | one regex VM per pattern reused across execs; `[Symbol.split]` searches for the next match instead of a sticky probe per position (also fixes the split limit inside captures) | string-replace-regex / regex-tokenize | 230 → 113 / 60 → 52 (52 / 7) |
 | perf/polymorphic-ic | side lists per site (≤ 8 entries, slot-indexed, POD) for polymorphic receivers and prototype hits 2–3 levels up, gated by a per-entry state byte; cached getters run on the fused and method-receiver sites too | polymorphic-access / class-hierarchy | 110 → 93 / 344 → 314 (31 / 70) |
 
 Suite total 6488 → 4736 ms (3.7x → 2.7x QuickJS); `watch_deepmerge` 1407 → 1184 ms (QuickJS 520).
