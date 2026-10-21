@@ -30,6 +30,17 @@ nonisolated struct JeffJSRawStack<T: AnyObject> {
         count += 1
     }
 
+    /// Park an entry the caller hands over as an unretained handle: one
+    /// retain for the stack's own reference and nothing else (`append(b[i])`
+    /// loaded a strong temporary out of the buffer, a pair on top).
+    @inline(__always)
+    mutating func appendRetaining(_ u: Unmanaged<T>) {
+        precondition(retaining)
+        if count == capacity { grow() }
+        base.unsafelyUnwrapped[count] = u.retain()
+        count += 1
+    }
+
     @inline(__always)
     mutating func popLast() -> T? {
         if count == 0 { return nil }
