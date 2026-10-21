@@ -1395,6 +1395,56 @@ nonisolated(unsafe) let jeffJS_threadOwnerKey: pthread_key_t = {
     return k
 }()
 
+/// Threads that run their own runtime concurrently with others (see
+/// `JeffJSThreadRuntime`). 0: `activeRuntime` is the one process-wide value.
+nonisolated let jeffJS_threadRuntimesActive = Atomic<Int>(0)
+
+nonisolated(unsafe) let jeffJS_threadRuntimeKey: pthread_key_t = {
+    var k = pthread_key_t()
+    pthread_key_create(&k, nil)
+    return k
+}()
+
+/// A thread that owns a runtime of its own and runs it while other threads
+/// run theirs (a Web Worker). QuickJS keeps no process-wide "current runtime";
+/// JeffJS does (`JeffJSGCObjectHeader.activeRuntime`), so such a thread gets
+/// its own copy of it:
+///
+///     JeffJSThreadRuntime.enter()      // first, before JeffJSRuntime()
+///     let rt = JeffJSRuntime(); let ctx = rt.newContext() ...
+///     ... run, then rt.free() on this thread ...
+///     JeffJSThreadRuntime.leave()
+///
+/// Everything else about a runtime already is per runtime (atoms, shapes,
+/// pools, GC lists, the bytecode cache's memory tier). Values never cross
+/// runtimes: hosts pass Swift data between them.
+nonisolated public enum JeffJSThreadRuntime {
+    nonisolated final class Slot {
+        var runtime: JeffJSRuntime?
+    }
+
+    /// Gives the calling thread its own `activeRuntime` (initially nil).
+    public static func enter() {
+        guard pthread_getspecific(jeffJS_threadRuntimeKey) == nil else { return }
+        let slot = Slot()
+        pthread_setspecific(jeffJS_threadRuntimeKey, Unmanaged.passRetained(slot).toOpaque())
+        jeffJS_threadRuntimesActive.add(1, ordering: .relaxed)
+    }
+
+    /// Ends `enter()` on the calling thread (after its runtime was freed).
+    public static func leave() {
+        guard let p = pthread_getspecific(jeffJS_threadRuntimeKey) else { return }
+        jeffJS_threadRuntimesActive.subtract(1, ordering: .relaxed)
+        pthread_setspecific(jeffJS_threadRuntimeKey, nil)
+        let slot = Unmanaged<Slot>.fromOpaque(p)
+        slot.takeUnretainedValue().runtime = nil
+        slot.release()
+    }
+
+    /// True on a thread between `enter()` and `leave()`.
+    public static var isOwnThread: Bool { pthread_getspecific(jeffJS_threadRuntimeKey) != nil }
+}
+
 /// Base class for every GC-managed object.
 // nonisolated: GC objects are created and freed on whatever thread runs the
 // engine. Without this they inherit the host's default actor isolation (React
@@ -1431,10 +1481,32 @@ nonisolated class JeffJSGCObjectHeader {
 
     /// The currently active runtime. Set by JeffJSContext during init and eval
     /// so that newly created objects automatically know their owning runtime.
-    /// nonisolated(unsafe) because JeffJS is single-threaded per runtime.
     /// Strong for the same side-table reason; runtime.free() clears it when
     /// it points at the runtime being freed.
-    nonisolated(unsafe) static var activeRuntime: JeffJSRuntime?
+    ///
+    /// One process-wide value, except on a thread that called
+    /// `JeffJSThreadRuntime.enter()` (a worker running its own runtime at the
+    /// same time as the page's): there it reads and writes that thread's own
+    /// slot, so two runtimes can run JS concurrently. While no such thread
+    /// exists this costs one load and a predictable branch.
+    static var activeRuntime: JeffJSRuntime? {
+        @inline(__always) get {
+            if jeffJS_threadRuntimesActive.load(ordering: .relaxed) != 0,
+               let slot = pthread_getspecific(jeffJS_threadRuntimeKey) {
+                return Unmanaged<JeffJSThreadRuntime.Slot>.fromOpaque(slot).takeUnretainedValue().runtime
+            }
+            return _sharedActiveRuntime
+        }
+        @inline(__always) set {
+            if jeffJS_threadRuntimesActive.load(ordering: .relaxed) != 0,
+               let slot = pthread_getspecific(jeffJS_threadRuntimeKey) {
+                Unmanaged<JeffJSThreadRuntime.Slot>.fromOpaque(slot).takeUnretainedValue().runtime = newValue
+                return
+            }
+            _sharedActiveRuntime = newValue
+        }
+    }
+    nonisolated(unsafe) static var _sharedActiveRuntime: JeffJSRuntime?
 
     init(refCount: Int = 1,
          gcObjType: JSGCObjectTypeEnum = .jsObject,

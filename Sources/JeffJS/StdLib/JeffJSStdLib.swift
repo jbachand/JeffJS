@@ -59,18 +59,22 @@ nonisolated struct JeffJSStdLib {
 
     /// Per-context console message callback: (level, message) -> Void.
     /// When set, console output routes here instead of stdout.
-    private static var consoleCallbacks: [ObjectIdentifier: (String, String) -> Void] = [:]
+    nonisolated(unsafe) private static var consoleCallbacks: [ObjectIdentifier: (String, String) -> Void] = [:]
+    /// Guards `consoleCallbacks` and `contextStates`: contexts of different
+    /// runtimes run on different threads (workers, `JeffJSThreadRuntime`).
+    private static let tablesLock = NSLock()
 
     /// Set a callback to receive console messages for a given context.
     static func setConsoleCallback(ctx: JeffJSContext, callback: @escaping (String, String) -> Void) {
         let key = ObjectIdentifier(ctx as AnyObject)
-        consoleCallbacks[key] = callback
+        tablesLock.lock(); consoleCallbacks[key] = callback; tablesLock.unlock()
     }
 
     /// Emit a console message: routes to callback if set, otherwise prints to stdout.
     private static func emitConsole(ctx: JeffJSContext, level: String, message: String) {
         let key = ObjectIdentifier(ctx as AnyObject)
-        if let cb = consoleCallbacks[key] {
+        tablesLock.lock(); let callback = consoleCallbacks[key]; tablesLock.unlock()
+        if let cb = callback {
             cb(level, message)
         } else {
             print("[console.\(level)] \(message)")
@@ -110,16 +114,17 @@ nonisolated struct JeffJSStdLib {
     /// Remove console callback (call when context is freed).
     static func removeConsoleCallback(ctx: JeffJSContext) {
         let key = ObjectIdentifier(ctx as AnyObject)
-        consoleCallbacks.removeValue(forKey: key)
+        tablesLock.lock(); consoleCallbacks.removeValue(forKey: key); tablesLock.unlock()
     }
 
     // Per-context state stored as opaque data on the context.
     // This holds timer lists, console counters, etc.
-    private static var contextStates: [ObjectIdentifier: JeffJSStdLibState] = [:]
+    nonisolated(unsafe) private static var contextStates: [ObjectIdentifier: JeffJSStdLibState] = [:]
 
     /// Retrieve or create the per-context standard library state.
     private static func getState(ctx: JeffJSContext) -> JeffJSStdLibState {
         let key = ObjectIdentifier(ctx as AnyObject)
+        tablesLock.lock(); defer { tablesLock.unlock() }
         if let state = contextStates[key] {
             return state
         }
@@ -131,7 +136,7 @@ nonisolated struct JeffJSStdLib {
     /// Remove per-context state (call when context is freed).
     static func removeState(ctx: JeffJSContext) {
         let key = ObjectIdentifier(ctx as AnyObject)
-        contextStates.removeValue(forKey: key)
+        tablesLock.lock(); contextStates.removeValue(forKey: key); tablesLock.unlock()
     }
 
     // MARK: - Master Registration
