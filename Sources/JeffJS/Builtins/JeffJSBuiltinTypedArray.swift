@@ -294,9 +294,27 @@ nonisolated func jeffJS_typedArrayStore(_ classID: Int, _ p: UnsafeMutableRawPoi
     }
 }
 
-/// Lookup TypedArrayElementInfo by classID.
+/// `typedArrayInfoTable` indexed by `classID - uint8cArray` (the typed-array
+/// class ids are the contiguous range uint8cArray...float64Array). The linear
+/// `first { $0.classID == classID }` search this replaced ran on every
+/// element read and write of a typed array that missed the inline fast
+/// path (set, subarray, DataView, iteration) and was 1.8 % of all time on
+/// bench/realworld.js (perf/typed-array-info, 2026-10-20).
+nonisolated(unsafe) let typedArrayInfoByClassID: [TypedArrayElementInfo?] = {
+    let base = JeffJSClassID.uint8cArray.rawValue
+    let count = JeffJSClassID.float64Array.rawValue - base + 1
+    var table = [TypedArrayElementInfo?](repeating: nil, count: count)
+    for info in typedArrayInfoTable { table[info.classID - base] = info }
+    return table
+}()
+
+/// Lookup TypedArrayElementInfo by classID (QuickJS reads it straight off
+/// `typed_array_size_log2(class_id)`; this is the same O(1) table read).
+@inline(__always)
 nonisolated func typedArrayInfo(forClassID classID: Int) -> TypedArrayElementInfo? {
-    return typedArrayInfoTable.first { $0.classID == classID }
+    let i = classID - JeffJSClassID.uint8cArray.rawValue
+    if i < 0 || i >= typedArrayInfoByClassID.count { return nil }
+    return typedArrayInfoByClassID[i]
 }
 
 // MARK: - ArrayBuffer Helpers
