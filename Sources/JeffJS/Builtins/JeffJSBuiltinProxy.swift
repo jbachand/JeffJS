@@ -336,14 +336,7 @@ nonisolated func js_proxy_getOwnPropertyDescriptor(_ ctx: JeffJSContext,
     }
 
     // Call trap(target, key).
-    let propName: JeffJSValue
-    if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
-        propName = JeffJSValue.borrowedSymbol(sym).dupValue()
-    } else if let name = ctx.rt.atomToString(atom) {
-        propName = ctx.newStringValue(name)
-    } else {
-        propName = .undefined
-    }
+    let propName = ctx.proxyTrapKey(atom)
     let result = ctx.callFunction(trap, thisVal: pd.handler, args: [pd.target, propName])
     if result.isException { return result }
 
@@ -372,14 +365,7 @@ nonisolated func js_proxy_defineProperty(_ ctx: JeffJSContext,
     }
 
     // Call trap(target, key, descriptor).
-    let propName: JeffJSValue
-    if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
-        propName = JeffJSValue.borrowedSymbol(sym).dupValue()
-    } else if let name = ctx.rt.atomToString(atom) {
-        propName = ctx.newStringValue(name)
-    } else {
-        propName = .undefined
-    }
+    let propName = ctx.proxyTrapKey(atom)
     let result = ctx.callFunction(trap, thisVal: pd.handler, args: [pd.target, propName, desc])
     if result.isException { return result }
     return result.toBool() ? .JS_TRUE : .JS_FALSE
@@ -402,14 +388,7 @@ nonisolated func js_proxy_has(_ ctx: JeffJSContext,
     }
 
     // Call trap(target, key).
-    let propName: JeffJSValue
-    if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
-        propName = JeffJSValue.borrowedSymbol(sym).dupValue()
-    } else if let name = ctx.rt.atomToString(atom) {
-        propName = ctx.newStringValue(name)
-    } else {
-        propName = .undefined
-    }
+    let propName = ctx.proxyTrapKey(atom)
     let result = ctx.callFunction(trap, thisVal: pd.handler, args: [pd.target, propName])
     if result.isException { return result }
     return JeffJSValue.newBool(result.toBool())
@@ -432,14 +411,7 @@ nonisolated func js_proxy_get(_ ctx: JeffJSContext,
     }
 
     // Call trap(target, key, receiver).
-    let propName: JeffJSValue
-    if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
-        propName = JeffJSValue.borrowedSymbol(sym).dupValue()
-    } else if let name = ctx.rt.atomToString(atom) {
-        propName = ctx.newStringValue(name)
-    } else {
-        propName = .undefined
-    }
+    let propName = ctx.proxyTrapKey(atom)
     let result = ctx.callFunction(trap, thisVal: pd.handler, args: [pd.target, propName, receiver])
     return result
 }
@@ -468,14 +440,7 @@ nonisolated func js_proxy_set(_ ctx: JeffJSContext,
     }
 
     // Call trap(target, key, value, receiver).
-    let propName: JeffJSValue
-    if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
-        propName = JeffJSValue.borrowedSymbol(sym).dupValue()
-    } else if let name = ctx.rt.atomToString(atom) {
-        propName = ctx.newStringValue(name)
-    } else {
-        propName = .undefined
-    }
+    let propName = ctx.proxyTrapKey(atom)
     let result = ctx.callFunction(trap, thisVal: pd.handler, args: [pd.target, propName, value, receiver])
     if result.isException { return result }
     return result.toBool() ? .JS_TRUE : .JS_FALSE
@@ -497,14 +462,7 @@ nonisolated func js_proxy_deleteProperty(_ ctx: JeffJSContext,
     }
 
     // Call trap(target, property).
-    let propName: JeffJSValue
-    if ctx.rt.atomIsSymbol(atom), let sym = ctx.rt.symbolStringForAtom(atom) {
-        propName = JeffJSValue.borrowedSymbol(sym).dupValue()
-    } else if let name = ctx.rt.atomToString(atom) {
-        propName = ctx.newStringValue(name)
-    } else {
-        propName = .undefined
-    }
+    let propName = ctx.proxyTrapKey(atom)
     let result = ctx.callFunction(trap, thisVal: pd.handler, args: [pd.target, propName])
     if result.isException { return result }
     return result.toBool() ? .JS_TRUE : .JS_FALSE
