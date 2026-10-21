@@ -571,39 +571,44 @@ nonisolated func findHashedShape(_ rt: JeffJSRuntime,
     h = shapeHash(h, atom)
     h = shapeHash(h, propFlags)
     let idx = Int(h & UInt32(rt.shapeHashSize - 1))
-    var cur = rt.shapeHash[idx]
-    while let shape = cur {
-        if shape.hash == h,
-           shape.proto === baseShape.proto,
-           shape.propCount == baseShape.propCount + 1 {
+    // The chain through unretained handles: `while let shape = cur` retained
+    // and released every shape visited (two pairs per property add on the
+    // deepmerge bench).
+    let baseProto = unsafeBitCast(baseShape.proto, to: UnsafeRawPointer?.self)
+    let baseU = Unmanaged.passUnretained(baseShape)
+    var curU = unsafeBitCast(rt.shapeHash[idx], to: UnsafeRawPointer?.self).map { Unmanaged<JeffJSShape>.fromOpaque($0) }
+    while let u = curU {
+        let (found, next): (Bool, Unmanaged<JeffJSShape>?) = u._withUnsafeGuaranteedRef { shape in
+            let next = unsafeBitCast(shape.shapeHashNext, to: UnsafeRawPointer?.self).map { Unmanaged<JeffJSShape>.fromOpaque($0) }
+            guard shape.hash == h,
+                  unsafeBitCast(shape.proto, to: UnsafeRawPointer?.self) == baseProto,
+                  shape.propCount == baseShape.propCount + 1 else { return (false, next) }
             let lastIdx = shape.propCount - 1
             let lastMatches = lastIdx < shape.prop.count &&
                 shape.prop[lastIdx].atom == atom &&
                 shape.prop[lastIdx].flags.rawValue == propFlags
-            if let parent = shape.parent {
+            if let pb = unsafeBitCast(shape.parent, to: UnsafeRawPointer?.self) {
                 // A transition recorded from a base shape: the base's identity
                 // proves the prefix, only the last property needs checking.
-                if parent === baseShape && lastMatches { return shape }
+                return (pb == UnsafeRawPointer(baseU.toOpaque()) && lastMatches, next)
             } else if lastMatches {
                 // No parent link (root or captured shapes): verify that the
                 // first N-1 properties match baseShape.
-                var matches = true
                 let baseCount = baseShape.propCount
                 if baseCount <= shape.prop.count {
                     for i in 0 ..< baseCount {
                         if shape.prop[i].atom  != baseShape.prop[i].atom ||
                            shape.prop[i].flags != baseShape.prop[i].flags {
-                            matches = false
-                            break
+                            return (false, next)
                         }
                     }
-                } else {
-                    matches = false
+                    return (true, next)
                 }
-                if matches { return shape }
             }
+            return (false, next)
         }
-        cur = shape.shapeHashNext
+        if found { return u.takeUnretainedValue() }
+        curU = next
     }
     return nil
 }

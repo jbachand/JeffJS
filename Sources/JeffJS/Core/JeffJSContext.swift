@@ -85,6 +85,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
 
     /// Shape for newly created plain arrays (class Array).
     var arrayShape: JeffJSShape?
+    /// `arrayShape` without a retain (newArray runs once per literal).
+    var arrayShapeU: Unmanaged<JeffJSShape>? {
+        @inline(__always) get { unsafeBitCast(arrayShape, to: UnsafeRawPointer?.self).map { Unmanaged<JeffJSShape>.fromOpaque($0) } }
+    }
     /// Lazy payload stub shapes (JeffJSLazyPayload.swift), one count held.
     var lazyObjectSentinel: JeffJSShape?
     var lazyArraySentinel: JeffJSShape?
@@ -1016,10 +1020,16 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // Recycled array (JeffJSObjectPool.swift): already an empty
         // `.array` payload with its `length` slot at 0; it only needs the
         // shared array shape (which fixes Array.prototype) and the GC list.
-        if let cached = arrayShape, cached.isHashed, let o = rt.arrayPool.popLast() {
+        if let csU = arrayShapeU, csU._withUnsafeGuaranteedRef({ $0.isHashed }), let o = rt.arrayPool.popLast() {
             o.refCount = 1
-            cached.refCount += 1
-            o.shape = cached
+            // A parked array keeps its shape and the count on it
+            // (jeffJS_recycleArray): on the shared array shape, as nearly
+            // every one is, nothing to swap (a release and a retain per array).
+            if o.shapeIdentity != UnsafeRawPointer(csU.toOpaque()) {
+                if let oldU = o.shapeU { oldU._withUnsafeGuaranteedRef { $0.refCount -= 1 } }   // hashed: never freed here
+                csU._withUnsafeGuaranteedRef { $0.refCount += 1 }
+                o.shape = csU.takeUnretainedValue()
+            }
             // (the prototype is read from the shape: nothing to mirror)
             addGCObject(rt, o)
             return JeffJSValue.makeObjectRecycled(o)

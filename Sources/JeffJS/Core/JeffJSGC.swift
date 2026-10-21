@@ -83,7 +83,7 @@ nonisolated func addGCObject(_ rt: JeffJSRuntime, _ header: JeffJSGCObjectHeader
     header.gcListIndex = rt.gcObjects.count
     rt.gcObjects.append(Unmanaged.passUnretained(header))
     header.mark = JeffJSGCMark.white
-    header.ownerRuntime = rt
+    if !header.isOwned(by: rt) { header.ownerRuntime = rt }
     // Track allocation size for GC threshold (actual collection deferred to safe points)
     rt.mallocState.mallocSize += JS_GC_OBJ_COST
     rt.mallocState.mallocCount += 1

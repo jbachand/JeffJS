@@ -1428,6 +1428,18 @@ nonisolated class JeffJSGCObjectHeader {
     final var _gcListIndex: Int32 = -1
     var gcObjType: JSGCObjectTypeEnum
     var mark: Bool
+    /// `ownerRuntime === rt` without materialising the strong reference
+    /// (addGCObject re-stored the same runtime on every recycled object: a
+    /// release of the old reference and a retain of the new, per object).
+    @inline(__always) final func isOwned(by rt: JeffJSRuntime) -> Bool {
+        unsafeBitCast(ownerRuntime, to: UnsafeRawPointer?.self) == UnsafeRawPointer(Unmanaged.passUnretained(rt).toOpaque())
+    }
+    /// The owning runtime without a retain (the recycle paths run their
+    /// whole body under `_withUnsafeGuaranteedRef`; `let rt = o.ownerRuntime`
+    /// was a retain/release pair per recycled object).
+    final var ownerRuntimeU: Unmanaged<JeffJSRuntime>? {
+        @inline(__always) get { unsafeBitCast(ownerRuntime, to: UnsafeRawPointer?.self).map { Unmanaged<JeffJSRuntime>.fromOpaque($0) } }
+    }
 
     /// The currently active runtime. Set by JeffJSContext during init and eval
     /// so that newly created objects automatically know their owning runtime.
@@ -1615,8 +1627,18 @@ nonisolated struct JeffJSBoundFunction {
 /// last holder lets go.
 nonisolated final class JeffJSForInKeyList {
     let keys: [JeffJSValue]
-    init(keys: [JeffJSValue]) { self.keys = keys }
-    deinit { for k in keys { k.freeValue() } }
+    /// The keys as a raw buffer (Object.keys fills the result array from
+    /// it: reading `keys` through the strong accessor copied the array, a
+    /// bridge retain/release per call).
+    let keysPtr: UnsafeMutablePointer<JeffJSValue>
+    let keysCount: Int
+    init(keys: [JeffJSValue]) {
+        self.keys = keys
+        keysCount = keys.count
+        keysPtr = UnsafeMutablePointer<JeffJSValue>.allocate(capacity: max(keys.count, 1))
+        keys.withUnsafeBufferPointer { b in if let base = b.baseAddress { keysPtr.initialize(from: base, count: b.count) } }
+    }
+    deinit { for k in keys { k.freeValue() }; keysPtr.deallocate() }
 }
 
 /// For-in iterator state: the key list being walked and the position. Lives
@@ -2479,6 +2501,12 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
     var shapeIdentity: UnsafeRawPointer? {
         @inline(__always) get { unsafeBitCast(shape, to: UnsafeRawPointer?.self) }
     }
+    /// The shape without a retain (the recycle paths read its count and
+    /// prototype through `_withUnsafeGuaranteedRef`; `if let s = shape`
+    /// cost a retain/release pair per recycled object).
+    var shapeU: Unmanaged<JeffJSShape>? {
+        @inline(__always) get { shapeIdentity.map { Unmanaged<JeffJSShape>.fromOpaque($0) } }
+    }
 
     /// Split property storage (see JeffJSProperty). `propValues` holds the data
     /// value for every slot (`.undefined` for accessor/varRef/autoInit slots);
@@ -2562,6 +2590,17 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
     }
     /// Detach the side box (freeObject): the object reads every boxed field
     /// as its default from here on; the caller owns the returned box.
+    /// `_fastArrayValues` without a retain.
+    final var _fastArrayValuesU: Unmanaged<JeffJSFastArrayStorage>? {
+        @inline(__always) get {
+            if (_flags & JeffJSObject.flagSlotIsAux) == 0 {
+                return unsafeBitCast(_slot, to: UnsafeRawPointer?.self).map { Unmanaged<JeffJSFastArrayStorage>.fromOpaque($0) }
+            }
+            return _auxU.unsafelyUnwrapped._withUnsafeGuaranteedRef {
+                unsafeBitCast($0.fastArrayValues, to: UnsafeRawPointer?.self).map { Unmanaged<JeffJSFastArrayStorage>.fromOpaque($0) }
+            }
+        }
+    }
     @inline(__always) final func takeAux() -> JeffJSObjectAux? {
         guard let a = aux else { return nil }
         aux = nil   // the slot gets the array store back, if any
@@ -3126,6 +3165,19 @@ nonisolated final class JeffJSObjectAux: JeffJSSideSlot {
         get { Int(_varRefsRawCount) }
         set { _varRefsRawCount = Int32(truncatingIfNeeded: newValue) }
     }
+    /// The `.bytecodeFunc` payload's body without copying the enum: the
+    /// enum's payload is laid out in place, and the function bytecode is its
+    /// first field (an optional class reference), so its bits are read
+    /// straight from the storage once the case is known. Nil for any other
+    /// case or a nil body.
+    var payloadBytecodeFuncU: Unmanaged<JeffJSFunctionBytecode>? {
+        // The mirror is set for every compiled body (createClosure,
+        // compileLazy); a closure over a body still pending lazy compilation
+        // has none and takes the copying match (rare: it was never called).
+        if let u = fbFastU { return u }
+        if case .bytecodeFunc(let fb, _, _) = payload, let fb { return Unmanaged.passUnretained(fb) }
+        return nil
+    }
     /// Unretained view of `fbFast` (its bits; no field).
     var fbFastU: Unmanaged<JeffJSFunctionBytecode>? {
         @inline(__always) get {
@@ -3133,20 +3185,26 @@ nonisolated final class JeffJSObjectAux: JeffJSSideSlot {
         }
     }
     /// An array's element store while the array also needs this box.
+    /// `rare` without a retain: `rare?.field` materialised a strong
+    /// reference to the box, a retain/release pair per read (two per native
+    /// call: cFuncFast + cMagicFast).
+    @inline(__always) private var rareU: Unmanaged<JeffJSObjectAuxRare>? {
+        unsafeBitCast(rare, to: UnsafeRawPointer?.self).map { Unmanaged<JeffJSObjectAuxRare>.fromOpaque($0) }
+    }
     var fastArrayValues: JeffJSFastArrayStorage? {
-        get { rare?.fastArrayValues }
+        get { rareU?._withUnsafeGuaranteedRef { $0.fastArrayValues } }
         set { if newValue == nil && rare == nil { return }; rareBox().fastArrayValues = newValue }
     }
     var cFuncFast: JSCFunctionType? {
-        get { rare?.cFuncFast }
+        get { rareU?._withUnsafeGuaranteedRef { $0.cFuncFast } }
         set { if newValue == nil && rare == nil { return }; rareBox().cFuncFast = newValue }
     }
     var cMagicFast: Int {
-        get { Int(rare?.cMagicFast ?? 0) }
+        get { Int(rareU?._withUnsafeGuaranteedRef { $0.cMagicFast } ?? 0) }
         set { if newValue == 0 && rare == nil { return }; rareBox().cMagicFast = Int32(truncatingIfNeeded: newValue) }
     }
     var storedCFunctionLength: Int {
-        get { Int(rare?.storedCFunctionLength ?? 0) }
+        get { Int(rareU?._withUnsafeGuaranteedRef { $0.storedCFunctionLength } ?? 0) }
         set { if newValue == 0 && rare == nil { return }; rareBox().storedCFunctionLength = Int32(truncatingIfNeeded: newValue) }
     }
     var weakrefCount: UInt32 {
@@ -3233,12 +3291,20 @@ nonisolated extension JeffJSObject {
     var isPoolableArray: Bool {
         guard classID == JeffJSClassID.array.rawValue, fastArray, extensible, !isExotic,
               !isProtectedGlobal, !hasImmutablePrototype, !isHTMLDDA, !isStdArrayPrototype,
-              !isConstructor, firstWeakRef == nil, _propExtraCount == 0,
-              storedPrimitiveValue.isUndefined, fbFast == nil, arrowThisVal == nil,
-              storedCFunction == nil, lazyFlags == 0,
-              let st = _fastArrayValues, !st.checked, st.attrs == nil,
-              let sh = shape, sh.isHashed, sh.propCount == 1, propValues.count == 1,
-              sh.prop[0].atom == JeffJSAtomID.JS_ATOM_length.rawValue else { return false }
+              !isConstructor, _propExtraCount == 0, lazyFlags == 0, propValues.count == 1,
+              let stU = _fastArrayValuesU, stU._withUnsafeGuaranteedRef({ !$0.checked && $0.attrs == nil }),
+              let shU = shapeU, shU._withUnsafeGuaranteedRef({ sh in
+                  sh.isHashed && sh.propCount == 1 && sh.prop[0].atom == JeffJSAtomID.JS_ATOM_length.rawValue })
+        else { return false }
+        // The side-box fields (an array rarely has a box): read once, without
+        // a retain each (`fbFast == nil` / `firstWeakRef == nil` through the
+        // strong accessors cost a pair apiece per recycled array).
+        if let u = _auxU {
+            return u._withUnsafeGuaranteedRef { a in
+                a.firstWeakRef == nil && a.storedPrimitiveValue.isUndefined && a.fbFastU == nil
+                    && a.arrowThisVal == nil && a.storedCFunction == nil
+            }
+        }
         return true
     }
 

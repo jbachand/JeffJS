@@ -1441,17 +1441,22 @@ nonisolated extension JeffJSContext {
         // otherwise into `childVarRefs`, which is also the payload's list.
         var childVarRefs: [JeffJSVarRef?] = []
         let lean = jeffJSLeanClosurePayload
-        var leanAux: JeffJSObjectAux? = nil
+        // Unretained: the object owns its box; a strong `leanAux` cost a
+        // retain/release pair per closure plus one per captured variable.
+        var leanAux: Unmanaged<JeffJSObjectAux>? = nil
         if !innerFB.closureVarsList.isEmpty {
-            let closureVars = innerFB.closureVarsList
             if lean {
-                let a = obj.ensureAux()
-                a.beginVarRefs(closureVars.count)
-                leanAux = a
+                _ = obj.ensureAux()
+                let aU = obj._auxU.unsafelyUnwrapped
+                aU._withUnsafeGuaranteedRef { $0.beginVarRefs(Int(innerFB.closureVarCount)) }
+                leanAux = aU
             } else {
-                childVarRefs.reserveCapacity(closureVars.count)
+                childVarRefs.reserveCapacity(Int(innerFB.closureVarCount))
             }
-            for cv in closureVars {
+            // Over the list's buffer: `for cv in innerFB.closureVarsList`
+            // retained and released the array (a bridge pair) per closure.
+            innerFB.closureVarsList.withUnsafeMutableBufferPointer { closureVarsBuf in
+            for cv in closureVarsBuf {
                 if cv.isLocal {
                     // The closure var references the parent's own local/arg slot.
                     // Check if we already have a live var_ref for this exact slot
@@ -1461,10 +1466,14 @@ nonisolated extension JeffJSContext {
                         // Plain index loop (the `first { }` predicate closure
                         // retained every element it looked at).
                         let wantIdx = UInt16(cv.varIdx), wantArg = cv.isArg
-                        parentFrame.liveVarRefs.withUnsafeBufferPointer { lv in
+                        // The mutable form reads the array in place (the
+                        // immutable one copied it: a bridge retain/release
+                        // per closure); entries are read through unretained
+                        // handles.
+                        parentFrame.liveVarRefs.withUnsafeMutableBufferPointer { lv in
                             for i in 0..<lv.count {
-                                let v = lv[i]
-                                if v.varIdx == wantIdx && v.isArg == wantArg && !v.isDetached { existingVR = v; break }
+                                let u = Unmanaged.passUnretained(lv[i])
+                                if u._withUnsafeGuaranteedRef({ $0.varIdx == wantIdx && $0.isArg == wantArg && !$0.isDetached }) { existingVR = lv[i]; break }
                             }
                         }
                     } else {
@@ -1475,7 +1484,7 @@ nonisolated extension JeffJSContext {
                         }
                     }
                     if let vr = existingVR {
-                        if let la = leanAux { la.appendVarRef(vr) } else { childVarRefs.append(vr) }
+                        if let la = leanAux { la._withUnsafeGuaranteedRef { $0.appendVarRef(vr) } } else { childVarRefs.append(vr) }
                     } else {
                         let vr: JeffJSVarRef
                         if jeffJSRecycleVarRefs, let pv = rt.varRefPool.popLast() {
@@ -1510,7 +1519,7 @@ nonisolated extension JeffJSContext {
                         }
                         parentFrame.liveVarRefs.append(vr)
                         parentFrame.hasLiveVarRefs = true
-                        if let la = leanAux { la.appendVarRef(vr) } else { childVarRefs.append(vr) }
+                        if let la = leanAux { la._withUnsafeGuaranteedRef { $0.appendVarRef(vr) } } else { childVarRefs.append(vr) }
                     }
                 } else {
                     // The closure var references the parent's own closure var
@@ -1518,19 +1527,21 @@ nonisolated extension JeffJSContext {
                     let parentIdx = cv.varIdx
                     if parentRawCount >= 0 {
                         if let la = leanAux {
-                            la.appendVarRefUnmanaged(parentIdx < parentRawCount ? parentRaw![parentIdx] : nil)
+                            let e = parentIdx < parentRawCount ? parentRaw![parentIdx] : nil
+                            la._withUnsafeGuaranteedRef { $0.appendVarRefUnmanaged(e) }
                         } else if parentIdx < parentRawCount, let u = parentRaw![parentIdx] {
                             childVarRefs.append(u.takeUnretainedValue())
                         } else {
                             childVarRefs.append(nil)
                         }
                     } else if parentIdx < varRefs.count {
-                        if let la = leanAux { la.appendVarRef(varRefs[parentIdx]) } else { childVarRefs.append(varRefs[parentIdx]) }
+                        if let la = leanAux { la._withUnsafeGuaranteedRef { $0.appendVarRef(varRefs[parentIdx]) } } else { childVarRefs.append(varRefs[parentIdx]) }
                     } else {
-                        if let la = leanAux { la.appendVarRef(nil) } else { childVarRefs.append(nil) }
+                        if let la = leanAux { la._withUnsafeGuaranteedRef { $0.appendVarRef(nil) } } else { childVarRefs.append(nil) }
                     }
                 }
             }
+            }   // withUnsafeBufferPointer
         }
 
         // ES2015 §14.2.16 / §12.3.5: an arrow function has no [[HomeObject]] of its
@@ -1601,8 +1612,12 @@ nonisolated extension JeffJSContext {
                 }
             }
         }
-        // Set proto after shape (proto may already be synced via shape)
-        obj.proto = closureProto
+        // Set proto after shape (proto may already be synced via shape).
+        // Already there (the shared root shape, or a recycled closure's kept
+        // shape): the setter cost two retain/release pairs per closure.
+        if obj.protoRaw != unsafeBitCast(closureProto, to: UnsafeRawPointer?.self) {
+            obj.proto = closureProto
+        }
 
         // A pooled object still holds its original creation retain.
         let funcVal = recycled != nil ? JeffJSValue.makeObjectRecycled(obj) : JeffJSValue.makeObject(obj)
@@ -9138,7 +9153,7 @@ nonisolated struct JeffJSInterpreter {
                     // call_method; the parser decides which).
                     let callThis: JeffJSValue = .undefined
                     do { // inline call (expanded; no nested-function capture of hot locals)
-                        let e_fastFb = fastFb
+                        // (`let fastFb = fastFb` was a retain/release pair per call)
                         let e_callObj = callObj
                         let e_funcVal = funcVal
                         let e_argc = argc
@@ -9154,12 +9169,12 @@ nonisolated struct JeffJSInterpreter {
                             bc: bc, bcLen: bcLen, fb: fb,
                             frame: frame,
                             funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned))
-                        fb = e_fastFb
-                        bc = e_fastFb.bcPtrFast ?? e_fastFb.bytecodePtr
-                        bcLen = e_fastFb.bytecodeLen
+                        fb = fastFb
+                        bc = fastFb.bcPtrFast ?? fastFb.bytecodePtr
+                        bcLen = fastFb.bytecodeLen
                         // Only functions with closure variables need their varRefs
                         // array (a retain/release pair per assignment otherwise).
-                        if e_fastFb.closureVarCount > 0 {
+                        if fastFb.closureVarCount > 0 {
                             vrRaw = e_callObj.varRefsRaw; vrCount = e_callObj.varRefsRawCount
                             varRefsLoaded = true
                         } else if varRefsLoaded {
@@ -9171,19 +9186,19 @@ nonisolated struct JeffJSInterpreter {
                         unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
                         newFrame.prevFrame = ctx.currentFrame
                         newFrame.curFunc = e_funcVal
-                        if e_fastFb.isArrow, let arrowThis = e_callObj.arrowThisVal {
+                        if fastFb.isArrow, let arrowThis = e_callObj.arrowThisVal {
                             newFrame.thisVal = arrowThis
-                        } else if !e_fastFb.isStrictMode && e_thisVal.isNullOrUndefined {
+                        } else if !fastFb.isStrictMode && e_thisVal.isNullOrUndefined {
                             // ES §10.2.1.2: sloppy callees see the global object.
                             newFrame.thisVal = ctx.globalObj
                         } else {
                             newFrame.thisVal = e_thisVal
                         }
                         newFrame.argCount = e_argc
-                        let newVarCount = Int(e_fastFb.varCount)
+                        let newVarCount = Int(fastFb.varCount)
                         newFrame.varCount = newVarCount
-                        let fbArgCount = Int(e_fastFb.argCount); let newArgSlots = fbArgCount > e_argc ? fbArgCount : e_argc
-                        let fbStack = Int(e_fastFb.stackSize); let newStackSlots = (fbStack > 4 ? fbStack : 4) + 32
+                        let fbArgCount = Int(fastFb.argCount); let newArgSlots = fbArgCount > e_argc ? fbArgCount : e_argc
+                        let fbStack = Int(fastFb.stackSize); let newStackSlots = (fbStack > 4 ? fbStack : 4) + 32
                         let newTotalSlots = newArgSlots + newVarCount + newStackSlots
                         let newBuf: UnsafeMutablePointer<JeffJSValue>
                         let newBufCap: Int
@@ -9210,7 +9225,7 @@ nonisolated struct JeffJSInterpreter {
                                                                       initializedPrefix: newArgSlots + newVarCount)
                             // Own buffer: borrow the caller's argument slots, or
                             // take copies when the callee owns its slots.
-                            if e_fastFb.copiesArgs {
+                            if fastFb.copiesArgs {
                                 for i in 0..<e_argc { newBuf[i] = buf[argStart + i].dupValue() }
                             } else {
                                 for i in 0..<e_argc { newBuf[i] = buf[argStart + i] }
@@ -9226,8 +9241,8 @@ nonisolated struct JeffJSInterpreter {
                         spBase = newArgSlots + newVarCount
                         sp = spBase
                         // Named function expression self-reference (ES §15.2.4).
-                        if e_fastFb.selfRefVarIdx >= 0 {
-                            buf[varBase + e_fastFb.selfRefVarIdx] = e_funcVal.dupValue()
+                        if fastFb.selfRefVarIdx >= 0 {
+                            buf[varBase + fastFb.selfRefVarIdx] = e_funcVal.dupValue()
                         }
                         frame.buf = buf
                         frame.bufCapacity = bufCapacity
@@ -9838,7 +9853,12 @@ nonisolated struct JeffJSInterpreter {
                     bcLen = saved.bcLen
                     fb = saved.fb
                     frame = saved.frame
-                    if saved.fb.closureVarCount > 0 { vrRaw = saved.funcObj.obj?.varRefsRaw; vrCount = saved.funcObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
+                    // The caller's var-refs from its function object: reading
+                    // `saved.fb.closureVarCount` through the unowned(unsafe)
+                    // field materialised a strong reference (a retain/release
+                    // pair per inline return). A closure's raw list has one
+                    // entry per closure variable, so the count test is the same.
+                    if let fo = saved.funcObj.obj, fo.varRefsRawCount > 0 { vrRaw = fo.varRefsRaw; vrCount = fo.varRefsRawCount; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                     mFuncObj = saved.funcObj
                     mFlags = saved.flags; bufOwned = saved.bufOwned
                     // 4. Push return value onto caller's stack
@@ -9873,7 +9893,12 @@ nonisolated struct JeffJSInterpreter {
                     bcLen = saved.bcLen
                     fb = saved.fb
                     frame = saved.frame
-                    if saved.fb.closureVarCount > 0 { vrRaw = saved.funcObj.obj?.varRefsRaw; vrCount = saved.funcObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
+                    // The caller's var-refs from its function object: reading
+                    // `saved.fb.closureVarCount` through the unowned(unsafe)
+                    // field materialised a strong reference (a retain/release
+                    // pair per inline return). A closure's raw list has one
+                    // entry per closure variable, so the count test is the same.
+                    if let fo = saved.funcObj.obj, fo.varRefsRawCount > 0 { vrRaw = fo.varRefsRaw; vrCount = fo.varRefsRawCount; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                     mFuncObj = saved.funcObj
                     mFlags = saved.flags; bufOwned = saved.bufOwned
                     if !saved.dropResult { buf[sp] = .undefined; sp += 1 }
@@ -14370,7 +14395,12 @@ nonisolated struct JeffJSInterpreter {
                     bcLen = saved.bcLen
                     fb = saved.fb
                     frame = saved.frame
-                    if saved.fb.closureVarCount > 0 { vrRaw = saved.funcObj.obj?.varRefsRaw; vrCount = saved.funcObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
+                    // The caller's var-refs from its function object: reading
+                    // `saved.fb.closureVarCount` through the unowned(unsafe)
+                    // field materialised a strong reference (a retain/release
+                    // pair per inline return). A closure's raw list has one
+                    // entry per closure variable, so the count test is the same.
+                    if let fo = saved.funcObj.obj, fo.varRefsRawCount > 0 { vrRaw = fo.varRefsRaw; vrCount = fo.varRefsRawCount; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                     mFuncObj = saved.funcObj
                     mFlags = saved.flags; bufOwned = saved.bufOwned
                     // Scan caller's stack for catch handler (skipped entirely

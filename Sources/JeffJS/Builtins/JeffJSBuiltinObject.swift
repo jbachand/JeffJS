@@ -595,18 +595,25 @@ nonisolated extension JeffJSContext {
         // array are: its index keys live in the backing buffer, not in the
         // shape, so the cached key list is missing every one of them and
         // `Object.keys(new Uint8Array(3))` came back empty.
-        if enumOnly, wantStrings, !wantSymbols, let shape = jsObj.shape,
+        if enumOnly, wantStrings, !wantSymbols, let shU = jsObj.shapeU,
            jsObj.classID != JSClassID.JS_CLASS_STRING.rawValue,
-           !jeffJS_isTypedArrayClass(jsObj.classID), jsObj.arraySnapshot() == nil {
-            let cached = shapeEnumKeys(shape).keys
+           !jeffJS_isTypedArrayClass(jsObj.classID), jsObj._fastArrayValuesU == nil {
+            // (`_fastArrayValues == nil` is `arraySnapshot() == nil`: every
+            // array has an element store; the lazy payload was materialised
+            // above.) The shape and its key cache are read without retains,
+            // the keys through the list's raw buffer.
             if jeffJSFastSpecies {
+                let list: JeffJSForInKeyList
+                if let c = shU._withUnsafeGuaranteedRef({ $0.enumKeyCache }) { list = c }
+                else { list = shapeEnumKeys(shU.takeUnretainedValue()) }
                 // The cached keys straight into the new array's element store.
-                if cached.isEmpty { return newArray() }
-                return cached.withUnsafeBufferPointer { b in
-                    for i in 0..<b.count { _ = b[i].dupValue() }
-                    return newArrayFromSlots(UnsafeMutablePointer(mutating: b.baseAddress!), b.count)
-                }
+                let n = list.keysCount
+                if n == 0 { return newArray() }
+                let b = list.keysPtr
+                for i in 0..<n { _ = b[i].dupValue() }
+                return newArrayFromSlots(b, n)
             }
+            let cached = shapeEnumKeys(shU.takeUnretainedValue()).keys
             var names: [JeffJSValue] = []
             names.reserveCapacity(cached.count)
             for k in cached { names.append(k.dupValue()) }

@@ -22,8 +22,9 @@ nonisolated func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
         if o.classID == JeffJSClassID.array.rawValue { return jeffJS_recycleArray(o) }
         if o.classID == JeffJSClassID.bytecodeFunction.rawValue { return jeffJS_recycleFunction(o) }
         guard !jeffJSObjectPoolDisabled, o.refCount == 1, o.isPoolable,
-              let rt = o.ownerRuntime, rt.initComplete,
-              rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain,
+              let rtU = o.ownerRuntimeU else { return false }
+        return rtU._withUnsafeGuaranteedRef { rt -> Bool in
+        guard rt.initComplete, rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain,
               rt.objectPool.count < jeffJSObjectPoolCapacity else { return false }
         o.refCount = 0
         // Off the GC list while parked: a pooled object is dead, and leaving
@@ -44,11 +45,7 @@ nonisolated func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
             o.propValues.removeAll(keepingCapacity: true)
             rt.inFreeChain = false
         }
-        if let shape = o.shape {
-            o.shape = nil
-            shape.refCount -= 1
-            if shape.refCount == 0 && !shape.isHashed { freeGCObjectChildren(rt, shape) }
-        }
+        jeffJS_dropShapeForRecycle(o, rt)
         o._flags = (o._flags | JeffJSObject.flagExtensible)
             & ~(JeffJSObject.flagFreeMark | JeffJSObject.flagTmpMark)
         o.mark = JeffJSGCMark.white
@@ -76,6 +73,7 @@ nonisolated func jeffJS_recycleObject(_ ptr: UnsafeRawPointer) -> Bool {
             }
         }
         return true
+        }
     }
 }
 
@@ -96,10 +94,10 @@ nonisolated func jeffJS_recycleFunction(_ o: JeffJSObject) -> Bool {
         | JeffJSObject.flagHasCFunc
     guard jeffJS_functionPoolEnabled, !jeffJSObjectPoolDisabled, o.refCount == 1,
           (o._flags & bad) == 0, o._propExtraCount == 0, o.weakrefCount == 0,
-          o._fastArrayValues == nil, let a = o.aux,
-          a.firstWeakRef == nil, a.storedCFunction == nil, a.storedPrimitiveValue.isUndefined,
-          let rt = o.ownerRuntime, rt.initComplete,
-          rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain,
+          o._fastArrayValues == nil, let aU = o._auxU, let rtU = o.ownerRuntimeU else { return false }
+    return rtU._withUnsafeGuaranteedRef { rt in aU._withUnsafeGuaranteedRef { a in
+    guard a.firstWeakRef == nil, a.storedCFunction == nil, a.storedPrimitiveValue.isUndefined,
+          rt.initComplete, rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain,
           rt.functionPool.count < jeffJSFunctionPoolCapacity else { return false }
     o.refCount = 0
     removeGCObject(rt, o)
@@ -112,41 +110,59 @@ nonisolated func jeffJS_recycleFunction(_ o: JeffJSObject) -> Bool {
         while i < n { o.propValues[i].freeValue(); i += 1 }
         o.propValues.removeAll(keepingCapacity: true)
     }
-    var payload: JeffJSObjectPayload = .opaque(nil)
-    swap(&payload, &a.payload)     // a move: no copy of the enum
-    if case .bytecodeFunc(let fb, _, _) = payload, let fb {
-        fb.liveClosures &-= 1
-        if fb.orphanOwned, fb.liveClosures == 0 { rt.queueOrphanBody(fb) }
+    // The body's closure count, read from the payload without copying the
+    // enum: `if case .bytecodeFunc(let fb, _, _) = payload` retained and
+    // released the body, the var-refs array and the home object for every
+    // recycled closure. The payload itself is dropped by the assignment
+    // (the one release of each it owns), inside the inFreeChain region as
+    // the old end-of-function `_ = payload` was not.
+    if let fbU = a.payloadBytecodeFuncU {
+        fbU._withUnsafeGuaranteedRef { fb in
+            fb.liveClosures &-= 1
+            if fb.orphanOwned, fb.liveClosures == 0 { rt.queueOrphanBody(fb) }
+        }
     }
+    a.payload = .opaque(nil)
     if let t = a.arrowThisVal { a.arrowThisVal = nil; t.freeValue() }
     a.cMagicFast = 0
     a.storedCFunctionLength = 0
     a.storedProto = nil
     rt.inFreeChain = false
-    o.fbFast = nil
+    a.fbFast = nil
     if (o._flags & JeffJSObject.flagHasVarRefs) != 0 {
         // interp.leanClosurePayload: keep the array's storage for the next
         // closure built on this object (createClosure fills it in place).
         if jeffJSLeanClosurePayload { a.clearVarRefsKeepingCapacity() } else { a.setVarRefs([]) }
     }
-    if let shape = o.shape {
-        o.shape = nil
-        shape.refCount -= 1
-        if shape.refCount == 0 && !shape.isHashed { freeGCObjectChildren(rt, shape) }
-    }
+    jeffJS_dropShapeForRecycle(o, rt)
     // Keep the slot bit: the side box stays with the parked closure.
     o._flags = JeffJSObject.flagExtensible | (o._flags & JeffJSObject.flagSlotIsAux)
     o.mark = JeffJSGCMark.white
     o.realmIndex = 0
     o.lazyFlags = 0
     rt.functionPool.append(o)
-    _ = payload   // var-refs array, home object and body released here
     if !rt.gcZeroRefCountObjects.isEmpty {
         while let d = rt.gcZeroRefCountObjects.popLast() {
             if d.refCount == 0 { freeGCObjectAtZeroRefcount(rt, d) }
         }
     }
     return true
+    } }
+}
+
+/// Drop a recycled object's shape: the manual count first, then the Swift
+/// reference, so a shape that reaches zero is still alive for
+/// freeGCObjectChildren. Reads the shape through the unretained handle
+/// (`if let shape = o.shape` was a retain/release pair per recycled object).
+@inline(__always)
+nonisolated func jeffJS_dropShapeForRecycle(_ o: JeffJSObject, _ rt: JeffJSRuntime) {
+    guard let sU = o.shapeU else { return }
+    let dead = sU._withUnsafeGuaranteedRef { s -> Bool in
+        s.refCount -= 1
+        return s.refCount == 0 && !s.isHashed
+    }
+    if dead { freeGCObjectChildren(rt, sU.takeUnretainedValue()) }
+    o.shape = nil
 }
 
 /// JEFFJS_GC_FUNCTIONPOOL=0 turns the function-object pool off (A/B).
@@ -165,10 +181,10 @@ let jeffJSArrayStorageKeepCapacity = 64
 @inline(never)
 nonisolated func jeffJS_recycleArray(_ o: JeffJSObject) -> Bool {
     guard !jeffJSObjectPoolDisabled, o.refCount == 1, o.isPoolableArray,
-          let rt = o.ownerRuntime, rt.initComplete,
-          rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain,
-          rt.arrayPool.count < jeffJSArrayPoolCapacity,
-          let st = o._fastArrayValues else { return false }
+          let rtU = o.ownerRuntimeU, let stU = o._fastArrayValuesU else { return false }
+    return rtU._withUnsafeGuaranteedRef { rt in stU._withUnsafeGuaranteedRef { st in
+    guard rt.initComplete, rt.gcPhase == .JS_GC_PHASE_NONE, !rt.inFreeChain,
+          rt.arrayPool.count < jeffJSArrayPoolCapacity else { return false }
     o.refCount = 0
     removeGCObject(rt, o)
     // Release the elements; nested zero transitions are deferred and drained
@@ -187,10 +203,8 @@ nonisolated func jeffJS_recycleArray(_ o: JeffJSObject) -> Bool {
     }
     st.count = 0
     o.propValues[0] = .newInt32(0)     // `length` (a number: nothing to release)
-    if let shape = o.shape {           // hashed (isPoolableArray): never freed here
-        o.shape = nil
-        shape.refCount -= 1
-    }
+    // The shape (hashed: isPoolableArray) stays on the parked array with its
+    // count; newArray swaps it only when the context's array shape differs.
     o.freeMark = false
     o.tmpMark = false
     o.mark = JeffJSGCMark.white
@@ -202,6 +216,7 @@ nonisolated func jeffJS_recycleArray(_ o: JeffJSObject) -> Bool {
         }
     }
     return true
+    } }
 }
 
 nonisolated extension JeffJSRuntime {
@@ -243,16 +258,19 @@ nonisolated func jeffJS_detachFrameVarRefs(_ frame: JeffJSStackFrame, _ rt: Jeff
     }
     frame.liveVarRefs.withUnsafeMutableBufferPointer { b in
         for i in 0..<b.count {
-            if b[i].isDetached { continue }
+            // Through the unretained handle: `let vr = b[i]` was a retain and
+            // a release per var-ref on every frame exit.
+            let u = Unmanaged.passUnretained(b[i])
+            if u._withUnsafeGuaranteedRef({ $0.isDetached }) { continue }
             if isKnownUniquelyReferenced(&b[i]), rt.varRefPool.count < jeffJSVarRefPoolCapacity {
-                let vr = b[i]
-                vr.parentFrame = nil; vr.slot = nil
-                rt.varRefPool.append(vr)
+                u._withUnsafeGuaranteedRef { $0.parentFrame = nil; $0.slot = nil }
+                rt.varRefPool.append(b[i])
             } else {
-                let vr = b[i]
-                vr.value = vr.pvalue.dupValue()
-                vr.isDetached = true
-                vr.parentFrame = nil; vr.slot = nil
+                u._withUnsafeGuaranteedRef { vr in
+                    vr.value = vr.pvalue.dupValue()
+                    vr.isDetached = true
+                    vr.parentFrame = nil; vr.slot = nil
+                }
             }
         }
     }
