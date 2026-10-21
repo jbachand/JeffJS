@@ -52,6 +52,11 @@ extension JeffJSTestRunner {
          #"(function(){ var d = new Date(1790000000000), s = d.toString(); return /GMT[+-]\d{4} \([^)]+\)$/.test(s) && /GMT[+-]\d{4} \([^)]+\)$/.test(d.toTimeString()) && Date.parse(s) === 1790000000000; })()"#),
         ("stack overflow is JSC's RangeError 'Maximum call stack size exceeded.' (no InternalError)",
          #"(function(){ function r(){ r(); } try { r(); return false; } catch (e) { return e instanceof RangeError && e.name === 'RangeError' && e.message === 'Maximum call stack size exceeded.'; } })()"#),
+        // deep recursion (2026-10-21): the inline-call depth was a hard-coded 10 000 (Facebook Lite's comment
+        // renderer recursed deeper: "Maximum call stack size exceeded"); it is stack.maxInlineDepth now, and
+        // recursion below it — plain and method calls — completes.
+        ("recursion just under stack.maxInlineDepth (default 10 000; plain and method calls) completes",
+         #"(function(){ var n = 9900; function r(k){ return k === 0 ? 0 : 1 + r(k - 1); } var o = { m: function(k){ return k === 0 ? 0 : 1 + this.m(k - 1); } }; return r(n) === n && o.m(n) === n; })()"#),
         ("Function.prototype has length 0, name '', constructor, Symbol.hasInstance, arguments/caller",
          #"(function(){ var fp = Function.prototype, names = Object.getOwnPropertyNames(fp); var h = Object.getOwnPropertyDescriptor(fp, Symbol.hasInstance); return fp.length === 0 && fp.name === '' && fp.constructor === Function && (function(){}).constructor === Function && typeof h.value === 'function' && !h.writable && !h.configurable && !h.enumerable && names.indexOf('@@hasInstance') < 0 && ['apply','arguments','bind','call','caller','constructor','length','name','toString'].every(function(n){ return names.indexOf(n) >= 0; }) && fp[Symbol.hasInstance].call(Array, []) === true; })()"#),
         ("an error carries own line / column / stack (JSC); Error.captureStackTrace, stackTraceLimit",

@@ -30,6 +30,8 @@
 	<integer>2</integer>
 	<key>stack.maxCallDepth</key>
 	<integer>200</integer>
+	<key>stack.maxInlineDepth</key>
+	<integer>10000</integer>
 	<key>stack.maxLocalVars</key>
 	<integer>65534</integer>
 	<key>stack.maxStackSize</key>

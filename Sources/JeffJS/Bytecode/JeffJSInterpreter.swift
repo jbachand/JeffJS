@@ -4262,7 +4262,7 @@ nonisolated private func executeFastTrace(
                   let callObj = buf[calleeSlot].obj,
                   callObj.realmIndex == ctxRealm,
                   let fbU = callObj.fbFastU,
-                  rt.inlineStackTop - inlineBase <= 10000 else { resume = pc; break traceLoop }
+                  rt.inlineStackTop - inlineBase <= JeffJSInterpreter.maxInlineDepth else { resume = pc; break traceLoop }
             unowned(unsafe) let fastFb: JeffJSFunctionBytecode = fbU.takeUnretainedValue()
             if fastFb.isGenerator || fastFb.isAsyncFunc { resume = pc; break traceLoop }
             let funcVal = buf[calleeSlot]
@@ -4413,7 +4413,7 @@ nonisolated private func executeFastTrace(
                   let callObj = buf[calleeSlot].obj,
                   callObj.realmIndex == ctxRealm,
                   let fbU = callObj.fbFastU,
-                  rt.inlineStackTop - inlineBase <= 10000 else { resume = pc; break traceLoop }
+                  rt.inlineStackTop - inlineBase <= JeffJSInterpreter.maxInlineDepth else { resume = pc; break traceLoop }
             unowned(unsafe) let fastFb: JeffJSFunctionBytecode = fbU.takeUnretainedValue()
             if fastFb.isGenerator || fastFb.isAsyncFunc { resume = pc; break traceLoop }
             let funcVal = buf[calleeSlot]
@@ -4500,7 +4500,7 @@ nonisolated private func executeFastTrace(
                   let callObj = buf[varBase + locIdx].obj,
                   callObj.realmIndex == ctxRealm,
                   let fbU = callObj.fbFastU,
-                  rt.inlineStackTop - inlineBase <= 10000 else { resume = pc; break traceLoop }
+                  rt.inlineStackTop - inlineBase <= JeffJSInterpreter.maxInlineDepth else { resume = pc; break traceLoop }
             unowned(unsafe) let fastFb: JeffJSFunctionBytecode = fbU.takeUnretainedValue()
             if fastFb.isGenerator || fastFb.isAsyncFunc { resume = pc; break traceLoop }
             // Fit check before pushing the callee (a deopt must leave the
@@ -7947,6 +7947,10 @@ nonisolated struct JeffJSInterpreter {
     /// 200 levels ≈ 400KB which fits comfortably in a 2MB+ thread stack.
     /// Both callFunction and callInternal increment this counter.
     static let maxCallDepth = JeffJSConfig.maxCallDepth
+    /// Inline call frames one interpreter activation may hold (`stack.maxInlineDepth`); past it a call
+    /// throws "Maximum call stack size exceeded." like a native stack overflow. Inline frames live on the
+    /// runtime's heap stack, not the native one, so this is the JS recursion depth of plain bytecode calls.
+    static let maxInlineDepth = JeffJSConfig.maxInlineDepth
 
     /// `JEFFJS_STACK_DEBUG=1`: besides the runtime's `[stack] trip` line, print the JS stack of
     /// the RangeError a native-stack trip throws (pages usually log only its message).
@@ -9129,7 +9133,7 @@ nonisolated struct JeffJSInterpreter {
                    let fastFb = callObj.fbFast, !fastFb.isGenerator, !fastFb.isAsyncFunc {
                     // Depth guard (checked before any state mutation; on overflow
                     // args+funcVal stay on the caller stack and unwind normally).
-                    if rt.inlineStackTop - inlineBase > 10000 {
+                    if rt.inlineStackTop - inlineBase > JeffJSInterpreter.maxInlineDepth {
                         _ = jeffJS_coldThrow(ctx, .m0)
                         retVal = .exception
                         break dispatchLoop
@@ -9431,7 +9435,7 @@ nonisolated struct JeffJSInterpreter {
                 if inlineCallsEnabled, cmThisSlot >= spBase,
                    let cmCallObj = buf[cmCalleeSlot].obj, cmCallObj.realmIndex == ctxRealm,
                    let cmFastFb = cmCallObj.fbFast, !cmFastFb.isGenerator, !cmFastFb.isAsyncFunc {
-                    if rt.inlineStackTop - inlineBase > 10000 {
+                    if rt.inlineStackTop - inlineBase > JeffJSInterpreter.maxInlineDepth {
                         _ = jeffJS_coldThrow(ctx, .m0)
                         retVal = .exception
                         break dispatchLoop
@@ -10363,7 +10367,7 @@ nonisolated struct JeffJSInterpreter {
                         // activation: getter-setter 5.6x QuickJS.)
                         if inlineCallsEnabled, let gObj = icGetter, gObj.realmIndex == ctxRealm,
                            let gFb = gObj.fbFast, !gFb.isGenerator, !gFb.isAsyncFunc,
-                           rt.inlineStackTop - inlineBase <= 10000, sp + 2 <= bufCapacity {
+                           rt.inlineStackTop - inlineBase <= JeffJSInterpreter.maxInlineDepth, sp + 2 <= bufCapacity {
                             let gThisSlot = sp
                             let gCalleeSlot = sp + 1
                             buf[gThisSlot] = obj                                        // the popped receiver (owned)
@@ -10763,7 +10767,7 @@ nonisolated struct JeffJSInterpreter {
                                 // (`dropResult`: put_field leaves nothing on the stack).
                                 if inlineCallsEnabled, sObj.realmIndex == ctxRealm,
                                    let sFb = sObj.fbFast, !sFb.isGenerator, !sFb.isAsyncFunc,
-                                   rt.inlineStackTop - inlineBase <= 10000, sp + 3 <= bufCapacity {
+                                   rt.inlineStackTop - inlineBase <= JeffJSInterpreter.maxInlineDepth, sp + 3 <= bufCapacity {
                                     let sThisSlot = sp
                                     let sCalleeSlot = sp + 1
                                     buf[sThisSlot] = obj                                        // the popped receiver (owned)
@@ -13782,7 +13786,7 @@ nonisolated struct JeffJSInterpreter {
                         // as `this`; its return lands where the property value goes.
                         if inlineCallsEnabled, let gObj = icGetter, gObj.realmIndex == ctxRealm,
                            let gFb = gObj.fbFast, !gFb.isGenerator, !gFb.isAsyncFunc,
-                           rt.inlineStackTop - inlineBase <= 10000, sp + 2 <= bufCapacity {
+                           rt.inlineStackTop - inlineBase <= JeffJSInterpreter.maxInlineDepth, sp + 2 <= bufCapacity {
                             let gThisSlot = sp
                             let gCalleeSlot = sp + 1
                             buf[gThisSlot] = obj.dupValue()                               // the local, borrowed: the frame takes its own ref
@@ -14079,7 +14083,7 @@ nonisolated struct JeffJSInterpreter {
                 if inlineCallsEnabled, argc == 0,
                    let callObj = buf[varBase + locIdx].obj, callObj.realmIndex == ctxRealm,
                    let fastFb = callObj.fbFast, !fastFb.isGenerator, !fastFb.isAsyncFunc,
-                   rt.inlineStackTop - inlineBase <= 10000 {
+                   rt.inlineStackTop - inlineBase <= JeffJSInterpreter.maxInlineDepth {
                     let calleeSlot = sp
                     let funcVal = buf[varBase + locIdx].dupValue()
                     buf[sp] = funcVal; sp += 1
