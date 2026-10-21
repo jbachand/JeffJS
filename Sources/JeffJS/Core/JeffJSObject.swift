@@ -106,6 +106,20 @@ nonisolated func jeffJS_icProtoHit(_ entry: JeffJSICEntry) -> JeffJSValue? {
     }
 }
 
+/// The getter of a prototype-chain entry whose holder slot is an accessor
+/// (a class `get x()` lives on the prototype), under the same shape checks
+/// as `jeffJS_icProtoHit`; nil for a data slot or a stale entry.
+@inline(__always)
+nonisolated func jeffJS_icProtoGetter(_ entry: JeffJSICEntry) -> JeffJSObject? {
+    guard let hp = entry.holderPtr, let hsp = entry.holderShapePtr else { return nil }
+    return Unmanaged<JeffJSObject>.fromOpaque(hp)._withUnsafeGuaranteedRef { h -> JeffJSObject? in
+        guard h.shapeIdentity == hsp, entry.propOffset >= 0,
+              entry.propOffset < h.propValues.count,
+              let ex = h.extra(at: entry.propOffset), ex.kind == .getset else { return nil }
+        return ex.getter
+    }
+}
+
 /// Slot of the inline-cache entry for the instruction at `pc`, read from the
 /// table's pc -> slot map (IC-site ordinal tables, perf/bytecode-paging).
 ///

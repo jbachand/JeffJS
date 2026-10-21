@@ -4644,7 +4644,7 @@ nonisolated private func executeFastTrace(
             } else {
                 varRefsRaw = nil; varRefsRawCount = 0
             }
-            buf[sp] = returnValue; sp += 1
+            if saved.dropResult { returnValue.freeValue() } else { buf[sp] = returnValue; sp += 1 }
 
         // ------------------------------------------------------------------
         // Closure variables through the unmanaged mirror (no ARC); TDZ and
@@ -7852,6 +7852,10 @@ nonisolated struct JeffJSInterpreter {
         var funcObj: JeffJSValue
         var flags: Int
         var bufOwned: Bool
+        /// The caller does not want the callee's return value on its stack
+        /// (an accessor setter run as an inline call from put_field): every
+        /// inline return releases it instead of pushing it.
+        var dropResult: Bool = false
     }
 
     /// Toggle to enable/disable inline calls for debugging.
@@ -9653,7 +9657,7 @@ nonisolated struct JeffJSInterpreter {
                 bc = tcSaved.bc; bcLen = tcSaved.bcLen
                 fb = tcSaved.fb; frame = tcSaved.frame; if tcSaved.fb.closureVarCount > 0 { vrRaw = tcSaved.funcObj.obj?.varRefsRaw; vrCount = tcSaved.funcObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                 mFuncObj = tcSaved.funcObj; mFlags = tcSaved.flags; bufOwned = tcSaved.bufOwned
-                buf[sp] = tcResult; sp += 1
+                if tcSaved.dropResult { tcResult.freeValue() } else { buf[sp] = tcResult; sp += 1 }
                 continue dispatchLoop
 
             case .tail_call_method:
@@ -9708,7 +9712,7 @@ nonisolated struct JeffJSInterpreter {
                 bc = tcmSaved.bc; bcLen = tcmSaved.bcLen
                 fb = tcmSaved.fb; frame = tcmSaved.frame; if tcmSaved.fb.closureVarCount > 0 { vrRaw = tcmSaved.funcObj.obj?.varRefsRaw; vrCount = tcmSaved.funcObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                 mFuncObj = tcmSaved.funcObj; mFlags = tcmSaved.flags; bufOwned = tcmSaved.bufOwned
-                buf[sp] = tcmResult; sp += 1
+                if tcmSaved.dropResult { tcmResult.freeValue() } else { buf[sp] = tcmResult; sp += 1 }
                 continue dispatchLoop
 
             case .call_constructor:
@@ -9815,7 +9819,7 @@ nonisolated struct JeffJSInterpreter {
                     mFuncObj = saved.funcObj
                     mFlags = saved.flags; bufOwned = saved.bufOwned
                     // 4. Push return value onto caller's stack
-                    buf[sp] = returnValue; sp += 1
+                    if saved.dropResult { returnValue.freeValue() } else { buf[sp] = returnValue; sp += 1 }
                     continue dispatchLoop
                 } else {
                     retVal = returnValue
@@ -9849,7 +9853,7 @@ nonisolated struct JeffJSInterpreter {
                     if saved.fb.closureVarCount > 0 { vrRaw = saved.funcObj.obj?.varRefsRaw; vrCount = saved.funcObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                     mFuncObj = saved.funcObj
                     mFlags = saved.flags; bufOwned = saved.bufOwned
-                    buf[sp] = .undefined; sp += 1
+                    if !saved.dropResult { buf[sp] = .undefined; sp += 1 }
                     continue dispatchLoop
                 } else {
                     retVal = .undefined
@@ -10297,12 +10301,17 @@ nonisolated struct JeffJSInterpreter {
                     if let ents = fb.icEntries {
                         let entry = ents[jeffJS_icSlot(ents, pc)]
                         var icHit: JeffJSValue? = nil
+                        var icGetter: JeffJSObject? = nil
                         if entry.pc == pc, entry.shapePtr == jsObj.shapeIdentity {
                             if entry.holderPtr != nil {
                                 icHit = jeffJS_icProtoHit(entry)     // prototype method/field
-                            } else if entry.propOffset >= 0, entry.propOffset < jsObj.propCount,
-                                      jsObj.extra(at: entry.propOffset) == nil {
-                                icHit = jsObj.dataValue(at: entry.propOffset)
+                                if icHit == nil { icGetter = jeffJS_icProtoGetter(entry) }   // prototype getter (class `get x()`)
+                            } else if entry.propOffset >= 0, entry.propOffset < jsObj.propCount {
+                                if let ex = jsObj.extra(at: entry.propOffset) {
+                                    if ex.kind == .getset { icGetter = ex.getter }
+                                } else {
+                                    icHit = jsObj.dataValue(at: entry.propOffset)
+                                }
                             }
                         }
                         if let hv = icHit {
@@ -10315,6 +10324,146 @@ nonisolated struct JeffJSInterpreter {
                                 pc += 5
                                 continue dispatchLoop
                             }
+                        }
+                        // Accessor hit: run a bytecode getter as an inline call
+                        // with the receiver as `this` and no arguments, exactly
+                        // like `get_field2 + call_method 0`; its return value
+                        // lands in the receiver's slot, where the property value
+                        // goes. (A getter used to miss the cache on every read
+                        // and go through getProperty → callFunction → a full
+                        // activation: getter-setter 5.6x QuickJS.)
+                        if inlineCallsEnabled, let gObj = icGetter, gObj.realmIndex == ctxRealm,
+                           let gFb = gObj.fbFast, !gFb.isGenerator, !gFb.isAsyncFunc,
+                           rt.inlineStackTop - inlineBase <= 10000, sp + 2 <= bufCapacity {
+                            let gThisSlot = sp
+                            let gCalleeSlot = sp + 1
+                            buf[gThisSlot] = obj                                        // the popped receiver (owned)
+                            buf[gCalleeSlot] = JeffJSValue.borrowedObject(gObj).dupValue()
+                    do { // inline call (expanded; no nested-function capture of hot locals)
+                        let e_fastFb = gFb
+                        let e_callObj = gObj
+                        let e_funcVal = buf[gCalleeSlot]
+                        let e_argc = 0
+                        let e_calleeSlot = gCalleeSlot
+                        let e_restoreSp = gThisSlot
+                        let e_thisVal = buf[gThisSlot]
+                        let e_instrSize = 5
+                        let argStart = e_calleeSlot + 1
+                        rt.inlinePush(InlineCallFrame(
+                            pc: pc + e_instrSize, sp: e_restoreSp, spTop: sp,
+                            buf: buf, bufCapacity: bufCapacity,
+                            varBase: varBase, spBase: spBase,
+                            bc: bc, bcLen: bcLen, fb: fb,
+                            frame: frame,
+                            funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned))
+                        fb = e_fastFb
+                        bc = e_fastFb.bcPtrFast ?? e_fastFb.bytecodePtr
+                        bcLen = e_fastFb.bytecodeLen
+                        // Only functions with closure variables need their varRefs
+                        // array (a retain/release pair per assignment otherwise).
+                        if e_fastFb.closureVarCount > 0 {
+                            vrRaw = e_callObj.varRefsRaw; vrCount = e_callObj.varRefsRawCount
+                            varRefsLoaded = true
+                        } else if varRefsLoaded {
+                            vrRaw = nil; vrCount = 0
+                            varRefsLoaded = false
+                        }
+                        mFuncObj = e_funcVal
+                        mFlags = 0
+                        unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
+                        newFrame.prevFrame = ctx.currentFrame
+                        newFrame.curFunc = e_funcVal
+                        if e_fastFb.isArrow, let arrowThis = e_callObj.arrowThisVal {
+                            newFrame.thisVal = arrowThis
+                        } else if !e_fastFb.isStrictMode && e_thisVal.isNullOrUndefined {
+                            // ES §10.2.1.2: sloppy callees see the global object.
+                            newFrame.thisVal = ctx.globalObj
+                        } else {
+                            newFrame.thisVal = e_thisVal
+                        }
+                        newFrame.argCount = e_argc
+                        let newVarCount = Int(e_fastFb.varCount)
+                        newFrame.varCount = newVarCount
+                        let fbArgCount = Int(e_fastFb.argCount); let newArgSlots = fbArgCount > e_argc ? fbArgCount : e_argc
+                        let fbStack = Int(e_fastFb.stackSize); let newStackSlots = (fbStack > 4 ? fbStack : 4) + 32
+                        let newTotalSlots = newArgSlots + newVarCount + newStackSlots
+                        let newBuf: UnsafeMutablePointer<JeffJSValue>
+                        let newBufCap: Int
+                        if argStart + newTotalSlots <= bufCapacity {
+                            newBuf = buf + argStart
+                            newBufCap = bufCapacity - argStart
+                            // Args are already in place; pad missing args + locals.
+                            // Straight-line stores for the common small counts: the loop
+                            // form was turned into a memset_pattern16 call per call.
+                            let prefix = newArgSlots + newVarCount
+                            let pad = prefix - e_argc
+                            if pad > 0 {
+                                newBuf[e_argc] = .undefined
+                                if pad > 1 { newBuf[e_argc + 1] = .undefined }
+                                if pad > 2 { newBuf[e_argc + 2] = .undefined }
+                                if pad > 3 {
+                                    var i = e_argc + 3
+                                    while i < prefix { newBuf[i] = .undefined; i += 1 }
+                                }
+                            }
+                            bufOwned = false
+                        } else {
+                            (newBuf, newBufCap) = rt.acquireInterpBuf(size: newTotalSlots,
+                                                                      initializedPrefix: newArgSlots + newVarCount)
+                            // Own buffer: borrow the caller's argument slots, or
+                            // take copies when the callee owns its slots.
+                            if e_fastFb.copiesArgs {
+                                for i in 0..<e_argc { newBuf[i] = buf[argStart + i].dupValue() }
+                            } else {
+                                for i in 0..<e_argc { newBuf[i] = buf[argStart + i] }
+                            }
+                            bufOwned = true
+                        }
+                        frame = newFrame
+                        ctx.currentFrame = frame
+                        frame.spBase = 0
+                        buf = newBuf
+                        bufCapacity = newBufCap
+                        varBase = newArgSlots
+                        spBase = newArgSlots + newVarCount
+                        sp = spBase
+                        // Named function expression self-reference (ES §15.2.4).
+                        if e_fastFb.selfRefVarIdx >= 0 {
+                            buf[varBase + e_fastFb.selfRefVarIdx] = e_funcVal.dupValue()
+                        }
+                        frame.buf = buf
+                        frame.bufCapacity = bufCapacity
+                        frame.bufVarBase = varBase
+                        frame.bufSpBase = spBase
+                        pc = 0
+                    }
+                    // Run the callee in the fast trace from its first instruction.
+                    if fb.traceLean {
+                        let r = executeFastTraceLean(bc: bc, bcLen: bcLen, entryPC: 0, exitPC: bcLen, startPC: pc,
+                                                     buf: buf, varBase: varBase, sp: &sp, ctx: ctx, cpool: fb.cpool,
+                                                     stackLimit: bufCapacity, icEntries: fb.icEntries)
+                        if r == -1 { retVal = .exception; break dispatchLoop }
+                        pc = r
+                        continue dispatchLoop
+                    }
+                    if fb.traceEntryEnabled {
+                        let fbIdBefore = ObjectIdentifier(fb)
+                        var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
+                        let resumePC = executeFastTrace(state: &hot, startPC: pc, ctx: ctx, rt: rt, inlineBase: inlineBase)
+                        sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
+                        bc = hot.bc; bcLen = hot.bcLen; fb = hot.fb; frame = hot.frame
+                        mFuncObj = hot.funcObj; mFlags = hot.flags; bufOwned = hot.bufOwned
+                        if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
+                        // Entry deopt accounting: an early exit still inside this function
+                        // means the trace could not run it; stop trying after a while.
+                        if hot.opsRun < 16, ObjectIdentifier(fb) == fbIdBefore {
+                            fb.traceEntryDeopts &+= 1
+                            if fb.traceEntryDeopts >= 100 { fb.traceEntryEnabled = false }
+                        }
+                        if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                        pc = resumePC
+                    }
+                    continue dispatchLoop
                         }
                     }
                     // IC miss: full lookup + cache update
@@ -10329,7 +10478,9 @@ nonisolated struct JeffJSInterpreter {
                             fb.getIC().update(pc, shape: shape, propOffset: propIdx)
                         } else if let holder = jsObj.proto, let hs = holder.shape,
                                   let hIdx = findShapeProperty(hs, atom),
-                                  hIdx < holder.propValues.count, holder.extra(at: hIdx) == nil {
+                                  hIdx < holder.propValues.count,
+                                  holder.extra(at: hIdx).map({ $0.kind == .getset }) ?? true {
+                            // A data slot, or an accessor (the hit path runs its getter).
                             fb.getIC().updateProto(pc, receiverShape: shape, holder: holder,
                                                    holderShape: hs, propOffset: hIdx)
                         }
@@ -10526,6 +10677,156 @@ nonisolated struct JeffJSInterpreter {
                             // the shape (prepareShapeUpdate), so identity covers it.
                             if jeffJS_icWrite(jsObj._ptr, entry, val) {
                                 obj.freeValue()   // the popped receiver ref (QuickJS: JS_FreeValue(sp[-2]))
+                                pc += 5
+                                continue dispatchLoop
+                            }
+                            // An own accessor with a setter: call it directly
+                            // (the slot is cached; the generic path re-walked
+                            // the shape and the prototype chain on every write).
+                            if let ex = jsObj.extra(at: entry.propOffset), ex.kind == .getset, let sObj = ex.setter {
+                                // A bytecode setter runs as an inline call with the
+                                // receiver as `this` and the value as its argument
+                                // (`dropResult`: put_field leaves nothing on the stack).
+                                if inlineCallsEnabled, sObj.realmIndex == ctxRealm,
+                                   let sFb = sObj.fbFast, !sFb.isGenerator, !sFb.isAsyncFunc,
+                                   rt.inlineStackTop - inlineBase <= 10000, sp + 3 <= bufCapacity {
+                                    let sThisSlot = sp
+                                    let sCalleeSlot = sp + 1
+                                    buf[sThisSlot] = obj                                        // the popped receiver (owned)
+                                    buf[sCalleeSlot] = JeffJSValue.borrowedObject(sObj).dupValue()
+                                    buf[sCalleeSlot + 1] = val                                  // the popped value (owned)
+                    do { // inline call (expanded; no nested-function capture of hot locals)
+                        let e_fastFb = sFb
+                        let e_callObj = sObj
+                        let e_funcVal = buf[sCalleeSlot]
+                        let e_argc = 1
+                        let e_calleeSlot = sCalleeSlot
+                        let e_restoreSp = sThisSlot
+                        let e_thisVal = buf[sThisSlot]
+                        let e_instrSize = 5
+                        let argStart = e_calleeSlot + 1
+                        rt.inlinePush(InlineCallFrame(
+                            pc: pc + e_instrSize, sp: e_restoreSp, spTop: sp,
+                            buf: buf, bufCapacity: bufCapacity,
+                            varBase: varBase, spBase: spBase,
+                            bc: bc, bcLen: bcLen, fb: fb,
+                            frame: frame,
+                            funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, dropResult: true))
+                        fb = e_fastFb
+                        bc = e_fastFb.bcPtrFast ?? e_fastFb.bytecodePtr
+                        bcLen = e_fastFb.bytecodeLen
+                        // Only functions with closure variables need their varRefs
+                        // array (a retain/release pair per assignment otherwise).
+                        if e_fastFb.closureVarCount > 0 {
+                            vrRaw = e_callObj.varRefsRaw; vrCount = e_callObj.varRefsRawCount
+                            varRefsLoaded = true
+                        } else if varRefsLoaded {
+                            vrRaw = nil; vrCount = 0
+                            varRefsLoaded = false
+                        }
+                        mFuncObj = e_funcVal
+                        mFlags = 0
+                        unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
+                        newFrame.prevFrame = ctx.currentFrame
+                        newFrame.curFunc = e_funcVal
+                        if e_fastFb.isArrow, let arrowThis = e_callObj.arrowThisVal {
+                            newFrame.thisVal = arrowThis
+                        } else if !e_fastFb.isStrictMode && e_thisVal.isNullOrUndefined {
+                            // ES §10.2.1.2: sloppy callees see the global object.
+                            newFrame.thisVal = ctx.globalObj
+                        } else {
+                            newFrame.thisVal = e_thisVal
+                        }
+                        newFrame.argCount = e_argc
+                        let newVarCount = Int(e_fastFb.varCount)
+                        newFrame.varCount = newVarCount
+                        let fbArgCount = Int(e_fastFb.argCount); let newArgSlots = fbArgCount > e_argc ? fbArgCount : e_argc
+                        let fbStack = Int(e_fastFb.stackSize); let newStackSlots = (fbStack > 4 ? fbStack : 4) + 32
+                        let newTotalSlots = newArgSlots + newVarCount + newStackSlots
+                        let newBuf: UnsafeMutablePointer<JeffJSValue>
+                        let newBufCap: Int
+                        if argStart + newTotalSlots <= bufCapacity {
+                            newBuf = buf + argStart
+                            newBufCap = bufCapacity - argStart
+                            // Args are already in place; pad missing args + locals.
+                            // Straight-line stores for the common small counts: the loop
+                            // form was turned into a memset_pattern16 call per call.
+                            let prefix = newArgSlots + newVarCount
+                            let pad = prefix - e_argc
+                            if pad > 0 {
+                                newBuf[e_argc] = .undefined
+                                if pad > 1 { newBuf[e_argc + 1] = .undefined }
+                                if pad > 2 { newBuf[e_argc + 2] = .undefined }
+                                if pad > 3 {
+                                    var i = e_argc + 3
+                                    while i < prefix { newBuf[i] = .undefined; i += 1 }
+                                }
+                            }
+                            bufOwned = false
+                        } else {
+                            (newBuf, newBufCap) = rt.acquireInterpBuf(size: newTotalSlots,
+                                                                      initializedPrefix: newArgSlots + newVarCount)
+                            // Own buffer: borrow the caller's argument slots, or
+                            // take copies when the callee owns its slots.
+                            if e_fastFb.copiesArgs {
+                                for i in 0..<e_argc { newBuf[i] = buf[argStart + i].dupValue() }
+                            } else {
+                                for i in 0..<e_argc { newBuf[i] = buf[argStart + i] }
+                            }
+                            bufOwned = true
+                        }
+                        frame = newFrame
+                        ctx.currentFrame = frame
+                        frame.spBase = 0
+                        buf = newBuf
+                        bufCapacity = newBufCap
+                        varBase = newArgSlots
+                        spBase = newArgSlots + newVarCount
+                        sp = spBase
+                        // Named function expression self-reference (ES §15.2.4).
+                        if e_fastFb.selfRefVarIdx >= 0 {
+                            buf[varBase + e_fastFb.selfRefVarIdx] = e_funcVal.dupValue()
+                        }
+                        frame.buf = buf
+                        frame.bufCapacity = bufCapacity
+                        frame.bufVarBase = varBase
+                        frame.bufSpBase = spBase
+                        pc = 0
+                    }
+                    // Run the callee in the fast trace from its first instruction.
+                    if fb.traceLean {
+                        let r = executeFastTraceLean(bc: bc, bcLen: bcLen, entryPC: 0, exitPC: bcLen, startPC: pc,
+                                                     buf: buf, varBase: varBase, sp: &sp, ctx: ctx, cpool: fb.cpool,
+                                                     stackLimit: bufCapacity, icEntries: fb.icEntries)
+                        if r == -1 { retVal = .exception; break dispatchLoop }
+                        pc = r
+                        continue dispatchLoop
+                    }
+                    if fb.traceEntryEnabled {
+                        let fbIdBefore = ObjectIdentifier(fb)
+                        var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
+                        let resumePC = executeFastTrace(state: &hot, startPC: pc, ctx: ctx, rt: rt, inlineBase: inlineBase)
+                        sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
+                        bc = hot.bc; bcLen = hot.bcLen; fb = hot.fb; frame = hot.frame
+                        mFuncObj = hot.funcObj; mFlags = hot.flags; bufOwned = hot.bufOwned
+                        if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
+                        // Entry deopt accounting: an early exit still inside this function
+                        // means the trace could not run it; stop trying after a while.
+                        if hot.opsRun < 16, ObjectIdentifier(fb) == fbIdBefore {
+                            fb.traceEntryDeopts &+= 1
+                            if fb.traceEntryDeopts >= 100 { fb.traceEntryEnabled = false }
+                        }
+                        if resumePC == -1 { retVal = .exception; break dispatchLoop }
+                        pc = resumePC
+                    }
+                    continue dispatchLoop
+                                }
+                                frame.curPC = pc
+                                let r = ctx.callFunction(JeffJSValue.borrowedObject(sObj), thisVal: obj, args: [val])
+                                val.freeValue()
+                                obj.freeValue()
+                                if r.isException { retVal = .exception; break dispatchLoop }
+                                r.freeValue()
                                 pc += 5
                                 continue dispatchLoop
                             }
