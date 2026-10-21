@@ -9757,6 +9757,29 @@ nonisolated struct JeffJSInterpreter {
                 let argsArray = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let funcVal = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let thisObj = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
+                // `f(...arr)` on a dense array: the elements go to the callee
+                // through this frame's stack slots (dup'd, so a callee that
+                // mutates the array cannot pull the arguments from under it;
+                // released after the call), no [JeffJSValue] (QuickJS
+                // js_function_apply builds argv the same way).
+                if let ao = argsArray.obj, ao.classID == JeffJSClassID.array.rawValue,
+                   let storage = ao._obj._fastArrayValues, storage.attrs == nil,
+                   Int(storage.count) <= storage.values.count, sp + Int(storage.count) <= bufCapacity {
+                    let n = Int(storage.count)
+                    var holes = false
+                    for i in 0 ..< n { if storage.values[i].isUninitialized { holes = true; break } }
+                    if !holes {
+                        for i in 0 ..< n { buf[sp + i] = storage.values[i].dupValue() }
+                        frame.curPC = pc
+                        let r = ctx.callFunction(funcVal, thisVal: thisObj, argv: n == 0 ? nil : UnsafePointer(buf + sp), argc: n)
+                        for i in 0 ..< n { buf[sp + i].freeValue() }
+                        argsArray.freeValue(); funcVal.freeValue(); thisObj.freeValue()
+                        if r.isException { retVal = .exception; break dispatchLoop }
+                        buf[sp] = r; sp += 1
+                        pc += 3
+                        continue dispatchLoop
+                    }
+                }
                 let callArgs = ctx.arrayToArgs(argsArray)   // owned copies
                 let result = ctx.callFunction(funcVal, thisVal: thisObj, args: callArgs)
                 argsArray.freeValue(); funcVal.freeValue(); thisObj.freeValue()

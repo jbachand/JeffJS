@@ -1500,30 +1500,32 @@ nonisolated func js_regexp_Symbol_split(
     // and then an empty tail: `"a,b,,c".split(/,*/)` came back as
     // ["a","b","c",""].
     while q < inputStr.len {
-        // Execute regex starting from position q using execInternal directly.
+        // The spec's splitter probes a sticky match at every position q; the
+        // first position >= q where that succeeds is exactly what one
+        // unanchored search from q finds (the engine tries the positions in
+        // order), so one exec replaces a probe per character (`text.split(/,/)`
+        // over 100 KB ran 100 000 execs; string-replace-regex 4.5x QuickJS).
         let matchResult = js_regexp_execInternal(
             ctx: ctx,
             obj: obj,
             inputStr: inputStr,
             startIndex: q,
-            flags: flags | LRE_FLAG_STICKY,  // Force sticky to only match at position q
+            flags: flags & ~LRE_FLAG_STICKY,
             captureCount: captureCount
         )
 
         guard let captures = matchResult, !captures.isEmpty else {
-            // No match at position q -- advance and retry.
-            q = js_regexp_advanceIndex(inputStr, index: q, unicode: isUnicode)
-            continue
+            break   // no further match: the tail follows
         }
 
         let matchStart = captures[0].start
         let e = captures[0].end
-
         if e == p {
             // Empty match at the same position as previous -- advance to avoid infinite loop.
-            q = js_regexp_advanceIndex(inputStr, index: q, unicode: isUnicode)
+            q = js_regexp_advanceIndex(inputStr, index: matchStart, unicode: isUnicode)
             continue
         }
+        if matchStart >= inputStr.len { break }   // step 19: q < size only
 
         // Add substring from p to matchStart.
         if let sub = jeffJS_subString(str: inputStr, start: p, end: matchStart) {
@@ -1547,6 +1549,7 @@ nonisolated func js_regexp_Symbol_split(
                 break
             }
         }
+        if UInt32(results.count) >= limit { break }   // step 19.d.vii.4: the limit ends the whole split
 
         p = e
         q = e
@@ -2045,8 +2048,9 @@ nonisolated private func js_regexp_execInternal(
     //    For sticky, we only try at startIndex.
     // One VM for every start position tried by this exec (each attempt
     // used to allocate its own backtrack stack).
-    let vm = REVirtualMachine(bytecode: bytecode, input: inputCodeUnits,
-                              startPos: startIndex, flags: regexpFlags)
+    let vm = ctx.rt.regexCaches.vm(for: bc, bytecode: bytecode, input: inputCodeUnits,
+                                   startPos: startIndex, flags: regexpFlags)
+    defer { vm.inUse = false }
     var pos = startIndex
     // `JEFFJS_REGEX_WATCH=1`: name every exec that takes > 250 ms (pattern,
     // flags, input length, start positions tried) — a page stalled in regex
@@ -2439,8 +2443,34 @@ nonisolated extension JeffJSContext {
 nonisolated final class JeffJSRegexCaches {
     private var inputs: [(JeffJSString, [UInt32])] = []
     private var names: [(JeffJSString, [String?])] = []
+    private var vms: [(JeffJSString, REVirtualMachine)] = []
     private static let maxInputs = 2
     private static let maxNames = 8
+    private static let maxVMs = 8
+
+    /// A matcher VM for the pattern `bc`, bound to `input`: the cached one when
+    /// it is free, else a fresh one (kept if there is room). The caller owns it
+    /// until it clears `inUse`.
+    func vm(for bc: JeffJSString, bytecode: [UInt8], input: [UInt32], startPos: Int,
+            flags: JeffJSRegExpFlags) -> REVirtualMachine {
+        if let i = vms.firstIndex(where: { $0.0 === bc }) {
+            let v = vms[i].1
+            if !v.inUse {
+                if i != 0 { let e = vms.remove(at: i); vms.insert(e, at: 0) }
+                v.rebind(input: input, startPos: startPos, flags: flags)
+                v.inUse = true
+                return v
+            }
+            let fresh = REVirtualMachine(bytecode: bytecode, input: input, startPos: startPos, flags: flags)
+            fresh.inUse = true
+            return fresh
+        }
+        let v = REVirtualMachine(bytecode: bytecode, input: input, startPos: startPos, flags: flags)
+        v.inUse = true
+        vms.insert((bc, v), at: 0)
+        if vms.count > Self.maxVMs { vms.removeLast() }
+        return v
+    }
 
     @inline(__always)
     func codeUnits(of s: JeffJSString) -> [UInt32] {
