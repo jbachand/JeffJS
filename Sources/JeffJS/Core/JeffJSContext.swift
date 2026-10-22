@@ -883,6 +883,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         arrayIterNextVal = .JS_UNDEFINED
         arrayCtorIntrinsic.freeValue()
         arrayCtorIntrinsic = .JS_UNDEFINED
+        twinIntrinsics?.release(rt)
         twinIntrinsics = nil
         for v in objectToStringCache { v.freeValue() }
         objectToStringCache = []

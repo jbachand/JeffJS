@@ -67,6 +67,12 @@ nonisolated enum JeffJSNativeTwins {
         /// The reference text: the library's functions as one site ships
         /// them, declared at the top of a function body.
         let source: String
+        /// Other builds of the same library (another bundler or Babel
+        /// version): their text and their names for the same roles / values,
+        /// in the same order.
+        var alternates: [(source: String, roles: [String], values: [String])] = []
+        /// The builtins its code reaches (checked per call).
+        let needs: JeffJSTwinIntrinsics.Needs
         /// Cheap argument test before the per-call guards (false: decline).
         let accepts: (JeffJSContext, UnsafePointer<JeffJSValue>?, Int) -> Bool
         /// The twin: nil = declined.
@@ -76,6 +82,9 @@ nonisolated enum JeffJSNativeTwins {
     /// Every family the engine knows.
     static let families: [Family] = [
         JeffJSTwinDeepmerge.family,
+        JeffJSTwinObjectSpread.family,
+        JeffJSTwinCloneDeep.family,
+        JeffJSTwinEquality.family,
     ]
 
     /// A family whose cells were checked for one call: its function objects
@@ -166,7 +175,11 @@ nonisolated enum JeffJSNativeTwins {
         for (fi, family) in families.enumerated() {
             for strict in [false, true] {
                 for lazy in [true, false] {
-                    register(ctx, t, familyIndex: fi, family: family, strict: strict, lazy: lazy)
+                    let refs = [(family.source, family.roles, family.values)] + family.alternates.map { ($0.source, $0.roles, $0.values) }
+                    for (source, roles, values) in refs {
+                        register(ctx, t, familyIndex: fi, family: family, source: source, roles: roles, values: values,
+                                 strict: strict, lazy: lazy)
+                    }
                 }
             }
         }
@@ -210,12 +223,13 @@ nonisolated enum JeffJSNativeTwins {
     }
 
     private static func register(_ ctx: JeffJSContext, _ t: Table, familyIndex: Int, family: Family,
+                                 source: String, roles: [String], values: [String],
                                  strict: Bool, lazy: Bool) {
         let rt = ctx.rt
         let savedLazy = rt.lazyFunctions
         rt.lazyFunctions = lazy
         defer { rt.lazyFunctions = savedLazy }
-        let text = "function __jeffjsTwinReference(){" + (strict ? "'use strict';" : "") + family.source + "}"
+        let text = "function __jeffjsTwinReference(){" + (strict ? "'use strict';" : "") + source + "}"
         guard let top = ctx.compileTwinReference(text) else {
             log("\(family.name): reference does not compile")
             return
@@ -237,15 +251,15 @@ nonisolated enum JeffJSNativeTwins {
                 byName[name] = fb   // `var X=function(…){…}`: named at run time
             }
         }
-        for (role, name) in family.roles.enumerated() {
+        for (role, name) in roles.enumerated() {
             guard let fb = byName[name] else {
                 log("\(family.name): reference has no function \(name)")
                 continue
             }
             let cells: [Cell] = fb.closureVarsList.map { cv in
                 let n = rt.atomToString(cv.varName) ?? ""
-                if let r = family.roles.firstIndex(of: n) { return .role(r) }
-                if let v = family.values.firstIndex(of: n) { return .value(v) }
+                if let r = roles.firstIndex(of: n) { return .role(r) }
+                if let v = values.firstIndex(of: n) { return .value(v) }
                 return .other
             }
             let h = structuralHash(fb, rt: rt)
@@ -363,7 +377,7 @@ nonisolated enum JeffJSNativeTwins {
         }
         do {
             guard let intrinsics = ctx.twinIntrinsics else { throw JeffJSTwinDecline(reason: "no intrinsics") }
-            try intrinsics.check(ctx)
+            try intrinsics.check(ctx, family.needs)
             let resolved = try resolve(ctx, t, family: family, entry: obj, entryMember: member, varRefs: varRefs)
             let r = try family.run(ctx, resolved, argv, argc)
             rt.twinStats.hits += 1
@@ -442,178 +456,6 @@ nonisolated enum JeffJSNativeTwins {
 
     static func log(_ s: String) {
         FileHandle.standardError.write(("[jeffjs:twins] " + s + "\n").data(using: .utf8)!)
-    }
-}
-
-// MARK: - Intrinsics a twin relies on
-
-/// The builtins the replaced code calls, captured when the context's
-/// intrinsics are built (before any page script). A twin runs only while the
-/// page still reaches exactly these through the same lookups the bytecode
-/// does (`check`).
-nonisolated final class JeffJSTwinIntrinsics {
-    weak var objectCtor: JeffJSObject?
-    weak var objectProto: JeffJSObject?
-    weak var functionProto: JeffJSObject?
-    weak var arrayCtor: JeffJSObject?
-    weak var arrayProto: JeffJSObject?
-    weak var keys: JeffJSObject?
-    weak var getOwnPropertySymbols: JeffJSObject?
-    weak var toString: JeffJSObject?
-    weak var hasOwnProperty: JeffJSObject?
-    weak var propertyIsEnumerable: JeffJSObject?
-    weak var call: JeffJSObject?
-    weak var isArray: JeffJSObject?
-    weak var concat: JeffJSObject?
-    weak var map: JeffJSObject?
-    weak var forEach: JeffJSObject?
-    weak var filter: JeffJSObject?
-    weak var speciesGetter: JeffJSObject?
-    weak var protoGetter: JeffJSObject?
-    weak var protoSetter: JeffJSObject?
-    let atomObject: UInt32
-    let atomArray: UInt32
-    let atomToString: UInt32
-    let atomConstructor: UInt32
-
-    private init?(_ ctx: JeffJSContext) {
-        func own(_ o: JeffJSObject?, _ atom: UInt32) -> JeffJSObject? {
-            guard let o else { return nil }
-            let idx = jeffJS_findOwnPropertyIndex(obj: o, atom: atom)
-            guard idx >= 0, let shape = o.shape, idx < o.propCount, shape.prop[idx].flags.isPlainData,
-                  o.extra(at: idx) == nil else { return nil }
-            return o.dataValue(at: idx).toObject()
-        }
-        func getter(_ o: JeffJSObject?, _ atom: UInt32) -> (JeffJSObject?, JeffJSObject?)? {
-            guard let o else { return nil }
-            let idx = jeffJS_findOwnPropertyIndex(obj: o, atom: atom)
-            guard idx >= 0, let prop = ctx.getOwnProperty(obj: .borrowedObject(o), atom: atom),
-                  case .getset(let g, let s) = prop else { return nil }
-            return (g, s)
-        }
-        // Predefined atoms (immortal: nothing to free).
-        atomObject = JSPredefinedAtom.Object.rawValue
-        atomArray = JSPredefinedAtom.Array_.rawValue
-        atomToString = JSPredefinedAtom.toStringAtom.rawValue
-        atomConstructor = JSPredefinedAtom.constructor_.rawValue
-        guard let g = ctx.globalObj.toObject(),
-              let oc = own(g, atomObject), let ac = own(g, atomArray),
-              let op = ctx.classProto[JSClassID.JS_CLASS_OBJECT.rawValue].toObject(),
-              let fp = ctx.functionProto.toObject(),
-              let ap = ctx.classProto[JSClassID.JS_CLASS_ARRAY.rawValue].toObject(),
-              let k = own(oc, JSAtomID.keys), let gops = own(oc, JSAtomID.getOwnPropertySymbols),
-              let ts = own(op, atomToString), let hop = own(op, JSAtomID.hasOwnProperty),
-              let pie = own(op, JSAtomID.propertyIsEnumerable), let cl = own(fp, JSAtomID.call),
-              let ia = own(ac, JSAtomID.isArray), let cc = own(ap, JSAtomID.concat),
-              let mp = own(ap, JSAtomID.map), let fe = own(ap, JSAtomID.forEach), let fl = own(ap, JSAtomID.filter),
-              let sp = getter(ac, JSAtomID.Symbol_species)?.0 else { return nil }
-        objectCtor = oc; objectProto = op; functionProto = fp; arrayCtor = ac; arrayProto = ap
-        keys = k; getOwnPropertySymbols = gops; toString = ts; hasOwnProperty = hop
-        propertyIsEnumerable = pie; call = cl; isArray = ia; concat = cc; map = mp; forEach = fe
-        filter = fl; speciesGetter = sp
-        let pg = getter(op, JSAtomID.__proto__)
-        protoGetter = pg?.0
-        protoSetter = pg?.1
-    }
-
-    static func capture(_ ctx: JeffJSContext) -> JeffJSTwinIntrinsics? {
-        let r = JeffJSTwinIntrinsics(ctx)
-        if r == nil, JeffJSConfig.nativeTwinsDebug { JeffJSNativeTwins.log("intrinsics not captured") }
-        return r
-    }
-
-    /// The own plain data property `atom` of `o` (borrowed), nil if absent;
-    /// throws if it is an accessor or exotic.
-    @inline(__always)
-    static func ownData(_ o: JeffJSObject, _ atom: UInt32) throws -> JeffJSValue? {
-        let idx = jeffJS_findOwnPropertyIndex(obj: o, atom: atom)
-        if idx < 0 { return nil }
-        guard let shape = o.shape, idx < o.propCount, shape.prop[idx].flags.isPlainData,
-              o.extra(at: idx) == nil else { throw JeffJSTwinDecline(reason: "accessor") }
-        return o.dataValue(at: idx)
-    }
-
-    private static func expect(_ o: JeffJSObject, _ atom: UInt32, _ fn: JeffJSObject, _ what: String) throws {
-        guard let v = try ownData(o, atom), v.toObject() === fn else {
-            throw JeffJSTwinDecline(reason: "\(what) patched")
-        }
-    }
-
-    private static func expectAbsent(_ o: JeffJSObject, _ atom: UInt32, _ what: String) throws {
-        if jeffJS_findOwnPropertyIndex(obj: o, atom: atom) >= 0 { throw JeffJSTwinDecline(reason: "\(what) shadowed") }
-    }
-
-    /// The lookups the replaced code makes still reach the intrinsics, and
-    /// [[Set]] on a fresh object can run no page code.
-    func check(_ ctx: JeffJSContext) throws {
-        // Held weakly (identity only): a freed one never matches again.
-        guard let objectCtor, let objectProto, let functionProto, let arrayCtor, let arrayProto, let keys,
-              let getOwnPropertySymbols, let toString, let hasOwnProperty, let propertyIsEnumerable, let call,
-              let isArray, let concat, let map, let forEach, let filter, let speciesGetter
-        else { throw JeffJSTwinDecline(reason: "intrinsics gone") }
-        // Global `Object` / `Array`: no script-level let/const shadows them
-        // and the global object holds the intrinsics as data properties.
-        if ctx.globalLexCount > 0,
-           ctx.globalLexIndex(atomObject) >= 0 || ctx.globalLexIndex(atomArray) >= 0 {
-            throw JeffJSTwinDecline(reason: "global lexical Object/Array")
-        }
-        guard let g = ctx.globalObj.toObject() else { throw JeffJSTwinDecline(reason: "no global") }
-        try Self.expect(g, atomObject, objectCtor, "Object")
-        try Self.expect(g, atomArray, arrayCtor, "Array")
-        // Object.keys / getOwnPropertySymbols / prototype, Array.isArray.
-        try Self.expect(objectCtor, JSAtomID.keys, keys, "Object.keys")
-        try Self.expect(objectCtor, JSAtomID.getOwnPropertySymbols, getOwnPropertySymbols, "Object.getOwnPropertySymbols")
-        try Self.expect(objectCtor, JSAtomID.prototype, objectProto, "Object.prototype")
-        try Self.expect(arrayCtor, JSAtomID.isArray, isArray, "Array.isArray")
-        // Object.hasOwnProperty / Object.propertyIsEnumerable resolve through
-        // Object → Function.prototype → Object.prototype.
-        guard objectCtor.proto === functionProto, functionProto.proto === objectProto,
-              objectProto.proto == nil else { throw JeffJSTwinDecline(reason: "prototype chain changed") }
-        for o in [objectCtor, functionProto] {
-            try Self.expectAbsent(o, JSAtomID.hasOwnProperty, "hasOwnProperty")
-            try Self.expectAbsent(o, JSAtomID.propertyIsEnumerable, "propertyIsEnumerable")
-        }
-        try Self.expect(objectProto, atomToString, toString, "Object.prototype.toString")
-        try Self.expect(objectProto, JSAtomID.hasOwnProperty, hasOwnProperty, "Object.prototype.hasOwnProperty")
-        try Self.expect(objectProto, JSAtomID.propertyIsEnumerable, propertyIsEnumerable, "Object.prototype.propertyIsEnumerable")
-        // `.call` on those three.
-        for f in [toString, hasOwnProperty, propertyIsEnumerable] {
-            guard f.proto === functionProto else { throw JeffJSTwinDecline(reason: "builtin prototype changed") }
-            try Self.expectAbsent(f, JSAtomID.call, "call")
-        }
-        try Self.expect(functionProto, JSAtomID.call, call, "Function.prototype.call")
-        // Arrays: concat / map / forEach / filter, species, spreading.
-        guard arrayProto.proto === objectProto, arrayCtor.proto === functionProto else {
-            throw JeffJSTwinDecline(reason: "array prototype chain changed")
-        }
-        try Self.expect(arrayProto, JSAtomID.concat, concat, "Array.prototype.concat")
-        try Self.expect(arrayProto, JSAtomID.map, map, "Array.prototype.map")
-        try Self.expect(arrayProto, JSAtomID.forEach, forEach, "Array.prototype.forEach")
-        try Self.expect(arrayProto, JSAtomID.filter, filter, "Array.prototype.filter")
-        try Self.expect(arrayProto, atomConstructor, arrayCtor, "Array.prototype.constructor")
-        guard let sp = ctx.getOwnProperty(obj: .borrowedObject(arrayCtor), atom: JSAtomID.Symbol_species),
-              case .getset(let sg, _) = sp, sg === speciesGetter else {
-            throw JeffJSTwinDecline(reason: "Array[@@species] patched")
-        }
-        try Self.expectAbsent(arrayProto, JSAtomID.Symbol_isConcatSpreadable, "@@isConcatSpreadable")
-        try Self.expectAbsent(objectProto, JSAtomID.Symbol_isConcatSpreadable, "@@isConcatSpreadable")
-        // [[Set]] on a fresh {}: Object.prototype has only writable data
-        // properties (a setter would run page code, a read-only one would
-        // fail the write) and the intrinsic __proto__ accessor.
-        guard let shape = objectProto.shape else { throw JeffJSTwinDecline(reason: "Object.prototype shape") }
-        let n = min(shape.prop.count, objectProto.propCount)
-        for i in 0..<n {
-            let p = shape.prop[i]
-            if p.atom == 0 { continue }
-            if p.flags.isPlainData, objectProto.extra(at: i) == nil {
-                if !p.flags.contains(.writable) { throw JeffJSTwinDecline(reason: "read-only Object.prototype member") }
-                continue
-            }
-            if p.atom == JSAtomID.__proto__,
-               let prop = ctx.getOwnProperty(obj: .borrowedObject(objectProto), atom: p.atom),
-               case .getset(let pg, let ps) = prop, pg === protoGetter, ps === protoSetter { continue }
-            throw JeffJSTwinDecline(reason: "Object.prototype accessor")
-        }
     }
 }
 

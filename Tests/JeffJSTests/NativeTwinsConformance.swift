@@ -185,4 +185,173 @@ function patched(label, m) {
         assert(after == "{\"a\":1,\"b\":{\"c\":2}}:3" && rt.twinStats.hits == h1 + 1,
                "\(group): replaced member -> \(after)")
     }
+
+    /// Home Depot's own copies of Babel's objectSpread2 (Page build), Apollo's
+    /// cloneDeep and @wry/equality (vendor-apollo build).
+    static let nativeTwinsVariants2 = #"""
+var SPREAD_X=(function(){'use strict';function moe(e,t){var r=Object.keys(e);if(Object.getOwnPropertySymbols){var n=Object.getOwnPropertySymbols(e);t&&(n=n.filter(function(a){return Object.getOwnPropertyDescriptor(e,a).enumerable})),r.push.apply(r,n)}return r}function ul(e){for(var t=1;t<arguments.length;t++){var r=arguments[t]!=null?arguments[t]:{};t%2?moe(Object(r),!0).forEach(function(n){_5e(e,n,r[n])}):Object.getOwnPropertyDescriptors?Object.defineProperties(e,Object.getOwnPropertyDescriptors(r)):moe(Object(r)).forEach(function(n){Object.defineProperty(e,n,Object.getOwnPropertyDescriptor(r,n))})}return e}function _5e(e,t,r){return(t=A5e(t))in e?Object.defineProperty(e,t,{value:r,enumerable:!0,configurable:!0,writable:!0}):e[t]=r,e}function A5e(e){var t=P5e(e,"string");return typeof t=="symbol"?t:t+""}function P5e(e,t){if(typeof e!="object"||!e)return e;var r=e[Symbol.toPrimitive];if(r!==void 0){var n=r.call(e,t||"default");if(typeof n!="object")return n;throw new TypeError("@@toPrimitive must return a primitive value.")}return(t==="string"?String:Number)(e)}return ul;})();
+var CLONE_X=(function(){'use strict';var fs=Object.prototype.toString;function hs(r){return xt(r)}function xt(r,e){switch(fs.call(r)){case"[object Array]":{if(e=e||new Map,e.has(r))return e.get(r);var t=r.slice(0);return e.set(r,t),t.forEach(function(i,s){t[s]=xt(i,e)}),t}case"[object Object]":{if(e=e||new Map,e.has(r))return e.get(r);var n=Object.create(Object.getPrototypeOf(r));return e.set(r,n),Object.keys(r).forEach(function(i){n[i]=xt(r[i],e)}),n}default:return r}}return hs;})();
+var EQ_X=(function(){'use strict';var yn=Object.prototype,wr=yn.toString,Ns=yn.hasOwnProperty,xr=Function.prototype.toString,Nt=new Map;function F(r,e){try{return Ct(r,e)}finally{Nt.clear()}}function Ct(r,e){if(r===e)return!0;var t=wr.call(r),n=wr.call(e);if(t!==n)return!1;switch(t){case"[object Array]":if(r.length!==e.length)return!1;case"[object Object]":{if(Ir(r,e))return!0;var i=Dr(r),s=Dr(e),a=i.length;if(a!==s.length)return!1;for(var o=0;o<a;++o)if(!Ns.call(e,i[o]))return!1;for(var o=0;o<a;++o){var u=i[o];if(!Ct(r[u],e[u]))return!1}return!0}case"[object Error]":return r.name===e.name&&r.message===e.message;case"[object Number]":if(r!==r)return e!==e;case"[object Boolean]":case"[object Date]":return+r==+e;case"[object RegExp]":case"[object String]":return r==""+e;case"[object Map]":case"[object Set]":{if(r.size!==e.size)return!1;if(Ir(r,e))return!0;for(var c=r.entries(),l=t==="[object Map]";;){var f=c.next();if(f.done)break;var h=f.value,v=h[0],m=h[1];if(!e.has(v)||l&&!Ct(m,e.get(v)))return!1}return!0}case"[object AsyncFunction]":case"[object GeneratorFunction]":case"[object AsyncGeneratorFunction]":case"[object Function]":{var y=xr.call(r);return y!==xr.call(e)?!1:!As(y,Rs)}}return!1}function Dr(r){return Object.keys(r).filter(Cs,r)}function Cs(r){return this[r]!==void 0}var Rs="{ [native code] }";function As(r,e){var t=r.length-e.length;return t>=0&&r.indexOf(e,t)===t}function Ir(r,e){var t=Nt.get(r);if(t){if(t.has(e))return!0}else Nt.set(r,t=new Set);return t.add(e),!1}return F;})();
+
+"""#
+
+    static let nativeTwinsCases2 = #"""
+// Differential cases for objectSpread2 / cloneDeep / @wry/equality.
+function show(v, seen) {
+  seen = seen || [];
+  if (v === null || typeof v !== "object") {
+    if (typeof v === "symbol") return "sym(" + String(v.description) + ")";
+    if (typeof v === "function") return "fn";
+    if (typeof v === "number" && Object.is(v, -0)) return "-0";
+    return typeof v + ":" + String(v);
+  }
+  var idx = seen.indexOf(v); if (idx >= 0) return "#" + idx;
+  seen.push(v);
+  var proto = Object.getPrototypeOf(v);
+  var p = proto === Object.prototype ? "O" : proto === Array.prototype ? "A" : proto === null ? "N" : "P(" + Object.prototype.toString.call(v) + ")";
+  var keys = Reflect.ownKeys(v);
+  var parts = keys.map(function (k) {
+    var d = Object.getOwnPropertyDescriptor(v, k);
+    var flags = (d.enumerable ? "e" : "") + (d.writable ? "w" : "") + (d.configurable ? "c" : "") + ("get" in d ? "G" : "");
+    return (typeof k === "symbol" ? "@" + String(k.description) : k) + "/" + flags + "=" + ("value" in d ? show(d.value, seen) : "acc");
+  });
+  return p + (Object.isExtensible(v) ? "" : "!x") + "{" + parts.join(",") + "}";
+}
+var OUT = [];
+function rec(name, fn) { var r; try { r = show(fn()); } catch (e) { r = "THROW " + (e && e.name) + ": " + (e && e.message); } OUT.push(name + " => " + r); }
+var SYM = Symbol("s"), D = new Date(5);
+var spreadCases = [
+  ["basic", function (s) { return s(s({}, { a: 1, b: 2 }), {}, { c: 3 }); }],
+  ["overwrite", function (s) { return s({ a: 1, b: 2 }, { b: 3, c: 4 }); }],
+  ["int keys", function (s) { return s({ z: 1 }, { 2: "b", 1: "a", x: 0 }); }],
+  ["symbols", function (s) { var o = { a: 1 }; o[SYM] = 2; Object.defineProperty(o, Symbol("hidden"), { value: 3, enumerable: false }); return s({}, o); }],
+  ["non-enumerable odd", function (s) { var o = { a: 1 }; Object.defineProperty(o, "h", { value: 2, enumerable: false }); return s({}, o); }],
+  ["non-enumerable even", function (s) { var o = { a: 1 }; Object.defineProperty(o, "h", { value: 2, enumerable: false, writable: true }); return s({}, {}, o); }],
+  ["even then odd", function (s) { var o = {}; Object.defineProperty(o, "h", { value: 2, enumerable: false, configurable: true }); return s({}, {}, o, { h: 5 }); }],
+  ["nullish", function (s) { return s({ a: 1 }, null, undefined, 5, true); }],
+  ["string source", function (s) { return s({}, "ab"); }],
+  ["array source", function (s) { return s({}, [1, 2]); }],
+  ["proto key", function (s) { return s({}, { toString: 1, constructor: 2 }); }],
+  ["__proto__ key", function (s) { return s({}, JSON.parse('{"__proto__":{"x":1},"y":2}')); }],
+  ["frozen target prop", function (s) { var t = {}; Object.defineProperty(t, "a", { value: 1, configurable: false, writable: true, enumerable: true }); return s(t, { a: 2 }); }],
+  ["non-writable configurable", function (s) { var t = {}; Object.defineProperty(t, "a", { value: 1, configurable: true, writable: false }); return s(t, { a: 2 }); }],
+  ["sealed target", function (s) { return s(Object.preventExtensions({ a: 1 }), { b: 2 }); }],
+  ["getter source", function (s) { var n = 0; var o = { get g() { n++; return 7; } }; var r = s({}, o); return [n, show(r)]; }],
+  ["setter target", function (s) { var log = []; var t = { set q(v) { log.push(v); } }; var r = s(t, { q: 1 }); return [log.join(), show(r)]; }],
+  ["proto setter target", function (s) { var log = []; var p = { set q(v) { log.push(v); } }; var t = Object.create(p); var r = s(t, { q: 1, w: 2 }); return [log.join(), show(r)]; }],
+  ["proxy source", function (s) { return s({}, new Proxy({ a: 1 }, {})); }],
+  ["same object", function (s) { var o = { a: 1 }; return s(o, o); }],
+  ["class instance source", function (s) { function C() { this.a = 1; } C.prototype.b = 2; return s({}, new C()); }],
+  ["many keys", function (s) { var o = {}; for (var i = 0; i < 100; i++) o["k" + i] = i; return s(s({}, o), { k5: "x" }); }],
+  ["target array", function (s) { return s([], { a: 1 }); }],
+  ["no args", function (s) { return s({ a: 1 }); }],
+];
+var Q = { x: 1 };
+var cloneCases = [
+  ["primitive", function (c) { return [c(1), c("s"), c(null), c(undefined)]; }],
+  ["nested", function (c) { return c({ a: [1, { b: 2 }], c: { d: [3] } }); }],
+  ["shared", function (c) { var s = { v: 1 }; var r = c({ a: s, b: s }); return [r.a === r.b, r.a !== s, show(r)]; }],
+  ["cycle", function (c) { var o = { a: 1 }; o.self = o; var r = c(o); return [r.self === r, r !== o]; }],
+  ["array cycle", function (c) { var a = [1]; a.push(a); var r = c(a); return [r[1] === r, r !== a]; }],
+  ["class instance", function (c) { function K() { this.a = 1; } K.prototype.m = function () {}; var r = c(new K()); return [Object.getPrototypeOf(r) === K.prototype, show(r)]; }],
+  ["null proto", function (c) { var o = Object.create(null); o.a = { b: 1 }; return c(o); }],
+  ["date leaf", function (c) { var r = c({ d: D }); return r.d === D; }],
+  ["map leaf", function (c) { var m = new Map(); return c({ m: m }).m === m; }],
+  ["holes", function (c) { return c([1, , 3]); }],
+  ["symbol key skipped", function (c) { var o = { a: 1 }; o[SYM] = 2; return c(o); }],
+  ["non-enumerable skipped", function (c) { var o = { a: 1 }; Object.defineProperty(o, "h", { value: 2 }); return c(o); }],
+  ["getter", function (c) { var n = 0; var r = c({ get g() { n++; return 1; } }); return [n, show(r)]; }],
+  ["proto setter", function (c) { var log = []; function K() { this.q = 1; } Object.defineProperty(K.prototype, "q", { set: function (v) { log.push(v); }, get: function () { return 9; }, configurable: true }); var k = Object.create(K.prototype); Object.defineProperty(k, "q", { value: 1, enumerable: true }); var r = c(k); return [log.join(), show(r)]; }],
+  ["proto readonly", function (c) { var p = {}; Object.defineProperty(p, "a", { value: 0, writable: false }); var o = Object.create(p); Object.defineProperty(o, "a", { value: 1, enumerable: true }); try { return c(o); } catch (e) { return "throw " + e.name; } }],
+  ["frozen source", function (c) { return c(Object.freeze({ a: Object.freeze([1]) })); }],
+  ["toStringTag", function (c) { var o = { a: 1 }; o[Symbol.toStringTag] = "Foo"; return c(o) === o; }],
+  ["array with prop", function (c) { var a = [1]; a.x = 2; return c(a); }],
+  ["big", function (c) { var o = { items: [] }; for (var i = 0; i < 200; i++) o.items.push({ id: i, tags: ["a", "b"], meta: { n: i } }); return c(o); }],
+  ["deep", function (c) { var o = {}, x = o; for (var i = 0; i < 300; i++) { x.n = {}; x = x.n; } var r = c(o); var d = 0; while (r.n) { r = r.n; d++; } return d; }],
+];
+var eqCases = [
+  ["prims", function (e) { return [e(1, 1), e(1, 2), e(NaN, NaN), e(0, -0), e("a", "a"), e("a", "b"), e(true, false), e(null, undefined), e(undefined, undefined), e(1, "1")]; }],
+  ["objects", function (e) { return [e({ a: 1 }, { a: 1 }), e({ a: 1 }, { a: 2 }), e({ a: 1 }, { b: 1 }), e({ a: 1, b: undefined }, { a: 1 }), e({ a: 1 }, { a: 1, b: undefined })]; }],
+  ["nested", function (e) { return [e({ a: [1, { b: 2 }] }, { a: [1, { b: 2 }] }), e({ a: [1, { b: 2 }] }, { a: [1, { b: 3 }] })]; }],
+  ["arrays", function (e) { return [e([1, 2], [1, 2]), e([1, 2], [1, 2, 3]), e([undefined, 1], [undefined, 1]), e([undefined], [null]), e([], {})]; }],
+  ["cycles", function (e) { var a = { x: 1 }; a.self = a; var b = { x: 1 }; b.self = b; var c = { x: 2 }; c.self = c; return [e(a, b), e(a, c)]; }],
+  ["key order", function (e) { return e({ a: 1, b: 2 }, { b: 2, a: 1 }); }],
+  ["proto differs", function (e) { function K() { this.a = 1; } return e(new K(), { a: 1 }); }],
+  ["null proto", function (e) { var o = Object.create(null); o.a = 1; return e(o, { a: 1 }); }],
+  ["dates", function (e) { return [e(new Date(1), new Date(1)), e(new Date(1), new Date(2))]; }],
+  ["maps", function (e) { return [e(new Map([[1, 2]]), new Map([[1, 2]])), e(new Set([1]), new Set([2]))]; }],
+  ["funcs", function (e) { var f = function () { return 1; }; return [e(f, function () { return 1; }), e(Math.max, Math.min)]; }],
+  ["errors", function (e) { return e(new Error("x"), new Error("x")); }],
+  ["wrappers", function (e) { return [e(new Number(1), new Number(1)), e(new String("a"), "a")]; }],
+  ["symbols", function (e) { return [e(SYM, SYM), e(Symbol("a"), Symbol("a")), e({ s: SYM }, { s: SYM })]; }],
+  ["getter", function (e) { var n = 0; var a = { get g() { n++; return 1; } }; var r = e(a, { g: 1 }); return [n, r]; }],
+  ["non-enumerable in b", function (e) { var b = {}; Object.defineProperty(b, "a", { value: 1 }); return e({ a: 1, c: 2 }, Object.assign(b, { c: 2, d: undefined })); }],
+  ["arguments", function (e) { return e((function () { return arguments; })(1), (function () { return arguments; })(1)); }],
+  ["toStringTag", function (e) { var a = { x: 1 }, b = { x: 1 }; a[Symbol.toStringTag] = "Foo"; b[Symbol.toStringTag] = "Foo"; return e(a, b); }],
+  ["big", function (e) { function mk() { var o = { items: [] }; for (var i = 0; i < 200; i++) o.items.push({ id: i, tags: ["a", "b"], meta: { n: i } }); return o; } var a = mk(), b = mk(); var r1 = e(a, b); b.items[199].meta.n = -1; return [r1, e(a, b)]; }],
+];
+function runAll2(label, s, c, e) {
+  spreadCases.forEach(function (x) { rec(label + " spread " + x[0], function () { return x[1](s); }); });
+  cloneCases.forEach(function (x) { rec(label + " clone " + x[0], function () { return x[1](c); }); });
+  eqCases.forEach(function (x) { rec(label + " equal " + x[0], function () { return x[1](e); }); });
+}
+function patched2(label, s, c, e) {
+  var ok = Object.keys; Object.keys = function (o) { return ok(o).reverse(); };
+  rec(label + " patched keys spread", function () { return s({}, { a: 1, b: 2 }); });
+  rec(label + " patched keys clone", function () { return c({ a: 1, b: 2 }); });
+  rec(label + " patched keys equal", function () { return e({ a: 1, b: 2 }, { a: 1, b: 2 }); });
+  Object.keys = ok;
+  var OM = Map; Map = function () { OUT.push("Map ctor ran"); return new OM(); };
+  rec(label + " patched Map clone", function () { return c({ a: [1] }); });
+  Map = OM;
+  var OS = Set; Set = function () { OUT.push("Set ctor ran"); return new OS(); };
+  rec(label + " patched Set equal", function () { return e({ a: 1 }, { a: 1 }); });
+  Set = OS;
+  var dp = Object.defineProperty; Object.defineProperty = function (o, k, d) { OUT.push("defineProperty " + String(k)); return dp(o, k, d); };
+  rec(label + " patched defineProperty spread", function () { return s({ toString: 0 }, { toString: 1 }); });
+  Object.defineProperty = dp;
+}
+
+"""#
+
+    /// objectSpread2, cloneDeep, @wry/equality: twin on vs off, as above.
+    mutating func testNativeTwinsRound2() {
+        let group = "NativeTwins2"
+        JeffJSStackDiag.currentLabel = group
+        let (rt, ctx) = makeCtx()
+        let saved = rt.nativeTwins
+        defer { rt.nativeTwins = saved }
+        func run(_ js: String, _ tag: String) -> String {
+            let r = ctx.eval(input: js, filename: "<eval><\(group)-\(tag)>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+            if r.isException {
+                let e = ctx.getException()
+                defer { e.freeValue() }
+                return "!" + (ctx.toSwiftString(e) ?? "?")
+            }
+            defer { r.freeValue() }
+            return ctx.toSwiftString(r) ?? "?"
+        }
+        let setup = run(Self.nativeTwinsVariants2 + Self.nativeTwinsCases2 + "'ok'", "setup")
+        assert(setup == "ok", "\(group): setup -> \(setup)")
+        let body = """
+            OUT = []; runAll2("x", SPREAD_X, CLONE_X, EQ_X); patched2("x", SPREAD_X, CLONE_X, EQ_X);
+            OUT.filter(function (l) { return !/ deep => /.test(l); }).join("\\n")
+            """
+        rt.nativeTwins = true
+        let h0 = rt.twinStats.hits
+        let on = run(body, "on")
+        let served = rt.twinStats.hits - h0
+        rt.nativeTwins = false
+        let off = run(body, "off")
+        assert(served > 30, "\(group): twins served \(served) calls")
+        assert(on == off, "\(group): twins and bytecode differ")
+        if on != off {
+            for (x, y) in zip(on.split(separator: "\n"), off.split(separator: "\n")) where x != y {
+                print("[\(group)] twin: \(x)\n[\(group)] code: \(y)")
+            }
+        }
+        rt.nativeTwins = true
+        let deep = run("OUT = []; rec('d', function(){ return cloneCases.filter(function(c){ return c[0] === 'deep'; })[0][1](CLONE_X); }); OUT[0]", "deep")
+        assert(deep == "d => number:300", "\(group): 300 levels -> \(deep)")
+    }
 }

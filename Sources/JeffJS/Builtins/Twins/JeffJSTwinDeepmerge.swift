@@ -48,6 +48,7 @@ nonisolated enum JeffJSTwinDeepmerge {
         roles: ["yC", "kze", "$7", "Ize", "Nze", "Qme", "Dze", "tNe", "Rze", "Sze", "Oze", "Cze", "_ze", "Aze"],
         values: ["Tze"],
         source: reference,
+        needs: .deepmerge,
         accepts: accepts,
         run: run)
 

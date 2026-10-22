@@ -44,5 +44,33 @@ nonisolated enum JeffJSTwinTableData {
         Entry(hash: 0x2d02d09cb48e015, prefilter: 0x800010001, family: "deepmerge", role: 12, cells: [1000]),   // _ze
         Entry(hash: 0x946cf61f8682273c, prefilter: 0x1800010000, family: "deepmerge", role: 13, cells: []),   // Aze
         Entry(hash: 0x18c3123d09c9c5ea, prefilter: 0x2e00030005, family: "deepmerge", role: 1, cells: [5, 2, 8, 7, 4]),   // kze
+        Entry(hash: 0x2fbd0c49cdc0d9ff, prefilter: 0x8400010002, family: "objectSpread2", role: 0, cells: [1, 2]),   // bf
+        Entry(hash: 0x62ab8e79c39d0a0, prefilter: 0x5000020000, family: "objectSpread2", role: 1, cells: []),   // Ef
+        Entry(hash: 0xae8c04f4dc1dce7c, prefilter: 0x3e00030001, family: "objectSpread2", role: 2, cells: [3]),   // w0
+        Entry(hash: 0x833598e20e64c738, prefilter: 0x1500010001, family: "objectSpread2", role: 3, cells: [4]),   // T0
+        Entry(hash: 0xdd6b02206ac4c63b, prefilter: 0x5e00020000, family: "objectSpread2", role: 4, cells: []),   // S0
+        Entry(hash: 0x4359439894b53a3b, prefilter: 0x5800020000, family: "objectSpread2", role: 4, cells: []),   // S0
+        Entry(hash: 0xbf4bf13daab1f5b4, prefilter: 0x8400010002, family: "objectSpread2", role: 0, cells: [1, 2]),   // bf
+        Entry(hash: 0xbc2b0c263f014ba0, prefilter: 0x5000020000, family: "objectSpread2", role: 1, cells: []),   // Ef
+        Entry(hash: 0xbef61172ee6c4fb4, prefilter: 0x3e00030001, family: "objectSpread2", role: 2, cells: [3]),   // w0
+        Entry(hash: 0xb4ed87deb1a70a50, prefilter: 0x1500010001, family: "objectSpread2", role: 3, cells: [4]),   // T0
+        Entry(hash: 0x41a746533da25c13, prefilter: 0x5e00020000, family: "objectSpread2", role: 4, cells: []),   // S0
+        Entry(hash: 0xc0936bbe4e9f0263, prefilter: 0x5800020000, family: "objectSpread2", role: 4, cells: []),   // S0
+        Entry(hash: 0x3b161a10ca0ead05, prefilter: 0x500010001, family: "cloneDeep", role: 0, cells: [1]),   // Tv
+        Entry(hash: 0xcc10286ffc4ffc33, prefilter: 0xd800020002, family: "cloneDeep", role: 1, cells: [1000, 1]),   // Iu
+        Entry(hash: 0xcdde82484a7a2a0d, prefilter: 0x500010001, family: "cloneDeep", role: 0, cells: [1]),   // Tv
+        Entry(hash: 0x23a45b206fda167b, prefilter: 0xd800020002, family: "cloneDeep", role: 1, cells: [1000, 1]),   // Iu
+        Entry(hash: 0x5999cf37a9465b92, prefilter: 0x2200020002, family: "wry-equality", role: 0, cells: [1, 1002]),   // F
+        Entry(hash: 0xd2626cc9de266d18, prefilter: 0x23f00020008, family: "wry-equality", role: 1, cells: [1000, 5, 2, 1001, 1, -1, 4, -1]),   // Ct
+        Entry(hash: 0x274b060d4c4db344, prefilter: 0x1800010001, family: "wry-equality", role: 2, cells: [3]),   // Dr
+        Entry(hash: 0xd81e5cd8f1273b91, prefilter: 0x600010000, family: "wry-equality", role: 3, cells: []),   // Cs
+        Entry(hash: 0x7f15ddc30c012c2a, prefilter: 0x1f00020000, family: "wry-equality", role: 4, cells: []),   // As
+        Entry(hash: 0xb950be2b974c4464, prefilter: 0x4200020001, family: "wry-equality", role: 5, cells: [1002]),   // Ir
+        Entry(hash: 0x54b248170f50cd6a, prefilter: 0x2200020002, family: "wry-equality", role: 0, cells: [1, 1002]),   // F
+        Entry(hash: 0x1c73808f83faeca0, prefilter: 0x23f00020008, family: "wry-equality", role: 1, cells: [1000, 5, 2, 1001, 1, -1, 4, -1]),   // Ct
+        Entry(hash: 0xe57fbace0ddbe9ec, prefilter: 0x1800010001, family: "wry-equality", role: 2, cells: [3]),   // Dr
+        Entry(hash: 0xb49c11ef4653e579, prefilter: 0x600010000, family: "wry-equality", role: 3, cells: []),   // Cs
+        Entry(hash: 0x1483b44167888502, prefilter: 0x1f00020000, family: "wry-equality", role: 4, cells: []),   // As
+        Entry(hash: 0x366b4a15e4e7ecac, prefilter: 0x4200020001, family: "wry-equality", role: 5, cells: [1002]),   // Ir
     ]
 }
