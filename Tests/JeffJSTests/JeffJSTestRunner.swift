@@ -336,6 +336,7 @@ struct JeffJSTestRunner {
             ("LazyCompile", { $0.testLazyCompile() }),
             ("NativeTwins", { $0.testNativeTwins() }),
             ("NativeTwins2", { $0.testNativeTwinsRound2() }),
+            ("NativeTwins3", { $0.testNativeTwinsRound3() }),
             ("StringIterator", { $0.testStringIterator() }),
             ("AggregateError", { $0.testAggregateError() }),
             ("WebStorage", { $0.testWebStorage() }),

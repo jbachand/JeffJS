@@ -43,6 +43,8 @@ nonisolated struct JeffJSNativeTwinStats {
     var declines = 0
     /// Bodies recognised as a family member.
     var recognised = 0
+    /// Calls served per family (index into `JeffJSNativeTwins.families`).
+    var servedByFamily: [Int] = []
 }
 
 /// A guard failed: run the bytecode instead. Thrown before the twin has
@@ -71,6 +73,10 @@ nonisolated enum JeffJSNativeTwins {
         /// version): their text and their names for the same roles / values,
         /// in the same order.
         var alternates: [(source: String, roles: [String], values: [String])] = []
+        /// Closure variables that hold another family's function (reference
+        /// name → that family's name and role): checked as that family's
+        /// member, its own cells included.
+        var foreign: [String: (family: String, role: Int)] = [:]
         /// The builtins its code reaches (checked per call).
         let needs: JeffJSTwinIntrinsics.Needs
         /// Cheap argument test before the per-call guards (false: decline).
@@ -85,6 +91,7 @@ nonisolated enum JeffJSNativeTwins {
         JeffJSTwinObjectSpread.family,
         JeffJSTwinCloneDeep.family,
         JeffJSTwinEquality.family,
+        JeffJSTwinClientStrip.family,
     ]
 
     /// A family whose cells were checked for one call: its function objects
@@ -97,7 +104,7 @@ nonisolated enum JeffJSNativeTwins {
 
     // MARK: The table
 
-    enum Cell { case role(Int), value(Int), other }
+    enum Cell { case role(Int), value(Int), foreign(family: Int, role: Int), other }
 
     struct Member {
         let family: Int
@@ -157,7 +164,11 @@ nonisolated enum JeffJSNativeTwins {
         let t = Table()
         for e in JeffJSTwinTableData.entries {
             guard let fi = families.firstIndex(where: { $0.name == e.family }), t.members.count < 253 else { continue }
-            let cells: [Cell] = e.cells.map { c in c < 0 ? .other : (c >= 1000 ? .value(Int(c) - 1000) : .role(Int(c))) }
+            let cells: [Cell] = e.cells.map { c in
+                if c < 0 { return .other }
+                if c >= 2000 { return .foreign(family: (Int(c) - 2000) / 100, role: (Int(c) - 2000) % 100) }
+                return c >= 1000 ? .value(Int(c) - 1000) : .role(Int(c))
+            }
             t.byHash[e.hash] = t.members.count
             t.members.append(Member(family: fi, role: e.role, cells: cells))
             t.prefilter.insert(e.prefilter)
@@ -197,7 +208,7 @@ nonisolated enum JeffJSNativeTwins {
             // table (JeffJSNativeTwins.swift), the reference texts' members as this compiler
             // compiles them. NativeTwinsConformance fails when it is stale: regenerate with
             //   swift run -c release jeffjs-cli --twin-table > Sources/JeffJS/Builtins/Twins/JeffJSTwinTableData.swift
-            // Cells: role index, 1000 + value index, -1 other.
+            // Cells: role index, 1000 + value index, 2000 + 100 * family index + role (another family's), -1 other.
 
             nonisolated enum JeffJSTwinTableData {
                 struct Entry {
@@ -214,7 +225,12 @@ nonisolated enum JeffJSNativeTwins {
             guard let h = hashes[i], let k = keys[i] else { continue }
             let fam = families[m.family]
             let cells = m.cells.map { c -> String in
-                switch c { case .role(let r): return "\(r)"; case .value(let v): return "\(1000 + v)"; case .other: return "-1" }
+                switch c {
+                case .role(let r): return "\(r)"
+                case .value(let v): return "\(1000 + v)"
+                case .foreign(let f, let r): return "\(2000 + f * 100 + r)"
+                case .other: return "-1"
+                }
             }.joined(separator: ", ")
             out += "        Entry(hash: 0x\(String(h, radix: 16)), prefilter: 0x\(String(k, radix: 16)), family: \"\(fam.name)\", role: \(m.role), cells: [\(cells)]),   // \(fam.roles[m.role])\n"
         }
@@ -260,6 +276,9 @@ nonisolated enum JeffJSNativeTwins {
                 let n = rt.atomToString(cv.varName) ?? ""
                 if let r = roles.firstIndex(of: n) { return .role(r) }
                 if let v = values.firstIndex(of: n) { return .value(v) }
+                if let f = family.foreign[n], let fi = families.firstIndex(where: { $0.name == f.family }) {
+                    return .foreign(family: fi, role: f.role)
+                }
                 return .other
             }
             let h = structuralHash(fb, rt: rt)
@@ -301,6 +320,7 @@ nonisolated enum JeffJSNativeTwins {
             switch (x, y) {
             case (.role(let p), .role(let q)) where p == q: continue
             case (.value(let p), .value(let q)) where p == q: continue
+            case (.foreign(let f, let p), .foreign(let g, let q)) where f == g && p == q: continue
             case (.other, .other): continue
             default: return false
             }
@@ -381,8 +401,15 @@ nonisolated enum JeffJSNativeTwins {
             let resolved = try resolve(ctx, t, family: family, entry: obj, entryMember: member, varRefs: varRefs)
             let r = try family.run(ctx, resolved, argv, argc)
             rt.twinStats.hits += 1
-            if JeffJSConfig.nativeTwinsDebug, rt.twinStats.hits & (rt.twinStats.hits - 1) == 0 {
-                log("\(family.name): \(rt.twinStats.hits) calls served, \(rt.twinStats.declines) declined")
+            if JeffJSConfig.nativeTwinsDebug {
+                if rt.twinStats.servedByFamily.count < families.count {
+                    rt.twinStats.servedByFamily = Array(repeating: 0, count: families.count)
+                }
+                rt.twinStats.servedByFamily[member.family] += 1
+                let n = rt.twinStats.servedByFamily[member.family]
+                if n & (n - 1) == 0 {
+                    log("\(family.name): \(n) calls served (all families \(rt.twinStats.hits), \(rt.twinStats.declines) declined)")
+                }
             }
             return r
         } catch let d as JeffJSTwinDecline {
@@ -405,6 +432,7 @@ nonisolated enum JeffJSNativeTwins {
         var r = Resolved(family: family, functions: Array(repeating: nil, count: family.roles.count),
                          values: Array(repeating: .undefined, count: family.values.count))
         var valueSeen = Array(repeating: false, count: family.values.count)
+        var checkedForeign = Set<ObjectIdentifier>()
         r.functions[0] = entry
         var queue: [(JeffJSObject, Member, [JeffJSVarRef?])] = [(entry, entryMember, varRefs)]
         while let (obj, member, refs) = queue.popLast() {
@@ -443,6 +471,24 @@ nonisolated enum JeffJSNativeTwins {
                     }
                     r.functions[role] = fo
                     queue.append((fo, m, vr.isEmpty ? fo.varRefsFast : vr))
+                case .foreign(let fi, let role):
+                    // Another family's function: that family's member, its
+                    // whole family checked from it (cached per call by object).
+                    guard let fo = v.toObject(), case .bytecodeFunc(let fbOpt, let vr, _) = fo.payload, let fb = fbOpt
+                    else { throw JeffJSTwinDecline(reason: "foreign member replaced") }
+                    if checkedForeign.contains(ObjectIdentifier(fo)) { continue }
+                    if fb.twinTag == 0, fb.isLazyPending, !ensureCompiled(ctx, fb) {
+                        throw JeffJSTwinDecline(reason: "foreign member does not compile")
+                    }
+                    let tag = classify(ctx, fb)
+                    guard tag >= 2 else { throw JeffJSTwinDecline(reason: "foreign member is other code") }
+                    let m = t.members[Int(tag - 2)]
+                    guard m.family == fi, m.role == role else { throw JeffJSTwinDecline(reason: "foreign member is another") }
+                    if role == 0 {
+                        _ = try resolve(ctx, t, family: families[fi], entry: fo, entryMember: m,
+                                        varRefs: vr.isEmpty ? fo.varRefsFast : vr)
+                    }
+                    checkedForeign.insert(ObjectIdentifier(fo))
                 case .other:
                     break
                 }

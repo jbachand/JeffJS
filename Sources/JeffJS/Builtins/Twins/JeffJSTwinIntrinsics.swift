@@ -34,6 +34,8 @@ nonisolated final class JeffJSTwinIntrinsics {
         /// @wry/equality: keys, filter (+ species), `.call`, Map get/set/clear,
         /// `new Set` has/add.
         static let equal = Needs(rawValue: 1 << 3)
+        /// Home Depot's data-model `_client` strip: keys, map, reduce (+ species).
+        static let strip = Needs(rawValue: 1 << 4)
     }
 
     var global: JeffJSObject?
@@ -67,6 +69,7 @@ nonisolated final class JeffJSTwinIntrinsics {
     var filter: JeffJSObject?
     var push: JeffJSObject?
     var slice: JeffJSObject?
+    var reduce: JeffJSObject?
     var speciesGetter: JeffJSObject?
     var protoGetter: JeffJSObject?
     var protoSetter: JeffJSObject?
@@ -147,6 +150,7 @@ nonisolated final class JeffJSTwinIntrinsics {
         filter = own(ap, JSAtomID.filter)
         push = own(ap, atomPush)
         slice = own(ap, atomSlice)
+        reduce = own(ap, JSPredefinedAtom.reduce.rawValue)
         speciesGetter = accessor(ac, JSAtomID.Symbol_species)?.0
         let pg = accessor(op, JSAtomID.__proto__)
         protoGetter = pg?.0
@@ -236,7 +240,7 @@ nonisolated final class JeffJSTwinIntrinsics {
               arrayProto.proto === objectProto else {
             throw JeffJSTwinDecline(reason: "prototype chain changed")
         }
-        if !needs.isDisjoint(with: [.deepmerge, .spread, .clone, .equal]) {
+        if !needs.isDisjoint(with: [.deepmerge, .spread, .clone, .equal, .strip]) {
             try expect(1, objectCtor, JSAtomID.keys, keys, "Object.keys")
         }
         if needs.contains(.deepmerge) {
@@ -294,6 +298,7 @@ nonisolated final class JeffJSTwinIntrinsics {
             try species(ctx)
             try indexAccessorsAbsent()
         }
+        if needs.contains(.strip) { try checkStrip(ctx) }
         if needs.contains(.equal) {
             try expect(70, global, atomSet, setCtor, "Set")
             try expect(71, setCtor, JSAtomID.prototype, setProto, "Set.prototype")
@@ -308,6 +313,12 @@ nonisolated final class JeffJSTwinIntrinsics {
             try expect(80, functionProto, JSAtomID.call, call, "Function.prototype.call")
             try species(ctx)
         }
+    }
+
+    private func checkStrip(_ ctx: JeffJSContext) throws {
+        try expect(100, arrayProto, JSAtomID.map, map, "Array.prototype.map")
+        try expect(101, arrayProto, JSPredefinedAtom.reduce.rawValue, reduce, "Array.prototype.reduce")
+        try species(ctx)
     }
 
     /// ArraySpeciesCreate on a plain array makes a plain array:

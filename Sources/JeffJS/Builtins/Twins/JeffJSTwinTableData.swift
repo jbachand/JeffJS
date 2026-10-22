@@ -3,7 +3,7 @@
 // table (JeffJSNativeTwins.swift), the reference texts' members as this compiler
 // compiles them. NativeTwinsConformance fails when it is stale: regenerate with
 //   swift run -c release jeffjs-cli --twin-table > Sources/JeffJS/Builtins/Twins/JeffJSTwinTableData.swift
-// Cells: role index, 1000 + value index, -1 other.
+// Cells: role index, 1000 + value index, 2000 + 100 * family index + role (another family's), -1 other.
 
 nonisolated enum JeffJSTwinTableData {
     struct Entry {
@@ -72,5 +72,13 @@ nonisolated enum JeffJSTwinTableData {
         Entry(hash: 0xb49c11ef4653e579, prefilter: 0x600010000, family: "wry-equality", role: 3, cells: []),   // Cs
         Entry(hash: 0x1483b44167888502, prefilter: 0x1f00020000, family: "wry-equality", role: 4, cells: []),   // As
         Entry(hash: 0x366b4a15e4e7ecac, prefilter: 0x4200020001, family: "wry-equality", role: 5, cells: [1002]),   // Ir
+        Entry(hash: 0xb999a8f21c338aba, prefilter: 0x900010001, family: "thd-client-strip", role: 0, cells: [1]),   // Po
+        Entry(hash: 0x80867546b3144376, prefilter: 0x2300020002, family: "thd-client-strip", role: 1, cells: [2100, 1]),   // Cr
+        Entry(hash: 0x9a881febb5224c58, prefilter: 0x2300020001, family: "thd-client-strip", role: 1, cells: [1]),   // Cr
+        Entry(hash: 0xac92d193e6bc0df9, prefilter: 0x2300020002, family: "thd-client-strip", role: 1, cells: [1, 2100]),   // Cr
+        Entry(hash: 0xdcf280e01696243a, prefilter: 0x900010001, family: "thd-client-strip", role: 0, cells: [1]),   // Po
+        Entry(hash: 0xd28b51f6f2943ebe, prefilter: 0x2300020002, family: "thd-client-strip", role: 1, cells: [2100, 1]),   // Cr
+        Entry(hash: 0xabb3c65b481f7b50, prefilter: 0x2300020001, family: "thd-client-strip", role: 1, cells: [1]),   // Cr
+        Entry(hash: 0xf294edf7b65255a1, prefilter: 0x2300020002, family: "thd-client-strip", role: 1, cells: [1, 2100]),   // Cr
     ]
 }

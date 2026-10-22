@@ -354,4 +354,96 @@ function patched2(label, s, c, e) {
         let deep = run("OUT = []; rec('d', function(){ return cloneCases.filter(function(c){ return c[0] === 'deep'; })[0][1](CLONE_X); }); OUT[0]", "deep")
         assert(deep == "d => number:300", "\(group): 300 levels -> \(deep)")
     }
+
+    /// Home Depot's `_client` strip, both builds (renamed as another bundle would).
+    static let nativeTwinsCases3 = #"""
+var STRIP_A=(function(){function Xa(e,t){var r=Object.keys(e);if(Object.getOwnPropertySymbols){var n=Object.getOwnPropertySymbols(e);t&&(n=n.filter(function(o){return Object.getOwnPropertyDescriptor(e,o).enumerable})),r.push.apply(r,n)}return r}function Xb(e){for(var t=1;t<arguments.length;t++){var r=arguments[t]!=null?arguments[t]:{};t%2?Xa(Object(r),!0).forEach(function(n){Xc(e,n,r[n])}):Object.getOwnPropertyDescriptors?Object.defineProperties(e,Object.getOwnPropertyDescriptors(r)):Xa(Object(r)).forEach(function(n){Object.defineProperty(e,n,Object.getOwnPropertyDescriptor(r,n))})}return e}function Xc(e,t,r){return(t=Xd(t))in e?Object.defineProperty(e,t,{value:r,enumerable:!0,configurable:!0,writable:!0}):e[t]=r,e}function Xd(e){var t=Xe(e,"string");return typeof t=="symbol"?t:t+""}function Xe(e,t){if(typeof e!="object"||!e)return e;var r=e[Symbol.toPrimitive];if(r!==void 0){var n=r.call(e,t);if(typeof n!="object")return n;throw new TypeError("@@toPrimitive must return a primitive value.")}return(t==="string"?String:Number)(e)}const Ss=(e,t)=>Object.keys(e).map(r=>typeof e[r]=="object"?t(e[r])?{}:{[r]:Ss(e[r],t)}:{[r]:e[r]}).reduce((r,n)=>Xb(Xb({},r),n),{}),Sv=e=>Ss(e,r=>!!r._client);return Sv;})();
+var STRIP_B=(function(){const Qx=(e,t)=>Object.keys(e).map(r=>typeof e[r]=="object"?t(e[r])?{}:{[r]:Qx(e[r],t)}:{[r]:e[r]}).reduce((r,n)=>({...r,...n}),{}),Qy=e=>Qx(e,r=>!!r._client);return Qy;})();
+var stripCases = [
+  ["basic", function (s) { return s({ a: 1, b: "x", c: true, d: undefined, f: function () {} }); }],
+  ["nested", function (s) { return s({ product: { id: 1, price: { value: 2 }, local: { _client: true, x: 1 } } }); }],
+  ["client falsy", function (s) { return s({ a: { _client: 0, b: 1 }, c: { _client: "", d: 2 }, e: { _client: "y" } }); }],
+  ["arrays", function (s) { return s({ list: [1, { a: 2 }, [3]], hidden: [{ _client: 1 }] }); }],
+  ["array root", function (s) { return s([{ a: 1 }, 2]); }],
+  ["array client prop", function (s) { var a = [1]; a._client = true; return s({ a: a }); }],
+  ["null value", function (s) { return s({ a: null }); }],
+  ["int keys", function (s) { return s({ z: 1, 2: { b: 1 }, 1: "a" }); }],
+  ["__proto__ key", function (s) { return s(JSON.parse('{"__proto__":{"x":1},"y":2}')); }],
+  ["proto client", function (s) { var p = { _client: true }; return s({ a: Object.create(p), b: Object.create({}) }); }],
+  ["getter", function (s) { var n = 0; var r = s({ get g() { n++; return { a: 1 }; } }); return [n, show(r)]; }],
+  ["client getter", function (s) { var n = 0; var r = s({ a: { get _client() { n++; return true; } } }); return [n, show(r)]; }],
+  ["date", function (s) { return s({ d: new Date(5), m: new Map() }); }],
+  ["symbols", function (s) { var o = { a: 1 }; o[SYM] = { b: 1 }; return s(o); }],
+  ["non-enumerable", function (s) { var o = { a: 1 }; Object.defineProperty(o, "h", { value: { x: 1 } }); return s(o); }],
+  ["class instance", function (s) { function K() { this.a = { b: 1 }; } K.prototype.c = 2; return s(new K()); }],
+  ["proxy", function (s) { return s({ a: new Proxy({ b: 1 }, {}) }); }],
+  ["holes", function (s) { return s({ a: [1, , 3] }); }],
+  ["frozen", function (s) { return s(Object.freeze({ a: Object.freeze({ b: 1 }) })); }],
+  ["shared", function (s) { var x = { v: 1 }; var r = s({ a: x, b: x }); return [r.a === r.b, show(r)]; }],
+  ["big", function (s) { var o = { items: [] }; for (var i = 0; i < 200; i++) o.items.push({ id: i, tags: ["a", "b"], meta: { n: i, _c: { _client: i % 2 } } }); return s(o); }],
+  ["deep", function (s) { var o = {}, x = o; for (var i = 0; i < 300; i++) { x.n = {}; x = x.n; } var r = s(o); var d = 0; while (r.n) { r = r.n; d++; } return d; }],
+];
+function runAll3(label, s) { stripCases.forEach(function (x) { rec(label + " strip " + x[0], function () { return x[1](s); }); }); }
+function patched3(label, s) {
+  var ok = Object.keys; Object.keys = function (o) { return ok(o).reverse(); };
+  rec(label + " patched keys", function () { return s({ a: 1, b: 2 }); });
+  Object.keys = ok;
+  var om = Array.prototype.map; Array.prototype.map = function (f) { OUT.push("map ran"); return om.call(this, f); };
+  rec(label + " patched map", function () { return s({ a: 1 }); });
+  Array.prototype.map = om;
+  var orr = Array.prototype.reduce; Array.prototype.reduce = function (f, i) { OUT.push("reduce ran"); return orr.call(this, f, i); };
+  rec(label + " patched reduce", function () { return s({ a: 1 }); });
+  Array.prototype.reduce = orr;
+  var dp = Object.defineProperty; Object.defineProperty = function (o, k, d) { OUT.push("defineProperty " + String(k)); return dp(o, k, d); };
+  rec(label + " patched defineProperty", function () { return s({ toString: { a: 1 } }); });
+  Object.defineProperty = dp;
+  Object.defineProperty(Object.prototype, "zz", { set: function (v) { OUT.push("setter ran"); }, configurable: true });
+  rec(label + " Object.prototype setter", function () { return s({ zz: 1, a: 2 }); });
+  delete Object.prototype.zz;
+}
+
+"""#
+
+    /// Home Depot's `_client` strip: twin on vs off, as above.
+    mutating func testNativeTwinsRound3() {
+        let group = "NativeTwins3"
+        JeffJSStackDiag.currentLabel = group
+        let (rt, ctx) = makeCtx()
+        let saved = rt.nativeTwins
+        defer { rt.nativeTwins = saved }
+        func run(_ js: String, _ tag: String) -> String {
+            let r = ctx.eval(input: js, filename: "<eval><\(group)-\(tag)>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+            if r.isException {
+                let e = ctx.getException()
+                defer { e.freeValue() }
+                return "!" + (ctx.toSwiftString(e) ?? "?")
+            }
+            defer { r.freeValue() }
+            return ctx.toSwiftString(r) ?? "?"
+        }
+        let setup = run(Self.nativeTwinsCases2 + Self.nativeTwinsCases3 + "'ok'", "setup")
+        assert(setup == "ok", "\(group): setup -> \(setup)")
+        let body = """
+            OUT = []; runAll3("a", STRIP_A); runAll3("b", STRIP_B); patched3("a", STRIP_A); patched3("b", STRIP_B);
+            OUT.filter(function (l) { return !/ deep => /.test(l); }).join("\\n")
+            """
+        rt.nativeTwins = true
+        let h0 = rt.twinStats.hits
+        let on = run(body, "on")
+        let served = rt.twinStats.hits - h0
+        rt.nativeTwins = false
+        let off = run(body, "off")
+        assert(served > 20, "\(group): twin served \(served) calls")
+        assert(on == off, "\(group): twin and bytecode differ")
+        if on != off {
+            for (x, y) in zip(on.split(separator: "\n"), off.split(separator: "\n")) where x != y {
+                print("[\(group)] twin: \(x)\n[\(group)] code: \(y)")
+            }
+        }
+        rt.nativeTwins = true
+        for v in ["STRIP_A", "STRIP_B"] {
+            let deep = run("OUT = []; rec('d', function(){ return stripCases.filter(function(c){ return c[0] === 'deep'; })[0][1](\(v)); }); OUT[0]", "deep")
+            assert(deep == "d => number:300", "\(group): \(v) 300 levels -> \(deep)")
+        }
+    }
 }
