@@ -407,6 +407,12 @@ public final class JeffJSEnvironment {
     /// debug tables, text and file name — equal for two scripts that differ
     /// only in whitespace and comments (with `lazyFunctions` off, so every
     /// body is compiled).
+    /// `JeffJSTwinTableData.swift` computed from the native twins' reference
+    /// texts with this compiler (jeffjs-cli --twin-table).
+    public func nativeTwinTableSource() -> String {
+        return JeffJSNativeTwins.tableSource(context)
+    }
+
     public func compileOnly(_ source: String, filename: String = "<eval>", hashBytecode: Bool = false,
                             positionFree: Bool = false)
         -> (parseMs: Double, compileMs: Double, bytecodeHash: UInt64?, error: String?)

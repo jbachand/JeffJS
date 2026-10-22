@@ -1555,8 +1555,10 @@ nonisolated extension JeffJSContext {
         // compiled one is stamped in use: the idle reclaim must not drop a
         // body that a function object reaches through fbFast.
         if let li = innerFB.lazyInfo {
-            if !li.isPending { obj.fbFast = innerFB; li.touch = rt.lazyReclaimPhase }
-        } else {
+            if !li.isPending, JeffJSNativeTwins.allowsFastPath(self, innerFB) {
+                obj.fbFast = innerFB; li.touch = rt.lazyReclaimPhase
+            }
+        } else if JeffJSNativeTwins.allowsFastPath(self, innerFB) {
             obj.fbFast = innerFB
         }
         if lean {
@@ -8101,10 +8103,18 @@ nonisolated struct JeffJSInterpreter {
             // Backfill the fast fields for the next call (a lazily compiled
             // body is in use again: see JeffJSLazyReclaim.swift).
             if let li = fbFromPayload.lazyInfo { li.touch = ctx.rt.lazyReclaimPhase }
-            obj.fbFast = fbFromPayload
             // interp.leanClosurePayload: createClosure keeps the var-refs in
             // varRefsFast only (the payload's list is empty).
             let payloadVarRefs = varRefs.isEmpty ? obj.varRefsFast : varRefs
+            // Native twin (JeffJSNativeTwins): the entry of a recognised
+            // library function runs in Swift when its guards hold; otherwise
+            // (nil) the bytecode below runs. Such a body keeps fbFast nil.
+            if JeffJSNativeTwins.allowsFastPath(ctx, fbFromPayload) {
+                obj.fbFast = fbFromPayload
+            } else if resumeState == nil, (flags & JS_CALL_FLAG_CONSTRUCTOR) == 0,
+                      let r = JeffJSNativeTwins.call(ctx, obj._obj, fbFromPayload, payloadVarRefs, thisVal, argv, argc) {
+                return r
+            }
             obj.varRefsFast = payloadVarRefs
             fb = fbFromPayload
             hasVarRefs0 = !payloadVarRefs.isEmpty

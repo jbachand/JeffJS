@@ -131,6 +131,14 @@ nonisolated enum JeffJSConfig {
     /// (its closure variables and source span) instead of its bytecode.
     /// `JEFFJS_COMPILE_LAZYFUNCTIONS=0` compiles everything eagerly.
     static let lazyFunctions       = bool("compile.lazyFunctions",     default: true)
+    /// Native twins (Builtins/Twins/JeffJSNativeTwins.swift): a recognised
+    /// library function (same code as a known npm build, compared by its
+    /// bytecode with every minified name left out) runs as Swift when its
+    /// guards hold. `JEFFJS_NATIVETWINS_ENABLED=0` turns the lookup off.
+    static let nativeTwins         = bool("nativeTwins.enabled",       default: true)
+    /// `JEFFJS_NATIVETWINS_DEBUG=1`: one stderr line per recognised body and
+    /// per declined call (the guard that failed), and a hit count.
+    static let nativeTwinsDebug    = bool("nativeTwins.debug",         default: false)
     /// Script text kept for lazy compilation / `Function.prototype.toString`
     /// lives in the bytecode-cache entry's file mapping instead of the heap:
     /// on a cache hit the deserializer uses the entry's text in place, and

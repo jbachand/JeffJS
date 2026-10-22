@@ -1003,6 +1003,13 @@ nonisolated class JeffJSFunctionBytecode {
     /// `argSlotsOwned` for a plain (non-generator, non-async) function: its
     /// call paths dup the arguments into the frame and release them at exit.
     var copiesArgs: Bool = false
+    /// Native twins (Builtins/Twins/JeffJSNativeTwins.swift): 0 = not looked
+    /// up yet, 1 = no twin, otherwise the twin table's member index + 2.
+    /// A body that is the entry of a twin never gets `fbFast` on its
+    /// closures, so every call reaches callInternal's payload path, which
+    /// tries the native twin first. (One byte, in the padding after
+    /// copiesArgs: the table holds at most 253 members.)
+    var twinTag: UInt8 = 0
     var cpool: [JeffJSValue] = [] {
         didSet { if _cpoolWanted { _rebuildCpoolRaw() } }
     }

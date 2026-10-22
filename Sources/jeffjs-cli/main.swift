@@ -51,6 +51,13 @@ if let bb = args.first(where: { $0.hasPrefix("--boot-bench") }) {
 // order (classic: the fixture file or inline text; module: the app's dumped
 // bundle `<file>.bundle.js` from --bundles=<dir>, else skipped). Network is
 // stubbed (fetch/XHR never settle) so runs are reproducible.
+// --twin-table: print JeffJSTwinTableData.swift (the native twin table computed from
+// the reference texts with this compiler) and exit.
+if args.contains("--twin-table") {
+    let text: String = JeffJSHostActor.assumeIsolated { JeffJSEnvironment().nativeTwinTableSource() }
+    print(text, terminator: "")
+    exit(0)
+}
 let pageDir = args.first(where: { $0.hasPrefix("--page=") }).map { String($0.dropFirst(7)) }
 let bundlesDir = args.first(where: { $0.hasPrefix("--bundles=") }).map { String($0.dropFirst(10)) }
 guard !paths.isEmpty || pageDir != nil else {

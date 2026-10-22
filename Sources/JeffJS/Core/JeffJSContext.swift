@@ -202,6 +202,9 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// interp.fastArrayBuiltins: the intrinsic %Array% and its original
     /// `get [Symbol.species]` (references held by the context; identity only).
     var arrayCtorIntrinsic: JeffJSValue = .JS_UNDEFINED
+    /// The builtins native twins rely on, captured once the intrinsics exist
+    /// (Builtins/Twins/JeffJSNativeTwins.swift).
+    var twinIntrinsics: JeffJSTwinIntrinsics? = nil
     var arraySpeciesGetterVal: JeffJSValue = .JS_UNDEFINED
     /// Transition shape of an array iterator `{_target, _index, _kind}`,
     /// captured from the first one built (pinned: refCount + 1).
@@ -826,6 +829,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             // Phase 7: builtin methods and statics are never enumerable.
             addIntrinsicNonEnumerableBuiltins()
 
+            if JeffJSConfig.nativeTwins { twinIntrinsics = JeffJSTwinIntrinsics.capture(self) }
+
             intrinsicsAdded = true
             rt.initComplete = true
         }
@@ -878,6 +883,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         arrayIterNextVal = .JS_UNDEFINED
         arrayCtorIntrinsic.freeValue()
         arrayCtorIntrinsic = .JS_UNDEFINED
+        twinIntrinsics = nil
         for v in objectToStringCache { v.freeValue() }
         objectToStringCache = []
         arraySpeciesGetterVal.freeValue()

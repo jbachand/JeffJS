@@ -868,6 +868,11 @@ nonisolated final class JeffJSRuntime {
     var lazyMinSourceBytes: Int = JeffJSConfig.lazyMinSourceBytes
     /// Counters for perf summaries (see JeffJSLazyStats).
     var lazyStats = JeffJSLazyStats()
+    /// Native twins (`nativeTwins.enabled`). Mutable so tests can compare
+    /// the twin with the bytecode it replaces in one process.
+    var nativeTwins: Bool = JeffJSConfig.nativeTwins
+    /// Native twin counters (calls served, declined, bodies recognised).
+    var twinStats = JeffJSNativeTwinStats()
     /// Some lazily compiled body waits to be written (JeffJSLazyBodyStore);
     /// the idle tick flushes it.
     var lazyBodiesPending = false

@@ -325,12 +325,36 @@ nonisolated struct JeffJSBytecodeSerializer {
     /// same bytes (`positionFreeBytes`; jeffjs-cli --bc-hash-code, the
     /// unminifier's semantic check).
     private var positionFree = false
+    /// Also leave out every name a minifier picks (JeffJSNativeTwins): the
+    /// function names, closure variable names and the parent slots of the
+    /// root's closure variables (where the enclosing module keeps them).
+    /// What stays is the code's structure, property names and globals.
+    private var nameFree = false
+    /// Nesting depth while writing (0 = the function asked for).
+    private var depth = 0
 
     /// The serialization with every position-dependent field zeroed or left
     /// out. Not loadable; for identity checks only.
     static func positionFreeBytes(_ fb: JeffJSFunctionBytecode, rt: JeffJSRuntime?) -> [UInt8] {
         var s = JeffJSBytecodeSerializer(atomTable: AtomTableBuilder())
         s.positionFree = true
+        s.writeFunctionBytecode(fb, rt: rt)
+        let atoms = s.atomTable.atomEntries
+        s.writeU32(UInt32(atoms.count))
+        for entry in atoms {
+            if let str = entry { s.writeU8(ATOM_ENTRY_STRING); s.writeString(str) } else { s.writeU8(ATOM_ENTRY_NULL) }
+        }
+        return s.buf
+    }
+
+    /// `positionFreeBytes` without the names a minifier chooses (see
+    /// `nameFree`): two copies of one library function minified differently
+    /// serialize to the same bytes. Nested functions must be compiled (a lazy
+    /// stub carries no body). Not loadable; for identity checks only.
+    static func nameFreeBytes(_ fb: JeffJSFunctionBytecode, rt: JeffJSRuntime) -> [UInt8] {
+        var s = JeffJSBytecodeSerializer(atomTable: AtomTableBuilder())
+        s.positionFree = true
+        s.nameFree = true
         s.writeFunctionBytecode(fb, rt: rt)
         let atoms = s.atomTable.atomEntries
         s.writeU32(UInt32(atoms.count))
@@ -455,12 +479,16 @@ nonisolated struct JeffJSBytecodeSerializer {
         if let c = compiled, !c.debugExprSpans.isEmpty { ext |= EXT_SPANS }
         if fb.isTopLevelCode { ext |= EXT_TOPLEVEL }
         if positionFree { ext &= ~(EXT_DEBUG | EXT_SPANS) }
+        // A body compiled lazily, eagerly or read from the cache is the same code.
+        if nameFree { ext &= ~(EXT_LAZY | EXT_LAZY_PENDING) }
         writeU8(ext)
         writeU16(fb.argCount)
         writeU16(fb.varCount)
         writeU16(fb.definedArgCount)
         // Function `name` atom, as an atom-table index (remapped on read).
-        writeU32((rt != nil) ? atomTable.intern(fb.nameAtom, rt: rt!) : fb.nameAtom)
+        if nameFree { writeU32(0) } else {
+            writeU32((rt != nil) ? atomTable.intern(fb.nameAtom, rt: rt!) : fb.nameAtom)
+        }
         writeU16(fb.stackSize)
         writeU16(fb.closureVarCount)
         writeU32(positionFree ? 0 : UInt32(fb.lineNum))
@@ -505,7 +533,7 @@ nonisolated struct JeffJSBytecodeSerializer {
         // deserialized closure binds the wrong variables.
         writeU16(UInt16(fb.closureVarsList.count))
         for cv in fb.closureVarsList {
-            let nameRef: UInt32 = (rt != nil) ? atomTable.intern(cv.varName, rt: rt!) : cv.varName
+            let nameRef: UInt32 = nameFree ? 0 : ((rt != nil) ? atomTable.intern(cv.varName, rt: rt!) : cv.varName)
             writeU32(nameRef)
             var f: UInt8 = 0
             if cv.isLocal { f |= 1 }
@@ -514,7 +542,7 @@ nonisolated struct JeffJSBytecodeSerializer {
             if cv.isLexical { f |= 8 }
             writeU8(f)
             writeU8(UInt8(truncatingIfNeeded: cv.varKind))
-            writeU32(UInt32(bitPattern: Int32(truncatingIfNeeded: cv.varIdx)))
+            writeU32(nameFree && depth == 0 ? 0 : UInt32(bitPattern: Int32(truncatingIfNeeded: cv.varIdx)))
         }
         writeU32(UInt32(bitPattern: Int32(truncatingIfNeeded: fb.selfRefVarIdx)))
         if let sites = fb.evalSites {
@@ -539,7 +567,7 @@ nonisolated struct JeffJSBytecodeSerializer {
                 }
             }
         }
-        if let li = fb.lazyInfo {
+        if !nameFree, let li = fb.lazyInfo {
             let seed = li.seed
             writeU8(seed.kind.rawValue)
             writeU8(seed.funcKind)
@@ -547,7 +575,7 @@ nonisolated struct JeffJSBytecodeSerializer {
             writeU16(seed.flags)
             writeU32(positionFree ? 0 : UInt32(bitPattern: seed.parseStart))
             writeU32(positionFree ? 0 : UInt32(bitPattern: seed.parseLine))
-            writeU32((rt != nil) ? atomTable.intern(seed.funcName, rt: rt!) : seed.funcName)
+            writeU32(nameFree ? 0 : ((rt != nil) ? atomTable.intern(seed.funcName, rt: rt!) : seed.funcName))
         }
         if ext & EXT_DEBUG != 0, let c = compiled {
             writeBytes(Array(c.debugPc2lineBuf.prefix(c.debugPc2lineLen)))
@@ -598,7 +626,9 @@ nonisolated struct JeffJSBytecodeSerializer {
         } else if let fb = val.toFunctionBytecode() {
             // Nested function — recursive serialization (shares atom table)
             writeU8(CPOOL_FUNCTION)
+            depth += 1
             writeFunctionBytecode(fb, rt: rt)
+            depth -= 1
         } else if let rt, val.isObject, let obj = val.toObject(),
                   let cooked = obj.arraySnapshot(),
                   let rawObj = obj.getOwnPropertyValue(atom: rt.findAtom("raw")).toObject(),
@@ -1463,7 +1493,7 @@ nonisolated final class JeffJSBytecodeCache {
     /// blobs written by another one, even when nobody bumped
     /// `compilerVersion`. `BytecodeCacheBudgetTests.testEngineSourceHashIsCurrent`
     /// fails when it is stale; `Scripts/update_bytecode_identity.sh` rewrites it.
-    static let engineSourceHash: UInt64 = 0xd8a9c8d51a2e0811 // bytecode-identity
+    static let engineSourceHash: UInt64 = 0x2882845a2a899637 // bytecode-identity
 
     /// The engine build identity: `compilerVersion`, the blob and entry
     /// layouts, `engineSourceHash`, and the opcode table the interpreter
