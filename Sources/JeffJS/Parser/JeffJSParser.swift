@@ -2596,7 +2596,6 @@ nonisolated final class JeffJSParser {
                     emitOp(.for_in_start)
                     let doneLabel = newLabel()
                     emitLabel(loopLabel)
-                    emitLabel(continueLabel)
                     emitOp(.for_in_next)
                     emitIfTrue(doneLabel)
 
@@ -2619,6 +2618,9 @@ nonisolated final class JeffJSParser {
                     parseStatement()
                     popBlockEnv()
 
+                    // Per-iteration bindings (see parseForOf).
+                    emitLabel(continueLabel)
+                    if isLexical { emitCloseLoopScopeVars(scopeIdx) }
                     emitGoto(loopLabel)
 
                     emitLabel(doneLabel)
@@ -2650,7 +2652,6 @@ nonisolated final class JeffJSParser {
                     }
                     let doneLabel = newLabel()
                     emitLabel(loopLabel)
-                    emitLabel(continueLabel)
                     emitForOfNext(isAwait: isAwait, doneLabel: doneLabel)
 
                     // Rewind and parse destructuring binding
@@ -2672,6 +2673,12 @@ nonisolated final class JeffJSParser {
                     parseStatement()
                     popBlockEnv()
 
+                    // Per-iteration bindings: closures made in the body keep
+                    // this iteration's pattern variables (chalk's style getters
+                    // `for (const [name, style] of Object.entries(…))` all saw
+                    // the last name). `continue` lands here too.
+                    emitLabel(continueLabel)
+                    if isLexical { emitCloseLoopScopeVars(scopeIdx) }
                     emitGoto(loopLabel)
 
                     // Normal completion (next() reported done) must not
@@ -2895,6 +2902,24 @@ nonisolated final class JeffJSParser {
     }
 
     /// Parse for-in loop body.
+    /// `close_loc` for every lexical variable declared in the loop head's own
+    /// scope (a destructuring `let`/`const` head declares several): the
+    /// per-iteration copy of ES §14.7.5.7 ForIn/OfBodyEvaluation step 5.
+    /// QuickJS gets the same from closing the loop scope each iteration.
+    private func emitCloseLoopScopeVars(_ scopeIdx: Int) {
+        guard scopeIdx >= 0 && scopeIdx < fd.scopes.count else { return }
+        var varIdx = fd.scopes[scopeIdx].first
+        while varIdx >= 0 && varIdx < fd.vars.count {
+            let v = fd.vars[varIdx]
+            if v.scopeLevel != scopeIdx { break }
+            if v.isLexical {
+                emitOp(.close_loc)
+                emitU16(UInt16(varIdx))
+            }
+            varIdx = v.scopeNext
+        }
+    }
+
     private func parseForIn(varIdx: Int, varAtom: JSAtom, scopeLevel: Int,
                             loopLabel: Int, breakLabel: Int, continueLabel: Int,
                             assignHead: (() -> Void)? = nil) {

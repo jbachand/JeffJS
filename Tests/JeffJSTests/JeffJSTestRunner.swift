@@ -6115,6 +6115,23 @@ extension JeffJSTestRunner {
         let (rt, ctx) = makeCtx()
         // Shared context — don't free per-test
 
+        // A destructuring let/const head gets a fresh binding per iteration
+        // (§14.7.5.7): closures made in the body keep that iteration's values
+        // (chalk's style getters all used the last style name and threw
+        // "property is not configurable"; washingtonpost.com's error page).
+        evalCheckStr(ctx, """
+            (function () {
+                var r = [];
+                for (let [t, e] of Object.entries({ a: 1, b: 2, z: 3 })) r.push(() => t + e);
+                for (const { k } of [{ k: 'x' }, { k: 'y' }]) { if (k === 'x') { r.push(() => k); continue; } r.push(() => k); }
+                for (let [k] in { p: 1, q: 2 }) r.push(() => k);
+                let outer = 0;
+                for (let [a] of [[1]]) r.push(() => a + outer);
+                outer = 10;
+                return r.map(function (f) { return f(); }).join();
+            })()
+            """, expect: "a1,b2,z3,x,y,p,q,11")
+
         // for-of with array — loop body doesn't execute; returns 0 instead of 60.
         evalCheckAnyInt(ctx, """
             var sum = 0;
