@@ -3248,6 +3248,23 @@ extension JeffJSTestRunner {
             u.searchParams.delete("a"); u.searchParams.delete("b");
             [before, after, u.search + "|" + u.href].join(" / ")
             """, expect: "?a=1 https://ex.com/p?a=1#frag / ?a=1&b=2+3 https://ex.com/p?a=1&b=2+3#frag / |https://ex.com/p#frag")
+        // The query is kept as parsed (WHATWG URL): a key without `=` does not
+        // gain one until searchParams is mutated (URLSearchParams update steps).
+        evalCheckStr(ctx, """
+            var base = "https://ex.com/dir/page";
+            var a = new URL("/a?x", base);
+            var b = new URL("https://ex.com/p?", base);
+            var c = new URL("https://ex.com/p?a=%7E&b#h");
+            var r = [a.href, a.search, b.href, "[" + b.search + "]", c.href, c.search];
+            a.searchParams.append("y", "1");
+            r.push(a.href);
+            c.search = "?q";
+            r.push(c.href);
+            c.search = "";
+            r.push(c.href);
+            r.join(" ")
+            """, expect: "https://ex.com/a?x ?x https://ex.com/p? [] https://ex.com/p?a=%7E&b#h ?a=%7E&b "
+                       + "https://ex.com/a?x=&y=1 https://ex.com/p?q#h https://ex.com/p#h")
         evalCheckStr(ctx, """
             var u = new URL("https://ex.com/p");
             u.search = "?z=9";

@@ -1053,16 +1053,49 @@ nonisolated struct JeffJSStdLib {
         put("password", components.password ?? "")
 
         let searchParams = buildSearchParams(ctx: ctx, query: components.query ?? "")
+        urlStoreQuery(ctx: ctx, obj: obj, query: components.percentEncodedQuery,
+                      params: searchParams)
         _ = ctx.setPropertyStr(obj: obj, name: "searchParams", value: searchParams)
+    }
+
+    /// The URL's query as parsed or set (WHATWG URL "query": null or a
+    /// string). It is kept verbatim — `?x` stays `?x`, not `?x=` — and is only
+    /// replaced by the serialised entries once `searchParams` is mutated (the
+    /// URLSearchParams "update steps"), detected through its version counter.
+    static let urlQuerySlot = "__urlQuery"
+    /// `searchParams`' version when `__urlQuery` was stored.
+    static let urlQueryVersionSlot = "__urlQueryVersion"
+
+    private static func urlStoreQuery(ctx: JeffJSContext, obj: JeffJSValue,
+                                      query: String?, params: JeffJSValue) {
+        _ = ctx.setPropertyStr(obj: obj, name: urlQuerySlot,
+                               value: query.map { ctx.newStringValue($0) } ?? .null)
+        _ = ctx.setPropertyStr(obj: obj, name: urlQueryVersionSlot,
+                               value: .newInt32(uspVersion(ctx, params)))
+    }
+
+    /// The URL's current query: the stored one, or the serialised entries when
+    /// `searchParams` changed since (empty serialisation = null, as the
+    /// update steps set it).
+    private static func urlCurrentQuery(ctx: JeffJSContext, this: JeffJSValue) -> String? {
+        let sp = ctx.getPropertyStr(obj: this, name: "searchParams")
+        defer { sp.freeValue() }
+        let stored = ctx.getPropertyStr(obj: this, name: urlQuerySlot)
+        defer { stored.freeValue() }
+        let version = ctx.getPropertyStr(obj: this, name: urlQueryVersionSlot)
+        defer { version.freeValue() }
+        if sp.isObject, !(version.isInt && version.toInt32() == uspVersion(ctx, sp)) {
+            let query = uspSerialize(uspReadEntries(ctx, sp))
+            return query.isEmpty ? nil : query
+        }
+        if stored.isString { return ctx.toSwiftString(stored) }
+        return nil
     }
 
     /// `url.search` — serialised from the live searchParams.
     static func urlSearchGetter(ctx: JeffJSContext, this: JeffJSValue,
                                 args: [JeffJSValue]) -> JeffJSValue {
-        let sp = ctx.getPropertyStr(obj: this, name: "searchParams")
-        defer { sp.freeValue() }
-        guard sp.isObject else { return ctx.newStringValue("") }
-        let query = uspSerialize(uspReadEntries(ctx, sp))
+        let query = urlCurrentQuery(ctx: ctx, this: this) ?? ""
         return ctx.newStringValue(query.isEmpty ? "" : "?" + query)
     }
 
@@ -1071,8 +1104,11 @@ nonisolated struct JeffJSStdLib {
         let sp = ctx.getPropertyStr(obj: this, name: "searchParams")
         defer { sp.freeValue() }
         guard sp.isObject else { return .undefined }
-        let raw = args.count >= 1 ? (ctx.toSwiftString(args[0]) ?? "") : ""
+        var raw = args.count >= 1 ? (ctx.toSwiftString(args[0]) ?? "") : ""
+        if raw.hasPrefix("?") { raw.removeFirst() }
         uspWriteEntries(ctx, sp, uspParse(raw))
+        // "" sets the query to null; anything else is kept as given.
+        urlStoreQuery(ctx: ctx, obj: this, query: raw.isEmpty ? nil : raw, params: sp)
         return .undefined
     }
 
@@ -1081,12 +1117,12 @@ nonisolated struct JeffJSStdLib {
                               args: [JeffJSValue]) -> JeffJSValue {
         let baseVal = ctx.getPropertyStr(obj: this, name: urlBaseSlot)
         defer { baseVal.freeValue() }
-        let searchVal = urlSearchGetter(ctx: ctx, this: this, args: [])
-        defer { searchVal.freeValue() }
+        // A non-null empty query still prints its `?` in href (not in search).
+        let query = urlCurrentQuery(ctx: ctx, this: this).map { "?" + $0 } ?? ""
         let hashVal = ctx.getPropertyStr(obj: this, name: "hash")
         defer { hashVal.freeValue() }
         return ctx.newStringValue((ctx.toSwiftString(baseVal) ?? "")
-                                  + (ctx.toSwiftString(searchVal) ?? "")
+                                  + query
                                   + (ctx.toSwiftString(hashVal) ?? ""))
     }
 
@@ -1215,6 +1251,18 @@ nonisolated struct JeffJSStdLib {
             ctx.setPropertyByIndex(obj: arr, index: UInt32(i), value: pair)
         }
         _ = ctx.setPropertyStr(obj: this, name: uspEntriesSlot, value: arr)
+        _ = ctx.setPropertyStr(obj: this, name: uspVersionSlot,
+                               value: .newInt32(uspVersion(ctx, this) &+ 1))
+    }
+
+    /// Bumped by every mutation of the entry list, so the owning URL can tell
+    /// its stored query is stale.
+    static let uspVersionSlot = "__uspVersion"
+
+    static func uspVersion(_ ctx: JeffJSContext, _ this: JeffJSValue) -> Int32 {
+        let v = ctx.getPropertyStr(obj: this, name: uspVersionSlot)
+        defer { v.freeValue() }
+        return v.isInt ? v.toInt32() : 0
     }
 
     /// Build a URLSearchParams object from a query string.
