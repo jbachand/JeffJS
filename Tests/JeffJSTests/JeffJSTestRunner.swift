@@ -2466,6 +2466,22 @@ extension JeffJSTestRunner {
             re.lastIndex = 4;
             re.test('bar foo')
             """, expect: true)
+
+        // A regex input that grows in place afterwards is re-read (the regex
+        // input cache once kept the stale one-character copy: apple.com's
+        // animation-expression tokenizer rejected "33px", "Expected unit type").
+        evalCheckStr(ctx, """
+            (function () {
+                function name(L) {
+                    let e = "";
+                    for (; null != L.c && /[a-z]/.test(L.c);) e += L.c, L.next();
+                    return e;
+                }
+                var L = { t: "33px", p: 2, c: "p", next() { this.c = this.t[++this.p] ?? null; } };
+                var u = name(L);
+                return [u, /^(t|px|vh)$/.test(u), /^px$/.exec(u) !== null, u.match(/x$/) !== null].join(",");
+            })()
+            """, expect: "px,true,true,true")
     }
 
     // MARK: - JSON

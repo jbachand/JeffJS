@@ -2439,7 +2439,12 @@ nonisolated extension JeffJSContext {
 /// Now a few most-recent entries per runtime (single-threaded, no lock).
 /// An entry holds a strong reference to its string, so its identity cannot
 /// be reused while it is cached; a `/g` loop, `replace` or a tokenizer
-/// re-running over the same input still converts it once.
+/// re-running over the same input still converts it once. An input entry is
+/// valid only while the string's length is the one converted: a string with
+/// no other JS holder can grow in place (`appendInPlace`, `s += c` in a
+/// loop), and the cache's own reference does not count as a holder. Apple's
+/// animation-expression tokenizer tested a one-character string, appended to
+/// it, and the regex then ran over the stale one-character copy.
 nonisolated final class JeffJSRegexCaches {
     private var inputs: [(JeffJSString, [UInt32])] = []
     private var names: [(JeffJSString, [String?])] = []
@@ -2474,7 +2479,7 @@ nonisolated final class JeffJSRegexCaches {
 
     @inline(__always)
     func codeUnits(of s: JeffJSString) -> [UInt32] {
-        if let e = inputs.first, e.0 === s { return e.1 }
+        if let e = inputs.first, e.0 === s, e.1.count == s.len { return e.1 }
         return codeUnitsSlow(s)
     }
 
@@ -2482,8 +2487,10 @@ nonisolated final class JeffJSRegexCaches {
     private func codeUnitsSlow(_ s: JeffJSString) -> [UInt32] {
         if let i = inputs.firstIndex(where: { $0.0 === s }) {
             let e = inputs.remove(at: i)
-            inputs.insert(e, at: 0)
-            return e.1
+            if e.1.count == s.len {
+                inputs.insert(e, at: 0)
+                return e.1
+            }
         }
         var c = [UInt32](); c.reserveCapacity(s.len)
         switch s.storage {
