@@ -347,6 +347,26 @@ final class FetchBridgeTests: XCTestCase {
         XCTAssertTrue(out.hasPrefix("203:cors:from-sw|"), out)
     }
 
+    // MARK: task ordering
+
+    /// A response that arrives while a script is still running is a task queued at its
+    /// arrival (the networking task source), so it runs before a timer the script set later.
+    /// The network leg used to run on the host actor: it started only after the script and
+    /// each of its awaits waited for the host thread, so the later timer won.
+    @JeffJSHostActor
+    func testResponseQueuedBeforeLaterTimer() async throws {
+        try skipIfNoServer()
+        let env = makeEnvironment()
+        let out = await runJS(env, """
+        var order = [];
+        fetch('\(base)/bin').then(function(){ order.push('fetch'); }, function(){ order.push('fetch-error'); });
+        var t0 = Date.now(); while (Date.now() - t0 < 600) {}
+        setTimeout(function(){ order.push('timer'); }, 0);
+        setTimeout(function(){ globalThis.__out = order.join(','); }, 1500);
+        """)
+        XCTAssertEqual(out, "fetch,timer")
+    }
+
     // MARK: binary
 
     @JeffJSHostActor

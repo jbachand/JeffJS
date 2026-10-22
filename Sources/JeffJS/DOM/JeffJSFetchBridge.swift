@@ -423,10 +423,18 @@ final class JeffJSFetchBridge {
             return requestID
         }
 
-        let task = Task { [weak self] in
+        // The network leg (service-worker hook, preflight, request) runs off the host thread
+        // and comes back as one host job when it completes, like a browser's networking task
+        // source: queued at arrival, in order with timers. When the leg ran on the host actor,
+        // its start and each of its awaits waited for the running script (a page busy for
+        // seconds delivered a 100 ms response after a 5 s `setTimeout` that started later —
+        // Home Depot's personalization timed out and its placeholders came back).
+        let prepared = prepareFetch(spec: spec)
+        let task = Task.detached { [weak self] in
+            let outcome = await Self.runNetwork(prepared)
             guard let self else { return }
-            let result = await self.performFetch(spec: spec)
             await JeffJSHostActor.run {
+                let result = self.finishFetch(prepared, outcome)
                 defer {
                     self.releaseCallback(for: requestID)
                     self.activeTasks.removeValue(forKey: requestID)
@@ -478,9 +486,11 @@ final class JeffJSFetchBridge {
         let size = spec.body?.count ?? 0
         guard keepaliveInflightBytes + size <= Self.keepaliveQuotaBytes else { return false }
         keepaliveInflightBytes += size
-        Task { [self] in
-            let result = await self.performFetch(spec: spec)
+        let prepared = prepareFetch(spec: spec)
+        Task.detached { [self] in
+            let outcome = await Self.runNetwork(prepared)
             await JeffJSHostActor.run {
+                let result = self.finishFetch(prepared, outcome)
                 self.keepaliveInflightBytes = max(0, self.keepaliveInflightBytes - size)
                 guard let requestID else { return }
                 defer {
@@ -827,19 +837,19 @@ final class JeffJSFetchBridge {
 
     // MARK: - CORS rules
 
-    private static let simpleMethods: Set<String> = ["GET", "HEAD", "POST"]
-    private static let safelistedRequestHeaders: Set<String> = [
+    nonisolated private static let simpleMethods: Set<String> = ["GET", "HEAD", "POST"]
+    nonisolated private static let safelistedRequestHeaders: Set<String> = [
         "accept", "accept-language", "content-language", "content-type", "range"
     ]
-    private static let simpleContentTypes: Set<String> = [
+    nonisolated private static let simpleContentTypes: Set<String> = [
         "application/x-www-form-urlencoded", "multipart/form-data", "text/plain"
     ]
-    private static let safelistedResponseHeaders: Set<String> = [
+    nonisolated private static let safelistedResponseHeaders: Set<String> = [
         "cache-control", "content-language", "content-length", "content-type",
         "expires", "last-modified", "pragma"
     ]
 
-    private static func needsPreflight(method: String, headers: [(name: String, value: String)]) -> Bool {
+    nonisolated private static func needsPreflight(method: String, headers: [(name: String, value: String)]) -> Bool {
         if !simpleMethods.contains(method.uppercased()) { return true }
         for (name, value) in headers {
             let lower = name.lowercased()
@@ -852,7 +862,7 @@ final class JeffJSFetchBridge {
         return false
     }
 
-    private static func allowOriginOK(_ headers: [String: String], origin: String,
+    nonisolated private static func allowOriginOK(_ headers: [String: String], origin: String,
                                       credentials: Bool) -> Bool {
         guard let allow = headers["access-control-allow-origin"]?
             .trimmingCharacters(in: .whitespaces) else { return false }
@@ -875,8 +885,51 @@ final class JeffJSFetchBridge {
     nonisolated(unsafe) static var hostServiceWorkerFetch:
         (@Sendable (_ request: URLRequest, _ mode: String, _ credentials: String) async -> Result<JeffJSFetchResult, Error>?)?
 
-    private func performFetch(spec: JeffJSFetchSpec) async -> Result<JeffJSFetchResult, Error> {
-        if let hook = Self.hostServiceWorkerFetch, let url = resolveURL(spec.urlString), url.scheme == "http" || url.scheme == "https" {
+    /// Everything the network leg of one fetch needs, built on the host actor when the fetch
+    /// starts (`prepareFetch`): the network leg itself (`runNetwork`) reads no bridge state.
+    nonisolated struct Prepared: @unchecked Sendable {
+        var spec: JeffJSFetchSpec
+        /// Decided before the network (bad URL, `same-origin` mode across origins), after the
+        /// service worker had its chance.
+        var early: Result<JeffJSFetchResult, Error>?
+        var swRequest: URLRequest?
+        var request: URLRequest?
+        var session: URLSession = .shared
+        var delegate: JeffJSRedirectDelegate?
+        var preflight: Preflight?
+        var targetURL: URL?
+        var method = "GET"
+        var mode = "cors"
+        var corsActive = false
+        var crossOrigin = false
+        var docOrigin: String?
+    }
+
+    /// A CORS preflight to send before the request (not cached for its key).
+    nonisolated struct Preflight: @unchecked Sendable {
+        var request: URLRequest
+        var cacheKey: String
+        var method: String
+        var headerNames: [String]
+        var origin: String
+        var credentials: Bool
+    }
+
+    /// What the network leg brought back.
+    nonisolated struct Outcome: @unchecked Sendable {
+        /// The service worker's answer, an early failure, or a failed preflight.
+        var decided: Result<JeffJSFetchResult, Error>?
+        /// A passed preflight's cache lifetime (seconds).
+        var preflightMaxAge: Double?
+        var data: Data?
+        var response: URLResponse?
+        var error: Error?
+        var durationMs: Double = 0
+    }
+
+    private func prepareFetch(spec: JeffJSFetchSpec) -> Prepared {
+        var p = Prepared(spec: spec)
+        if Self.hostServiceWorkerFetch != nil, let url = resolveURL(spec.urlString), url.scheme == "http" || url.scheme == "https" {
             var request = URLRequest(url: url)
             request.httpMethod = spec.method.isEmpty ? "GET" : spec.method.uppercased()
             for (name, value) in spec.headers { request.setValue(value, forHTTPHeaderField: name) }
@@ -887,10 +940,7 @@ final class JeffJSFetchBridge {
                     request.setValue(ct, forHTTPHeaderField: "Content-Type")
                 }
             }
-            if let handled = await hook(request, spec.mode.isEmpty ? "cors" : spec.mode,
-                                        spec.credentials.isEmpty ? "same-origin" : spec.credentials) {
-                return handled
-            }
+            p.swRequest = request
         }
         guard let targetURL = resolveURL(spec.urlString) else {
             let reason = baseURL == nil ? "baseURL is nil" : "cannot resolve \"\(spec.urlString)\""
@@ -898,20 +948,27 @@ final class JeffJSFetchBridge {
             onNetworkLog?(JeffJSNetworkLogEntry(method: spec.method, url: spec.urlString,
                                                 statusCode: 0, statusText: "", durationMs: 0,
                                                 responseSize: 0, error: "Invalid URL: \(reason)"))
-            return .failure(JeffJSFetchFailure(name: "TypeError", message: "Failed to parse URL: \(spec.urlString)"))
+            p.early = .failure(JeffJSFetchFailure(name: "TypeError", message: "Failed to parse URL: \(spec.urlString)"))
+            return p
         }
+        p.targetURL = targetURL
 
         let docOrigin = documentOrigin
         let crossOrigin = docOrigin != nil && Self.origin(of: targetURL) != docOrigin!
         let corsActive = enforceCORS && crossOrigin && docOrigin != nil
         var mode = spec.mode.isEmpty ? "cors" : spec.mode
+        p.docOrigin = docOrigin
+        p.crossOrigin = crossOrigin
+        p.corsActive = corsActive
 
         if corsActive && mode == "same-origin" {
-            return .failure(JeffJSFetchFailure(
+            p.early = .failure(JeffJSFetchFailure(
                 name: "TypeError",
                 message: "Failed to fetch: request mode is 'same-origin' but the URL is cross-origin"))
+            return p
         }
         if !enforceCORS && mode == "no-cors" { mode = "cors" }
+        p.mode = mode
 
         // no-cors downgrades the request to the simple subset.
         var method = spec.method.isEmpty ? "GET" : spec.method.uppercased()
@@ -920,6 +977,7 @@ final class JeffJSFetchBridge {
             if !Self.simpleMethods.contains(method) { method = "GET" }
             headers = headers.filter { Self.safelistedRequestHeaders.contains($0.name.lowercased()) }
         }
+        p.method = method
 
         // Preflight for non-simple cross-origin requests.
         if corsActive && mode == "cors" {
@@ -928,12 +986,8 @@ final class JeffJSFetchBridge {
                 preflightHeaders.append(("content-type", ct))
             }
             if Self.needsPreflight(method: method, headers: preflightHeaders) {
-                if let failure = await preflight(url: targetURL, method: method,
-                                                 headers: preflightHeaders,
-                                                 origin: docOrigin!,
-                                                 credentials: spec.credentials == "include") {
-                    return .failure(failure)
-                }
+                p.preflight = preparePreflight(url: targetURL, method: method, headers: preflightHeaders,
+                                               origin: docOrigin!, credentials: spec.credentials == "include")
             }
         }
 
@@ -973,92 +1027,59 @@ final class JeffJSFetchBridge {
         }
         }
         applyCachePolicy(spec.cache, to: &request)
+        p.request = request
 
-        let startTime = CFAbsoluteTimeGetCurrent()
-        let redirectMode = spec.redirect.isEmpty ? "follow" : spec.redirect
-        let delegate = JeffJSRedirectDelegate(mode: redirectMode)
+        let delegate = JeffJSRedirectDelegate(mode: spec.redirect.isEmpty ? "follow" : spec.redirect)
         delegate.onRedirect = jarRedirectHandler(credentials: spec.credentials)
+        p.delegate = delegate
+        p.session = (method == "GET" && spec.cache != "no-store") ? Self.cachedSession : URLSession.shared
+        return p
+    }
 
+    /// The network leg: service worker, preflight, request. Runs on no particular thread and
+    /// touches nothing of the bridge's.
+    nonisolated static func runNetwork(_ p: Prepared) async -> Outcome {
+        var out = Outcome()
+        if let hook = hostServiceWorkerFetch, let swRequest = p.swRequest {
+            if let handled = await hook(swRequest, p.spec.mode.isEmpty ? "cors" : p.spec.mode,
+                                        p.spec.credentials.isEmpty ? "same-origin" : p.spec.credentials) {
+                out.decided = handled
+                return out
+            }
+        }
+        if let early = p.early { out.decided = early; return out }
+        if let pf = p.preflight {
+            switch await sendPreflight(pf) {
+            case .failure(let failure): out.decided = .failure(failure); return out
+            case .success(let maxAge): out.preflightMaxAge = maxAge
+            }
+        }
+        guard let request = p.request else { return out }
+        let startTime = CFAbsoluteTimeGetCurrent()
         do {
-            let session = (method == "GET" && spec.cache != "no-store") ? Self.cachedSession : URLSession.shared
-            let (data, response) = try await session.data(for: request, delegate: delegate)
-            let durationMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
-            let http = response as? HTTPURLResponse
-            storeJarCookies(from: http, url: http?.url ?? targetURL, credentials: spec.credentials,
-                            fromCache: delegate.responseFromCache)
-
-            // Blocked redirect (redirect: manual | error).
-            if let blocked = delegate.blocked {
-                onNetworkLog?(JeffJSNetworkLogEntry(method: method, url: spec.urlString,
-                                                    statusCode: blocked.statusCode,
-                                                    statusText: HTTPURLResponse.localizedString(forStatusCode: blocked.statusCode),
-                                                    durationMs: durationMs, responseSize: 0, error: nil))
-                if redirectMode == "error" {
-                    return .failure(JeffJSFetchFailure(
-                        name: "TypeError",
-                        message: "Failed to fetch: redirect was not followed (redirect: \"error\")"))
-                }
-                // manual -> opaque redirect, exactly like a browser.
-                return .success(JeffJSFetchResult(
-                    status: 0, statusText: "", url: targetURL.absoluteString,
-                    redirected: false, type: "opaqueredirect", headers: [:],
-                    bytes: [], mimeType: "", charset: nil))
-            }
-
-            let statusCode = http?.statusCode ?? 0
-            let statusText = HTTPURLResponse.localizedString(forStatusCode: statusCode)
-            var headerMap: [String: String] = [:]
-            if let http {
-                for (key, value) in http.allHeaderFields {
-                    let k = String(describing: key).lowercased()
-                    let v = String(describing: value)
-                    // Forbidden response header names (Fetch §2.2.2): the jar has them.
-                    if cookieJar != nil && (k == "set-cookie" || k == "set-cookie2") { continue }
-                    if k == "set-cookie", let existing = headerMap[k] {
-                        headerMap[k] = existing + "\n" + v   // set-cookie combined
-                    } else {
-                        headerMap[k] = v
-                    }
-                }
-            }
-
-            onNetworkLog?(JeffJSNetworkLogEntry(method: method, url: spec.urlString,
-                                                statusCode: statusCode, statusText: statusText,
-                                                durationMs: durationMs, responseSize: data.count,
-                                                error: nil))
-
-            // no-cors -> opaque response: the request went out, the answer is hidden.
-            if corsActive && mode == "no-cors" {
-                return .success(JeffJSFetchResult(
-                    status: 0, statusText: "", url: "", redirected: false, type: "opaque",
-                    headers: [:], bytes: [], mimeType: "", charset: nil))
-            }
-
-            if corsActive && mode == "cors" {
-                guard Self.allowOriginOK(headerMap, origin: docOrigin!,
-                                         credentials: spec.credentials == "include") else {
-                    let allow = headerMap["access-control-allow-origin"] ?? "<missing>"
-                    return .failure(JeffJSFetchFailure(
-                        name: "TypeError",
-                        message: "Failed to fetch: CORS check failed for \(targetURL.absoluteString) — Access-Control-Allow-Origin: \(allow) does not allow origin \(docOrigin!)"))
-                }
-                headerMap = Self.filterCORSResponseHeaders(headerMap,
-                                                           credentials: spec.credentials == "include")
-            }
-
-            let contentType = headerMap["content-type"]
-            return .success(JeffJSFetchResult(
-                status: statusCode,
-                statusText: statusText,
-                url: http?.url?.absoluteString ?? targetURL.absoluteString,
-                redirected: delegate.redirected,
-                type: crossOrigin ? "cors" : "basic",
-                headers: headerMap,
-                bytes: Array(data),
-                mimeType: JeffJSFetchText.mimeType(fromContentType: contentType),
-                charset: JeffJSFetchText.charset(fromContentType: contentType)))
+            let (data, response) = try await p.session.data(for: request, delegate: p.delegate)
+            out.data = data
+            out.response = response
         } catch {
-            let durationMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
+            out.error = error
+        }
+        out.durationMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
+        return out
+    }
+
+    /// Back on the host actor: preflight cache, cookies, logs, CORS checks, the result.
+    private func finishFetch(_ p: Prepared, _ out: Outcome) -> Result<JeffJSFetchResult, Error> {
+        if let pf = p.preflight, let maxAge = out.preflightMaxAge, maxAge > 0 {
+            Self.preflightCache[pf.cacheKey] = Date().addingTimeInterval(maxAge)
+        }
+        if let decided = out.decided { return decided }
+        let spec = p.spec, method = p.method, mode = p.mode, corsActive = p.corsActive
+        guard let targetURL = p.targetURL, let delegate = p.delegate else {
+            return .failure(JeffJSFetchFailure(name: "TypeError", message: "Failed to fetch"))
+        }
+        let durationMs = out.durationMs
+        let redirectMode = delegate.mode
+        if let error = out.error {
             onNetworkLog?(JeffJSNetworkLogEntry(method: method, url: spec.urlString,
                                                 statusCode: 0, statusText: "",
                                                 durationMs: durationMs, responseSize: 0,
@@ -1068,6 +1089,81 @@ final class JeffJSFetchBridge {
             }
             return .failure(error)
         }
+        let data = out.data ?? Data()
+        let http = out.response as? HTTPURLResponse
+        storeJarCookies(from: http, url: http?.url ?? targetURL, credentials: spec.credentials,
+                        fromCache: delegate.responseFromCache)
+
+        // Blocked redirect (redirect: manual | error).
+        if let blocked = delegate.blocked {
+            onNetworkLog?(JeffJSNetworkLogEntry(method: method, url: spec.urlString,
+                                                statusCode: blocked.statusCode,
+                                                statusText: HTTPURLResponse.localizedString(forStatusCode: blocked.statusCode),
+                                                durationMs: durationMs, responseSize: 0, error: nil))
+            if redirectMode == "error" {
+                return .failure(JeffJSFetchFailure(
+                    name: "TypeError",
+                    message: "Failed to fetch: redirect was not followed (redirect: \"error\")"))
+            }
+            // manual -> opaque redirect, exactly like a browser.
+            return .success(JeffJSFetchResult(
+                status: 0, statusText: "", url: targetURL.absoluteString,
+                redirected: false, type: "opaqueredirect", headers: [:],
+                bytes: [], mimeType: "", charset: nil))
+        }
+
+        let statusCode = http?.statusCode ?? 0
+        let statusText = HTTPURLResponse.localizedString(forStatusCode: statusCode)
+        var headerMap: [String: String] = [:]
+        if let http {
+            for (key, value) in http.allHeaderFields {
+                let k = String(describing: key).lowercased()
+                let v = String(describing: value)
+                // Forbidden response header names (Fetch §2.2.2): the jar has them.
+                if cookieJar != nil && (k == "set-cookie" || k == "set-cookie2") { continue }
+                if k == "set-cookie", let existing = headerMap[k] {
+                    headerMap[k] = existing + "\n" + v   // set-cookie combined
+                } else {
+                    headerMap[k] = v
+                }
+            }
+        }
+
+        onNetworkLog?(JeffJSNetworkLogEntry(method: method, url: spec.urlString,
+                                            statusCode: statusCode, statusText: statusText,
+                                            durationMs: durationMs, responseSize: data.count,
+                                            error: nil))
+
+        // no-cors -> opaque response: the request went out, the answer is hidden.
+        if corsActive && mode == "no-cors" {
+            return .success(JeffJSFetchResult(
+                status: 0, statusText: "", url: "", redirected: false, type: "opaque",
+                headers: [:], bytes: [], mimeType: "", charset: nil))
+        }
+
+        if corsActive && mode == "cors", let docOrigin = p.docOrigin {
+            guard Self.allowOriginOK(headerMap, origin: docOrigin,
+                                     credentials: spec.credentials == "include") else {
+                let allow = headerMap["access-control-allow-origin"] ?? "<missing>"
+                return .failure(JeffJSFetchFailure(
+                    name: "TypeError",
+                    message: "Failed to fetch: CORS check failed for \(targetURL.absoluteString) — Access-Control-Allow-Origin: \(allow) does not allow origin \(docOrigin)"))
+            }
+            headerMap = Self.filterCORSResponseHeaders(headerMap,
+                                                       credentials: spec.credentials == "include")
+        }
+
+        let contentType = headerMap["content-type"]
+        return .success(JeffJSFetchResult(
+            status: statusCode,
+            statusText: statusText,
+            url: http?.url?.absoluteString ?? targetURL.absoluteString,
+            redirected: delegate.redirected,
+            type: p.crossOrigin ? "cors" : "basic",
+            headers: headerMap,
+            bytes: Array(data),
+            mimeType: JeffJSFetchText.mimeType(fromContentType: contentType),
+            charset: JeffJSFetchText.charset(fromContentType: contentType)))
     }
 
     /// Browsers only expose safelisted response headers plus the ones named by
@@ -1095,11 +1191,10 @@ final class JeffJSFetchBridge {
         }
     }
 
-    /// Send the CORS preflight (OPTIONS) unless a cached result still applies.
-    /// Returns a failure when the preflight denies the request.
-    private func preflight(url: URL, method: String,
-                           headers: [(name: String, value: String)],
-                           origin: String, credentials: Bool) async -> JeffJSFetchFailure? {
+    /// The CORS preflight (OPTIONS) for a request, or nil when a cached result still applies.
+    private func preparePreflight(url: URL, method: String,
+                                  headers: [(name: String, value: String)],
+                                  origin: String, credentials: Bool) -> Preflight? {
         let headerNames = headers.map { $0.name.lowercased() }
             .filter { !Self.safelistedRequestHeaders.contains($0) || $0 == "content-type" }
             .sorted()
@@ -1121,48 +1216,50 @@ final class JeffJSFetchBridge {
         // CORS-preflight requests never carry credentials (Fetch §4.8); the
         // legacy path let URLSession add its stored cookies.
         req.httpShouldHandleCookies = cookieJar == nil ? credentials : false
+        return Preflight(request: req, cacheKey: cacheKey, method: method, headerNames: headerNames,
+                         origin: origin, credentials: credentials)
+    }
 
+    /// Send a preflight and check its answer: the failure, or the result's cache lifetime.
+    nonisolated private static func sendPreflight(_ pf: Preflight) async -> Result<Double, JeffJSFetchFailure> {
+        let method = pf.method, origin = pf.origin, credentials = pf.credentials
         do {
-            let (_, response) = try await URLSession.shared.data(for: req)
+            let (_, response) = try await URLSession.shared.data(for: pf.request)
             guard let http = response as? HTTPURLResponse else {
-                return JeffJSFetchFailure(name: "TypeError", message: "Failed to fetch: preflight did not return an HTTP response")
+                return .failure(JeffJSFetchFailure(name: "TypeError", message: "Failed to fetch: preflight did not return an HTTP response"))
             }
             var map: [String: String] = [:]
             for (k, v) in http.allHeaderFields { map[String(describing: k).lowercased()] = String(describing: v) }
 
             guard (200...299).contains(http.statusCode) else {
-                return JeffJSFetchFailure(name: "TypeError",
-                    message: "Failed to fetch: preflight returned HTTP \(http.statusCode)")
+                return .failure(JeffJSFetchFailure(name: "TypeError",
+                    message: "Failed to fetch: preflight returned HTTP \(http.statusCode)"))
             }
-            guard Self.allowOriginOK(map, origin: origin, credentials: credentials) else {
-                return JeffJSFetchFailure(name: "TypeError",
-                    message: "Failed to fetch: preflight Access-Control-Allow-Origin does not allow \(origin)")
+            guard allowOriginOK(map, origin: origin, credentials: credentials) else {
+                return .failure(JeffJSFetchFailure(name: "TypeError",
+                    message: "Failed to fetch: preflight Access-Control-Allow-Origin does not allow \(origin)"))
             }
             let allowedMethods = Set((map["access-control-allow-methods"] ?? "")
                 .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).uppercased() })
             if !(allowedMethods.contains(method.uppercased())
                  || (allowedMethods.contains("*") && !credentials)
-                 || Self.simpleMethods.contains(method.uppercased())) {
-                return JeffJSFetchFailure(name: "TypeError",
-                    message: "Failed to fetch: method \(method) is not allowed by Access-Control-Allow-Methods")
+                 || simpleMethods.contains(method.uppercased())) {
+                return .failure(JeffJSFetchFailure(name: "TypeError",
+                    message: "Failed to fetch: method \(method) is not allowed by Access-Control-Allow-Methods"))
             }
             let allowedHeaders = Set((map["access-control-allow-headers"] ?? "")
                 .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() })
             let wildcardHeaders = allowedHeaders.contains("*") && !credentials
-            for name in headerNames where !Self.safelistedRequestHeaders.contains(name) {
+            for name in pf.headerNames where !safelistedRequestHeaders.contains(name) {
                 if !wildcardHeaders && !allowedHeaders.contains(name) {
-                    return JeffJSFetchFailure(name: "TypeError",
-                        message: "Failed to fetch: header \(name) is not allowed by Access-Control-Allow-Headers")
+                    return .failure(JeffJSFetchFailure(name: "TypeError",
+                        message: "Failed to fetch: header \(name) is not allowed by Access-Control-Allow-Headers"))
                 }
             }
-            let maxAge = min(Double(map["access-control-max-age"].flatMap { Int($0.trimmingCharacters(in: .whitespaces)) } ?? 5), 600)
-            if maxAge > 0 {
-                Self.preflightCache[cacheKey] = Date().addingTimeInterval(maxAge)
-            }
-            return nil
+            return .success(min(Double(map["access-control-max-age"].flatMap { Int($0.trimmingCharacters(in: .whitespaces)) } ?? 5), 600))
         } catch {
-            return JeffJSFetchFailure(name: "TypeError",
-                message: "Failed to fetch: preflight request failed — \(error.localizedDescription)")
+            return .failure(JeffJSFetchFailure(name: "TypeError",
+                message: "Failed to fetch: preflight request failed — \(error.localizedDescription)"))
         }
     }
 
