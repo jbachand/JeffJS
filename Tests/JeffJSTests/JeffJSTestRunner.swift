@@ -2431,6 +2431,13 @@ extension JeffJSTestRunner {
 
         // String.replace with regex
         evalCheckStr(ctx, "'hello world'.replace(/world/, 'JS')", expect: "hello JS")
+        // A global replace collects every match before calling the replacer (ES §22.2.6.11): a replacer
+        // that reuses the same regexp (three.js's recursive #include resolution) must not restart it.
+        evalCheckStr(ctx, "(function(){ var re = /^#i <(\\w+)>/gm, ch = {a: 'A1\\n#i <b>\\nA2', b: 'B'}; function r(s){ return s.replace(re, function(m, k){ return r(ch[k]); }); } return r('x\\n#i <a>\\ny\\n#i <b>\\nz'); })()", expect: "x\nA1\nB\nA2\ny\nB\nz")
+        evalCheckStr(ctx, "'abc'.replace(/(?:)/g, '-')", expect: "-a-b-c-")
+        // A non-string replaceValue is ToString'd (three.js: `.replace(/NUM_CLIPPING_PLANES/g, 0)`).
+        evalCheckStr(ctx, "'#if N > 0'.replace(/N/g, 0)", expect: "#if 0 > 0")
+        evalCheckStr(ctx, "'a-b'.replace(/-/, null)", expect: "anullb")
 
         // Global flag
         evalCheck(ctx, "'aaa'.match(/a/g).length", expectInt: 3)

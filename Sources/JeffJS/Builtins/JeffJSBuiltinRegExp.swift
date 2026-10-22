@@ -1198,12 +1198,22 @@ nonisolated func js_regexp_Symbol_replace(
         replaceIsFunc = false
     }
 
+    // Step 6: a non-callable replaceValue is ToString'd (a number such as three.js's
+    // `.replace(/NUM_CLIPPING_PLANES/g, 0)` became "undefined").
     let replaceStr: JeffJSString?
+    var replaceStrValue: JeffJSValue = .undefined
     if !replaceIsFunc {
-        replaceStr = replaceVal.stringValue ?? JeffJSString(swiftString: "undefined")
+        if let s = replaceVal.stringValue {
+            replaceStr = s
+        } else {
+            replaceStrValue = ctx.toString(replaceVal)
+            if replaceStrValue.isException { return .exception }
+            replaceStr = replaceStrValue.stringValue ?? JeffJSString(swiftString: "undefined")
+        }
     } else {
         replaceStr = nil
     }
+    defer { replaceStrValue.freeValue() }
 
     if isGlobal {
         if !js_regexp_setLastIndex(ctx, obj, value: 0) { return .exception }
@@ -1215,39 +1225,61 @@ nonisolated func js_regexp_Symbol_replace(
     let buf = JeffJSStringBuffer()
     var lastMatchEnd = 0
 
-    // Execute the regex repeatedly (once for non-global, loop for global).
+    // ES §22.2.6.11 steps 11-13: collect every match first, then compute the replacements
+    // (QuickJS js_regexp_Symbol_replace does the same). Calling the replacer inside the exec loop
+    // let a replacer that reuses the same global regexp — three.js resolves `#include <chunk>`
+    // recursively with one /gm pattern — reset lastIndex under the outer loop, which then
+    // re-matched the first include forever (every three.js shader grew to MBs).
+    var results: [JeffJSValue] = []
+    defer { for r in results { r.freeValue() } }
     var loopCount = 0
     let maxLoops = isGlobal ? inputStr.len + 1 : 1
-
     while loopCount < maxLoops {
         loopCount += 1
-
-        // exec borrows its argument; the match array is ours (it leaked once
-        // per match: every regex String.prototype.replace grew the heap).
+        // exec borrows its argument; the match array is ours (released by the defer above).
         let result = js_regexp_execVia(ctx: ctx, this: this, input: input.value, userExec: userExec)
         if result.isException {
             buf.free()
             return .exception
         }
-        if result.isNull {
-            break
+        if result.isNull { break }
+        guard let resObj = result.toObject() else { result.freeValue(); break }
+        results.append(result)
+        if !isGlobal { break }
+        // An empty match advances lastIndex (step 11.c.iii).
+        let matched = resObj.getArrayElement(0)
+        let matchLen = matched.stringValue?.len ?? (ctx.toString(matched).stringValue?.len ?? 0)
+        if matchLen == 0 {
+            guard let li = js_regexp_getLastIndex(ctx, obj),
+                  js_regexp_setLastIndex(ctx, obj, value: js_regexp_advanceIndex(inputStr, index: li, unicode: isUnicode)) else {
+                buf.free()
+                return .exception
+            }
         }
-        defer { result.freeValue() }
+    }
 
-        guard let resObj = result.toObject() else { break }
+    for result in results {
+        guard let resObj = result.toObject() else { continue }
 
-        // Get the match position.
+        // Get the match position (clamped to the input, step 14.e-f).
         let indexVal = resObj.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_index.rawValue)
-        let matchStart: Int
+        var matchStart: Int
         if indexVal.isInt {
             matchStart = Int(indexVal.toInt32())
+        } else if indexVal.isFloat64 {
+            let d = indexVal.toFloat64()
+            matchStart = d.isFinite ? Int(max(min(d, 1e15), -1e15)) : 0
         } else {
             matchStart = 0
         }
+        matchStart = max(0, min(matchStart, inputStr.len))
 
         let matched = resObj.getArrayElement(0)
         let matchedStr = matched.stringValue
         let matchLen = matchedStr?.len ?? 0
+
+        // Step 14.l: a match starting before the previous one's end is skipped.
+        if matchStart < lastMatchEnd { continue }
 
         // Append the part of the input before this match.
         if matchStart > lastMatchEnd {
@@ -1272,7 +1304,7 @@ nonisolated func js_regexp_Symbol_replace(
             }
             // Capture groups: result[1], result[2], ...
             let nCaptures = Int(resObj.arrayCount)
-            for i in 1 ..< nCaptures {
+            for i in 1 ..< max(nCaptures, 1) {
                 let cap = resObj.getArrayElement(UInt32(i))
                 callArgs.append(cap.isUndefined ? JeffJSValue.undefined : cap.dupValue())
             }
@@ -1319,18 +1351,6 @@ nonisolated func js_regexp_Symbol_replace(
         }
 
         lastMatchEnd = matchStart + matchLen
-
-        // For global, check if match was empty to avoid infinite loop.
-        if isGlobal && matchLen == 0 {
-            guard let li = js_regexp_getLastIndex(ctx, obj),
-                  js_regexp_setLastIndex(ctx, obj, value: js_regexp_advanceIndex(inputStr, index: li, unicode: isUnicode)) else {
-                return .exception
-            }
-        }
-
-        if !isGlobal {
-            break
-        }
     }
 
     // Append the tail of the input after the last match.
