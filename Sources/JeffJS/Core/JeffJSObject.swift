@@ -2188,6 +2188,11 @@ nonisolated final class JeffJSStackFrame {
     /// ToObject(thisArgument)); released with the frame. Callers pass
     /// `this` borrowed, so only the boxed copy is owned.
     var ownsThis: Bool                = false
+    /// Arrow functions created in a derived constructor before super() returned (counted
+    /// references): their lexical `this` is bound when init_this runs (ES §9.1.1.3.1 BindThisValue:
+    /// the arrow reads the constructor's this binding, not a copy taken at creation).
+    var pendingArrows: [JeffJSValue]  = []
+    var hasPendingArrows: Bool        = false
     var newTarget: JeffJSValue        = .undefined
     var curPC: Int                    = 0
     /// The host (native) function this activation is calling right now, if
@@ -2244,6 +2249,11 @@ nonisolated final class JeffJSStackFrame {
             ownsThis = false
         }
         if !newTarget.isUndefined { newTarget = .undefined }
+        if hasPendingArrows {
+            for v in pendingArrows { v.freeValue() }
+            pendingArrows.removeAll(keepingCapacity: false)
+            hasPendingArrows = false
+        }
         curPC = 0
         buf = nil
         ownsBuf = false
@@ -2262,6 +2272,16 @@ nonisolated final class JeffJSStackFrame {
             liveVarRefs.removeAll(keepingCapacity: true)
             hasLiveVarRefs = false
         }
+    }
+
+    /// init_this: the arrows created before super() returned now see `constructed` as `this`.
+    final func bindPendingArrows(_ constructed: JeffJSValue) {
+        for v in pendingArrows {
+            if let o = v.toObject() { o.arrowThisVal = constructed.dupValue() }
+            v.freeValue()
+        }
+        pendingArrows.removeAll(keepingCapacity: false)
+        hasPendingArrows = false
     }
 
     // NOTE: The frame pool lives on JeffJSRuntime (acquireFrame/releaseFrame).

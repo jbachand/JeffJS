@@ -6524,6 +6524,18 @@ extension JeffJSTestRunner {
             class B extends A { constructor(){ super(); this.y = 2; } }
             var b = new B(); ('x' in b) && ('y' in b) && !('z' in b)
             """, expect: true)
+        // An arrow made before super() returned reads the constructor's this binding once it exists
+        // (ES §9.1.1.3.1); Google Maps passes such an arrow to super() as a callback.
+        evalCheck(ctx, """
+            class A0 { constructor(f){ this.f = f; } }
+            class B0 extends A0 { constructor(){ super(() => this.x); this.x = 5; } }
+            new B0().f()
+            """, expectInt: 5)
+        evalCheckBool(ctx, """
+            class A1 { constructor(f){ try { f(); this.threw = false; } catch (e) { this.threw = e instanceof ReferenceError; } } }
+            class B1 extends A1 { constructor(){ super(() => this); } }
+            new B1().threw
+            """, expect: true)
         evalCheckBool(ctx, "(function(a){ return (0 in arguments) && !(1 in arguments) && ('callee' in arguments) && ('length' in arguments); })(1)", expect: true)
         evalCheckBool(ctx, "(function(a,b){ a = 9; return (0 in arguments) && arguments[0] === 9; })(1,2)", expect: true)
         evalCheckBool(ctx, "('Object' in globalThis) && !('__nope__' in globalThis)", expect: true)

@@ -1571,8 +1571,11 @@ nonisolated extension JeffJSContext {
 
         // Arrow functions capture the enclosing function's `this` value
         // so that `push_this` inside the arrow returns the lexical `this`.
+        // In a derived constructor before super() returned there is no `this` yet: the arrow is bound
+        // at init_this (JeffJSStackFrame.pendingArrows); until then it throws like the constructor.
+        let deferArrowThis = innerFB.isArrow && parentFrame.thisVal.isUninitialized
         if innerFB.isArrow {
-            obj.arrowThisVal = parentFrame.thisVal.dupValue()
+            obj.arrowThisVal = deferArrowThis ? .uninitialized : parentFrame.thisVal.dupValue()
         }
 
         // Set prototype: use the class-specific prototype if available,
@@ -1608,6 +1611,10 @@ nonisolated extension JeffJSContext {
 
         // A pooled object still holds its original creation retain.
         let funcVal = recycled != nil ? JeffJSValue.makeObjectRecycled(obj) : JeffJSValue.makeObject(obj)
+        if deferArrowThis {
+            parentFrame.pendingArrows.append(funcVal.dupValue())
+            parentFrame.hasPendingArrows = true
+        }
 
         // For regular (non-arrow, non-generator, non-async) functions,
         // F.prototype = { constructor: F } is built LAZILY on first access
@@ -8641,6 +8648,7 @@ nonisolated struct JeffJSInterpreter {
                                 break dispatchLoop
                             }
                             frame.thisVal = constructed
+                            if frame.hasPendingArrows { frame.bindPendingArrows(constructed) }
                             buf[sp] = constructed.dupValue(); sp += 1
                             pc += 2
                             continue dispatchLoop
@@ -8992,6 +9000,7 @@ nonisolated struct JeffJSInterpreter {
                     break dispatchLoop
                 }
                 frame.thisVal = constructed
+                if frame.hasPendingArrows { frame.bindPendingArrows(constructed) }
                 buf[sp] = constructed.dupValue(); sp += 1
                 pc += 1
 
