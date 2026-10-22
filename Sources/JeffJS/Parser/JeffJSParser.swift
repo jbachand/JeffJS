@@ -6278,6 +6278,19 @@ nonisolated final class JeffJSParser {
         }
     }
 
+    /// The member reference just parsed is the callee of a call: `(`, a
+    /// tagged template, or `?.(` (QuickJS js_parse_postfix_expr checks the
+    /// same three before choosing get_field2 / get_array_el2). Without the
+    /// `?.(` case a link after an earlier `?.` lost its receiver:
+    /// `a?.b?.m?.(x)` called `m` with `this` undefined (i18next's
+    /// `reportNamespaces?.addUsedNamespaces?.(ns)`, draftkings.com).
+    @inline(__always)
+    private func calleeOfCall() -> Bool {
+        tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue
+            || (tok == JSTokenType.TOK_OPTIONAL_CHAIN.rawValue
+                && s.simpleNextToken() == 0x28)
+    }
+
     /// One `?.` link (`?.(args)`, `?.[key]`, `?.name`, `?.#name`); the labels
     /// are the chain's shared short-circuit targets, created on first use.
     @inline(never)
@@ -6314,7 +6327,7 @@ nonisolated final class JeffJSParser {
             next()
             parseExpression()
             expect(0x5D)
-            if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
+            if calleeOfCall() {
                 emitOp(.get_array_el2)   // keep the receiver for the call
                 pendingMethodCall = true
             } else {
@@ -6328,7 +6341,7 @@ nonisolated final class JeffJSParser {
                 fieldAtom = getAtom(keywordTokenName(tok))
             }
             next()
-            if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
+            if calleeOfCall() {
                 emitOp(.get_field2)      // keep the receiver for the call
                 emitAtom(fieldAtom)
                 pendingMethodCall = true
@@ -6340,7 +6353,7 @@ nonisolated final class JeffJSParser {
             // non-nullish path, same shape as the '.' case above.
             let fieldAtom = s.token.identAtom
             next()
-            if tok == 0x28 || tok == JSTokenType.TOK_TEMPLATE.rawValue {
+            if calleeOfCall() {
                 emitOp(.dup)             // keep the receiver for the call
                 pendingMethodCall = true
             }

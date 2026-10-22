@@ -37,6 +37,8 @@ extension JeffJSTestRunner {
          "(function(){ var o = { m: function(){ 'use strict'; return this; }, n: null }; return (o.m)`x` === o && (o.n || o.m)`x` === undefined && o.m`x` === o; })()"),
         ("(o.m)?.() passes o; (o.n || o.m)?.() passes undefined",
          "(function(){ var o = { m: function(){ 'use strict'; return this; }, n: null }; return (o.m)?.() === o && (o.n || o.m)?.() === undefined && o.m?.() === o && o.x?.() === undefined; })()"),
+        ("a?.b?.m?.() / a?.[k]?.() / a?.#m?.() pass the object after an earlier ?. (draftkings i18next)",
+         "(function(){ class R { #p(){ return this; } constructor(){ this.u = {}; } add(e){ e.forEach(r => { this.u[r] || (this.u[r] = !0); }); return this; } q(){ return this?.#p?.(); } } var a = { rn: new R() }, o = { m: function(){ 'use strict'; return this; }, n: null }, r = a.rn; return a?.rn?.add?.(['x']) === r && r.u.x === true && o?.m?.() === o && o?.['m']?.() === o && o?.x?.() === undefined && o?.n?.m?.() === undefined && (void 0)?.m?.() === undefined && r.q() === r; })()"),
         ("a zero-argument call after a property read in the arguments of another call",
          "(function(){ var o = { k: function(){ 'use strict'; return this; } }; function f(v){ 'use strict'; return [this, v]; } var g = o.k; var r = f(o.k); return r[0] === undefined && r[1] === o.k && g() === undefined; })()"),
         ("new (o.n || o.C)() and new o.C() still construct",
