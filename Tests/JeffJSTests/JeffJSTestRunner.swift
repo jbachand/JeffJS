@@ -6536,6 +6536,16 @@ extension JeffJSTestRunner {
             class B1 extends A1 { constructor(){ super(() => this); } }
             new B1().threw
             """, expect: true)
+        // f.call(t, …) of a callee too large for the fast trace's buffer: the trace bailed out after
+        // rewriting the stack and the main loop called thisArg (Home Depot's Akamai script:
+        // "PH.call is not a function … instance of Window").
+        do {
+            let bigVars = (0..<9000).map { "v\($0)=\($0)" }.joined(separator: ",")
+            evalCheck(ctx, """
+                function bigCallee(a,b){ var \(bigVars); return a+b+v8999; }
+                (function(){ var s=0; for (var i=0;i<3;i++) s += bigCallee.call(this,1,[2][0]); return s; })()
+                """, expectInt: 27006)
+        }
         evalCheckBool(ctx, "(function(a){ return (0 in arguments) && !(1 in arguments) && ('callee' in arguments) && ('length' in arguments); })(1)", expect: true)
         evalCheckBool(ctx, "(function(a,b){ a = 9; return (0 in arguments) && arguments[0] === 9; })(1,2)", expect: true)
         evalCheckBool(ctx, "('Object' in globalThis) && !('__nope__' in globalThis)", expect: true)

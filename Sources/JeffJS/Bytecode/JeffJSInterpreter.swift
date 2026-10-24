@@ -4361,11 +4361,29 @@ nonisolated private func executeFastTrace(
             // dispatched once. JSC's bytecode does the same for `.call`
             // (CallFunctionCallDotNode), so no `call` frame shows in stacks.
             // A/B: JEFFJS_INTERP_TRACECALLINTRINSIC=0.
+            // Only when the code below will run the rewritten call: a bailout
+            // (`resume = pc`) re-executes this call_method in the main loop,
+            // which reads argc from the bytecode again and would find the
+            // stack one slot short — the callee slot then holds thisArg
+            // ("PH.call is not a function … instance of Window" on Home Depot's
+            // Akamai script, whose PH is too large for the trace's buffer).
             if jeffJSTraceCallIntrinsic, let callPtr = ctx.funcProtoCallPtr,
                sp - argc - 2 >= state.spBase,
                let fnObj = buf[sp - argc - 1].obj, fnObj._ptr == callPtr,
                let target = buf[sp - argc - 2].obj, target.realmIndex == ctxRealm,
-               (target.fbFast.map { !$0.isGenerator && !$0.isAsyncFunc } ?? false) || target.cFuncFast != nil {
+               target.cFuncFast != nil
+                || (target.fbFast.map { tfb in
+                        guard !tfb.isGenerator && !tfb.isAsyncFunc,
+                              rt.inlineStackTop - inlineBase <= JeffJSInterpreter.maxInlineDepth else { return false }
+                        // The inline call's buffer check below, for the rewritten
+                        // stack (the callee slot stays at sp - argc - 1).
+                        let newArgc = argc >= 1 ? argc - 1 : 0
+                        let fbArgCount = Int(tfb.argCount)
+                        let fbStack = Int(tfb.stackSize)
+                        let slots = (fbArgCount > newArgc ? fbArgCount : newArgc) + Int(tfb.varCount)
+                            + (fbStack > 4 ? fbStack : 4) + 32
+                        return (sp - argc) + slots <= state.bufCapacity
+                    } ?? false) {
                 let cSlot = sp - argc - 1
                 let tSlot = cSlot - 1
                 let targetVal = buf[tSlot]
