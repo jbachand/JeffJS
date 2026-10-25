@@ -131,3 +131,54 @@ extension DOMBridgeBenchTests {
         }
     }
 }
+
+extension DOMBridgeBenchTests {
+    /// `el.style.x = v` with a host's CSSOM semantics: the old shape (JS glue
+    /// over three natives that re-parse the whole style per write, as React
+    /// Natively's `<cssom-style>` did) against `inlineStyleHost` (one native
+    /// over a cached block). Both use InlineStyleHostConformance's test parser,
+    /// so the difference is the re-parse + crossings, not the CSS work.
+    @JeffJSHostActor
+    func testInlineStyleBench() {
+        let script = """
+        (function() {
+          var N = 2000, R = 5, els = [];
+          for (var i = 0; i < N; i++) { var e = document.createElement('div');
+            e.setAttribute('style', 'display: flex; position: relative; margin: 0px; padding: 4px 8px; color: rgb(1, 2, 3); font-size: 14px;'); els.push(e); }
+          function bench(fn) { fn(); var best = 1e18; for (var r = 0; r < R; r++) { var t0 = __hrnow(); fn(); var dt = __hrnow() - t0; if (dt < best) best = dt; } return (best * 1e6 / N).toFixed(0); }
+          var a = bench(function() { for (var i = 0; i < N; i++) els[i].style.color = (i & 1) ? 'red' : 'blue'; });
+          var b = bench(function() { for (var i = 0; i < N; i++) els[i].style.setProperty('margin-top', (i & 7) + 'px'); });
+          return a + ' ' + b;
+        })()
+        """
+        // Old shape: the host's glue redefines setProperty over raw natives.
+        let legacyGlue = """
+        (function() {
+          var s = document.createElement('div').style, P = Object.getPrototypeOf(s);
+          var RG = P.__get_cssText, RS = P.__set_cssText;
+          Object.defineProperty(P, 'setProperty', { value: function setProperty(n, v, p) {
+            var t = __benchStyleSet(RG.call(this), String(n), v === null ? '' : String(v), p == null ? '' : String(p));
+            if (typeof t === 'string') RS.call(this, t); }, writable: true, configurable: true, enumerable: true });
+        })()
+        """
+        for host in [false, true] {
+            let env = JeffJSEnvironment(configuration: .init(viewportWidth: 390, viewportHeight: 844))
+            let ctx = env.context
+            let g = ctx.getGlobalObject()
+            ctx.setPropertyFunc(obj: g, name: "__hrnow", fn: { _, _, _ in
+                .newFloat64(Double(DispatchTime.now().uptimeNanoseconds) / 1e6)
+            }, length: 0)
+            ctx.setPropertyFunc(obj: g, name: "__benchStyleSet", fn: { ctx, _, args in
+                let s = args.map { ctx.toSwiftString($0) ?? "" }
+                let block = TestInlineStyleBlock(s[0])
+                return block.setProperty(s[1], value: s[2], priority: s[3]) ? ctx.newStringValue(block.cssText) : .undefined
+            }, length: 4)
+            g.freeValue()
+            if host { env.domBridge?.inlineStyleHost = TestInlineStyleHost() } else { _ = env.eval(legacyGlue) }
+            if case .success(let s) = env.eval(script) {
+                let parts = (s ?? "").split(separator: " ")
+                print("BENCH style (\(host ? "inlineStyleHost" : "legacy glue")) style.color= \(parts[0]) ns, setProperty \(parts[1]) ns")
+            } else { XCTFail("bench threw") }
+        }
+    }
+}

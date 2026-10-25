@@ -71,6 +71,12 @@ final class JeffJSDOMBridge {
     /// Shared prototype of every DOMTokenList (`classList`, `relList`).
     private var tokenListPrototype: JeffJSValue?
 
+    /// CSSOM semantics for `element.style` (JeffJSDOMBridge+InlineStyle.swift):
+    /// set before the first `el.style` read; nil keeps the engine's own natives.
+    public var inlineStyleHost: JeffJSInlineStyleHost?
+    /// Per-element parsed blocks for `inlineStyleHost`.
+    var inlineStyleEntries: [UUID: JeffJSInlineStyleEntry] = [:]
+
     /// Shared prototype for all DOM element objects. Methods and accessor properties
     /// live here so they're non-enumerable and shared across all elements — matching
     /// browser behavior where methods are on HTMLElement.prototype, not per-element.
@@ -310,6 +316,7 @@ final class JeffJSDOMBridge {
         classListCache.removeAll()
         for (_, v) in styleObjectCache { v.freeValue() }
         styleObjectCache.removeAll()
+        inlineStyleEntries.removeAll()
         for (_, v) in relListCache { v.freeValue() }
         relListCache.removeAll()
         for (_, v) in detachedDocuments { v.freeValue() }
@@ -397,6 +404,7 @@ final class JeffJSDOMBridge {
             cachedList.freeValue()
         }
         if !styleObjectCache.isEmpty, let st = styleObjectCache.removeValue(forKey: nodeID) { st.freeValue() }
+        if !inlineStyleEntries.isEmpty { inlineStyleEntries.removeValue(forKey: nodeID) }
         if !relListCache.isEmpty, let cachedList = relListCache.removeValue(forKey: nodeID) {
             cachedList.freeValue()
         }
@@ -3180,6 +3188,10 @@ final class JeffJSDOMBridge {
             }
         }
         definerFn.freeValue()
+
+        // A host's CSSOM semantics replace the members above with natives over
+        // a parsed block per element (the camelCase setters call setProperty).
+        if inlineStyleHost != nil { installHostInlineStyleMembers(on: proto, ctx: ctx) }
 
         return proto
     }

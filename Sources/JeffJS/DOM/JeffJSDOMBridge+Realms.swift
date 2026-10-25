@@ -79,6 +79,7 @@ extension JeffJSDOMBridge {
         relListCache.removeAll()
         for (_, v) in datasetCache { v.freeValue() }
         datasetCache.removeAll()
+        inlineStyleEntries.removeAll()
         nodeRegistry.removeAll()
         moRegistrations.removeAll()
         templateContent.removeAll()
