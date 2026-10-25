@@ -39,6 +39,8 @@ final class JeffJSDOMBridge {
     internal(set) var root: DOMNode
     private let baseURL: URL
     private let onMutated: JeffJSDOMMutationObserver?
+    /// The set `notifyMutation` hands to `onMutated` (reused, see there).
+    private var mutationScratch = Set<UUID>(minimumCapacity: 1)
     /// Host script runner: called once per script-inserted `<script>` element
     /// the page made ready to run, with that element, already marked
     /// `scriptAlreadyStarted` (HTML §4.12.1.1). Inline classic scripts must be
@@ -3721,7 +3723,14 @@ final class JeffJSDOMBridge {
     /// algorithms prepare them (`JeffJSDOMBridge+Scripts.swift`), once per
     /// script, with the <script> element itself.
     func notifyMutation(for node: DOMNode) {
-        onMutated?([node.id])
+        guard let onMutated else { return }
+        // One reused set: a fresh one-element Set per DOM write was an
+        // allocation and a free on every setAttribute / appendChild / style
+        // write. Clearing it in place is safe: a callback that kept the set
+        // holds a reference, and the next write then copies (COW).
+        mutationScratch.removeAll(keepingCapacity: true)
+        mutationScratch.insert(node.id)
+        onMutated(mutationScratch)
     }
 
     /// Several nodes at once (one host callback).
