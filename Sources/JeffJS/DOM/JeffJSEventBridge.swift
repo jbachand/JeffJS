@@ -72,6 +72,11 @@ nonisolated private final class JeffJSEventListenerRecord {
 /// targetKey -> event type -> listener list (registration order).
 nonisolated private final class JeffJSEventListenerStore {
     private var store: [String: [String: [JeffJSEventListenerRecord]]] = [:]
+    /// Targets in `store` whose key is a node's ("node:<uuid>"): while there
+    /// are none, a node's listeners need no key to be looked up.
+    private(set) var nodeTargetCount = 0
+
+    private static func isNodeKey(_ key: String) -> Bool { key.hasPrefix("node:") }
 
     /// A snapshot (clone) of the listener list — what dispatch iterates.
     func handlers(for targetKey: String, type: String) -> [JeffJSEventListenerRecord] {
@@ -83,6 +88,7 @@ nonisolated private final class JeffJSEventListenerStore {
     }
 
     func append(targetKey: String, type: String, record: JeffJSEventListenerRecord) {
+        if store[targetKey] == nil, Self.isNodeKey(targetKey) { nodeTargetCount += 1 }
         store[targetKey, default: [:]][type, default: []].append(record)
     }
 
@@ -93,7 +99,10 @@ nonisolated private final class JeffJSEventListenerStore {
         list.removeAll { $0 === record }
         if list.isEmpty {
             store[targetKey]?.removeValue(forKey: type)
-            if store[targetKey]?.isEmpty == true { store.removeValue(forKey: targetKey) }
+            if store[targetKey]?.isEmpty == true {
+                store.removeValue(forKey: targetKey)
+                if Self.isNodeKey(targetKey) { nodeTargetCount -= 1 }
+            }
         } else {
             store[targetKey]?[type] = list
         }
@@ -102,6 +111,7 @@ nonisolated private final class JeffJSEventListenerStore {
     /// Removes and releases every listener registered on `targetKey`.
     func removeAll(for targetKey: String) {
         guard let typeMap = store.removeValue(forKey: targetKey) else { return }
+        if Self.isNodeKey(targetKey) { nodeTargetCount -= 1 }
         for (_, records) in typeMap { for rec in records { rec.release() } }
     }
 
@@ -112,6 +122,7 @@ nonisolated private final class JeffJSEventListenerStore {
     func removeAll() {
         let all = store
         store.removeAll()
+        nodeTargetCount = 0
         for (_, typeMap) in all {
             for (_, records) in typeMap { for rec in records { rec.release() } }
         }
@@ -204,6 +215,9 @@ final class JeffJSEventBridge {
     /// Called when the node is collected (see JeffJSDOMBridge.collectDetachedNodes);
     /// removal from the tree keeps them.
     func removeAllListeners(forNodeID nodeID: UUID) {
+        // No node has a listener: skip building the key (every collected
+        // node comes through here).
+        guard listenerStore.nodeTargetCount > 0 else { return }
         listenerStore.removeAll(for: "node:\(nodeID.uuidString)")
     }
 

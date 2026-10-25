@@ -192,4 +192,33 @@ final class DOMBridgeFastPathConformance: XCTestCase {
         })()
         """), "\"ab\u{00e9}\",\"x\u{0001F600}y\",\"\",\"42\",\"z\"|4|0|qz|qz")
     }
+
+    // MARK: - Node collection
+
+    /// Collected nodes release their listeners whether or not other nodes
+    /// still have some (the store skips the per-node key while no node has a
+    /// listener), and a listener added later is found again.
+    @JeffJSHostActor
+    func testCollectionReleasesNodeListenersByCount() {
+        let env = makeEnvironment()
+        guard let dom = env.domBridge, let events = env.eventBridge else { return XCTFail("no bridges") }
+        dom.collectDetachedNodes()
+        let base = events.listenerTargetCount
+        _ = evalString(env, """
+        (function() {
+          var f = function() {};
+          var a = document.createElement('div'); a.addEventListener('x', f); a.removeEventListener('x', f);
+          for (var i = 0; i < 50; i++) document.createElement('b');
+          window.__h = document.createElement('i'); window.__h.addEventListener('x', function() { window.__n = (window.__n || 0) + 1; });
+          for (var i = 0; i < 50; i++) { var e = document.createElement('u'); e.addEventListener('x', f); }
+        })()
+        """)
+        dom.collectDetachedNodes()
+        XCTAssertEqual(events.listenerTargetCount - base, 1)
+        XCTAssertEqual(evalString(env, "window.__h.dispatchEvent(new Event('x')); String(window.__n)"), "1")
+        _ = evalString(env, "window.__h = null")
+        dom.collectDetachedNodes()
+        XCTAssertEqual(events.listenerTargetCount, base)
+    }
+
 }

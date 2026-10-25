@@ -378,28 +378,31 @@ final class JeffJSDOMBridge {
     /// can no longer reach (see `collectDetachedNodes`). Removal from the
     /// tree does NOT call this: listeners belong to the node (DOM §2.7).
     func clearEventListeners(for nodeID: UUID) {
+        // Called for every node of every collected subtree, so each table is
+        // hashed only when it holds anything (most are empty on most pages)
+        // and each entry is looked up once.
+
         // Tell centralized event bridge to free listeners for this node
         eventBridge?.removeAllListeners(forNodeID: nodeID)
 
         // Free cached wrapper
-        if let cachedVal = elementCache[nodeID] {
+        if let cachedVal = elementCache.removeValue(forKey: nodeID) {
             cachedVal.freeValue()
         }
-        elementCache.removeValue(forKey: nodeID)
         nodeRegistry.removeValue(forKey: nodeID)
-        elementScrollPositions.removeValue(forKey: nodeID)
-        if let cachedList = classListCache.removeValue(forKey: nodeID) {
+        if !elementScrollPositions.isEmpty { elementScrollPositions.removeValue(forKey: nodeID) }
+        if !classListCache.isEmpty, let cachedList = classListCache.removeValue(forKey: nodeID) {
             cachedList.freeValue()
         }
-        if let st = styleObjectCache.removeValue(forKey: nodeID) { st.freeValue() }
-        if let cachedList = relListCache.removeValue(forKey: nodeID) {
+        if !styleObjectCache.isEmpty, let st = styleObjectCache.removeValue(forKey: nodeID) { st.freeValue() }
+        if !relListCache.isEmpty, let cachedList = relListCache.removeValue(forKey: nodeID) {
             cachedList.freeValue()
         }
-        templateContent.removeValue(forKey: nodeID)
-        if let ds = datasetCache.removeValue(forKey: nodeID) { ds.freeValue() }
-        dirtyTextareas.remove(nodeID)
-        pendingDetailsToggles.removeValue(forKey: nodeID)
-        if moRegistrations.removeValue(forKey: nodeID) != nil { pruneIdleMutationObservers() }
+        if !templateContent.isEmpty { templateContent.removeValue(forKey: nodeID) }
+        if !datasetCache.isEmpty, let ds = datasetCache.removeValue(forKey: nodeID) { ds.freeValue() }
+        if !dirtyTextareas.isEmpty { dirtyTextareas.remove(nodeID) }
+        if !pendingDetailsToggles.isEmpty { pendingDetailsToggles.removeValue(forKey: nodeID) }
+        if !moRegistrations.isEmpty, moRegistrations.removeValue(forKey: nodeID) != nil { pruneIdleMutationObservers() }
     }
 
     // MARK: - document.currentScript
