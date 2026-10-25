@@ -582,7 +582,27 @@ nonisolated public final class DOMNode: @unchecked Sendable, Identifiable {
     }
 
     func removeChild(_ child: DOMNode) {
-        state.withLock { $0.children.removeAll { $0 === child } }
+        // Found by its cached position when current, else by identity, and
+        // taken out with one `remove(at:)`: `removeAll` retained, released and
+        // moved every child (most of a removal from a long child list).
+        let version = state.withLock { $0.childrenVersion }
+        let hint = child.state.withLock { s -> Int? in
+            s.parent === self && s.posVersion == version ? s.posIndex : nil
+        }
+        state.withLock { s in
+            let i: Int
+            if let h = hint, h < s.children.count, s.children[h] === child {
+                i = h
+            } else if let found = s.children.firstIndex(where: { $0 === child }) {
+                i = found
+            } else {
+                return
+            }
+            s.children.remove(at: i)
+            // A node is in a child list once; if it ever were twice, every
+            // copy goes, as removeAll did.
+            if s.children[i...].contains(where: { $0 === child }) { s.children.removeAll { $0 === child } }
+        }
         child.parent = nil
     }
 
