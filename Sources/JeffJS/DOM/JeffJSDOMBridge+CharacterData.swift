@@ -212,6 +212,14 @@ extension JeffJSDOMBridge {
     /// value) before the change, as the spec does.
     func replaceCharacterData(_ node: DOMNode, offset: Int, count: Int, data: String) {
         let old = node.textContent ?? ""
+        // The whole data replaced (the `data` / `nodeValue` setters): the
+        // result is `data` itself, without the UTF-16 round trip.
+        if offset == 0, count >= old.utf16.count {
+            queueCharacterDataRecord(target: node, oldValue: old)
+            node.textContent = data
+            notifyMutation(for: node)
+            return
+        }
         var units = Array(old.utf16)
         let start = min(offset, units.count)
         let end = min(units.count, start + count)

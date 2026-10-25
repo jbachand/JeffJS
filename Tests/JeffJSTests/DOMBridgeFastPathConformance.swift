@@ -170,4 +170,26 @@ final class DOMBridgeFastPathConformance: XCTestCase {
         })()
         """), "250|e294,e288,e282|e299|true|51|e3|A|true|true|true")
     }
+
+    // MARK: - Character data
+
+    @JeffJSHostActor
+    func testWholeDataWrites() {
+        let env = makeEnvironment()
+        XCTAssertEqual(evalString(env, """
+        (function() {
+          var t = document.createTextNode('abé'), p = document.createElement('p');
+          p.appendChild(t); document.body.appendChild(p);
+          var mo = new MutationObserver(function() {});
+          mo.observe(t, { characterData: true, characterDataOldValue: true });
+          t.data = 'x😀y'; var l1 = t.length;
+          t.nodeValue = null; var l2 = t.length;
+          t.data = 42;
+          t.textContent = 'z';
+          t.replaceData(0, 0, 'q');
+          return mo.takeRecords().map(function(r) { return JSON.stringify(r.oldValue); }).join(',') +
+                 '|' + l1 + '|' + l2 + '|' + t.data + '|' + p.textContent;
+        })()
+        """), "\"ab\u{00e9}\",\"x\u{0001F600}y\",\"\",\"42\",\"z\"|4|0|qz|qz")
+    }
 }
