@@ -446,4 +446,153 @@ function patched3(label, s) {
             assert(deep == "d => number:300", "\(group): \(v) 300 levels -> \(deep)")
         }
     }
+
+    /// React's shallowEqual (16.13.1, 18.x, Meta's www build, 19.x, terser /
+    /// esbuild re-minified) and fbjs's shallowEqual: twin on vs off.
+    static let nativeTwinsReactVariants = #"""
+var SE_A=(function(){var Qa="function"===typeof Object.is?Object.is:function(a,b){return a===b&&(0!==a||1/a===1/b)||a!==a&&b!==b},$i=Object.prototype.hasOwnProperty;function Ob(a,b){if(Qa(a,b))return!0;if("object"!==typeof a||null===a||"object"!==typeof b||null===b)return!1;var c=Object.keys(a),d=Object.keys(b);if(c.length!==d.length)return!1;for(d=0;d<c.length;d++)if(!$i.call(b,c[d])||!Qa(a[c[d]],b[c[d]]))return!1;return!0}
+return Ob;})();
+var SE_B=(function(){var ua="function"===typeof Object.is?Object.is:function(a,b){return a===b&&(0!==a||1/a===1/b)||a!==a&&b!==b},Zd=Object.prototype.hasOwnProperty;function qc(a,b){if(ua(a,b))return!0;if("object"!==typeof a||null===a||"object"!==typeof b||null===b)return!1;var c=Object.keys(a),d=Object.keys(b);if(c.length!==d.length)return!1;for(d=0;d<c.length;d++){var e=c[d];if(!Zd.call(b,e)||!ua(a[e],b[e]))return!1}return!0}
+return qc;})();
+var SE_C=(function(){function On(e,t){return e===t&&(e!==0||1/e===1/t)||e!==e&&t!==t}var Bn=typeof Object.is=="function"?Object.is:On,xt=Object.prototype.hasOwnProperty;function vo(e,t){if(Bn(e,t))return!0;if(typeof e!="object"||e===null||typeof t!="object"||t===null)return!1;var n=Object.keys(e),r=Object.keys(t);if(n.length!==r.length)return!1;for(r=0;r<n.length;r++){var o=n[r];if(!xt.call(t,o)||!Bn(e[o],t[o]))return!1}return!0}
+return vo;})();
+var SE_D=(function(){var hasOwnProperty = Object.prototype.hasOwnProperty;
+function is(x, y) {
+  return (x === y && (0 !== x || 1 / x === 1 / y)) || (x !== x && y !== y);
+}
+var objectIs = "function" === typeof Object.is ? Object.is : is;
+function shallowEqual(objA, objB) {
+  if (objectIs(objA, objB)) return !0;
+  if (
+    "object" !== typeof objA ||
+    null === objA ||
+    "object" !== typeof objB ||
+    null === objB
+  )
+    return !1;
+  var keysA = Object.keys(objA),
+    keysB = Object.keys(objB);
+  if (keysA.length !== keysB.length) return !1;
+  for (keysB = 0; keysB < keysA.length; keysB++) {
+    var currentKey = keysA[keysB];
+    if (
+      !hasOwnProperty.call(objB, currentKey) ||
+      !objectIs(objA[currentKey], objB[currentKey])
+    )
+      return !1;
+  }
+  return !0;
+}
+return shallowEqual;})();
+var SE_E=(function(){var He="function"==typeof Object.is?Object.is:function(e,t){return e===t&&(0!==e||1/e==1/t)||e!=e&&t!=t},Ie=Object.prototype.hasOwnProperty;function Je(e,t){if(He(e,t))return!0;if("object"!=typeof e||null===e||"object"!=typeof t||null===t)return!1;var n=Object.keys(e),r=Object.keys(t);if(n.length!==r.length)return!1;for(r=0;r<n.length;r++)if(!Ie.call(t,n[r])||!He(e[n[r]],t[n[r]]))return!1;return!0}
+return Je;})();
+var SE_F=(function(){var He="function"==typeof Object.is?Object.is:function(e,t){return e===t&&(0!==e||1/e==1/t)||e!=e&&t!=t},ja=Object.prototype.hasOwnProperty;function Ie(e,n){if(He(e,n))return!0;if("object"!=typeof e||null===e||"object"!=typeof n||null===n)return!1;var t=Object.keys(e),r=Object.keys(n);if(t.length!==r.length)return!1;for(r=0;r<t.length;r++){var l=t[r];if(!ja.call(n,l)||!He(e[l],n[l]))return!1}return!0}
+return Ie;})();
+var SE_G=(function(){function Ca(e,n){return e===n&&(e!==0||1/e===1/n)||e!==e&&n!==n}var ee=typeof Object.is=="function"?Object.is:Ca,Na=Object.prototype.hasOwnProperty;function Jn(e,n){if(ee(e,n))return!0;if(typeof e!="object"||e===null||typeof n!="object"||n===null)return!1;var t=Object.keys(e),r=Object.keys(n);if(t.length!==r.length)return!1;for(r=0;r<t.length;r++)if(!Na.call(n,t[r])||!ee(e[t[r]],n[t[r]]))return!1;return!0}
+return Jn;})();
+var SE_FB=(function(){'use strict';var e=Object.prototype.hasOwnProperty.call.bind(Object.prototype.hasOwnProperty);function l(e,t){return e===t?e!==0||t!==0||1/e===1/t:e!==e&&t!==t}function s(t,n){if(l(t,n))return!0;if(typeof t!="object"||t===null||typeof n!="object"||n===null)return!1;var r=Object.keys(t),o=Object.keys(n);if(r.length!==o.length)return!1;for(var a=0;a<r.length;a++)if(!e(n,r[a])||!l(t[r[a]],n[r[a]]))return!1;return!0}
+return s;})();
+var SE_NOIS=(function(){var save=Object.is;delete Object.is;try{return (function(){var Qa="function"===typeof Object.is?Object.is:function(a,b){return a===b&&(0!==a||1/a===1/b)||a!==a&&b!==b},$i=Object.prototype.hasOwnProperty;function Ob(a,b){if(Qa(a,b))return!0;if("object"!==typeof a||null===a||"object"!==typeof b||null===b)return!1;var c=Object.keys(a),d=Object.keys(b);if(c.length!==d.length)return!1;for(d=0;d<c.length;d++)if(!$i.call(b,c[d])||!Qa(a[c[d]],b[c[d]]))return!1;return!0}
+return Ob;})();}finally{Object.is=save;}})();
+
+var OUT = [];
+function rec(name, fn) { var r; try { r = JSON.stringify(fn()); } catch (e) { r = "THROW " + (e && e.name) + ": " + (e && e.message); } OUT.push(name + " => " + r); }
+var SYM = Symbol("s"), F1 = function () {}, O1 = { x: 1 };
+var seCases = [
+  ["prims", function (s) { return [s(1, 1), s(1, 2), s(NaN, NaN), s(0, -0), s(-0, -0), s("a", "a"), s(null, null), s(undefined, null), s(null, {}), s({}, null), s(1, {}), s("ab", "ab")]; }],
+  ["same object", function (s) { return s(O1, O1); }],
+  ["equal", function (s) { return [s({ a: 1, b: "x", c: O1, d: F1 }, { a: 1, b: "x", c: O1, d: F1 }), s({}, {})]; }],
+  ["differ", function (s) { return [s({ a: 1 }, { a: 2 }), s({ a: {} }, { a: {} }), s({ a: 1 }, { b: 1 }), s({ a: 1 }, { a: 1, b: 2 }), s({ a: 1, b: 2 }, { a: 1 })]; }],
+  ["key order", function (s) { return s({ a: 1, b: 2 }, { b: 2, a: 1 }); }],
+  ["undefined vs missing", function (s) { return [s({ a: undefined }, {}), s({ a: undefined }, { b: undefined }), s({ a: undefined }, { a: undefined })]; }],
+  ["NaN and -0 values", function (s) { return [s({ a: NaN }, { a: NaN }), s({ a: 0 }, { a: -0 }), s({ a: -0 }, { a: -0 }), s({ a: 1.5 }, { a: 1.5 })]; }],
+  ["strings by content", function (s) { var x = "ab" + Math.random().toString(36).slice(0, 0) + "c"; return s({ a: x }, { a: "abc" }); }],
+  ["int keys", function (s) { return [s({ 1: "a", 0: "b", z: 1 }, { z: 1, 0: "b", 1: "a" }), s({ 1: "a" }, { 1: "b" }), s({ 2: 1 }, { "2": 1 })]; }],
+  ["symbols ignored", function (s) { var a = { x: 1 }, b = { x: 1 }; a[SYM] = 1; return [s(a, b), s(b, a)]; }],
+  ["non-enumerable", function (s) { var a = { x: 1 }, b = { x: 1 }; Object.defineProperty(b, "h", { value: 2 }); var c = { y: 2 }; Object.defineProperty(c, "x", { value: 1 }); return [s(a, b), s(b, a), s({ x: 1, y: 2 }, c), s(a, c)]; }],
+  ["getter in a", function (s) { var n = 0; var a = { get g() { n++; return 1; } }; var r = [s(a, { g: 1 }), s({ z: 1, g: 2 }, a)]; return [n, r]; }],
+  ["getter in b", function (s) { var n = 0; var b = { get g() { n++; return 1; }, z: 2 }; var r = [s({ g: 1, z: 2 }, b), s({ y: 1, z: 2 }, b)]; return [n, r]; }],
+  ["non-enumerable getter in b", function (s) { var n = 0; var b = { y: 2, z: 3 }; Object.defineProperty(b, "x", { get: function () { n++; return 1; } }); return [s({ x: 1, y: 2 }, b), n]; }],
+  ["proxies", function (s) { var log = []; var h = { ownKeys: function (t) { log.push("ownKeys"); return Reflect.ownKeys(t); }, get: function (t, k) { log.push("get " + String(k)); return t[k]; } }; var p = new Proxy({ a: 1 }, h); var r = [s(p, { a: 1 }), s({ a: 1 }, p)]; return [r, log]; }],
+  ["arrays", function (s) { return [s([1, 2], [1, 2]), s([1, 2], [1, 3]), s([], {}), s([1], { 0: 1 })]; }],
+  ["functions", function (s) { var g = function () {}; g.a = 1; return [s(g, function () {}), s(F1, { a: 1 }), s({ a: 1 }, g)]; }],
+  ["dates and maps", function (s) { return [s(new Date(1), new Date(2)), s(new Map(), new Map([[1, 2]])), s(/x/, /y/)]; }],
+  ["class instances", function (s) { function K(v) { this.v = v; } K.prototype.p = 1; return [s(new K(1), new K(1)), s(new K(1), { v: 1 }), s(new K(1), new K(2))]; }],
+  ["null proto", function (s) { var a = Object.create(null), b = Object.create(null); a.x = 1; b.x = 1; return [s(a, b), s(a, { x: 1 })]; }],
+  ["frozen", function (s) { return s(Object.freeze({ a: 1 }), Object.freeze({ a: 1 })); }],
+  ["__proto__ own key", function (s) { return [s(JSON.parse('{"__proto__":1,"a":2}'), JSON.parse('{"__proto__":1,"a":2}')), s(JSON.parse('{"__proto__":1}'), {})]; }],
+  ["wrappers", function (s) { return [s(new Number(1), new Number(1)), s(new String("ab"), new String("ab")), s(new String("ab"), new String("ac"))]; }],
+  ["big", function (s) { var a = {}, b = {}; for (var i = 0; i < 200; i++) { a["k" + i] = i; b["k" + i] = i; } var r1 = s(a, b); b.k199 = -1; return [r1, s(a, b)]; }],
+  ["deleted keys", function (s) { var a = { x: 1, y: 2, z: 3 }; delete a.y; return [s(a, { x: 1, z: 3 }), s({ z: 3, x: 1 }, a)]; }],
+  ["one arg", function (s) { return [s({}), s(), s(undefined)]; }],
+];
+function runSE(label, s) { seCases.forEach(function (c) { rec(label + " " + c[0], function () { return c[1](s); }); }); }
+function patchedSE(label, s) {
+  var ok = Object.keys; Object.keys = function (o) { OUT.push("keys ran"); return ok(o); };
+  rec(label + " patched keys", function () { return s({ a: 1 }, { a: 1 }); });
+  Object.keys = ok;
+  var hop = Object.prototype.hasOwnProperty; Object.prototype.hasOwnProperty = function (k) { OUT.push("hop ran"); return hop.call(this, k); };
+  rec(label + " replaced hasOwnProperty", function () { return s({ a: 1 }, { a: 1 }); });
+  Object.prototype.hasOwnProperty = hop;
+  var oi = Object.is; Object.is = function (a, b) { OUT.push("is ran"); return oi(a, b); };
+  rec(label + " replaced Object.is", function () { return s({ a: 1 }, { a: 1 }); });
+  Object.is = oi;
+  var call = Function.prototype.call; Function.prototype.call = function () { OUT.push("call ran"); return call.apply(this, arguments); };
+  rec(label + " patched call", function () { return s({ a: 1 }, { a: 1 }); });
+  Function.prototype.call = call;
+  hop.call = function (o, k) { OUT.push("own call ran"); return hop.apply(o, [k]); };
+  rec(label + " hasOwnProperty.call shadowed", function () { return s({ a: 1 }, { a: 1 }); });
+  delete hop.call;
+}
+
+"""#
+
+    mutating func testNativeTwinsReact() {
+        let group = "NativeTwinsReact"
+        JeffJSStackDiag.currentLabel = group
+        let (rt, ctx) = makeCtx()
+        let saved = rt.nativeTwins
+        defer { rt.nativeTwins = saved }
+        func run(_ js: String, _ tag: String) -> String {
+            let r = ctx.eval(input: js, filename: "<eval><\(group)-\(tag)>", evalFlags: JS_EVAL_TYPE_GLOBAL)
+            if r.isException {
+                let e = ctx.getException()
+                defer { e.freeValue() }
+                return "!" + (ctx.toSwiftString(e) ?? "?")
+            }
+            defer { r.freeValue() }
+            return ctx.toSwiftString(r) ?? "?"
+        }
+        let setup = run(Self.nativeTwinsReactVariants + "'ok'", "setup")
+        assert(setup == "ok", "\(group): setup -> \(setup)")
+        let body = """
+            OUT = [];
+            [["A", SE_A], ["B", SE_B], ["C", SE_C], ["D", SE_D], ["E", SE_E], ["F", SE_F], ["G", SE_G], ["FB", SE_FB], ["NOIS", SE_NOIS]]
+              .forEach(function (v) { runSE(v[0], v[1]); patchedSE(v[0], v[1]); });
+            OUT.join("\\n")
+            """
+        rt.nativeTwins = true
+        let h0 = rt.twinStats.hits
+        let on = run(body, "on")
+        let served = rt.twinStats.hits - h0
+        rt.nativeTwins = false
+        let off = run(body, "off")
+        assert(served > 300, "\(group): twins served \(served) calls")
+        assert(on == off, "\(group): twins and bytecode differ")
+        if on != off {
+            for (x, y) in zip(on.split(separator: "\n"), off.split(separator: "\n")) where x != y {
+                print("[\(group)] twin: \(x)\n[\(group)] code: \(y)")
+            }
+        }
+        // Every variant was recognised (each served at least one call).
+        rt.nativeTwins = true
+        for v in ["SE_A", "SE_B", "SE_C", "SE_D", "SE_E", "SE_F", "SE_G", "SE_FB"] {
+            let h = rt.twinStats.hits
+            _ = run("\(v)({ a: 1 }, { a: 1 })", "rec-\(v)")
+            assert(rt.twinStats.hits == h + 1, "\(group): \(v) not served")
+        }
+        let h = rt.twinStats.hits
+        _ = run("SE_NOIS({ a: 1 }, { a: 1 })", "nois")
+        assert(rt.twinStats.hits == h, "\(group): React's own objectIs must decline")
+    }
 }

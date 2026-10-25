@@ -57,8 +57,9 @@ nonisolated enum JeffJSNativeTwins {
 
     // MARK: Families
 
-    /// One library a twin replaces.
-    struct Family {
+    /// One library a twin replaces. A class: `call` reads it per call and a
+    /// struct copy retained every field.
+    nonisolated final class Family {
         let name: String
         /// The library's functions as the reference text names them. Role 0
         /// is the entry (the function the twin replaces).
@@ -72,17 +73,53 @@ nonisolated enum JeffJSNativeTwins {
         /// Other builds of the same library (another bundler or Babel
         /// version): their text and their names for the same roles / values,
         /// in the same order.
-        var alternates: [(source: String, roles: [String], values: [String])] = []
+        let alternates: [(source: String, roles: [String], values: [String])]
         /// Closure variables that hold another family's function (reference
         /// name → that family's name and role): checked as that family's
         /// member, its own cells included.
-        var foreign: [String: (family: String, role: Int)] = [:]
+        let foreign: [String: (family: String, role: Int)]
         /// The builtins its code reaches (checked per call).
         let needs: JeffJSTwinIntrinsics.Needs
         /// Cheap argument test before the per-call guards (false: decline).
         let accepts: (JeffJSContext, UnsafePointer<JeffJSValue>?, Int) -> Bool
         /// The twin: nil = declined.
         let run: (JeffJSContext, Resolved, UnsafePointer<JeffJSValue>?, Int) throws -> JeffJSValue
+        /// A one-function family (no other role, nothing foreign) may answer
+        /// from its entry's cells directly, without building `Resolved` (an
+        /// allocation-free call: React's helpers run per fiber / per element).
+        let runLeaf: ((JeffJSContext, LeafCells, UnsafePointer<JeffJSValue>?, Int) throws -> JeffJSValue)?
+
+        init(name: String, roles: [String], values: [String], source: String,
+             alternates: [(source: String, roles: [String], values: [String])] = [],
+             foreign: [String: (family: String, role: Int)] = [:],
+             needs: JeffJSTwinIntrinsics.Needs,
+             accepts: @escaping (JeffJSContext, UnsafePointer<JeffJSValue>?, Int) -> Bool,
+             run: @escaping (JeffJSContext, Resolved, UnsafePointer<JeffJSValue>?, Int) throws -> JeffJSValue,
+             runLeaf: ((JeffJSContext, LeafCells, UnsafePointer<JeffJSValue>?, Int) throws -> JeffJSValue)? = nil) {
+            self.name = name; self.roles = roles; self.values = values; self.source = source
+            self.alternates = alternates; self.foreign = foreign; self.needs = needs
+            self.accepts = accepts; self.run = run
+            self.runLeaf = (roles.count == 1 && foreign.isEmpty) ? runLeaf : nil
+        }
+    }
+
+    /// The closure cells of a one-function family's entry, read in place.
+    struct LeafCells {
+        let refs: [JeffJSVarRef?]
+        let cells: [Cell]
+
+        /// The value cell `k` (borrowed); declines when it is missing or in its TDZ.
+        @inline(__always)
+        func value(_ k: Int) throws -> JeffJSValue {
+            for i in 0..<cells.count {
+                guard case .value(let v) = cells[i], v == k else { continue }
+                guard i < refs.count, let ref = refs[i] else { throw JeffJSTwinDecline(reason: "cell missing") }
+                let x = ref.pvalue
+                if x.isUninitialized { throw JeffJSTwinDecline(reason: "cell in TDZ") }
+                return x
+            }
+            throw JeffJSTwinDecline(reason: "value not reached")
+        }
     }
 
     /// Every family the engine knows.
@@ -92,6 +129,8 @@ nonisolated enum JeffJSNativeTwins {
         JeffJSTwinCloneDeep.family,
         JeffJSTwinEquality.family,
         JeffJSTwinClientStrip.family,
+        JeffJSTwinShallowEqual.family,
+        JeffJSTwinShallowEqual.fbjsFamily,
     ]
 
     /// A family whose cells were checked for one call: its function objects
@@ -398,8 +437,14 @@ nonisolated enum JeffJSNativeTwins {
         do {
             guard let intrinsics = ctx.twinIntrinsics else { throw JeffJSTwinDecline(reason: "no intrinsics") }
             try intrinsics.check(ctx, family.needs)
-            let resolved = try resolve(ctx, t, family: family, entry: obj, entryMember: member, varRefs: varRefs)
-            let r = try family.run(ctx, resolved, argv, argc)
+            let r: JeffJSValue
+            if let leaf = family.runLeaf, !member.cells.contains(where: { if case .role = $0 { return true }; return false }) {
+                guard obj.realmIndex == ctx.realmIndex else { throw JeffJSTwinDecline(reason: "other realm") }
+                r = try leaf(ctx, LeafCells(refs: varRefs, cells: member.cells), argv, argc)
+            } else {
+                let resolved = try resolve(ctx, t, family: family, entry: obj, entryMember: member, varRefs: varRefs)
+                r = try family.run(ctx, resolved, argv, argc)
+            }
             rt.twinStats.hits += 1
             if JeffJSConfig.nativeTwinsDebug {
                 if rt.twinStats.servedByFamily.count < families.count {

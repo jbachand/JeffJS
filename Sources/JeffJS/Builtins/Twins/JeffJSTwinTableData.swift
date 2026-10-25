@@ -80,5 +80,21 @@ nonisolated enum JeffJSTwinTableData {
         Entry(hash: 0xd28b51f6f2943ebe, prefilter: 0x2300020002, family: "thd-client-strip", role: 1, cells: [2100, 1]),   // Cr
         Entry(hash: 0xabb3c65b481f7b50, prefilter: 0x2300020001, family: "thd-client-strip", role: 1, cells: [1]),   // Cr
         Entry(hash: 0xf294edf7b65255a1, prefilter: 0x2300020002, family: "thd-client-strip", role: 1, cells: [1, 2100]),   // Cr
+        Entry(hash: 0x124027b9e7b1c123, prefilter: 0x9100020002, family: "react-shallowEqual", role: 0, cells: [1000, 1001]),   // Ob
+        Entry(hash: 0xffe395400c5eb86d, prefilter: 0x8d00020002, family: "react-shallowEqual", role: 0, cells: [1000, 1001]),   // Ob
+        Entry(hash: 0x3e05ce59a2299c97, prefilter: 0x8b00020002, family: "react-shallowEqual", role: 0, cells: [1000, 1001]),   // Ob
+        Entry(hash: 0x8159969a65a5e903, prefilter: 0x9100020002, family: "react-shallowEqual", role: 0, cells: [1000, 1001]),   // Ob
+        Entry(hash: 0x5ebe84bc1a69f18d, prefilter: 0x8d00020002, family: "react-shallowEqual", role: 0, cells: [1000, 1001]),   // Ob
+        Entry(hash: 0x76a4a273b2085031, prefilter: 0x8f00020002, family: "react-shallowEqual", role: 0, cells: [1000, 1001]),   // Ob
+        Entry(hash: 0xe0c5dad79e40153b, prefilter: 0x9100020002, family: "react-shallowEqual", role: 0, cells: [1000, 1001]),   // Ob
+        Entry(hash: 0xd38f4cf4e281f7e5, prefilter: 0x8d00020002, family: "react-shallowEqual", role: 0, cells: [1000, 1001]),   // Ob
+        Entry(hash: 0xaad645fe5f235daf, prefilter: 0x8b00020002, family: "react-shallowEqual", role: 0, cells: [1000, 1001]),   // Ob
+        Entry(hash: 0x3c757e3fdd9da49b, prefilter: 0x9100020002, family: "react-shallowEqual", role: 0, cells: [1000, 1001]),   // Ob
+        Entry(hash: 0x2bfa1aaad33ae885, prefilter: 0x8d00020002, family: "react-shallowEqual", role: 0, cells: [1000, 1001]),   // Ob
+        Entry(hash: 0xd2e21dedccec65f9, prefilter: 0x8f00020002, family: "react-shallowEqual", role: 0, cells: [1000, 1001]),   // Ob
+        Entry(hash: 0x46072829e40db2dc, prefilter: 0x8c00020002, family: "fbjs-shallowEqual", role: 0, cells: [1, 1000]),   // s
+        Entry(hash: 0x8b2ef7e7c62aff3d, prefilter: 0x2700020000, family: "fbjs-shallowEqual", role: 1, cells: []),   // l
+        Entry(hash: 0x867f86d36cfdf984, prefilter: 0x8c00020002, family: "fbjs-shallowEqual", role: 0, cells: [1, 1000]),   // s
+        Entry(hash: 0x3011ce9668c06a85, prefilter: 0x2700020000, family: "fbjs-shallowEqual", role: 1, cells: []),   // l
     ]
 }

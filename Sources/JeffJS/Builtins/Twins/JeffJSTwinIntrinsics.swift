@@ -36,6 +36,9 @@ nonisolated final class JeffJSTwinIntrinsics {
         static let equal = Needs(rawValue: 1 << 3)
         /// Home Depot's data-model `_client` strip: keys, map, reduce (+ species).
         static let strip = Needs(rawValue: 1 << 4)
+        /// React's shallowEqual: Object.keys, hasOwnProperty via `.call`
+        /// (Object.is and hasOwnProperty themselves are closure cells).
+        static let shallow = Needs(rawValue: 1 << 5)
     }
 
     var global: JeffJSObject?
@@ -57,6 +60,7 @@ nonisolated final class JeffJSTwinIntrinsics {
     var defineProperties: JeffJSObject?
     var create: JeffJSObject?
     var getPrototypeOf: JeffJSObject?
+    var objectIs: JeffJSObject?
     var toString: JeffJSObject?
     var hasOwnProperty: JeffJSObject?
     var propertyIsEnumerable: JeffJSObject?
@@ -138,6 +142,7 @@ nonisolated final class JeffJSTwinIntrinsics {
         defineProperties = own(oc, atomDefineProperties)
         create = own(oc, atomCreate)
         getPrototypeOf = own(oc, atomGetPrototypeOf)
+        objectIs = own(oc, JSPredefinedAtom.is_.rawValue)
         toString = own(op, atomToString)
         hasOwnProperty = own(op, JSAtomID.hasOwnProperty)
         propertyIsEnumerable = own(op, JSAtomID.propertyIsEnumerable)
@@ -230,17 +235,17 @@ nonisolated final class JeffJSTwinIntrinsics {
         }
         // Global `Object` / `Array` / `Map` / `Set`: no script-level
         // let/const shadows them, and the global object holds the intrinsics.
-        if ctx.globalLexCount > 0 {
-            for a in [atomObject, atomArray, atomMap, atomSet] where ctx.globalLexIndex(a) >= 0 {
-                throw JeffJSTwinDecline(reason: "global lexical binding")
-            }
+        if ctx.globalLexCount > 0,
+           ctx.globalLexIndex(atomObject) >= 0 || ctx.globalLexIndex(atomArray) >= 0
+            || ctx.globalLexIndex(atomMap) >= 0 || ctx.globalLexIndex(atomSet) >= 0 {
+            throw JeffJSTwinDecline(reason: "global lexical binding")
         }
         try expect(0, global, atomObject, objectCtor, "Object")
         guard objectCtor?.proto === functionProto, functionProto.proto === objectProto, objectProto.proto == nil,
               arrayProto.proto === objectProto else {
             throw JeffJSTwinDecline(reason: "prototype chain changed")
         }
-        if !needs.isDisjoint(with: [.deepmerge, .spread, .clone, .equal, .strip]) {
+        if !needs.isDisjoint(with: [.deepmerge, .spread, .clone, .equal, .strip, .shallow]) {
             try expect(1, objectCtor, JSAtomID.keys, keys, "Object.keys")
         }
         if needs.contains(.deepmerge) {
@@ -299,6 +304,10 @@ nonisolated final class JeffJSTwinIntrinsics {
             try indexAccessorsAbsent()
         }
         if needs.contains(.strip) { try checkStrip(ctx) }
+        if needs.contains(.shallow) {
+            try callable(110, hasOwnProperty, JSAtomID.call, "hasOwnProperty.call")
+            try expect(111, functionProto, JSAtomID.call, call, "Function.prototype.call")
+        }
         if needs.contains(.equal) {
             try expect(70, global, atomSet, setCtor, "Set")
             try expect(71, setCtor, JSAtomID.prototype, setProto, "Set.prototype")

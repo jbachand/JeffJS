@@ -337,6 +337,7 @@ struct JeffJSTestRunner {
             ("NativeTwins", { $0.testNativeTwins() }),
             ("NativeTwins2", { $0.testNativeTwinsRound2() }),
             ("NativeTwins3", { $0.testNativeTwinsRound3() }),
+            ("NativeTwinsReact", { $0.testNativeTwinsReact() }),
             ("StringIterator", { $0.testStringIterator() }),
             ("AggregateError", { $0.testAggregateError() }),
             ("WebStorage", { $0.testWebStorage() }),
