@@ -221,4 +221,20 @@ final class DOMBridgeFastPathConformance: XCTestCase {
         XCTAssertEqual(events.listenerTargetCount, base)
     }
 
+    /// A wrapper's interface prototype is chosen by the element's
+    /// ASCII-lowercase tag name.
+    @JeffJSHostActor
+    func testInterfacePrototypeByLowercaseTag() {
+        let env = makeEnvironment()
+        XCTAssertEqual(evalString(env, """
+        (function() {
+          var EP = Object.getPrototypeOf(document.createElement('div'));
+          var D = Object.create(EP), U = Object.create(EP);
+          __rnSetNodeInterfaces({ div: D }, U, null, null);
+          return [Object.getPrototypeOf(document.createElement('DiV')) === D,
+                  Object.getPrototypeOf(document.createElement('blink')) === U,
+                  Object.getPrototypeOf(document.createElement('x-y')) === EP].join();
+        })()
+        """), "true,true,true")
+    }
 }

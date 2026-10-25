@@ -1304,7 +1304,9 @@ final class JeffJSDOMBridge {
         if interfacePrototypesByTag.isEmpty { return nil }
         switch node.nodeType {
         case .element:
-            guard node.isHTMLNamespace, !node.isShadowRoot, let tag = node.tagName?.lowercased() else { return nil }
+            // The precomputed ASCII-lowercase name (HTML's rule; `lowercased()`
+            // allocated a string per wrapper).
+            guard node.isHTMLNamespace, !node.isShadowRoot, let tag = node.lowercasedTagName else { return nil }
             if let p = interfacePrototypesByTag[tag] { return p }
             if tag.contains("-") { return nil }          // valid custom element name: HTMLElement
             return unknownElementInterfacePrototype
