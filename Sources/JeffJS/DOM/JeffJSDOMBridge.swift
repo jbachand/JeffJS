@@ -66,6 +66,9 @@ final class JeffJSDOMBridge {
     /// Getter/setter definitions live here and use `this` to find the DOMNode.
     private var stylePrototype: JeffJSValue?
 
+    /// Shared prototype of every DOMTokenList (`classList`, `relList`).
+    private var tokenListPrototype: JeffJSValue?
+
     /// Shared prototype for all DOM element objects. Methods and accessor properties
     /// live here so they're non-enumerable and shared across all elements — matching
     /// browser behavior where methods are on HTMLElement.prototype, not per-element.
@@ -275,6 +278,8 @@ final class JeffJSDOMBridge {
         // Free shared style prototype
         stylePrototype?.freeValue()
         stylePrototype = nil
+        tokenListPrototype?.freeValue()
+        tokenListPrototype = nil
 
         elementPrototype?.freeValue()
         elementPrototype = nil
@@ -2525,7 +2530,7 @@ final class JeffJSDOMBridge {
             guard let self else { return ctx.newObject() }
             guard let targetNode = self.extractNode(from: thisVal) else { return ctx.newObject() }
             if let cached = self.classListCache[targetNode.id] {
-                self.syncTokenListIndices(cached, DOMNode.orderedTokenSet(targetNode.attributes["class"] ?? ""), ctx: ctx)
+                if let t = self.tokenListTarget(cached) { self.syncTokenListIndices(cached, t, ctx: ctx) }
                 return cached.dupValue()
             }
             let list = self.buildClassListObject(for: targetNode, ctx: ctx)
@@ -3195,20 +3200,43 @@ final class JeffJSDOMBridge {
     /// A `DOMTokenList` over any token-list attribute (`class` -> `classList`,
     /// `rel` -> `relList`, ...). Tokens split on ASCII whitespace per HTML, so
     /// `class="\n\tfoo\n\tbar"` is two tokens and empty runs are dropped.
+    ///
+    /// One shared prototype carries the methods and the `length` / `value`
+    /// accessors (WebIDL: DOMTokenList.prototype); a list is an object with
+    /// that prototype whose payload names its element and attribute, plus its
+    /// indexed tokens as own properties. It used to be a fresh object with
+    /// fourteen per-list native closures: building one cost ~2 µs per element
+    /// on its first `classList` read, and releasing it dominated the detached
+    /// node sweep.
     private func buildTokenListObject(for node: DOMNode, attribute: String, ctx: JeffJSContext) -> JeffJSValue {
-        let obj = ctx.newObject()
+        if tokenListPrototype == nil { tokenListPrototype = buildTokenListPrototype(ctx: ctx) }
+        let obj = ctx.newObjectProto(proto: tokenListPrototype!)
+        let target = JeffJSTokenListTarget(node: node, attribute: attribute)
+        obj.toObject()?.payload = .opaque(target)
+        syncTokenListIndices(obj, target, ctx: ctx)
+        return obj
+    }
+
+    /// The element / attribute a DOMTokenList object reads (nil: not a list).
+    func tokenListTarget(_ val: JeffJSValue) -> JeffJSTokenListTarget? {
+        guard let obj = val.toObject(), case .opaque(let any) = obj.payload else { return nil }
+        return any as? JeffJSTokenListTarget
+    }
+
+    /// The shared DOMTokenList prototype (built once per bridge).
+    private func buildTokenListPrototype(ctx: JeffJSContext) -> JeffJSValue {
+        let proto = ctx.newObject()
 
         // Document order is significant (`className` round-trips through CSS and
         // through code that string-matches it), so the list keeps insertion order
         // instead of the alphabetical sort the first implementation used.
-        func tokens() -> [String] {
-            DOMNode.orderedTokenSet(node.attributes[attribute] ?? "")
+        func tokens(_ t: JeffJSTokenListTarget) -> [String] {
+            t.node.tokenList(for: t.attribute)
         }
         // DOM §7.1 "update steps": no attribute is created for an empty set.
-        let store: ([String]) -> Void = { [weak self] list in
-            guard let self else { return }
-            if list.isEmpty, node.attributes[attribute] == nil { return }
-            self.setAttributeValue(node, name: attribute, value: list.joined(separator: " "))
+        func store(_ bridge: JeffJSDOMBridge, _ t: JeffJSTokenListTarget, _ list: [String]) {
+            if list.isEmpty, t.node.attributeValue(t.attribute) == nil { return }
+            bridge.setAttributeValue(t.node, name: t.attribute, value: list.joined(separator: " "))
         }
         // DOM §7.1 validation: "" is a SyntaxError, ASCII whitespace an
         // InvalidCharacterError. Returns the thrown exception or nil.
@@ -3227,65 +3255,76 @@ final class JeffJSDOMBridge {
         func strings(_ ctx: JeffJSContext, _ args: [JeffJSValue]) -> [String] {
             args.map { ctx.toSwiftString($0) ?? "" }
         }
+        func illegal(_ ctx: JeffJSContext, _ name: String) -> JeffJSValue {
+            ctx.throwTypeError(message: "Can only call DOMTokenList.\(name) on instances of DOMTokenList")
+        }
+        /// After a change: the list's indices, then the host's mutation callback.
+        func changed(_ bridge: JeffJSDOMBridge, _ thisVal: JeffJSValue, _ t: JeffJSTokenListTarget, _ ctx: JeffJSContext) {
+            bridge.syncTokenListIndices(thisVal, t, ctx: ctx)
+            bridge.notifyMutation(for: t.node)
+        }
 
         // add(token, ...)
-        ctx.setPropertyFunc(obj: obj, name: "add", fn: { [weak self] ctx, thisVal, args in
+        ctx.setPropertyFunc(obj: proto, name: "add", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.undefined }
+            guard let t = self.tokenListTarget(thisVal) else { return illegal(ctx, "add") }
             let add = strings(ctx, args)
             if let exc = validate(self, ctx, add) { return exc }
-            var list = tokens()
+            var list = tokens(t)
             for cls in add where !list.contains(cls) { list.append(cls) }
-            store(list)
-            self.syncTokenListIndices(thisVal, list, ctx: ctx)
-            self.notifyMutation(for: node)
+            store(self, t, list)
+            changed(self, thisVal, t, ctx)
             return JeffJSValue.undefined
         }, length: 0)
 
         // remove(token, ...)
-        ctx.setPropertyFunc(obj: obj, name: "remove", fn: { [weak self] ctx, thisVal, args in
+        ctx.setPropertyFunc(obj: proto, name: "remove", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return JeffJSValue.undefined }
+            guard let t = self.tokenListTarget(thisVal) else { return illegal(ctx, "remove") }
             let remove = strings(ctx, args)
             if let exc = validate(self, ctx, remove) { return exc }
-            var list = tokens()
+            var list = tokens(t)
             list.removeAll { remove.contains($0) }
-            store(list)
-            self.syncTokenListIndices(thisVal, list, ctx: ctx)
-            self.notifyMutation(for: node)
+            store(self, t, list)
+            changed(self, thisVal, t, ctx)
             return JeffJSValue.undefined
         }, length: 0)
 
         // toggle(token, force?) -> bool
-        ctx.setPropertyFunc(obj: obj, name: "toggle", fn: { [weak self] ctx, thisVal, args in
+        ctx.setPropertyFunc(obj: proto, name: "toggle", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return .newBool(false) }
+            guard let t = self.tokenListTarget(thisVal) else { return illegal(ctx, "toggle") }
             let cls = ctx.toSwiftString(args.first ?? .undefined) ?? ""
             if let exc = validate(self, ctx, [cls]) { return exc }
-            var list = tokens()
+            var list = tokens(t)
             let present = list.contains(cls)
             let hasForce = args.count >= 2 && !args[1].isUndefined
             let force = hasForce ? ctx.toBool(args[1]) : !present
             if present == force { return .newBool(present) }   // nothing to do
             if force { list.append(cls) } else { list.removeAll { $0 == cls } }
-            store(list)
-            self.syncTokenListIndices(thisVal, list, ctx: ctx)
-            self.notifyMutation(for: node)
+            store(self, t, list)
+            changed(self, thisVal, t, ctx)
             return .newBool(force)
         }, length: 1)
 
         // contains(cls) -> bool
-        ctx.setPropertyFunc(obj: obj, name: "contains", fn: { ctx, _, args in
+        ctx.setPropertyFunc(obj: proto, name: "contains", fn: { [weak self] ctx, thisVal, args in
+            guard let self else { return .newBool(false) }
+            guard let t = self.tokenListTarget(thisVal) else { return illegal(ctx, "contains") }
             guard let cls = ctx.toSwiftString(args.first ?? .undefined) else { return .newBool(false) }
-            return .newBool(tokens().contains(cls))
+            return .newBool(tokens(t).contains(cls))
         }, length: 1)
 
         // replace(oldCls, newCls) -> bool
-        ctx.setPropertyFunc(obj: obj, name: "replace", fn: { [weak self] ctx, thisVal, args in
+        ctx.setPropertyFunc(obj: proto, name: "replace", fn: { [weak self] ctx, thisVal, args in
             guard let self else { return .newBool(false) }
+            guard let t = self.tokenListTarget(thisVal) else { return illegal(ctx, "replace") }
             guard args.count >= 2 else {
                 return ctx.throwTypeError(message: "Failed to execute 'replace' on 'DOMTokenList': 2 arguments required, but only \(args.count) present.")
             }
             let oldCls = ctx.toSwiftString(args[0]) ?? "", newCls = ctx.toSwiftString(args[1]) ?? ""
             if let exc = validate(self, ctx, [oldCls, newCls]) { return exc }
-            var list = tokens()
+            var list = tokens(t)
             guard let idx = list.firstIndex(of: oldCls) else { return .newBool(false) }
             // DOM §7.1 "replace": the first of old/new keeps the position.
             if let newIdx = list.firstIndex(of: newCls) {
@@ -3293,31 +3332,36 @@ final class JeffJSDOMBridge {
             } else {
                 list[idx] = newCls
             }
-            store(list)
-            self.syncTokenListIndices(thisVal, list, ctx: ctx)
-            self.notifyMutation(for: node)
+            store(self, t, list)
+            changed(self, thisVal, t, ctx)
             return .newBool(true)
         }, length: 2)
 
         // item(index) -> string | null
-        ctx.setPropertyFunc(obj: obj, name: "item", fn: { ctx, _, args in
-            let list = tokens()
+        ctx.setPropertyFunc(obj: proto, name: "item", fn: { [weak self] ctx, thisVal, args in
+            guard let self else { return JeffJSValue.null }
+            guard let t = self.tokenListTarget(thisVal) else { return illegal(ctx, "item") }
+            let list = tokens(t)
             guard let raw = args.first, let idx = ctx.toInt32(raw), idx >= 0, Int(idx) < list.count else {
                 return JeffJSValue.null
             }
             return ctx.newStringValue(list[Int(idx)])
         }, length: 1)
 
-        ctx.setPropertyFunc(obj: obj, name: "toString", fn: { ctx, _, _ in
-            ctx.newStringValue(node.attributes[attribute] ?? "")
+        ctx.setPropertyFunc(obj: proto, name: "toString", fn: { [weak self] ctx, thisVal, _ in
+            guard let self else { return ctx.newStringValue("") }
+            guard let t = self.tokenListTarget(thisVal) else { return illegal(ctx, "toString") }
+            return ctx.newStringValue(t.node.attributeValue(t.attribute) ?? "")
         }, length: 0)
 
         // forEach(callback, thisArg)
-        ctx.setPropertyFunc(obj: obj, name: "forEach", fn: { ctx, thisVal, args in
+        ctx.setPropertyFunc(obj: proto, name: "forEach", fn: { [weak self] ctx, thisVal, args in
+            guard let self else { return JeffJSValue.undefined }
+            guard let t = self.tokenListTarget(thisVal) else { return illegal(ctx, "forEach") }
             guard let callback = args.first, callback.isObject else { return JeffJSValue.undefined }
             let thisArg = args.count > 1 ? args[1] : JeffJSValue.undefined
             // The callee borrows its arguments: the token string is ours to free.
-            for (i, token) in tokens().enumerated() {
+            for (i, token) in tokens(t).enumerated() {
                 let tokenVal = ctx.newStringValue(token)
                 let r = ctx.callRetained(callback, this: thisArg, args: [tokenVal, .newInt32(Int32(i)), thisVal])
                 tokenVal.freeValue()
@@ -3328,61 +3372,71 @@ final class JeffJSDOMBridge {
         }, length: 1)
 
         // Iterable: values()/keys()/entries()/[Symbol.iterator]
-        func tokenArray() -> JeffJSValue {
+        func tokenArray(_ ctx: JeffJSContext, _ t: JeffJSTokenListTarget) -> JeffJSValue {
             let arr = ctx.newArray()
-            for (i, token) in tokens().enumerated() {
+            for (i, token) in tokens(t).enumerated() {
                 _ = ctx.setPropertyUint32(obj: arr, index: UInt32(i), value: ctx.newStringValue(token))
             }
             return arr
         }
-        ctx.setPropertyFunc(obj: obj, name: "values", fn: { ctx, _, _ in
-            ctx.createArrayIterator(obj: tokenArray(), kind: 1)
-        }, length: 0)
-        ctx.setPropertyFunc(obj: obj, name: "keys", fn: { ctx, _, _ in
-            ctx.createArrayIterator(obj: tokenArray(), kind: 0)
-        }, length: 0)
-        ctx.setPropertyFunc(obj: obj, name: "entries", fn: { ctx, _, _ in
-            ctx.createArrayIterator(obj: tokenArray(), kind: 2)
-        }, length: 0)
-        let iterFn = ctx.newCFunction({ ctx, _, _ in
-            ctx.createArrayIterator(obj: tokenArray(), kind: 1)
+        for (name, kind) in [("values", 1), ("keys", 0), ("entries", 2)] {
+            ctx.setPropertyFunc(obj: proto, name: name, fn: { [weak self] ctx, thisVal, _ in
+                guard let self else { return .undefined }
+                guard let t = self.tokenListTarget(thisVal) else { return illegal(ctx, name) }
+                return ctx.createArrayIterator(obj: tokenArray(ctx, t), kind: kind)
+            }, length: 0)
+        }
+        let iterFn = ctx.newCFunction({ [weak self] ctx, thisVal, _ in
+            guard let self else { return .undefined }
+            guard let t = self.tokenListTarget(thisVal) else { return illegal(ctx, "values") }
+            return ctx.createArrayIterator(obj: tokenArray(ctx, t), kind: 1)
         }, name: "[Symbol.iterator]", length: 0)
-        _ = ctx.setProperty(obj: obj, atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue, value: iterFn)
+        _ = ctx.setProperty(obj: proto, atom: JeffJSAtomID.JS_ATOM_Symbol_iterator.rawValue, value: iterFn)
 
         // supports(token) — DOMTokenList.supports; only defined for attributes
         // with a known token set, which we do not model, so report true.
-        ctx.setPropertyFunc(obj: obj, name: "supports", fn: { _, _, _ in
+        ctx.setPropertyFunc(obj: proto, name: "supports", fn: { _, _, _ in
             .newBool(true)
         }, length: 1)
 
-        // `length` and `value` are live accessors — the list object is cached per
-        // element, so a snapshot taken at build time would go stale on the first
-        // add()/remove().
-        let lengthGetter = ctx.newCFunction({ _, _, _ in .newInt32(Int32(tokens().count)) },
-                                            name: "get length", length: 0)
-        ctx.setPropertyGetSet(obj: obj, name: "length", getter: lengthGetter, setter: nil)
+        // `length` and `value` are live accessors (the list object is cached per
+        // element and outlives attribute changes).
+        let lengthGetter = ctx.newCFunction({ [weak self] ctx, thisVal, _ in
+            guard let self, let t = self.tokenListTarget(thisVal) else { return illegal(ctx, "length") }
+            return .newInt32(Int32(tokens(t).count))
+        }, name: "get length", length: 0)
+        ctx.setPropertyGetSet(obj: proto, name: "length", getter: lengthGetter, setter: nil)
 
-        let valueGetter = ctx.newCFunction({ ctx, _, _ in
-            ctx.newStringValue(node.attributes[attribute] ?? "")
+        let valueGetter = ctx.newCFunction({ [weak self] ctx, thisVal, _ in
+            guard let self, let t = self.tokenListTarget(thisVal) else { return illegal(ctx, "value") }
+            return ctx.newStringValue(t.node.attributeValue(t.attribute) ?? "")
         }, name: "get value", length: 0)
-        let valueSetter = ctx.newCFunction({ [weak self] ctx, _, args in
-            guard let self, let v = ctx.toSwiftString(args.first ?? .undefined) else { return .undefined }
-            self.setAttributeValue(node, name: attribute, value: v)
-            self.notifyMutation(for: node)
+        let valueSetter = ctx.newCFunction({ [weak self] ctx, thisVal, args in
+            guard let self, let t = self.tokenListTarget(thisVal) else { return illegal(ctx, "value") }
+            guard let v = ctx.toSwiftString(args.first ?? .undefined) else { return .undefined }
+            self.setAttributeValue(t.node, name: t.attribute, value: v)
+            self.notifyMutation(for: t.node)
             return .undefined
         }, name: "set value", length: 1)
         // (the indices are re-synced by the classList/relList getters too)
-        ctx.setPropertyGetSet(obj: obj, name: "value", getter: valueGetter, setter: valueSetter)
+        ctx.setPropertyGetSet(obj: proto, name: "value", getter: valueGetter, setter: valueSetter)
 
-        for (i, cls) in tokens().enumerated() {
-            ctx.setPropertyUint32(obj: obj, index: UInt32(i), value: ctx.newStringValue(cls))
-        }
-
-        return obj
+        return proto
     }
 
-    /// Keeps a cached DOMTokenList's indexed properties equal to `list`
-    /// (the object outlives attribute changes made by other APIs).
+    /// Keeps a cached DOMTokenList's indexed properties equal to its
+    /// attribute's tokens (the object outlives attribute changes made by
+    /// other APIs). Free when the attribute is the string the indices were
+    /// last built from.
+    func syncTokenListIndices(_ obj: JeffJSValue, _ target: JeffJSTokenListTarget, ctx: JeffJSContext) {
+        let value = target.node.attributeValue(target.attribute)
+        if target.synced, target.syncedValue == value { return }
+        syncTokenListIndices(obj, target.node.tokenList(for: target.attribute), ctx: ctx)
+        target.synced = true
+        target.syncedValue = value
+    }
+
+    /// Keeps a DOMTokenList's indexed properties equal to `list`.
     func syncTokenListIndices(_ obj: JeffJSValue, _ list: [String], ctx: JeffJSContext) {
         guard obj.isObject else { return }
         for (i, t) in list.enumerated() {
@@ -4212,5 +4266,20 @@ nonisolated struct JeffJSHyperlinkURL {
             "strict-origin", "origin-when-cross-origin", "strict-origin-when-cross-origin", "unsafe-url",
         ]
         return known.contains(v) ? v : ""
+    }
+}
+
+/// What a DOMTokenList object reads and writes: one element's token-list
+/// attribute. `syncedValue` is the attribute string its indexed properties
+/// were last built from.
+nonisolated final class JeffJSTokenListTarget {
+    let node: DOMNode
+    let attribute: String
+    var synced = false
+    var syncedValue: String?
+
+    init(node: DOMNode, attribute: String) {
+        self.node = node
+        self.attribute = attribute
     }
 }
