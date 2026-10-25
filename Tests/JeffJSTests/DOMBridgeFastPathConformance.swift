@@ -221,6 +221,15 @@ final class DOMBridgeFastPathConformance: XCTestCase {
         XCTAssertEqual(events.listenerTargetCount, base)
     }
 
+    func testNodeIDsAreUniqueVersion4UUIDs() {
+        var seen = Set<UUID>()
+        for _ in 0..<10_000 { XCTAssertTrue(seen.insert(DOMNode.text("t").id).inserted) }
+        let s = DOMNode.element(tag: "div").id.uuidString
+        XCTAssertEqual(Array(s)[14], "4")
+        XCTAssertTrue("89AB".contains(Array(s)[19]))
+        XCTAssertEqual(UUID(uuidString: s), UUID(uuidString: s))
+    }
+
     /// A wrapper's interface prototype is chosen by the element's
     /// ASCII-lowercase tag name.
     @JeffJSHostActor

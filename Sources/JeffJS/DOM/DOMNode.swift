@@ -34,7 +34,7 @@ import Synchronization
 
 /// A node in the parsed HTML document tree.
 nonisolated public final class DOMNode: @unchecked Sendable, Identifiable {
-    public let id = UUID()
+    public let id = DOMNode.makeID()
     public let nodeType: NodeType
 
     /// The reader-visible mutable state, guarded by one lock per node (see the
@@ -390,6 +390,27 @@ nonisolated public final class DOMNode: @unchecked Sendable, Identifiable {
         if !attributes.isEmpty { initial.attributeOrder = attributes.keys.sorted() }
         self.state = Mutex(initial)
     }
+
+    /// A process-unique node id, shaped like a version-4 UUID: a random
+    /// 64-bit prefix drawn once per process, then a counter. `UUID()` reads
+    /// the system's cryptographic RNG for every node (about 150 ns, a tenth
+    /// of `createElement`); ids only need to be unique among this process's
+    /// nodes (dictionary keys, `nativeNodeID` round trips).
+    static func makeID() -> UUID {
+        let n = nextIDCounter.wrappingAdd(1, ordering: .relaxed).newValue
+        let p = idPrefix
+        return UUID(uuid: (
+            UInt8(truncatingIfNeeded: p >> 56), UInt8(truncatingIfNeeded: p >> 48),
+            UInt8(truncatingIfNeeded: p >> 40), UInt8(truncatingIfNeeded: p >> 32),
+            UInt8(truncatingIfNeeded: p >> 24), UInt8(truncatingIfNeeded: p >> 16),
+            0x40 | UInt8(truncatingIfNeeded: (p >> 8) & 0x0F), UInt8(truncatingIfNeeded: p),
+            0x80 | UInt8(truncatingIfNeeded: (n >> 56) & 0x3F), UInt8(truncatingIfNeeded: n >> 48),
+            UInt8(truncatingIfNeeded: n >> 40), UInt8(truncatingIfNeeded: n >> 32),
+            UInt8(truncatingIfNeeded: n >> 24), UInt8(truncatingIfNeeded: n >> 16),
+            UInt8(truncatingIfNeeded: n >> 8), UInt8(truncatingIfNeeded: n)))
+    }
+    private static let idPrefix = UInt64.random(in: .min ... .max)
+    private static let nextIDCounter = Atomic<UInt64>(0)
 
     /// `lowercased()` that hands back the same string (no copy) when there is
     /// nothing to lower — the common case, as the parser lowercases HTML tags.
