@@ -417,9 +417,24 @@ nonisolated public struct CSSMatchContext: Sendable {
 /// push / pop, which long selector lists use to reject entries cheaply.
 /// One scan's private state: never shared between threads.
 nonisolated final class DOMAncestorChain: @unchecked Sendable {
-    var nodes: [DOMNode] = []
-    /// The element being tested; the chain describes its ancestors.
-    var subject: DOMNode?
+    /// Unretained: every entry is held by the scan itself (its starting
+    /// ancestor list and its child snapshots) for as long as it is on the
+    /// chain; retaining them was the slow side-table path per scanned parent.
+    var nodes: [Unmanaged<DOMNode>] = []
+    /// The element being tested; the chain describes its ancestors. Not
+    /// retained: the scan sets it to an element its own child snapshots hold
+    /// and clears it before they go (a strong store was a retain/release per
+    /// scanned element, on the slow path: DOMNodes have weak-reference side
+    /// tables).
+    var subject: DOMNode? {
+        get { _subject }
+        set { _subject = newValue; subjectID = newValue.map { ObjectIdentifier($0) } }
+    }
+    unowned(unsafe) private var _subject: DOMNode?
+    /// `subject`'s identity, compared without loading (a load is a retain).
+    private(set) var subjectID: ObjectIdentifier?
+
+    @inline(__always) func isSubject(_ node: DOMNode) -> Bool { subjectID == ObjectIdentifier(node) }
     let tracksFilter: Bool
     private var counters: [UInt16]
     private var hashes: [UInt32] = []
@@ -431,7 +446,7 @@ nonisolated final class DOMAncestorChain: @unchecked Sendable {
     }
 
     func push(_ node: DOMNode) {
-        nodes.append(node)
+        nodes.append(Unmanaged.passUnretained(node))
         guard tracksFilter else { return }
         levelStart.append(hashes.count)
         if node.nodeType == .element {
@@ -474,7 +489,7 @@ nonisolated public struct CSSSelectorMatcher: Sendable {
 
     /// Test whether a complex selector matches a DOM node within a scope.
     public static func matches(_ selector: CSSComplexSelector, node: DOMNode, context: CSSMatchContext) -> Bool {
-        let chain = context.ancestorChain.flatMap { $0.subject === node ? $0 : nil }
+        let chain = context.ancestorChain.flatMap { $0.isSubject(node) ? $0 : nil }
         return matches(selector, node: node, context: context, chain: chain)
     }
 
@@ -541,7 +556,7 @@ nonisolated public struct CSSSelectorMatcher: Sendable {
     @inline(__always)
     private static func parentStep(_ node: DOMNode, _ context: CSSMatchContext,
                                    _ chain: DOMAncestorChain?, _ upTo: Int) -> (DOMNode?, Int) {
-        if let chain { return upTo > 0 ? (chain.nodes[upTo - 1], upTo - 1) : (nil, 0) }
+        if let chain { return upTo > 0 ? (chain.nodes[upTo - 1].takeUnretainedValue(), upTo - 1) : (nil, 0) }
         return (selectorParent(of: node, context: context), 0)
     }
 
@@ -2377,7 +2392,7 @@ nonisolated final class CSSQueryPlan: @unchecked Sendable {
             for sel in selectors where CSSSelectorMatcher.matches(sel, node: node, context: context) { return true }
             return false
         }
-        let chain = context.ancestorChain.flatMap { $0.subject === node && $0.tracksFilter ? $0 : nil }
+        let chain = context.ancestorChain.flatMap { $0.isSubject(node) && $0.tracksFilter ? $0 : nil }
         func test(_ indices: [Int]) -> Bool {
             for i in indices {
                 if let chain {

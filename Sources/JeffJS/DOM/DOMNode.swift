@@ -841,13 +841,19 @@ nonisolated public final class DOMNode: @unchecked Sendable, Identifiable {
         }
         for node in above.reversed() { chain.push(node) }
         context.ancestorChain = chain
+        // A constant for the closure (capturing the `var` copied the context,
+        // retaining its nodes, for every scanned element).
+        let scanContext = context
         var results: [DOMNode] = []
-        walkDescendantElements(chain: chain) { node in
-            if plan.matches(node, context: context) {
-                results.append(node)
-                return firstOnly
+        // `above` keeps the chain's starting entries alive (it holds them unretained).
+        withExtendedLifetime(above) {
+            walkDescendantElements(chain: chain) { node in
+                if plan.matches(node, context: scanContext) {
+                    results.append(node)
+                    return firstOnly
+                }
+                return false
             }
-            return false
         }
         return results
     }
@@ -858,23 +864,36 @@ nonisolated public final class DOMNode: @unchecked Sendable, Identifiable {
     /// With a `chain`, an element is pushed while its subtree is walked and
     /// `chain.subject` names the element handed to `body`.
     func walkDescendantElements(chain: DOMAncestorChain? = nil, _ body: (DOMNode) -> Bool) {
-        var stack: [(nodes: [DOMNode], next: Int)] = [(children, 0)]
-        while let top = stack.indices.last {
-            if stack[top].next >= stack[top].nodes.count {
-                stack.removeLast()
-                if chain != nil, !stack.isEmpty { chain.unsafelyUnwrapped.pop() }
+        // The child snapshots (`frames`) own every node visited; the walk
+        // reads them unretained. A DOMNode has a weak-reference side table
+        // (children point at their parent weakly), so each retain/release
+        // takes the runtime's slow path: retaining every scanned element was
+        // most of a querySelectorAll over a large document.
+        var frames: [[DOMNode]] = [children]
+        var next: [Int] = [0]
+        while let top = frames.indices.last {
+            let i = next[top]
+            let count = frames[top].count
+            if i >= count {
+                frames.removeLast(); next.removeLast()
+                if chain != nil, !frames.isEmpty { chain.unsafelyUnwrapped.pop() }
                 continue
             }
-            let child = stack[top].nodes[stack[top].next]
-            stack[top].next += 1
-            guard child.nodeType == .element else { continue }
-            chain?.subject = child
-            if body(child) { chain?.subject = nil; return }
-            let kids = child.children
-            if !kids.isEmpty {
-                chain?.push(child)
-                stack.append((kids, 0))
+            next[top] = i + 1
+            let child = frames[top].withUnsafeBufferPointer { Unmanaged.passUnretained($0[i]) }
+            let stop: Bool = child._withUnsafeGuaranteedRef { node -> Bool in
+                guard node.nodeType == .element else { return false }
+                chain?.subject = node
+                if body(node) { return true }
+                let kids = node.children
+                if !kids.isEmpty {
+                    chain?.push(node)
+                    frames.append(kids)
+                    next.append(0)
+                }
+                return false
             }
+            if stop { chain?.subject = nil; return }
         }
         chain?.subject = nil
     }

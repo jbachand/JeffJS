@@ -266,4 +266,33 @@ final class DOMBridgeFastPathConformance: XCTestCase {
         })()
         """), "data-k=null,data-k=1,id=null,viewBox=null,viewBox=0 0 1 1|data-k,id|q|0 0 2 2|true")
     }
+
+    // MARK: - Queries
+
+    /// Subtree scans (unretained walk + ancestor chain) on attached and
+    /// detached trees, with combinators that step up the chain.
+    @JeffJSHostActor
+    func testQueriesOnAttachedAndDetachedTrees() {
+        let env = makeEnvironment()
+        XCTAssertEqual(evalString(env, """
+        (function() {
+          function build() {
+            var d = document.createElement('div');
+            d.innerHTML = '<section class="s"><ul><li class="a"><b>1</b></li><li><b class="x">2</b></li></ul></section><p id="q"><b>3</b></p>';
+            return d;
+          }
+          var out = [];
+          [build(), (function() { var d = build(); document.body.appendChild(d); return d; })()].forEach(function(d) {
+            var inner = d.querySelector('ul');
+            out.push(d.querySelectorAll('section li > b').length, d.querySelectorAll('.s b.x').length,
+                     d.querySelector('#q b').textContent, inner.querySelectorAll(':scope > li b').length,
+                     inner.querySelectorAll('div b').length, inner.querySelectorAll('p b').length,
+                     d.querySelectorAll('li + li b, #q > b').length, String(d.querySelector('.nosuch')));
+          });
+          var frag = build(); var ul = frag.querySelector('ul'); frag = null;
+          out.push(ul.querySelectorAll('li b').length);
+          return out.join(',');
+        })()
+        """), "2,1,3,2,2,0,2,null,2,1,3,2,2,0,2,null,2")
+    }
 }
