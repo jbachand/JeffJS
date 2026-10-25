@@ -324,11 +324,14 @@ extension JeffJSDOMBridge {
     func setAttributeValue(_ node: DOMNode, name: String, value: String) {
         let foreign = node.nodeType == .element && !node.isHTMLNamespace
         let key = foreign ? name : name.lowercased()
-        let old = node.attributes[key]
+        let old: String?
         if foreign {
+            old = node.attributeValue(key)
             node.setAttributePreservingCase(name: name, value: value)
         } else {
-            node.setAttribute(name: name, value: value)
+            // Old value and write under one lock (`attributes[key]` copied the
+            // whole dictionary out first, and setAttribute lowercased again).
+            old = node.setLowercasedAttribute(key, value: value)
         }
         attributeChanged(node, name: key, oldValue: old, newValue: value)
     }

@@ -246,4 +246,24 @@ final class DOMBridgeFastPathConformance: XCTestCase {
         })()
         """), "true,true,true")
     }
+
+    // MARK: - Attributes
+
+    @JeffJSHostActor
+    func testSetAttributeOldValuesAndCase() {
+        let env = makeEnvironment()
+        XCTAssertEqual(evalString(env, """
+        (function() {
+          var e = document.createElement('div'), s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+          document.body.appendChild(e); document.body.appendChild(s);
+          var mo = new MutationObserver(function() {});
+          mo.observe(e, { attributes: true, attributeOldValue: true });
+          mo.observe(s, { attributes: true, attributeOldValue: true });
+          e.setAttribute('Data-K', '1'); e.setAttribute('data-k', '2'); e.setAttribute('ID', 'q');
+          s.setAttribute('viewBox', '0 0 1 1'); s.setAttribute('viewBox', '0 0 2 2');
+          return mo.takeRecords().map(function(r) { return r.attributeName + '=' + r.oldValue; }).join(',') + '|' +
+                 e.getAttributeNames().join() + '|' + e.id + '|' + s.getAttribute('viewBox') + '|' + (document.getElementById('q') === e);
+        })()
+        """), "data-k=null,data-k=1,id=null,viewBox=null,viewBox=0 0 1 1|data-k,id|q|0 0 2 2|true")
+    }
 }

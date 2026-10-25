@@ -710,6 +710,20 @@ nonisolated public final class DOMNode: @unchecked Sendable, Identifiable {
         DOMNode.bumpSelectorEpoch()
     }
 
+    /// `setAttribute(name:value:)` for a name that is already lowercase,
+    /// returning the previous value (one lock, no second lowercasing).
+    @discardableResult
+    func setLowercasedAttribute(_ lower: String, value: String) -> String? {
+        let old = state.withLock { s -> String? in
+            let old = s.attributes.updateValue(value, forKey: lower)
+            if old == nil { s.attributeOrder.append(lower) }
+            s.attributeDidChange(lower)
+            return old
+        }
+        DOMNode.bumpSelectorEpoch()
+        return old
+    }
+
     public func removeAttribute(name: String) {
         let lower = name.lowercased()
         state.withLock {
