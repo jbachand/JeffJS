@@ -119,4 +119,55 @@ final class DOMBridgeFastPathConformance: XCTestCase {
         })()
         """), "class:null,class:a,rel:null")
     }
+
+    // MARK: - Tree mutations
+
+    /// Removal and insertion records carry the right siblings whether or not
+    /// the parent's sibling positions are current (the bridge reads them only
+    /// while an observer is registered).
+    @JeffJSHostActor
+    func testChildListRecordSiblings() {
+        let env = makeEnvironment()
+        XCTAssertEqual(evalString(env, """
+        (function() {
+          var p = document.createElement('div'); document.body.appendChild(p);
+          var k = []; for (var i = 0; i < 6; i++) { var c = document.createElement('i'); c.id = 'c' + i; p.appendChild(c); k.push(c); }
+          var n = function(x) { return x ? x.id : '-'; };
+          void k[3].nextSibling;   // stamp the positions
+          var mo = new MutationObserver(function() {});
+          mo.observe(p, { childList: true });
+          p.removeChild(k[2]);                 // stamps stale after this
+          p.insertBefore(k[2], k[5]);
+          p.removeChild(k[0]);
+          p.appendChild(k[0]);
+          k[4].remove();
+          p.insertBefore(k[4], k[1]);
+          return mo.takeRecords().map(function(r) {
+            return (r.addedNodes.length ? '+' + n(r.addedNodes[0]) : '-' + n(r.removedNodes[0])) +
+                   '(' + n(r.previousSibling) + ',' + n(r.nextSibling) + ')';
+          }).join(' ') + ' | ' + Array.prototype.map.call(p.childNodes, n).join('');
+        })()
+        """), "-c2(c1,c3) +c2(c4,c5) -c0(-,c1) +c0(c5,-) -c4(c3,c2) +c4(-,c1) | c4c1c3c2c5c0")
+    }
+
+    /// The same moves with no observer leave the same tree and sibling links.
+    @JeffJSHostActor
+    func testMovesWithoutObserversKeepTheTree() {
+        let env = makeEnvironment()
+        XCTAssertEqual(evalString(env, """
+        (function() {
+          var host = document.createElement('div'), p = document.createElement('div'), a = document.createElement('a');
+          document.body.appendChild(host); p.appendChild(a);
+          var els = []; for (var i = 0; i < 300; i++) { var e = document.createElement('b'); e.id = 'e' + i; host.appendChild(e); els.push(e); }
+          for (var i = 0; i < 300; i += 3) { p.insertBefore(els[i], a); }
+          for (var i = 0; i < 300; i += 6) { p.removeChild(els[i]); host.insertBefore(els[i], host.firstChild); }
+          var ids = []; for (var n = host.firstChild; n; n = n.nextSibling) ids.push(n.id);
+          var back = []; for (var n = host.lastChild; n; n = n.previousSibling) back.push(n.id);
+          var pk = []; for (var n = p.firstChild; n; n = n.nextSibling) pk.push(n.id || n.tagName);
+          return [host.childNodes.length, ids.slice(0, 3).join(','), ids[ids.length - 1],
+                  back.reverse().join() === ids.join(), pk.length, pk[0], pk[pk.length - 1],
+                  els[3].parentNode === p, els[6].parentNode === host, els[1].parentNode === host].join('|');
+        })()
+        """), "250|e294,e288,e282|e299|true|51|e3|A|true|true|true")
+    }
 }

@@ -156,7 +156,9 @@ extension JeffJSDOMBridge {
     func insertNodes(_ nodes: [DOMNode], into parent: DOMNode, before reference: DOMNode?) {
         guard !nodes.isEmpty else { return }
         let ref = (reference?.parent === parent) ? reference : nil
-        let previous = ref.map { previousSibling(of: $0) } ?? parent.lastChildNode
+        // Only the childList record reads `previous` (see removeNodeFromParent).
+        let previous = moRegistrations.isEmpty ? nil
+            : (ref.map { parent.neighbors(of: $0)?.previous ?? nil } ?? parent.lastChildNode)
         for n in nodes {
             if let ref { parent.insertChild(n, before: ref) } else { parent.appendChild(n) }
             n.nodeDocument = nil
@@ -182,8 +184,13 @@ extension JeffJSDOMBridge {
     /// candidate and keeps the old tree's document as its node document.
     func removeNodeFromParent(_ node: DOMNode, suppressObservers: Bool = false) {
         guard let parent = node.parent else { return }
-        let previous = previousSibling(of: node)
-        let next = nextSibling(of: node)
+        // The siblings are only for the childList record; finding them after
+        // a change to `parent`'s children re-stamps every child's position
+        // (O(children)), so removing n children of one parent was O(n^2).
+        let recording = !suppressObservers && !moRegistrations.isEmpty
+        let around = recording ? parent.neighbors(of: node) : nil
+        let previous = around?.previous ?? nil
+        let next = around?.next ?? nil
         if !suppressObservers { addTransientRegistrations(for: node, removedFrom: parent) }
         let document = nodeDocument(of: parent)
         parent.removeChild(node)

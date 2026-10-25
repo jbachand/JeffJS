@@ -68,6 +68,29 @@ extension DOMNode {
         return result
     }
 
+    /// The children before and after `child` of this node in one look: the
+    /// child's cached position when it is current, else one scan under this
+    /// node's lock. Unlike `sibling(offset:)` it never re-stamps every
+    /// child's position (a stale stamp costs O(children) locks), which made a
+    /// loop of removals from one parent quadratic (DOMBridgeBenchTests).
+    func neighbors(of child: DOMNode) -> (previous: DOMNode?, next: DOMNode?)? {
+        let version = state.withLock { $0.childrenVersion }
+        let hint = child.state.withLock { s -> Int? in
+            s.parent === self && s.posVersion == version ? s.posIndex : nil
+        }
+        return state.withLock { s -> (previous: DOMNode?, next: DOMNode?)? in
+            let i: Int
+            if let h = hint, h < s.children.count, s.children[h] === child {
+                i = h
+            } else if let found = s.children.firstIndex(where: { $0 === child }) {
+                i = found
+            } else {
+                return nil
+            }
+            return (i > 0 ? s.children[i - 1] : nil, i + 1 < s.children.count ? s.children[i + 1] : nil)
+        }
+    }
+
     /// The sibling `offset` places from this node (any node type), or nil.
     func sibling(offset: Int) -> DOMNode? {
         guard let position = siblingPosition() else { return nil }

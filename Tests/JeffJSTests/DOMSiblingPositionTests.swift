@@ -112,3 +112,29 @@ final class DOMSiblingPositionTests: XCTestCase {
         XCTAssertLessThan(Double(DispatchTime.now().uptimeNanoseconds - m0) / 1e6, 300)
     }
 }
+
+extension DOMSiblingPositionTests {
+    /// `removeChild` by a current position stamp, by identity when the stamp
+    /// is stale, and `neighbors(of:)` in both cases.
+    func testRemoveChildAndNeighborsWithStaleAndCurrentPositions() {
+        let parent = DOMNode.element(tag: "div")
+        let kids = (0..<8).map { _ in DOMNode.element(tag: "i") }
+        for k in kids { parent.appendChild(k) }
+        _ = kids[4].sibling(offset: 1)                      // stamps every position
+        XCTAssertTrue(parent.neighbors(of: kids[4])! == (kids[3], kids[5]))
+        parent.removeChild(kids[4])                          // current stamp
+        XCTAssertNil(kids[4].parent)
+        XCTAssertTrue(parent.neighbors(of: kids[5])! == (kids[3], kids[6]))   // stale stamps: scan
+        parent.removeChild(kids[0])                          // stale stamp
+        parent.removeChild(kids[7])
+        XCTAssertTrue(parent.neighbors(of: kids[1])! == (nil, kids[2]))
+        XCTAssertTrue(parent.neighbors(of: kids[6])! == (kids[5], nil))
+        XCTAssertNil(parent.neighbors(of: kids[4]))
+        parent.removeChild(kids[4])                          // not a child: no change
+        XCTAssertTrue(parent.children.map { ObjectIdentifier($0) } == [1, 2, 3, 5, 6].map { ObjectIdentifier(kids[$0]) })
+    }
+}
+
+private func == (a: (previous: DOMNode?, next: DOMNode?), b: (DOMNode?, DOMNode?)) -> Bool {
+    a.previous === b.0 && a.next === b.1
+}
