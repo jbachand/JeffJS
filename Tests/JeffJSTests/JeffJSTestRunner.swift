@@ -1125,6 +1125,17 @@ extension JeffJSTestRunner {
 
     mutating func testFunctions() {
         let (rt, ctx) = makeCtx()
+        // apply's CreateListFromArrayLike reads with [[Get]]: typed arrays (length is a prototype
+        // getter), accessor lengths, inherited elements; a throwing length propagates (build_arg_list).
+        evalCheckStr(ctx, #"""
+            var proto = { 1: 'b' }, al = Object.create(proto); al[0] = 'a';
+            Object.defineProperty(al, 'length', { get: function () { return 2; } });
+            var thrown = false;
+            try { Math.max.apply(null, { get length() { throw 7; } }); } catch (e) { thrown = e === 7; }
+            [String.fromCharCode.apply(null, new Uint8Array([104, 105])), Math.max.apply(null, new Int16Array([3, -9, 7])),
+             Array.prototype.concat.apply([], al).join(''), Math.max.apply(null, { length: '2', 0: 1, 1: 5 }),
+             Math.max.apply(null, [1, , 3]), thrown].join()
+            """#, expect: "hi,7,ab,5,NaN,true")
         // Shared context — don't free per-test
 
         // Function declaration

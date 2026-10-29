@@ -364,6 +364,7 @@ nonisolated struct JeffJSBuiltinFunction {
 
         // Delegate to the engine's main callFunction so bytecode, C-functions,
         // and bound functions all work correctly.
+        defer { for v in argList { v.freeValue() } }
         return ctx.callFunction(funcVal, thisVal: thisArg, args: argList)
     }
 
@@ -599,8 +600,10 @@ nonisolated struct JeffJSBuiltinFunction {
 
     // MARK: - Internal Helpers
 
-    /// Builds an argument list from an array-like object (for apply / Reflect.apply).
-    /// Returns nil on error (exception already thrown on context).
+    /// Builds an argument list from an array-like object (for apply / Reflect.apply):
+    /// CreateListFromArrayLike (ES §7.3.18) with ordinary [[Get]]s, so a typed array, an
+    /// accessor `length` or an inherited element counts. Returns owned values (the caller
+    /// frees them), or nil on error (exception already thrown on context).
     ///
     /// Mirrors `build_arg_list` in QuickJS.
     static func buildArgList(ctx: JeffJSContext, args: JeffJSValue) -> [JeffJSValue]? {
@@ -609,46 +612,37 @@ nonisolated struct JeffJSBuiltinFunction {
             return nil
         }
 
-        // Get the length property
-        let lengthVal = argsObj.getOwnPropertyValue(
-            atom: JeffJSAtomID.JS_ATOM_length.rawValue)
-        let length: Int
-        if lengthVal.isInt {
-            length = Int(lengthVal.toInt32())
-        } else if lengthVal.isFloat64 {
-            let d = lengthVal.toFloat64()
-            length = (d.isFinite && abs(d) < Double(Int.max / 2)) ? Int(d) : 0
-        } else {
-            length = 0
-        }
-
-        guard length >= 0 else {
-            _ = ctx.throwTypeError("invalid array length")
-            return nil
-        }
-
-        // Fast path for arrays
+        // Fast path for fast arrays (`length` is their own data property)
         if argsObj.isArray, let snap = argsObj.arraySnapshot() {
-            let actualCount = min(length, snap.count)
-            return Array(snap.values.prefix(actualCount))
+            let lengthVal = argsObj.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_length.rawValue)
+            let length = lengthVal.isInt ? max(0, Int(lengthVal.toInt32())) : snap.count
+            return snap.values.prefix(min(length, snap.count)).map { $0.arrayHoleAsUndefined.dupValue() }
         }
 
-        // General path: read indexed properties. An array-like's length is
-        // arbitrary (`{length: 2**32 + 1}`): reserving/looping that many
-        // slots hung or exhausted memory. QuickJS throws "too many arguments"
-        // past 65,535; allow more (engines differ) but not unbounded.
-        if length > 10_000_000 {
+        let lengthVal = ctx.getProperty(obj: args, atom: JeffJSAtomID.JS_ATOM_length.rawValue)
+        if lengthVal.isException { return nil }
+        let (d, ok) = JeffJSTypeConvert.toNumber(ctx: ctx, val: lengthVal)
+        lengthVal.freeValue()
+        guard ok else { return nil }
+        // ToLength; an array-like's length is arbitrary (`{length: 2**32 + 1}`):
+        // reserving/looping that many slots hung or exhausted memory. QuickJS throws
+        // "too many arguments" past 65,535; allow more (engines differ) but not unbounded.
+        let n = d.isNaN || d <= 0 ? 0 : d.rounded(.towardZero)
+        if n > 10_000_000 {
             _ = ctx.throwRangeError(message: "too many arguments in function call")
             return nil
         }
+        let length = Int(n)
         var result: [JeffJSValue] = []
         result.reserveCapacity(length)
         for i in 0..<length {
-            let indexAtom = UInt32(i) | JS_ATOM_TAG_INT
-            let val = argsObj.getOwnPropertyValue(atom: indexAtom)
+            let val = ctx.getPropertyUint32(obj: args, index: UInt32(i))
+            if val.isException {
+                for v in result { v.freeValue() }
+                return nil
+            }
             result.append(val)
         }
-
         return result
     }
 
