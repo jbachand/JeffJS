@@ -151,10 +151,8 @@ nonisolated enum WasmJSAPI {
     /// The JS function for a wasm function (JS API §4.5.1 "a new Exported Function"), one per function.
     static func exportedFunction(_ f: WasmFunction, ctx: JeffJSContext) -> JeffJSValue {
         if !f.jsObject.isUndefined { return f.jsObject.dupValue() }
-        if f.code == nil, !f.host.isUndefined {
-            // A host function re-exported: the same callable (§4.5.4 step "If func is a host function…").
-            return f.host.dupValue()
-        }
+        // A re-exported host function gets its own Exported Function too (it carries the wasm type, so
+        // importing it elsewhere is type-checked: linking.wast), as in V8 and JSC.
         let fnBox = f
         // The JS function and `f` hold each other (f.jsObject, the closure); the realm's store frees
         // the JS side when the realm goes (WasmStore.release).
