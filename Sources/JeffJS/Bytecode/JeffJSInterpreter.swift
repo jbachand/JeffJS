@@ -306,6 +306,7 @@ nonisolated func jeffJS_traceThisKeyedGet(_ ents: UnsafeMutablePointer<JeffJSICE
 nonisolated func jeffJS_nativeCallFromSlots(_ ctx: JeffJSContext, _ rt: JeffJSRuntime, _ cf: JSCFunctionType,
                                 _ thisVal: JeffJSValue, _ argp: UnsafeMutablePointer<JeffJSValue>,
                                 _ argc: Int, _ magic: Int) -> JeffJSValue {
+    if JeffJSPromiseTrace.recordDepth > 0, let callee = ctx.currentFrame?.nativeCallee { JeffJSPromiseTrace.noteNative(callee) }
     // The argv ABI takes the stack slots as they are.
     if case .argv(let fn) = cf { return fn(ctx, thisVal, argc == 0 ? nil : UnsafePointer(argp), argc) }
     // interp.leanNativeArgs: one reused array per argument count (1–4),
@@ -828,6 +829,7 @@ nonisolated extension JeffJSContext {
         if let cf = obj.cFuncFast {
             let nf = currentFrame, prevNative = nf?.nativeCalleePtr
             nf?.nativeCalleePtr = Unmanaged.passUnretained(obj).toOpaque()
+            if JeffJSPromiseTrace.recordDepth > 0 { JeffJSPromiseTrace.noteNative(obj) }
             let r = JeffJSContext.dispatchCFunction(self, cf, thisVal, args, obj.cMagicFast)
             nf?.nativeCalleePtr = prevNative
             return r

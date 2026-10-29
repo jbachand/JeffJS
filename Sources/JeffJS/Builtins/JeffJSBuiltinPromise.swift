@@ -258,8 +258,12 @@ nonisolated struct JeffJSBuiltinPromise {
         let (resolveFunc, rejectFunc) = createResolvingFunctions(ctx: ctx, promise: promiseObj)
 
         // Call the executor synchronously: executor(resolve, reject)
+        if JeffJSPromiseTrace.enabled { JeffJSPromiseTrace.beginExecutor() }
         let executorResult = ctx.callFunction(func_: executor, this: .undefined,
                                               args: [resolveFunc, rejectFunc])
+        if JeffJSPromiseTrace.enabled, let obj = promiseObj.toObject(), case .promiseData(let d) = obj.payload {
+            JeffJSPromiseTrace.endExecutor(d)
+        }
 
         if executorResult.isException {
             // If the executor throws, reject the promise with the thrown value

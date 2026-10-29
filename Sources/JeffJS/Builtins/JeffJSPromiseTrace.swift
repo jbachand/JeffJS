@@ -28,6 +28,30 @@ nonisolated enum JeffJSPromiseTrace {
         return text.split(separator: "\n").map(String.init).filter { !$0.isEmpty && $0 != ": " }.joined(separator: " < ")
     }
 
+    /// `new Promise(executor)`: the native functions the executor calls (what will settle it).
+    nonisolated(unsafe) static var recordDepth = 0
+    nonisolated(unsafe) private static var recorded: [[String]] = []
+    static func beginExecutor() { lock.lock(); recordDepth += 1; recorded.append([]); lock.unlock() }
+    static func noteNative(_ fn: JeffJSObject) {
+        let v = fn.getOwnPropertyValue(atom: JeffJSAtomID.JS_ATOM_name.rawValue)
+        let name = v.isString ? (v.stringValue?.toSwiftString() ?? "?") : "?"
+        lock.lock(); defer { lock.unlock() }
+        guard var top = recorded.popLast() else { return }
+        // Distinct names in call order; glue internals (`__…`) and call/apply are noise.
+        if top.count < 40, !name.hasPrefix("__"), name != "call", name != "apply", !top.contains(name) {
+            top.append(name.isEmpty ? "(anonymous)" : name)
+        }
+        recorded.append(top)
+    }
+    static func endExecutor(_ data: JeffJSPromiseData) {
+        let key = ObjectIdentifier(data)
+        lock.lock()
+        recordDepth = max(0, recordDepth - 1)
+        guard let calls = recorded.popLast(), !calls.isEmpty else { lock.unlock(); return }
+        created[key] = (created[key] ?? "") + " [executor called: " + calls.joined(separator: ", ") + "]"
+        lock.unlock()
+    }
+
     /// A promise object was made (`new Promise`, `then`'s derived promise, a capability, an async result).
     static func noteCreated(ctx: JeffJSContext, data: JeffJSPromiseData) {
         let stack = stackText(ctx)
