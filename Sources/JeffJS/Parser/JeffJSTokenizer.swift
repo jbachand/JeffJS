@@ -1351,7 +1351,8 @@ nonisolated extension JeffJSParseState {
     /// go to `strUnits` (and a lossy `strValue` for diagnostics), so
     /// `"a\uD800b"` is three code units, not "" (ES §12.9.4.1, §6.1.4).
     func setCookedString(_ bytes: [UInt8]) {
-        if let str = String(bytes: bytes, encoding: .utf8) {
+        // Not Foundation's String(bytes:encoding:), which drops a leading U+FEFF ("\u{FEFF}x" is 2 units).
+        if let str = String(validating: bytes, as: UTF8.self) {
             token.strValue = str
             token.strUnits = nil
             return

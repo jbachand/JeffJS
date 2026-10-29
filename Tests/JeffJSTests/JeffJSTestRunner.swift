@@ -927,6 +927,9 @@ extension JeffJSTestRunner {
 
     mutating func testStrings() {
         let (rt, ctx) = makeCtx()
+        // A literal's leading U+FEFF is part of its value (js_parse_string: the SV keeps every code unit).
+        evalCheckStr(ctx, #"["\ufeffx".length, "\ufeff".length, "\ufeff\u00e9".length, `\ufeffy`.length, "\ufeff".charCodeAt(0)].join()"#,
+                     expect: "2,1,2,2,65279")
         // Shared context — don't free per-test
 
         // String literals
