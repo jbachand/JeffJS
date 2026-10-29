@@ -388,8 +388,11 @@ nonisolated enum WasmCompiler {
                     guard dp < ctrls.count else { throw err("br_table depth exceeds control stack") }
                     let lt = ctrls[ctrls.count - 1 - dp].labelTypes
                     guard lt.count == arity else { throw err("br_table targets have different arities") }
-                    try pop(lt)
-                    push(lt)
+                    // push_vals(pop_vals(labels)): what was popped goes back, so unknown operands of
+                    // unreachable code stay unknown for the next label (Appendix, br_table).
+                    var popped: [WasmOperand] = []
+                    for t in lt.reversed() { popped.append(try pop(t)) }
+                    for v in popped.reversed() { pushOperand(v) }
                 }
                 let src = stack.count - arity
                 let start = tables.count

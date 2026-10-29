@@ -274,7 +274,7 @@ nonisolated enum WasmJSAPI {
         }
         def("custom", 2) { ctx, a in
             guard a.count == 2, let m = unbox(a[0], ModuleBox.self)?.module, let name = ctx.toSwiftString(a[1]) else { return .undefined }
-            return array(ctx, m.customSections.filter { $0.name == name }.map { section -> JeffJSValue in
+            return array(ctx, m.customSections.filter { $0.name.unicodeScalars.elementsEqual(name.unicodeScalars) }.map { section -> JeffJSValue in
                 let ab = JeffJSArrayBuffer(byteLength: section.bytes.count)
                 ab.data = section.bytes
                 return arrayBufferObject(ctx, ab)

@@ -297,7 +297,9 @@ nonisolated struct WasmDecoder {
         return t
     }
 
-    mutating func limits(maxAllowed: UInt32) throws -> WasmLimits {
+    /// `maxAllowed` bounds the minimum, and the maximum too when `boundMax` (memories: 2^16 pages
+    /// is a validity rule, §3.2.4); a table's maximum may be anything up to 2^32 - 1 (JSC / V8 clamp it).
+    mutating func limits(maxAllowed: UInt32, boundMax: Bool = true) throws -> WasmLimits {
         let flag = try byte()
         switch flag {
         case 0x00:
@@ -306,7 +308,8 @@ nonisolated struct WasmDecoder {
             return WasmLimits(min: mn, max: nil)
         case 0x01:
             let mn = try u32(), mx = try u32()
-            guard mn <= maxAllowed, mx <= maxAllowed else { throw fail("maximum size is too large") }
+            guard mn <= maxAllowed else { throw fail("initial size is too large") }
+            guard !boundMax || mx <= maxAllowed else { throw fail("maximum size is too large") }
             guard mn <= mx else { throw fail("size minimum must not be greater than maximum") }
             return WasmLimits(min: mn, max: mx)
         case 0x02, 0x03: throw fail("shared memory is not supported")
@@ -401,6 +404,7 @@ nonisolated struct WasmDecoder {
             }
         }
         var funcCount: Int?
+        var sawData = false
         while !atEnd {
             let id = try byte()
             let size = Int(try u32())
@@ -433,7 +437,7 @@ nonisolated struct WasmDecoder {
                 let n = Int(try u32())
                 for _ in 0..<n {
                     let t = try refType()
-                    m.tables.append(WasmTableType(elem: t, limits: try limits(maxAllowed: Self.maxTableSize)))
+                    m.tables.append(WasmTableType(elem: t, limits: try limits(maxAllowed: Self.maxTableSize, boundMax: false)))
                 }
             case 5:
                 let n = Int(try u32())
@@ -454,10 +458,11 @@ nonisolated struct WasmDecoder {
                 }
             case 7:
                 let n = Int(try u32())
-                var names = Set<String>()
+                // By code points: Swift's String == is canonical equivalence ("\u{C5}" == "A\u{30A}").
+                var names = Set<[UInt8]>()
                 for _ in 0..<n {
                     let nm = try name()
-                    guard names.insert(nm).inserted else { throw fail("duplicate export name '\(nm)'") }
+                    guard names.insert(Array(nm.utf8)).inserted else { throw fail("duplicate export name '\(nm)'") }
                     guard let k = WasmExportKind(rawValue: try byte()) else { throw fail("invalid export kind") }
                     let idx = Int(try u32())
                     switch k {
@@ -500,6 +505,7 @@ nonisolated struct WasmDecoder {
                     pos = bodyEnd
                 }
             case 11:
+                sawData = true
                 let n = Int(try u32())
                 if let dc = m.dataCount, dc != n { throw fail("data section and data count section have inconsistent lengths") }
                 for _ in 0..<n {
@@ -524,6 +530,7 @@ nonisolated struct WasmDecoder {
             guard pos == end else { throw fail("section \(id) has the wrong size", at: end) }
         }
         if (funcCount ?? 0) != m.bodies.count { throw fail("function and code section have inconsistent lengths") }
+        if !sawData, let dc = m.dataCount, dc != 0 { throw fail("data section and data count section have inconsistent lengths") }
     }
 
     private mutating func typeSection(_ m: WasmModule) throws {
@@ -556,7 +563,7 @@ nonisolated struct WasmDecoder {
                 m.importedFuncCount += 1
             case 1:
                 let t = try refType()
-                let tt = WasmTableType(elem: t, limits: try limits(maxAllowed: Self.maxTableSize))
+                let tt = WasmTableType(elem: t, limits: try limits(maxAllowed: Self.maxTableSize, boundMax: false))
                 m.imports.append(WasmImport(module: mod, name: nm, desc: .table(tt)))
                 m.tables.append(tt)
                 m.importedTableCount += 1
