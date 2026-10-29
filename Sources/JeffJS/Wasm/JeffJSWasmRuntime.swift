@@ -33,12 +33,13 @@ nonisolated final class WasmMemory {
 
     var pages: UInt32 { UInt32(ab.byteLength / 65536) }
 
-    /// `memory.grow`: the old size in pages, or nil when it cannot grow.
+    /// `memory.grow`: the old size in pages, or nil when it cannot grow. A successful grow, by 0
+    /// pages too, detaches the old buffer (JS API "refresh the memory buffer"; V8 does the same for
+    /// memory.grow in wasm); a failed one leaves it.
     func grow(by delta: UInt32) -> UInt32? {
         let old = pages
         let limit = min(maxPages ?? WasmDecoder.maxMemoryPages, WasmDecoder.maxMemoryPages)
         guard UInt64(old) + UInt64(delta) <= UInt64(limit) else { return nil }
-        if delta == 0 { return old }
         let newBytes = Int(old + delta) * 65536
         // Engines refuse growth they cannot back; so do we, past 1 GiB.
         guard newBytes <= 1 << 30 else { return nil }

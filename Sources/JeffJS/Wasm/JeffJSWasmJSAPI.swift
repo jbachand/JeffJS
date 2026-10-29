@@ -130,6 +130,11 @@ nonisolated enum WasmJSAPI {
         }
     }
 
+    /// DefaultValue(type) (JS API §4.3): undefined for externref, null for funcref, 0 otherwise.
+    static func defaultValue(_ t: WasmValType, ctx: JeffJSContext) -> UInt64 {
+        t == .externref ? WasmRefs.shared.extern(.undefined, store: WasmStore.of(ctx)) : 0
+    }
+
     static func iterableToList(_ v: JeffJSValue, ctx: JeffJSContext) -> [JeffJSValue]? {
         ctx.iterableToList(v)
     }
@@ -330,7 +335,7 @@ nonisolated enum WasmJSAPI {
             guard let s = ctx.toSwiftString(a[0]), let t = valType(s), t.isRef else { return .undefined }
             let initial = UInt32(truncatingIfNeeded: Int(a[1].toNumber()))
             let maximum: UInt32? = !a[2].isUndefined ? UInt32(truncatingIfNeeded: Int(a[2].toNumber())) : nil
-            var fill: UInt64 = 0
+            var fill = defaultValue(t, ctx: ctx)
             if a.count > 3, !a[3].isUndefined {
                 do { fill = try toWasm(a[3], t, ctx: ctx) } catch { return .exception }
             }
@@ -350,20 +355,22 @@ nonisolated enum WasmJSAPI {
             guard i >= 0, i < Double(t.elems.count) else { return ctx.throwRangeError(message: "WebAssembly.Table.prototype.get expects an integer less than the length of the table") }
             return toJS(t.elems[Int(i)], t.elemType, ctx: ctx)
         }
-        def("tableSet", 3) { ctx, a in
+        def("tableSet", 4) { ctx, a in
             guard let t = unbox(a[0], WasmTable.self) else { return .undefined }
             let i = a[1].toNumber()
             guard i >= 0, i < Double(t.elems.count) else { return ctx.throwRangeError(message: "WebAssembly.Table.prototype.set expects an integer less than the length of the table") }
-            do { t.elems[Int(i)] = a.count > 2 && !a[2].isUndefined ? try toWasm(a[2], t.elemType, ctx: ctx) : 0 }
+            // A missing value is DefaultValue; a present one (undefined too) is converted (V8, JSC).
+            let missing = a.count > 3 && a[3].toBool()
+            do { t.elems[Int(i)] = missing ? defaultValue(t.elemType, ctx: ctx) : try toWasm(a.count > 2 ? a[2] : .undefined, t.elemType, ctx: ctx) }
             catch { return .exception }
             return .undefined
         }
-        def("tableGrow", 3) { ctx, a in
+        def("tableGrow", 4) { ctx, a in
             guard let t = unbox(a[0], WasmTable.self) else { return .undefined }
             let d = a[1].toNumber()
-            var fill: UInt64 = 0
-            if a.count > 2, !a[2].isUndefined {
-                do { fill = try toWasm(a[2], t.elemType, ctx: ctx) } catch { return .exception }
+            var fill = defaultValue(t.elemType, ctx: ctx)
+            if !(a.count > 3 && a[3].toBool()) {
+                do { fill = try toWasm(a.count > 2 ? a[2] : .undefined, t.elemType, ctx: ctx) } catch { return .exception }
             }
             guard d >= 0, d <= Double(UInt32.max), let old = t.grow(by: UInt32(d), fill: fill) else { return .newInt32(-1) }
             return .newFloat64(Double(old))
@@ -371,7 +378,7 @@ nonisolated enum WasmJSAPI {
         // Global
         def("globalNew", 3) { ctx, a in
             guard let s = ctx.toSwiftString(a[0]), let t = valType(s) else { return .undefined }
-            let g = WasmGlobal(type: WasmGlobalType(type: t, mutable: a[1].toBool()), bits: 0)
+            let g = WasmGlobal(type: WasmGlobalType(type: t, mutable: a[1].toBool()), bits: defaultValue(t, ctx: ctx))
             if a.count > 2, !a[2].isUndefined {
                 do { g.bits = try toWasm(a[2], t, ctx: ctx) } catch { return .exception }
             }
@@ -706,10 +713,10 @@ nonisolated enum WasmJSAPI {
         return N.tableGet(slot(this, 'table', tableThis).h, index(i, 'WebAssembly.Table.prototype.get expects an integer less than the length of the table'));
       });
       method(Table.prototype, 'set', 1, function (i, v) {
-        N.tableSet(slot(this, 'table', tableThis).h, index(i, 'WebAssembly.Table.prototype.set expects an integer less than the length of the table'), v);
+        N.tableSet(slot(this, 'table', tableThis).h, index(i, 'WebAssembly.Table.prototype.set expects an integer less than the length of the table'), v, arguments.length < 2);
       });
       method(Table.prototype, 'grow', 1, function (delta, v) {
-        var old = N.tableGrow(slot(this, 'table', tableThis).h, index(delta, 'WebAssembly.Table.prototype.grow expects an integer'), v);
+        var old = N.tableGrow(slot(this, 'table', tableThis).h, index(delta, 'WebAssembly.Table.prototype.grow expects an integer'), v, arguments.length < 2);
         if (old < 0) throw new RangeError('WebAssembly.Table.prototype.grow could not grow the table');
         return old;
       });
@@ -723,7 +730,6 @@ nonisolated enum WasmJSAPI {
         var mutable = !!descriptor.mutable;
         var type = String(descriptor.value);
         if (['i32', 'i64', 'f32', 'f64', 'anyfunc', 'funcref', 'externref'].indexOf(type) < 0) throw new TypeError('WebAssembly.Global expects its \'value\' field to be the string \'i32\', \'i64\', \'f32\', \'f64\', \'anyfunc\', \'funcref\', or \'externref\'');
-        if (v === undefined && type === 'externref' && arguments.length < 2) v = undefined;
         var h = N.globalNew(type, mutable, v);
         var self = create(new.target.prototype);
         slots.set(self, { kind: 'global', h: h });
