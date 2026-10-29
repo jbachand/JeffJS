@@ -154,6 +154,7 @@ nonisolated struct JeffJSStdLib {
         addStructuredClone(ctx: ctx)
         addMicrotask(ctx: ctx)
         addBase64(ctx: ctx)
+        WasmJSAPI.install(ctx: ctx)   // WebAssembly (Sources/JeffJS/Wasm/)
     }
 
     // MARK: - Shell `print` Helper

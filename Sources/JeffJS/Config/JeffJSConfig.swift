@@ -193,6 +193,12 @@ nonisolated enum JeffJSConfig {
     /// (default: only on memory pressure / `JeffJSRuntime.evictLazyPayloads`).
     static let jsonLazyEvictOnIdle = bool("json.lazyEvictOnIdle",      default: false)
 
+    // MARK: - WebAssembly
+
+    /// The `WebAssembly` namespace (Sources/JeffJS/Wasm/, issue #13): a decoder, validator and
+    /// interpreter with the JS API. `JEFFJS_WASM_ENABLED=0` leaves it out (no global at all).
+    static let wasmEnabled = bool("wasm.enabled", default: true)
+
     // MARK: - Web Storage
 
     /// Bytes one origin's `localStorage` may hold (keys + values, WebKit's
