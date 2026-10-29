@@ -76,6 +76,15 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(runner.failCount, 0)
     }
 
+    /// The "WebAssembly" group alone (`swift test -c release --filter EngineTests/testWebAssemblyGroup`).
+    func testWebAssemblyGroup() {
+        var runner = JeffJSTestRunner()
+        runner.testWebAssembly()
+        print("WebAssembly: \(runner.passCount) passed, \(runner.failCount) failed")
+        for f in runner.errors { print("  \(f)") }
+        XCTAssertEqual(runner.failCount, 0)
+    }
+
     func testPerfBenchmarks() {
         let report = JeffJSPerfTests.runAll()
         print(report)

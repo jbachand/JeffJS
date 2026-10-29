@@ -374,6 +374,7 @@ struct JeffJSTestRunner {
             ("EngineMisc", { $0.testEngineMisc() }),
             ("ArrayReduceRight", { $0.testArrayReduceRight() }),
             ("RefcountLeftovers", { $0.testRefcountLeftovers() }),
+            ("WebAssembly", { $0.testWebAssembly() }),
         ]
     }
 
