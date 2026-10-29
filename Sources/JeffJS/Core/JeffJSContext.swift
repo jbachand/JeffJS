@@ -205,6 +205,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// The builtins native twins rely on, captured once the intrinsics exist
     /// (Builtins/Twins/JeffJSNativeTwins.swift).
     var twinIntrinsics: JeffJSTwinIntrinsics? = nil
+    /// This realm's WebAssembly store (JeffJSWasmRuntime.swift), made on first use; released in `free`.
+    var wasmStore: WasmStore? = nil
     var arraySpeciesGetterVal: JeffJSValue = .JS_UNDEFINED
     /// Transition shape of an array iterator `{_target, _index, _kind}`,
     /// captured from the first one built (pinned: refCount + 1).
@@ -885,6 +887,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         arrayCtorIntrinsic = .JS_UNDEFINED
         twinIntrinsics?.release(rt)
         twinIntrinsics = nil
+        wasmStore?.release()
+        wasmStore = nil
         for v in objectToStringCache { v.freeValue() }
         objectToStringCache = []
         arraySpeciesGetterVal.freeValue()

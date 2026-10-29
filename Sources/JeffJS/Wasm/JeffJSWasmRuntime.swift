@@ -89,7 +89,9 @@ nonisolated final class WasmGlobal {
 nonisolated final class WasmFunction {
     let type: WasmFuncType
     unowned(unsafe) var instance: WasmInstance?
-    /// Strong reference for host functions' and exported functions' instances (keeps the instance alive).
+    /// Keeps `instance` alive while the function is reachable (a table, an exported JS function,
+    /// another instance's imports): a failed instantiation's functions can outlive it in an imported
+    /// table (linking.wast). The instance → function → instance cycle is broken by `WasmStore.release`.
     var instanceRef: WasmInstance?
     let code: WasmCompiledFunction?
     /// A host function: the JS callable and its realm.
@@ -99,21 +101,32 @@ nonisolated final class WasmFunction {
     let index: Int
     /// The exported JS function object (identity across exports / tables), made on demand.
     var jsObject: JeffJSValue = .undefined
-    lazy var refID: UInt64 = WasmRefs.shared.register(self)
+    /// The store of the realm the function was made in (owns its reference id).
+    let store: WasmStore
+    private var refIDStorage: UInt64 = 0
+    /// The funcref bits of this function, registered on first use.
+    var refID: UInt64 {
+        if refIDStorage == 0 { refIDStorage = WasmRefs.shared.register(self, store: store) }
+        return refIDStorage
+    }
 
-    init(type: WasmFuncType, instance: WasmInstance?, code: WasmCompiledFunction?, index: Int) {
+    init(type: WasmFuncType, instance: WasmInstance?, code: WasmCompiledFunction?, index: Int, store: WasmStore) {
         self.type = type
         self.instance = instance
         self.instanceRef = instance
         self.code = code
         self.index = index
+        self.store = store
     }
 }
 
-/// Reference values (funcref / externref) as slot bits: an id into this table, 0 = null.
+/// Reference values (funcref / externref) as slot bits: an id into this table, 0 = null. Ids are
+/// never reused; an entry lives until the store that registered it is released, after which its id
+/// reads as null.
 nonisolated final class WasmRefs {
     nonisolated(unsafe) static let shared = WasmRefs()
-    private var objects: [AnyObject?] = [nil]
+    private var objects: [UInt64: AnyObject] = [:]
+    private var next: UInt64 = 1
     private let lock = NSLock()
 
     final class Extern {
@@ -122,24 +135,100 @@ nonisolated final class WasmRefs {
         deinit { value.freeValue() }
     }
 
-    func register(_ o: AnyObject) -> UInt64 {
-        lock.lock(); defer { lock.unlock() }
-        objects.append(o)
-        return UInt64(objects.count - 1)
+    func register(_ o: AnyObject, store: WasmStore) -> UInt64 {
+        lock.lock()
+        let id = next
+        next += 1
+        objects[id] = o
+        lock.unlock()
+        store.refIDs.append(id)
+        return id
+    }
+
+    func unregister(_ ids: [UInt64]) {
+        lock.lock()
+        var dropped: [AnyObject] = []   // released after the lock (an Extern's deinit frees a JS value)
+        dropped.reserveCapacity(ids.count)
+        for id in ids { if let o = objects.removeValue(forKey: id) { dropped.append(o) } }
+        lock.unlock()
+        dropped.removeAll()
     }
 
     func object(_ id: UInt64) -> AnyObject? {
         guard id != 0 else { return nil }
         lock.lock(); defer { lock.unlock() }
-        return Int(id) < objects.count ? objects[Int(id)] : nil
+        return objects[id]
     }
 
     func function(_ id: UInt64) -> WasmFunction? { object(id) as? WasmFunction }
 
-    /// An externref for a JS value (null → 0).
-    func extern(_ v: JeffJSValue) -> UInt64 {
+    /// An externref for a JS value (null → 0); one id per object per store.
+    func extern(_ v: JeffJSValue, store: WasmStore) -> UInt64 {
         if v.isNull { return 0 }
-        return register(Extern(v))
+        guard let o = v.toObject() else { return register(Extern(v), store: store) }
+        let key = ObjectIdentifier(o)
+        if let id = store.externIDs[key] { return id }
+        let id = register(Extern(v), store: store)
+        store.externIDs[key] = id
+        return id
+    }
+}
+
+/// The store (Core §4.2.1) of one realm: the instances, host functions, reference ids and JS
+/// wrappers made in it. Swift objects here hold JS values (an exported function's JS object, a
+/// memory's handle, an externref) that hold them back, a cycle the JS collector cannot see, so the
+/// whole store lives until its realm is freed (`JeffJSContext.free`), which calls `release`.
+nonisolated final class WasmStore {
+    var instances: [WasmInstance] = []
+    var hostFunctions: [WasmFunction] = []
+    var refIDs: [UInt64] = []
+    var externIDs: [ObjectIdentifier: UInt64] = [:]
+    /// Exported function objects listed in `WasmJSAPI.exported` by this realm.
+    var exportedKeys: [ObjectIdentifier] = []
+    /// Functions, memories, tables and globals whose JS objects were made in this realm.
+    var wrapped: [AnyObject] = []
+    var errorCtors: (compile: JeffJSValue, link: JeffJSValue, runtime: JeffJSValue)?
+
+    static func of(_ ctx: JeffJSContext) -> WasmStore {
+        if let s = ctx.wasmStore { return s }
+        let s = WasmStore()
+        ctx.wasmStore = s
+        return s
+    }
+
+    /// The realm is going away: drop every JS value held from Swift and break the instance cycles.
+    /// A function another realm still holds keeps its (now dead) instance; calling it traps.
+    func release() {
+        WasmJSAPI.forgetExported(exportedKeys)
+        exportedKeys = []
+        for o in wrapped {
+            switch o {
+            case let f as WasmFunction: f.jsObject.freeValue(); f.jsObject = .undefined
+            case let m as WasmMemory:
+                m.jsObject.freeValue(); m.jsObject = .undefined
+                m.bufferObject.freeValue(); m.bufferObject = .undefined
+            case let t as WasmTable: t.jsObject.freeValue(); t.jsObject = .undefined
+            case let g as WasmGlobal: g.jsObject.freeValue(); g.jsObject = .undefined
+            default: break
+            }
+        }
+        wrapped = []
+        for f in hostFunctions { f.host.freeValue(); f.host = .undefined; f.hostCtx = nil }
+        hostFunctions = []
+        for inst in instances {
+            inst.dead = true
+            inst.functions = []
+            inst.tables = []
+            inst.memories = []
+            inst.globals = []
+        }
+        instances = []
+        let ids = refIDs
+        refIDs = []
+        externIDs = [:]
+        WasmRefs.shared.unregister(ids)
+        if let e = errorCtors { e.compile.freeValue(); e.link.freeValue(); e.runtime.freeValue() }
+        errorCtors = nil
     }
 }
 
@@ -153,10 +242,14 @@ nonisolated final class WasmInstance {
     var droppedElems: [Bool] = []
     /// The realm the instance was made in (host calls, exported functions).
     unowned(unsafe) let ctx: JeffJSContext
+    let store: WasmStore
+    /// Set when the realm's store was released: the instance's state is gone, calls into it trap.
+    var dead = false
 
     init(module: WasmModule, ctx: JeffJSContext) {
         self.module = module
         self.ctx = ctx
+        self.store = WasmStore.of(ctx)
     }
 
     /// Instantiation (§4.5.4) after the imports were resolved and type-checked by the JS API:
@@ -167,10 +260,8 @@ nonisolated final class WasmInstance {
         functions = importedFunctions
         for (i, code) in m.code.enumerated() {
             let idx = m.importedFuncCount + i
-            functions.append(WasmFunction(type: m.types[m.funcTypes[idx]], instance: self, code: code, index: idx))
+            functions.append(WasmFunction(type: m.types[m.funcTypes[idx]], instance: self, code: code, index: idx, store: store))
         }
-        // Defined functions point back here unowned; break the strong self-cycle.
-        for f in functions where f.instance === self { f.instanceRef = nil }
         globals = importedGlobals
         for def in m.globalDefs {
             globals.append(WasmGlobal(type: def.type, bits: evalConst(def.initExpr)))
@@ -282,6 +373,7 @@ nonisolated enum WasmInterpreter {
     /// Calls `f` with `args` (slot bits); returns the results' bits.
     static func invoke(_ f: WasmFunction, args: [UInt64], ctx: JeffJSContext) throws -> [UInt64] {
         if f.code == nil { return try callHost(f, args: args) }
+        if f.instance?.dead ?? true { throw WasmError.trap(deadRealm) }
         let stack = WasmStack.current()
         let fp = stack.top
         guard let code = f.code, fp + code.frameSize < WasmStack.slots else { throw WasmError.stackOverflow }
@@ -346,6 +438,7 @@ nonisolated enum WasmInterpreter {
     }
 
     static let truncTrap = "Out of bounds Trunc operation"
+    static let deadRealm = "call to a function whose realm was destroyed"
 
     /// Truncation to an integer range [lo, hi): the value if in range, nil otherwise (NaN included).
     @inline(__always) static func truncIn(_ v: Double, _ lo: Double, _ hi: Double) -> Double? {
@@ -488,7 +581,11 @@ nonisolated enum WasmInterpreter {
                     instrs = c.code
                     pc = 0
                     fp = s
-                    if callee.instance !== inst { inst = callee.instance!; (mem, memSize) = memoryView(inst) }
+                    if callee.instance !== inst {
+                        guard let ci = callee.instance, !ci.dead else { throw WasmError.trap(deadRealm) }
+                        inst = ci
+                        (mem, memSize) = memoryView(inst)
+                    }
                 } else {
                     let n = callee.type.params.count
                     let args = (0..<n).map { S[s + $0] }

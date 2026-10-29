@@ -37,22 +37,19 @@ nonisolated enum WasmJSAPI {
 
     /// The handle object of a memory / table / global (one per Swift object: identity).
     static func handle(_ ctx: JeffJSContext, memory m: WasmMemory) -> JeffJSValue {
-        if m.jsObject.isUndefined { m.jsObject = newHandle(ctx, m) }
+        if m.jsObject.isUndefined { m.jsObject = newHandle(ctx, m); WasmStore.of(ctx).wrapped.append(m) }
         return m.jsObject.dupValue()
     }
     static func handle(_ ctx: JeffJSContext, table t: WasmTable) -> JeffJSValue {
-        if t.jsObject.isUndefined { t.jsObject = newHandle(ctx, t) }
+        if t.jsObject.isUndefined { t.jsObject = newHandle(ctx, t); WasmStore.of(ctx).wrapped.append(t) }
         return t.jsObject.dupValue()
     }
     static func handle(_ ctx: JeffJSContext, global g: WasmGlobal) -> JeffJSValue {
-        if g.jsObject.isUndefined { g.jsObject = newHandle(ctx, g) }
+        if g.jsObject.isUndefined { g.jsObject = newHandle(ctx, g); WasmStore.of(ctx).wrapped.append(g) }
         return g.jsObject.dupValue()
     }
 
-    // MARK: Error constructors (registered by the glue, per realm)
-
-    nonisolated(unsafe) private static var errorCtors: [ObjectIdentifier: (compile: JeffJSValue, link: JeffJSValue, runtime: JeffJSValue)] = [:]
-    private static let lock = NSLock()
+    // MARK: Error constructors (registered by the glue, per realm: WasmStore.errorCtors)
 
     static func throwWasm(_ ctx: JeffJSContext, _ error: WasmError) -> JeffJSValue {
         switch error {
@@ -65,10 +62,7 @@ nonisolated enum WasmJSAPI {
     }
 
     static func throwError(_ ctx: JeffJSContext, kind: Int, _ message: String) -> JeffJSValue {
-        lock.lock()
-        let ctors = errorCtors[ObjectIdentifier(ctx)]
-        lock.unlock()
-        guard let ctors else { return ctx.throwTypeError(message: message) }
+        guard let ctors = WasmStore.of(ctx).errorCtors else { return ctx.throwTypeError(message: message) }
         let ctor = kind == 0 ? ctors.compile : kind == 1 ? ctors.link : ctors.runtime
         let msg = ctx.newStringValue(message)
         let err = ctx.callConstructor(ctor, args: [msg])
@@ -129,7 +123,7 @@ nonisolated enum WasmJSAPI {
             }
             return f.refID
         case .externref:
-            return WasmRefs.shared.extern(v)
+            return WasmRefs.shared.extern(v, store: WasmStore.of(ctx))
         case .v128:
             _ = ctx.throwTypeError(message: "Invalid argument type")
             throw WasmError.jsException
@@ -162,10 +156,8 @@ nonisolated enum WasmJSAPI {
             return f.host.dupValue()
         }
         let fnBox = f
-        // An exported function keeps its instance alive (JS API §4.5.1: the function's [[FunctionAddress]]
-        // lives in the store). The instance → function → JS function → instance cycle is only broken by
-        // the page's teardown (open: a finalizer on the JS function would let instances be collected).
-        f.instanceRef = f.instance
+        // The JS function and `f` hold each other (f.jsObject, the closure); the realm's store frees
+        // the JS side when the realm goes (WasmStore.release).
         let fn = ctx.newCFunction({ ctx, _, args in
             callExported(fnBox, args: args, ctx: ctx)
         }, name: String(f.index), length: f.type.params.count)
@@ -174,15 +166,26 @@ nonisolated enum WasmJSAPI {
             exportedLock.lock()
             exported[ObjectIdentifier(o)] = fnBox   // identity for ToWebAssemblyValue(funcref) and imports
             exportedLock.unlock()
+            WasmStore.of(ctx).exportedKeys.append(ObjectIdentifier(o))
         }
         f.jsObject = fn.dupValue()
+        WasmStore.of(ctx).wrapped.append(f)
         return fn
     }
 
     /// Exported function objects → their wasm function. Each object is kept alive by its function's
-    /// `jsObject` (and the function by this table), so an address is never reused while listed.
+    /// `jsObject` (and the function by this table) until its realm's store forgets it, so an address
+    /// is never reused while listed.
     nonisolated(unsafe) private static var exported: [ObjectIdentifier: WasmFunction] = [:]
     private static let exportedLock = NSLock()
+
+    static func forgetExported(_ keys: [ObjectIdentifier]) {
+        exportedLock.lock()
+        var dropped: [WasmFunction] = []
+        for k in keys { if let f = exported.removeValue(forKey: k) { dropped.append(f) } }
+        exportedLock.unlock()
+        dropped.removeAll()
+    }
 
     static func wasmFunction(of v: JeffJSValue) -> WasmFunction? {
         guard let o = v.toObject() else { return nil }
@@ -248,9 +251,9 @@ nonisolated enum WasmJSAPI {
         }
         def("errors", 3) { ctx, a in
             guard a.count == 3 else { return .undefined }
-            lock.lock()
-            errorCtors[ObjectIdentifier(ctx)] = (a[0].dupValue(), a[1].dupValue(), a[2].dupValue())
-            lock.unlock()
+            let store = WasmStore.of(ctx)
+            if let e = store.errorCtors { e.compile.freeValue(); e.link.freeValue(); e.runtime.freeValue() }
+            store.errorCtors = (a[0].dupValue(), a[1].dupValue(), a[2].dupValue())
             return .undefined
         }
         def("isBytes", 1) { _, a in .newBool(a.first.flatMap { bytes(of: $0) } != nil) }
@@ -307,7 +310,7 @@ nonisolated enum WasmJSAPI {
         }
         def("memBuffer", 1) { ctx, a in
             guard let m = a.first.flatMap({ unbox($0, WasmMemory.self) }) else { return .undefined }
-            if m.bufferObject.isUndefined { m.bufferObject = arrayBufferObject(ctx, m.ab) }
+            if m.bufferObject.isUndefined { m.bufferObject = arrayBufferObject(ctx, m.ab); WasmStore.of(ctx).wrapped.append(m) }
             return m.bufferObject.dupValue()
         }
         def("memGrow", 2) { ctx, a in
@@ -433,9 +436,10 @@ nonisolated enum WasmJSAPI {
                     funcs.append(wf)
                 } else {
                     guard ctx.isCallable(v) else { return str(ctx, "LinkError:\(what): import function must be callable") }
-                    let f = WasmFunction(type: type, instance: nil, code: nil, index: m.funcTypes.count + i)
+                    let f = WasmFunction(type: type, instance: nil, code: nil, index: m.funcTypes.count + i, store: WasmStore.of(ctx))
                     f.host = v.dupValue()
                     f.hostCtx = ctx
+                    WasmStore.of(ctx).hostFunctions.append(f)
                     funcs.append(f)
                 }
             case .memory(let l):
@@ -470,6 +474,9 @@ nonisolated enum WasmJSAPI {
             }
         }
         let inst = WasmInstance(module: m, ctx: ctx)
+        // In the store before initialization: a trapping segment leaves earlier writes (and this
+        // instance's functions) in imported tables (Core §4.5.4, linking.wast).
+        inst.store.instances.append(inst)
         do {
             try inst.initialize(importedFunctions: funcs, importedTables: tables, importedMemories: mems, importedGlobals: globals)
         } catch WasmError.trap(let msg) {
