@@ -3020,6 +3020,21 @@ extension JeffJSTestRunner {
         let (rt, ctx) = makeCtx()
         // Shared context — don't free per-test
 
+        // NaNs with a payload read back as a number (a payload in a tag range used to read as a
+        // tagged value: typeof undefined, then a crash). QuickJS __JS_NewFloat64 canonicalises.
+        evalCheckStr(ctx, """
+            var dv = new DataView(new ArrayBuffer(8)), out = [];
+            [0x7fe00000, 0xffa00001, 0x7fa00000, 0x7fc00001].forEach(function (b) {
+              dv.setUint32(0, b, true); var x = dv.getFloat32(0, true);
+              out.push(typeof x + (x !== x));
+            });
+            dv.setUint32(4, 0x7ffc0000, true); dv.setUint32(0, 5, true);
+            var y = dv.getFloat64(0, true), f = new Float64Array(dv.buffer)[0], g = new Float32Array([NaN]);
+            new Uint32Array(g.buffer)[0] = 0x7fe00001;
+            out.push(typeof y + (y !== y), typeof f + (f !== f), typeof g[0] + isNaN(g[0]), String(y + 1));
+            out.join()
+            """, expect: "numbertrue,numbertrue,numbertrue,numbertrue,numbertrue,numbertrue,numbertrue,NaN")
+
         // Int8Array
         evalCheck(ctx, "new Int8Array(4).length", expectInt: 4)
         evalCheck(ctx, "new Int8Array([1,2,3])[1]", expectInt: 2)

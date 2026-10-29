@@ -158,9 +158,13 @@ nonisolated struct JeffJSValue {
         JeffJSValue(bits: _intTag | UInt64(UInt32(bitPattern: val)))
     }
 
+    /// A NaN whose top 16 bits fall in a tag range (0x7FF9-0x7FFF / 0xFFF9-0xFFFF) would read
+    /// as a tagged value; such NaNs (payload NaNs from a Float32Array / DataView / wasm, or a
+    /// signalling NaN quieted by arithmetic) become the canonical NaN (QuickJS __JS_NewFloat64).
     @inline(__always)
     static func newFloat64(_ val: Double) -> JeffJSValue {
-        JeffJSValue(bits: val.bitPattern)
+        let b = val.bitPattern
+        return JeffJSValue(bits: (b >> 48) & 0x7FFF >= 0x7FF9 ? 0x7FF8_0000_0000_0000 : b)
     }
 
     @inline(__always)
