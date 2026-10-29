@@ -63,6 +63,7 @@ nonisolated struct JeffJSPromiseReaction {
 /// `new Promise(function () {}).then(f)` used to pin `f` and the derived
 /// promise for the life of the runtime.
 nonisolated func jeffJS_promiseDataFree(_ d: JeffJSPromiseData) {
+    if JeffJSPromiseTrace.enabled { JeffJSPromiseTrace.noteDone(d) }
     let fulfill = d.promiseFulfillReactions
     let reject = d.promiseRejectReactions
     let result = d.promiseResult
@@ -959,6 +960,7 @@ nonisolated struct JeffJSBuiltinPromise {
         switch promiseData.promiseState {
         case .pending:
             // Queue the reactions for later
+            if JeffJSPromiseTrace.enabled { JeffJSPromiseTrace.noteWait(ctx: ctx, data: promiseData) }
             promiseData.promiseFulfillReactions.append(fulfillReaction)
             promiseData.promiseRejectReactions.append(rejectReaction)
 
@@ -1054,6 +1056,7 @@ nonisolated struct JeffJSBuiltinPromise {
         let promiseData = getPromiseData(promiseObj)
 
         guard promiseData.promiseState == .pending else { return }
+        if JeffJSPromiseTrace.enabled { JeffJSPromiseTrace.noteDone(promiseData) }
 
         // Save the reactions before clearing
         let reactions = promiseData.promiseFulfillReactions
@@ -1082,6 +1085,7 @@ nonisolated struct JeffJSBuiltinPromise {
         let promiseData = getPromiseData(promiseObj)
 
         guard promiseData.promiseState == .pending else { return }
+        if JeffJSPromiseTrace.enabled { JeffJSPromiseTrace.noteDone(promiseData) }
 
         let reactions = promiseData.promiseRejectReactions
 
