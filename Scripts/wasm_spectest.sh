@@ -6,8 +6,9 @@
 # (default $TMPDIR/jeffjs-wasm-spectest). Each .wast becomes a JS script (Scripts/wasm_spectest_gen.js)
 # that prints "<name> PASS n FAIL m SKIP k"; a line is printed when JeffJS and node differ.
 # Known differences, all node's: V8 implements post-2.0 proposals (multi-memory, extended constant
-# expressions), so a few assert_invalid cases fail in node only; conversions.wast has 4 cases that
-# pass a NaN payload through JS (implementation-defined), failing in both; data, elem and global
+# expressions), so a few assert_invalid cases fail in node only; conversions.wast has 8 cases that
+# pass a NaN payload through JS (implementation-defined: JeffJS canonicalises NaNs read from typed
+# arrays as JSC does, V8 keeps some payloads and fails 4 of them); data, elem and global
 # each have 2 "unknown global" assert_invalid cases both engines accept (extended constants).
 set -eu
 ROOT=${0:a:h:h}

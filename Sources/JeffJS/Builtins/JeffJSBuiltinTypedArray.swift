@@ -72,7 +72,7 @@ nonisolated struct TypedArrayElementInfo {
                     | (UInt32(data[offset + 3]) << 24)
             if !littleEndian { raw = raw.byteSwapped }
             let f = Float(bitPattern: raw)
-            return .newFloat64(Double(f))
+            return .newFloat64Purified(Double(f))
 
         case JeffJSClassID.float64Array.rawValue:
             var raw = UInt64(data[offset])
@@ -84,7 +84,7 @@ nonisolated struct TypedArrayElementInfo {
                     | (UInt64(data[offset + 6]) << 48)
                     | (UInt64(data[offset + 7]) << 56)
             if !littleEndian { raw = raw.byteSwapped }
-            return .newFloat64(Double(bitPattern: raw))
+            return .newFloat64Purified(Double(bitPattern: raw))
 
         case JeffJSClassID.bigInt64Array.rawValue:
             var raw = UInt64(data[offset])
@@ -258,8 +258,8 @@ nonisolated func jeffJS_typedArrayLoad(_ classID: Int, _ p: UnsafeRawPointer) ->
     case JeffJSClassID.uint16Array.rawValue: return .newInt32(Int32(UInt16(littleEndian: p.loadUnaligned(as: UInt16.self))))
     case JeffJSClassID.int32Array.rawValue: return .newInt32(Int32(littleEndian: p.loadUnaligned(as: Int32.self)))
     case JeffJSClassID.uint32Array.rawValue: return .newFloat64(Double(UInt32(littleEndian: p.loadUnaligned(as: UInt32.self))))
-    case JeffJSClassID.float32Array.rawValue: return .newFloat64(Double(Float(bitPattern: UInt32(littleEndian: p.loadUnaligned(as: UInt32.self)))))
-    default: return .newFloat64(Double(bitPattern: UInt64(littleEndian: p.loadUnaligned(as: UInt64.self))))
+    case JeffJSClassID.float32Array.rawValue: return .newFloat64Purified(Double(Float(bitPattern: UInt32(littleEndian: p.loadUnaligned(as: UInt32.self)))))
+    default: return .newFloat64Purified(Double(bitPattern: UInt64(littleEndian: p.loadUnaligned(as: UInt64.self))))
     }
 }
 
@@ -1243,7 +1243,7 @@ nonisolated func jsDataView_getFloat32(_ ctx: JeffJSContext, _ thisVal: JeffJSVa
     return dataViewGet(ctx, thisVal, argv, bytesPerElement: 4) { data, off, le in
         var raw = UInt32(data[off]) | (UInt32(data[off+1]) << 8) | (UInt32(data[off+2]) << 16) | (UInt32(data[off+3]) << 24)
         if !le { raw = raw.byteSwapped }
-        return .newFloat64(Double(Float(bitPattern: raw)))
+        return .newFloat64Purified(Double(Float(bitPattern: raw)))
     }
 }
 
@@ -1252,7 +1252,7 @@ nonisolated func jsDataView_getFloat64(_ ctx: JeffJSContext, _ thisVal: JeffJSVa
         var raw: UInt64 = 0
         for i in 0..<8 { raw |= UInt64(data[off + i]) << (i * 8) }
         if !le { raw = raw.byteSwapped }
-        return .newFloat64(Double(bitPattern: raw))
+        return .newFloat64Purified(Double(bitPattern: raw))
     }
 }
 

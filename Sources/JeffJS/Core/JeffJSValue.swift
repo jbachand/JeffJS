@@ -158,13 +158,20 @@ nonisolated struct JeffJSValue {
         JeffJSValue(bits: _intTag | UInt64(UInt32(bitPattern: val)))
     }
 
-    /// A NaN whose top 16 bits fall in a tag range (0x7FF9-0x7FFF / 0xFFF9-0xFFFF) would read
-    /// as a tagged value; such NaNs (payload NaNs from a Float32Array / DataView / wasm, or a
-    /// signalling NaN quieted by arithmetic) become the canonical NaN (QuickJS __JS_NewFloat64).
     @inline(__always)
     static func newFloat64(_ val: Double) -> JeffJSValue {
-        let b = val.bitPattern
-        return JeffJSValue(bits: (b >> 48) & 0x7FFF >= 0x7FF9 ? 0x7FF8_0000_0000_0000 : b)
+        JeffJSValue(bits: val.bitPattern)
+    }
+
+    /// A double read from raw bytes (Float32Array / Float64Array / DataView): any NaN becomes the
+    /// canonical NaN, as JSC's purifyNaN does on typed-array loads (QuickJS normalises every NaN in
+    /// __JS_NewFloat64). A payload NaN whose top 16 bits fall in a tag range (0x7FF9-0x7FFF /
+    /// 0xFFF9-0xFFFF) would otherwise read as a tagged value, and a signalling NaN would become one
+    /// when arithmetic quiets it. Values computed by arithmetic need no check: with canonical NaN
+    /// inputs every NaN result is canonical.
+    @inline(__always)
+    static func newFloat64Purified(_ val: Double) -> JeffJSValue {
+        JeffJSValue(bits: val.isNaN ? 0x7FF8_0000_0000_0000 : val.bitPattern)
     }
 
     @inline(__always)
