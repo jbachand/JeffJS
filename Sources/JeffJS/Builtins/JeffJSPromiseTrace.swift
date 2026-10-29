@@ -12,11 +12,27 @@ nonisolated enum JeffJSPromiseTrace {
 
     private struct Entry {
         let stack: String
+        let created: String
         let since: CFAbsoluteTime
         var waits: Int
     }
     private static let lock = NSLock()
     nonisolated(unsafe) private static var pending: [ObjectIdentifier: Entry] = [:]
+    /// Creation stacks of promises not settled yet (only those with a JS frame).
+    nonisolated(unsafe) private static var created: [ObjectIdentifier: String] = [:]
+
+    private static func stackText(_ ctx: JeffJSContext) -> String {
+        var natives: [(before: Int, name: String)] = []
+        let frames = ctx.captureStackFrames(maxDepth: 12, natives: &natives, skipInnermostNative: false)
+        let text = ctx.formatStackTrace(errorName: "", message: "", frames: frames, natives: natives)
+        return text.split(separator: "\n").map(String.init).filter { !$0.isEmpty && $0 != ": " }.joined(separator: " < ")
+    }
+
+    /// A promise object was made (`new Promise`, `then`'s derived promise, a capability, an async result).
+    static func noteCreated(ctx: JeffJSContext, data: JeffJSPromiseData) {
+        let stack = stackText(ctx)
+        lock.lock(); created[ObjectIdentifier(data)] = stack; lock.unlock()
+    }
 
     /// A reaction was queued on a pending promise.
     static func noteWait(ctx: JeffJSContext, data: JeffJSPromiseData) {
@@ -29,12 +45,11 @@ nonisolated enum JeffJSPromiseTrace {
             return
         }
         lock.unlock()
-        var natives: [(before: Int, name: String)] = []
-        let frames = ctx.captureStackFrames(maxDepth: 12, natives: &natives, skipInnermostNative: false)
-        let text = ctx.formatStackTrace(errorName: "", message: "", frames: frames, natives: natives)
-        let stack = text.split(separator: "\n").map(String.init).filter { !$0.isEmpty && $0 != ": " }.joined(separator: " < ")
+        let stack = stackText(ctx)
         lock.lock()
+        let made = created[key] ?? "?"
         pending[key] = Entry(stack: stack.isEmpty ? "(no JS frame: native/microtask)" : stack,
+                             created: made.isEmpty ? "(no JS frame)" : made,
                              since: CFAbsoluteTimeGetCurrent(), waits: 1)
         lock.unlock()
     }
@@ -43,6 +58,7 @@ nonisolated enum JeffJSPromiseTrace {
     static func noteDone(_ data: JeffJSPromiseData) {
         lock.lock()
         pending[ObjectIdentifier(data)] = nil
+        created[ObjectIdentifier(data)] = nil
         lock.unlock()
     }
 
@@ -54,12 +70,13 @@ nonisolated enum JeffJSPromiseTrace {
         lock.unlock()
         var groups: [String: (count: Int, waits: Int, oldest: Double)] = [:]
         for e in entries {
-            var g = groups[e.stack] ?? (0, 0, 0)
+            let k = "created " + String(e.created.prefix(500)) + "  ||  waited " + e.stack
+            var g = groups[k] ?? (0, 0, 0)
             g.count += 1; g.waits += e.waits; g.oldest = max(g.oldest, now - e.since)
-            groups[e.stack] = g
+            groups[k] = g
         }
         let lines = groups.sorted { $0.value.oldest > $1.value.oldest }.prefix(limit).map { stack, g in
-            String(format: "%5.1fs x%d waits=%d | ", g.oldest, g.count, g.waits) + String(stack.prefix(600))
+            String(format: "%5.1fs x%d waits=%d | ", g.oldest, g.count, g.waits) + String(stack.prefix(1100))
         }
         return ["pending promises (waited on >= \(seconds)s): \(entries.count)"] + lines
     }

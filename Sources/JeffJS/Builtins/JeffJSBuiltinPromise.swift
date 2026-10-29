@@ -1346,6 +1346,7 @@ nonisolated struct JeffJSBuiltinPromise {
         if let obj = promiseVal.toObject() {
             let data = JeffJSPromiseData()
             obj.payload = .promiseData(data)
+            if JeffJSPromiseTrace.enabled { JeffJSPromiseTrace.noteCreated(ctx: ctx, data: data) }
         }
         return promiseVal
     }
