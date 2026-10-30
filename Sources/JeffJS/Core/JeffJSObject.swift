@@ -171,11 +171,18 @@ nonisolated func jeffJS_icFillDeep(_ fb: JeffJSFunctionBytecode, _ pc: Int, _ re
     let ic = fb.getIC()
     guard ic.wantsDeepEntry(pc, receiverShape: rshape) else { return }
     guard let p1 = rshape.proto, let s1 = p1.shape, let p2 = s1.proto else { return }
+    // Only for a property that really lives deeper: the callers come here whenever the own /
+    // depth-1 entry could not be made, including when the receiver or its prototype *has* the
+    // property but in a form the primary entry does not cache. Caching the deeper one then
+    // skips a shadowing property (an input's `type` read HTMLElement.prototype's generic
+    // reflector, '' — React stopped treating the field as a text input and dropped onChange).
+    if findShapeProperty(rshape, atom) != nil || findShapeProperty(s1, atom) != nil { return }
+    if (p1.lazyFlags & JeffJSObject.lazyHostBit) != 0 { return }
     var c2: JeffJSShape? = nil
     var cur = p2
     var depth = 2
     while depth <= 3 {
-        guard let hs = cur.shape else { return }
+        guard let hs = cur.shape, (cur.lazyFlags & JeffJSObject.lazyHostBit) == 0 else { return }
         if let idx = findShapeProperty(hs, atom) {
             guard idx < cur.propValues.count else { return }
             ic.updateDeep(pc, receiverShape: rshape, chain1: s1, chain2: c2, holder: cur, holderShape: hs, propOffset: idx)
