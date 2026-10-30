@@ -165,19 +165,24 @@ nonisolated func jeffJS_icPolyRead(_ ents: UnsafeMutablePointer<JeffJSICEntry>, 
 /// primary entry covers own and depth-1): walks from `receiver`.
 @inline(never)
 nonisolated func jeffJS_icFillDeep(_ fb: JeffJSFunctionBytecode, _ pc: Int, _ receiver: JeffJSObject, _ atom: UInt32) {
-    guard let rshape = receiver.shape, let p1 = rshape.proto, let s1 = p1.shape, let p2 = s1.proto else { return }
-    var chain: [JeffJSShape] = [s1]
+    guard let rshape = receiver.shape else { return }
+    // A megamorphic site, or one that already lists this receiver shape, gains nothing from the
+    // walk (three.js: ~15 % of a frame was this walk and its chain array on every miss).
+    let ic = fb.getIC()
+    guard ic.wantsDeepEntry(pc, receiverShape: rshape) else { return }
+    guard let p1 = rshape.proto, let s1 = p1.shape, let p2 = s1.proto else { return }
+    var c2: JeffJSShape? = nil
     var cur = p2
     var depth = 2
     while depth <= 3 {
         guard let hs = cur.shape else { return }
         if let idx = findShapeProperty(hs, atom) {
             guard idx < cur.propValues.count else { return }
-            fb.getIC().updateDeep(pc, receiverShape: rshape, chain: chain, holder: cur, holderShape: hs, propOffset: idx)
+            ic.updateDeep(pc, receiverShape: rshape, chain1: s1, chain2: c2, holder: cur, holderShape: hs, propOffset: idx)
             return
         }
         guard let n = hs.proto else { return }
-        chain.append(hs)
+        c2 = hs
         cur = n
         depth += 1
     }
@@ -407,28 +412,37 @@ nonisolated final class JeffJSInlineCache {
                    site: site, pc: pc)
     }
 
-    /// Cache a hit `chain.count + 1` prototypes up (chain.count ≤ 2):
-    /// receivers on `receiverShape`, through prototypes on `chain` (in order),
-    /// find the property on `holder` at `propOffset`.
-    func updateDeep(_ pc: Int, receiverShape: JeffJSShape, chain: [JeffJSShape],
+    /// false = `updateDeep` would add nothing (megamorphic site, or the receiver shape is listed).
+    func wantsDeepEntry(_ pc: Int, receiverShape: JeffJSShape) -> Bool {
+        guard slot(pc) != 0 else { return false }
+        guard let sites = polyBySlot, let site = sites[slot(pc)] else { return true }
+        if site.megamorphic { return false }
+        return !site.has(UnsafeRawPointer(Unmanaged.passUnretained(receiverShape).toOpaque()))
+    }
+
+    /// Cache a hit two or three prototypes up: receivers on `receiverShape`, through prototypes
+    /// on `chain1` (and `chain2`, in order), find the property on `holder` at `propOffset`.
+    func updateDeep(_ pc: Int, receiverShape: JeffJSShape, chain1: JeffJSShape, chain2: JeffJSShape?,
                     holder: JeffJSObject, holderShape: JeffJSShape, propOffset: Int) {
-        guard chain.count <= 2, slot(pc) != 0, !receiverShape.isLazySentinel, !holderShape.isLazySentinel else { return }
+        guard slot(pc) != 0, !receiverShape.isLazySentinel, !holderShape.isLazySentinel else { return }
         guard let site = polySite(pc) else { return }
         let rs = UnsafeRawPointer(Unmanaged.passUnretained(receiverShape).toOpaque())
         if site.has(rs) { return }
         if site.entries.count >= Self.polyLimit { site.megamorphic = true; polyAppend(JeffJSPolyEntry.placeholder, site: site, pc: pc); return }
-        for s in chain where s.isLazySentinel { return }
+        if chain1.isLazySentinel || chain2?.isLazySentinel == true { return }
         receiverShape.icCached = true
         holderShape.icCached = true
-        var c1: UnsafeRawPointer? = nil, c2: UnsafeRawPointer? = nil
-        if chain.count >= 1 { chain[0].icCached = true; c1 = UnsafeRawPointer(Unmanaged.passRetained(chain[0]).toOpaque()) }
-        if chain.count >= 2 { chain[1].icCached = true; c2 = UnsafeRawPointer(Unmanaged.passRetained(chain[1]).toOpaque()) }
+        chain1.icCached = true
+        let c1: UnsafeRawPointer? = UnsafeRawPointer(Unmanaged.passRetained(chain1).toOpaque())
+        var c2: UnsafeRawPointer? = nil
+        if let chain2 { chain2.icCached = true; c2 = UnsafeRawPointer(Unmanaged.passRetained(chain2).toOpaque()) }
+        let chainCount = chain2 == nil ? 1 : 2
         _ = Unmanaged.passRetained(receiverShape)
         polyAppend(JeffJSPolyEntry(
             receiverShape: rs, chain1: c1, chain2: c2,
             holder: UnsafeRawPointer(Unmanaged.passRetained(holder).toOpaque()),
             holderShape: UnsafeRawPointer(Unmanaged.passRetained(holderShape).toOpaque()),
-            propOffset: Int32(truncatingIfNeeded: propOffset), chainCount: UInt8(chain.count), writable: false),
+            propOffset: Int32(truncatingIfNeeded: propOffset), chainCount: UInt8(chainCount), writable: false),
             site: site, pc: pc)
     }
 
