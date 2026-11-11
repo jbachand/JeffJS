@@ -1,6 +1,6 @@
 # Config — Claude neuron
 
-> Area: `Sources/JeffJS/Config/` · Repo: engine · Last reviewed: 2026-11-02 (app 20c9d08 / engine 1bcbde2)
+> Area: `Sources/JeffJS/Config/` · Repo: engine · Last reviewed: 2026-11-11 (app 59ae5c0 / engine perf/manual-memory-varrefs)
 
 ## Purpose
 `JeffJSConfig` is the single source of engine flags: one `static let` per key, read once at process start from
@@ -19,6 +19,7 @@ cache, lazy compile, storage, wasm, quantum…) reads its switches from here. Th
 - Edit the plist, not the code, for a value change; a new key = one `static let` here + plist entries + a doc line in `README.md` § "Configuration" when user-facing.
 - Config keys are the only `JEFFJS_` env source. Direct `ProcessInfo` reads that bypass `JeffJSConfig` exist only as diagnostics (`JEFFJS_REGEX_WATCH`, `JEFFJS_GC_METAL`, `JEFFJS_TEST_UNMINIFY_EVAL`, `JEFFJS_GC_VERIFYROOTS`…); prefer a key with a documented A/B default.
 
+- `JeffJSConfig.manualMemory` is not a plist key: it mirrors the compilation condition `JEFFJS_MANUAL_MEMORY` (the manual-memory core, issue #1), set by `JEFFJS_MANUAL_MEMORY=1` at `swift build` or in Xcode's active compilation conditions.
 ## Gotchas
 - `build.precompilePolyfills` is **false in the shipped plists** (both); the app's `Scripts/precompile_polyfills.sh` reads the engine plist with PlistBuddy and skips when false — flip it to true for a `.jfbc` regen run and restore it (the app still loads the `.jfbc` either way).
 - `cache.bytecodeMaxSize`: 0 = no cap from engine d563ff4 on, but the app plist uses 1 000 000 000 because older engines compared it against bytecode length (0 disabled caching).

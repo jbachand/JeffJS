@@ -1,6 +1,6 @@
 # JeffJS Core — Claude neuron
 
-> Area: `Sources/JeffJS/Core/` · Repo: engine · Last reviewed: 2026-11-02 (app 20c9d08 / engine 1bcbde2)
+> Area: `Sources/JeffJS/Core/` · Repo: engine · Last reviewed: 2026-11-11 (app 59ae5c0 / engine perf/manual-memory-varrefs)
 
 ## Purpose
 The engine heart of JeffJS, a 1:1 Swift port of QuickJS: runtime (atoms, shapes, GC lists, job queue), contexts/realms
@@ -17,6 +17,7 @@ output: object graph semantics the interpreter, the DOM bridges and the host (`J
 - `JeffJSObject.swift` — `JeffJSGCObjectHeader` (refCount, strong `ownerRuntime`, `gcListIndex`), `JeffJSObject` (80 B), inline-cache entries (`JeffJSICEntry`, `JeffJSPolySite`, `jeffJS_icFillDeep`), `JeffJSThreadRuntime` + `activeRuntime`, `JeffJSPropertyFlags`.
 - `JeffJSShape.swift` — hidden classes / transition tree, runtime shape hash (`shapes.*` config), `icCached` + `prepareShapeUpdate` (a cached shape never grows in place).
 - `JeffJSPropStorage.swift`, `JeffJSRawStack.swift` — raw malloc'd slot/pointer storage (no Swift Array COW/bounds/retain traffic on the hot path).
+- `JeffJSVarRefHold.swift` — closure var-ref lifetime (quickjs `js_closure2`/`close_var_refs`/`free_var_ref`): `jeffJS_varRefHold/Drop`, `jeffJS_makeVarRef`, `JeffJSVarRefList` (a frame's unmanaged live list). Build with the compilation condition `JEFFJS_MANUAL_MEMORY` (issue #1, off by default) and the hold is a manual count with one manual retain; without it, a Swift retain/release on the same lists.
 - `JeffJSGC.swift` — `runGC` (refcount + cycle collection, `JSGCPhaseEnum`), `freeObject`, weak refs (`JeffJSWeakRef`, `pruneWeakRefs`), idle GC (`jeffJS_idleGCTick`), `clearGCState`, `JEFFJS_GC_OFF/DEBUG`.
 - `JeffJSMetalGC.swift` — GPU cycle detection (trial_decref → scan_rescue → collect_dead) above `gc.metalThreshold` objects; declines (returns false) and the CPU collector runs instead.
 - `JeffJSObjectPool.swift` — recycle pools for plain objects, function objects and arrays (`jeffJS_recycleObject/Function/Array`); only `isPoolable` objects; off in debug modes.
@@ -73,6 +74,7 @@ output: object graph semantics the interpreter, the DOM bridges and the host (`J
 - Tests: `swift test -c release` (Debug exceeds the timeout). Groups gating Core: `EngineThreadingRuleTests`, `ThreadRuntimeTests`, `HostActorTests`, `RuntimeTeardownReleaseTests`, `RefcountLeakTests`, `ObjectSizeRefLeakTests`, `FreedValueConformance`, `RefcountLeftoversConformance`, `MetalGCParityTests`, `MetalGCVarRefTests`, `LargeObjectShapeTests`, `InlineCacheSizingTests`, `InlineCacheOrdinalTests`, `InterfaceShadowICConformance`, `OwnPropertyOrderConformance`, `DefineOverExistingConformance`, `ArrayIntegrityConformance`, `BrowserFingerprintConformance`, `AkamaiSensorConformance`, `EngineTests` ("Realms" group, `JEFFJS_REALM_PROBE`).
 
 ## Debug switches
+- Build-time: `JEFFJS_MANUAL_MEMORY=1 swift build -c release --scratch-path .build-mm` (Package.swift) — the manual-memory core (issue #1); `JeffJSConfig.manualMemory` reports it. A/B is two builds, not an env var. Run `swift test` and `bench/arc/check.sh` in both.
 - `JEFFJS_GC_VERIFYROOTS=1` — thread-change logging of GC-list mutations (`[jeffjs:gc-thread]`) + list check before each collection (`[jeffjs:gc-verify]`, any build).
 - `JEFFJS_GC_OFF=1` refcount only · `JEFFJS_GC_DEBUG=1` prints what a collection frees · `JEFFJS_GC_METAL=1`, `JEFFJS_GC_METALTHRESHOLD=<n>` GPU collector.
 - `JEFFJS_GC_TEARDOWNFREESHEAP=0`, `JEFFJS_GC_TEARDOWNFREESINITOBJECTS=0`, `JEFFJS_GC_LEGACYREFLEAKS=1`, `JEFFJS_GC_SHAREDSTRINGS=0`, `JEFFJS_GC_FUNCTIONPOOL=0`, `JEFFJS_NO_POOL=1` — A/B (old leaking / unpooled behaviour).
