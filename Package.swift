@@ -4,10 +4,11 @@ import Foundation
 
 // Build-time switch for the manual-memory core (JeffJS issue #1): engine
 // records leave Swift ARC under the compilation condition
-// `JEFFJS_MANUAL_MEMORY`. Off by default; `JEFFJS_MANUAL_MEMORY=1 swift build
-// --scratch-path .build-mm` builds the other side for an A/B.
+// `JEFFJS_MANUAL_MEMORY`. On by default since 2026-11-12 (the apps define it
+// in their project settings); `JEFFJS_MANUAL_MEMORY=0 swift build
+// --scratch-path .build-arc` builds the ARC lifetime for an A/B.
 let manualMemory: [SwiftSetting] =
-    ProcessInfo.processInfo.environment["JEFFJS_MANUAL_MEMORY"] == "1" ? [.define("JEFFJS_MANUAL_MEMORY")] : []
+    ProcessInfo.processInfo.environment["JEFFJS_MANUAL_MEMORY"] == "0" ? [] : [.define("JEFFJS_MANUAL_MEMORY")]
 
 let package = Package(
     name: "JeffJS",

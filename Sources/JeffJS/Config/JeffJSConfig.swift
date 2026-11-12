@@ -387,8 +387,9 @@ nonisolated enum JeffJSConfig {
     /// Build-time switch `JEFFJS_MANUAL_MEMORY` (JeffJS issue #1, the
     /// manual-memory core): engine records leave Swift ARC one kind at a
     /// time under it. Not a plist key: the lifetime is compiled in, so A/B
-    /// is two builds (`JEFFJS_MANUAL_MEMORY=1 swift build`, or the
-    /// compilation condition in Xcode). Off by default.
+    /// is two builds (`JEFFJS_MANUAL_MEMORY=0 swift build` for the ARC
+    /// lifetime; the compilation condition in Xcode). On by default since
+    /// 2026-11-12 (Package.swift and the apps' project settings).
     /// Step 1 (2026-11-11): closure var-refs on a manual hold count (one
     /// per closure entry, one while on the frame's live list) backed by a
     /// single manual retain: no swift_retain/release on capture, close or

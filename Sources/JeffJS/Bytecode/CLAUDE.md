@@ -29,7 +29,7 @@ QuickJS counterparts are named in each file header.
 - `JeffJSStackDiag.swift` — value-stack overflow reporter (`overflowCount`, `currentLabel` read by `EngineTests`).
 
 ## Invariants
-- **`fb` in `callInternalRaw` / `executeFastTrace` is a `JeffJSFBHandle`** ([Core](../Core/CLAUDE.md) `JeffJSFBRef.swift`), not the class: pass it to a function that takes the class as `fb.object` (cold; a retain) or `fb.with { … }` (hot; borrowed), compare identities with `fb.identity`, look a callee up with `fbFastH`. Build both `swift build` and `JEFFJS_MANUAL_MEMORY=1 swift build --scratch-path .build-mm` after touching the dispatch.
+- **`fb` in `callInternalRaw` / `executeFastTrace` is a `JeffJSFBHandle`** ([Core](../Core/CLAUDE.md) `JeffJSFBRef.swift`), not the class: pass it to a function that takes the class as `fb.object` (cold; a retain) or `fb.with { … }` (hot; borrowed), compare identities with `fb.identity`, look a callee up with `fbFastH`. Build both `swift build` (the handle; default) and `JEFFJS_MANUAL_MEMORY=0 swift build --scratch-path .build-arc` after touching the dispatch.
 - **Cache identity = engine identity, never the app binary.** Disk dir `Caches/JeffJSBytecodeCache/v<diskVersion 5>-cv<compilerVersion 19>-<engineIdentity>`;
   identity mixes `compilerVersion`, `JFBC_VERSION` (7), the entry header version, `engineSourceHash` (FNV-1a of
   `Parser/*.swift`, `JeffJSCompiler.swift`, `JeffJSOpcodes.swift`, `JeffJSBytecodeCache.swift`) and the opcode table.

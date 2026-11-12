@@ -31,11 +31,10 @@ import Foundation
 // `refCount` (the GC header's) is untouched: it stays the collector's scratch
 // count, seeded and recomputed by each collection (`gcSeedVarRefs`).
 //
-// A/B: built without `JEFFJS_MANUAL_MEMORY` (the default) every hold is a
-// Swift retain and every drop a release (the ARC lifetime, on the same raw
-// lists); parking happens only at frame exit, as before. Build with
-// `JEFFJS_MANUAL_MEMORY=1 swift build` (Package.swift) or the compilation
-// condition `JEFFJS_MANUAL_MEMORY` in Xcode for the manual count.
+// A/B: built without `JEFFJS_MANUAL_MEMORY` (`JEFFJS_MANUAL_MEMORY=0 swift
+// build`; the condition is on by default) every hold is a Swift retain and
+// every drop a release (the ARC lifetime, on the same raw lists); parking
+// happens only at frame exit, as before.
 //
 // Ownership: `jeffJS_makeVarRef` returns a var-ref carrying one hold (the
 // frame list's). Whoever stores an `Unmanaged<JeffJSVarRef>` in a counted
@@ -44,7 +43,7 @@ import Foundation
 
 /// The build-time switch (`JEFFJS_MANUAL_MEMORY`, JeffJS issue #1): a
 /// constant, so the lifetime the build does not use is compiled out of every
-/// hold and drop. Off (the default) is the ARC lifetime.
+/// hold and drop. On by default; off is the ARC lifetime.
 #if JEFFJS_MANUAL_MEMORY
 @inline(__always) nonisolated var jeffJSArclessVarRefs: Bool { true }
 #else

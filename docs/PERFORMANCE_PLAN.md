@@ -1445,6 +1445,21 @@ identical to the base binary. Switch on, under AddressSanitizer: the whole suite
 leak scripts report nothing (`testTailCallArgumentsDoesNotLeak` fails there on RSS growth: the sanitizer's quarantine).
 Tests: `FunctionRecordHandleTests` (functions that drop, replace or outlive their bindings while running).
 
+**On by default (2026-11-12).** After a trial on both devices (app build 220) Jeff made the switch the default:
+`Package.swift` defines `JEFFJS_MANUAL_MEMORY` unless `JEFFJS_MANUAL_MEMORY=0`, and the apps carry it in their
+project-level compilation conditions. "Off" below means the `=0` build.
+
+Standing after step 2 (instructions retired, G; system `jsc`, `/opt/homebrew/bin/qjs`; one run each):
+
+| bench | jsc (JIT) | jsc `--useJIT=false` | qjs | JeffJS before step 1 | JeffJS now | now / qjs |
+|---|---:|---:|---:|---:|---:|---:|
+| realworld | 11.1 | 50.2 | 58.7 | 138.9 | 134.8 | 2.30× (was 2.37×) |
+| watch_deepmerge | 2.1 | 10.9 | 17.3 | 34.3 | 29.0 | 1.68× (was 1.99×) |
+| watch_callbacks | 1.4 | 18.5 | 22.0 | 32.4 | 29.0 | 1.32× (was 1.47×) |
+| kernels | 1.2 | 32.3 | 37.1 | 55.2 | 53.3 | 1.44× (was 1.49×) |
+
+(Measure a `swift build` binary: after `swift test` the same scratch path holds a testable build, ~5 % slower.)
+
 **Left, with counts** (deepmerge, on): createClosure ~12 pairs × 1.6 M closures and `jeffJS_recycleFunction`'s payload
 destroy (step 3: function records and closure objects), `cFuncFast` 2.2 M (the `JSCFunctionType` closure copied to call
 it: the `@convention(c)` native table, step 3), `put_var`'s cache probe (same shape as `get_var`, lower count). Lazy
