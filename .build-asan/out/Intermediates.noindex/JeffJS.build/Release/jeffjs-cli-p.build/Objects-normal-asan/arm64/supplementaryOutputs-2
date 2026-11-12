@@ -1,0 +1,11 @@
+{
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Sources/jeffjs-cli/MallocCensus.swift" : {
+    "abi-baseline-json" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/jeffjs-cli-p.build/Objects-normal-asan/arm64/jeffjs_cli.abi.json",
+    "const-values" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/jeffjs-cli-p.build/Objects-normal-asan/arm64/jeffjs-cli-primary.swiftconstvalues",
+    "dependencies" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/jeffjs-cli-p.build/Objects-normal-asan/arm64/jeffjs-cli-primary.d",
+    "diagnostics" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/jeffjs-cli-p.build/Objects-normal-asan/arm64/jeffjs-cli-primary.dia",
+    "swiftdoc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/jeffjs-cli-p.build/Objects-normal-asan/arm64/jeffjs_cli.swiftdoc",
+    "swiftmodule" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/jeffjs-cli-p.build/Objects-normal-asan/arm64/jeffjs_cli.swiftmodule",
+    "swiftsourceinfo" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/jeffjs-cli-p.build/Objects-normal-asan/arm64/jeffjs_cli.swiftsourceinfo"
+  }
+}

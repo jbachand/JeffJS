@@ -1,0 +1,12 @@
+{
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJS-t.build/DerivedSources/resource_bundle_accessor.swift" : {
+    "abi-baseline-json" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJS-t.build/Objects-normal-asan/arm64/JeffJS.abi.json",
+    "const-values" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJS-t.build/Objects-normal-asan/arm64/JeffJS-primary.swiftconstvalues",
+    "dependencies" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJS-t.build/Objects-normal-asan/arm64/JeffJS-primary.d",
+    "diagnostics" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJS-t.build/Objects-normal-asan/arm64/JeffJS-primary.dia",
+    "objc-header" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJS-t.build/Objects-normal-asan/arm64/JeffJS-Swift.h",
+    "swiftdoc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJS-t.build/Objects-normal-asan/arm64/JeffJS.swiftdoc",
+    "swiftmodule" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJS-t.build/Objects-normal-asan/arm64/JeffJS.swiftmodule",
+    "swiftsourceinfo" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJS-t.build/Objects-normal-asan/arm64/JeffJS.swiftsourceinfo"
+  }
+}

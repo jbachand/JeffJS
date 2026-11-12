@@ -1,0 +1,18 @@
+Target dependency graph (6 targets)
+Target 'AllIncludingTests' in project 'Aggregate'
+➜ Explicit dependency on target 'JeffJSTests-product' in project 'JeffJS'
+➜ Dependency on target 'JeffJSTests-product' in project 'JeffJS' via transitive dependency through 'JeffJSTests-test-runner'
+➜ Explicit dependency on target 'JeffJS-product' in project 'JeffJS'
+➜ Explicit dependency on target 'jeffjs-cli-product' in project 'JeffJS'
+➜ Explicit dependency on target 'JeffJS' in project 'JeffJS'
+➜ Explicit dependency on target 'JeffJS_JeffJS' in project 'JeffJS'
+Target 'jeffjs-cli-product' in project 'JeffJS'
+➜ Explicit dependency on target 'JeffJS' in project 'JeffJS'
+Target 'JeffJS-product' in project 'JeffJS'
+➜ Explicit dependency on target 'JeffJS' in project 'JeffJS'
+➜ Explicit dependency on target 'JeffJS_JeffJS' in project 'JeffJS'
+Target 'JeffJSTests-product' in project 'JeffJS'
+➜ Explicit dependency on target 'JeffJS' in project 'JeffJS'
+Target 'JeffJS' in project 'JeffJS'
+➜ Explicit dependency on target 'JeffJS_JeffJS' in project 'JeffJS'
+Target 'JeffJS_JeffJS' in project 'JeffJS' (no dependencies)

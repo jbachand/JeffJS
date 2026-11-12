@@ -1,0 +1,4 @@
+module JeffJS {
+header "JeffJS-Swift.h"
+export *
+}

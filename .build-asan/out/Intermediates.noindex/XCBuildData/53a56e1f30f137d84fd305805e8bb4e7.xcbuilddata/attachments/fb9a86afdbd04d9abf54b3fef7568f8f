@@ -1,0 +1,606 @@
+{
+  "" : {
+    "const-values" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSTests-primary.swiftconstvalues",
+    "dependencies" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSTests-primary.d",
+    "diagnostics" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSTests-primary.dia",
+    "emit-module-dependencies" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSTests-primary-emit-module.d",
+    "emit-module-diagnostics" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSTests-primary-emit-module.dia",
+    "pch" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSTests-primary-Bridging-header.pch",
+    "swift-dependencies" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSTests-primary.swiftdeps"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/DerivedSources/test_entry_point.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/test_entry_point.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/test_entry_point.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/test_entry_point.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/AggregateErrorConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/AggregateErrorConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/AggregateErrorConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/AggregateErrorConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/AkamaiSensorConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/AkamaiSensorConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/AkamaiSensorConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/AkamaiSensorConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/ArclessVarRefTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ArclessVarRefTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ArclessVarRefTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ArclessVarRefTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/ArrayFromIteratorConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ArrayFromIteratorConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ArrayFromIteratorConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ArrayFromIteratorConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/ArrayIntegrityConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ArrayIntegrityConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ArrayIntegrityConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ArrayIntegrityConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/ArrayReduceRightConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ArrayReduceRightConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ArrayReduceRightConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ArrayReduceRightConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/AssignmentPatternConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/AssignmentPatternConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/AssignmentPatternConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/AssignmentPatternConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/AwaitSuspensionConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/AwaitSuspensionConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/AwaitSuspensionConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/AwaitSuspensionConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/BrowserFingerprintConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BrowserFingerprintConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BrowserFingerprintConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BrowserFingerprintConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/BytecodeCacheBudgetTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BytecodeCacheBudgetTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BytecodeCacheBudgetTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BytecodeCacheBudgetTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/BytecodeCacheClosureTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BytecodeCacheClosureTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BytecodeCacheClosureTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BytecodeCacheClosureTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/BytecodeCacheKeyTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BytecodeCacheKeyTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BytecodeCacheKeyTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BytecodeCacheKeyTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/BytecodeCacheLazyTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BytecodeCacheLazyTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BytecodeCacheLazyTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BytecodeCacheLazyTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/BytecodePagingTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BytecodePagingTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BytecodePagingTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/BytecodePagingTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/CSSScopingConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/CSSScopingConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/CSSScopingConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/CSSScopingConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/CallThisConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/CallThisConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/CallThisConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/CallThisConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/CallbackRetentionConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/CallbackRetentionConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/CallbackRetentionConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/CallbackRetentionConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/ClassConstructorCallConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ClassConstructorCallConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ClassConstructorCallConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ClassConstructorCallConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/ClassStaticElementConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ClassStaticElementConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ClassStaticElementConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ClassStaticElementConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/CookieJarTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/CookieJarTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/CookieJarTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/CookieJarTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DOMAPITests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMAPITests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMAPITests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMAPITests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DOMBridgeBenchTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMBridgeBenchTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMBridgeBenchTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMBridgeBenchTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DOMBridgeFastPathConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMBridgeFastPathConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMBridgeFastPathConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMBridgeFastPathConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DOMBridgeRung15Conformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMBridgeRung15Conformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMBridgeRung15Conformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMBridgeRung15Conformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DOMCharacterDataConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMCharacterDataConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMCharacterDataConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMCharacterDataConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DOMEventConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMEventConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMEventConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMEventConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DOMGeometryTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMGeometryTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMGeometryTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMGeometryTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DOMNodeInterfaceConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMNodeInterfaceConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMNodeInterfaceConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMNodeInterfaceConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DOMParserInsertionConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMParserInsertionConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMParserInsertionConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMParserInsertionConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DOMQueryBenchTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMQueryBenchTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMQueryBenchTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMQueryBenchTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DOMQueryFastPathTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMQueryFastPathTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMQueryFastPathTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMQueryFastPathTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DOMScriptPrepareConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMScriptPrepareConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMScriptPrepareConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMScriptPrepareConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DOMSiblingPositionTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMSiblingPositionTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMSiblingPositionTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMSiblingPositionTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DOMThreadSafetyTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMThreadSafetyTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMThreadSafetyTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DOMThreadSafetyTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DeclarativeShadowDOMConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DeclarativeShadowDOMConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DeclarativeShadowDOMConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DeclarativeShadowDOMConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DefineOverExistingConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DefineOverExistingConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DefineOverExistingConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DefineOverExistingConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DirectEvalConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DirectEvalConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DirectEvalConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DirectEvalConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/DynamicImportCheckpointTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DynamicImportCheckpointTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DynamicImportCheckpointTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/DynamicImportCheckpointTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/EngineMiscConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/EngineMiscConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/EngineMiscConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/EngineMiscConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/EngineTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/EngineTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/EngineTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/EngineTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/EngineThreadingRuleTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/EngineThreadingRuleTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/EngineThreadingRuleTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/EngineThreadingRuleTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/FetchBridgeTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/FetchBridgeTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/FetchBridgeTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/FetchBridgeTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/FormControlAccessorsConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/FormControlAccessorsConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/FormControlAccessorsConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/FormControlAccessorsConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/FreedValueConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/FreedValueConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/FreedValueConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/FreedValueConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/FunctionRecordHandleTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/FunctionRecordHandleTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/FunctionRecordHandleTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/FunctionRecordHandleTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/GeneratorInstantiationConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/GeneratorInstantiationConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/GeneratorInstantiationConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/GeneratorInstantiationConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/GlobalVarCacheConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/GlobalVarCacheConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/GlobalVarCacheConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/GlobalVarCacheConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/HTMLParserTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/HTMLParserTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/HTMLParserTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/HTMLParserTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/HTMLParsingConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/HTMLParsingConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/HTMLParsingConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/HTMLParsingConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/HomedepotAkamaiConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/HomedepotAkamaiConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/HomedepotAkamaiConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/HomedepotAkamaiConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/HostActorTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/HostActorTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/HostActorTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/HostActorTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/IndexArgumentConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IndexArgumentConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IndexArgumentConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IndexArgumentConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/InlineCacheOrdinalTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/InlineCacheOrdinalTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/InlineCacheOrdinalTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/InlineCacheOrdinalTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/InlineCacheSizingTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/InlineCacheSizingTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/InlineCacheSizingTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/InlineCacheSizingTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/InlineStyleHostConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/InlineStyleHostConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/InlineStyleHostConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/InlineStyleHostConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/InterfaceShadowICConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/InterfaceShadowICConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/InterfaceShadowICConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/InterfaceShadowICConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/InterruptTerminationTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/InterruptTerminationTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/InterruptTerminationTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/InterruptTerminationTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/IntlFormatStylesConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IntlFormatStylesConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IntlFormatStylesConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IntlFormatStylesConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/IntlTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IntlTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IntlTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IntlTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/IntrinsicAttributesConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IntrinsicAttributesConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IntrinsicAttributesConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IntrinsicAttributesConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/IteratorCloseConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IteratorCloseConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IteratorCloseConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IteratorCloseConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/IteratorHelperConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IteratorHelperConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IteratorHelperConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/IteratorHelperConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/JeffJSPerfTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSPerfTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSPerfTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSPerfTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/JeffJSTestRunner.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSTestRunner.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSTestRunner.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSTestRunner.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/LargeObjectShapeTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LargeObjectShapeTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LargeObjectShapeTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LargeObjectShapeTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/LazyCompileConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LazyCompileConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LazyCompileConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LazyCompileConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/LazyPayloadConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LazyPayloadConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LazyPayloadConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LazyPayloadConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/LazyPayloadTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LazyPayloadTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LazyPayloadTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LazyPayloadTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/LogicalAssignmentConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LogicalAssignmentConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LogicalAssignmentConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LogicalAssignmentConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/LoneSurrogateConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LoneSurrogateConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LoneSurrogateConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/LoneSurrogateConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/MetalGCParityTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/MetalGCParityTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/MetalGCParityTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/MetalGCParityTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/MetalGCVarRefTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/MetalGCVarRefTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/MetalGCVarRefTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/MetalGCVarRefTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/NamedEvaluationConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/NamedEvaluationConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/NamedEvaluationConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/NamedEvaluationConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/NativeTwinsConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/NativeTwinsConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/NativeTwinsConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/NativeTwinsConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/NflConstructorConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/NflConstructorConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/NflConstructorConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/NflConstructorConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/NumberFormattingConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/NumberFormattingConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/NumberFormattingConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/NumberFormattingConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/ObjectLiteralDefineConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ObjectLiteralDefineConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ObjectLiteralDefineConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ObjectLiteralDefineConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/ObjectSizeRefLeakTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ObjectSizeRefLeakTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ObjectSizeRefLeakTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ObjectSizeRefLeakTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/OfIdentifierConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/OfIdentifierConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/OfIdentifierConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/OfIdentifierConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/OwnPropertyOrderConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/OwnPropertyOrderConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/OwnPropertyOrderConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/OwnPropertyOrderConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/ParamPatternTypedArrayConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ParamPatternTypedArrayConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ParamPatternTypedArrayConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ParamPatternTypedArrayConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/ParameterOwnershipConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ParameterOwnershipConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ParameterOwnershipConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ParameterOwnershipConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/ParameterScopeConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ParameterScopeConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ParameterScopeConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ParameterScopeConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/ParserNestingConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ParserNestingConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ParserNestingConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ParserNestingConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/PrecompilerTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/PrecompilerTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/PrecompilerTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/PrecompilerTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/ProgramCompletionConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ProgramCompletionConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ProgramCompletionConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ProgramCompletionConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/PromiseIterableConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/PromiseIterableConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/PromiseIterableConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/PromiseIterableConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/ProxyReflectionConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ProxyReflectionConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ProxyReflectionConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ProxyReflectionConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/QuantumTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/QuantumTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/QuantumTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/QuantumTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/RealmConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RealmConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RealmConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RealmConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/RedeclarationConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RedeclarationConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RedeclarationConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RedeclarationConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/RefcountLeakTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RefcountLeakTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RefcountLeakTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RefcountLeakTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/RefcountLeftoversConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RefcountLeftoversConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RefcountLeftoversConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RefcountLeftoversConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/RegExpPropertyEscapeConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RegExpPropertyEscapeConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RegExpPropertyEscapeConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RegExpPropertyEscapeConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/RequestHeadersTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RequestHeadersTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RequestHeadersTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RequestHeadersTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/RuntimeTeardownReleaseTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RuntimeTeardownReleaseTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RuntimeTeardownReleaseTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/RuntimeTeardownReleaseTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/SelectorBenchTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SelectorBenchTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SelectorBenchTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SelectorBenchTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/SelectorFixtureBenchTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SelectorFixtureBenchTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SelectorFixtureBenchTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SelectorFixtureBenchTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/SelectorMatcherDifferentialTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SelectorMatcherDifferentialTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SelectorMatcherDifferentialTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SelectorMatcherDifferentialTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/SelectorMatchingCacheConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SelectorMatchingCacheConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SelectorMatchingCacheConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SelectorMatchingCacheConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/SelectorTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SelectorTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SelectorTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SelectorTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/ShadowDOMConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ShadowDOMConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ShadowDOMConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ShadowDOMConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/StorageBridgeTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/StorageBridgeTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/StorageBridgeTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/StorageBridgeTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/StringConcatConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/StringConcatConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/StringConcatConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/StringConcatConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/StringIteratorConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/StringIteratorConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/StringIteratorConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/StringIteratorConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/SuperInArrowConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SuperInArrowConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SuperInArrowConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SuperInArrowConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/SyntaxErrorTextConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SyntaxErrorTextConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SyntaxErrorTextConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/SyntaxErrorTextConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/TaggedTemplateNestingConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/TaggedTemplateNestingConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/TaggedTemplateNestingConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/TaggedTemplateNestingConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/TaskSpikesConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/TaskSpikesConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/TaskSpikesConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/TaskSpikesConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/TaskSpikesTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/TaskSpikesTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/TaskSpikesTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/TaskSpikesTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/ThreadRuntimeTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ThreadRuntimeTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ThreadRuntimeTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/ThreadRuntimeTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/TypedArrayFastPathTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/TypedArrayFastPathTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/TypedArrayFastPathTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/TypedArrayFastPathTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/TypedArraySetConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/TypedArraySetConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/TypedArraySetConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/TypedArraySetConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/UnminifierTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/UnminifierTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/UnminifierTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/UnminifierTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/VarBindingPushConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/VarBindingPushConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/VarBindingPushConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/VarBindingPushConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/WebAssemblyConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/WebAssemblyConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/WebAssemblyConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/WebAssemblyConformance.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/WebSocketBridgeTests.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/WebSocketBridgeTests.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/WebSocketBridgeTests.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/WebSocketBridgeTests.o"
+  },
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/Tests/JeffJSTests/WebStorageConformance.swift" : {
+    "index-unit-output-path" : "/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/WebStorageConformance.o",
+    "llvm-bc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/WebStorageConformance.bc",
+    "object" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/WebStorageConformance.o"
+  }
+}

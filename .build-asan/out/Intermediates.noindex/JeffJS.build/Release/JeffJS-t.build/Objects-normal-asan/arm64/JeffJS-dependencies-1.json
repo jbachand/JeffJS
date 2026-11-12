@@ -1,0 +1,404 @@
+[
+  {
+    "isFramework" : true,
+    "moduleName" : "Combine",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/Combine.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "CoreFoundation",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/CoreFoundation.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : true,
+    "moduleName" : "CoreGraphics",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/CoreGraphics.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : true,
+    "moduleName" : "CryptoKit",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/CryptoKit.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "Darwin",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/Darwin.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "Dispatch",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/Dispatch.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : true,
+    "moduleName" : "Foundation",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/Foundation.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "IOKit",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/IOKit.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : true,
+    "moduleName" : "LocalAuthentication",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/LocalAuthentication.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "Metal",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/Metal.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "ObjectiveC",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/ObjectiveC.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "Observation",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/Observation.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "Swift",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/Swift.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "Synchronization",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/Synchronization.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "System",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/System.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "XPC",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/XPC.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "_Builtin_float",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/_Builtin_float.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "_Concurrency",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/_Concurrency.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "_DarwinFoundation1",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/_DarwinFoundation1.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "_DarwinFoundation2",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/_DarwinFoundation2.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "_DarwinFoundation3",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/_DarwinFoundation3.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "_StringProcessing",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/_StringProcessing.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "isFramework" : false,
+    "moduleName" : "os",
+    "modulePath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/swift\/macosx\/prebuilt-modules\/27.0\/os.swiftmodule\/arm64e-apple-macos.swiftmodule"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/System\/Library\/Frameworks\/CFNetwork.framework\/Modules\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/CFNetwork-CJ6BFZHQPJB56DWSTKIZEHZZO.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "CFNetwork"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/System\/Library\/Frameworks\/CoreFoundation.framework\/Modules\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/CoreFoundation-1D6DXWBTVDQFJREVEXOIYAH0P.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "CoreFoundation"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/System\/Library\/Frameworks\/CoreGraphics.framework\/Modules\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/CoreGraphics-AXR0VJYDD1SB4EQQV52AB8D40.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "CoreGraphics"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/System\/Library\/Frameworks\/CoreServices.framework\/Modules\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/CoreServices-DM8NB2CQRJC7LXQRD6L6CT91U.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "CoreServices"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/Darwin.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/Darwin-BKGXBZ9DOEA6IKUYNUA2I8JRI.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "Darwin"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/System\/Library\/Frameworks\/DiskArbitration.framework\/Modules\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/DiskArbitration-2V5MJ1N6LO8IJ19P3WJ1WQFHW.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "DiskArbitration"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/dispatch.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/Dispatch-BGZAFLM1Z3QMY42DERTQA1DK2.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "Dispatch"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/System\/Library\/Frameworks\/Foundation.framework\/Modules\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/Foundation-9WN6ETH0FSDXO68A88J6RM20U.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "Foundation"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/System\/Library\/Frameworks\/IOKit.framework\/Modules\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/IOKit-EWS3IF12OA9H4JKMKEHR4HEMZ.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "IOKit"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/System\/Library\/Frameworks\/IOSurface.framework\/Modules\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/IOSurface-EJ741AYZNVGNWPCEFX2JKIOWC.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "IOSurface"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/System\/Library\/Frameworks\/LocalAuthentication.framework\/Modules\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/LocalAuthentication-DKDDD1TII5ABS5BFZYYJI9DO.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "LocalAuthentication"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/DarwinBasic.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/MachO-3GMBJNDC83KXFE6QQOQB65QBR.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "MachO"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/System\/Library\/Frameworks\/Metal.framework\/Modules\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/Metal-1CXX3ZSPGK755V8O41ZE9ZYVE.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "Metal"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/ObjectiveC.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/ObjectiveC-C83YMB6UK2KAH787SCDRFCCZP.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "ObjectiveC"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/SQLite3.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/SQLite3-32Q7F4AZQRW8S092RSY1O8AG6.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "SQLite3"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/System\/Library\/Frameworks\/Security.framework\/Modules\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/Security-EZQV6BM3IXEGJ9ANZHR3ROA4E.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "Security"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/lib\/swift\/shims\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/SwiftShims-83GFRUJA21YQ01NIWVKJCLEU7.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "SwiftShims"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/xpc.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/XPC-5X0ZSGSDVTHT66PU56KHTNUVZ.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "XPC"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/DarwinFoundation1.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/_AvailabilityInternal-EHSTQ8ZUBPXEXHRDYOMYMF83M.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "_AvailabilityInternal"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/clang\/21\/include\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/_Builtin_float-7FOCOI6U8IAOR9IED3ZL3W64V.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "_Builtin_float"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/clang\/21\/include\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/_Builtin_inttypes-C7TC8JWZWXG7XCZZZ2SRQMG8F.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "_Builtin_inttypes"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/clang\/21\/include\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/_Builtin_limits-6JVQCFOZ73QLTPEHRPXD8MZR6.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "_Builtin_limits"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/clang\/21\/include\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/_Builtin_stdarg-Q74LVXTATOGE4MYKJY4R20QY.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "_Builtin_stdarg"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/clang\/21\/include\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/_Builtin_stdatomic-E8CAQ3PLVQ5YI0VTAIT7VRVER.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "_Builtin_stdatomic"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/clang\/21\/include\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/_Builtin_stdbool-D8UF3CORKDQJSUO859MOB6026.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "_Builtin_stdbool"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/clang\/21\/include\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/_Builtin_stddef-E3CXLIJ3S7LDT9WLD1XT62JD1.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "_Builtin_stddef"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/clang\/21\/include\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/_Builtin_stdint-D0P93Q2IS0KFBRTBEOQ4A348J.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "_Builtin_stdint"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/DarwinFoundation1.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/_DarwinFoundation1-1NCG0PPQEOUO3TZHK7JOOHSGN.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "_DarwinFoundation1"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/DarwinFoundation2.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/_DarwinFoundation2-D0KUE6UFVQKLR0NWIBUWKBH6U.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "_DarwinFoundation2"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/DarwinFoundation3.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/_DarwinFoundation3-CG3MBM3AP56L6T9F0VBHH8QLK.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "_DarwinFoundation3"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/lib\/swift\/shims\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/_SwiftConcurrencyShims-H1TZ0HFRZ2MRTBAZKE7ZAF8R.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "_SwiftConcurrencyShims"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/launch.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/launch-B3IE2EJ0CJ3SU2R4QFBZKYKQN.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "launch"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/libDER\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/libDER-8DF8EDCCECD5ULOM00LJDVPRE.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "libDER"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/libkern.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/libkern-85V4IE6KBZYOAC7HS2G40D6ZW.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "libkern"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/os.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/os-C64YHW0LZPB1O9BXM4SQ0CCB7.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "os"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/os.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/os_object-6MS3HUIGX7NG965HBLBIMLBDC.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "os_object"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/os.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/os_workgroup-6V2C4TX9L3PQO33G1WI4MKFZK.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "os_workgroup"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/clang\/21\/include\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/ptrauth-5A399T70PXZ9HX64TUOLVXJT9.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "ptrauth"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Toolchains\/XcodeDefault.xctoolchain\/usr\/lib\/clang\/21\/include\/module.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/ptrcheck-1DJOMRGKO9ZNAJX86WD6QWZDZ.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "ptrcheck"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/c_standard_library.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/string_h-ATJ4VLJ70508S52WQCV369EEJ.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "string_h"
+  },
+  {
+    "clangModuleMapPath" : "\/Applications\/Xcode.app\/Contents\/Developer\/Platforms\/MacOSX.platform\/Developer\/SDKs\/MacOSX.sdk\/usr\/include\/DarwinFoundation2.modulemap",
+    "clangModulePath" : "\/private\/tmp\/claude-503\/-Users-jeffbachand-www-React-Natively\/63c695de-dc43-4984-8464-5d333066eab5\/scratchpad\/jeffjs-mm\/.build-asan\/out\/SDKExplicitPrecompiledModules\/sys_types-4ZH40BVDR5WZWZA4Y195FBPC5.pcm",
+    "isBridgingHeaderDependency" : false,
+    "isFramework" : false,
+    "moduleName" : "sys_types"
+  }
+]

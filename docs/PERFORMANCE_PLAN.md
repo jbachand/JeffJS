@@ -1420,4 +1420,32 @@ the manual count itself shows only where closures are created and dropped in bul
 Both builds: `swift test -c release` 422 tests, the 4 known failing cases only; `bench/arc/check.sh` clean (default,
 `NO_POOL`, `ZOMBIES`); `realworld.js` checksums identical to the base binary.
 
-**Next (issue #1 step 2):** frames materialised only when observed, the ~40 M call-path ARC calls round 15 left.
+**Step 2 (2026-11-11, `perf/manual-memory-frames`): the running function's record through an uncounted handle.**
+quickjs `JS_CallInternal` reads the function's bytecode through a borrowed pointer `b`. The exact counts put the
+call path's ARC on our `fb` (a strong local: a pair per assignment at every inline call and return, around every trace
+entry, and on the callee lookup `fbFast`), not on the frame object, which is already pooled and unowned. Under
+`JEFFJS_MANUAL_MEMORY` `callInternalRaw`, `executeFastTrace`, `HotState` and `InlineCallFrame` hold a `JeffJSFBRef`
+(`Core/JeffJSFBRef.swift`: an unmanaged pointer whose accessors are guaranteed, uncounted reads); the record stays alive
+through the function object in the caller's slot / `frame.curFunc`, the invariant the saved inline frames already used.
+Without the switch `JeffJSFBHandle` is the class and `handle` / `object` / `with` are identities (same source).
+Both builds: `get_var` probes the global-variable cache through `shapeIdentity` and an unretained `ic` (two pairs per
+global read, the largest single site left on deepmerge).
+
+| bench (instructions retired) | step 1, off | step 2, off | step 2, on | on vs engine branch before step 1 |
+|---|---:|---:|---:|---:|
+| watch_deepmerge | 30 650 M | 29 991 M | 28 968 M | −15.4 % |
+| watch_callbacks | 30 442 M | 30 459 M | 28 974 M | −10.2 % |
+| realworld | 137 147 M | 136 948 M | 134 666 M | −3.1 % |
+| kernels | 54 132 M | 54 135 M | 53 199 M | −3.4 % |
+| closure create/free micro | 33 590 M | 31 187 M | 23 046 M | −40.5 % |
+
+Swift ARC calls on watch_deepmerge (bench/arc/interpose): 313 M (step 1, on) → **256 M** (on); 318 M → 294 M (off).
+Both builds: `swift test -c release` 424 tests, the 4 known failing cases only; `bench/arc/check.sh` clean; checksums
+identical to the base binary. Switch on, under AddressSanitizer: the whole suite, realworld, watch_callbacks and the
+leak scripts report nothing (`testTailCallArgumentsDoesNotLeak` fails there on RSS growth: the sanitizer's quarantine).
+Tests: `FunctionRecordHandleTests` (functions that drop, replace or outlive their bindings while running).
+
+**Left, with counts** (deepmerge, on): createClosure ~12 pairs × 1.6 M closures and `jeffJS_recycleFunction`'s payload
+destroy (step 3: function records and closure objects), `cFuncFast` 2.2 M (the `JSCFunctionType` closure copied to call
+it: the `@convention(c)` native table, step 3), `put_var`'s cache probe (same shape as `get_var`, lower count). Lazy
+frames (a frame object only when observed) would save instructions, not ARC: the frame is pooled and unowned already.

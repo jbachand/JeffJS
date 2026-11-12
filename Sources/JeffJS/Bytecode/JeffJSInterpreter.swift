@@ -175,9 +175,9 @@ nonisolated func jeffJS_lexicalICPut(_ ctx: JeffJSContext, _ entry: JeffJSICEntr
 /// captures none of the interpreter's locals (which would pin them to memory).
 @inline(__always)
 nonisolated func jeffJS_pop(_ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: inout Int, _ spBase: Int,
-                _ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int) -> JeffJSValue {
+                _ ctx: JeffJSContext, _ fb: JeffJSFBHandle, _ pc: Int) -> JeffJSValue {
     if sp <= spBase {
-        jeffJS_reportStackUnderflow(ctx, fb, pc, sp, spBase)
+        jeffJS_reportStackUnderflow(ctx, fb.object, pc, sp, spBase)
         return .undefined
     }
     sp -= 1
@@ -3925,7 +3925,11 @@ nonisolated private func executeFastTrace(
     var varBase = state.varBase
     var bc = state.bc
     var bcLen = state.bcLen
+    #if JEFFJS_MANUAL_MEMORY
+    var fb: JeffJSFBRef = state.fb   // uncounted handle (JeffJSFBRef.swift)
+    #else
     unowned(unsafe) var fb: JeffJSFunctionBytecode = state.fb   // no retain/release per call entry/return
+    #endif
     unowned(unsafe) var frame: JeffJSStackFrame = state.frame
     var varRefsRaw = state.varRefsRaw
     var varRefsRawCount = state.varRefsRawCount
@@ -4280,7 +4284,11 @@ nonisolated private func executeFastTrace(
                   callObj.realmIndex == ctxRealm,
                   let fbU = callObj.fbFastU,
                   rt.inlineStackTop - inlineBase <= JeffJSInterpreter.maxInlineDepth else { resume = pc; break traceLoop }
+            #if JEFFJS_MANUAL_MEMORY
+            let fastFb = JeffJSFBRef(u: fbU)
+            #else
             unowned(unsafe) let fastFb: JeffJSFunctionBytecode = fbU.takeUnretainedValue()
+            #endif
             if fastFb.isGenerator || fastFb.isAsyncFunc { resume = pc; break traceLoop }
             let funcVal = buf[calleeSlot]
             let restoreSp = calleeSlot
@@ -4449,7 +4457,11 @@ nonisolated private func executeFastTrace(
                   callObj.realmIndex == ctxRealm,
                   let fbU = callObj.fbFastU,
                   rt.inlineStackTop - inlineBase <= JeffJSInterpreter.maxInlineDepth else { resume = pc; break traceLoop }
+            #if JEFFJS_MANUAL_MEMORY
+            let fastFb = JeffJSFBRef(u: fbU)
+            #else
             unowned(unsafe) let fastFb: JeffJSFunctionBytecode = fbU.takeUnretainedValue()
+            #endif
             if fastFb.isGenerator || fastFb.isAsyncFunc { resume = pc; break traceLoop }
             let funcVal = buf[calleeSlot]
             let restoreSp = thisSlot
@@ -4536,7 +4548,11 @@ nonisolated private func executeFastTrace(
                   callObj.realmIndex == ctxRealm,
                   let fbU = callObj.fbFastU,
                   rt.inlineStackTop - inlineBase <= JeffJSInterpreter.maxInlineDepth else { resume = pc; break traceLoop }
+            #if JEFFJS_MANUAL_MEMORY
+            let fastFb = JeffJSFBRef(u: fbU)
+            #else
             unowned(unsafe) let fastFb: JeffJSFunctionBytecode = fbU.takeUnretainedValue()
+            #endif
             if fastFb.isGenerator || fastFb.isAsyncFunc { resume = pc; break traceLoop }
             // Fit check before pushing the callee (a deopt must leave the
             // stack exactly as the main loop expects for this opcode).
@@ -7898,7 +7914,11 @@ nonisolated struct JeffJSInterpreter {
         var spBase: Int
         var bc: UnsafePointer<UInt8>
         var bcLen: Int
+        #if JEFFJS_MANUAL_MEMORY
+        var fb: JeffJSFBRef
+        #else
         unowned(unsafe) var fb: JeffJSFunctionBytecode
+        #endif
         unowned(unsafe) var frame: JeffJSStackFrame
         var funcObj: JeffJSValue
         var flags: Int
@@ -7928,7 +7948,11 @@ nonisolated struct JeffJSInterpreter {
         // frame's prevFrame chain, and its bytecode through frame.curFunc, so
         // these saved pointers never dangle. Strong references here cost a
         // retain/release pair per field per call.
+        #if JEFFJS_MANUAL_MEMORY
+        var fb: JeffJSFBRef
+        #else
         unowned(unsafe) var fb: JeffJSFunctionBytecode
+        #endif
         unowned(unsafe) var frame: JeffJSStackFrame
         // No varRefs field: the caller's varRefs are re-derived on pop from
         // funcObj (varRefsFast). Keeping the struct free of refcounted fields
@@ -8087,9 +8111,9 @@ nonisolated struct JeffJSInterpreter {
         // Hot path: a plain bytecode function. The denormalized fbFast field
         // avoids pattern-matching the payload enum, which copies it (retaining
         // the FB and the varRefs array) on every call.
-        var fb: JeffJSFunctionBytecode   // mutable so inline calls can swap callee's bytecode in
+        var fb: JeffJSFBHandle   // mutable so inline calls can swap callee's bytecode in (JeffJSFBRef.swift)
         let hasVarRefs0: Bool
-        if let fastFB = obj.fbFast {
+        if let fastFB = obj.fbFastH {
             fb = fastFB
             hasVarRefs0 = obj.varRefsRawCount > 0
         } else {
@@ -8149,7 +8173,7 @@ nonisolated struct JeffJSInterpreter {
                 return r
             }
             obj.varRefsFast = payloadVarRefs
-            fb = fbFromPayload
+            fb = fbFromPayload.handle
             hasVarRefs0 = !payloadVarRefs.isEmpty
         }
 
@@ -8498,7 +8522,7 @@ nonisolated struct JeffJSInterpreter {
                 case .park(let promise):
                     if let genObj = generatorObject.toObject(),
                        case .generatorData(let gd) = genObj.payload {
-                        var st = jeffJS_suspendActivation(rt, frame, fb, buf, varBase, spBase, sp,
+                        var st = jeffJS_suspendActivation(rt, frame, fb.object, buf, varBase, spBase, sp,
                                                           pc: saved.pc, funcObj: saved.funcObj, thisVal: saved.thisVal)
                         st.delegatedIter = saved.delegatedIter
                         gd.savedState = st
@@ -8539,7 +8563,7 @@ nonisolated struct JeffJSInterpreter {
                         // More values — yield this one and re-suspend.
                         if let genObj = generatorObject.toObject(),
                            case .generatorData(let genData) = genObj.payload {
-                            var newSaved = jeffJS_suspendActivation(rt, frame, fb, buf, varBase, spBase, sp,
+                            var newSaved = jeffJS_suspendActivation(rt, frame, fb.object, buf, varBase, spBase, sp,
                                                                     pc: pc, funcObj: mFuncObj, thisVal: thisVal)
                             newSaved.delegatedIter = iter
                             genData.savedState = newSaved
@@ -8582,7 +8606,7 @@ nonisolated struct JeffJSInterpreter {
         }
         if !retVal.isException, resumeState == nil, fb.traceEntryEnabled, !fb.traceLean,
            !fb.isGenerator, !fb.isAsyncFunc, pc < bcLen, !jeffJSNoTrace {
-            let fbIdBefore = ObjectIdentifier(fb)
+            let fbIdBefore = fb.identity
             var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
             let resumePC = executeFastTrace(state: &hot, startPC: pc, ctx: ctx, rt: rt, inlineBase: inlineBase)
             sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
@@ -8591,7 +8615,7 @@ nonisolated struct JeffJSInterpreter {
             if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
             // Entry deopt accounting: an early exit still inside this function
             // means the trace could not run it; stop trying after a while.
-            if hot.opsRun < 16, ObjectIdentifier(fb) == fbIdBefore {
+            if hot.opsRun < 16, fb.identity == fbIdBefore {
                 fb.traceEntryDeopts &+= 1
                 if fb.traceEntryDeopts >= 100 { fb.traceEntryEnabled = false }
             }
@@ -8633,7 +8657,7 @@ nonisolated struct JeffJSInterpreter {
             #endif
 
             if traceOps || traceLast {
-            if traceLast { jeffJS_recordLastOp(fb, pc, bc[pc], sp - spBase) }
+            if traceLast { jeffJS_recordLastOp(fb.object, pc, bc[pc], sp - spBase) }
             if traceOps { jeffJS_coldTraceOp(ctx, op, pc, sp, spBase, bc, buf, varBase) }
             }
 
@@ -8705,7 +8729,7 @@ nonisolated struct JeffJSInterpreter {
                         case .lazy_literal:
                             // A large pure-data literal: a lazy payload over
                             // its source span (JeffJSLazyPayload.swift).
-                            let v = ctx.lazyLiteralValue(fb: fb, cpoolIndex: Int(readU32(bc, pc + 2)),
+                            let v = ctx.lazyLiteralValue(fb: fb.object, cpoolIndex: Int(readU32(bc, pc + 2)),
                                                          sourceOffset: Int(readU32(bc, pc + 6)))
                             if v.isException { retVal = .exception; break dispatchLoop }
                             buf[sp] = v; sp += 1
@@ -8910,8 +8934,8 @@ nonisolated struct JeffJSInterpreter {
                 // No buf↔frame sync needed: createClosure only builds VarRefs
                 // pointing at the parent frame, and VarRef.pvalue reads through
                 // frame.buf (always current) in preference to the frame arrays.
-                let closureVal = ctx.createClosure(fb: fb, cpoolIdx: idx, varRefs: [], parentRaw: vrRaw, parentRawCount: vrCount,
-                                                    parentFrame: frame)
+                let closureVal = fb.with { ctx.createClosure(fb: $0, cpoolIdx: idx, varRefs: [], parentRaw: vrRaw, parentRawCount: vrCount,
+                                                                  parentFrame: frame) }
                 buf[sp] = closureVal; sp += 1
                 pc += 5
 
@@ -9175,7 +9199,7 @@ nonisolated struct JeffJSInterpreter {
                 // (never called before) takes the slow path, which backfills it.
                 if inlineCallsEnabled, calleeSlot >= spBase,
                    let callObj = funcVal.obj, callObj.realmIndex == ctxRealm,
-                   let fastFb = callObj.fbFast, !fastFb.isGenerator, !fastFb.isAsyncFunc {
+                   let fastFb = callObj.fbFastH, !fastFb.isGenerator, !fastFb.isAsyncFunc {
                     // Depth guard (checked before any state mutation; on overflow
                     // args+funcVal stay on the caller stack and unwind normally).
                     if rt.inlineStackTop - inlineBase > JeffJSInterpreter.maxInlineDepth {
@@ -9294,7 +9318,7 @@ nonisolated struct JeffJSInterpreter {
                         continue dispatchLoop
                     }
                     if fb.traceEntryEnabled {
-                        let fbIdBefore = ObjectIdentifier(fb)
+                        let fbIdBefore = fb.identity
                         var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
                         let resumePC = executeFastTrace(state: &hot, startPC: pc, ctx: ctx, rt: rt, inlineBase: inlineBase)
                         sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
@@ -9303,7 +9327,7 @@ nonisolated struct JeffJSInterpreter {
                         if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                         // Entry deopt accounting: an early exit still inside this function
                         // means the trace could not run it; stop trying after a while.
-                        if hot.opsRun < 16, ObjectIdentifier(fb) == fbIdBefore {
+                        if hot.opsRun < 16, fb.identity == fbIdBefore {
                             fb.traceEntryDeopts &+= 1
                             if fb.traceEntryDeopts >= 100 { fb.traceEntryEnabled = false }
                         }
@@ -9479,7 +9503,7 @@ nonisolated struct JeffJSInterpreter {
                 let cmThisSlot = cmCalleeSlot - 1
                 if inlineCallsEnabled, cmThisSlot >= spBase,
                    let cmCallObj = buf[cmCalleeSlot].obj, cmCallObj.realmIndex == ctxRealm,
-                   let cmFastFb = cmCallObj.fbFast, !cmFastFb.isGenerator, !cmFastFb.isAsyncFunc {
+                   let cmFastFb = cmCallObj.fbFastH, !cmFastFb.isGenerator, !cmFastFb.isAsyncFunc {
                     if rt.inlineStackTop - inlineBase > JeffJSInterpreter.maxInlineDepth {
                         _ = jeffJS_coldThrow(ctx, .m0)
                         retVal = .exception
@@ -9593,7 +9617,7 @@ nonisolated struct JeffJSInterpreter {
                         continue dispatchLoop
                     }
                     if fb.traceEntryEnabled {
-                        let fbIdBefore = ObjectIdentifier(fb)
+                        let fbIdBefore = fb.identity
                         var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
                         let resumePC = executeFastTrace(state: &hot, startPC: pc, ctx: ctx, rt: rt, inlineBase: inlineBase)
                         sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
@@ -9602,7 +9626,7 @@ nonisolated struct JeffJSInterpreter {
                         if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                         // Entry deopt accounting: an early exit still inside this function
                         // means the trace could not run it; stop trying after a while.
-                        if hot.opsRun < 16, ObjectIdentifier(fb) == fbIdBefore {
+                        if hot.opsRun < 16, fb.identity == fbIdBefore {
                             fb.traceEntryDeopts &+= 1
                             if fb.traceEntryDeopts >= 100 { fb.traceEntryEnabled = false }
                         }
@@ -10044,7 +10068,7 @@ nonisolated struct JeffJSInterpreter {
                 let evalThis: JeffJSValue = siteRaw & 0x8000 != 0
                     ? jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) : .undefined
                 let result = ctx.directEvalOrCall(funcVal: evalFunc, thisVal: evalThis, args: evalArgs,
-                                                  callerFB: fb, site: siteRaw & 0x7FFF, frame: frame)
+                                                  callerFB: fb.object, site: siteRaw & 0x7FFF, frame: frame)
                 evalFunc.freeValue(); evalThis.freeValue()
                 for a in evalArgs { a.freeValue() }
                 if result.isException {
@@ -10063,7 +10087,7 @@ nonisolated struct JeffJSInterpreter {
                 let evalThis = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let evalArgs = ctx.arrayToArgs(argsArray)   // owned copies
                 let result = ctx.directEvalOrCall(funcVal: evalFunc, thisVal: evalThis, args: evalArgs,
-                                                  callerFB: fb, site: site & 0x7FFF, frame: frame)
+                                                  callerFB: fb.object, site: site & 0x7FFF, frame: frame)
                 argsArray.freeValue(); evalFunc.freeValue(); evalThis.freeValue()
                 for a in evalArgs { a.freeValue() }
                 if result.isException {
@@ -10143,15 +10167,17 @@ nonisolated struct JeffJSInterpreter {
                 // Global-var inline cache: top-level `var`s are properties of the
                 // global object, so a shape-matched (shape, slot) pair turns a
                 // hash lookup per read into a direct slot load.
-                if let gObj = ctx.globalObj.obj, let gShape = gObj.shape, let ic = fb.ic {
-                    let entry = ic.lookup(pc)
+                // (Shape and cache through unretained handles: strong locals
+                // cost two retain/release pairs per global read.)
+                if let gObj = ctx.globalObj.obj, let gShapeId = gObj.shapeIdentity, let icU = fb.icU {
+                    let entry = icU._withUnsafeGuaranteedRef { $0.lookup(pc) }
                     if entry.pc == pc, entry.atom == jeffJSLexicalICTag, let lv = jeffJS_lexicalICGet(ctx, entry) {
                         buf[sp] = lv; sp += 1
                         pc += 5
                         continue dispatchLoop
                     }
                     if entry.pc == pc,
-                       entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()), entry.atom == ctx.globalLexEpoch,
+                       entry.shapePtr == gShapeId, entry.atom == ctx.globalLexEpoch,
                        entry.propOffset >= 0, entry.propOffset < gObj.propCount,
                        gObj.extra(at: entry.propOffset) == nil {
                         buf[sp] = gObj.dataValue(at: entry.propOffset).dupValue(); sp += 1
@@ -10161,7 +10187,7 @@ nonisolated struct JeffJSInterpreter {
                 }
                 let val = ctx.getGlobalVar(atom: atom, throwRefError: !nextIsTypeof)
                 if val.isException {
-                    if jeffJSRefErrDebug { jeffJSDumpRefError(ctx: ctx, fb: fb, pc: pc, atom: atom) }
+                    if jeffJSRefErrDebug { jeffJSDumpRefError(ctx: ctx, fb: fb.object, pc: pc, atom: atom) }
                     retVal = .exception
                     break dispatchLoop
                 }
@@ -10421,7 +10447,7 @@ nonisolated struct JeffJSInterpreter {
                         // and go through getProperty → callFunction → a full
                         // activation: getter-setter 5.6x QuickJS.)
                         if inlineCallsEnabled, let gObj = icGetter, gObj.realmIndex == ctxRealm,
-                           let gFb = gObj.fbFast, !gFb.isGenerator, !gFb.isAsyncFunc,
+                           let gFb = gObj.fbFastH, !gFb.isGenerator, !gFb.isAsyncFunc,
                            rt.inlineStackTop - inlineBase <= JeffJSInterpreter.maxInlineDepth, sp + 2 <= bufCapacity {
                             let gThisSlot = sp
                             let gCalleeSlot = sp + 1
@@ -10535,7 +10561,7 @@ nonisolated struct JeffJSInterpreter {
                         continue dispatchLoop
                     }
                     if fb.traceEntryEnabled {
-                        let fbIdBefore = ObjectIdentifier(fb)
+                        let fbIdBefore = fb.identity
                         var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
                         let resumePC = executeFastTrace(state: &hot, startPC: pc, ctx: ctx, rt: rt, inlineBase: inlineBase)
                         sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
@@ -10544,7 +10570,7 @@ nonisolated struct JeffJSInterpreter {
                         if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                         // Entry deopt accounting: an early exit still inside this function
                         // means the trace could not run it; stop trying after a while.
-                        if hot.opsRun < 16, ObjectIdentifier(fb) == fbIdBefore {
+                        if hot.opsRun < 16, fb.identity == fbIdBefore {
                             fb.traceEntryDeopts &+= 1
                             if fb.traceEntryDeopts >= 100 { fb.traceEntryEnabled = false }
                         }
@@ -10592,7 +10618,7 @@ nonisolated struct JeffJSInterpreter {
                             fb.getIC().updateProto(pc, receiverShape: shape, holder: holder,
                                                    holderShape: hs, propOffset: hIdx)
                         } else {
-                            jeffJS_icFillDeep(fb, pc, jsObj._obj, atom)
+                            jeffJS_icFillDeep(fb.object, pc, jsObj._obj, atom)
                         }
                     }
                     obj.freeValue()
@@ -10606,7 +10632,7 @@ nonisolated struct JeffJSInterpreter {
                     let val = ctx.getProperty(obj: obj, atom: atom)
                     if val.isException { obj.freeValue(); retVal = .exception; break dispatchLoop }
                     buf[sp] = val; sp += 1
-                    if obj.isString { jeffJS_stringFieldFill(ctx, fb, pc, atom) }
+                    if obj.isString { jeffJS_stringFieldFill(ctx, fb.object, pc, atom) }
                     obj.freeValue()
                 }
                 pc += 5
@@ -10779,7 +10805,7 @@ nonisolated struct JeffJSInterpreter {
                             fb.getIC().updateProto(pc, receiverShape: shape, holder: holder,
                                                    holderShape: hs, propOffset: hIdx)
                         } else {
-                            jeffJS_icFillDeep(fb, pc, jsObj._obj, atom)
+                            jeffJS_icFillDeep(fb.object, pc, jsObj._obj, atom)
                         }
                     }
                 } else {
@@ -10791,7 +10817,7 @@ nonisolated struct JeffJSInterpreter {
                     let val = ctx.getProperty(obj: obj, atom: atom)
                     if val.isException { retVal = .exception; break dispatchLoop }
                     buf[sp] = val; sp += 1
-                    if obj.isString { jeffJS_stringFieldFill(ctx, fb, pc, atom) }
+                    if obj.isString { jeffJS_stringFieldFill(ctx, fb.object, pc, atom) }
                 }
                 pc += 5
 
@@ -10821,7 +10847,7 @@ nonisolated struct JeffJSInterpreter {
                                 // receiver as `this` and the value as its argument
                                 // (`dropResult`: put_field leaves nothing on the stack).
                                 if inlineCallsEnabled, sObj.realmIndex == ctxRealm,
-                                   let sFb = sObj.fbFast, !sFb.isGenerator, !sFb.isAsyncFunc,
+                                   let sFb = sObj.fbFastH, !sFb.isGenerator, !sFb.isAsyncFunc,
                                    rt.inlineStackTop - inlineBase <= JeffJSInterpreter.maxInlineDepth, sp + 3 <= bufCapacity {
                                     let sThisSlot = sp
                                     let sCalleeSlot = sp + 1
@@ -10936,7 +10962,7 @@ nonisolated struct JeffJSInterpreter {
                         continue dispatchLoop
                     }
                     if fb.traceEntryEnabled {
-                        let fbIdBefore = ObjectIdentifier(fb)
+                        let fbIdBefore = fb.identity
                         var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
                         let resumePC = executeFastTrace(state: &hot, startPC: pc, ctx: ctx, rt: rt, inlineBase: inlineBase)
                         sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
@@ -10945,7 +10971,7 @@ nonisolated struct JeffJSInterpreter {
                         if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                         // Entry deopt accounting: an early exit still inside this function
                         // means the trace could not run it; stop trying after a while.
-                        if hot.opsRun < 16, ObjectIdentifier(fb) == fbIdBefore {
+                        if hot.opsRun < 16, fb.identity == fbIdBefore {
                             fb.traceEntryDeopts &+= 1
                             if fb.traceEntryDeopts >= 100 { fb.traceEntryEnabled = false }
                         }
@@ -11083,7 +11109,7 @@ nonisolated struct JeffJSInterpreter {
                 if kAtom != 0, let jsObj = obj.obj {
                     let v: JeffJSValue
                     if let hv = jeffJS_keyedICGet(fb.icEntries, pc, jsObj, kAtom) { v = hv.dupValue() }
-                    else { v = jeffJS_keyedGetMiss(ctx, fb, pc, obj, jsObj, kAtom) }
+                    else { v = jeffJS_keyedGetMiss(ctx, fb.object, pc, obj, jsObj, kAtom) }
                     obj.freeValue(); key.freeValue()
                     if v.isException { retVal = .exception; break dispatchLoop }
                     buf[sp] = v; sp += 1
@@ -11134,7 +11160,7 @@ nonisolated struct JeffJSInterpreter {
                 if kAtom2 != 0, let jsObj = obj.obj {
                     let v: JeffJSValue
                     if let hv = jeffJS_keyedICGet(fb.icEntries, pc, jsObj, kAtom2) { v = hv.dupValue() }
-                    else { v = jeffJS_keyedGetMiss(ctx, fb, pc, obj, jsObj, kAtom2) }
+                    else { v = jeffJS_keyedGetMiss(ctx, fb.object, pc, obj, jsObj, kAtom2) }
                     key.freeValue()
                     if v.isException { retVal = .exception; break dispatchLoop }
                     buf[sp] = v; sp += 1
@@ -11185,7 +11211,7 @@ nonisolated struct JeffJSInterpreter {
                 let kAtomP = jeffJS_keyedAtom(key)
                 if kAtomP != 0, let jsObj = obj.obj {
                     let okP = jeffJS_keyedICPut(fb.icEntries, pc, jsObj, kAtomP, val)
-                        || jeffJS_keyedPutMiss(ctx, fb, pc, obj, jsObj, kAtomP, val)
+                        || jeffJS_keyedPutMiss(ctx, fb.object, pc, obj, jsObj, kAtomP, val)
                     obj.freeValue(); key.freeValue()
                     if !okP { retVal = .exception; break dispatchLoop }
                     pc += 1
@@ -11762,7 +11788,7 @@ nonisolated struct JeffJSInterpreter {
                                 pc = resumePC
                                 continue dispatchLoop
                             }
-                                let fbIdBefore = ObjectIdentifier(fb)
+                                let fbIdBefore = fb.identity
                                 var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
                                 let resumePC = executeFastTrace(state: &hot, startPC: traceInfo.startPC, ctx: ctx, rt: rt, inlineBase: inlineBase)
                                 sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
@@ -11771,7 +11797,7 @@ nonisolated struct JeffJSInterpreter {
                                 if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                                 if resumePC == -1 { retVal = .exception; break dispatchLoop }
                                 if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
-                                    jeffJS_coldTraceDeopt(traceInfo, resumePC, ObjectIdentifier(fb) != fbIdBefore, hot.opsRun, bc, bcLen)
+                                    jeffJS_coldTraceDeopt(traceInfo, resumePC, fb.identity != fbIdBefore, hot.opsRun, bc, bcLen)
                                 }
                                 // A block that keeps deopting (unsupported op in the
                                 // body or in a callee) costs a state handoff per
@@ -11780,7 +11806,7 @@ nonisolated struct JeffJSInterpreter {
                                 // that executes most of the body before deopting is
                                 // still a net win over the main loop.
                                 if hot.opsRun < 16,
-                                   ObjectIdentifier(fb) != fbIdBefore
+                                   fb.identity != fbIdBefore
                                     || (resumePC >= traceInfo.entryPC && resumePC < traceInfo.exitPC) {
                                     traceInfo.deoptCount &+= 1
                                     if traceInfo.deoptCount >= 200 { traceInfo.isActive = false; traceInfo.disabled = true }
@@ -11826,7 +11852,7 @@ nonisolated struct JeffJSInterpreter {
                                 pc = resumePC
                                 continue dispatchLoop
                             }
-                                let fbIdBefore = ObjectIdentifier(fb)
+                                let fbIdBefore = fb.identity
                                 var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
                                 let resumePC = executeFastTrace(state: &hot, startPC: traceInfo.startPC, ctx: ctx, rt: rt, inlineBase: inlineBase)
                                 sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
@@ -11835,7 +11861,7 @@ nonisolated struct JeffJSInterpreter {
                                 if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                                 if resumePC == -1 { retVal = .exception; break dispatchLoop }
                                 if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
-                                    jeffJS_coldTraceDeopt(traceInfo, resumePC, ObjectIdentifier(fb) != fbIdBefore, hot.opsRun, bc, bcLen)
+                                    jeffJS_coldTraceDeopt(traceInfo, resumePC, fb.identity != fbIdBefore, hot.opsRun, bc, bcLen)
                                 }
                                 // A block that keeps deopting (unsupported op in the
                                 // body or in a callee) costs a state handoff per
@@ -11844,7 +11870,7 @@ nonisolated struct JeffJSInterpreter {
                                 // that executes most of the body before deopting is
                                 // still a net win over the main loop.
                                 if hot.opsRun < 16,
-                                   ObjectIdentifier(fb) != fbIdBefore
+                                   fb.identity != fbIdBefore
                                     || (resumePC >= traceInfo.entryPC && resumePC < traceInfo.exitPC) {
                                     traceInfo.deoptCount &+= 1
                                     if traceInfo.deoptCount >= 200 { traceInfo.isActive = false; traceInfo.disabled = true }
@@ -11886,7 +11912,7 @@ nonisolated struct JeffJSInterpreter {
                                 pc = resumePC
                                 continue dispatchLoop
                             }
-                                let fbIdBefore = ObjectIdentifier(fb)
+                                let fbIdBefore = fb.identity
                                 var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
                                 let resumePC = executeFastTrace(state: &hot, startPC: traceInfo.startPC, ctx: ctx, rt: rt, inlineBase: inlineBase)
                                 sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
@@ -11895,7 +11921,7 @@ nonisolated struct JeffJSInterpreter {
                                 if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                                 if resumePC == -1 { retVal = .exception; break dispatchLoop }
                                 if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
-                                    jeffJS_coldTraceDeopt(traceInfo, resumePC, ObjectIdentifier(fb) != fbIdBefore, hot.opsRun, bc, bcLen)
+                                    jeffJS_coldTraceDeopt(traceInfo, resumePC, fb.identity != fbIdBefore, hot.opsRun, bc, bcLen)
                                 }
                                 // A block that keeps deopting (unsupported op in the
                                 // body or in a callee) costs a state handoff per
@@ -11904,7 +11930,7 @@ nonisolated struct JeffJSInterpreter {
                                 // that executes most of the body before deopting is
                                 // still a net win over the main loop.
                                 if hot.opsRun < 16,
-                                   ObjectIdentifier(fb) != fbIdBefore
+                                   fb.identity != fbIdBefore
                                     || (resumePC >= traceInfo.entryPC && resumePC < traceInfo.exitPC) {
                                     traceInfo.deoptCount &+= 1
                                     if traceInfo.deoptCount >= 200 { traceInfo.isActive = false; traceInfo.disabled = true }
@@ -11948,7 +11974,7 @@ nonisolated struct JeffJSInterpreter {
                                 pc = resumePC
                                 continue dispatchLoop
                             }
-                                let fbIdBefore = ObjectIdentifier(fb)
+                                let fbIdBefore = fb.identity
                                 var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
                                 let resumePC = executeFastTrace(state: &hot, startPC: traceInfo.startPC, ctx: ctx, rt: rt, inlineBase: inlineBase)
                                 sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
@@ -11957,7 +11983,7 @@ nonisolated struct JeffJSInterpreter {
                                 if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                                 if resumePC == -1 { retVal = .exception; break dispatchLoop }
                                 if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
-                                    jeffJS_coldTraceDeopt(traceInfo, resumePC, ObjectIdentifier(fb) != fbIdBefore, hot.opsRun, bc, bcLen)
+                                    jeffJS_coldTraceDeopt(traceInfo, resumePC, fb.identity != fbIdBefore, hot.opsRun, bc, bcLen)
                                 }
                                 // A block that keeps deopting (unsupported op in the
                                 // body or in a callee) costs a state handoff per
@@ -11966,7 +11992,7 @@ nonisolated struct JeffJSInterpreter {
                                 // that executes most of the body before deopting is
                                 // still a net win over the main loop.
                                 if hot.opsRun < 16,
-                                   ObjectIdentifier(fb) != fbIdBefore
+                                   fb.identity != fbIdBefore
                                     || (resumePC >= traceInfo.entryPC && resumePC < traceInfo.exitPC) {
                                     traceInfo.deoptCount &+= 1
                                     if traceInfo.deoptCount >= 200 { traceInfo.isActive = false; traceInfo.disabled = true }
@@ -12051,7 +12077,7 @@ nonisolated struct JeffJSInterpreter {
                                 pc = resumePC
                                 continue dispatchLoop
                             }
-                                let fbIdBefore = ObjectIdentifier(fb)
+                                let fbIdBefore = fb.identity
                                 var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
                                 let resumePC = executeFastTrace(state: &hot, startPC: traceInfo.startPC, ctx: ctx, rt: rt, inlineBase: inlineBase)
                                 sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
@@ -12060,7 +12086,7 @@ nonisolated struct JeffJSInterpreter {
                                 if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                                 if resumePC == -1 { retVal = .exception; break dispatchLoop }
                                 if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
-                                    jeffJS_coldTraceDeopt(traceInfo, resumePC, ObjectIdentifier(fb) != fbIdBefore, hot.opsRun, bc, bcLen)
+                                    jeffJS_coldTraceDeopt(traceInfo, resumePC, fb.identity != fbIdBefore, hot.opsRun, bc, bcLen)
                                 }
                                 // A block that keeps deopting (unsupported op in the
                                 // body or in a callee) costs a state handoff per
@@ -12069,7 +12095,7 @@ nonisolated struct JeffJSInterpreter {
                                 // that executes most of the body before deopting is
                                 // still a net win over the main loop.
                                 if hot.opsRun < 16,
-                                   ObjectIdentifier(fb) != fbIdBefore
+                                   fb.identity != fbIdBefore
                                     || (resumePC >= traceInfo.entryPC && resumePC < traceInfo.exitPC) {
                                     traceInfo.deoptCount &+= 1
                                     if traceInfo.deoptCount >= 200 { traceInfo.isActive = false; traceInfo.disabled = true }
@@ -12115,7 +12141,7 @@ nonisolated struct JeffJSInterpreter {
                                 pc = resumePC
                                 continue dispatchLoop
                             }
-                                let fbIdBefore = ObjectIdentifier(fb)
+                                let fbIdBefore = fb.identity
                                 var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
                                 let resumePC = executeFastTrace(state: &hot, startPC: traceInfo.startPC, ctx: ctx, rt: rt, inlineBase: inlineBase)
                                 sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
@@ -12124,7 +12150,7 @@ nonisolated struct JeffJSInterpreter {
                                 if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                                 if resumePC == -1 { retVal = .exception; break dispatchLoop }
                                 if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
-                                    jeffJS_coldTraceDeopt(traceInfo, resumePC, ObjectIdentifier(fb) != fbIdBefore, hot.opsRun, bc, bcLen)
+                                    jeffJS_coldTraceDeopt(traceInfo, resumePC, fb.identity != fbIdBefore, hot.opsRun, bc, bcLen)
                                 }
                                 // A block that keeps deopting (unsupported op in the
                                 // body or in a callee) costs a state handoff per
@@ -12133,7 +12159,7 @@ nonisolated struct JeffJSInterpreter {
                                 // that executes most of the body before deopting is
                                 // still a net win over the main loop.
                                 if hot.opsRun < 16,
-                                   ObjectIdentifier(fb) != fbIdBefore
+                                   fb.identity != fbIdBefore
                                     || (resumePC >= traceInfo.entryPC && resumePC < traceInfo.exitPC) {
                                     traceInfo.deoptCount &+= 1
                                     if traceInfo.deoptCount >= 200 { traceInfo.isActive = false; traceInfo.disabled = true }
@@ -12175,7 +12201,7 @@ nonisolated struct JeffJSInterpreter {
                                 pc = resumePC
                                 continue dispatchLoop
                             }
-                                let fbIdBefore = ObjectIdentifier(fb)
+                                let fbIdBefore = fb.identity
                                 var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
                                 let resumePC = executeFastTrace(state: &hot, startPC: traceInfo.startPC, ctx: ctx, rt: rt, inlineBase: inlineBase)
                                 sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
@@ -12184,7 +12210,7 @@ nonisolated struct JeffJSInterpreter {
                                 if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                                 if resumePC == -1 { retVal = .exception; break dispatchLoop }
                                 if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
-                                    jeffJS_coldTraceDeopt(traceInfo, resumePC, ObjectIdentifier(fb) != fbIdBefore, hot.opsRun, bc, bcLen)
+                                    jeffJS_coldTraceDeopt(traceInfo, resumePC, fb.identity != fbIdBefore, hot.opsRun, bc, bcLen)
                                 }
                                 // A block that keeps deopting (unsupported op in the
                                 // body or in a callee) costs a state handoff per
@@ -12193,7 +12219,7 @@ nonisolated struct JeffJSInterpreter {
                                 // that executes most of the body before deopting is
                                 // still a net win over the main loop.
                                 if hot.opsRun < 16,
-                                   ObjectIdentifier(fb) != fbIdBefore
+                                   fb.identity != fbIdBefore
                                     || (resumePC >= traceInfo.entryPC && resumePC < traceInfo.exitPC) {
                                     traceInfo.deoptCount &+= 1
                                     if traceInfo.deoptCount >= 200 { traceInfo.isActive = false; traceInfo.disabled = true }
@@ -12233,7 +12259,7 @@ nonisolated struct JeffJSInterpreter {
                                 pc = resumePC
                                 continue dispatchLoop
                             }
-                                let fbIdBefore = ObjectIdentifier(fb)
+                                let fbIdBefore = fb.identity
                                 var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
                                 let resumePC = executeFastTrace(state: &hot, startPC: traceInfo.startPC, ctx: ctx, rt: rt, inlineBase: inlineBase)
                                 sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
@@ -12242,7 +12268,7 @@ nonisolated struct JeffJSInterpreter {
                                 if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                                 if resumePC == -1 { retVal = .exception; break dispatchLoop }
                                 if jeffJSTraceDebug, traceInfo.deoptCount < 6 {
-                                    jeffJS_coldTraceDeopt(traceInfo, resumePC, ObjectIdentifier(fb) != fbIdBefore, hot.opsRun, bc, bcLen)
+                                    jeffJS_coldTraceDeopt(traceInfo, resumePC, fb.identity != fbIdBefore, hot.opsRun, bc, bcLen)
                                 }
                                 // A block that keeps deopting (unsupported op in the
                                 // body or in a callee) costs a state handoff per
@@ -12251,7 +12277,7 @@ nonisolated struct JeffJSInterpreter {
                                 // that executes most of the body before deopting is
                                 // still a net win over the main loop.
                                 if hot.opsRun < 16,
-                                   ObjectIdentifier(fb) != fbIdBefore
+                                   fb.identity != fbIdBefore
                                     || (resumePC >= traceInfo.entryPC && resumePC < traceInfo.exitPC) {
                                     traceInfo.deoptCount &+= 1
                                     if traceInfo.deoptCount >= 200 { traceInfo.isActive = false; traceInfo.disabled = true }
@@ -12705,7 +12731,7 @@ nonisolated struct JeffJSInterpreter {
                     frame.argCount = formalCount
                     // The pc saved points to the instruction *after* initial_yield
                     // so that when we resume, we continue with the next opcode.
-                    var st = jeffJS_suspendActivation(rt, frame, fb, buf, varBase, spBase, sp,
+                    var st = jeffJS_suspendActivation(rt, frame, fb.object, buf, varBase, spBase, sp,
                                                       pc: pc + 1, funcObj: mFuncObj, thisVal: thisVal)
                     st.isInitialYield = true
                     genData.savedState = st
@@ -12729,7 +12755,7 @@ nonisolated struct JeffJSInterpreter {
                     // generator's JSAsyncFunctionState keeps sf alive; a
                     // `yield` only records cur_pc / cur_sp). pc + 1 points past
                     // the yield_ opcode so resumption continues after it.
-                    genData.savedState = jeffJS_suspendActivation(rt, frame, fb, buf, varBase, spBase, sp,
+                    genData.savedState = jeffJS_suspendActivation(rt, frame, fb.object, buf, varBase, spBase, sp,
                                                                   pc: pc + 1, funcObj: mFuncObj, thisVal: thisVal)
                     genData.state = .suspended_yield
                     sp = spBase   // the value stack lives on in the parked frame
@@ -12776,7 +12802,7 @@ nonisolated struct JeffJSInterpreter {
                             // Park the delegating generator on the delegate's
                             // pending result, keeping the delegation state; the
                             // driver resumes with the settled iterator result.
-                            var st = jeffJS_suspendActivation(rt, frame, fb, buf, varBase, spBase, sp,
+                            var st = jeffJS_suspendActivation(rt, frame, fb.object, buf, varBase, spBase, sp,
                                                               pc: pc, funcObj: mFuncObj, thisVal: thisVal)
                             sp = spBase   // the value stack lives on in the parked frame
                             suspendedHere = true
@@ -12806,7 +12832,7 @@ nonisolated struct JeffJSInterpreter {
                         // Yield this value and save state for lazy resumption.
                         // On resume, we'll continue iterating the inner iterator.
                         // Resume at this same yield_star opcode.
-                        var saved = jeffJS_suspendActivation(rt, frame, fb, buf, varBase, spBase, sp,
+                        var saved = jeffJS_suspendActivation(rt, frame, fb.object, buf, varBase, spBase, sp,
                                                              pc: pc, funcObj: mFuncObj, thisVal: thisVal)
                         sp = spBase   // the value stack lives on in the parked frame
                         suspendedHere = true
@@ -12940,7 +12966,7 @@ nonisolated struct JeffJSInterpreter {
                         if fb.isGenerator, fb.isAsyncFunc,
                            let genObj = generatorObject.toObject(),
                            case .generatorData(let genData) = genObj.payload {
-                            genData.savedState = jeffJS_suspendActivation(rt, frame, fb, buf, varBase, spBase, sp,
+                            genData.savedState = jeffJS_suspendActivation(rt, frame, fb.object, buf, varBase, spBase, sp,
                                                                           pc: pc + 1, funcObj: mFuncObj, thisVal: thisVal)
                             sp = spBase   // the value stack lives on in the parked frame
                             suspendedHere = true
@@ -12989,7 +13015,7 @@ nonisolated struct JeffJSInterpreter {
                         // drops the caller's only reference as soon as the call
                         // returns the promise, so resuming touched a freed (and
                         // possibly pool-recycled) function object.
-                        let saved = jeffJS_suspendActivation(rt, frame, fb, buf, varBase, spBase, sp,
+                        let saved = jeffJS_suspendActivation(rt, frame, fb.object, buf, varBase, spBase, sp,
                                                              pc: pc + 1, funcObj: mFuncObj.dupValue(),
                                                              thisVal: frame.thisVal.dupValue())
                         sp = spBase   // the value stack lives on in the parked frame
@@ -13673,8 +13699,8 @@ nonisolated struct JeffJSInterpreter {
 
             case .fclosure8:
                 let idx = Int(readU8(bc, pc + 1))
-                let closureVal = ctx.createClosure(fb: fb, cpoolIdx: idx, varRefs: [], parentRaw: vrRaw, parentRawCount: vrCount,
-                                                    parentFrame: frame)
+                let closureVal = fb.with { ctx.createClosure(fb: $0, cpoolIdx: idx, varRefs: [], parentRaw: vrRaw, parentRawCount: vrCount,
+                                                                  parentFrame: frame) }
                 buf[sp] = closureVal; sp += 1
                 pc += 2
 
@@ -13840,7 +13866,7 @@ nonisolated struct JeffJSInterpreter {
                         // side-list hit): run it as an inline call with the receiver
                         // as `this`; its return lands where the property value goes.
                         if inlineCallsEnabled, let gObj = icGetter, gObj.realmIndex == ctxRealm,
-                           let gFb = gObj.fbFast, !gFb.isGenerator, !gFb.isAsyncFunc,
+                           let gFb = gObj.fbFastH, !gFb.isGenerator, !gFb.isAsyncFunc,
                            rt.inlineStackTop - inlineBase <= JeffJSInterpreter.maxInlineDepth, sp + 2 <= bufCapacity {
                             let gThisSlot = sp
                             let gCalleeSlot = sp + 1
@@ -13954,7 +13980,7 @@ nonisolated struct JeffJSInterpreter {
                         continue dispatchLoop
                     }
                     if fb.traceEntryEnabled {
-                        let fbIdBefore = ObjectIdentifier(fb)
+                        let fbIdBefore = fb.identity
                         var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
                         let resumePC = executeFastTrace(state: &hot, startPC: pc, ctx: ctx, rt: rt, inlineBase: inlineBase)
                         sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
@@ -13963,7 +13989,7 @@ nonisolated struct JeffJSInterpreter {
                         if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                         // Entry deopt accounting: an early exit still inside this function
                         // means the trace could not run it; stop trying after a while.
-                        if hot.opsRun < 16, ObjectIdentifier(fb) == fbIdBefore {
+                        if hot.opsRun < 16, fb.identity == fbIdBefore {
                             fb.traceEntryDeopts &+= 1
                             if fb.traceEntryDeopts >= 100 { fb.traceEntryEnabled = false }
                         }
@@ -13993,7 +14019,7 @@ nonisolated struct JeffJSInterpreter {
                             fb.getIC().updateProto(pc, receiverShape: shape, holder: holder,
                                                    holderShape: hs, propOffset: hIdx)
                         } else {
-                            jeffJS_icFillDeep(fb, pc, jsObj._obj, atom)
+                            jeffJS_icFillDeep(fb.object, pc, jsObj._obj, atom)
                         }
                     }
                 } else {
@@ -14065,7 +14091,7 @@ nonisolated struct JeffJSInterpreter {
                             fb.getIC().updateProto(pc, receiverShape: shape, holder: holder,
                                                    holderShape: hs, propOffset: hIdx)
                         } else {
-                            jeffJS_icFillDeep(fb, pc, jsObj._obj, atom)
+                            jeffJS_icFillDeep(fb.object, pc, jsObj._obj, atom)
                         }
                     }
                 } else {
@@ -14077,7 +14103,7 @@ nonisolated struct JeffJSInterpreter {
                     let val = ctx.getProperty(obj: obj, atom: atom)
                     if val.isException { retVal = .exception; break dispatchLoop }
                     buf[sp] = val; sp += 1
-                    if obj.isString { jeffJS_stringFieldFill(ctx, fb, pc, atom) }
+                    if obj.isString { jeffJS_stringFieldFill(ctx, fb.object, pc, atom) }
                 }
                 pc += 5
 
@@ -14137,7 +14163,7 @@ nonisolated struct JeffJSInterpreter {
                 // callInternal with an args array).
                 if inlineCallsEnabled, argc == 0,
                    let callObj = buf[varBase + locIdx].obj, callObj.realmIndex == ctxRealm,
-                   let fastFb = callObj.fbFast, !fastFb.isGenerator, !fastFb.isAsyncFunc,
+                   let fastFb = callObj.fbFastH, !fastFb.isGenerator, !fastFb.isAsyncFunc,
                    rt.inlineStackTop - inlineBase <= JeffJSInterpreter.maxInlineDepth {
                     let calleeSlot = sp
                     let funcVal = buf[varBase + locIdx].dupValue()
@@ -14250,7 +14276,7 @@ nonisolated struct JeffJSInterpreter {
                         continue dispatchLoop
                     }
                     if fb.traceEntryEnabled {
-                        let fbIdBefore = ObjectIdentifier(fb)
+                        let fbIdBefore = fb.identity
                         var hot = HotState(sp: sp, buf: buf, bufCapacity: bufCapacity, varBase: varBase, spBase: spBase, bc: bc, bcLen: bcLen, fb: fb, frame: frame, funcObj: mFuncObj, flags: mFlags, bufOwned: bufOwned, varRefsLoaded: varRefsLoaded, varRefsRaw: mFuncObj.obj?.varRefsRaw, varRefsRawCount: mFuncObj.obj?.varRefsRawCount ?? 0)
                         let resumePC = executeFastTrace(state: &hot, startPC: pc, ctx: ctx, rt: rt, inlineBase: inlineBase)
                         sp = hot.sp; buf = hot.buf; bufCapacity = hot.bufCapacity; varBase = hot.varBase; spBase = hot.spBase
@@ -14259,7 +14285,7 @@ nonisolated struct JeffJSInterpreter {
                         if fb.closureVarCount > 0 { vrRaw = mFuncObj.obj?.varRefsRaw; vrCount = mFuncObj.obj?.varRefsRawCount ?? 0; varRefsLoaded = true } else if varRefsLoaded { vrRaw = nil; vrCount = 0; varRefsLoaded = false }
                         // Entry deopt accounting: an early exit still inside this function
                         // means the trace could not run it; stop trying after a while.
-                        if hot.opsRun < 16, ObjectIdentifier(fb) == fbIdBefore {
+                        if hot.opsRun < 16, fb.identity == fbIdBefore {
                             fb.traceEntryDeopts &+= 1
                             if fb.traceEntryDeopts >= 100 { fb.traceEntryEnabled = false }
                         }
@@ -14347,7 +14373,7 @@ nonisolated struct JeffJSInterpreter {
         if retVal.isException {
             // JSC source appender: quote the instruction that raised it.
             if ctx.pendingSourceAppender != nil {
-                ctx.applyPendingSourceAppender(fb: fb, bc: bc, bcLen: bcLen, pc: pc)
+                ctx.applyPendingSourceAppender(fb: fb.object, bc: bc, bcLen: bcLen, pc: pc)
             }
             var handlerFound = false
             // Interrupt-requested termination is uncatchable: unwind the whole

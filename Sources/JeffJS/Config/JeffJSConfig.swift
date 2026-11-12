@@ -394,6 +394,8 @@ nonisolated enum JeffJSConfig {
     /// single manual retain: no swift_retain/release on capture, close or
     /// free, and a var-ref that dies (live or detached) is parked and
     /// reused. See Core/JeffJSVarRefHold.swift.
+    /// Step 2 (2026-11-11): the dispatch reads the running function's
+    /// bytecode record through an uncounted handle (Core/JeffJSFBRef.swift).
     #if JEFFJS_MANUAL_MEMORY
     static let manualMemory = true
     #else

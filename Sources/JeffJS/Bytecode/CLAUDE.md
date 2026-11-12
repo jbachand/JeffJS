@@ -1,6 +1,6 @@
 # JeffJS Bytecode — Claude neuron
 
-> Area: `Sources/JeffJS/Bytecode/` · Repo: engine · Last reviewed: 2026-11-02 (app 20c9d08 / engine 1bcbde2)
+> Area: `Sources/JeffJS/Bytecode/` · Repo: engine · Last reviewed: 2026-11-11 (app fafaacd / engine perf/manual-memory-frames)
 
 ## Purpose
 The middle of the QuickJS pipeline as ported to Swift: the parser's raw bytecode (`../Parser/`) comes in, the
@@ -29,6 +29,7 @@ QuickJS counterparts are named in each file header.
 - `JeffJSStackDiag.swift` — value-stack overflow reporter (`overflowCount`, `currentLabel` read by `EngineTests`).
 
 ## Invariants
+- **`fb` in `callInternalRaw` / `executeFastTrace` is a `JeffJSFBHandle`** ([Core](../Core/CLAUDE.md) `JeffJSFBRef.swift`), not the class: pass it to a function that takes the class as `fb.object` (cold; a retain) or `fb.with { … }` (hot; borrowed), compare identities with `fb.identity`, look a callee up with `fbFastH`. Build both `swift build` and `JEFFJS_MANUAL_MEMORY=1 swift build --scratch-path .build-mm` after touching the dispatch.
 - **Cache identity = engine identity, never the app binary.** Disk dir `Caches/JeffJSBytecodeCache/v<diskVersion 5>-cv<compilerVersion 19>-<engineIdentity>`;
   identity mixes `compilerVersion`, `JFBC_VERSION` (7), the entry header version, `engineSourceHash` (FNV-1a of
   `Parser/*.swift`, `JeffJSCompiler.swift`, `JeffJSOpcodes.swift`, `JeffJSBytecodeCache.swift`) and the opcode table.

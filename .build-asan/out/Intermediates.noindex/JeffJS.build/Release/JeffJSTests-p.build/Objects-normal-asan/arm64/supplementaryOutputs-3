@@ -1,0 +1,11 @@
+{
+  "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/DerivedSources/test_entry_point.swift" : {
+    "abi-baseline-json" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSTests.abi.json",
+    "const-values" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSTests-primary.swiftconstvalues",
+    "dependencies" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSTests-primary.d",
+    "diagnostics" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSTests-primary.dia",
+    "swiftdoc" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSTests.swiftdoc",
+    "swiftmodule" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSTests.swiftmodule",
+    "swiftsourceinfo" : "/private/tmp/claude-503/-Users-jeffbachand-www-React-Natively/63c695de-dc43-4984-8464-5d333066eab5/scratchpad/jeffjs-mm/.build-asan/out/Intermediates.noindex/JeffJS.build/Release/JeffJSTests-p.build/Objects-normal-asan/arm64/JeffJSTests.swiftsourceinfo"
+  }
+}
