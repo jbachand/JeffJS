@@ -4,6 +4,4 @@
 .DS_Store
 .github/AppStoreListing.md
 /MarketingAssets/Icons
-.build-mm/
-.build-arc/
-.build-meas/
+.build-*/
