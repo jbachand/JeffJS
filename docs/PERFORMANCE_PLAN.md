@@ -1460,7 +1460,78 @@ Standing after step 2 (instructions retired, G; system `jsc`, `/opt/homebrew/bin
 
 (Measure a `swift build` binary: after `swift test` the same scratch path holds a testable build, ~5 % slower.)
 
-**Left, with counts** (deepmerge, on): createClosure ~12 pairs × 1.6 M closures and `jeffJS_recycleFunction`'s payload
+**Left after step 2, with counts** (deepmerge, on): createClosure ~12 pairs × 1.6 M closures and `jeffJS_recycleFunction`'s payload
 destroy (step 3: function records and closure objects), `cFuncFast` 2.2 M (the `JSCFunctionType` closure copied to call
 it: the `@convention(c)` native table, step 3), `put_var`'s cache probe (same shape as `get_var`, lower count). Lazy
 frames (a frame object only when observed) would save instructions, not ARC: the frame is pooled and unowned already.
+
+**Step 3 (2026-11-16, `perf/manual-memory-closures`): closure objects, frames and the rest of the call path.**
+Method as before: exact counts first (`bench/arc/interpose`; 256 M calls on deepmerge after step 2), a per-address
+listing with the nearest source lines around each call (the calls themselves carry line 0), then one site group at a time.
+
+- **A closure's body and home object leave the payload enum** (quickjs `js_closure2`: `p->u.func.function_bytecode = b`,
+  one count; `js_bytecode_function_finalizer` gives it back). Building `.bytecodeFunc(body, [], home)` per closure and
+  destroying it per death was about nine retain/release calls, and `fbFast` was a second counted reference to the same
+  body. Under the flag the side box holds the body on one manual retain (`closureFBU`), `fbFast` is an uncounted mirror
+  (`fbFastRaw`), a home object (methods; rare) stays in `_payload` as `.bytecodeFunc(nil, [], home)`, and `payload`
+  presents the pair as the `.bytecodeFunc` case to every reader. The box stays at 128 bytes. A `.bytecodeFunc` payload
+  no longer carries a var-ref list at all (the raw buffer is the list; `interp.leanClosurePayload` is always on under
+  the flag).
+- **createClosure through unretained handles** (`createClosureImpl` / `fillClosure`): the constant through `_cpoolRaw`,
+  the body through `functionBytecodeU`, the object through the one retain its value carries, `lazyInfoU`, the prototype
+  by identity. `createClosureRaw` is the interpreter's entry: no `varRefs: []` (the empty-array literal was a pair).
+- **A recycled closure keeps its realm's closure root shape** (and its owner count) while parked;
+  `createClosure` checks it is still the right one, `drainObjectPool` gives the counts back at teardown.
+- **The frame through `JeffJSFrameRef`** (`Core/JeffJSFrameRef.swift`; quickjs `JS_CallInternal`'s `sf`): the dispatch
+  held the frame in an `unowned(unsafe) var`, which the compiler copies (a pair) around member reads, when it is
+  passed to a function and when it is stored into another `unowned(unsafe)` slot. `callInternalRaw`, both traces,
+  `HotState` and `InlineCallFrame` hold the handle; `JeffJSStackFrame.prevFrameU` and `JeffJSContext.currentFrameU`
+  are unmanaged storage in both builds (`prevFrame` / `currentFrame` stay as views for cold readers).
+- **Closure-variable opcodes** (`get/put/set_var_ref*`, the `_check` forms) read the var-ref through
+  `jeffJS_varRefValue` / `jeffJS_varRefStore` (guaranteed references); a detaching var-ref borrows its runtime.
+- **`put_var`** (main loop and both traces) probes the global-variable cache through `shapeU` / `icU`, as `get_var`
+  does since step 2; `putGlobalVar`'s in-place path and `callFunction`'s C-function path borrow the object.
+- The keyed / field miss helpers take the function handle (`fb.object` was a pair per miss).
+
+| bench (instructions retired, M; min of 3) | step 2 | step 3 | | ARC build, step 3 | qjs | now / qjs |
+|---|---:|---:|---:|---:|---:|---:|
+| watch_deepmerge | 29 069 | 27 295 | −6.1 % | 29 326 | 17 242 | 1.58× (was 1.69×) |
+| watch_callbacks | 29 061 | 27 630 | −4.9 % | 29 458 | 21 984 | 1.26× (was 1.32×) |
+| realworld | 134 771 | 133 426 | −1.0 % | 135 647 | 58 642 | 2.28× (was 2.30×) |
+| kernels | 53 320 | 53 669 | +0.7 % | 54 455 | 37 118 | 1.45× (was 1.44×) |
+| closure create/free micro (5 M closures, 2 captures) | 23 126 | 17 923 | −22.5 % | 28 073 | 15 209 | 1.18× (was 1.52×) |
+| native-call micro (6 M native calls, 2 M callbacks) | 10 788 | 9 902 | −8.2 % | 10 415 | 5 836 | 1.70× (was 1.85×) |
+
+Swift ARC calls: deepmerge 256 M → **179 M** (269 M in the ARC build), watch_callbacks 198 M → 133 M, realworld
+1 020 M → 938 M. Per closure created and freed: 27 calls → 2 (the body's retain and release).
+Both builds: `swift test -c release` 428 tests, the 4 known failing cases only; `bench/arc/check.sh` clean; checksums
+identical to the step 2 binary. Flag on under AddressSanitizer: the suite, the three benchmarks, the leak scripts and
+the new cases report nothing (the RSS-growth test fails there as before; a beacon timing test failed once in the full
+run and passes alone). Tests: `ManualMemoryCallPathTests` (ten JS cases that agree with QuickJS and JavaScriptCore,
+the payload view, parked closures' shapes, two contexts sharing the function pool).
+
+**What the trace loop taught us.** Midway `calls` / `method-call` / `closure` were 10 % slower with no ARC difference
+at all. `executeFastTrace` had grown from 48.5 to 56.9 KB: the new `payload` getter (it synthesises the enum for a
+closure) was inlined at the one place the trace read `jsObj.payload`, a dead `.array` arm of `get_array_el`, and the
+whole loop's register allocation moved (a spill or a move in the shared dispatch block is paid per opcode). The arm
+is gone from both traces and the main loop (an array's elements are always its element store), the aux `payload`
+accessors are `@inline(never)`, and the kernels are back within noise; what is left (+0.7 %, one extra register move
+in the dispatch block) is the same sensitivity round 15 and step 1 recorded. Rule: nothing that builds or destroys an
+enum, an array or a closure context belongs inside either trace or on a main-loop fast path, even in a cold arm.
+Check `nm` sizes of `executeFastTrace` / `callInternalRaw` and the three call kernels after any dispatch change.
+
+**Measured dead end.** A context-free function pointer for natives: `@convention(thin)` compiles, but a global
+function passed as a closure carries a context (a reabstraction thunk), so the pointer cannot be called thin. A native
+call still copies its `JSCFunctionType` (an outlined copy and consume, about 9 M calls on deepmerge); removing that
+needs a C-convention entry per builtin, which is its own change.
+
+**Left, with counts** (flag on). deepmerge (179 M): `getPropertyInternal` 18 M (a strong object at entry, a pair per
+prototype level), `callInternalRaw` 17 M, `arraySpeciesCreate` 11 M, `setPropertyInternal` 10 M, strict equality on
+strings 9 M + `jeffJS_stringEquals` 6 M, `Array.prototype.concat` 8 M, `getOwnPropertyNames` 7.5 M, `hasPropertyEx`
+6 M, `newArray` 6 M. realworld (938 M): `callInternalRaw` 94 M (the back-edge trace entry alone 39 M: a strong
+`TraceBlockInfo` and the `cpool` array per entry; `put_field` adding a property 10 M; spread into an array 10 M),
+`getPropertyInternal` 87 M, the two traces 62 M, `JeffJSInlineCache.polyRead` 34 M, string concat 28 M,
+`setPropertyInternal` 16 M, object and string `deinit` 15 M each. Objects already live on the JS count with one
+Swift retain (`makeObject`), so the object step is this same borrowing work in property lookup and the builtins,
+not a new representation.
+

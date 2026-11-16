@@ -389,6 +389,14 @@ nonisolated struct JeffJSValue {
         return unsafeBitCast(ptr, to: JeffJSFunctionBytecode.self)
     }
 
+    /// The function bytecode this value holds, without a retain (the value
+    /// keeps it alive): closure creation reads its constant this way.
+    @inline(__always)
+    var functionBytecodeU: Unmanaged<JeffJSFunctionBytecode>? {
+        guard (bits & Self._tagMask) == Self._fbTag, let ptr = _rawPtr else { return nil }
+        return Unmanaged<JeffJSFunctionBytecode>.fromOpaque(ptr)
+    }
+
     @inline(__always)
     func toPtr() -> AnyObject? { _heapRef }
 
@@ -755,6 +763,14 @@ nonisolated struct JeffJSValue {
     static func borrowedSymbol(_ s: JeffJSString) -> JeffJSValue {
         let raw = Unmanaged.passUnretained(s).toOpaque()
         return JeffJSValue(bits: _symbolTag | UInt64(UInt(bitPattern: raw)))
+    }
+
+    /// Value for an object whose one Swift retain the caller already holds
+    /// as `u` (a recycled object's original, or `Unmanaged.passRetained` of
+    /// a new one): the bits only.
+    @inline(__always)
+    static func makeObjectU(_ u: Unmanaged<JeffJSObject>) -> JeffJSValue {
+        JeffJSValue(bits: _objectTag | UInt64(UInt(bitPattern: u.toOpaque())))
     }
 
     /// Value for an object taken from the recycle pool: it still carries the

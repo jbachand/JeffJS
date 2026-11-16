@@ -397,6 +397,9 @@ nonisolated enum JeffJSConfig {
     /// reused. See Core/JeffJSVarRefHold.swift.
     /// Step 2 (2026-11-11): the dispatch reads the running function's
     /// bytecode record through an uncounted handle (Core/JeffJSFBRef.swift).
+    /// Step 3 (2026-11-16): a closure's body in a side-box field instead of
+    /// the payload enum, the frame through an uncounted handle
+    /// (Core/JeffJSFrameRef.swift), recycled closures parked on their root shape.
     #if JEFFJS_MANUAL_MEMORY
     static let manualMemory = true
     #else

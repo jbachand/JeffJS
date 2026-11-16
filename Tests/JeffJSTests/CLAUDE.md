@@ -1,6 +1,6 @@
 # Engine tests — Claude neuron
 
-> Area: `Tests/JeffJSTests/` · Repo: engine · Last reviewed: 2026-11-02 (app 20c9d08 / engine 1bcbde2)
+> Area: `Tests/JeffJSTests/` · Repo: engine · Last reviewed: 2026-11-16 (app b16c7d3 / engine perf/manual-memory-closures)
 
 ## Purpose
 The JeffJS engine's correctness gate: one SwiftPM test target (`JeffJSTests` in `Package.swift`) holding the
@@ -32,6 +32,7 @@ benchmarks. Nothing here is compiled into the React Natively app; the app's own 
   tiers and budgets, key fields, serialize→deserialize parity, lazy bodies, mapped code, off-thread precompile;
   `BytecodeCacheBudgetTests.testEngineSourceHashIsCurrent` checks `Scripts/update_bytecode_identity.sh`'s hash.
 - `MetalGCParityTests.swift`, `MetalGCVarRefTests.swift` — the GPU collector frees exactly what the CPU one frees.
+- `ArclessVarRefTests`, `FunctionRecordHandleTests`, `ManualMemoryCallPathTests` — the manual-memory core (JeffJS issue #1, `JEFFJS_MANUAL_MEMORY`): var-ref hold counts, functions that outlive their bindings, closure body / payload view, parked closures, frames; run them in both builds (`JEFFJS_MANUAL_MEMORY=0 swift test --scratch-path .build-arc`) and under `--sanitize=address`.
 - `RefcountLeakTests`, `ObjectSizeRefLeakTests`, `RuntimeTeardownReleaseTests`, `TaskSpikesTests`, `LazyPayloadTests`,
   `LargeObjectShapeTests` — memory comes back to baseline. `DOMThreadSafetyTests`, `HostActorTests`, `ThreadRuntimeTests`,
   `InterruptTerminationTests`, `DynamicImportCheckpointTests` — DOM one-writer contract, host actor, per-thread runtimes, interrupts.

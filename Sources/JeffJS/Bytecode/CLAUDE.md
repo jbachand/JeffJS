@@ -1,6 +1,6 @@
 # JeffJS Bytecode — Claude neuron
 
-> Area: `Sources/JeffJS/Bytecode/` · Repo: engine · Last reviewed: 2026-11-11 (app fafaacd / engine perf/manual-memory-frames)
+> Area: `Sources/JeffJS/Bytecode/` · Repo: engine · Last reviewed: 2026-11-16 (app b16c7d3 / engine perf/manual-memory-closures)
 
 ## Purpose
 The middle of the QuickJS pipeline as ported to Swift: the parser's raw bytecode (`../Parser/`) comes in, the
@@ -29,6 +29,8 @@ QuickJS counterparts are named in each file header.
 - `JeffJSStackDiag.swift` — value-stack overflow reporter (`overflowCount`, `currentLabel` read by `EngineTests`).
 
 ## Invariants
+- **`frame` in `callInternalRaw` / both traces is a `JeffJSFrameHandle`** ([Core](../Core/CLAUDE.md) `JeffJSFrameRef.swift`): `frame.object` (cold; a retain) or `frame.with { … }` (hot; borrowed) for a function that takes the class, `frame.unmanaged` for the raw link, `ctx.currentFrameU = frame.prevFrameU` to pop. Closure variables go through `jeffJS_varRefValue` / `jeffJS_varRefStore`, never an `unowned(unsafe) let vr`.
+- **Nothing that builds or destroys an enum, an array or a closure context inside either trace or on a main-loop fast path, even in a cold arm** (no `obj.payload`, no `[]` argument, no strong `shape` / `ic` / `TraceBlockInfo` local): one such arm moved the trace loop's register allocation and cost 10 % on call kernels with no ARC difference. After any dispatch change compare `nm` sizes of `executeFastTrace` / `callInternalRaw` and instructions on the `calls`, `method-call` and `closure` kernels (`docs/PERFORMANCE_PLAN.md`, round 16 step 3).
 - **`fb` in `callInternalRaw` / `executeFastTrace` is a `JeffJSFBHandle`** ([Core](../Core/CLAUDE.md) `JeffJSFBRef.swift`), not the class: pass it to a function that takes the class as `fb.object` (cold; a retain) or `fb.with { … }` (hot; borrowed), compare identities with `fb.identity`, look a callee up with `fbFastH`. Build both `swift build` (the handle; default) and `JEFFJS_MANUAL_MEMORY=0 swift build --scratch-path .build-arc` after touching the dispatch.
 - **Cache identity = engine identity, never the app binary.** Disk dir `Caches/JeffJSBytecodeCache/v<diskVersion 5>-cv<compilerVersion 19>-<engineIdentity>`;
   identity mixes `compilerVersion`, `JFBC_VERSION` (7), the entry header version, `engineSourceHash` (FNV-1a of

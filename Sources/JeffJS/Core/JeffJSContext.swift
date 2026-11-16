@@ -202,6 +202,14 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// interp.fastClosure: root shape of plain bytecode closures over
     /// %Function.prototype% (hashed; the context holds one count).
     var closureRootShape: JeffJSShape? = nil
+    /// `closureRootShape`'s identity / the shape without a retain (closure
+    /// creation and recycling compare and count through these).
+    @inline(__always) final var closureRootShapeRaw: UnsafeRawPointer? {
+        unsafeBitCast(closureRootShape, to: UnsafeRawPointer?.self)
+    }
+    @inline(__always) final var closureRootShapeU: Unmanaged<JeffJSShape>? {
+        closureRootShapeRaw.map { Unmanaged<JeffJSShape>.fromOpaque($0) }
+    }
 
     /// interp.fastArrayBuiltins: the intrinsic %Array% and its original
     /// `get [Symbol.species]` (references held by the context; identity only).
@@ -639,7 +647,13 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// dictionary keyed by ObjectIdentifier, which added dictionary-lookup overhead
     /// on every frame access in the hot interpreter loop).
     /// unowned(unsafe): frames are immortal (see JeffJSStackFrame.prevFrame).
-    unowned(unsafe) var currentFrame: JeffJSStackFrame? = nil
+    /// Stored unmanaged (`currentFrameU`, copied by the dispatch without a
+    /// count; JeffJSFrameRef.swift); `currentFrame` is the view for cold readers.
+    var currentFrameU: Unmanaged<JeffJSStackFrame>? = nil
+    var currentFrame: JeffJSStackFrame? {
+        @inline(__always) get { currentFrameU?.takeUnretainedValue() }
+        @inline(__always) set { currentFrameU = newValue.map { Unmanaged.passUnretained($0) } }
+    }
 
     /// This context's slot in its runtime's realm table (see
     /// `JeffJSRuntime.newRealm()`): 0 for ordinary contexts, 1…255 for the

@@ -50,6 +50,22 @@ import Foundation
 @inline(__always) nonisolated var jeffJSArclessVarRefs: Bool { false }
 #endif
 
+/// The binding's current value (borrowed, not dup'd), read through a
+/// guaranteed reference. The closure-variable opcodes used an
+/// `unowned(unsafe) let vr`, which the compiler copies around its member
+/// reads: a retain/release pair per get, put or set of a captured variable.
+@inline(__always)
+nonisolated func jeffJS_varRefValue(_ u: Unmanaged<JeffJSVarRef>) -> JeffJSValue {
+    u._withUnsafeGuaranteedRef { vr in vr.isDetached ? vr.value : vr.pvalue }
+}
+
+/// `vr.store(v)` (quickjs set_value on the var-ref's slot) through a
+/// guaranteed reference; `v` is moved in.
+@inline(__always)
+nonisolated func jeffJS_varRefStore(_ u: Unmanaged<JeffJSVarRef>, _ v: JeffJSValue) {
+    u._withUnsafeGuaranteedRef { $0.store(v) }
+}
+
 /// Take a hold on `u` for a counted holder.
 @inline(__always)
 nonisolated func jeffJS_varRefHold(_ u: Unmanaged<JeffJSVarRef>) {

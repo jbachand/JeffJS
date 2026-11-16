@@ -185,6 +185,19 @@ nonisolated func jeffJS_pop(_ buf: UnsafeMutablePointer<JeffJSValue>, _ sp: inou
 }
 
 
+/// A cached global slot is still a writable plain data property of the
+/// global object's shape. The shape is borrowed: the `put_var` handlers
+/// held it (and the inline cache, and the global object for the store) in
+/// strong locals, two to three retain/release pairs per global write.
+@inline(__always)
+nonisolated func jeffJS_shapeSlotIsWritableData(_ sU: Unmanaged<JeffJSShape>, _ off: Int) -> Bool {
+    sU._withUnsafeGuaranteedRef { sh in
+        guard off < sh.prop.count else { return false }
+        let f = sh.prop[off].flags
+        return f.contains(.writable) && f.isPlainData
+    }
+}
+
 // MARK: - Computed-key inline caches
 //
 // `o["name"]` / `o[k]` with a string key is `o.name`: once the key string has
@@ -238,7 +251,7 @@ nonisolated func jeffJS_keyedICGet(_ ents: UnsafeMutablePointer<JeffJSICEntry>?,
 /// Keyed read cache miss: full lookup (owned result or exception), then
 /// cache an own data slot or a depth-1 prototype slot.
 @inline(never)
-nonisolated func jeffJS_keyedGetMiss(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int,
+nonisolated func jeffJS_keyedGetMiss(_ ctx: JeffJSContext, _ fb: JeffJSFBHandle, _ pc: Int,
                          _ obj: JeffJSValue, _ jsObj: JeffJSObj, _ atom: UInt32) -> JeffJSValue {
     #if JEFFJS_JSPROF
     jeffJS_icCount(4)
@@ -376,7 +389,7 @@ nonisolated func jeffJS_traceArrayFrom(_ ctx: JeffJSContext, _ buf: UnsafeMutabl
 /// Keyed write miss: full sloppy/strict set (takes `val`), then cache the
 /// slot. Returns false on exception.
 @inline(never)
-nonisolated func jeffJS_keyedPutMiss(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int,
+nonisolated func jeffJS_keyedPutMiss(_ ctx: JeffJSContext, _ fb: JeffJSFBHandle, _ pc: Int,
                          _ obj: JeffJSValue, _ jsObj: JeffJSObj, _ atom: UInt32, _ val: JeffJSValue) -> Bool {
     #if JEFFJS_JSPROF
     jeffJS_icCount(5)
@@ -429,7 +442,7 @@ nonisolated func jeffJS_stringFieldGet(_ ctx: JeffJSContext, _ ents: UnsafeMutab
 /// Cache miss for a named read on a string primitive: remember
 /// String.prototype's own data slot for `atom` at this site.
 @inline(never)
-nonisolated func jeffJS_stringFieldFill(_ ctx: JeffJSContext, _ fb: JeffJSFunctionBytecode, _ pc: Int, _ atom: UInt32) {
+nonisolated func jeffJS_stringFieldFill(_ ctx: JeffJSContext, _ fb: JeffJSFBHandle, _ pc: Int, _ atom: UInt32) {
     guard (atom & JS_ATOM_TAG_INT) == 0, atom != JeffJSAtomID.JS_ATOM_length.rawValue else { return }
     if ctx.stringProtoRaw == nil {
         guard let p = ctx.classProto[JSClassID.JS_CLASS_STRING.rawValue].toObject() else { return }
@@ -781,6 +794,19 @@ nonisolated extension JeffJSContext {
             return JeffJSInterpreter.callInternal(ctx: self, funcObj: funcVal,
                                                   thisVal: thisVal, args: args,
                                                   stackChecked: cfgFastCallEntry && callDepth > 1)
+        }
+        // C function path through the unretained handle (the function is on
+        // the caller's stack): a strong object reference, the strong
+        // `fbFast` test and the frame view were three retain/release pairs
+        // per native callee (`f.call(...)`, natives calling natives).
+        if let co = funcVal.obj, co.realmIndex == realmIndex, co.fbFastU == nil, let cf = co.cFuncFast {
+            let nfU = currentFrameU
+            let prevNative: UnsafeMutableRawPointer? = nfU.flatMap { u in u._withUnsafeGuaranteedRef { $0.nativeCalleePtr } }
+            nfU?._withUnsafeGuaranteedRef { $0.nativeCalleePtr = co._ptr }
+            if JeffJSPromiseTrace.recordDepth > 0 { JeffJSPromiseTrace.noteNative(co.asClass) }
+            let r = JeffJSContext.dispatchCFunction(self, cf, thisVal, args, co.cMagicFast)
+            nfU?._withUnsafeGuaranteedRef { $0.nativeCalleePtr = prevNative }
+            return r
         }
         guard let obj = funcVal.toObject() else {
             let desc: String
@@ -1407,31 +1433,82 @@ nonisolated extension JeffJSContext {
     func createClosure(fb: JeffJSFunctionBytecode, cpoolIdx: Int,
                        varRefs: [JeffJSVarRef?], parentRaw: UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>?,
                        parentRawCount: Int, parentFrame: JeffJSStackFrame) -> JeffJSValue {
-        guard cpoolIdx < fb.cpool.count else {
-            return .undefined
+        return createClosureImpl(fb: fb, cpoolIdx: cpoolIdx, varRefs: varRefs, parentRaw: parentRaw,
+                                 parentRawCount: parentRawCount, parentFrame: parentFrame)
+    }
+
+    /// The interpreter's entry (`fclosure`): the parent's var-refs are its
+    /// raw mirror (`parentRawCount` >= 0), so no array is passed at all (an
+    /// empty array literal per closure was a retain and a release of the
+    /// empty-array storage).
+    func createClosureRaw(fb: JeffJSFunctionBytecode, cpoolIdx: Int,
+                          parentRaw: UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>?,
+                          parentRawCount: Int, parentFrame: JeffJSStackFrame) -> JeffJSValue {
+        return createClosureImpl(fb: fb, cpoolIdx: cpoolIdx, varRefs: nil, parentRaw: parentRaw,
+                                 parentRawCount: parentRawCount, parentFrame: parentFrame)
+    }
+
+    /// quickjs js_closure / js_closure2. The function object and the child's
+    /// body are handled through unretained handles from here to the return:
+    /// the object lives on the one Swift retain its value carries (a parked
+    /// closure's original, or the one taken below for a new one), the body
+    /// on the constant pool's and then on the closure's own.
+    private func createClosureImpl(fb: JeffJSFunctionBytecode, cpoolIdx: Int,
+                                   varRefs: [JeffJSVarRef?]?,
+                                   parentRaw: UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>?,
+                                   parentRawCount: Int, parentFrame: JeffJSStackFrame) -> JeffJSValue {
+        // The constant through the unretained view when the function has one
+        // (every executing function does).
+        let closureFB: JeffJSValue
+        if let p = fb._cpoolRaw {
+            guard cpoolIdx < fb.cpoolRawCount else { return .undefined }
+            closureFB = p[cpoolIdx]
+        } else {
+            guard cpoolIdx < fb.cpool.count else { return .undefined }
+            closureFB = fb.cpool[cpoolIdx]
         }
-        let closureFB = fb.cpool[cpoolIdx]
-        guard let innerFB = closureFB.toFunctionBytecode() else {
+        guard let innerU = closureFB.functionBytecodeU else {
             return closureFB.dupValue()
         }
         // A recycled closure (jeffJS_recycleFunction) comes back reset, with
         // its side box; it rejoins the GC list here as a fresh one does in init.
-        let recycled = rt.functionPool.popLast()
-        let obj: JeffJSObject
-        if let r = recycled {
-            r.refCount = 1
-            addGCObject(rt, r)
-            obj = r
+        let objU: Unmanaged<JeffJSObject>
+        if let ru = rt.functionPool.popLastUnmanaged() {
+            // A pooled object still holds its original creation retain.
+            ru._withUnsafeGuaranteedRef { r in
+                r.refCount = 1
+                addGCObject(rt, r)
+            }
+            objU = ru
         } else {
-            obj = JeffJSObject()
+            let o = JeffJSObject()
+            JeffJSGCObjectHeader.trackCreate(o)
+            objU = Unmanaged.passRetained(o)   // the value's retain (JeffJSValue.makeObject)
         }
+        let funcVal = JeffJSValue.makeObjectU(objU)
+        innerU._withUnsafeGuaranteedRef { innerFB in
+            objU._withUnsafeGuaranteedRef { obj in
+                fillClosure(obj, innerFB, parentFB: fb, varRefs: varRefs, parentRaw: parentRaw,
+                            parentRawCount: parentRawCount, parentFrame: parentFrame, funcVal: funcVal)
+            }
+        }
+        return funcVal
+    }
 
+    /// createClosure's body: `obj` (the new function object) and `innerFB`
+    /// (its bytecode) are borrowed for the whole of it.
+    @inline(__always)
+    private func fillClosure(_ obj: JeffJSObject, _ innerFB: JeffJSFunctionBytecode,
+                             parentFB fb: JeffJSFunctionBytecode, varRefs: [JeffJSVarRef?]?,
+                             parentRaw: UnsafeMutablePointer<Unmanaged<JeffJSVarRef>?>?,
+                             parentRawCount: Int, parentFrame: JeffJSStackFrame, funcVal: JeffJSValue) {
+        let isGenerator = innerFB.isGenerator, isAsync = innerFB.isAsyncFunc, isArrow = innerFB.isArrow
         // Determine the correct classID based on function kind
-        if innerFB.isGenerator && innerFB.isAsyncFunc {
+        if isGenerator && isAsync {
             obj.classID = JSClassID.JS_CLASS_ASYNC_GENERATOR_FUNCTION.rawValue
-        } else if innerFB.isGenerator {
+        } else if isGenerator {
             obj.classID = JSClassID.JS_CLASS_GENERATOR_FUNCTION.rawValue
-        } else if innerFB.isAsyncFunc {
+        } else if isAsync {
             obj.classID = JSClassID.JS_CLASS_ASYNC_FUNCTION.rawValue
         } else {
             obj.classID = JeffJSClassID.bytecodeFunction.rawValue
@@ -1439,7 +1516,63 @@ nonisolated extension JeffJSContext {
 
         obj.extensible = true
 
-        // Build the child's var_ref array from its closureVars metadata.
+        // Build the child's var-refs from its closureVars metadata:
+        // - `isLocal` closure vars reference the parent's own local/arg slot
+        //   (the live var-ref of that slot, shared by every closure over it);
+        // - the others reuse the parent's own var-ref (threading through an
+        //   intermediate function).
+        #if JEFFJS_MANUAL_MEMORY
+        // Straight into the closure's side box: a raw buffer that owns one
+        // hold per entry (a recycled closure keeps its buffer).
+        var hasVarRefs = false
+        if !innerFB.closureVarsList.isEmpty {
+            if obj._auxU == nil { _ = obj.makeAux() }
+            let la = obj._auxU.unsafelyUnwrapped
+            la._withUnsafeGuaranteedRef { $0.beginVarRefs(Int(innerFB.closureVarCount), rt) }
+            hasVarRefs = true
+            // Over the list's buffer: `for cv in innerFB.closureVarsList`
+            // retained and released the array (a bridge pair) per closure.
+            innerFB.closureVarsList.withUnsafeMutableBufferPointer { closureVarsBuf in
+            for cv in closureVarsBuf {
+                if cv.isLocal {
+                    let wantIdx = UInt16(cv.varIdx), wantArg = cv.isArg
+                    if let u = parentFrame.liveVarRefs.findLive(isArg: wantArg, varIdx: wantIdx) {
+                        la._withUnsafeGuaranteedRef { $0.appendVarRefUnmanaged(u) }
+                    } else {
+                        let u = jeffJS_makeVarRef(rt, isArg: wantArg, varIdx: wantIdx, frame: parentFrame)
+                        u._withUnsafeGuaranteedRef { vr in
+                            // `fb` is the parent's: a parameter slot it lets a
+                            // closure capture is one it owns (argSlotsOwned).
+                            if cv.isArg { vr.argOwned = fb.argSlotsOwned }
+                            // Direct slot pointer (see JeffJSVarRef.slot).
+                            vr.slot = nil
+                            if let b = parentFrame.buf {
+                                if cv.isArg {
+                                    if cv.varIdx < parentFrame.bufVarBase { vr.slot = b + cv.varIdx }
+                                } else {
+                                    vr.slot = b + parentFrame.bufVarBase + cv.varIdx
+                                }
+                            }
+                        }
+                        parentFrame.liveVarRefs.append(u)   // the hold jeffJS_makeVarRef took
+                        parentFrame.hasLiveVarRefs = true
+                        la._withUnsafeGuaranteedRef { $0.appendVarRefUnmanaged(u) }
+                    }
+                } else {
+                    let parentIdx = cv.varIdx
+                    if parentRawCount >= 0 {
+                        let pu = parentIdx < parentRawCount ? parentRaw![parentIdx] : nil
+                        la._withUnsafeGuaranteedRef { $0.appendVarRefUnmanaged(pu) }
+                    } else if let vrs = varRefs, parentIdx < vrs.count {
+                        la._withUnsafeGuaranteedRef { $0.appendVarRef(vrs[parentIdx]) }
+                    } else {
+                        la._withUnsafeGuaranteedRef { $0.appendVarRef(nil) }
+                    }
+                }
+            }
+            }   // withUnsafeMutableBufferPointer
+        }
+        #else
         // interp.leanClosurePayload: the var-refs are built straight into the closure's side box
         // (a raw buffer that owns one hold per entry; a recycled closure keeps its buffer);
         // otherwise into `childVarRefs`, which is also the payload's list.
@@ -1458,16 +1591,9 @@ nonisolated extension JeffJSContext {
             } else {
                 childVarRefs.reserveCapacity(Int(innerFB.closureVarCount))
             }
-            // Over the list's buffer: `for cv in innerFB.closureVarsList`
-            // retained and released the array (a bridge pair) per closure.
             innerFB.closureVarsList.withUnsafeMutableBufferPointer { closureVarsBuf in
             for cv in closureVarsBuf {
                 if cv.isLocal {
-                    // The closure var references the parent's own local/arg slot.
-                    // Check if we already have a live var_ref for this exact slot
-                    // on the parent frame, so multiple closures share the same ref.
-                    // (A plain index loop over unmanaged entries: no retain per
-                    // element looked at.)
                     let wantIdx = UInt16(cv.varIdx), wantArg = cv.isArg
                     if let u = parentFrame.liveVarRefs.findLive(isArg: wantArg, varIdx: wantIdx) {
                         if let la = leanAux { la._withUnsafeGuaranteedRef { $0.appendVarRefUnmanaged(u) } } else {
@@ -1478,12 +1604,7 @@ nonisolated extension JeffJSContext {
                     } else {
                         let u = jeffJS_makeVarRef(rt, isArg: wantArg, varIdx: wantIdx, frame: parentFrame)
                         u._withUnsafeGuaranteedRef { vr in
-                            // `fb` is the parent's: a parameter slot it lets a
-                            // closure capture is one it owns (argSlotsOwned).
                             if cv.isArg { vr.argOwned = fb.argSlotsOwned }
-                            // Direct slot pointer (see JeffJSVarRef.slot). Generator /
-                            // async frames re-acquire their buffer on resume, so they
-                            // keep the frame-based lookup.
                             vr.slot = nil
                             if let b = parentFrame.buf {
                                 if cv.isArg {
@@ -1502,8 +1623,6 @@ nonisolated extension JeffJSContext {
                         }
                     }
                 } else {
-                    // The closure var references the parent's own closure var
-                    // (threading through an intermediate function).
                     let parentIdx = cv.varIdx
                     if parentRawCount >= 0 {
                         if let la = leanAux {
@@ -1514,23 +1633,34 @@ nonisolated extension JeffJSContext {
                         } else {
                             childVarRefs.append(nil)
                         }
-                    } else if parentIdx < varRefs.count {
-                        if let la = leanAux { la._withUnsafeGuaranteedRef { $0.appendVarRef(varRefs[parentIdx]) } } else { childVarRefs.append(varRefs[parentIdx]) }
+                    } else if let vrs = varRefs, parentIdx < vrs.count {
+                        if let la = leanAux { la._withUnsafeGuaranteedRef { $0.appendVarRef(vrs[parentIdx]) } } else { childVarRefs.append(vrs[parentIdx]) }
                     } else {
                         if let la = leanAux { la._withUnsafeGuaranteedRef { $0.appendVarRef(nil) } } else { childVarRefs.append(nil) }
                     }
                 }
             }
-            }   // withUnsafeBufferPointer
+            }   // withUnsafeMutableBufferPointer
         }
+        #endif
 
         // ES2015 §14.2.16 / §12.3.5: an arrow function has no [[HomeObject]] of its
         // own — `super.x` inside it is the enclosing method's (its
         // GetThisEnvironment is the method's). Methods get theirs afterwards
         // from `set_home_object`. (google.com's history store:
         // `get(a){pMa(this,()=>c=super.get(a))}` threw "undefined is not a function".)
+        #if JEFFJS_MANUAL_MEMORY
+        // The body's one count and the home object (js_closure2), read from
+        // the enclosing function without copying its payload; a closure
+        // that inherits none has no home object variable to release.
+        if isArrow, let parentFn = parentFrame.curFunc.obj, let home = parentFn._with({ $0.closureHome }) {
+            obj.installClosureBody(innerFB, home: home, fast: false)
+        } else {
+            obj.installClosureBody(innerFB, home: nil, fast: false)
+        }
+        #else
         var inheritedHome: JeffJSObject? = nil
-        if innerFB.isArrow, let parentFn = parentFrame.curFunc.toObject(),
+        if isArrow, let parentFn = parentFrame.curFunc.toObject(),
            case .bytecodeFunc(_, _, let h) = parentFn.payload {
             inheritedHome = h
         }
@@ -1538,6 +1668,7 @@ nonisolated extension JeffJSContext {
         // raw mirror) only — one array reference per closure instead of two
         // (a retain at creation, a release and an array copy check at death).
         obj.installClosurePayload(innerFB, varRefs: lean ? [] : childVarRefs, home: inheritedHome)
+        #endif
         obj.realmIndex = realmIndex   // the closure belongs to the realm running its enclosing code
         innerFB.liveClosures &+= 1   // perf/memory-census (uncounted in freeObject)
         // A lazy function whose body is not compiled yet keeps fbFast nil:
@@ -1545,51 +1676,83 @@ nonisolated extension JeffJSContext {
         // compiles it (JeffJSCompiler.compileLazy) and sets fbFast. A
         // compiled one is stamped in use: the idle reclaim must not drop a
         // body that a function object reaches through fbFast.
-        if let li = innerFB.lazyInfo {
-            if !li.isPending, JeffJSNativeTwins.allowsFastPath(self, innerFB) {
-                obj.fbFast = innerFB; li.touch = rt.lazyReclaimPhase
+        let fast: Bool
+        if let liU = innerFB.lazyInfoU {
+            fast = liU._withUnsafeGuaranteedRef { li -> Bool in
+                if !li.isPending, JeffJSNativeTwins.allowsFastPath(self, innerFB) {
+                    li.touch = rt.lazyReclaimPhase
+                    return true
+                }
+                return false
             }
-        } else if JeffJSNativeTwins.allowsFastPath(self, innerFB) {
-            obj.fbFast = innerFB
+        } else {
+            fast = JeffJSNativeTwins.allowsFastPath(self, innerFB)
         }
+        #if JEFFJS_MANUAL_MEMORY
+        if fast { obj.setFbFastToBody() }
+        // (built in place above) a recycled closure with no captures keeps no stale entries:
+        // jeffJS_recycleFunction released them.
+        if hasVarRefs { obj._flags |= JeffJSObject.flagHasVarRefs } else { obj._flags &= ~JeffJSObject.flagHasVarRefs }
+        #else
+        if fast { obj.fbFast = innerFB }
         if lean {
-            // (built in place above) a recycled closure with no captures keeps no stale entries:
-            // jeffJS_recycleFunction released them.
             if leanAux != nil { obj._flags |= JeffJSObject.flagHasVarRefs } else { obj._flags &= ~JeffJSObject.flagHasVarRefs }
         } else {
             // The payload's list is an ARC holder the hold count does not see.
             for vr in childVarRefs { vr?.coldHeld = true }
             obj.varRefsFast = childVarRefs
         }
+        #endif
 
         // Arrow functions capture the enclosing function's `this` value
         // so that `push_this` inside the arrow returns the lexical `this`.
         // In a derived constructor before super() returned there is no `this` yet: the arrow is bound
         // at init_this (JeffJSStackFrame.pendingArrows); until then it throws like the constructor.
-        let deferArrowThis = innerFB.isArrow && parentFrame.thisVal.isUninitialized
-        if innerFB.isArrow {
+        let deferArrowThis = isArrow && parentFrame.thisVal.isUninitialized
+        if isArrow {
             obj.arrowThisVal = deferArrowThis ? .uninitialized : parentFrame.thisVal.dupValue()
         }
 
-        // Set prototype: use the class-specific prototype if available,
-        // otherwise fall back to the generic function prototype.
+        // The prototype: the class-specific one if available, otherwise the
+        // generic function prototype. Its identity only (the shared root
+        // shape already carries the reference).
         let classProtoID = obj.classID
-        var closureProto: JeffJSObject? = nil
+        let protoVal: JeffJSValue
         if classProtoID < classProto.count && classProto[classProtoID].isObject {
-            closureProto = classProto[classProtoID].toObject()
+            protoVal = classProto[classProtoID]
         } else if functionProto.isObject {
-            closureProto = functionProto.toObject()
+            protoVal = functionProto
+        } else {
+            protoVal = .undefined
         }
+        let protoRaw: UnsafeRawPointer? = protoVal.obj.map { UnsafeRawPointer($0._ptr) }
 
+        // interp.fastClosure: the root shape of plain closures over
+        // %Function.prototype% is kept on the context (it holds a count)
+        // instead of a hashed-shape table lookup per closure.
+        let rootRaw: UnsafeRawPointer? = jeffJSFastClosure ? closureRootShapeRaw : nil
+        let rootFits: Bool
+        if let csU = closureRootShapeU, rootRaw != nil {
+            rootFits = csU._withUnsafeGuaranteedRef {
+                $0.isHashed && unsafeBitCast($0.proto, to: UnsafeRawPointer?.self) == protoRaw
+            }
+        } else {
+            rootFits = false
+        }
+        #if JEFFJS_MANUAL_MEMORY
+        // A recycled closure parked on a closure root shape keeps it (and
+        // its owner count) when it is still the right one.
+        if let have = obj.shapeIdentity, !(rootFits && have == rootRaw) {
+            jeffJS_dropShapeForRecycle(obj, rt)
+        }
+        #endif
         // Ensure shape exists — use zero-alloc initial shape
-        if obj.shape == nil {
-            // interp.fastClosure: the root shape of plain closures over
-            // %Function.prototype% is kept on the context (it holds a count)
-            // instead of a hashed-shape table lookup per closure.
-            if jeffJSFastClosure, let cs = closureRootShape, cs.isHashed, cs.proto === closureProto {
-                cs.refCount += 1
-                obj.shape = cs
+        if obj.shapeIdentity == nil {
+            if rootFits, let csU = closureRootShapeU {
+                csU._withUnsafeGuaranteedRef { $0.refCount += 1 }
+                obj.shape = csU.takeUnretainedValue()
             } else {
+                let closureProto = protoVal.toObject()
                 let rs = jeffJS_rootShape(self, proto: closureProto)
                 obj.shape = rs
                 if jeffJSFastClosure, rs.isHashed, classProtoID == JeffJSClassID.bytecodeFunction.rawValue {
@@ -1602,12 +1765,10 @@ nonisolated extension JeffJSContext {
         // Set proto after shape (proto may already be synced via shape).
         // Already there (the shared root shape, or a recycled closure's kept
         // shape): the setter cost two retain/release pairs per closure.
-        if obj.protoRaw != unsafeBitCast(closureProto, to: UnsafeRawPointer?.self) {
-            obj.proto = closureProto
+        if obj.protoRaw != protoRaw {
+            obj.proto = protoVal.toObject()
         }
 
-        // A pooled object still holds its original creation retain.
-        let funcVal = recycled != nil ? JeffJSValue.makeObjectRecycled(obj) : JeffJSValue.makeObject(obj)
         if deferArrowThis {
             parentFrame.pendingArrows.append(funcVal.dupValue())
             parentFrame.hasPendingArrows = true
@@ -1618,15 +1779,13 @@ nonisolated extension JeffJSContext {
         // (see materializeFunctionPrototype). Building it eagerly cost an
         // object + shape + two property defines per closure — most closures
         // are never used as constructors.
-        if !innerFB.isGenerator && !innerFB.isAsyncFunc && !innerFB.isArrow {
+        if !isGenerator && !isAsync && !isArrow {
             obj.needsLazyPrototype = true
             obj.isConstructor = true
         }
         // `name` and `length` are likewise deferred: two flag stores instead of
         // two property defines + two shape transitions per closure.
         obj.needsLazyNameLength = true
-
-        return funcVal
     }
 
     /// Materialize the `name` and `length` own properties of a bytecode
@@ -2429,17 +2588,22 @@ nonisolated extension JeffJSContext {
     /// Sets a global variable value.
     func putGlobalVar(atom: UInt32, val: JeffJSValue, flags: Int) -> Bool {
         // Fast path: overwrite an existing writable data property in place.
-        if let gObj = globalObj.toObject(), let shape = gObj.shape {
-            let idx = jeffJS_findOwnPropertyIndex(obj: gObj, atom: atom)
-            if idx >= 0, idx < gObj.propCount {
-                let f = shape.prop[idx].flags
-                if f.isPlainData, f.contains(.writable),
-                   gObj.extra(at: idx) == nil {
-                    let old = gObj.propValues[idx]
-                    gObj.propValues[idx] = val
-                    old.freeValue()
-                    return true
-                }
+        // The global object and its shape are borrowed (strong locals were
+        // two retain/release pairs per global write that missed its cache).
+        if let gh = globalObj.obj {
+            let old: JeffJSValue? = gh._with { gObj -> JeffJSValue? in
+                guard let shapeU = gObj.shapeU else { return nil }
+                let idx = jeffJS_findOwnPropertyIndex(obj: gObj, atom: atom)
+                guard idx >= 0, idx < gObj.propCount,
+                      jeffJS_shapeSlotIsWritableData(shapeU, idx),
+                      gObj.extra(at: idx) == nil else { return nil }
+                let old = gObj.propValues[idx]
+                gObj.propValues[idx] = val
+                return old
+            }
+            if let old {
+                old.freeValue()
+                return true
             }
         }
         // JS_PROP_THROW: strict (a refused write throws); otherwise a refused write
@@ -3843,7 +4007,7 @@ nonisolated func jeffJS_storeArg(_ buf: UnsafeMutablePointer<JeffJSValue>, _ idx
 /// Reads the slot layout off the frame (`buf`, `bufVarBase`, `argCount`,
 /// kept current by every call path) to keep the call sites small.
 @inline(never)
-nonisolated func jeffJS_releaseOwnedArgSlots(_ frame: JeffJSStackFrame, bufOwned: Bool) {
+nonisolated func jeffJS_releaseOwnedArgSlots(_ frame: JeffJSFrameHandle, bufOwned: Bool) {
     guard let buf = frame.buf else { return }
     let varBase = frame.bufVarBase
     var i = bufOwned ? 0 : frame.argCount
@@ -3930,7 +4094,11 @@ nonisolated private func executeFastTrace(
     #else
     unowned(unsafe) var fb: JeffJSFunctionBytecode = state.fb   // no retain/release per call entry/return
     #endif
+    #if JEFFJS_MANUAL_MEMORY
+    var frame: JeffJSFrameRef = state.frame   // uncounted handle (JeffJSFrameRef.swift)
+    #else
     unowned(unsafe) var frame: JeffJSStackFrame = state.frame
+    #endif
     var varRefsRaw = state.varRefsRaw
     var varRefsRawCount = state.varRefsRawCount
     guard pc >= 0, pc < bcLen, sp >= 0, sp < state.bufCapacity else { return startPC }
@@ -4313,8 +4481,12 @@ nonisolated private func executeFastTrace(
                 varRefsRawCount = callObj.varRefsRawCount
                 state.funcObj = funcVal
                 state.flags = 0
+                #if JEFFJS_MANUAL_MEMORY
+                let newFrame = JeffJSFrameRef(u: rt.acquireFrameU())
+                #else
                 unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
-                newFrame.prevFrame = ctx.currentFrame
+                #endif
+                newFrame.prevFrameU = ctx.currentFrameU
                 newFrame.curFunc = funcVal
                 if fastFb.isArrow, let arrowThis = callObj.arrowThisVal {
                     newFrame.thisVal = arrowThis
@@ -4339,7 +4511,7 @@ nonisolated private func executeFastTrace(
                 }
                 state.bufOwned = false
                 frame = newFrame
-                ctx.currentFrame = frame
+                ctx.currentFrameU = frame.unmanaged
                 frame.spBase = 0
                 state.bufCapacity = state.bufCapacity - argStart
                 buf = newBuf
@@ -4486,8 +4658,12 @@ nonisolated private func executeFastTrace(
                 varRefsRawCount = callObj.varRefsRawCount
                 state.funcObj = funcVal
                 state.flags = 0
+                #if JEFFJS_MANUAL_MEMORY
+                let newFrame = JeffJSFrameRef(u: rt.acquireFrameU())
+                #else
                 unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
-                newFrame.prevFrame = ctx.currentFrame
+                #endif
+                newFrame.prevFrameU = ctx.currentFrameU
                 newFrame.curFunc = funcVal
                 if fastFb.isArrow, let arrowThis = callObj.arrowThisVal {
                     newFrame.thisVal = arrowThis
@@ -4512,7 +4688,7 @@ nonisolated private func executeFastTrace(
                 }
                 state.bufOwned = false
                 frame = newFrame
-                ctx.currentFrame = frame
+                ctx.currentFrameU = frame.unmanaged
                 frame.spBase = 0
                 state.bufCapacity = state.bufCapacity - argStart
                 buf = newBuf
@@ -4585,8 +4761,12 @@ nonisolated private func executeFastTrace(
                 varRefsRawCount = callObj.varRefsRawCount
                 state.funcObj = funcVal
                 state.flags = 0
+                #if JEFFJS_MANUAL_MEMORY
+                let newFrame = JeffJSFrameRef(u: rt.acquireFrameU())
+                #else
                 unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
-                newFrame.prevFrame = ctx.currentFrame
+                #endif
+                newFrame.prevFrameU = ctx.currentFrameU
                 newFrame.curFunc = funcVal
                 if fastFb.isArrow, let arrowThis = callObj.arrowThisVal {
                     newFrame.thisVal = arrowThis
@@ -4611,7 +4791,7 @@ nonisolated private func executeFastTrace(
                 }
                 state.bufOwned = false
                 frame = newFrame
-                ctx.currentFrame = frame
+                ctx.currentFrameU = frame.unmanaged
                 frame.spBase = 0
                 state.bufCapacity = state.bufCapacity - argStart
                 buf = newBuf
@@ -4678,8 +4858,8 @@ nonisolated private func executeFastTrace(
             // function exit and the caller frees func/this/args after the call.
             do { var i = varBase; let n = state.spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
             if fb.copiesArgs { jeffJS_releaseOwnedArgSlots(frame, bufOwned: state.bufOwned) }
-            ctx.currentFrame = frame.prevFrame
-            rt.releaseFrameU(Unmanaged.passUnretained(frame))
+            ctx.currentFrameU = frame.prevFrameU
+            rt.releaseFrameU(frame.unmanaged)
             if state.bufOwned { rt.releaseInterpBuf(buf, capacity: state.bufCapacity) }
             let saved = rt.inlinePop()
             do { var p = saved.sp; let e = saved.spTop; while p < e { saved.buf[p].freeValueFast(); p += 1 } }
@@ -4969,7 +5149,7 @@ nonisolated private func executeFastTrace(
             }
 
         case .put_var:
-            guard let ents = fb.icEntries, let gObj = ctx.globalObj.obj, let gShape = gObj.shape else {
+            guard let ents = fb.icEntries, let gObj = ctx.globalObj.obj, let gShapeU = gObj.shapeU else {
                 resume = pc; break traceLoop // deopt
             }
             let entry = ents[jeffJS_icSlot(ents, pc)]
@@ -4979,15 +5159,13 @@ nonisolated private func executeFastTrace(
                 continue traceLoop
             }
             if entry.pc == pc,
-               entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()), entry.atom == ctx.globalLexEpoch,
+               entry.shapePtr == UnsafeRawPointer(gShapeU.toOpaque()), entry.atom == ctx.globalLexEpoch,
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
-               entry.propOffset < gShape.prop.count,
-               gShape.prop[entry.propOffset].flags.contains(.writable),
-               gShape.prop[entry.propOffset].flags.isPlainData,
+               jeffJS_shapeSlotIsWritableData(gShapeU, entry.propOffset),
                gObj.extra(at: entry.propOffset) == nil {
                 sp -= 1; let val = buf[sp]
                 let old = gObj.dataValue(at: entry.propOffset)
-                gObj.asClass.propValues[entry.propOffset] = val
+                gObj._with { $0.propValues[entry.propOffset] = val }
                 old.freeValue()
                 pc += 5
             } else {
@@ -5032,12 +5210,11 @@ nonisolated private func executeFastTrace(
                     let e = storage.values[Int(uidx)]
                     if !e.isUninitialized { element = e }   // hole: deopt
                 }
-            } else if case .array(_, let vals, let count) = jsObj.payload {
-                if uidx < count, Int(uidx) < vals.count {
-                    let e = vals[Int(uidx)]
-                    if !e.isUninitialized { element = e }
-                }
             }
+            // (No `.array` payload arm: an array's elements are always its
+            // element store; `payload` of an array without one is never
+            // `.array`, and reading the enum here put the payload accessor
+            // into the trace loop.)
             guard let el = element else { resume = pc; break traceLoop } // deopt: OOB/holes — slow path decides
             let elDup = el.dupValue()
             objV.freeValueFast()   // the popped receiver ref (`arr[i]` leaked one per read)
@@ -6338,7 +6515,7 @@ nonisolated private func executeFastTraceLean(
             }
 
         case .put_var:
-            guard let ents = icEntries, let gObj = ctx.globalObj.obj, let gShape = gObj.shape else {
+            guard let ents = icEntries, let gObj = ctx.globalObj.obj, let gShapeU = gObj.shapeU else {
                 ctx.interruptCounter = interrupt; return pc // deopt
             }
             let entry = ents[jeffJS_icSlot(ents, pc)]
@@ -6348,15 +6525,13 @@ nonisolated private func executeFastTraceLean(
                 continue traceLoop
             }
             if entry.pc == pc,
-               entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()), entry.atom == ctx.globalLexEpoch,
+               entry.shapePtr == UnsafeRawPointer(gShapeU.toOpaque()), entry.atom == ctx.globalLexEpoch,
                entry.propOffset >= 0, entry.propOffset < gObj.propCount,
-               entry.propOffset < gShape.prop.count,
-               gShape.prop[entry.propOffset].flags.contains(.writable),
-               gShape.prop[entry.propOffset].flags.isPlainData,
+               jeffJS_shapeSlotIsWritableData(gShapeU, entry.propOffset),
                gObj.extra(at: entry.propOffset) == nil {
                 sp -= 1; let val = buf[sp]
                 let old = gObj.dataValue(at: entry.propOffset)
-                gObj.asClass.propValues[entry.propOffset] = val
+                gObj._with { $0.propValues[entry.propOffset] = val }
                 old.freeValue()
                 pc += 5
             } else {
@@ -6393,12 +6568,11 @@ nonisolated private func executeFastTraceLean(
                     let e = storage.values[Int(uidx)]
                     if !e.isUninitialized { element = e }   // hole: deopt
                 }
-            } else if case .array(_, let vals, let count) = jsObj.payload {
-                if uidx < count, Int(uidx) < vals.count {
-                    let e = vals[Int(uidx)]
-                    if !e.isUninitialized { element = e }
-                }
             }
+            // (No `.array` payload arm: an array's elements are always its
+            // element store; `payload` of an array without one is never
+            // `.array`, and reading the enum here put the payload accessor
+            // into the trace loop.)
             guard let el = element else { ctx.interruptCounter = interrupt; return pc } // deopt: OOB/holes — slow path decides
             let elDup = el.dupValue()
             objV.freeValueFast()
@@ -7919,7 +8093,11 @@ nonisolated struct JeffJSInterpreter {
         #else
         unowned(unsafe) var fb: JeffJSFunctionBytecode
         #endif
+        #if JEFFJS_MANUAL_MEMORY
+        var frame: JeffJSFrameRef
+        #else
         unowned(unsafe) var frame: JeffJSStackFrame
+        #endif
         var funcObj: JeffJSValue
         var flags: Int
         var bufOwned: Bool
@@ -7953,7 +8131,11 @@ nonisolated struct JeffJSInterpreter {
         #else
         unowned(unsafe) var fb: JeffJSFunctionBytecode
         #endif
+        #if JEFFJS_MANUAL_MEMORY
+        var frame: JeffJSFrameRef
+        #else
         unowned(unsafe) var frame: JeffJSStackFrame
+        #endif
         // No varRefs field: the caller's varRefs are re-derived on pop from
         // funcObj (varRefsFast). Keeping the struct free of refcounted fields
         // makes push/pop plain stores on the runtime's unsafe inline stack.
@@ -8247,7 +8429,11 @@ nonisolated struct JeffJSInterpreter {
         }
         }   // resumeState == nil
         }
+        #if JEFFJS_MANUAL_MEMORY
+        var frame = JeffJSFrameRef(u: frameU)   // uncounted handle (JeffJSFrameRef.swift)
+        #else
         unowned(unsafe) var frame: JeffJSStackFrame = frameU.takeUnretainedValue()
+        #endif
 
         // Initialize local variables. Append into the pooled frame's array
         // (released with keepingCapacity) instead of assigning a fresh array —
@@ -8316,10 +8502,14 @@ nonisolated struct JeffJSInterpreter {
         }   // resumeState == nil
 
         // Push frame
-        ctx.currentFrame = frame
+        ctx.currentFrameU = frame.unmanaged
         frame.spBase = 0
         // This activation's own (base) frame: `frame` moves to inline-called frames.
+        #if JEFFJS_MANUAL_MEMORY
+        let baseFrame = frame
+        #else
         unowned(unsafe) let baseFrame: JeffJSStackFrame = frame
+        #endif
 
         var pc = 0  // program counter (index into bc[])
         var retVal: JeffJSValue = .undefined
@@ -8448,8 +8638,8 @@ nonisolated struct JeffJSInterpreter {
                     // Early exit: the activation completes here, so retire its
                     // frame as the epilogue would (closures get detached
                     // copies; arguments, locals and stack values released).
-                    ctx.currentFrame = frame.prevFrame
-                    jeffJS_retireOwnFrame(rt, frame, buf, sp)
+                    ctx.currentFrameU = frame.prevFrameU
+                    jeffJS_retireOwnFrame(rt, frame.object, buf, sp)
                     rt.inlineStackTop = inlineBase
                     return retVal
                 }
@@ -8522,7 +8712,7 @@ nonisolated struct JeffJSInterpreter {
                 case .park(let promise):
                     if let genObj = generatorObject.toObject(),
                        case .generatorData(let gd) = genObj.payload {
-                        var st = jeffJS_suspendActivation(rt, frame, fb.object, buf, varBase, spBase, sp,
+                        var st = jeffJS_suspendActivation(rt, frame.object, fb.object, buf, varBase, spBase, sp,
                                                           pc: saved.pc, funcObj: saved.funcObj, thisVal: saved.thisVal)
                         st.delegatedIter = saved.delegatedIter
                         gd.savedState = st
@@ -8530,7 +8720,7 @@ nonisolated struct JeffJSInterpreter {
                         gd.awaitedPromise = promise
                         gd.delegateAwaitPending = true
                         // Parked again on its own frame: nothing to release.
-                        ctx.currentFrame = frame.prevFrame
+                        ctx.currentFrameU = frame.prevFrameU
                         rt.inlineStackTop = inlineBase
                         return .undefined
                     }
@@ -8563,7 +8753,7 @@ nonisolated struct JeffJSInterpreter {
                         // More values — yield this one and re-suspend.
                         if let genObj = generatorObject.toObject(),
                            case .generatorData(let genData) = genObj.payload {
-                            var newSaved = jeffJS_suspendActivation(rt, frame, fb.object, buf, varBase, spBase, sp,
+                            var newSaved = jeffJS_suspendActivation(rt, frame.object, fb.object, buf, varBase, spBase, sp,
                                                                     pc: pc, funcObj: mFuncObj, thisVal: thisVal)
                             newSaved.delegatedIter = iter
                             genData.savedState = newSaved
@@ -8571,7 +8761,7 @@ nonisolated struct JeffJSInterpreter {
                         }
                         retVal = value
                         // Parked again on its own frame: nothing to release.
-                        ctx.currentFrame = frame.prevFrame
+                        ctx.currentFrameU = frame.prevFrameU
                         rt.inlineStackTop = inlineBase
                         return retVal
                     }
@@ -8934,8 +9124,8 @@ nonisolated struct JeffJSInterpreter {
                 // No buf↔frame sync needed: createClosure only builds VarRefs
                 // pointing at the parent frame, and VarRef.pvalue reads through
                 // frame.buf (always current) in preference to the frame arrays.
-                let closureVal = fb.with { ctx.createClosure(fb: $0, cpoolIdx: idx, varRefs: [], parentRaw: vrRaw, parentRawCount: vrCount,
-                                                                  parentFrame: frame) }
+                let closureVal = fb.with { fbo in frame.with { fr in
+                    ctx.createClosureRaw(fb: fbo, cpoolIdx: idx, parentRaw: vrRaw, parentRawCount: vrCount, parentFrame: fr) } }
                 buf[sp] = closureVal; sp += 1
                 pc += 5
 
@@ -8979,15 +9169,16 @@ nonisolated struct JeffJSInterpreter {
                 // argument slots in place (no argBuf/varBuf materialisation).
                 if jeffJSFastArguments, kind <= SpecialObjectType.mappedArguments.rawValue {
                     let argc = min(frame.argCount, varBase)
-                    let obj = ctx.newArgumentsObject(mapped: kind == SpecialObjectType.mappedArguments.rawValue,
-                                                     frame: frame, argp: buf, argc: argc)
+                    let obj = frame.with { fr in
+                        ctx.newArgumentsObject(mapped: kind == SpecialObjectType.mappedArguments.rawValue,
+                                               frame: fr, argp: buf, argc: argc) }
                     buf[sp] = obj; sp += 1
                     pc += 2
                     break
                 }
                 // Sync buf → frame since newSpecialObject reads frame.argBuf
-                jeffJS_syncBufToFrame(frame, buf, varBase)
-                let obj = ctx.newSpecialObject(kind: kind, frame: frame)
+                jeffJS_syncBufToFrame(frame.object, buf, varBase)
+                let obj = ctx.newSpecialObject(kind: kind, frame: frame.object)
                 buf[sp] = obj; sp += 1
                 pc += 2
 
@@ -9241,8 +9432,12 @@ nonisolated struct JeffJSInterpreter {
                         }
                         mFuncObj = e_funcVal
                         mFlags = 0
+                        #if JEFFJS_MANUAL_MEMORY
+                        let newFrame = JeffJSFrameRef(u: rt.acquireFrameU())
+                        #else
                         unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
-                        newFrame.prevFrame = ctx.currentFrame
+                        #endif
+                        newFrame.prevFrameU = ctx.currentFrameU
                         newFrame.curFunc = e_funcVal
                         if fastFb.isArrow, let arrowThis = e_callObj.arrowThisVal {
                             newFrame.thisVal = arrowThis
@@ -9291,7 +9486,7 @@ nonisolated struct JeffJSInterpreter {
                             bufOwned = true
                         }
                         frame = newFrame
-                        ctx.currentFrame = frame
+                        ctx.currentFrameU = frame.unmanaged
                         frame.spBase = 0
                         buf = newBuf
                         bufCapacity = newBufCap
@@ -9540,8 +9735,12 @@ nonisolated struct JeffJSInterpreter {
                         }
                         mFuncObj = e_funcVal
                         mFlags = 0
+                        #if JEFFJS_MANUAL_MEMORY
+                        let newFrame = JeffJSFrameRef(u: rt.acquireFrameU())
+                        #else
                         unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
-                        newFrame.prevFrame = ctx.currentFrame
+                        #endif
+                        newFrame.prevFrameU = ctx.currentFrameU
                         newFrame.curFunc = e_funcVal
                         if e_fastFb.isArrow, let arrowThis = e_callObj.arrowThisVal {
                             newFrame.thisVal = arrowThis
@@ -9590,7 +9789,7 @@ nonisolated struct JeffJSInterpreter {
                             bufOwned = true
                         }
                         frame = newFrame
-                        ctx.currentFrame = frame
+                        ctx.currentFrameU = frame.unmanaged
                         frame.spBase = 0
                         buf = newBuf
                         bufCapacity = newBufCap
@@ -9708,7 +9907,7 @@ nonisolated struct JeffJSInterpreter {
                 if tcResult.isException { retVal = .exception; break dispatchLoop }
                 if frame.hasLiveVarRefs {
                     jeffJS_syncForDetach(frame, buf, varBase)
-                    jeffJS_detachFrameVarRefs(frame, rt)
+                    frame.with { jeffJS_detachFrameVarRefs($0, rt) }
                 }
                 // Release this frame's variable slots, exactly as return_ does:
                 // a tail call is the frame's last act, so nothing else will ever
@@ -9717,8 +9916,8 @@ nonisolated struct JeffJSInterpreter {
                 // object, whose binding is a local slot.
                 do { var i = varBase; let n = spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
                 if fb.copiesArgs { jeffJS_releaseOwnedArgSlots(frame, bufOwned: bufOwned) }
-                ctx.currentFrame = frame.prevFrame
-                rt.releaseFrameU(Unmanaged.passUnretained(frame))
+                ctx.currentFrameU = frame.prevFrameU
+                rt.releaseFrameU(frame.unmanaged)
                 if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
                 let tcSaved = rt.inlinePop()
                 // ... and the callee/receiver/args the caller pushed for this
@@ -9768,14 +9967,14 @@ nonisolated struct JeffJSInterpreter {
                 if tcmResult.isException { retVal = .exception; break dispatchLoop }
                 if frame.hasLiveVarRefs {
                     jeffJS_syncForDetach(frame, buf, varBase)
-                    jeffJS_detachFrameVarRefs(frame, rt)
+                    frame.with { jeffJS_detachFrameVarRefs($0, rt) }
                 }
                 // See tail_call: the frame's variable slots and the caller's
                 // callee/receiver/args slots are ours to release here.
                 do { var i = varBase; let n = spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
                 if fb.copiesArgs { jeffJS_releaseOwnedArgSlots(frame, bufOwned: bufOwned) }
-                ctx.currentFrame = frame.prevFrame
-                rt.releaseFrameU(Unmanaged.passUnretained(frame))
+                ctx.currentFrameU = frame.prevFrameU
+                rt.releaseFrameU(frame.unmanaged)
                 if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
                 let tcmSaved = rt.inlinePop()
                 do { var p = tcmSaved.sp; let e = tcmSaved.spTop; while p < e { tcmSaved.buf[p].freeValueFast(); p += 1 } }
@@ -9887,15 +10086,15 @@ nonisolated struct JeffJSInterpreter {
                     // 1. Sync buf → frame and detach live var-refs
                     if frame.hasLiveVarRefs {
                         jeffJS_syncForDetach(frame, buf, varBase)
-                        jeffJS_detachFrameVarRefs(frame, rt)
+                        frame.with { jeffJS_detachFrameVarRefs($0, rt) }
                     }
                     // 2. Restore previous frame pointer and release callee frame
                     // 1b. Release the callee's variable slots; the caller's
                     // func/this/args slots are released after the pop.
                     do { var i = varBase; let n = spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
                     if fb.copiesArgs { jeffJS_releaseOwnedArgSlots(frame, bufOwned: bufOwned) }
-                    ctx.currentFrame = frame.prevFrame
-                    rt.releaseFrameU(Unmanaged.passUnretained(frame))
+                    ctx.currentFrameU = frame.prevFrameU
+                    rt.releaseFrameU(frame.unmanaged)
                     // 2b. Release callee's buf to pool
                     if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
                     // 3. Pop saved caller state
@@ -9932,12 +10131,12 @@ nonisolated struct JeffJSInterpreter {
                     // ── Inline return undefined: restore caller's frame ──
                     if frame.hasLiveVarRefs {
                         jeffJS_syncForDetach(frame, buf, varBase)
-                        jeffJS_detachFrameVarRefs(frame, rt)
+                        frame.with { jeffJS_detachFrameVarRefs($0, rt) }
                     }
                     do { var i = varBase; let n = spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
                     if fb.copiesArgs { jeffJS_releaseOwnedArgSlots(frame, bufOwned: bufOwned) }
-                    ctx.currentFrame = frame.prevFrame
-                    rt.releaseFrameU(Unmanaged.passUnretained(frame))
+                    ctx.currentFrameU = frame.prevFrameU
+                    rt.releaseFrameU(frame.unmanaged)
                     if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
                     let saved = rt.inlinePop()
                     do { var p = saved.sp; let e = saved.spTop; while p < e { saved.buf[p].freeValueFast(); p += 1 } }
@@ -10068,7 +10267,7 @@ nonisolated struct JeffJSInterpreter {
                 let evalThis: JeffJSValue = siteRaw & 0x8000 != 0
                     ? jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) : .undefined
                 let result = ctx.directEvalOrCall(funcVal: evalFunc, thisVal: evalThis, args: evalArgs,
-                                                  callerFB: fb.object, site: siteRaw & 0x7FFF, frame: frame)
+                                                  callerFB: fb.object, site: siteRaw & 0x7FFF, frame: frame.object)
                 evalFunc.freeValue(); evalThis.freeValue()
                 for a in evalArgs { a.freeValue() }
                 if result.isException {
@@ -10087,7 +10286,7 @@ nonisolated struct JeffJSInterpreter {
                 let evalThis = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 let evalArgs = ctx.arrayToArgs(argsArray)   // owned copies
                 let result = ctx.directEvalOrCall(funcVal: evalFunc, thisVal: evalThis, args: evalArgs,
-                                                  callerFB: fb.object, site: site & 0x7FFF, frame: frame)
+                                                  callerFB: fb.object, site: site & 0x7FFF, frame: frame.object)
                 argsArray.freeValue(); evalFunc.freeValue(); evalThis.freeValue()
                 for a in evalArgs { a.freeValue() }
                 if result.isException {
@@ -10212,21 +10411,19 @@ nonisolated struct JeffJSInterpreter {
                 let atom = readU32(bc, pc + 1)
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
                 // Global-var inline cache: shape-matched writable data slot
-                if let gObj = ctx.globalObj.obj, let gShape = gObj.shape, let ic = fb.ic {
-                    let entry = ic.lookup(pc)
+                if let gObj = ctx.globalObj.obj, let gShapeU = gObj.shapeU, let icU = fb.icU {
+                    let entry = icU._withUnsafeGuaranteedRef { $0.lookup(pc) }
                     if entry.pc == pc, entry.atom == jeffJSLexicalICTag, jeffJS_lexicalICPut(ctx, entry, val) {
                         pc += 5
                         continue dispatchLoop
                     }
                     if entry.pc == pc,
-                       entry.shapePtr == UnsafeRawPointer(Unmanaged.passUnretained(gShape).toOpaque()), entry.atom == ctx.globalLexEpoch,
+                       entry.shapePtr == UnsafeRawPointer(gShapeU.toOpaque()), entry.atom == ctx.globalLexEpoch,
                        entry.propOffset >= 0, entry.propOffset < gObj.propCount,
-                       entry.propOffset < gShape.prop.count,
-                       gShape.prop[entry.propOffset].flags.contains(.writable),
-                       gShape.prop[entry.propOffset].flags.isPlainData,
+                       jeffJS_shapeSlotIsWritableData(gShapeU, entry.propOffset),
                        gObj.extra(at: entry.propOffset) == nil {
                         let old = gObj.dataValue(at: entry.propOffset)
-                        gObj.asClass.propValues[entry.propOffset] = val
+                        gObj._with { $0.propValues[entry.propOffset] = val }
                         old.freeValue()
                         pc += 5
                         continue dispatchLoop
@@ -10484,8 +10681,12 @@ nonisolated struct JeffJSInterpreter {
                         }
                         mFuncObj = e_funcVal
                         mFlags = 0
+                        #if JEFFJS_MANUAL_MEMORY
+                        let newFrame = JeffJSFrameRef(u: rt.acquireFrameU())
+                        #else
                         unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
-                        newFrame.prevFrame = ctx.currentFrame
+                        #endif
+                        newFrame.prevFrameU = ctx.currentFrameU
                         newFrame.curFunc = e_funcVal
                         if e_fastFb.isArrow, let arrowThis = e_callObj.arrowThisVal {
                             newFrame.thisVal = arrowThis
@@ -10534,7 +10735,7 @@ nonisolated struct JeffJSInterpreter {
                             bufOwned = true
                         }
                         frame = newFrame
-                        ctx.currentFrame = frame
+                        ctx.currentFrameU = frame.unmanaged
                         frame.spBase = 0
                         buf = newBuf
                         bufCapacity = newBufCap
@@ -10618,7 +10819,7 @@ nonisolated struct JeffJSInterpreter {
                             fb.getIC().updateProto(pc, receiverShape: shape, holder: holder,
                                                    holderShape: hs, propOffset: hIdx)
                         } else {
-                            jeffJS_icFillDeep(fb.object, pc, jsObj._obj, atom)
+                            jeffJS_icFillDeep(fb, pc, jsObj._obj, atom)
                         }
                     }
                     obj.freeValue()
@@ -10632,7 +10833,7 @@ nonisolated struct JeffJSInterpreter {
                     let val = ctx.getProperty(obj: obj, atom: atom)
                     if val.isException { obj.freeValue(); retVal = .exception; break dispatchLoop }
                     buf[sp] = val; sp += 1
-                    if obj.isString { jeffJS_stringFieldFill(ctx, fb.object, pc, atom) }
+                    if obj.isString { jeffJS_stringFieldFill(ctx, fb, pc, atom) }
                     obj.freeValue()
                 }
                 pc += 5
@@ -10805,7 +11006,7 @@ nonisolated struct JeffJSInterpreter {
                             fb.getIC().updateProto(pc, receiverShape: shape, holder: holder,
                                                    holderShape: hs, propOffset: hIdx)
                         } else {
-                            jeffJS_icFillDeep(fb.object, pc, jsObj._obj, atom)
+                            jeffJS_icFillDeep(fb, pc, jsObj._obj, atom)
                         }
                     }
                 } else {
@@ -10817,7 +11018,7 @@ nonisolated struct JeffJSInterpreter {
                     let val = ctx.getProperty(obj: obj, atom: atom)
                     if val.isException { retVal = .exception; break dispatchLoop }
                     buf[sp] = val; sp += 1
-                    if obj.isString { jeffJS_stringFieldFill(ctx, fb.object, pc, atom) }
+                    if obj.isString { jeffJS_stringFieldFill(ctx, fb, pc, atom) }
                 }
                 pc += 5
 
@@ -10885,8 +11086,12 @@ nonisolated struct JeffJSInterpreter {
                         }
                         mFuncObj = e_funcVal
                         mFlags = 0
+                        #if JEFFJS_MANUAL_MEMORY
+                        let newFrame = JeffJSFrameRef(u: rt.acquireFrameU())
+                        #else
                         unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
-                        newFrame.prevFrame = ctx.currentFrame
+                        #endif
+                        newFrame.prevFrameU = ctx.currentFrameU
                         newFrame.curFunc = e_funcVal
                         if e_fastFb.isArrow, let arrowThis = e_callObj.arrowThisVal {
                             newFrame.thisVal = arrowThis
@@ -10935,7 +11140,7 @@ nonisolated struct JeffJSInterpreter {
                             bufOwned = true
                         }
                         frame = newFrame
-                        ctx.currentFrame = frame
+                        ctx.currentFrameU = frame.unmanaged
                         frame.spBase = 0
                         buf = newBuf
                         bufCapacity = newBufCap
@@ -11094,13 +11299,6 @@ nonisolated struct JeffJSInterpreter {
                                 pc += 1
                                 continue dispatchLoop
                             }
-                        } else if case .array(_, let vals, let count) = jsObj.payload {
-                            if uidx < count, Int(uidx) < vals.count {
-                                buf[sp] = vals[Int(uidx)].arrayHoleAsUndefined.dupValue(); sp += 1
-                                obj.freeValue()
-                                pc += 1
-                                continue dispatchLoop
-                            }
                         }
                     }
                 }
@@ -11109,7 +11307,7 @@ nonisolated struct JeffJSInterpreter {
                 if kAtom != 0, let jsObj = obj.obj {
                     let v: JeffJSValue
                     if let hv = jeffJS_keyedICGet(fb.icEntries, pc, jsObj, kAtom) { v = hv.dupValue() }
-                    else { v = jeffJS_keyedGetMiss(ctx, fb.object, pc, obj, jsObj, kAtom) }
+                    else { v = jeffJS_keyedGetMiss(ctx, fb, pc, obj, jsObj, kAtom) }
                     obj.freeValue(); key.freeValue()
                     if v.isException { retVal = .exception; break dispatchLoop }
                     buf[sp] = v; sp += 1
@@ -11147,12 +11345,6 @@ nonisolated struct JeffJSInterpreter {
                                 pc += 1
                                 continue dispatchLoop
                             }
-                        } else if case .array(_, let vals, let count) = jsObj.payload {
-                            if uidx < count, Int(uidx) < vals.count {
-                                buf[sp] = vals[Int(uidx)].arrayHoleAsUndefined.dupValue(); sp += 1
-                                pc += 1
-                                continue dispatchLoop
-                            }
                         }
                     }
                 }
@@ -11160,7 +11352,7 @@ nonisolated struct JeffJSInterpreter {
                 if kAtom2 != 0, let jsObj = obj.obj {
                     let v: JeffJSValue
                     if let hv = jeffJS_keyedICGet(fb.icEntries, pc, jsObj, kAtom2) { v = hv.dupValue() }
-                    else { v = jeffJS_keyedGetMiss(ctx, fb.object, pc, obj, jsObj, kAtom2) }
+                    else { v = jeffJS_keyedGetMiss(ctx, fb, pc, obj, jsObj, kAtom2) }
                     key.freeValue()
                     if v.isException { retVal = .exception; break dispatchLoop }
                     buf[sp] = v; sp += 1
@@ -11211,7 +11403,7 @@ nonisolated struct JeffJSInterpreter {
                 let kAtomP = jeffJS_keyedAtom(key)
                 if kAtomP != 0, let jsObj = obj.obj {
                     let okP = jeffJS_keyedICPut(fb.icEntries, pc, jsObj, kAtomP, val)
-                        || jeffJS_keyedPutMiss(ctx, fb.object, pc, obj, jsObj, kAtomP, val)
+                        || jeffJS_keyedPutMiss(ctx, fb, pc, obj, jsObj, kAtomP, val)
                     obj.freeValue(); key.freeValue()
                     if !okP { retVal = .exception; break dispatchLoop }
                     pc += 1
@@ -11598,10 +11790,10 @@ nonisolated struct JeffJSInterpreter {
 
             case .get_var_ref:
                 let idx = Int(readU16(bc, pc + 1))
-                if idx < vrCount, let vrU = vrRaw![idx] { unowned(unsafe) let vr = vrU.takeUnretainedValue();
-                    let val = vr.isDetached ? vr.value.dupValue() : vr.pvalue.dupValue()
+                if idx < vrCount, let vrU = vrRaw![idx] {
+                    let val = jeffJS_varRefValue(vrU).dupValue()
                     if traceOps {
-                        jeffJS_coldPrint1(idx, vr, val)
+                        jeffJS_coldPrint1(idx, vrU.takeUnretainedValue(), val)
                     }
                     buf[sp] = val; sp += 1
                 } else {
@@ -11615,24 +11807,24 @@ nonisolated struct JeffJSInterpreter {
             case .put_var_ref:
                 let idx = Int(readU16(bc, pc + 1))
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                if idx < vrCount, let vrU = vrRaw![idx] { unowned(unsafe) let vr = vrU.takeUnretainedValue();
-                    vr.store(val)
+                if idx < vrCount, let vrU = vrRaw![idx] {
+                    jeffJS_varRefStore(vrU, val)
                 }
                 pc += 3
 
             case .set_var_ref:
                 let idx = Int(readU16(bc, pc + 1))
-                if idx < vrCount, let vrU = vrRaw![idx] { unowned(unsafe) let vr = vrU.takeUnretainedValue();
+                if idx < vrCount, let vrU = vrRaw![idx] {
                     let val = buf[sp - 1].dupValue()
-                    vr.store(val)
+                    jeffJS_varRefStore(vrU, val)
                 }
                 pc += 3
 
             case .get_var_ref0:
-                if vrCount > 0, let vrU = vrRaw![0] { unowned(unsafe) let vr = vrU.takeUnretainedValue();
-                    let val = vr.isDetached ? vr.value.dupValue() : vr.pvalue.dupValue()
+                if vrCount > 0, let vrU = vrRaw![0] {
+                    let val = jeffJS_varRefValue(vrU).dupValue()
                     if traceOps {
-                        jeffJS_coldPrint3(vr, val)
+                        jeffJS_coldPrint3(vrU.takeUnretainedValue(), val)
                     }
                     buf[sp] = val; sp += 1
                 } else {
@@ -11640,19 +11832,19 @@ nonisolated struct JeffJSInterpreter {
                     buf[sp] = .undefined; sp += 1
                 }
                 pc += 1
-            case .get_var_ref1: if vrCount > 1, let vrU = vrRaw![1] { unowned(unsafe) let vr = vrU.takeUnretainedValue(); buf[sp] = vr.isDetached ? vr.value.dupValue() : vr.pvalue.dupValue(); sp += 1 } else { buf[sp] = .undefined; sp += 1 }; pc += 1
-            case .get_var_ref2: if vrCount > 2, let vrU = vrRaw![2] { unowned(unsafe) let vr = vrU.takeUnretainedValue(); buf[sp] = vr.isDetached ? vr.value.dupValue() : vr.pvalue.dupValue(); sp += 1 } else { buf[sp] = .undefined; sp += 1 }; pc += 1
-            case .get_var_ref3: if vrCount > 3, let vrU = vrRaw![3] { unowned(unsafe) let vr = vrU.takeUnretainedValue(); buf[sp] = vr.isDetached ? vr.value.dupValue() : vr.pvalue.dupValue(); sp += 1 } else { buf[sp] = .undefined; sp += 1 }; pc += 1
+            case .get_var_ref1: if vrCount > 1, let vrU = vrRaw![1] { buf[sp] = jeffJS_varRefValue(vrU).dupValue(); sp += 1 } else { buf[sp] = .undefined; sp += 1 }; pc += 1
+            case .get_var_ref2: if vrCount > 2, let vrU = vrRaw![2] { buf[sp] = jeffJS_varRefValue(vrU).dupValue(); sp += 1 } else { buf[sp] = .undefined; sp += 1 }; pc += 1
+            case .get_var_ref3: if vrCount > 3, let vrU = vrRaw![3] { buf[sp] = jeffJS_varRefValue(vrU).dupValue(); sp += 1 } else { buf[sp] = .undefined; sp += 1 }; pc += 1
 
-            case .put_var_ref0: if vrCount > 0, let vrU = vrRaw![0] { unowned(unsafe) let vr = vrU.takeUnretainedValue(); let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); vr.store(v) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
-            case .put_var_ref1: if vrCount > 1, let vrU = vrRaw![1] { unowned(unsafe) let vr = vrU.takeUnretainedValue(); let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); vr.store(v) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
-            case .put_var_ref2: if vrCount > 2, let vrU = vrRaw![2] { unowned(unsafe) let vr = vrU.takeUnretainedValue(); let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); vr.store(v) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
-            case .put_var_ref3: if vrCount > 3, let vrU = vrRaw![3] { unowned(unsafe) let vr = vrU.takeUnretainedValue(); let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); vr.store(v) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
+            case .put_var_ref0: if vrCount > 0, let vrU = vrRaw![0] { let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); jeffJS_varRefStore(vrU, v) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
+            case .put_var_ref1: if vrCount > 1, let vrU = vrRaw![1] { let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); jeffJS_varRefStore(vrU, v) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
+            case .put_var_ref2: if vrCount > 2, let vrU = vrRaw![2] { let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); jeffJS_varRefStore(vrU, v) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
+            case .put_var_ref3: if vrCount > 3, let vrU = vrRaw![3] { let v = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc); jeffJS_varRefStore(vrU, v) } else { let _ = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }; pc += 1
 
-            case .set_var_ref0: if vrCount > 0, let vrU = vrRaw![0] { unowned(unsafe) let vr = vrU.takeUnretainedValue(); let v = buf[sp - 1].dupValue(); vr.store(v) }; pc += 1
-            case .set_var_ref1: if vrCount > 1, let vrU = vrRaw![1] { unowned(unsafe) let vr = vrU.takeUnretainedValue(); let v = buf[sp - 1].dupValue(); vr.store(v) }; pc += 1
-            case .set_var_ref2: if vrCount > 2, let vrU = vrRaw![2] { unowned(unsafe) let vr = vrU.takeUnretainedValue(); let v = buf[sp - 1].dupValue(); vr.store(v) }; pc += 1
-            case .set_var_ref3: if vrCount > 3, let vrU = vrRaw![3] { unowned(unsafe) let vr = vrU.takeUnretainedValue(); let v = buf[sp - 1].dupValue(); vr.store(v) }; pc += 1
+            case .set_var_ref0: if vrCount > 0, let vrU = vrRaw![0] { let v = buf[sp - 1].dupValue(); jeffJS_varRefStore(vrU, v) }; pc += 1
+            case .set_var_ref1: if vrCount > 1, let vrU = vrRaw![1] { let v = buf[sp - 1].dupValue(); jeffJS_varRefStore(vrU, v) }; pc += 1
+            case .set_var_ref2: if vrCount > 2, let vrU = vrRaw![2] { let v = buf[sp - 1].dupValue(); jeffJS_varRefStore(vrU, v) }; pc += 1
+            case .set_var_ref3: if vrCount > 3, let vrU = vrRaw![3] { let v = buf[sp - 1].dupValue(); jeffJS_varRefStore(vrU, v) }; pc += 1
 
             // -----------------------------------------------------------------
             // TDZ (Temporal Dead Zone) Operations
@@ -11712,8 +11904,8 @@ nonisolated struct JeffJSInterpreter {
 
             case .get_var_ref_check:
                 let idx = Int(readU16(bc, pc + 1))
-                if idx < vrCount, let vrU = vrRaw![idx] { unowned(unsafe) let vr = vrU.takeUnretainedValue();
-                    let val = vr.isDetached ? vr.value : vr.pvalue
+                if idx < vrCount, let vrU = vrRaw![idx] {
+                    let val = jeffJS_varRefValue(vrU)
                     if val.isUninitialized {
                         _ = jeffJS_coldThrow(ctx, .m8)
                         retVal = .exception
@@ -11728,22 +11920,22 @@ nonisolated struct JeffJSInterpreter {
             case .put_var_ref_check:
                 let idx = Int(readU16(bc, pc + 1))
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                if idx < vrCount, let vrU = vrRaw![idx] { unowned(unsafe) let vr = vrU.takeUnretainedValue();
-                    let current = vr.isDetached ? vr.value : vr.pvalue
+                if idx < vrCount, let vrU = vrRaw![idx] {
+                    let current = jeffJS_varRefValue(vrU)
                     if current.isUninitialized {
                         _ = jeffJS_coldThrow(ctx, .m8)
                         retVal = .exception
                         break dispatchLoop
                     }
-                    vr.store(val)
+                    jeffJS_varRefStore(vrU, val)
                 }
                 pc += 3
 
             case .put_var_ref_check_init:
                 let idx = Int(readU16(bc, pc + 1))
                 let val = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)
-                if idx < vrCount, let vrU = vrRaw![idx] { unowned(unsafe) let vr = vrU.takeUnretainedValue();
-                    vr.store(val)
+                if idx < vrCount, let vrU = vrRaw![idx] {
+                    jeffJS_varRefStore(vrU, val)
                 }
                 pc += 3
 
@@ -11754,7 +11946,7 @@ nonisolated struct JeffJSInterpreter {
             case .close_loc:
                 let idx = Int(readU16(bc, pc + 1))
                 // closeLexicalVar reads the live slot from frame.buf directly.
-                ctx.closeLexicalVar(frame: frame, idx: idx)
+                frame.with { ctx.closeLexicalVar(frame: $0, idx: idx) }
                 pc += 3
 
             // -----------------------------------------------------------------
@@ -12391,7 +12583,7 @@ nonisolated struct JeffJSInterpreter {
             case .make_loc_ref:
                 let atom = readU32(bc, pc + 1)
                 let idx = Int(readU16(bc, pc + 5))
-                let ref = ctx.makeLocalRef(frame: frame, idx: idx)
+                let ref = ctx.makeLocalRef(frame: frame.object, idx: idx)
                 buf[sp] = .makeObject(ref); sp += 1
                 buf[sp] = ctx.atomToString(atom); sp += 1
                 pc += 7
@@ -12399,7 +12591,7 @@ nonisolated struct JeffJSInterpreter {
             case .make_arg_ref:
                 let atom = readU32(bc, pc + 1)
                 let idx = Int(readU16(bc, pc + 5))
-                let ref = ctx.makeArgRef(frame: frame, idx: idx)
+                let ref = ctx.makeArgRef(frame: frame.object, idx: idx)
                 buf[sp] = .makeObject(ref); sp += 1
                 buf[sp] = ctx.atomToString(atom); sp += 1
                 pc += 7
@@ -12731,7 +12923,7 @@ nonisolated struct JeffJSInterpreter {
                     frame.argCount = formalCount
                     // The pc saved points to the instruction *after* initial_yield
                     // so that when we resume, we continue with the next opcode.
-                    var st = jeffJS_suspendActivation(rt, frame, fb.object, buf, varBase, spBase, sp,
+                    var st = jeffJS_suspendActivation(rt, frame.object, fb.object, buf, varBase, spBase, sp,
                                                       pc: pc + 1, funcObj: mFuncObj, thisVal: thisVal)
                     st.isInitialYield = true
                     genData.savedState = st
@@ -12755,7 +12947,7 @@ nonisolated struct JeffJSInterpreter {
                     // generator's JSAsyncFunctionState keeps sf alive; a
                     // `yield` only records cur_pc / cur_sp). pc + 1 points past
                     // the yield_ opcode so resumption continues after it.
-                    genData.savedState = jeffJS_suspendActivation(rt, frame, fb.object, buf, varBase, spBase, sp,
+                    genData.savedState = jeffJS_suspendActivation(rt, frame.object, fb.object, buf, varBase, spBase, sp,
                                                                   pc: pc + 1, funcObj: mFuncObj, thisVal: thisVal)
                     genData.state = .suspended_yield
                     sp = spBase   // the value stack lives on in the parked frame
@@ -12802,7 +12994,7 @@ nonisolated struct JeffJSInterpreter {
                             // Park the delegating generator on the delegate's
                             // pending result, keeping the delegation state; the
                             // driver resumes with the settled iterator result.
-                            var st = jeffJS_suspendActivation(rt, frame, fb.object, buf, varBase, spBase, sp,
+                            var st = jeffJS_suspendActivation(rt, frame.object, fb.object, buf, varBase, spBase, sp,
                                                               pc: pc, funcObj: mFuncObj, thisVal: thisVal)
                             sp = spBase   // the value stack lives on in the parked frame
                             suspendedHere = true
@@ -12832,7 +13024,7 @@ nonisolated struct JeffJSInterpreter {
                         // Yield this value and save state for lazy resumption.
                         // On resume, we'll continue iterating the inner iterator.
                         // Resume at this same yield_star opcode.
-                        var saved = jeffJS_suspendActivation(rt, frame, fb.object, buf, varBase, spBase, sp,
+                        var saved = jeffJS_suspendActivation(rt, frame.object, fb.object, buf, varBase, spBase, sp,
                                                              pc: pc, funcObj: mFuncObj, thisVal: thisVal)
                         sp = spBase   // the value stack lives on in the parked frame
                         suspendedHere = true
@@ -12966,7 +13158,7 @@ nonisolated struct JeffJSInterpreter {
                         if fb.isGenerator, fb.isAsyncFunc,
                            let genObj = generatorObject.toObject(),
                            case .generatorData(let genData) = genObj.payload {
-                            genData.savedState = jeffJS_suspendActivation(rt, frame, fb.object, buf, varBase, spBase, sp,
+                            genData.savedState = jeffJS_suspendActivation(rt, frame.object, fb.object, buf, varBase, spBase, sp,
                                                                           pc: pc + 1, funcObj: mFuncObj, thisVal: thisVal)
                             sp = spBase   // the value stack lives on in the parked frame
                             suspendedHere = true
@@ -13015,7 +13207,7 @@ nonisolated struct JeffJSInterpreter {
                         // drops the caller's only reference as soon as the call
                         // returns the promise, so resuming touched a freed (and
                         // possibly pool-recycled) function object.
-                        let saved = jeffJS_suspendActivation(rt, frame, fb.object, buf, varBase, spBase, sp,
+                        let saved = jeffJS_suspendActivation(rt, frame.object, fb.object, buf, varBase, spBase, sp,
                                                              pc: pc + 1, funcObj: mFuncObj.dupValue(),
                                                              thisVal: frame.thisVal.dupValue())
                         sp = spBase   // the value stack lives on in the parked frame
@@ -13699,8 +13891,8 @@ nonisolated struct JeffJSInterpreter {
 
             case .fclosure8:
                 let idx = Int(readU8(bc, pc + 1))
-                let closureVal = fb.with { ctx.createClosure(fb: $0, cpoolIdx: idx, varRefs: [], parentRaw: vrRaw, parentRawCount: vrCount,
-                                                                  parentFrame: frame) }
+                let closureVal = fb.with { fbo in frame.with { fr in
+                    ctx.createClosureRaw(fb: fbo, cpoolIdx: idx, parentRaw: vrRaw, parentRawCount: vrCount, parentFrame: fr) } }
                 buf[sp] = closureVal; sp += 1
                 pc += 2
 
@@ -13903,8 +14095,12 @@ nonisolated struct JeffJSInterpreter {
                         }
                         mFuncObj = e_funcVal
                         mFlags = 0
+                        #if JEFFJS_MANUAL_MEMORY
+                        let newFrame = JeffJSFrameRef(u: rt.acquireFrameU())
+                        #else
                         unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
-                        newFrame.prevFrame = ctx.currentFrame
+                        #endif
+                        newFrame.prevFrameU = ctx.currentFrameU
                         newFrame.curFunc = e_funcVal
                         if e_fastFb.isArrow, let arrowThis = e_callObj.arrowThisVal {
                             newFrame.thisVal = arrowThis
@@ -13953,7 +14149,7 @@ nonisolated struct JeffJSInterpreter {
                             bufOwned = true
                         }
                         frame = newFrame
-                        ctx.currentFrame = frame
+                        ctx.currentFrameU = frame.unmanaged
                         frame.spBase = 0
                         buf = newBuf
                         bufCapacity = newBufCap
@@ -14019,7 +14215,7 @@ nonisolated struct JeffJSInterpreter {
                             fb.getIC().updateProto(pc, receiverShape: shape, holder: holder,
                                                    holderShape: hs, propOffset: hIdx)
                         } else {
-                            jeffJS_icFillDeep(fb.object, pc, jsObj._obj, atom)
+                            jeffJS_icFillDeep(fb, pc, jsObj._obj, atom)
                         }
                     }
                 } else {
@@ -14091,7 +14287,7 @@ nonisolated struct JeffJSInterpreter {
                             fb.getIC().updateProto(pc, receiverShape: shape, holder: holder,
                                                    holderShape: hs, propOffset: hIdx)
                         } else {
-                            jeffJS_icFillDeep(fb.object, pc, jsObj._obj, atom)
+                            jeffJS_icFillDeep(fb, pc, jsObj._obj, atom)
                         }
                     }
                 } else {
@@ -14103,7 +14299,7 @@ nonisolated struct JeffJSInterpreter {
                     let val = ctx.getProperty(obj: obj, atom: atom)
                     if val.isException { retVal = .exception; break dispatchLoop }
                     buf[sp] = val; sp += 1
-                    if obj.isString { jeffJS_stringFieldFill(ctx, fb.object, pc, atom) }
+                    if obj.isString { jeffJS_stringFieldFill(ctx, fb, pc, atom) }
                 }
                 pc += 5
 
@@ -14199,8 +14395,12 @@ nonisolated struct JeffJSInterpreter {
                         }
                         mFuncObj = e_funcVal
                         mFlags = 0
+                        #if JEFFJS_MANUAL_MEMORY
+                        let newFrame = JeffJSFrameRef(u: rt.acquireFrameU())
+                        #else
                         unowned(unsafe) let newFrame: JeffJSStackFrame = rt.acquireFrameU().takeUnretainedValue()
-                        newFrame.prevFrame = ctx.currentFrame
+                        #endif
+                        newFrame.prevFrameU = ctx.currentFrameU
                         newFrame.curFunc = e_funcVal
                         if e_fastFb.isArrow, let arrowThis = e_callObj.arrowThisVal {
                             newFrame.thisVal = arrowThis
@@ -14249,7 +14449,7 @@ nonisolated struct JeffJSInterpreter {
                             bufOwned = true
                         }
                         frame = newFrame
-                        ctx.currentFrame = frame
+                        ctx.currentFrameU = frame.unmanaged
                         frame.spBase = 0
                         buf = newBuf
                         bufCapacity = newBufCap
@@ -14388,7 +14588,7 @@ nonisolated struct JeffJSInterpreter {
                 // never given back by the epilogue (it releases only the
                 // current frame's buffer). Releasing the base claim drops
                 // everything above it (JeffJSRuntime.releaseInterpBufSlow).
-                if frame !== baseFrame, rt.vsEnabled, let entryBuf = baseFrame.buf {
+                if frame.unmanaged.toOpaque() != baseFrame.unmanaged.toOpaque(), rt.vsEnabled, let entryBuf = baseFrame.buf {
                     rt.releaseInterpBufSlow(entryBuf, capacity: 0)
                     bufOwned = false
                 }
@@ -14427,7 +14627,7 @@ nonisolated struct JeffJSInterpreter {
                     // Run frame epilogue for current (callee) frame
                     if frame.hasLiveVarRefs {
                         jeffJS_syncForDetach(frame, buf, varBase)
-                        jeffJS_detachFrameVarRefs(frame, rt)
+                        frame.with { jeffJS_detachFrameVarRefs($0, rt) }
                     }
                     // Same epilogue as return_: the unwound frame's variable
                     // slots are nobody else's to free (the caller-stack scan
@@ -14437,8 +14637,8 @@ nonisolated struct JeffJSInterpreter {
                     // of all.
                     do { var i = varBase; let n = spBase; while i < n { buf[i].freeValueFast(); i += 1 } }
                     if fb.copiesArgs { jeffJS_releaseOwnedArgSlots(frame, bufOwned: bufOwned) }
-                    ctx.currentFrame = frame.prevFrame
-                    rt.releaseFrameU(Unmanaged.passUnretained(frame))
+                    ctx.currentFrameU = frame.prevFrameU
+                    rt.releaseFrameU(frame.unmanaged)
                     if bufOwned { rt.releaseInterpBuf(buf, capacity: bufCapacity) }
                     // Restore caller state
                     let saved = rt.inlinePop()
@@ -14532,7 +14732,7 @@ nonisolated struct JeffJSInterpreter {
         // and detach walk cost real time at 250k calls/sec.
         if frame.hasLiveVarRefs, !suspendedHere {
             jeffJS_syncForDetach(frame, buf, varBase)
-            jeffJS_detachFrameVarRefs(frame, rt)
+            frame.with { jeffJS_detachFrameVarRefs($0, rt) }
         }
 
         // Release the variable slots (QuickJS frees var_buf at exit), and the
@@ -14614,7 +14814,7 @@ nonisolated struct JeffJSInterpreter {
             }
             // Return frame to pool for reuse (only if no live closures reference it,
             // since closures have already been detached above and copied their values)
-            rt.releaseFrameU(Unmanaged.passUnretained(frame))
+            rt.releaseFrameU(frame.unmanaged)
         }
 
         // Abandon any inline frames left by an abrupt exit (uncatchable
@@ -14657,9 +14857,9 @@ nonisolated private func jeffJS_closeIteratorForUnwind(_ ctx: JeffJSContext, _ i
 /// interp.fastCallEntry; the sync allocated two arrays on every return of a
 /// function whose locals a closure captured (or that built `arguments`).
 @inline(__always)
-nonisolated private func jeffJS_syncForDetach(_ frame: JeffJSStackFrame, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {
+nonisolated private func jeffJS_syncForDetach(_ frame: JeffJSFrameHandle, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {
     if JeffJSRuntime.fastCallEntry, frame.buf != nil { return }
-    jeffJS_syncBufToFrame(frame, buf, varBase)
+    jeffJS_syncBufToFrame(frame.object, buf, varBase)
 }
 
 /// QuickJS `async_func_init`: a suspending activation (generator `yield` /
@@ -14700,7 +14900,7 @@ nonisolated private func jeffJS_suspendActivation(
         frame.ownsBuf = true
     }
     return GeneratorSavedState(pc: pc, sp: sp, buf: own, bufCapacity: cap, varBase: varBase, spBase: spBase,
-                               frame: Unmanaged.passUnretained(frame), funcObj: funcObj, thisVal: thisVal)
+                               frame: frame.unmanaged, funcObj: funcObj, thisVal: thisVal)
 }
 
 /// Retires a resumed activation's own frame from inside the dispatch (an
@@ -14728,7 +14928,7 @@ nonisolated private func jeffJS_retireOwnFrame(_ rt: JeffJSRuntime, _ frame: Jef
         frame.buf = nil
         buf.deallocate()
     }
-    rt.releaseFrameU(Unmanaged.passUnretained(frame))
+    rt.releaseFrameU(frame.unmanaged)
 }
 
 nonisolated private func jeffJS_syncBufToFrame(_ frame: JeffJSStackFrame, _ buf: UnsafeMutablePointer<JeffJSValue>, _ varBase: Int) {

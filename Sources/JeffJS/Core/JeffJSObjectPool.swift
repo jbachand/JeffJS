@@ -122,7 +122,14 @@ nonisolated func jeffJS_recycleFunction(_ o: JeffJSObject) -> Bool {
             if fb.orphanOwned, fb.liveClosures == 0 { rt.queueOrphanBody(fb) }
         }
     }
+    #if JEFFJS_MANUAL_MEMORY
+    // The body's one count goes back (quickjs free_object ->
+    // js_bytecode_function_finalizer: JS_FreeValueRT of function_bytecode),
+    // and a home object with it; no payload enum is built or destroyed.
+    a.resetPayload()
+    #else
     a.payload = .opaque(nil)
+    #endif
     if let t = a.arrowThisVal { a.arrowThisVal = nil; t.freeValue() }
     a.cMagicFast = 0
     a.storedCFunctionLength = 0
@@ -134,7 +141,21 @@ nonisolated func jeffJS_recycleFunction(_ o: JeffJSObject) -> Bool {
         // closure built on this object (createClosure fills it in place).
         if jeffJSLeanClosurePayload { a.clearVarRefsKeepingCapacity(rt) } else { a.setVarRefs([]) }
     }
+    #if JEFFJS_MANUAL_MEMORY
+    // A closure that never grew a property still sits on its realm's closure
+    // root shape (JeffJSContext.closureRootShape): it is parked with it, its
+    // owner count included, and createClosure checks it is still the right
+    // one. A recycled closure then costs no shape reference on either side.
+    // Any other shape (materialised `name`/`length`, a changed prototype)
+    // is left as before.
+    var keepShape = false
+    if let sRaw = o.shapeIdentity, let cU = rt.realmTable[Int(o.realmIndex)] {
+        keepShape = cU._withUnsafeGuaranteedRef { $0.closureRootShapeRaw == sRaw }
+    }
+    if !keepShape { jeffJS_dropShapeForRecycle(o, rt) }
+    #else
     jeffJS_dropShapeForRecycle(o, rt)
+    #endif
     // Keep the slot bit: the side box stays with the parked closure.
     o._flags = JeffJSObject.flagExtensible | (o._flags & JeffJSObject.flagSlotIsAux)
     o.mark = JeffJSGCMark.white
@@ -229,7 +250,16 @@ nonisolated extension JeffJSRuntime {
         objectPool.removeAll()
         arrayPool.forEachUnretained { $0.release() }
         arrayPool.removeAll()
+        #if JEFFJS_MANUAL_MEMORY
+        // A parked closure may still sit on its closure root shape
+        // (jeffJS_recycleFunction): give the owner count back first.
+        functionPool.forEachUnretained { u in
+            u._withUnsafeGuaranteedRef { o in jeffJS_dropShapeForRecycle(o, self) }
+            u.release()
+        }
+        #else
         functionPool.forEachUnretained { $0.release() }
+        #endif
         functionPool.removeAll()
         arrayStoragePool.removeAll()
         // Parked var-refs hold the runtime (ownerRuntime); each rides its own

@@ -164,7 +164,7 @@ nonisolated func jeffJS_icPolyRead(_ ents: UnsafeMutablePointer<JeffJSICEntry>, 
 /// Miss-path fill for a property found two or three prototypes up (the
 /// primary entry covers own and depth-1): walks from `receiver`.
 @inline(never)
-nonisolated func jeffJS_icFillDeep(_ fb: JeffJSFunctionBytecode, _ pc: Int, _ receiver: JeffJSObject, _ atom: UInt32) {
+nonisolated func jeffJS_icFillDeep(_ fb: JeffJSFBHandle, _ pc: Int, _ receiver: JeffJSObject, _ atom: UInt32) {
     guard let rshape = receiver.shape else { return }
     // A megamorphic site, or one that already lists this receiver shape, gains nothing from the
     // walk (three.js: ~15 % of a frame was this walk and its chain array on every miss).
@@ -1261,6 +1261,10 @@ nonisolated class JeffJSFunctionBytecode {
 
     /// A lazily compiled function whose body is not compiled yet.
     @inline(__always) var isLazyPending: Bool { lazyInfo?.isPending ?? false }
+    /// `lazyInfo` without a retain (closure creation reads it per closure).
+    @inline(__always) final var lazyInfoU: Unmanaged<JeffJSLazyFunctionInfo>? {
+        unsafeBitCast(lazyInfo, to: UnsafeRawPointer?.self).map { Unmanaged<JeffJSLazyFunctionInfo>.fromOpaque($0) }
+    }
 
     /// Drop the raw copy of `bytecode` materialized by `bytecodePtr` (lazy
     /// compilation replaced the bytecode of this object).
@@ -2089,8 +2093,11 @@ nonisolated final class JeffJSVarRef: JeffJSGCObjectHeader {
     /// `gcSeedVarRefs`.
     var isDetached: Bool {
         didSet {
-            if isDetached, !oldValue, gcListIndex == -1, let rt = ownerRuntime {
-                addGCObject(rt, self)
+            // The runtime is borrowed: `let rt = ownerRuntime` was a
+            // retain/release pair per detached var-ref (every captured
+            // variable of every closure that outlives its frame).
+            if isDetached, !oldValue, gcListIndex == -1, let rtU = ownerRuntimeU {
+                rtU._withUnsafeGuaranteedRef { addGCObject($0, self) }
             }
         }
     }
@@ -2234,7 +2241,15 @@ nonisolated final class JeffJSStackFrame {
     /// unowned(unsafe): frames are immortal — owned by the runtime's
     /// `allFrames` list and recycled through a free list — so caller links
     /// need no retain/release (two pairs per call otherwise).
-    unowned(unsafe) var prevFrame: JeffJSStackFrame? = nil
+    /// Stored unmanaged (`prevFrameU`): a read of an `unowned(unsafe)`
+    /// reference is a strong copy, so `ctx.currentFrame = frame.prevFrame`
+    /// was a retain/release pair on every return. The dispatch copies the
+    /// link (JeffJSFrameRef.swift); `prevFrame` is the view for cold readers.
+    var prevFrameU: Unmanaged<JeffJSStackFrame>? = nil
+    var prevFrame: JeffJSStackFrame? {
+        @inline(__always) get { prevFrameU?.takeUnretainedValue() }
+        @inline(__always) set { prevFrameU = newValue.map { Unmanaged.passUnretained($0) } }
+    }
     /// Free-list link (JeffJSRuntime.frameFreeListU); trivially copyable.
     var nextFree: Unmanaged<JeffJSStackFrame>? = nil
     /// True once argBuf/varBuf were materialised for this activation.
@@ -2925,6 +2940,15 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
                 a.cFuncFast = nil
                 _flags &= ~JeffJSObject.flagHasCFunc
             }
+            #if JEFFJS_MANUAL_MEMORY
+            // The side box keeps a `.bytecodeFunc` payload's body and home
+            // object, not its var-ref list (the closure's var-refs are its
+            // raw buffer): install a list the writer has not installed yet.
+            if case .bytecodeFunc(_, let vrs, _) = newValue, !vrs.isEmpty,
+               (_flags & JeffJSObject.flagHasVarRefs) == 0 {
+                varRefsFast = vrs
+            }
+            #endif
         }
     }
 
@@ -3006,6 +3030,32 @@ nonisolated final class JeffJSObject: JeffJSGCObjectHeader {
             _flags &= ~JeffJSObject.flagHasCFunc
         }
     }
+
+    #if JEFFJS_MANUAL_MEMORY
+    /// quickjs js_closure2: `p->u.func.function_bytecode = b` (one count on
+    /// the body), `home_object`, and whether calls may take the fast paths
+    /// (`fbFast`). For a freshly created or recycled closure; see the side
+    /// box for why the payload enum is not built.
+    @inline(__always)
+    final func installClosureBody(_ fb: JeffJSFunctionBytecode, home: JeffJSObject?, fast: Bool) {
+        if _auxU == nil { _ = makeAux() }
+        _auxU.unsafelyUnwrapped._withUnsafeGuaranteedRef { a in
+            a.setClosureBody(fb, home: home)
+            a.setFbFastToBody(fast)
+            if (_flags & JeffJSObject.flagHasCFunc) != 0 { a.cFuncFast = nil }
+        }
+        _flags &= ~JeffJSObject.flagHasCFunc
+    }
+    /// The closure's home object (nil for anything else).
+    final var closureHome: JeffJSObject? {
+        auxRead(nil) { $0.closureHome }
+    }
+    /// `fbFast = <the closure's body>` (see installClosureBody).
+    @inline(__always)
+    final func setFbFastToBody() {
+        if let u = _auxU { u._withUnsafeGuaranteedRef { $0.setFbFastToBody(true) } }
+    }
+    #endif
 
     // -- Denormalized .bytecodeFunc payload (call-path fast fields) -----------
     // Pattern-matching `case .bytecodeFunc(...) = payload` copies the enum
@@ -3271,8 +3321,124 @@ nonisolated final class JeffJSObjectAuxRare {
 nonisolated final class JeffJSObjectAux: JeffJSSideSlot {
     // Layout: what a closure uses inline (payload, body, var-refs and their
     // raw mirror, captured `this`, accessor slots), the rest in `rare`.
+    #if JEFFJS_MANUAL_MEMORY
+    // quickjs keeps a closure's body in `u.func.function_bytecode` and
+    // touches one reference count per closure (js_closure2 dups it,
+    // free_object / js_bytecode_function_finalizer gives it back). Building
+    // `.bytecodeFunc(body, [], home)` in the payload enum per closure and
+    // destroying it per death cost about nine retain/release calls (the
+    // body, the empty var-ref array and the home object on both sides, the
+    // enum's outlined copy and destroy), and `fbFast` was a second counted
+    // reference to the same body. Under JEFFJS_MANUAL_MEMORY the body is one
+    // field on one manual retain, `fbFast` is an uncounted mirror of it, and
+    // `payload` presents the pair as the `.bytecodeFunc` case to every
+    // reader and takes a `.bytecodeFunc` assignment apart. A home object
+    // (methods; rare) stays in `_payload` as `.bytecodeFunc(nil, [], home)`.
+    // Field order: the box stays at 128 bytes (ObjectSizeRefLeakTests).
+    private var _payload: JeffJSObjectPayload = .opaque(nil)
+    /// `_payload` is not `.opaque(nil)`.
+    private var _payloadSet: Bool = false
+    /// The body when it may take the interpreter's fast call paths (the old
+    /// `fbFast` reference), uncounted: `closureFBU` keeps it alive.
+    private var fbFastRaw: UnsafeRawPointer? = nil
+    /// The closure's body ([[ECMAScriptCode]]), on one manual retain given
+    /// back by `clearClosureBody` / deinit.
+    private(set) var closureFBU: Unmanaged<JeffJSFunctionBytecode>? = nil
+
+    // Out of line on purpose: every hot reader has its own accessor
+    // (closureFBU, fbFastU, taU, cFuncFast ...), and inlined into the
+    // dispatch at each of its cold `payload` matches the synthesising
+    // getter grew callInternalRaw by 8 KB (calls +10 % from register
+    // pressure alone).
+    var payload: JeffJSObjectPayload {
+        @inline(never) get {
+            if let u = closureFBU {
+                if _payloadSet, case .bytecodeFunc(_, _, let home) = _payload {
+                    return .bytecodeFunc(functionBytecode: u.takeUnretainedValue(), varRefs: [], homeObject: home)
+                }
+                return .bytecodeFunc(functionBytecode: u.takeUnretainedValue(), varRefs: [], homeObject: nil)
+            }
+            return _payload
+        }
+        @inline(never) set {
+            if case .bytecodeFunc(let fb, _, let home) = newValue, let fb {
+                setClosureBody(fb, home: home)
+            } else {
+                clearClosureBody()
+                _payload = newValue
+                if case .opaque(let o) = newValue, o == nil { _payloadSet = false } else { _payloadSet = true }
+            }
+        }
+    }
+
+    /// Make `fb` the closure's body (kept when it already is) and `home` its
+    /// home object. `fbFast` survives only when the body does.
+    @inline(__always)
+    final func setClosureBody(_ fb: JeffJSFunctionBytecode, home: JeffJSObject?) {
+        let nu = Unmanaged.passUnretained(fb)
+        if let old = closureFBU {
+            if old.toOpaque() != nu.toOpaque() {
+                closureFBU = nu.retain()
+                fbFastRaw = nil
+                old.release()
+            }
+        } else {
+            closureFBU = nu.retain()
+        }
+        if let home {
+            _payload = .bytecodeFunc(functionBytecode: nil, varRefs: [], homeObject: home)
+            _payloadSet = true
+        } else if _payloadSet {
+            _payload = .opaque(nil)
+            _payloadSet = false
+        }
+    }
+
+    /// Give the body (and the home object) back: the object is no longer a
+    /// bytecode function, or is being parked.
+    @inline(__always)
+    final func clearClosureBody() {
+        fbFastRaw = nil
+        guard let old = closureFBU else { return }
+        closureFBU = nil
+        if _payloadSet { _payload = .opaque(nil); _payloadSet = false }
+        old.release()
+    }
+
+    /// `payload = .opaque(nil)` without building or destroying an enum for
+    /// a closure (jeffJS_recycleFunction).
+    @inline(__always)
+    final func resetPayload() {
+        clearClosureBody()
+        if _payloadSet { _payload = .opaque(nil); _payloadSet = false }
+    }
+
+    /// The home object without copying the enum for a closure that has none.
+    final var closureHome: JeffJSObject? {
+        if closureFBU != nil, _payloadSet, case .bytecodeFunc(_, _, let home) = _payload { return home }
+        return nil
+    }
+
+    var fbFast: JeffJSFunctionBytecode? {
+        get { fbFastRaw.map { Unmanaged<JeffJSFunctionBytecode>.fromOpaque($0).takeUnretainedValue() } }
+        set {
+            guard let nv = newValue else { fbFastRaw = nil; return }
+            // Every writer installs the payload first: only the closure's own
+            // body can be mirrored (nothing else keeps another one alive).
+            let raw = UnsafeRawPointer(Unmanaged.passUnretained(nv).toOpaque())
+            let same = closureFBU.map { UnsafeRawPointer($0.toOpaque()) } == raw
+            assert(same, "fbFast set to a body the payload does not hold")
+            fbFastRaw = same ? raw : nil
+        }
+    }
+    /// `fbFast = closureFB` for a body just installed by `setClosureBody`.
+    @inline(__always) final func setFbFastToBody(_ on: Bool) {
+        fbFastRaw = on ? closureFBU.map { UnsafeRawPointer($0.toOpaque()) } : nil
+    }
+    #else
     var payload: JeffJSObjectPayload = .opaque(nil)
     var fbFast: JeffJSFunctionBytecode? = nil
+    #endif
     /// Unretained mirror of a `.typedArray` payload (the payload owns it); set by the payload setter.
     var taU: Unmanaged<JeffJSTypedArray>? = nil
     /// The closure's var-refs: a raw buffer that owns one hold per non-nil entry
@@ -3319,6 +3485,13 @@ nonisolated final class JeffJSObjectAux: JeffJSSideSlot {
     /// first field (an optional class reference), so its bits are read
     /// straight from the storage once the case is known. Nil for any other
     /// case or a nil body.
+    #if JEFFJS_MANUAL_MEMORY
+    var payloadBytecodeFuncU: Unmanaged<JeffJSFunctionBytecode>? { closureFBU }
+    /// Unretained view of `fbFast`: one load.
+    var fbFastU: Unmanaged<JeffJSFunctionBytecode>? {
+        @inline(__always) get { fbFastRaw.map { Unmanaged<JeffJSFunctionBytecode>.fromOpaque($0) } }
+    }
+    #else
     var payloadBytecodeFuncU: Unmanaged<JeffJSFunctionBytecode>? {
         // The mirror is set for every compiled body (createClosure,
         // compileLazy); a closure over a body still pending lazy compilation
@@ -3333,6 +3506,7 @@ nonisolated final class JeffJSObjectAux: JeffJSSideSlot {
             unsafeBitCast(fbFast, to: UnsafeRawPointer?.self).map { Unmanaged<JeffJSFunctionBytecode>.fromOpaque($0) }
         }
     }
+    #endif
     /// An array's element store while the array also needs this box.
     /// `rare` without a retain: `rare?.field` materialised a strong
     /// reference to the box, a retain/release pair per read (two per native
@@ -3446,7 +3620,11 @@ nonisolated final class JeffJSObjectAux: JeffJSSideSlot {
     /// Release the var-refs but keep the buffer (a parked closure).
     func clearVarRefsKeepingCapacity(_ rt: JeffJSRuntime? = nil) { releaseVarRefs(rt) }
 
+    #if JEFFJS_MANUAL_MEMORY
+    deinit { releaseVarRefs(); varRefsRaw?.deallocate(); closureFBU?.release() }
+    #else
     deinit { releaseVarRefs(); varRefsRaw?.deallocate() }
+    #endif
 }
 
 nonisolated extension JeffJSObject {
@@ -4292,6 +4470,8 @@ nonisolated struct JeffJSObj {
         nonmutating set { _obj.shape = newValue }
     }
     @inline(__always) var shapeIdentity: UnsafeRawPointer? { _with { $0.shapeIdentity } }
+    /// The shape without a retain (see JeffJSObject.shapeU).
+    @inline(__always) var shapeU: Unmanaged<JeffJSShape>? { _with { $0.shapeU } }
 
     // Split property storage (zero-ARC handle): index directly on _obj so the
     // ContiguousArray struct is never copied (no buffer retain).
