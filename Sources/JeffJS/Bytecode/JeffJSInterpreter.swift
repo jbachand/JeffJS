@@ -1987,6 +1987,64 @@ nonisolated extension JeffJSContext {
     /// 2. Create a new object with that prototype.
     /// 3. Call the constructor with the new object as `this`.
     /// 4. If the constructor returns an object, use it; otherwise use the new object.
+    /// `[[Construct]]` with the arguments as `argv[0 ..< argc]` (borrowed: the
+    /// callee dups what it keeps), the interpreter's entry for `new F(...)`. A
+    /// bytecode constructor of this realm runs with no argument array and no
+    /// payload match (its body is `fbFast`); any other callee (a builtin, a
+    /// bound function, a proxy, another realm, a function still to be compiled)
+    /// takes `callConstructor(_:newTarget:args:)` with an array built from the
+    /// pointer, so behaviour is identical. Mirrors quickjs
+    /// `JS_CallConstructorInternal` (argc / argv).
+    func callConstructor(_ funcVal: JeffJSValue, newTarget: JeffJSValue,
+                         argv: UnsafePointer<JeffJSValue>?, argc: Int) -> JeffJSValue {
+        guard let fo = funcVal.obj, fo.realmIndex == realmIndex, fo.isConstructor, let fbU = fo.fbFastU else {
+            return callConstructor(funcVal, newTarget: newTarget,
+                                   args: argc == 0 ? [] : Array(UnsafeBufferPointer(start: argv, count: argc)))
+        }
+        return constructBytecode(funcVal, derived: fbU._withUnsafeGuaranteedRef { $0.isDerivedClassConstructor },
+                                 newTarget: newTarget, argv: argv, argc: argc)
+    }
+
+    /// The bytecode-function tail of `[[Construct]]` (ES §10.2.2): a derived
+    /// class constructor runs with `this` uninitialised until `super()`
+    /// constructs it; a base constructor gets an object whose prototype is
+    /// `newTarget.prototype` and returns it unless it returns an object itself.
+    private func constructBytecode(_ funcVal: JeffJSValue, derived: Bool, newTarget: JeffJSValue,
+                                   argv: UnsafePointer<JeffJSValue>?, argc: Int) -> JeffJSValue {
+        // Derived class constructor: `this` is uninitialised until super()
+        // constructs it (see init_this); the activation epilogue returns it.
+        if derived {
+            return JeffJSInterpreter.callInternalRaw(ctx: self, funcObj: funcVal, thisVal: .uninitialized,
+                                                     argv: argv, argc: argc,
+                                                     flags: JS_CALL_FLAG_CONSTRUCTOR, newTarget: newTarget)
+        }
+        // 1. OrdinaryCreateFromConstructor(newTarget): the new object's
+        //    [[Prototype]] is newTarget.prototype (=== F.prototype for plain
+        //    `new F()`), falling back to Object.prototype.
+        let protoSource = newTarget.isObject ? newTarget : funcVal
+        let protoVal = getProperty(obj: protoSource, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue)
+        if protoVal.isException { return .exception }
+        let newObj: JeffJSValue
+        if protoVal.isObject {
+            newObj = newObjectProto(proto: protoVal)   // takes its own reference to the prototype
+        } else {
+            // If .prototype is not an object, use Object.prototype
+            newObj = newObject()
+        }
+        protoVal.freeValue()
+        // 2. Call the constructor with the new object as `this`
+        let result = JeffJSInterpreter.callInternalRaw(ctx: self, funcObj: funcVal, thisVal: newObj,
+                                                       argv: argv, argc: argc,
+                                                       flags: JS_CALL_FLAG_CONSTRUCTOR, newTarget: newTarget)
+        if result.isException { newObj.freeValue(); return .exception }
+        // 3. If the constructor explicitly returned an object, use it (and
+        //    release the pre-created one)
+        if result.isObject { newObj.freeValue(); return result }
+        result.freeValue()
+        // 4. Otherwise return the newly created object
+        return newObj
+    }
+
     func callConstructor(_ funcVal: JeffJSValue, newTarget: JeffJSValue,
                          args: [JeffJSValue]) -> JeffJSValue {
         guard let obj = funcVal.toObject() else {
@@ -2059,40 +2117,10 @@ nonisolated extension JeffJSContext {
         guard case .bytecodeFunc(let fbOpt, _, _) = obj.payload, obj.isConstructor else {
             return throwNotAConstructor(funcVal)
         }
-        // Derived class constructor: `this` is uninitialised until super()
-        // constructs it (see init_this); the activation epilogue returns it.
-        if let fb = fbOpt, fb.isDerivedClassConstructor {
-            return JeffJSInterpreter.callInternal(ctx: self, funcObj: funcVal,
-                                                  thisVal: .uninitialized, args: args,
-                                                  flags: JS_CALL_FLAG_CONSTRUCTOR,
-                                                  newTarget: newTarget)
+        let derived = fbOpt?.isDerivedClassConstructor ?? false
+        return args.withUnsafeBufferPointer { b in
+            constructBytecode(funcVal, derived: derived, newTarget: newTarget, argv: b.baseAddress, argc: b.count)
         }
-        // 1. OrdinaryCreateFromConstructor(newTarget): the new object's
-        //    [[Prototype]] is newTarget.prototype (=== F.prototype for plain
-        //    `new F()`), falling back to Object.prototype.
-        let protoSource = newTarget.isObject ? newTarget : funcVal
-        let protoVal = getProperty(obj: protoSource, atom: JeffJSAtomID.JS_ATOM_prototype.rawValue)
-        if protoVal.isException { return .exception }
-        let newObj: JeffJSValue
-        if protoVal.isObject {
-            newObj = newObjectProto(proto: protoVal)   // takes its own reference to the prototype
-        } else {
-            // If .prototype is not an object, use Object.prototype
-            newObj = newObject()
-        }
-        protoVal.freeValue()
-        // 2. Call the constructor with the new object as `this`
-        let result = JeffJSInterpreter.callInternal(ctx: self, funcObj: funcVal,
-                                                     thisVal: newObj, args: args,
-                                                     flags: JS_CALL_FLAG_CONSTRUCTOR,
-                                                     newTarget: newTarget)
-        if result.isException { newObj.freeValue(); return .exception }
-        // 3. If the constructor explicitly returned an object, use it (and
-        //    release the pre-created one)
-        if result.isObject { newObj.freeValue(); return result }
-        result.freeValue()
-        // 4. Otherwise return the newly created object
-        return newObj
     }
 
     /// Re-prototypes a builtin constructor's freshly built instance to
@@ -10077,6 +10105,26 @@ nonisolated struct JeffJSInterpreter {
                 frame.curPC = pc   // so Error stacks can name this frame's line
                 ctx.lastGetFieldAtom = 0
                 let argc = Int(readU16(bc, pc &+ 1))
+                // Stack: constructor, new.target, arguments. The arguments stay
+                // where they are for the call (borrowed, as for a function
+                // call): an array per `new` was a malloc and a free.
+                let ccArgs = sp &- argc
+                if ccArgs &- 2 >= spBase {
+                    let newTarget = buf[ccArgs &- 1], funcVal = buf[ccArgs &- 2]
+                    let result = ctx.callConstructor(funcVal, newTarget: newTarget, argv: buf + ccArgs, argc: argc)
+                    var ci = ccArgs
+                    while ci < sp { buf[ci].freeValue(); ci &+= 1 }
+                    funcVal.freeValue(); newTarget.freeValue()
+                    sp = ccArgs &- 2
+                    if result.isException {
+                        retVal = .exception
+                        break dispatchLoop
+                    }
+                    buf[sp] = result; sp &+= 1
+                    pc &+= 3
+                    continue dispatchLoop
+                }
+                // Fewer operands than the opcode needs (malformed bytecode): the guarded pops report it.
                 var callArgs = [JeffJSValue](repeating: .undefined, count: argc)
                 for i in stride(from: argc - 1, through: 0, by: -1) { callArgs[i] = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc) }
                 let newTarget = jeffJS_pop(buf, &sp, spBase, ctx, fb, pc)

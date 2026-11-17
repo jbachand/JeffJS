@@ -1650,3 +1650,23 @@ copy, 11 M pairs: the measured dead end of step 3), string concat 30 M and strin
 `callFunction`'s native path 12 M, `findAtom(jsString:)` 11 M, `jeffJS_objectAddShapeProperty` 11 M, the sort
 comparator closure 10 M. By time (in-process sampler, realworld): retain/release 17 %, malloc/free 13 %, the three
 dispatch functions 28 %.
+
+### `new` with the arguments on the stack (2026-11-16, `perf/construct-argv`)
+
+`new B(i)` on a two-level class cost 15 550 instructions against QuickJS's 3 250 (in-process sampler: 12 % of the
+time in `Array.init(repeating:count:)`). `call_constructor` built a `[JeffJSValue]` per `new`, and
+`callConstructor` matched the callee's payload four times before reaching the bytecode case, each match
+synthesising and destroying the closure payload. Now the opcode leaves the arguments where they are and calls
+`callConstructor(_:newTarget:argv:argc:)` (quickjs `JS_CallConstructorInternal`, argc / argv): a bytecode
+constructor of this realm (`fbFast`) goes straight to `constructBytecode`, which the array entry shares; every other
+callee takes the array entry as before.
+
+| instructions per `new` (whole loop, 1.2 M constructions) | before | after | qjs |
+|---|---:|---:|---:|
+| `new B(i)` (derived class, `super`, a getter read) | 15 552 | 10 849 | 3 250 |
+| `new A(i)` (plain function) | 8 386 | 6 270 | 1 724 |
+
+Both builds: 433 tests, the 4 known failing cases only; AddressSanitizer clean. Test: the `constructors` case of
+`ManualMemoryPropertyTests`. Still 3.3 to 3.6× QuickJS: a constructor runs as a nested activation (about 600
+instructions of prologue and epilogue in `callInternalRaw`, exact count 4 016 per `new A(i)` in a warm loop) rather
+than as an inline frame, and a quarter of the time is allocation.

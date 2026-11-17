@@ -85,6 +85,29 @@ final class ManualMemoryPropertyTests: XCTestCase {
               return s.length + ":" + n;
             })()
             """#, #""80:369140""#),
+        // `new` with the arguments left on the stack (quickjs JS_CallConstructorInternal, argc / argv)
+        ("constructors", #"""
+            (function () {
+              function F(a, b) { this.a = a; this.b = b === undefined ? "u" : b; this.n = arguments.length; }
+              function G(a) { this.a = a; return { other: a }; }
+              function H(a) { this.a = a; return 5; }
+              class A { constructor(x, y) { this.x = x; this.y = y; this.t = new.target === A ? "A" : new.target.name; } }
+              class B extends A { constructor(x) { super(x, x + 1); this.z = 1; } get sum() { return this.x + this.y + this.z; } }
+              class C extends B { }
+              var Bd = F.bind(null, 7), out = [], s = 0;
+              for (var i = 0; i < 400; i++) {
+                var f = new F(i), f2 = new F(i, 2, 3, 4), g = new G(i), h = new H(i), b = new B(i), c = new C(i), d = new Bd(i);
+                s += f.a + f.n + f2.n + f2.b + g.other + (g.a === undefined ? 1 : 0) + h.a + b.sum + c.sum + d.a + d.b;
+                if (i === 399) out.push(f.b, b.t, c.t, b instanceof A, c instanceof B, g instanceof G, h instanceof H, Object.getPrototypeOf(d) === F.prototype);
+              }
+              var rc = Reflect.construct(F, [1, 2], B); out.push(Object.getPrototypeOf(rc) === B.prototype, rc.n);
+              var errs = [];
+              [function () { new (function* () {})(); }, function () { new (() => 1)(); }, function () { new Math.max(); }, function () { A(); }, function () { new (class extends A { constructor() { this.q = 1; } })(); }, function () { new 5; }]
+                .forEach(function (t) { try { t(); errs.push("no"); } catch (e) { errs.push(e instanceof TypeError ? "T" : e instanceof ReferenceError ? "R" : "?"); } });
+              var deep = 0; function D(n) { this.n = n; if (n > 0) this.c = new D(n - 1); deep++; } new D(100);
+              return s + ":" + out.join(",") + ":" + errs.join("") + ":" + deep;
+            })()
+            """#, #""646000:u,B,C,true,true,false,true,true,true,2:TTTTRT:101""#),
     ]
 
     private func run(_ ctx: JeffJSContext, _ name: String, _ src: String, _ want: String, _ label: String) {
