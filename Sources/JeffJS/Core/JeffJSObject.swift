@@ -130,8 +130,27 @@ nonisolated struct JeffJSPolyEntry {
 }
 
 nonisolated final class JeffJSPolySite {
-    var entries: [JeffJSPolyEntry] = []
+    /// The list (the owner of record: `has`, `releaseAll`, the writers).
+    var entries: [JeffJSPolyEntry] = [] { didSet { syncRaw() } }
     var megamorphic = false
+    /// `entries` mirrored into a malloc'd buffer for the hit path: `polyRead`
+    /// reads it through an unretained site, where reading the array retained
+    /// and released its buffer on every polymorphic property read. At most
+    /// `JeffJSInlineCache.polyLimit` plain-pointer entries.
+    private(set) var raw: UnsafeMutablePointer<JeffJSPolyEntry>? = nil
+    private(set) var rawCount: Int = 0
+    private var rawCapacity: Int = 0
+    private func syncRaw() {
+        let n = entries.count
+        if n > rawCapacity {
+            raw?.deallocate()
+            rawCapacity = max(8, n)
+            raw = UnsafeMutablePointer<JeffJSPolyEntry>.allocate(capacity: rawCapacity)
+        }
+        if let r = raw { for i in 0..<n { r[i] = entries[i] } }
+        rawCount = n
+    }
+    deinit { raw?.deallocate() }
     @inline(__always) func has(_ rs: UnsafeRawPointer) -> Bool {
         for e in entries where e.receiverShape == rs { return true }
         return false
@@ -150,15 +169,17 @@ nonisolated final class JeffJSPolySite {
 
 nonisolated enum JeffJSPolyHit {
     case value(JeffJSValue)      // borrowed
-    case getter(JeffJSObject)
+    case getter(JeffJSObj)       // borrowed: the accessor slot holds it
 }
 
 /// Side-list read through the raw entry pointer a trace holds (slot 0
 /// carries the table).
 @inline(__always)
-nonisolated func jeffJS_icPolyRead(_ ents: UnsafeMutablePointer<JeffJSICEntry>, _ pc: Int, _ receiver: JeffJSObject) -> JeffJSPolyHit? {
+nonisolated func jeffJS_icPolyRead(_ ents: UnsafeMutablePointer<JeffJSICEntry>, _ pc: Int, _ receiver: JeffJSObj) -> JeffJSPolyHit? {
     guard let tp = ents[0].shapePtr else { return nil }
-    return Unmanaged<JeffJSInlineCache>.fromOpaque(tp)._withUnsafeGuaranteedRef { $0.polyRead(pc, receiver) }
+    return Unmanaged<JeffJSInlineCache>.fromOpaque(tp)._withUnsafeGuaranteedRef { ic in
+        receiver._with { ic.polyRead(pc, $0) }
+    }
 }
 
 /// Miss-path fill for a property found two or three prototypes up (the
@@ -199,13 +220,13 @@ nonisolated func jeffJS_icFillDeep(_ fb: JeffJSFBHandle, _ pc: Int, _ receiver: 
 /// (a class `get x()` lives on the prototype), under the same shape checks
 /// as `jeffJS_icProtoHit`; nil for a data slot or a stale entry.
 @inline(__always)
-nonisolated func jeffJS_icProtoGetter(_ entry: JeffJSICEntry) -> JeffJSObject? {
+nonisolated func jeffJS_icProtoGetter(_ entry: JeffJSICEntry) -> JeffJSObj? {
     guard let hp = entry.holderPtr, let hsp = entry.holderShapePtr else { return nil }
-    return Unmanaged<JeffJSObject>.fromOpaque(hp)._withUnsafeGuaranteedRef { h -> JeffJSObject? in
+    return Unmanaged<JeffJSObject>.fromOpaque(hp)._withUnsafeGuaranteedRef { h -> JeffJSObj? in
         guard h.shapeIdentity == hsp, entry.propOffset >= 0,
               entry.propOffset < h.propValues.count,
               let ex = h.extra(at: entry.propOffset), ex.kind == .getset else { return nil }
-        return ex.getter
+        return ex.getterH
     }
 }
 
@@ -358,6 +379,9 @@ nonisolated final class JeffJSInlineCache {
 
     /// Side lists by slot, allocated on the first site that needs one.
     var polyBySlot: [JeffJSPolySite?]? = nil
+    /// `polyBySlot` as unretained pointers, one per slot (the array above
+    /// owns the sites), so the hit path loads a site without a retain.
+    private var polyRaw: UnsafeMutablePointer<Unmanaged<JeffJSPolySite>?>? = nil
     static let polyLimit = 8   // a linear scan of pointer compares; sites with more go megamorphic
 
     /// 0 / 1 / 2 for `JeffJSICEntry.polyState`.
@@ -371,10 +395,16 @@ nonisolated final class JeffJSInlineCache {
     private func polySite(_ pc: Int) -> JeffJSPolySite? {
         let idx = slot(pc)
         guard idx != 0 else { return nil }
-        if polyBySlot == nil { polyBySlot = [JeffJSPolySite?](repeating: nil, count: entries.count) }
+        if polyBySlot == nil {
+            polyBySlot = [JeffJSPolySite?](repeating: nil, count: entries.count)
+            let raw = UnsafeMutablePointer<Unmanaged<JeffJSPolySite>?>.allocate(capacity: entries.count)
+            raw.initialize(repeating: nil, count: entries.count)
+            polyRaw = raw
+        }
         if let s = polyBySlot![idx] { return s.megamorphic ? nil : s }
         let s = JeffJSPolySite()
         polyBySlot![idx] = s
+        polyRaw.unsafelyUnwrapped[idx] = Unmanaged.passUnretained(s)
         return s
     }
 
@@ -454,43 +484,58 @@ nonisolated final class JeffJSInlineCache {
     }
 
     /// Side-list read for `receiver` at `pc`: the data value (borrowed) or
-    /// the getter of an accessor slot; nil on no match.
+    /// the getter of an accessor slot (borrowed); nil on no match.
+    /// No reference is counted on this path: the site and its entries are
+    /// read through raw mirrors, the prototypes on the way through their
+    /// raw addresses (the shapes own them), the holder is borrowed.
     @inline(never)
     func polyRead(_ pc: Int, _ receiver: JeffJSObject) -> JeffJSPolyHit? {
-        guard let sites = polyBySlot, let site = sites[slot(pc)], let rsid = receiver.shapeIdentity else { return nil }
-        return site.entries.withUnsafeBufferPointer { b -> JeffJSPolyHit? in
+        guard let sites = polyRaw, let siteU = sites[slot(pc)], let rsid = receiver.shapeIdentity else { return nil }
+        return siteU._withUnsafeGuaranteedRef { site -> JeffJSPolyHit? in
+            guard let b = site.raw else { return nil }
+            let n = site.rawCount
             var i = 0
-            let n = b.count
             while i < n {
                 if b[i].receiverShape == rsid {
-                    let holderObj: JeffJSObject
-                    if let hp = b[i].holder {
-                        guard let rshape = receiver.shape, var cur = rshape.proto else { return nil }
-                        if let c1 = b[i].chain1 {
-                            guard cur.shapeIdentity == c1, let s = cur.shape, let next = s.proto else { return nil }
+                    let e = b[i]
+                    var holderRaw = UnsafeRawPointer(Unmanaged.passUnretained(receiver).toOpaque())
+                    if let hp = e.holder {
+                        // receiver -> its prototype (-> chain1's -> chain2's) must be the holder.
+                        guard var cur = receiver.protoRaw else { return nil }
+                        if let c1 = e.chain1 {
+                            guard let next = Self.protoIfShape(cur, c1) else { return nil }
                             cur = next
-                            if let c2 = b[i].chain2 {
-                                guard cur.shapeIdentity == c2, let s2 = cur.shape, let next2 = s2.proto else { return nil }
+                            if let c2 = e.chain2 {
+                                guard let next2 = Self.protoIfShape(cur, c2) else { return nil }
                                 cur = next2
                             }
                         }
-                        guard UnsafeRawPointer(Unmanaged.passUnretained(cur).toOpaque()) == hp,
-                              cur.shapeIdentity == b[i].holderShape else { return nil }
-                        holderObj = cur
-                    } else {
-                        holderObj = receiver
+                        guard cur == hp else { return nil }
+                        holderRaw = cur
                     }
-                    let off = Int(b[i].propOffset)
-                    guard off >= 0, off < holderObj.propCount else { return nil }
-                    if let ex = holderObj.extra(at: off) {
-                        if ex.kind == .getset, let g = ex.getter { return .getter(g) }
-                        return nil
+                    return Unmanaged<JeffJSObject>.fromOpaque(holderRaw)._withUnsafeGuaranteedRef { holderObj -> JeffJSPolyHit? in
+                        if e.holder != nil, holderObj.shapeIdentity != e.holderShape { return nil }
+                        let off = Int(e.propOffset)
+                        guard off >= 0, off < holderObj.propCount else { return nil }
+                        if let ex = holderObj.extra(at: off) {
+                            if ex.kind == .getset, let g = ex.getterH { return .getter(g) }
+                            return nil
+                        }
+                        return .value(holderObj.dataValue(at: off))
                     }
-                    return .value(holderObj.dataValue(at: off))
                 }
                 i += 1
             }
             return nil
+        }
+    }
+
+    /// The prototype of the object at `obj` when that object sits on shape
+    /// `shape` (the prototype is the shape's), else nil. Borrowed.
+    @inline(__always)
+    private static func protoIfShape(_ obj: UnsafeRawPointer, _ shape: UnsafeRawPointer) -> UnsafeRawPointer? {
+        Unmanaged<JeffJSObject>.fromOpaque(obj)._withUnsafeGuaranteedRef { o in
+            o.shapeIdentity == shape ? o.protoRaw : nil
         }
     }
 
@@ -528,6 +573,7 @@ nonisolated final class JeffJSInlineCache {
         Self.liveTables.wrappingSubtract(1, ordering: .relaxed)
         Self.liveBytes.wrappingSubtract(blockBytes, ordering: .relaxed)
         if let sites = polyBySlot { for site in sites { site?.releaseAll() } }
+        polyRaw?.deallocate()
         for entry in entries.dropFirst() {   // slot 0 holds the table pointer, unretained
             if let old = entry.shapePtr {
                 Unmanaged<JeffJSShape>.fromOpaque(old).release()
@@ -645,6 +691,34 @@ nonisolated final class JeffJSInlineCache {
 
 /// Describes a hot loop trace that the fast mini-interpreter can execute.
 /// Created by the compiler's fuseBasicBlocks pass after label resolution.
+/// A `TraceBlockInfo` read through an uncounted reference: the function's
+/// `traceBlocks` dictionary owns the block for as long as the function's
+/// bytecode lives, which is longer than any activation that asks for it.
+nonisolated struct TraceBlockRef {
+    let u: Unmanaged<TraceBlockInfo>
+    @inline(__always) var object: TraceBlockInfo { u.takeUnretainedValue() }
+    @inline(__always) var entryPC: Int { u._withUnsafeGuaranteedRef { $0.entryPC } }
+    @inline(__always) var exitPC: Int { u._withUnsafeGuaranteedRef { $0.exitPC } }
+    @inline(__always) var startPC: Int { u._withUnsafeGuaranteedRef { $0.startPC } }
+    @inline(__always) var hasCalls: Bool { u._withUnsafeGuaranteedRef { $0.hasCalls } }
+    @inline(__always) var hitCount: UInt8 {
+        get { u._withUnsafeGuaranteedRef { $0.hitCount } }
+        nonmutating set { u._withUnsafeGuaranteedRef { $0.hitCount = newValue } }
+    }
+    @inline(__always) var isActive: Bool {
+        get { u._withUnsafeGuaranteedRef { $0.isActive } }
+        nonmutating set { u._withUnsafeGuaranteedRef { $0.isActive = newValue } }
+    }
+    @inline(__always) var deoptCount: UInt16 {
+        get { u._withUnsafeGuaranteedRef { $0.deoptCount } }
+        nonmutating set { u._withUnsafeGuaranteedRef { $0.deoptCount = newValue } }
+    }
+    @inline(__always) var disabled: Bool {
+        get { u._withUnsafeGuaranteedRef { $0.disabled } }
+        nonmutating set { u._withUnsafeGuaranteedRef { $0.disabled = newValue } }
+    }
+}
+
 nonisolated final class TraceBlockInfo {
     /// First bytecode offset of the loop region (lowest backward-jump target
     /// among the merged overlapping loops that form this region)
@@ -1193,6 +1267,13 @@ nonisolated class JeffJSFunctionBytecode {
 
     /// Trace block whose loop head is `pc`, if any.
     @inline(__always) func traceBlock(at pc: Int) -> TraceBlockInfo? {
+        traceBlockRef(at: pc)?.object
+    }
+
+    /// The same block through an uncounted handle (`traceBlocks` owns it):
+    /// the dispatch asks at every backward jump, and a counted result was a
+    /// retain/release pair per loop iteration that enters a trace.
+    @inline(__always) func traceBlockRef(at pc: Int) -> TraceBlockRef? {
         let n = Int(_traceIndexCount)
         if n == 0 { return nil }
         if n < 0 { return _buildTraceIndex(pc) }
@@ -1201,13 +1282,13 @@ nonisolated class JeffJSFunctionBytecode {
         while lo <= hi {
             let mid = (lo + hi) >> 1
             let v = pcs[mid]
-            if v == pc { return infos[mid].takeUnretainedValue() }
+            if v == pc { return TraceBlockRef(u: infos[mid]) }
             if v < pc { lo = mid + 1 } else { hi = mid - 1 }
         }
         return nil
     }
 
-    @inline(never) private func _buildTraceIndex(_ pc: Int) -> TraceBlockInfo? {
+    @inline(never) private func _buildTraceIndex(_ pc: Int) -> TraceBlockRef? {
         guard let blocks = traceBlocks, !blocks.isEmpty else { _traceIndexCount = 0; return nil }
         let sorted = blocks.sorted { $0.key < $1.key }
         let n = sorted.count
@@ -1218,7 +1299,7 @@ nonisolated class JeffJSFunctionBytecode {
             (infos + i).initialize(to: Unmanaged.passUnretained(kv.value))
         }
         _traceIndexPCs = pcs; _traceIndexInfos = infos; _traceIndexCount = Int32(truncatingIfNeeded: n)
-        return blocks[pc]
+        return blocks[pc].map { TraceBlockRef(u: Unmanaged.passUnretained($0)) }
     }
 
     fileprivate func _dropTraceIndex() {
@@ -2475,6 +2556,10 @@ nonisolated struct JeffJSExtraRef {
     var kind: JeffJSPropertyExtra.Kind { with { $0.kind } }
     var getter: JeffJSObject? { with { $0.getter } }
     var setter: JeffJSObject? { with { $0.setter } }
+    /// The accessor's getter / setter as unretained handles (the slot holds
+    /// them): `getter` / `setter` return counted references.
+    var getterH: JeffJSObj? { with { $0.getterRaw }.map { JeffJSObj(UnsafeMutableRawPointer(mutating: $0)) } }
+    var setterH: JeffJSObj? { with { $0.setterRaw }.map { JeffJSObj(UnsafeMutableRawPointer(mutating: $0)) } }
     var varRef: JeffJSVarRef? { with { $0.varRef } }
     var autoRealmAndId: UInt { with { $0.autoRealmAndId } }
     var autoOpaque: Any? { with { $0.autoOpaque } }
@@ -2497,6 +2582,13 @@ nonisolated final class JeffJSPropertyExtra {
     var getter: JeffJSObject? {
         @inline(__always) get { kind == .getset ? _a.map { unsafeDowncast($0, to: JeffJSObject.self) } : nil }
         set { _a = newValue }
+    }
+    /// The getter's / setter's address without a retain (nil for another kind or none).
+    @inline(__always) var getterRaw: UnsafeRawPointer? {
+        kind == .getset ? unsafeBitCast(_a, to: UnsafeRawPointer?.self) : nil
+    }
+    @inline(__always) var setterRaw: UnsafeRawPointer? {
+        kind == .getset ? unsafeBitCast(_b, to: UnsafeRawPointer?.self) : nil
     }
     var setter: JeffJSObject? {
         @inline(__always) get { kind == .getset ? _b.map { unsafeDowncast($0, to: JeffJSObject.self) } : nil }
@@ -4292,9 +4384,10 @@ nonisolated extension JeffJSObject {
     /// ref-type storage. Returns 0 if the object is not a fast array.
     @inline(__always)
     func fastArrayPush(_ value: JeffJSValue) -> UInt32 {
-        // Fast path: ref-type storage already active
-        if let storage = _fastArrayValues {
-            return storage.push(value)
+        // Fast path: ref-type storage already active (borrowed: a strong
+        // local was a retain/release pair per push)
+        if let stU = _fastArrayValuesU {
+            return stU._withUnsafeGuaranteedRef { $0.push(value) }
         }
         // Lazy init: migrate from enum payload to ref-type storage
         guard case .array(_, let vals, let count) = payload else { return 0 }
@@ -4489,7 +4582,9 @@ nonisolated struct JeffJSObj {
     @inline(__always) func extraStrong(at i: Int) -> JeffJSPropertyExtra? { _with { $0.extraStrong(at: i) } }
     @inline(__always) func setExtraSlot(_ i: Int, _ e: JeffJSPropertyExtra?) { _obj.setExtraSlot(i, e) }
     @inline(__always) func propEntry(at i: Int) -> JeffJSProperty { _obj.propEntry(at: i) }
-    @inline(__always) func setPropEntry(at i: Int, _ p: JeffJSProperty) { _obj.setPropEntry(at: i, p) }
+    @inline(__always) func setPropEntry(at i: Int, _ p: JeffJSProperty) { _with { $0.setPropEntry(at: i, p) } }
+    /// Append to a fast array (see `JeffJSObject.fastArrayPush`): the new length, 0 when it is not one.
+    @inline(__always) func fastArrayPush(_ value: JeffJSValue) -> UInt32 { _with { $0.fastArrayPush(value) } }
     @inline(__always) func appendProp(_ p: JeffJSProperty) { _obj.appendProp(p) }
     @inline(__always) func appendDataValue(_ v: JeffJSValue) { _obj.appendDataValue(v) }
     @inline(__always) func clearProps() { _obj.clearProps() }
@@ -4524,6 +4619,51 @@ nonisolated struct JeffJSObj {
         get { _with { $0._fastArrayValues } }
         nonmutating set { _obj._fastArrayValues = newValue }
     }
+
+    // -- Borrowed element and typed-array access (JeffJS issue #1 step 4) -----
+    // The dispatch read an array's element store through a strong local
+    // (`if let storage = jsObj._fastArrayValues`) and a typed array through
+    // `jsObj._obj.typedArrayGet(...)`: a retain/release pair per element
+    // read or write in both traces and the main loop. These go through
+    // guaranteed references instead.
+
+    /// Element `uidx` of a fast array, borrowed (a hole reads
+    /// `.uninitialized`); nil without an element store or past its end.
+    @inline(__always) func fastArrayElement(_ uidx: UInt32) -> JeffJSValue? {
+        _with { o -> JeffJSValue? in
+            guard let stU = o._fastArrayValuesU else { return nil }
+            return stU._withUnsafeGuaranteedRef { st -> JeffJSValue? in
+                (uidx < st.count && Int(uidx) < st.values.count) ? st.values[Int(uidx)] : nil
+            }
+        }
+    }
+
+    /// In-bounds overwrite of element `idx` of a fast array whose element
+    /// writes are unchecked (`!checked`): stores `val` (moved in) and returns
+    /// the value it replaced, for the caller to release. nil (nothing
+    /// stored) for a negative or out-of-range index, a checked store, or no
+    /// element store: growth, length updates and frozen / sealed arrays take
+    /// the general path.
+    @inline(__always) func fastArrayReplaceElement(_ idx: Int32, _ val: JeffJSValue) -> JeffJSValue? {
+        _with { o -> JeffJSValue? in
+            guard idx >= 0, let stU = o._fastArrayValuesU else { return nil }
+            return stU._withUnsafeGuaranteedRef { st -> JeffJSValue? in
+                guard !st.checked, UInt32(idx) < st.count, Int(idx) < st.values.count else { return nil }
+                let old = st.values[Int(idx)]
+                st.values[Int(idx)] = val
+                return old
+            }
+        }
+    }
+
+    /// The object as a borrowed value (no count taken: `.dupValue()` it to keep it).
+    @inline(__always) var borrowedValue: JeffJSValue {
+        JeffJSValue.makeObjectU(Unmanaged<JeffJSObject>.fromOpaque(UnsafeRawPointer(_ptr)))
+    }
+
+    @inline(__always) func typedArrayGet(_ idx: UInt32) -> JeffJSValue? { _with { $0.typedArrayGet(idx) } }
+    @inline(__always) func typedArraySet(_ idx: UInt32, _ value: JeffJSValue) -> Int { _with { $0.typedArraySet(idx, value) } }
+    @inline(__always) func typedArrayLengthFast() -> Int? { _with { $0.typedArrayLengthFast() } }
 
     @inline(__always) var arrowThisVal: JeffJSValue? {
         get { _with { $0.arrowThisVal } }

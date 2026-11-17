@@ -411,10 +411,15 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// the builtin, which throws the TypeError.
     @inline(__always)
     static func arrayAcceptsFastPush(_ arr: JeffJSObj) -> Bool {
-        guard arr.extensible, arr.propCount > 0, let shape = arr.shape, shape.prop.count > 0 else { return false }
-        let p0 = shape.prop[0]
-        return p0.atom == JeffJSAtomID.JS_ATOM_length.rawValue && p0.flags.contains(.writable)
-            && arr.extra(at: 0) == nil
+        guard arr.extensible, arr.propCount > 0, let shU = arr.shapeU else { return false }
+        // The shape is borrowed (the array owns it): a strong local was a
+        // retain/release pair per push.
+        let lengthIsWritable = shU._withUnsafeGuaranteedRef { shape -> Bool in
+            guard shape.prop.count > 0 else { return false }
+            let p0 = shape.prop[0]
+            return p0.atom == JeffJSAtomID.JS_ATOM_length.rawValue && p0.flags.contains(.writable)
+        }
+        return lengthIsWritable && arr.extra(at: 0) == nil
     }
     /// %ThrowTypeError% — a frozen function that always throws TypeError.
     /// Used for arguments.callee in strict mode, etc.
@@ -1882,7 +1887,13 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// wrapper above collapsed -1 into "absent", so `'x' in revokedProxy`
     /// answered `false` and a throwing trap was swallowed outright.
     func hasPropertyEx(obj: JeffJSValue, atom: UInt32) -> Int {
-        guard let jsObj = obj.toObject() else { return 0 }
+        // Borrowed for the whole test (quickjs JS_HasProperty walks `p` without
+        // a JS_DupValue except around an exotic `has_property`): see getPropertyInternal.
+        guard let h = obj.obj else { return 0 }
+        return h._with { hasPropertyOfObject($0, atom: atom) }
+    }
+
+    private func hasPropertyOfObject(_ jsObj: JeffJSObject, atom: UInt32) -> Int {
         jsObj.ensureLazyMaterialized()
 
         // Proxy intercept: if this object is a proxy, dispatch to handler.has trap
@@ -1980,19 +1991,23 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             if jsObj.pendingStack != nil, atom == JeffJSAtomID.JS_ATOM_stack.rawValue { return 1 }
         }
 
-        // Check own properties via the shape hash table
-        if let shape = jsObj.shape, findShapeProperty(shape, atom) != nil {
+        // Check own properties via the shape hash table (the shape is borrowed)
+        if let shU = jsObj.shapeU, shU._withUnsafeGuaranteedRef({ findShapeProperty($0, atom) != nil }) {
             return 1
         }
 
         if jeffJSUnretainedProtoWalk {
             var cur = jsObj.protoRaw
             while let pr = cur {
-                unowned(unsafe) let p = Unmanaged<JeffJSObject>.fromOpaque(pr).takeUnretainedValue()
-                if (p.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(p) }
-                if let shape = p.shape, findShapeProperty(shape, atom) != nil { return 1 }
-                if isProxyObject(p) { return proxyOnChainHas(p, atom: atom) }
-                cur = p.protoRaw
+                var next: UnsafeRawPointer? = nil
+                if let found = Unmanaged<JeffJSObject>.fromOpaque(pr)._withUnsafeGuaranteedRef({ p -> Int? in
+                    if (p.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(p) }
+                    if let shU = p.shapeU, shU._withUnsafeGuaranteedRef({ findShapeProperty($0, atom) != nil }) { return 1 }
+                    if isProxyObject(p) { return proxyOnChainHas(p, atom: atom) }
+                    next = p.protoRaw
+                    return nil
+                }) { return found }
+                cur = next
             }
             return 0
         }
@@ -5340,12 +5355,30 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
 
     /// Internal property get implementation.
     /// Mirrors `JS_GetPropertyInternal()` from QuickJS.
+    ///
+    /// The object is borrowed for the whole lookup, as in QuickJS
+    /// (`p = JS_VALUE_GET_OBJ(obj)`, no `JS_DupValue`): the caller's value
+    /// keeps it alive, and nothing here touches it after a call into JS (a
+    /// getter, a proxy trap). As a strong local it was a retain/release pair
+    /// on every property read that misses the inline caches.
     private func getPropertyInternal(
         obj: JeffJSValue,
         atom: UInt32,
         receiver: JeffJSValue
     ) -> JeffJSValue {
-        guard let jsObj = obj.toObject() else {
+        guard let h = obj.obj else { return getPropertyOfPrimitive(obj: obj, atom: atom, receiver: receiver) }
+        return h._with { getPropertyOfObject($0, atom: atom, receiver: receiver) }
+    }
+
+    /// `[[Get]]` on a primitive: its wrapper prototype answers (a string
+    /// answers `length` and its indexes itself); null and undefined throw.
+    @inline(never)
+    private func getPropertyOfPrimitive(
+        obj: JeffJSValue,
+        atom: UInt32,
+        receiver: JeffJSValue
+    ) -> JeffJSValue {
+        do {
             // Primitive value — auto-box and get from prototype
             if obj.isString {
                 // String indexing
@@ -5410,7 +5443,14 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             }
             return .JS_UNDEFINED
         }
+    }
 
+    /// `[[Get]]` on an object the caller keeps alive (`jsObj` is borrowed).
+    private func getPropertyOfObject(
+        _ jsObj: JeffJSObject,
+        atom: UInt32,
+        receiver: JeffJSValue
+    ) -> JeffJSValue {
         // Deferred own properties first: a lazy payload stub builds its top
         // level (JeffJSLazyPayload.swift) before the exotic fast paths below;
         // a function's `prototype` / `name` / `length` and an error's `stack`.
@@ -5527,16 +5567,15 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // copying JeffJSProperty enums across the call boundary).
         let ownIdx = jeffJS_findOwnPropertyIndex(obj: jsObj, atom: atom)
         if ownIdx >= 0, jsObj.shapeIdentity != nil, ownIdx < jsObj.propValues.count {
-            if jsObj.extra(at: ownIdx) != nil, let e = jsObj.extraStrong(at: ownIdx) {
+            if let e = jsObj.extra(at: ownIdx) {
                 // Accessor property — call the getter
-                if e.kind == .getset, let getterObj = e.getter {
+                if e.kind == .getset, let getterH = e.getterH {
                     // The slot's reference is borrowed: a getter that
                     // redefines or deletes its own property frees it mid-call
-                    // (QuickJS dups the getter here for the same reason).
-                    // Borrowed: callRetainingFunction holds a count for the call
-                    // (`makeObject` took a Swift retain nothing gave back).
-                    let getterVal = JeffJSValue.borrowedObject(getterObj)
-                    return callRetainingFunction(getterVal, this: receiver, args: [])
+                    // (QuickJS dups the getter here for the same reason), so
+                    // callRetainingFunction0 holds a count for the call. The
+                    // box and the getter are read through uncounted handles.
+                    return callRetainingFunction0(getterH.borrowedValue, this: receiver)
                 }
                 // Mapped arguments: the slot aliases a live parameter.
                 if e.kind == .varRef, let vr = e.varRef {
@@ -5587,22 +5626,11 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         if jeffJSUnretainedProtoWalk {
             var cur = jsObj.protoRaw
             while let pr = cur {
-                unowned(unsafe) let p = Unmanaged<JeffJSObject>.fromOpaque(pr).takeUnretainedValue()
-                if (p.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(p) }
-                let pIdx = jeffJS_findOwnPropertyIndex(obj: p, atom: atom)
-                if pIdx < 0 {
-                    if isProxyObject(p) { return proxyOnChainGet(p, atom: atom, receiver: receiver) }
-                } else if p.shapeIdentity != nil, pIdx < p.propValues.count {
-                    if p.extra(at: pIdx) != nil, let e = p.extraStrong(at: pIdx) {
-                        if e.kind == .getset, let getterObj = e.getter {
-                            let getterVal = JeffJSValue.borrowedObject(getterObj)
-                            return callRetainingFunction(getterVal, this: receiver, args: [])
-                        }
-                        return .JS_UNDEFINED
-                    }
-                    return p.propValues[pIdx].dupValue()
-                }
-                cur = p.protoRaw
+                var next: UnsafeRawPointer? = nil
+                if let found = Unmanaged<JeffJSObject>.fromOpaque(pr)._withUnsafeGuaranteedRef({
+                    getPropertyOnPrototype($0, atom: atom, receiver: receiver, next: &next)
+                }) { return found }
+                cur = next
             }
             return .JS_UNDEFINED
         }
@@ -5642,12 +5670,80 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// hot ordinary walks keep their frames.
     @inline(never)
     private func proxyOnChainGet(_ p: JeffJSObject, atom: UInt32, receiver: JeffJSValue) -> JeffJSValue {
-        return getPropertyInternal(obj: .borrowedObject(p), atom: atom, receiver: receiver)
+        // The walk borrows `p` from the shape that owns it, and a trap may
+        // change that chain: hold the proxy across its own [[Get]] (quickjs
+        // JS_GetPropertyInternal dups the object around an exotic get_property).
+        let pv = JeffJSValue.borrowedObject(p).dupValue()
+        let r = getPropertyInternal(obj: pv, atom: atom, receiver: receiver)
+        pv.freeValue()
+        return r
+    }
+
+    /// One prototype level of `getPropertyOfObject`'s walk. `p` is borrowed
+    /// (the shape below it on the chain owns it). Returns the value when this
+    /// level answers; otherwise nil with `next` set to its prototype.
+    @inline(__always)
+    private func getPropertyOnPrototype(_ p: JeffJSObject, atom: UInt32, receiver: JeffJSValue,
+                                        next: inout UnsafeRawPointer?) -> JeffJSValue? {
+        if (p.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(p) }
+        let pIdx = jeffJS_findOwnPropertyIndex(obj: p, atom: atom)
+        if pIdx < 0 {
+            if isProxyObject(p) { return proxyOnChainGet(p, atom: atom, receiver: receiver) }
+        } else if p.shapeIdentity != nil, pIdx < p.propValues.count {
+            if let e = p.extra(at: pIdx) {
+                if e.kind == .getset, let getterH = e.getterH {
+                    return callRetainingFunction0(getterH.borrowedValue, this: receiver)
+                }
+                return .JS_UNDEFINED
+            }
+            return p.propValues[pIdx].dupValue()
+        }
+        next = p.protoRaw
+        return nil
     }
 
     @inline(never)
     private func proxyOnChainHas(_ p: JeffJSObject, atom: UInt32) -> Int {
-        return hasPropertyEx(obj: .borrowedObject(p), atom: atom)
+        let pv = JeffJSValue.borrowedObject(p).dupValue()   // held across the trap (see proxyOnChainGet)
+        let r = hasPropertyEx(obj: pv, atom: atom)
+        pv.freeValue()
+        return r
+    }
+
+    /// One prototype level of `setPropertyOfObject`'s walk for an inherited
+    /// setter. `p` is borrowed (the shape below it on the chain owns it).
+    /// Returns the write's result when this level decides it (a setter ran,
+    /// an accessor without one refused, a proxy answered); otherwise nil with
+    /// `next` = the prototype to look at next, or nil to stop the walk (a
+    /// data property or a shadowable host stub: the write lands on the receiver).
+    @inline(__always)
+    private func setPropertyOnPrototype(_ p: JeffJSObject, obj: JeffJSValue, atom: UInt32, value: JeffJSValue,
+                                        flags: Int, setterThis: JeffJSValue?,
+                                        next: inout UnsafeRawPointer?) -> Int? {
+        if (p.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(p) }
+        let pIdx = jeffJS_findOwnPropertyIndex(obj: p, atom: atom)
+        if pIdx < 0, isProxyObject(p) {
+            return proxyOnChainSet(p, atom: atom, value: value, receiver: setterThis ?? obj, flags: flags)
+        }
+        if pIdx >= 0, let pShapeU = p.shapeU, pIdx < p.propValues.count {
+            let pFlags = pShapeU._withUnsafeGuaranteedRef { $0.prop[pIdx].flags }
+            if pFlags.contains(.getset) {
+                if let e = p.extra(at: pIdx), e.kind == .getset, let setterH = e.setterH {
+                    let result = callRetainingFunction1(setterH.borrowedValue, this: setterThis ?? obj, arg: value)
+                    value.freeValue()
+                    result.freeValue()
+                    return result.isException ? -1 : 1
+                }
+                if pFlags.contains(.shadowable) { return nil }
+                value.freeValue()
+                if (flags & JS_PROP_THROW) == 0 { return 0 }
+                _ = throwTypeError(message: "Cannot set property which has only a getter")
+                return -1
+            }
+            return nil
+        }
+        next = p.protoRaw
+        return nil
     }
 
     /// Consumes `value`: 1 written, 0 refused (TypeError with JS_PROP_THROW), -1 exception.
@@ -5655,7 +5751,10 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     private func proxyOnChainSet(_ p: JeffJSObject, atom: UInt32, value: JeffJSValue,
                                  receiver: JeffJSValue, flags: Int) -> Int {
         let key = proxyTrapKey(atom)
-        let r = reflectSet(.borrowedObject(p), key: key, atom: atom, value: value, receiver: receiver)
+        // Held across the trap: the walk borrows `p` from the chain the trap may change.
+        let pv = JeffJSValue.borrowedObject(p).dupValue()
+        let r = reflectSet(pv, key: key, atom: atom, value: value, receiver: receiver)
+        pv.freeValue()
         key.freeValue()
         value.freeValue()   // reflectSet borrows; this path consumes
         if r == 0 && (flags & JS_PROP_THROW) != 0 {
@@ -5714,7 +5813,18 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         flags: Int,
         setterThis: JeffJSValue? = nil
     ) -> Int {
-        guard let jsObj = obj.toObject() else {
+        // The object is borrowed for the whole write (quickjs
+        // JS_SetPropertyInternal: `p = JS_VALUE_GET_OBJ(this_obj)`): the
+        // caller's value keeps it alive. See getPropertyInternal.
+        guard let h = obj.obj else { return setPropertyOfPrimitive(obj: obj, value: value, flags: flags) }
+        return h._with { setPropertyOfObject($0, obj: obj, atom: atom, value: value, flags: flags, setterThis: setterThis) }
+    }
+
+    /// A write through a primitive base: consumes `value`, throws for null /
+    /// undefined and in strict mode.
+    @inline(never)
+    private func setPropertyOfPrimitive(obj: JeffJSValue, value: JeffJSValue, flags: Int) -> Int {
+        do {
             // Writing through a null/undefined base always throws, in sloppy
             // mode too (ES §13.15.2 / PutValue step 5) — `o.m.n = 1` used to
             // fail silently and leave `e.message` undefined.
@@ -5731,7 +5841,17 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
             value.freeValue()
             return -1
         }
+    }
 
+    /// `[[Set]]` on an object the caller keeps alive (`jsObj` is borrowed; `obj` is its value).
+    private func setPropertyOfObject(
+        _ jsObj: JeffJSObject,
+        obj: JeffJSValue,
+        atom: UInt32,
+        value: JeffJSValue,
+        flags: Int,
+        setterThis: JeffJSValue?
+    ) -> Int {
         if (jsObj.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(jsObj) }
         // Deferred own properties (a lazy payload stub builds its top level).
         if (jsObj.lazyFlags & JeffJSObject.lazyActiveMask) != 0 {
@@ -5916,22 +6036,22 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         // Check if property already exists via shape-based lookup (index form:
         // one hash probe, no JeffJSProperty enum copies)
         let exIdx = jeffJS_findOwnPropertyIndex(obj: jsObj, atom: atom)
-        if exIdx >= 0, let exShape = jsObj.shape, exIdx < jsObj.propValues.count {
-            let exFlags = exShape.prop[exIdx].flags
+        if exIdx >= 0, let exShapeU = jsObj.shapeU, exIdx < jsObj.propValues.count {
+            let exFlags = exShapeU._withUnsafeGuaranteedRef { $0.prop[exIdx].flags }
             if exFlags.isVarRef {
                 // Mapped arguments: write through to the live parameter slot.
-                if let e = jsObj.extraStrong(at: exIdx), e.kind == .varRef, let vr = e.varRef {
+                if let e = jsObj.extra(at: exIdx), e.kind == .varRef, let vr = e.varRef {
                     vr.store(value)   // releases the replaced value when the slot owns it
                     return 1
                 }
             }
             if exFlags.isGetSet {
                 // Accessor property — call the setter
-                if let e = jsObj.extraStrong(at: exIdx), e.kind == .getset, let setterObj = e.setter {
+                if let e = jsObj.extra(at: exIdx), e.kind == .getset, let setterH = e.setterH {
                     // Borrowed (callRetainingFunction holds a count for the call).
                     // `makeObject` took a Swift retain nothing gave back: every
                     // accessor whose setter ever ran outlived its runtime.
-                    let setterVal = JeffJSValue.borrowedObject(setterObj)
+                    let setterVal = setterH.borrowedValue
                     // `setPropertyInternal` consumes `value`, and a callee
                     // borrows its arguments (Round 9) — so the setter branch
                     // owes both a release of the argument and a release of the
@@ -5940,7 +6060,7 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                     // `__proto__` setter — left one permanent reference on the
                     // object assigned. The setter itself is borrowed from the
                     // slot, which it may redefine while it runs: call retained.
-                    let result = callRetainingFunction(setterVal, this: setterThis ?? obj, args: [value])
+                    let result = callRetainingFunction1(setterVal, this: setterThis ?? obj, arg: value)
                     value.freeValue()
                     result.freeValue()
                     if result.isException { return -1 }
@@ -5975,31 +6095,12 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         if jeffJSUnretainedProtoWalk {
             var cur = jsObj.protoRaw
             while let pr = cur {
-                unowned(unsafe) let p = Unmanaged<JeffJSObject>.fromOpaque(pr).takeUnretainedValue()
-                if (p.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(p) }
-                let pIdx = jeffJS_findOwnPropertyIndex(obj: p, atom: atom)
-                if pIdx < 0, isProxyObject(p) {
-                    return proxyOnChainSet(p, atom: atom, value: value, receiver: setterThis ?? obj, flags: flags)
-                }
-                if pIdx >= 0, let pShape = p.shape, pIdx < p.propValues.count {
-                    if pShape.prop[pIdx].flags.contains(.getset) {
-                        if let e = p.extraStrong(at: pIdx), e.kind == .getset, let setterObj = e.setter {
-                            let setterVal = JeffJSValue.borrowedObject(setterObj)
-                            let result = callRetainingFunction(setterVal, this: setterThis ?? obj, args: [value])
-                            value.freeValue()
-                            result.freeValue()
-                            if result.isException { return -1 }
-                            return 1
-                        }
-                        if pShape.prop[pIdx].flags.contains(.shadowable) { break }
-                        value.freeValue()
-                        if (flags & JS_PROP_THROW) == 0 { return 0 }
-                        _ = throwTypeError(message: "Cannot set property which has only a getter")
-                        return -1
-                    }
-                    break
-                }
-                cur = p.protoRaw
+                var next: UnsafeRawPointer? = nil
+                if let done = Unmanaged<JeffJSObject>.fromOpaque(pr)._withUnsafeGuaranteedRef({
+                    setPropertyOnPrototype($0, obj: obj, atom: atom, value: value, flags: flags,
+                                           setterThis: setterThis, next: &next)
+                }) { return done }
+                cur = next
             }
         } else {
         var setProto = jsObj.proto
@@ -6957,6 +7058,26 @@ nonisolated extension JeffJSContext {
     func callRetainingFunction(_ fn: JeffJSValue, this thisVal: JeffJSValue, args: [JeffJSValue]) -> JeffJSValue {
         fn.dupValueFast()
         let result = callFunction(fn, thisVal: thisVal, args: args)
+        fn.freeValueFast()
+        return result
+    }
+
+    /// `callRetainingFunction` with one argument (an accessor's setter): a
+    /// bytecode setter runs through the argv entry with no argument array.
+    @inline(__always)
+    func callRetainingFunction1(_ fn: JeffJSValue, this thisVal: JeffJSValue, arg: JeffJSValue) -> JeffJSValue {
+        fn.dupValueFast()
+        let result = withUnsafePointer(to: arg) { callFunction(fn, thisVal: thisVal, argv: $0, argc: 1) }
+        fn.freeValueFast()
+        return result
+    }
+
+    /// `callRetainingFunction` with no arguments (an accessor's getter): a
+    /// bytecode getter runs through the argv entry with no argument array.
+    @inline(__always)
+    func callRetainingFunction0(_ fn: JeffJSValue, this thisVal: JeffJSValue) -> JeffJSValue {
+        fn.dupValueFast()
+        let result = callFunction(fn, thisVal: thisVal, argv: nil, argc: 0)
         fn.freeValueFast()
         return result
     }
