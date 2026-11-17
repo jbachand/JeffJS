@@ -462,11 +462,17 @@ private let _h263_p4: UInt32 = 263 &* 263 &* 263 &* 263
 /// Polynomial hash for 8-bit data matching QuickJS `hash_string8`.
 /// 4x unrolled: processes 4 bytes per iteration using precomputed powers of 263.
 nonisolated func jeffJS_hashString8(data: [UInt8], len: Int, h: UInt32 = 0) -> UInt32 {
-    var hash = h
     let count = min(len, data.count)
+    guard count > 0 else { return h }
+    return data.withUnsafeBufferPointer { jeffJS_hashString8(units: $0.baseAddress, count: count, h: h) }
+}
+
+/// The same hash over borrowed code units (a flat string's `units8`).
+nonisolated func jeffJS_hashString8(units: UnsafePointer<UInt8>?, count: Int, h: UInt32 = 0) -> UInt32 {
+    var hash = h
     guard count > 0 else { return hash }
-    return data.withUnsafeBufferPointer { buf in
-        guard let p = buf.baseAddress else { return hash }
+    do {
+        guard let p = units else { return hash }
         var i = 0
         while i &+ 3 < count {
             hash = hash &* _h263_p4
@@ -487,11 +493,17 @@ nonisolated func jeffJS_hashString8(data: [UInt8], len: Int, h: UInt32 = 0) -> U
 /// Polynomial hash for 16-bit data matching QuickJS `hash_string16`.
 /// 4x unrolled: processes 4 code units per iteration.
 nonisolated func jeffJS_hashString16(data: [UInt16], len: Int, h: UInt32 = 0) -> UInt32 {
-    var hash = h
     let count = min(len, data.count)
+    guard count > 0 else { return h }
+    return data.withUnsafeBufferPointer { jeffJS_hashString16(units: $0.baseAddress, count: count, h: h) }
+}
+
+/// The same hash over borrowed code units (a flat string's `units16`).
+nonisolated func jeffJS_hashString16(units: UnsafePointer<UInt16>?, count: Int, h: UInt32 = 0) -> UInt32 {
+    var hash = h
     guard count > 0 else { return hash }
-    return data.withUnsafeBufferPointer { buf in
-        guard let p = buf.baseAddress else { return hash }
+    do {
+        guard let p = units else { return hash }
         var i = 0
         while i &+ 3 < count {
             hash = hash &* _h263_p4
@@ -512,11 +524,10 @@ nonisolated func jeffJS_hashString16(data: [UInt16], len: Int, h: UInt32 = 0) ->
 /// Compute and cache the hash of a `JeffJSString`.
 nonisolated func jeffJS_computeHash(str: JeffJSString) -> UInt32 {
     let h: UInt32
-    switch str.storage {
-    case .str8(let buf):
-        h = jeffJS_hashString8(data: buf, len: str.len)
-    case .str16(let buf):
-        h = jeffJS_hashString16(data: buf, len: str.len)
+    if str.isWideChar {
+        h = jeffJS_hashString16(units: str.units16, count: str.len)
+    } else {
+        h = jeffJS_hashString8(units: str.units8, count: str.len)
     }
     let masked = h & 0x3FFF_FFFF  // 30-bit
     str.hash = masked
