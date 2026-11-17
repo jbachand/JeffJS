@@ -108,6 +108,23 @@ final class ManualMemoryPropertyTests: XCTestCase {
               return s + ":" + out.join(",") + ":" + errs.join("") + ":" + deep;
             })()
             """#, #""646000:u,B,C,true,true,false,true,true,true,2:TTTTRT:101""#),
+        // step 5: flat strings read through their borrowed code-unit pointer (compare, equals, concat, search, key hashing; 8- and 16-bit)
+        ("strings", #"""
+            (function () {
+              var out = [], a = "alpha", w = "αβγ", e = "", s = "";
+              var words = ["pear", "apple", "fig", "apple2", "éclair", "ω", "Apple", "", "app", "fig"];
+              out.push(words.slice().sort().join("|"), words.indexOf("fig"), words.lastIndexOf("fig"));
+              for (var i = 0; i < 300; i++) { s += (i % 7 === 0 ? w : a) + i; if (i % 50 === 0) s = s + e + "-"; }
+              out.push(s.length, s.indexOf("alpha299"), s.indexOf("γ" + 294), s.charCodeAt(5), s.charCodeAt(s.length - 1), s.indexOf("zz"), s.indexOf("a", 2000));
+              var o = {}; for (var j = 0; j < 200; j++) { o["k" + (j % 40)] = j; o[w + (j % 3)] = j; o[String(j % 5)] = j; }
+              out.push(Object.keys(o).length, o.k39, o[w + "2"], o["4"], o[4]);
+              out.push("abc" < "abd", "abc" < "ab", w < a, a < w, "a" === "a" + e, w + a === "αβγalpha", "x".repeat(300) === "x".repeat(299) + "x", "" === e, a + w < a + w + "!", ("x".repeat(400) + w) > ("x".repeat(400) + a));
+              var m = new Map(); for (var k = 0; k < 100; k++) m.set("key" + k + (k & 1 ? w : ""), k); out.push(m.get("key7" + w), m.get("key8"), m.size);
+              return out.join(",");
+            })()
+            """#, #"""
+"|Apple|app|apple|apple2|fig|fig|pear|éclair|ω,2,9,2210,2202,2166,97,57,-1,2008,48,199,197,199,199,true,false,false,true,true,true,true,true,true,true,7,8,100"
+"""#),
     ]
 
     private func run(_ ctx: JeffJSContext, _ name: String, _ src: String, _ want: String, _ label: String) {

@@ -1670,3 +1670,24 @@ Both builds: 433 tests, the 4 known failing cases only; AddressSanitizer clean. 
 `ManualMemoryPropertyTests`. Still 3.3 to 3.6× QuickJS: a constructor runs as a nested activation (about 600
 instructions of prologue and epilogue in `callInternalRaw`, exact count 4 016 per `new A(i)` in a warm loop) rather
 than as an inline frame, and a quarter of the time is allocation.
+
+### Round 16, step 5, first piece (2026-11-17, `perf/manual-memory-strings`): flat strings read in place
+
+A flat string keeps its code units in a ContiguousArray inside a one-word enum, and every reader went through
+`storage`, which copies the array reference out (a retain/release pair per compare, equals, concat, search and key
+hash). The readers now use `JeffJSString.units8` / `units16` / `unit(at:)`: borrowed pointers to the code units
+(quickjs reads `p->u.str8` / `p->u.str16` straight from the JSString). The pointer is **computed, not stored**: a
+stored one made the string 56 bytes, which the allocator rounds to 64 (`testCompactLayouts` caught it), so it is read
+from the layout instead: the enum word is the array's buffer object, and a contiguous array's elements start 32
+bytes into it. `StringCodeUnitPointerTests` pins that against `withUnsafeBufferPointer` for every way a flat string
+gets its characters, including in-place appends and widening; 32-bit targets ask the array. The atom table's chain
+in `findAtom(jsString:)` is walked through borrowed entries.
+
+Converted: `jeffJS_getString`, `jeffJS_stringCompare`, `jeffJS_stringEquals`, `jeffJS_flatConcatStrings`,
+`jeffJS_indexOf8`, the key hash in `findAtom(jsString:)`. Swift ARC calls on realworld: 646 M → 615 M; instructions
+−0.9 % (realworld), −0.6 % (watch_deepmerge). The string stays 48 bytes.
+
+**Left in strings**: `jeffJS_concatStrings`' own strong `stringBase` / `stringValue` reads (14 M), string `deinit`
+(15 M: one release of the array per string, inherent while the characters are a Swift array), and every creation
+still allocates the array and the string separately. Removing those is the record of the original plan (characters
+in the string's own allocation): a new representation, its own change.

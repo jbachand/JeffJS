@@ -1841,13 +1841,19 @@ nonisolated final class JeffJSRuntime {
         var h: UInt32 = 0
         var simple = true
         func mix(_ b: UInt32) { h = h &* 31 &+ b }
-        switch js.storage {
-        case .str8(let buf):
-            for cu in buf {
+        // The code units through the borrowed pointers (reading `storage`
+        // copied the array reference: a retain/release pair per key).
+        let jsLen = js.len
+        if let p8 = js.units8 {
+            var i = 0
+            while i < jsLen {
+                let cu = p8[i]; i &+= 1
                 if cu < 0x80 { mix(UInt32(cu)) } else { mix(0xC0 | UInt32(cu >> 6)); mix(0x80 | UInt32(cu & 0x3F)) }
             }
-        case .str16(let buf):
-            for cu in buf {
+        } else if let p16 = js.units16 {
+            var i = 0
+            while i < jsLen {
+                let cu = p16[i]; i &+= 1
                 if cu < 0x80 { mix(UInt32(cu)) }
                 else if cu < 0x800 { mix(0xC0 | UInt32(cu >> 6)); mix(0x80 | UInt32(cu & 0x3F)) }
                 else if cu >= 0xD800 && cu < 0xE000 { simple = false; break }
@@ -1857,12 +1863,20 @@ nonisolated final class JeffJSRuntime {
         let atom: UInt32
         if simple {
             let hash = h & JS_ATOM_HASH_MASK
-            var found: UInt32 = 0
-            var atomIdx = atomHash[Int(hash) & (atomHashSize - 1)]
-            while atomIdx != 0 {
-                guard let entry = atomArray[Int(atomIdx)] else { break }
-                if entry.hash == hash && jeffJS_utf8Equals(entry.str, js) { found = atomIdx; break }
-                atomIdx = entry.hashNext
+            // The chain through borrowed entries (the table owns them): a
+            // strong `entry` was a retain/release pair per link visited.
+            let first = atomHash[Int(hash) & (atomHashSize - 1)]
+            let found: UInt32 = atomArray.withUnsafeBufferPointer { tab -> UInt32 in
+                var atomIdx = first
+                while atomIdx != 0, Int(atomIdx) < tab.count {
+                    guard let raw = unsafeBitCast(tab[Int(atomIdx)], to: UnsafeRawPointer?.self) else { break }
+                    let (hit, next) = Unmanaged<JeffJSAtomStruct>.fromOpaque(raw)._withUnsafeGuaranteedRef { entry in
+                        (entry.hash == hash && jeffJS_utf8Equals(entry.str, js), entry.hashNext)
+                    }
+                    if hit { return atomIdx }
+                    atomIdx = next
+                }
+                return 0
             }
             if found != 0 { atomArray[Int(found)]?.refCount += 1; atom = found }
             else { atom = findAtom(js.toSwiftString()) }

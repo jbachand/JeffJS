@@ -135,6 +135,45 @@ nonisolated final class JeffJSString: JeffJSStringBase {
     }
     private var _chars: Chars
 
+    /// Address of the first code unit of `_chars`, read out of the array
+    /// reference in place (JeffJS issue #1 step 5; quickjs reads `p->u.str8` /
+    /// `p->u.str16` straight from the JSString). Reading the characters through
+    /// `storage` copies the array reference out of the enum: a retain/release
+    /// pair per compare, concat, hash or index. A stored pointer would have
+    /// cost 16 bytes per string (48 -> 64 in the allocator), so this uses the
+    /// layout instead: `Chars` is one word holding the ContiguousArray's
+    /// buffer object, with the enum case in pointer bits no address uses, and
+    /// a contiguous array's elements start 32 bytes into that object (object
+    /// header, count, capacity) on every 64-bit Swift ABI.
+    /// `StringCodeUnitPointerTests` pins it against `withUnsafeBufferPointer`.
+    /// Valid until the string is appended to in place or freed.
+    @inline(__always) private var _base: UnsafeRawPointer? {
+        #if _pointerBitWidth(_64)
+        let word = withUnsafePointer(to: &_chars) { UnsafeRawPointer($0).load(as: UInt.self) }
+        return UnsafeRawPointer(bitPattern: (word & 0x0000_FFFF_FFFF_FFF8) &+ 32)
+        #else
+        // 32-bit pointers (arm64_32): another layout; ask the array.
+        switch _chars {
+        case .c8(let c): return c.withUnsafeBufferPointer { UnsafeRawPointer($0.baseAddress) }
+        case .c16(let c): return c.withUnsafeBufferPointer { UnsafeRawPointer($0.baseAddress) }
+        }
+        #endif
+    }
+
+    /// The Latin-1 code units, borrowed (nil for a 16-bit or empty string).
+    @inline(__always) var units8: UnsafePointer<UInt8>? {
+        (isWideChar || _len == 0) ? nil : _base?.assumingMemoryBound(to: UInt8.self)
+    }
+    /// The UTF-16 code units, borrowed (nil for an 8-bit or empty string).
+    @inline(__always) var units16: UnsafePointer<UInt16>? {
+        (isWideChar && _len != 0) ? _base?.assumingMemoryBound(to: UInt16.self) : nil
+    }
+    /// Code unit `i` (no bounds check: the caller has tested `i < len`).
+    @inline(__always) func unit(at i: Int) -> UInt32 {
+        guard let b = _base else { return 0 }
+        return isWideChar ? UInt32(b.assumingMemoryBound(to: UInt16.self)[i]) : UInt32(b.assumingMemoryBound(to: UInt8.self)[i])
+    }
+
     var storage: JeffJSStringStorage {
         @inline(__always) get {
             switch _chars {
@@ -334,12 +373,7 @@ nonisolated func jeffJS_stringLength(_ sb: JeffJSStringBase) -> Int {
 
 nonisolated func jeffJS_getString(str: JeffJSString, at index: Int) -> UInt32 {
     guard index >= 0, index < str.len else { return 0 }
-    switch str.storage {
-    case .str8(let buf):
-        return UInt32(buf[index])
-    case .str16(let buf):
-        return UInt32(buf[index])
-    }
+    return str.unit(at: index)
 }
 
 // MARK: - Substring
@@ -469,14 +503,10 @@ nonisolated func jeffJS_stringCompare(s1: JeffJSString, s2: JeffJSString) -> Int
 
     // Fast path: both 8-bit — memcmp is SIMD-optimized on Apple platforms
     if !s1.isWideChar && !s2.isWideChar {
-        if case .str8(let a) = s1.storage, case .str8(let b) = s2.storage {
-            let minLen = min(s1.len, s2.len, a.count, b.count)
-            let cmp = a.withUnsafeBufferPointer { bufA in
-                b.withUnsafeBufferPointer { bufB in
-                    guard let pA = bufA.baseAddress, let pB = bufB.baseAddress else { return Int32(0) }
-                    return Int32(memcmp(pA, pB, minLen))
-                }
-            }
+        do {
+            let minLen = min(s1.len, s2.len)
+            var cmp: Int32 = 0
+            if minLen > 0, let pA = s1.units8, let pB = s2.units8 { cmp = Int32(memcmp(pA, pB, minLen)) }
             if cmp != 0 { return cmp < 0 ? -1 : 1 }
             return s1.len < s2.len ? -1 : (s1.len > s2.len ? 1 : 0)
         }
@@ -484,14 +514,11 @@ nonisolated func jeffJS_stringCompare(s1: JeffJSString, s2: JeffJSString) -> Int
 
     // Fast path: both 16-bit
     if s1.isWideChar && s2.isWideChar {
-        if case .str16(let a) = s1.storage, case .str16(let b) = s2.storage {
-            let minLen = min(s1.len, s2.len, a.count, b.count)
-            let cmp = a.withUnsafeBufferPointer { bufA in
-                b.withUnsafeBufferPointer { bufB in
-                    guard let pA = bufA.baseAddress, let pB = bufB.baseAddress else { return Int32(0) }
-                    return Int32(memcmp(pA, pB, minLen &* 2))
-                }
-            }
+        do {
+            // (memcmp order on UTF-16 units is byte order, as before)
+            let minLen = min(s1.len, s2.len)
+            var cmp: Int32 = 0
+            if minLen > 0, let pA = s1.units16, let pB = s2.units16 { cmp = Int32(memcmp(pA, pB, minLen &* 2)) }
             if cmp != 0 { return cmp < 0 ? -1 : 1 }
             return s1.len < s2.len ? -1 : (s1.len > s2.len ? 1 : 0)
         }
@@ -518,27 +545,19 @@ nonisolated func jeffJS_stringEquals(s1: JeffJSString, s2: JeffJSString) -> Bool
 
     // Fast path: both 8-bit — single memcmp
     if !s1.isWideChar && !s2.isWideChar {
-        if case .str8(let a) = s1.storage, case .str8(let b) = s2.storage {
-            let len = min(s1.len, a.count, b.count)
-            return a.withUnsafeBufferPointer { bufA in
-                b.withUnsafeBufferPointer { bufB in
-                    guard let pA = bufA.baseAddress, let pB = bufB.baseAddress else { return len == 0 }
-                    return memcmp(pA, pB, len) == 0
-                }
-            }
+        do {
+            let len = s1.len
+            guard len > 0, let pA = s1.units8, let pB = s2.units8 else { return len == 0 }
+            return memcmp(pA, pB, len) == 0
         }
     }
 
     // Fast path: both 16-bit — single memcmp
     if s1.isWideChar && s2.isWideChar {
-        if case .str16(let a) = s1.storage, case .str16(let b) = s2.storage {
-            let len = min(s1.len, a.count, b.count)
-            return a.withUnsafeBufferPointer { bufA in
-                b.withUnsafeBufferPointer { bufB in
-                    guard let pA = bufA.baseAddress, let pB = bufB.baseAddress else { return len == 0 }
-                    return memcmp(pA, pB, len &* 2) == 0
-                }
-            }
+        do {
+            let len = s1.len
+            guard len > 0, let pA = s1.units16, let pB = s2.units16 else { return len == 0 }
+            return memcmp(pA, pB, len &* 2) == 0
         }
     }
 
@@ -556,17 +575,13 @@ nonisolated func jeffJS_stringEquals(s1: JeffJSString, s2: JeffJSString) -> Bool
 /// Find the first occurrence of `needle` in the 8-bit string starting at `fromIndex`.
 /// Returns the index, or -1 if not found. Uses memchr which is SIMD-optimized.
 nonisolated func jeffJS_indexOf8(_ str: JeffJSString, needle: UInt8, fromIndex: Int = 0) -> Int {
-    guard !str.isWideChar, case .str8(let data) = str.storage else { return -1 }
+    guard !str.isWideChar else { return -1 }
     let start = max(fromIndex, 0)
-    let len = min(str.len, data.count)
-    guard start < len else { return -1 }
-    return data.withUnsafeBufferPointer { buf in
-        guard let base = buf.baseAddress else { return -1 }
-        let searchBase = base + start
-        let searchLen = len - start
-        guard let found = memchr(searchBase, Int32(needle), searchLen) else { return -1 }
-        return start + searchBase.distance(to: found.assumingMemoryBound(to: UInt8.self))
-    }
+    let len = str.len
+    guard start < len, let base = str.units8 else { return -1 }
+    let searchBase = base + start
+    guard let found = memchr(searchBase, Int32(needle), len - start) else { return -1 }
+    return start + searchBase.distance(to: found.assumingMemoryBound(to: UInt8.self))
 }
 
 /// Find the first occurrence of a substring in an 8-bit string.
@@ -773,20 +788,14 @@ nonisolated private func jeffJS_flatConcatStrings(_ s1: JeffJSString, _ s2: Jeff
         buf.withUnsafeMutableBufferPointer { dst in
             guard let dstBase = dst.baseAddress else { return }
             // Copy s1
-            if s1.isWideChar, case .str16(let a) = s1.storage {
-                a.withUnsafeBufferPointer { src in
-                    guard let srcBase = src.baseAddress else { return }
-                    memcpy(dstBase, srcBase, min(len1, a.count) &* 2)
-                }
+            if let src = s1.units16 {
+                if len1 > 0 { memcpy(dstBase, src, len1 &* 2) }
             } else {
                 for i in 0 ..< len1 { dstBase[i] = UInt16(jeffJS_getString(str: s1, at: i)) }
             }
             // Copy s2
-            if s2.isWideChar, case .str16(let a) = s2.storage {
-                a.withUnsafeBufferPointer { src in
-                    guard let srcBase = src.baseAddress else { return }
-                    memcpy(dstBase + len1, srcBase, min(len2, a.count) &* 2)
-                }
+            if let src = s2.units16 {
+                if len2 > 0 { memcpy(dstBase + len1, src, len2 &* 2) }
             } else {
                 for i in 0 ..< len2 { (dstBase + len1)[i] = UInt16(jeffJS_getString(str: s2, at: i)) }
             }
@@ -799,20 +808,14 @@ nonisolated private func jeffJS_flatConcatStrings(_ s1: JeffJSString, _ s2: Jeff
         var buf = [UInt8](repeating: 0, count: totalLen)
         buf.withUnsafeMutableBufferPointer { dst in
             guard let dstBase = dst.baseAddress else { return }
-            if case .str8(let a) = s1.storage {
-                a.withUnsafeBufferPointer { src in
-                    guard let srcBase = src.baseAddress else { return }
-                    let copyLen = min(s1.len, a.count, totalLen)
-                    if copyLen > 0 { memcpy(dstBase, srcBase, copyLen) }
-                }
+            if let src = s1.units8 {
+                let copyLen = min(s1.len, totalLen)
+                if copyLen > 0 { memcpy(dstBase, src, copyLen) }
             }
-            if case .str8(let b) = s2.storage {
-                b.withUnsafeBufferPointer { src in
-                    guard let srcBase = src.baseAddress else { return }
-                    let offset = min(s1.len, totalLen)
-                    let copyLen = min(s2.len, b.count, totalLen - offset)
-                    if copyLen > 0 { memcpy(dstBase + offset, srcBase, copyLen) }
-                }
+            if let src = s2.units8 {
+                let offset = min(s1.len, totalLen)
+                let copyLen = min(s2.len, totalLen - offset)
+                if copyLen > 0 { memcpy(dstBase + offset, src, copyLen) }
             }
         }
         return JeffJSString(refCount: 1,

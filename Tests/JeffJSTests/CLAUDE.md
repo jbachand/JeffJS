@@ -1,6 +1,6 @@
 # Engine tests — Claude neuron
 
-> Area: `Tests/JeffJSTests/` · Repo: engine · Last reviewed: 2026-11-16 (app 7447fa1 / engine perf/trace-hygiene)
+> Area: `Tests/JeffJSTests/` · Repo: engine · Last reviewed: 2026-11-17 (app 7447fa1 / engine perf/manual-memory-strings)
 
 ## Purpose
 The JeffJS engine's correctness gate: one SwiftPM test target (`JeffJSTests` in `Package.swift`) holding the
@@ -33,6 +33,7 @@ benchmarks. Nothing here is compiled into the React Natively app; the app's own 
   `BytecodeCacheBudgetTests.testEngineSourceHashIsCurrent` checks `Scripts/update_bytecode_identity.sh`'s hash.
 - `MetalGCParityTests.swift`, `MetalGCVarRefTests.swift` — the GPU collector frees exactly what the CPU one frees.
 - `InterpreterLoopTests` — the three dispatch loops (round 17): eight programs whose loops leave a trace mid-expression, across `try`, through labelled jumps, with many locals / arguments, heap values pushed from locals and int / double transitions (values are QuickJS's and JavaScriptCore's), run warm and from cold, plus the opcode byte-to-case decode the exhaustive switches rely on.
+- `StringCodeUnitPointerTests` — issue #1 step 5: `JeffJSString.units8` / `units16` are computed from the array layout; this pins them against the array's own buffer pointer (all creation paths, in-place appends, widening) and the 48-byte string size. **If the standard library's array layout changes, this fails first.**
 - `ManualMemoryPropertyTests` — issue #1 step 4: borrowed `[[Get]]` / `[[Set]]` / `[[HasProperty]]`, accessors that delete or redefine themselves mid-call, a Proxy on the prototype chain, polymorphic sites, array and typed-array element paths (values are QuickJS's).
 - `ArclessVarRefTests`, `FunctionRecordHandleTests`, `ManualMemoryCallPathTests` — the manual-memory core (JeffJS issue #1, `JEFFJS_MANUAL_MEMORY`): var-ref hold counts, functions that outlive their bindings, closure body / payload view, parked closures, frames; run them in both builds (`JEFFJS_MANUAL_MEMORY=0 swift test --scratch-path .build-arc`) and under `--sanitize=address`.
 - `RefcountLeakTests`, `ObjectSizeRefLeakTests`, `RuntimeTeardownReleaseTests`, `TaskSpikesTests`, `LazyPayloadTests`,
