@@ -329,7 +329,7 @@ nonisolated struct JeffJSBuiltinString {
             count = wide.count
         }
 
-        private final class OwnedUnits16 {
+        private nonisolated final class OwnedUnits16 {
             let p: UnsafeMutablePointer<UInt16>
             init(_ a: [UInt16]) {
                 p = UnsafeMutablePointer<UInt16>.allocate(capacity: max(a.count, 1))
