@@ -41,11 +41,13 @@ nonisolated extension JeffJSContext {
         var narrow = true
         for u in units where u > 0xFF { narrow = false; break }
         if narrow {
-            var b = [UInt8](); b.reserveCapacity(units.count)
-            for u in units { b.append(UInt8(truncatingIfNeeded: u)) }
-            return JeffJSValue.makeString(JeffJSString(refCount: 1, len: units.count, isWideChar: false, storage: .str8(b)))
+            let n = units.count
+            return JeffJSValue.makeString(JeffJSString(latin1Count: n) { dst in
+                var i = 0
+                while i < n { dst[i] = UInt8(truncatingIfNeeded: units[i]); i &+= 1 }
+            })
         }
-        return JeffJSValue.makeString(JeffJSString(refCount: 1, len: units.count, isWideChar: true, storage: .str16(units)))
+        return JeffJSValue.makeString(JeffJSString(utf16: units, count: units.count))
     }
 
     /// Create an iterator result object { value, done }.
@@ -303,45 +305,65 @@ nonisolated struct JeffJSBuiltinString {
     /// [UInt16] on entry and narrow every result on exit; on a CSV-parsing
     /// kernel that was a third of the time.
     struct CodeUnits {
-        enum Storage { case narrow([UInt8]), wide([UInt16]) }
-        let storage: Storage
+        /// What keeps the code units alive while the view is used: the flat
+        /// string itself (its JS reference may already be released by the
+        /// caller, as `requireThisUnits` does), or a copied buffer.
+        private let owner: AnyObject?
+        /// Latin-1 code units (nil for wide or empty contents).
+        let p8: UnsafePointer<UInt8>?
+        /// UTF-16 code units (nil for narrow or empty contents).
+        let p16: UnsafePointer<UInt16>?
         let count: Int
 
+        /// A view of a flat string's own code units, read in place (the view
+        /// used to take the string's arrays; JeffJS issue #1 step 5).
         init(_ js: JeffJSString) {
-            switch js.storage {
-            case .str8(let b): storage = .narrow(b)
-            case .str16(let w): storage = .wide(w)
-            }
+            owner = js
+            p8 = js.units8
+            p16 = js.units16
             count = js.len
         }
-        init(wide: [UInt16]) { storage = .wide(wide); count = wide.count }
+        init(wide: [UInt16]) {
+            let o = OwnedUnits16(wide)
+            owner = o
+            p8 = nil
+            p16 = wide.isEmpty ? nil : UnsafePointer(o.p)
+            count = wide.count
+        }
+
+        private nonisolated final class OwnedUnits16 {
+            let p: UnsafeMutablePointer<UInt16>
+            init(_ a: [UInt16]) {
+                p = UnsafeMutablePointer<UInt16>.allocate(capacity: max(a.count, 1))
+                a.withUnsafeBufferPointer { if let b = $0.baseAddress, a.count > 0 { p.initialize(from: b, count: a.count) } }
+            }
+            deinit { p.deallocate() }
+        }
 
         @inline(__always) subscript(i: Int) -> UInt16 {
-            switch storage {
-            case .narrow(let b): return UInt16(b[i])
-            case .wide(let w): return w[i]
-            }
+            if let b = p8 { return UInt16(b[i]) }
+            return p16.unsafelyUnwrapped[i]
         }
 
         /// The substring [start, end) as an owned JS string value.
         func slice(_ start: Int, _ end: Int) -> JeffJSValue {
             let lo = max(0, min(start, count)), hi = max(lo, min(end, count))
-            switch storage {
-            case .narrow(let b):
-                return JeffJSValue.makeString(JeffJSString(refCount: 1, len: hi - lo, isWideChar: false,
-                                                           storage: .str8(Array(b[lo..<hi]))))
-            case .wide(let w):
-                var narrow = true
-                var i = lo
-                while i < hi { if w[i] > 0xFF { narrow = false; break }; i += 1 }
-                if narrow {
-                    var out = [UInt8](); out.reserveCapacity(hi - lo)
-                    for j in lo..<hi { out.append(UInt8(truncatingIfNeeded: w[j])) }
-                    return JeffJSValue.makeString(JeffJSString(refCount: 1, len: hi - lo, isWideChar: false, storage: .str8(out)))
-                }
-                return JeffJSValue.makeString(JeffJSString(refCount: 1, len: hi - lo, isWideChar: true,
-                                                           storage: .str16(Array(w[lo..<hi]))))
+            let n = hi - lo
+            if n == 0 { return JeffJSValue.makeString(JeffJSString(latin1Count: 0) { _ in }) }
+            if let b = p8 {
+                return JeffJSValue.makeString(JeffJSString(latin1Count: n) { memcpy($0, b + lo, n) })
             }
+            let w = p16.unsafelyUnwrapped
+            var narrow = true
+            var i = lo
+            while i < hi { if w[i] > 0xFF { narrow = false; break }; i += 1 }
+            if narrow {
+                return JeffJSValue.makeString(JeffJSString(latin1Count: n) { dst in
+                    var j = 0
+                    while j < n { dst[j] = UInt8(truncatingIfNeeded: w[lo &+ j]); j &+= 1 }
+                })
+            }
+            return JeffJSValue.makeString(JeffJSString(utf16Count: n) { memcpy($0, w + lo, n &* 2) })
         }
 
         /// First index >= startPos where `search` occurs, or -1.
@@ -351,7 +373,7 @@ nonisolated struct JeffJSBuiltinString {
             if searchLen > sLen { return -1 }
             let limit = sLen - searchLen
             var i = max(startPos, 0)
-            if case .narrow(let hb) = storage, case .narrow(let nb) = search.storage {
+            if let hb = p8, let nb = search.p8 {
                 let first = nb[0]
                 while i <= limit {
                     if hb[i] == first {
@@ -389,7 +411,7 @@ nonisolated struct JeffJSBuiltinString {
         }
         let str = ctx.toString(this)
         if str.isException { return nil }
-        defer { str.freeValue() }   // the view holds the storage buffer itself
+        defer { str.freeValue() }   // the view keeps the string object (its code units) alive
         if let js = str.stringValue { return CodeUnits(js) }
         return CodeUnits(wide: ctx.toUTF16Array(str))
     }
@@ -730,9 +752,9 @@ nonisolated struct JeffJSBuiltinString {
     @inline(__always)
     static func oneCodeUnitString(_ cu: UInt32) -> JeffJSValue {
         if cu < 256 {
-            return JeffJSValue.makeString(JeffJSString(refCount: 1, len: 1, isWideChar: false, storage: .str8([UInt8(cu)])))
+            return JeffJSValue.makeString(JeffJSString(latin1Count: 1) { $0[0] = UInt8(cu) })
         }
-        return JeffJSValue.makeString(JeffJSString(refCount: 1, len: 1, isWideChar: true, storage: .str16([UInt16(cu)])))
+        return JeffJSValue.makeString(JeffJSString(utf16Count: 1) { $0[0] = UInt16(truncatingIfNeeded: cu) })
     }
 
     static func charAt(ctx: JeffJSContext, this: JeffJSValue, args: UnsafeBufferPointer<JeffJSValue>) -> JeffJSValue {
@@ -1390,17 +1412,20 @@ nonisolated struct JeffJSBuiltinString {
         guard let str = requireThisUnits(ctx: ctx, this: this, method: "toLowerCase") else { return .exception }
         // ASCII in narrow storage maps in place; anything else takes the
         // Unicode-aware Swift path.
-        if case .narrow(let b) = str.storage {
+        if let b = str.p8 {
             var ascii = true
             var i = 0
             while i < str.count { if b[i] >= 0x80 { ascii = false; break }; i += 1 }
             if ascii {
-                var out = [UInt8](); out.reserveCapacity(str.count)
-                for j in 0..<str.count {
-                    let c = b[j]
-                    out.append(c >= 0x41 && c <= 0x5a ? c + 0x20 : c)
-                }
-                return JeffJSValue.makeString(JeffJSString(refCount: 1, len: str.count, isWideChar: false, storage: .str8(out)))
+                let n = str.count
+                return JeffJSValue.makeString(JeffJSString(latin1Count: n) { out in
+                    var j = 0
+                    while j < n {
+                        let c = b[j]
+                        out[j] = c >= 0x41 && c <= 0x5a ? c + 0x20 : c
+                        j &+= 1
+                    }
+                })
             }
         }
         var units = [UInt16](); units.reserveCapacity(str.count)
@@ -1414,17 +1439,20 @@ nonisolated struct JeffJSBuiltinString {
         guard let str = requireThisUnits(ctx: ctx, this: this, method: "toUpperCase") else { return .exception }
         // ASCII in narrow storage maps in place; anything else takes the
         // Unicode-aware Swift path.
-        if case .narrow(let b) = str.storage {
+        if let b = str.p8 {
             var ascii = true
             var i = 0
             while i < str.count { if b[i] >= 0x80 { ascii = false; break }; i += 1 }
             if ascii {
-                var out = [UInt8](); out.reserveCapacity(str.count)
-                for j in 0..<str.count {
-                    let c = b[j]
-                    out.append(c >= 0x61 && c <= 0x7a ? c - 0x20 : c)
-                }
-                return JeffJSValue.makeString(JeffJSString(refCount: 1, len: str.count, isWideChar: false, storage: .str8(out)))
+                let n = str.count
+                return JeffJSValue.makeString(JeffJSString(latin1Count: n) { out in
+                    var j = 0
+                    while j < n {
+                        let c = b[j]
+                        out[j] = c >= 0x61 && c <= 0x7a ? c - 0x20 : c
+                        j &+= 1
+                    }
+                })
             }
         }
         var units = [UInt16](); units.reserveCapacity(str.count)

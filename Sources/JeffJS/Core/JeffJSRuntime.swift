@@ -2306,14 +2306,18 @@ nonisolated final class JeffJSRuntime {
 nonisolated func jeffJS_utf8Equals(_ str: String, _ js: JeffJSString) -> Bool {
     var it = str.utf8.makeIterator()
     @inline(__always) func take() -> UInt32? { if let b = it.next() { return UInt32(b) } ; return nil }
-    switch js.storage {
-    case .str8(let buf):
-        for cu in buf {
+    let jsLen = js.len
+    if let buf = js.units8 {
+        var i = 0
+        while i < jsLen {
+            let cu = buf[i]; i &+= 1
             if cu < 0x80 { if take() != UInt32(cu) { return false } }
             else { if take() != (0xC0 | UInt32(cu >> 6)) || take() != (0x80 | UInt32(cu & 0x3F)) { return false } }
         }
-    case .str16(let buf):
-        for cu in buf {
+    } else if let buf = js.units16 {
+        var i = 0
+        while i < jsLen {
+            let cu = buf[i]; i &+= 1
             if cu < 0x80 { if take() != UInt32(cu) { return false } }
             else if cu < 0x800 { if take() != (0xC0 | UInt32(cu >> 6)) || take() != (0x80 | UInt32(cu & 0x3F)) { return false } }
             else { if take() != (0xE0 | UInt32(cu >> 12)) || take() != (0x80 | UInt32((cu >> 6) & 0x3F)) || take() != (0x80 | UInt32(cu & 0x3F)) { return false } }

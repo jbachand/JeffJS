@@ -1,6 +1,6 @@
 # JeffJS Core — Claude neuron
 
-> Area: `Sources/JeffJS/Core/` · Repo: engine · Last reviewed: 2026-11-16 (app b16c7d3 / engine perf/manual-memory-closures)
+> Area: `Sources/JeffJS/Core/` · Repo: engine · Last reviewed: 2026-11-17 (app 2c8dfb7 / engine perf/string-record)
 
 ## Purpose
 The engine heart of JeffJS, a 1:1 Swift port of QuickJS: runtime (atoms, shapes, GC lists, job queue), contexts/realms
@@ -37,7 +37,7 @@ output: object graph semantics the interpreter, the DOM bridges and the host (`J
 - `JeffJSConstants.swift` — QuickJS limits/flags/enums; reads `Config/JeffJSConfig.swift` (`JEFFJS_OPTIMIZE`, `JS_DEFAULT_STACK_SIZE`, …).
 
 ## Invariants
-- **Flat string characters: read `units8` / `units16` / `unit(at:)`, not `storage`, on any hot path** (`storage` copies the array reference out of the enum: a retain/release pair). The pointers are computed from the array layout (`JeffJSString._base`; no stored field, the string stays 48 bytes) and are valid until the string is appended to in place or freed. `StringCodeUnitPointerTests`.
+- **A flat string owns its code units in one malloc block** (`JeffJSString._units`, quickjs `JSString`; nil when empty; freed in `deinit`; the object stays 48 bytes). Read `units8` / `units16` / `unit(at:)`; the pointers are valid until the string is appended to in place or freed. `storage` / `str8` / `str16` **copy the units into a new array** (cold readers and tests only; the setter replaces block and width). Create through `init(latin1Count:fill:)` / `init(utf16Count:fill:)` / `init(latin1:count:)` / `init(utf16:count:)` (the fill closure must write every unit); `init(storage:)` copies its array. `appendInPlace` reallocs with doubling and asks the allocator for the block's capacity (`jeffJS_mallocCapacity`). `StringCodeUnitPointerTests`.
 - **Property lookup borrows.** `getPropertyInternal` / `setPropertyInternal` / `hasPropertyEx` hand the object to `getPropertyOfObject` / `setPropertyOfObject` / `hasPropertyOfObject` as a guaranteed reference and walk prototypes by address (`getPropertyOnPrototype`, `setPropertyOnPrototype`); the caller's value keeps the object alive (quickjs holds none either). **Nothing may touch the borrowed object or prototype after a call into JS** (getter, setter, proxy trap): return straight away. A Proxy on the chain is dup'ed around its trap. Accessors: `JeffJSExtraRef.getterH` / `setterH` + `callRetainingFunction0` / `1`, never `extraStrong` or `args: []` on these paths. `ManualMemoryPropertyTests`.
 - **`traceBlockRef(at:)` / `TraceBlockRef`, `_cpoolRaw`** are what the dispatch uses (uncounted; the function record owns both); `traceBlock(at:)` and `cpool` are for cold readers.
 - **QuickJS fidelity**: Core changes port the quickjs.c function by name (commit message + comment cite it, `CONTRIBUTING.md`); architectural changes to Core/GC need an issue first. No dependencies beyond Foundation (+ optional Metal, under `#if canImport(Metal)`).

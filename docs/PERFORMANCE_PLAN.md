@@ -1740,3 +1740,63 @@ Swift array. The record of the original plan (code units in the string's own mal
 largest single gap left on these kernels. It changes every reader that takes the code units as a Swift array (the
 regex VM's input and bytecode, the JSON parsers, parseInt / parseFloat, the bytecode cache), which is why it is its
 own change.
+
+### Plan: the string record (issue #1 step 5, second piece), 2026-11-17
+
+Goal: a flat string's code units in one malloc block the string owns (quickjs `JSString`), instead of a Swift
+ContiguousArray inside an enum: one allocation and one free per string, no array object, no generic teardown. The
+object stays 48 bytes (the pointer takes the enum's word; capacity from `malloc_size` where `appendInPlace` needs it).
+
+It lands in this order, each step shippable on its own:
+
+1. **Readers stop taking arrays** (representation unchanged; `units8` / `units16` / `unit(at:)` exist since the first
+   piece). Inventory of `storage` readers outside `JeffJSString.swift`, by what they need:
+   - *Hold the array past the call*: the regex VM's bytecode (`JeffJSBuiltinRegExp.swift` 998, 2029, 2531: give
+     `JeffJSRegexCaches` a `[UInt8]` per bytecode string, as `groupNames` already has), `jeffJS_utf8Bytes` (JSON
+     parse input, `JeffJSBuiltinJSON.swift` 1396: returns the array itself when ASCII), the string-search view in
+     `JeffJSBuiltinString.swift` 311 (make it hold pointers; the strings outlive it).
+   - *Scan once*: JSON quoting (`JeffJSBuiltinJSON.swift` 1040, `JeffJSBuiltinJSONFast.swift` 63), parseFloat
+     (`JeffJSBuiltinGlobal.swift` 257), `jeffJS_utf8Equals` (`JeffJSRuntime.swift` 2309), the interpreter's private
+     equals / toSwiftString (`JeffJSInterpreter.swift` 8144, 8170), regex input widening (2516), the lazy JSON
+     string cache (`JeffJSLazyPayload.swift` 585), the bytecode cache writer (cold).
+   - Inside `JeffJSString.swift`: `jeffJS_subString`, `jeffJS_computeHash`, `jeffJS_indexOfString8`,
+     `flattenInto8/16`, `JeffJSStringBuffer.concat`, `canonicalArrayIndex`, `toSwiftString`, `appendInPlace`.
+2. **Creators stop building arrays first**: `jeffJS_subString`, `JeffJSString(swiftString:)`, number to string,
+   the string builtins (`slice`, `split`, `replace`, case mapping), JSON and lazy-payload strings, through
+   `JeffJSString(latin1Count:fill:)` / `(utf16Count:fill:)` (already used by flat concat).
+3. **The representation flips**: `_chars` becomes the malloc pointer; `storage` stays as a copying accessor for the
+   cold readers left; `StringCodeUnitPointerTests` changes from pinning the array layout to pinning the block.
+
+Measure each step with the template kernel (`bench/step/kernels`, 18 040 instructions per row today, 13 020 in
+libraries) and the single-kernel sampler runs; the gate for step 3 is the string kernels of realworld
+(template-html, template-literals, large-object-keys, string-split-trim) at least 30 % faster.
+
+### Done: the string record, 2026-11-17
+
+All three steps landed as one change. `JeffJSString` holds `_units`, a malloc block of `len` one- or two-byte code
+units (nil when empty), freed in `deinit`; the object is still 48 bytes. `units8` / `units16` return the block;
+`storage` is a copying accessor (the bytecode cache writer and tests are its only readers) and its setter replaces
+the block and the width. `appendInPlace` grows the block with `realloc`, doubling, and uses the allocator's size
+class (`jeffJS_mallocCapacity`: `malloc_size` / `malloc_usable_size`) to skip the call while there is room; a
+string appended to itself reads its source after the block may have moved. Creators that write into the block
+directly (`init(latin1Count:fill:)`, `init(utf16Count:fill:)`, `init(latin1:count:)`, `init(utf16:count:)`): flat
+concat, substring, `JeffJSString(swiftString:)` for ASCII, `jeffJS_stringFromUTF8` for ASCII, int to string, rope
+flattening, the string buffer's result, case mapping, one-code-unit strings, `newStringFromUTF16`, the fast JSON
+quoter. The remaining `init(storage:)` callers copy their array once (regex sources and bytecode, lazy-payload
+strings, non-ASCII Swift strings, the tokenizer): correct, one transient array each, not on a measured path.
+
+Measured against the build before it (41fc950), same results on every case file and benchmark checksum:
+
+| | before | after |
+|---|---|---|
+| template row, 8 concats (`bench/step/kernels/tmplhtml`) | 18 040 instr | 13 945 instr |
+| realworld, instructions | 122.2 G | 114.1 G (−6.6 %) |
+| template-html | 235 ms | 154 ms |
+| template-literals | 181 ms | 112 ms |
+| string-split-trim | 107 ms | 76 ms |
+| realworld peak memory | 110 MB | 100 MB |
+
+kernels, watch_deepmerge and watch_callbacks are unchanged (no string building). What is left in a template row is
+two allocations per temporary string (the object and its block) and their frees, about 60 % of the row; one
+allocation would need the code units after the object's fields, which a Swift class cannot express without
+`ManagedBuffer` (a different class layout for every string reader). Not planned.

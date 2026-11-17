@@ -815,7 +815,8 @@ nonisolated func jeffJS_stringFromUTF8(_ u: UnsafeBufferPointer<UInt8>) -> JeffJ
     var acc: UInt8 = 0
     for b in u { acc |= b }
     if acc < 0x80 {
-        return JeffJSString(refCount: 1, len: u.count, isWideChar: false, storage: .str8(Array(u)))
+        let n = u.count
+        return JeffJSString(latin1Count: n) { dst in if n > 0, let b = u.baseAddress { memcpy(dst, b, n) } }
     }
     var units = [UInt16]()
     units.reserveCapacity(u.count)

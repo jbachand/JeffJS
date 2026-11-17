@@ -7564,16 +7564,18 @@ nonisolated struct JeffJSTypeConvert {
         if val.isInt {
             // Digits straight into a Latin-1 string (the Swift String round
             // trip dominated `"s" + i` and template building).
-            var n = Int(val.toInt32())
-            var digits = [UInt8](); digits.reserveCapacity(11)
-            if n == 0 { digits.append(48) } else {
-                let neg = n < 0
-                if neg { n = -n }
-                while n > 0 { digits.append(UInt8(48 + n % 10)); n /= 10 }
-                if neg { digits.append(45) }
-                digits.reverse()
-            }
-            return JeffJSValue.makeString(JeffJSString(refCount: 1, len: digits.count, isWideChar: false, storage: .str8(digits)))
+            let v = Int(val.toInt32())
+            let neg = v < 0
+            let mag = neg ? -v : v
+            var count = neg ? 2 : 1
+            var t = mag
+            while t >= 10 { t /= 10; count &+= 1 }
+            return JeffJSValue.makeString(JeffJSString(latin1Count: count) { dst in
+                var n = mag
+                var i = count &- 1
+                repeat { dst[i] = UInt8(48 &+ n % 10); n /= 10; i &-= 1 } while n > 0
+                if neg { dst[0] = 45 }
+            })
         }
         if val.isFloat64 {
             let d = val.toFloat64()
@@ -8141,14 +8143,7 @@ nonisolated private func jeffJS_stringEqual(_ a: JeffJSString, _ b: JeffJSString
         }
         return true
     }
-    switch (a.storage, b.storage) {
-    case (.str8(let ab), .str8(let bb)):
-        return ab == bb
-    case (.str16(let ab), .str16(let bb)):
-        return ab == bb
-    default:
-        return false
-    }
+    return jeffJS_stringEquals(s1: a, s2: b)   // same width, same length: one memcmp over the code units
 }
 
 /// Lexicographic comparison of two JeffJSString values.
@@ -8167,12 +8162,7 @@ nonisolated private func jeffJS_stringCompare(_ a: JeffJSString, _ b: JeffJSStri
 
 /// Convert a JeffJSString to a Swift String.
 nonisolated private func jeffJS_toSwiftString(_ s: JeffJSString) -> String {
-    switch s.storage {
-    case .str8(let buf):
-        return String(buf.prefix(s.len).map { Character(Unicode.Scalar($0)) })
-    case .str16(let buf):
-        return String(utf16CodeUnits: Array(buf.prefix(s.len)), count: s.len)
-    }
+    return s.toSwiftString()
 }
 
 // =============================================================================
