@@ -95,6 +95,7 @@ nonisolated struct JeffJSFBRef {
     @inline(__always) func getIC() -> JeffJSInlineCache { u._withUnsafeGuaranteedRef { $0.getIC() } }
     @inline(__always) func constant(_ i: Int) -> JeffJSValue { u._withUnsafeGuaranteedRef { $0.constant(i) } }
     @inline(__always) func traceBlock(at pc: Int) -> TraceBlockInfo? { u._withUnsafeGuaranteedRef { $0.traceBlock(at: pc) } }
+    @inline(__always) func traceBlockRef(at pc: Int) -> TraceBlockRef? { u._withUnsafeGuaranteedRef { $0.traceBlockRef(at: pc) } }
 }
 
 typealias JeffJSFBHandle = JeffJSFBRef

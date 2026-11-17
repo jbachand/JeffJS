@@ -1607,3 +1607,46 @@ trace-ops flag test, the jump table address rebuilt, two spill moves) against 6 
 class: 15 500 instructions against QuickJS's 3 250 (an argument array per `new`, four payload matches in
 `callConstructor`, a recursive activation). `for…in`: 1 214 per property. A closure created and called per
 iteration: 3 017.
+
+### Round 16, step 4 (2026-11-16, `perf/manual-memory-objects3`): property access, elements and the back-edge
+
+Objects already live on the JS count with one Swift retain, so this step is borrowing, not a new representation
+(the slab record of the original plan is not needed to remove retain/release). By exact counts, one group at a time:
+
+- **`[[Get]]`, `[[Set]]`, `[[HasProperty]]` borrow the object** (quickjs `JS_GetPropertyInternal`,
+  `JS_SetPropertyInternal`, `JS_HasProperty`: `p = JS_VALUE_GET_OBJ(obj)`, no dup). `getPropertyInternal` /
+  `setPropertyInternal` / `hasPropertyEx` are now entries that hand a guaranteed reference to
+  `getPropertyOfObject` / `setPropertyOfObject` / `hasPropertyOfObject`; the primitive cases are out of line. The
+  prototype walk borrows each level (`getPropertyOnPrototype`, `setPropertyOnPrototype`), the own shape is read
+  through `shapeU`, accessors through `JeffJSExtraRef.getterH` / `setterH`, and a getter or setter is called through
+  `callRetainingFunction0` / `1` (the argv entry: no argument array for a bytecode accessor). A Proxy met on the
+  chain is held across its trap (`proxyOnChainGet` / `Set` / `Has`), as quickjs does around an exotic method.
+- **Elements and typed arrays in the dispatch** through `JeffJSObj.fastArrayElement`, `fastArrayReplaceElement`,
+  `typedArrayGet` / `Set` / `LengthFast` and `fastArrayPush` (guaranteed references to the element store);
+  `arrayAcceptsFastPush` borrows the shape.
+- **The polymorphic cache hit path** (`JeffJSInlineCache.polyRead`): sites and entries through raw mirrors
+  (`polyRaw`, `JeffJSPolySite.raw`), prototypes by address, a cached getter as a `JeffJSObj` handle.
+- **The back-edge trace entry**: `traceBlockRef(at:)` returns a `TraceBlockRef` (uncounted; `traceBlocks` owns the
+  block) and the lean trace takes the constant pool as `_cpoolRaw` + count instead of the array.
+
+| (flag on) | step 3 | loops (round 17) | + step 4 |
+|---|---:|---:|---:|
+| Swift ARC calls, realworld | 939 M | 939 M | **646 M (−31 %)** |
+| Swift ARC calls, watch_deepmerge | 179 M | 179 M | **143 M (−20 %)** |
+| instructions, realworld (M) | 133 431 | 130 704 | 124 892 (−6.4 %) |
+| instructions, kernels (M) | 53 673 | 45 676 | 44 343 (−17.4 %) |
+| instructions, watch_deepmerge (M) | 27 340 | 27 232 | 26 901 (−1.6 %) |
+| instructions, watch_callbacks (M) | 27 671 | 27 654 | 27 524 (−0.5 %) |
+
+(The instruction rows were measured before the `[[Set]]` / `[[HasProperty]]` part; the ARC rows include it.)
+`getPropertyInternal` (87 M on realworld) and `polyRead` (34 M) are gone from the list; `callInternalRaw` went from
+95 M to 35 M. Both builds: 433 tests, the 4 known failing cases only; checksums identical to step 3; `check.sh`
+clean. Tests: `ManualMemoryPropertyTests` (accessors that delete or redefine themselves or cut the chain while they
+run, a Proxy on the chain, polymorphic sites, frozen and growing arrays; values are QuickJS's).
+
+**Left, with counts** (realworld, 646 M): `callInternalRaw` 35 M, `executeFastTrace` 22 M (the native-call closure
+copy, 11 M pairs: the measured dead end of step 3), string concat 30 M and string / object `deinit` 15 M each
+(step 5), `newObjectClass` 15 M (the object pool is a Swift array: a retain and a release per recycled object),
+`callFunction`'s native path 12 M, `findAtom(jsString:)` 11 M, `jeffJS_objectAddShapeProperty` 11 M, the sort
+comparator closure 10 M. By time (in-process sampler, realworld): retain/release 17 %, malloc/free 13 %, the three
+dispatch functions 28 %.
