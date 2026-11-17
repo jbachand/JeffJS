@@ -1715,3 +1715,28 @@ realworld −1.2 % instructions. Both builds: 436 tests, the 4 known failing cas
 activation prologue, an array in the `super(...)` path); adding a property to a fresh object is about 700
 instructions per property (the setter walk up the prototype chain, then the hashed transition), which a
 transition cache at `put_field` would remove but needs a way to know no accessor appeared on the chain.
+
+### Property adds and flat concat (2026-11-17, `perf/put-field-add`); where the slow kernels' time is
+
+- `put_field`'s miss path cached the slot after every write. For a write that *added* the property the object has
+  moved to a new shape, and the next object the site meets (the next `this.x = v` of a constructor) is on the old
+  one again: the cache never hit, at a shape lookup and a retain/release pair per property added. It now caches
+  only when the write left the object on its shape. `new A(i)` 3 782 → 3 483 instructions, `new B(i)` 10 953 → 10 063.
+- `jeffJS_flatConcatStrings` builds its result through `JeffJSString(latin1Count:fill:)` / `(utf16Count:fill:)`:
+  one allocation written once (it zero-filled a Swift array, copied into it, then handed it over). About 1 % on
+  the string kernels.
+
+realworld −0.4 % instructions. Both builds: 436 tests, the 4 known failing cases only; AddressSanitizer clean.
+
+**Where the slow real-world kernels spend their time** (in-process sampler on single kernels; wall ratio to qjs:
+template-html 4.6×, template-literals 4.4×, large-object-keys 4.7×, proxy-reactive 5.9×, date-number-format 2.8×,
+class-hierarchy 3.5×). In all but class-hierarchy, **60 to 70 % of the samples are outside the executable**: malloc,
+free, memmove, memset, `swift_allocObject`, array storage teardown and generic-metadata lookups, charged to
+`jeffJS_flatConcatStrings` (20 to 36 %), `JeffJSString.deinit` + `freeValueSlow` (20 to 25 %) and array growth.
+A template row of eight concatenations is 18 040 instructions, 13 020 of them in libraries: about 1 600 library
+instructions per string made and dropped, where QuickJS pays one malloc and one free. This is not retain/release
+(step 5's first piece counted those: 2 % of realworld's calls) but the two-allocation string: a Swift object plus a
+Swift array. The record of the original plan (code units in the string's own malloc block) is the fix; it is the
+largest single gap left on these kernels. It changes every reader that takes the code units as a Swift array (the
+regex VM's input and bytecode, the JSON parsers, parseInt / parseFloat, the bytecode cache), which is why it is its
+own change.
