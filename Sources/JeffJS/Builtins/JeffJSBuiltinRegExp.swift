@@ -58,8 +58,8 @@ nonisolated private func js_regexp_adoptPattern(_ val: JeffJSValue) -> JeffJSStr
         return unsafeDowncast(sb, to: JeffJSString.self)
     }
     guard let flat = val.stringValue else { return nil }
-    return js_regexp_adoptFreshPattern(
-        JeffJSString(len: flat.len, isWideChar: flat.isWideChar, storage: flat.storage))
+    guard let copy = jeffJS_subString(str: flat, start: 0, end: flat.len) else { return nil }
+    return js_regexp_adoptFreshPattern(copy)
 }
 
 /// A newly created pattern string (refCount 1, never wrapped): wrapping it
@@ -994,12 +994,8 @@ nonisolated private func js_regexp_globalMatchFast(
         return .exception  // signal to fall back to slow path
     }
 
-    let bytecode: [UInt8]
-    if case .str8(let buf) = bc.storage {
-        bytecode = Array(buf.prefix(bc.len))
-    } else {
-        return .exception  // bytecode must be str8
-    }
+    guard !bc.isWideChar else { return .exception }  // bytecode must be str8
+    let bytecode = ctx.rt.regexCaches.bytecode(of: bc)
 
     guard bytecode.count >= 5 else { return .exception }
 
@@ -2025,12 +2021,8 @@ nonisolated private func js_regexp_execInternal(
     }
 
     // Unwrap the JeffJSString -> [UInt8].
-    let bytecode: [UInt8]
-    if case .str8(let buf) = bc.storage {
-        bytecode = buf.count == bc.len ? buf : Array(buf.prefix(bc.len))   // no per-exec copy
-    } else {
-        return nil  // bytecode must be str8
-    }
+    guard !bc.isWideChar else { return nil }  // bytecode must be str8
+    let bytecode = ctx.rt.regexCaches.bytecode(of: bc)   // cached per pattern: no per-exec copy
 
     guard bytecode.count >= 5 else { return nil }  // need at least the header
 
@@ -2469,6 +2461,22 @@ nonisolated final class JeffJSRegexCaches {
     private var inputs: [(JeffJSString, [UInt32])] = []
     private var names: [(JeffJSString, [String?])] = []
     private var vms: [(JeffJSString, REVirtualMachine)] = []
+    /// The compiled program of a pattern as the array the matcher takes,
+    /// copied out of the pattern's bytecode string once (the string's code
+    /// units are no longer handed out as an array; JeffJS issue #1 step 5).
+    private var bytecodes: [(JeffJSString, [UInt8])] = []
+    private static let maxBytecodes = 16
+
+    func bytecode(of bc: JeffJSString) -> [UInt8] {
+        if let i = bytecodes.firstIndex(where: { $0.0 === bc }) {
+            if i != 0 { let e = bytecodes.remove(at: i); bytecodes.insert(e, at: 0) }
+            return bytecodes[0].1
+        }
+        let a: [UInt8] = bc.units8.map { Array(UnsafeBufferPointer(start: $0, count: bc.len)) } ?? []
+        bytecodes.insert((bc, a), at: 0)
+        if bytecodes.count > Self.maxBytecodes { bytecodes.removeLast() }
+        return a
+    }
     private static let maxInputs = 2
     private static let maxNames = 8
     private static let maxVMs = 8
@@ -2513,10 +2521,9 @@ nonisolated final class JeffJSRegexCaches {
             }
         }
         var c = [UInt32](); c.reserveCapacity(s.len)
-        switch s.storage {
-        case .str8(let b): for u in b.prefix(s.len) { c.append(UInt32(u)) }
-        case .str16(let b): for u in b.prefix(s.len) { c.append(UInt32(u)) }
-        }
+        let n = s.len
+        if let b = s.units8 { var i = 0; while i < n { c.append(UInt32(b[i])); i &+= 1 } }
+        else if let b = s.units16 { var i = 0; while i < n { c.append(UInt32(b[i])); i &+= 1 } }
         inputs.insert((s, c), at: 0)
         if inputs.count > Self.maxInputs { inputs.removeLast() }
         return c
@@ -2527,16 +2534,11 @@ nonisolated final class JeffJSRegexCaches {
             if i != 0 { let e = names.remove(at: i); names.insert(e, at: 0) }
             return names[0].1
         }
-        let g: [String?]
-        if case .str8(let bcBuf) = bc.storage {
-            g = lreGetGroupNames(bcBuf.count == bc.len ? bcBuf : Array(bcBuf.prefix(bc.len)))
-        } else {
-            g = []
-        }
+        let g: [String?] = bc.isWideChar ? [] : lreGetGroupNames(bytecode(of: bc))
         names.insert((bc, g), at: 0)
         if names.count > Self.maxNames { names.removeLast() }
         return g
     }
 
-    func removeAll() { inputs.removeAll(); names.removeAll() }
+    func removeAll() { inputs.removeAll(); names.removeAll(); bytecodes.removeAll() }
 }

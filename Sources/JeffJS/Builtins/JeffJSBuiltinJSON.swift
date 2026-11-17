@@ -1035,18 +1035,9 @@ nonisolated struct JeffJSBuiltinJSON {
     private static func quoteJSONString(units js: JeffJSString) -> String {
         var result = "\""
         let n = js.len
-        var s8: [UInt8]? = nil
-        var s16: [UInt16]? = nil
-        switch js.storage {
-        case .str8(let b): s8 = b
-        case .str16(let w): s16 = w
-        }
         var i = 0
         while i < n {
-            let cp: UInt32
-            if let b = s8 { guard i < b.count else { break }; cp = UInt32(b[i]) }
-            else if let w = s16 { guard i < w.count else { break }; cp = UInt32(w[i]) }
-            else { break }
+            let cp: UInt32 = js.unit(at: i)   // read in place
             i += 1
             switch cp {
             case 0x22: result += "\\\""
@@ -1059,7 +1050,7 @@ nonisolated struct JeffJSBuiltinJSON {
             default:
                 if cp < 0x20 {
                     result += String(format: "\\u%04x", cp)
-                } else if cp >= 0xD800 && cp <= 0xDBFF, let w = s16, i < n, i < w.count,
+                } else if cp >= 0xD800 && cp <= 0xDBFF, let w = js.units16, i < n,
                           w[i] >= 0xDC00 && w[i] <= 0xDFFF {
                     let full = 0x10000 + ((cp - 0xD800) << 10) + (UInt32(w[i]) - 0xDC00)
                     i += 1
@@ -1393,20 +1384,22 @@ nonisolated extension JeffJSContext {
 /// all ASCII is returned as-is; otherwise code units are transcoded directly.
 nonisolated func jeffJS_utf8Bytes(of js: JeffJSString) -> [UInt8] {
     let n = js.len
-    switch js.storage {
-    case .str8(let b):
-        let m = min(n, b.count)
+    if n == 0 { return [] }
+    if let b = js.units8 {
+        let m = n
         var ascii = true
         for i in 0..<m where b[i] >= 0x80 { ascii = false; break }
-        if ascii { return m == b.count ? b : Array(b[0..<m]) }
+        if ascii { return Array(UnsafeBufferPointer(start: b, count: m)) }
         var out = [UInt8](); out.reserveCapacity(m + m / 4)
         for i in 0..<m {
             let c = b[i]
             if c < 0x80 { out.append(c) } else { out.append(0xC0 | (c >> 6)); out.append(0x80 | (c & 0x3F)) }
         }
         return out
-    case .str16(let w):
-        let m = min(n, w.count)
+    }
+    do {
+        guard let w = js.units16 else { return [] }
+        let m = n
         var out = [UInt8](); out.reserveCapacity(m + m / 2)
         var i = 0
         while i < m {

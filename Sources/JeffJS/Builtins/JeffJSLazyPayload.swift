@@ -582,8 +582,8 @@ nonisolated private func jeffJS_lazyStringValue(_ b: JeffJSLazyPayloadBuffer, _ 
         var key: UInt64 = 0
         if jeffJS_sharedStringsEnabled, n <= JeffJSLazyPayloadBuffer.strCacheMaxLen {
             key = jeffJS_fnv64(p, s, e)
-            if let v = b.strCache[key], let js = v.stringValue, js.len == n, case .str8(let st) = js.storage,
-               st.count >= n, st.withUnsafeBufferPointer({ memcmp($0.baseAddress!, p.baseAddress! + s, n) == 0 }) {
+            if let v = b.strCache[key], let js = v.stringValue, js.len == n, let st = js.units8,
+               memcmp(st, p.baseAddress! + s, n) == 0 {
                 return v.dupValue()
             }
         }
