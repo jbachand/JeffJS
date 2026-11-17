@@ -1,6 +1,6 @@
 # Bench, Scripts, gcstress, Console — Claude neuron
 
-> Area: `bench/` · Repo: engine · Last reviewed: 2026-11-02 (app 20c9d08 / engine 1bcbde2)
+> Area: `bench/` · Repo: engine · Last reviewed: 2026-11-16 (app 7447fa1 / engine perf/trace-hygiene)
 
 ## Purpose
 The engine's measurement scripts (`bench/`), its maintenance scripts (`Scripts/`), the collector stress input
@@ -21,6 +21,11 @@ before/after (QuickJS = `/opt/homebrew/bin/qjs`, jsc = the system binary) is rec
 - `arc/` — ARC-removal harness (`README.md`): `ir.sh <cli> <bench.js>` (instr/cycles/RSS, ±0.05 %), `check.sh <cli>`
   (`leaks/*.js` under default / `JEFFJS_NO_POOL=1` / `JEFFJS_ZOMBIES=1`, outputs compared, RSS + `JEFFJS_TRACK_RC=1` live
   objects), `arc*.py` (xctrace retain/release attribution), `interpose/` (exact dynamic ARC counts via `DYLD_INSERT_LIBRARIES`).
+- `step/` — exact instruction profiles without a debugger (`README.md`): `libstep.dylib` single-steps the CLI between two
+  marker calls and counts every executed instruction (`mp.sh <cli> <tag> [kernel…]` over `kernels/*.js`: instructions per
+  loop iteration; `stepmap.py` by function and `case .op`, `hot.py` / `seq.py` for the instruction listing), `libsample.dylib`
+  is an in-process pc sampler for long runs (`smp.py`, `smpfn.py`). Round 17's numbers; the tool to reach for when a
+  dispatch change moves the kernels with no difference in the source.
 - `arch/dispatch_bench.swift` — standalone dispatch microbenchmark behind `docs/EXECUTION_ARCHITECTURE_RETHINK.md` (`swiftc -O -wmo`).
 - `../Scripts/run_tests.sh [release|debug] [--filter p]` — `swift test` under the CPU collector, again under `JEFFJS_GC_METAL=1`,
   then every `Tests/gcstress/*.js` under both, outputs diffed. `../Tests/gcstress/cycles.js` — the heap shapes.

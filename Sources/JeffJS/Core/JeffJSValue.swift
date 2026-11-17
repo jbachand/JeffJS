@@ -441,17 +441,21 @@ nonisolated struct JeffJSValue {
     @inline(__always)
     @discardableResult
     func dupValueFast() -> JeffJSValue {
+        // Numbers, booleans, undefined and null (most of what a loop pushes)
+        // leave on one compare; the object test is only reached for heap values.
+        guard _isHeapTag else { return self }
         if (bits & Self._tagMask) == Self._objectTag, !jeffJS_refDebugMode,
            let p = UnsafeRawPointer(bitPattern: UInt(bits & Self._ptrMask)) {
-            Unmanaged<JeffJSObject>.fromOpaque(p)._withUnsafeGuaranteedRef { $0.refCount += 1 }
+            Unmanaged<JeffJSObject>.fromOpaque(p)._withUnsafeGuaranteedRef { $0.refCount &+= 1 }
             return self
         }
-        if _isHeapTag { dupValueHeap() }
+        dupValueHeap()
         return self
     }
 
     @inline(__always)
     func freeValueFast() {
+        guard _isHeapTag else { return }   // one compare for numbers / booleans / undefined
         if (bits & Self._tagMask) == Self._objectTag, !jeffJS_refDebugMode,
            let p = UnsafeRawPointer(bitPattern: UInt(bits & Self._ptrMask)) {
             let alive = Unmanaged<JeffJSObject>.fromOpaque(p)._withUnsafeGuaranteedRef { o -> Bool in
@@ -463,7 +467,7 @@ nonisolated struct JeffJSValue {
             freeValueSlow()
             return
         }
-        if _isHeapTag { freeValueHeap() }
+        freeValueHeap()
     }
 
     /// Out-of-line heap dup. Plain objects (the common case) bump the manual

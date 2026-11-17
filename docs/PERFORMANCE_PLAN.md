@@ -1535,3 +1535,75 @@ strings 9 M + `jeffJS_stringEquals` 6 M, `Array.prototype.concat` 8 M, `getOwnPr
 Swift retain (`makeObject`), so the object step is this same borrowing work in property lookup and the builtins,
 not a new representation.
 
+
+## Round 17 — the dispatch loops by exact instruction counts (2026-11-16, branch `perf/trace-hygiene`)
+
+Step 3 left `kernels.js` 0.7 % slower with no retain/release difference, and the first batch of step 4 made it 2 %
+slower again. Every earlier round met this ("the trace loop is sensitive") and could only bisect builds, because
+nothing on this Mac may attach to a process: `lldb`, `sample` and Instruments all need Developer Tools access.
+This round starts with the tool that was missing.
+
+**`bench/step` (new).** `libstep.dylib` is injected with `DYLD_INSERT_LIBRARIES`, puts a hardware breakpoint on a
+function in its own process and single-steps through its own Mach exception port, counting executions per pc; no
+debugger and no entitlement. `mp.sh` runs small kernels (`bench/step/kernels`) between two marker calls and prints
+exact instructions per loop iteration; `stepmap.py` splits them by function and by `case .op`, `seq.py` prints one
+iteration in execution order with source lines. `libsample.dylib` is an in-process pc sampler for long runs.
+The counts repeat to the instruction, so two builds can be compared per opcode.
+
+**What it showed.** The 2 % was one register: `varBase` had been spilled in the lean trace, five reloads per iteration
+of an integer loop. But the absolute numbers were the finding. `for (i…) s = (s + i) | 0` took **234 instructions per
+iteration** (seven opcodes), a call and return about 330, a property read through a warm inline cache about 55, and
+about a sixth of everything had no source line at all (spills, reloads, register moves). The three dispatch functions
+keep 13 to 30 values alive across the loop on ten callee-saved registers, and the compiler cannot tell the hot ones
+from the cold ones in a 270-way switch. What follows is the mechanical part: no opcode changes meaning, no handler
+is restructured.
+
+- **The lean trace's stack pointer in a register** (quickjs `JS_CallInternal`: `sp` is a local). It was
+  `sp: inout Int`: loaded and stored at every push and pop, because a store through `buf` could alias it. The trace is
+  now `executeFastTraceLeanBody`, which takes `sp` by value and returns `(pc, sp)`; `executeFastTraceLean` is an
+  inlined wrapper. Passing `&sp` had also pinned the caller's own `sp` to memory in the main loop and the call trace.
+- **Opcode switches that name every opcode** (quickjs dispatches through a full table with no bound). The two traces
+  ended in `default: deopt`, so the jump table carried a range check: `sub`, `cmp`, `b.hi` on every dispatched opcode.
+  With every case named there is none (dispatch in the lean trace: 9 instructions → 6).
+- **Index arithmetic without overflow traps**: `pc &+= n`, `sp &-= 1`, `bc[pc &+ 1]`, `buf[sp &- 1]`,
+  `buf[varBase &+ i]` in all three loops (each `+` was an `adds` and a branch to a trap), and in the lean trace locals
+  through one pointer, `locals = buf + varBase` (no add at all; the trace has no calls, so both are fixed).
+- **No per-opcode counter in the call trace.** `opsRun` (the progress measure behind "this trace keeps leaving
+  early") was incremented on every opcode: a register and three or four instructions per dispatch. It now lives in
+  `HotState` and is adjusted only where pc jumps (`state.opsRun &+= pc &- target`), which gives the bytes of bytecode
+  run; the exit halves that into the opcode estimate the `< 16` guards compare.
+- **`dupValueFast` / `freeValueFast` test for a heap value first** (one compare for a number, boolean or undefined;
+  the object test is only reached for heap values), and the lean trace's local and argument pushes use the inline
+  form. In the call trace the same change cost more than it saved (the dispatch block lost a register): left alone.
+
+Instructions per loop iteration (`bench/step/mp.sh`, exact; step 3 = `d1e1886`):
+
+| kernel | step 3 | this round | |
+|---|---:|---:|---:|
+| intloop (`s = (s + i) \| 0`) | 235.0 | 170.0 | −27.7 % |
+| propgetset (`o.x = o.y + o.z; s += o.x`) | 654.4 | 504.3 | −22.9 % |
+| arrayread (`s += a[i]`) | 444.1 | 351.1 | −20.9 % |
+| calls (`s = h(s, i) \| 0`) | 792.4 | 707.4 | −10.7 % |
+| allocobjs (`{a, b}` per iteration) | 1 372.0 | 1 230.0 | −10.3 % |
+| fib (per call) | 705.3 | 655.7 | −7.0 % |
+| arraypush | 997.1 | 967.3 | −3.0 % |
+| methodcall | 1 250.8 | 1 216.8 | −2.7 % |
+
+Instructions retired, whole benchmarks (M, min of 3): kernels 53 865 → **46 117 (−14.4 %)**, realworld 133 948 →
+130 720 (−2.4 %), watch_deepmerge 27 465 → 26 950 (−1.9 %), watch_callbacks 27 764 → 27 657 (−0.4 %). Real-world
+code spends its interpreter time in the main loop (14.5 % of realworld's samples, against 7.7 % and 5.4 % in the two
+traces), which got only the arithmetic change. Both builds: `swift test -c release` 431 tests, the 4 known failing
+cases only; checksums identical to the step 3 binary; under AddressSanitizer the suite, the three benchmarks, the
+kernels and the leak scripts report nothing. Tests: `InterpreterLoopTests`.
+
+**Measured and dropped.** Reading `bcLen`, the var-ref mirror and the interrupt counter from `state` / `ctx` instead
+of locals in the call trace (to free registers for `sp` and `varBase`, which stay spilled there): no change, reverted.
+
+**Left, with counts.** The call trace still spills `sp` and `varBase` (a load or two on every stack and local
+access) and about 110 of a call iteration's 707 instructions have no source line; a call and return is about 320
+instructions (frame pool pop and release with their flag tests, a 112-byte inline-stack record saved and restored,
+two loops that free the callee's slots). The main loop's dispatch is 14 instructions (a `pc < bcLen` test, a
+trace-ops flag test, the jump table address rebuilt, two spill moves) against 6 in the lean trace. `new` on a
+class: 15 500 instructions against QuickJS's 3 250 (an argument array per `new`, four payload matches in
+`callConstructor`, a recursive activation). `for…in`: 1 214 per property. A closure created and called per
+iteration: 3 017.
