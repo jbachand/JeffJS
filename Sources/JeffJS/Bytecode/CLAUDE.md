@@ -1,6 +1,6 @@
 # JeffJS Bytecode — Claude neuron
 
-> Area: `Sources/JeffJS/Bytecode/` · Repo: engine · Last reviewed: 2026-11-16 (app b16c7d3 / engine perf/manual-memory-closures)
+> Area: `Sources/JeffJS/Bytecode/` · Repo: engine · Last reviewed: 2026-11-16 (app 7447fa1 / engine perf/trace-hygiene)
 
 ## Purpose
 The middle of the QuickJS pipeline as ported to Swift: the parser's raw bytecode (`../Parser/`) comes in, the
@@ -29,6 +29,12 @@ QuickJS counterparts are named in each file header.
 - `JeffJSStackDiag.swift` — value-stack overflow reporter (`overflowCount`, `currentLabel` read by `EngineTests`).
 
 ## Invariants
+- **The three dispatch loops are register-starved, so their bookkeeping is shaped for codegen** (`docs/PERFORMANCE_PLAN.md` round 17; measure with `bench/step/mp.sh`, never by eye):
+  - *The opcode `switch` in `executeFastTraceLeanBody` and `executeFastTrace` names every opcode, no `default:`.* With an exhaustive switch the jump table needs no range check (three instructions per dispatched opcode). A new opcode gets a handler or goes on the deopt list at the end of each switch; the compiler refuses the build otherwise. `InterpreterLoopTests.testOpcodeBytesAreEnumCases` pins the byte-to-case decode this relies on.
+  - *The lean trace's stack pointer travels by value.* `executeFastTraceLean` is an `@inline(__always)` wrapper around `executeFastTraceLeanBody`, which takes `sp` and returns `(pc, sp)`: as an `inout` it was loaded and stored at every push and pop, and passing `&sp` to it pinned the caller's own `sp` to memory. Every exit is `return (pc, sp)`; never add an `inout` or a `&sp` to a call inside a dispatch loop.
+  - *Index arithmetic on `pc` / `sp` / `varBase` is `&+` / `&-`* (they are bounded by the bytecode and the frame; the trapping forms cost a branch each). The lean trace reads locals through `locals` (`buf + varBase`, fixed for the trace: it has no calls); the call-capable trace and the main loop use `buf[varBase &+ i]` because both change at calls and returns.
+  - *`executeFastTrace` has no per-opcode counter.* Its progress measure for the deopt guards (`HotState.opsRun`) is kept in `state` and touched only where pc is not simply advanced (`state.opsRun &+= pc &- target` at taken jumps, calls and returns); the exit turns bytes run into an opcode estimate. A new jump handler must keep that line.
+  - *Local and argument pushes in the lean trace use `dupValueFast()`*; in `executeFastTrace` they stay on `dupValue()` (the inline form moved that loop's registers and cost more than the call it saved: measured).
 - **`frame` in `callInternalRaw` / both traces is a `JeffJSFrameHandle`** ([Core](../Core/CLAUDE.md) `JeffJSFrameRef.swift`): `frame.object` (cold; a retain) or `frame.with { … }` (hot; borrowed) for a function that takes the class, `frame.unmanaged` for the raw link, `ctx.currentFrameU = frame.prevFrameU` to pop. Closure variables go through `jeffJS_varRefValue` / `jeffJS_varRefStore`, never an `unowned(unsafe) let vr`.
 - **Nothing that builds or destroys an enum, an array or a closure context inside either trace or on a main-loop fast path, even in a cold arm** (no `obj.payload`, no `[]` argument, no strong `shape` / `ic` / `TraceBlockInfo` local): one such arm moved the trace loop's register allocation and cost 10 % on call kernels with no ARC difference. After any dispatch change compare `nm` sizes of `executeFastTrace` / `callInternalRaw` and instructions on the `calls`, `method-call` and `closure` kernels (`docs/PERFORMANCE_PLAN.md`, round 16 step 3).
 - **`fb` in `callInternalRaw` / `executeFastTrace` is a `JeffJSFBHandle`** ([Core](../Core/CLAUDE.md) `JeffJSFBRef.swift`), not the class: pass it to a function that takes the class as `fb.object` (cold; a retain) or `fb.with { … }` (hot; borrowed), compare identities with `fb.identity`, look a callee up with `fbFastH`. Build both `swift build` (the handle; default) and `JEFFJS_MANUAL_MEMORY=0 swift build --scratch-path .build-arc` after touching the dispatch.
