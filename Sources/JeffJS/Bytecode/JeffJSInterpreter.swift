@@ -11332,13 +11332,20 @@ nonisolated struct JeffJSInterpreter {
                     }
                     // IC miss: full path + cache update (sloppy writes to
                     // non-writable/frozen targets fail silently per spec)
+                    let shapeBeforeWrite = jsObj.shapeIdentity
                     let ok = ctx.setPropertyChecked(obj: obj, atom: atom, value: val,
                                                     strict: fb.isStrictMode)
                     if ok < 0 { obj.freeValue(); retVal = .exception; break dispatchLoop }
-                    // Re-read shape after setProperty — it may have transitioned.
+                    // Cache the slot only when the write left the object on
+                    // its shape. A write that added the property moved it to
+                    // a new one, and the next object this site meets (the
+                    // next `this.x = v` of a constructor) is on the old one
+                    // again: caching the new shape never hit, and cost a
+                    // shape lookup and a retain / release pair per property
+                    // added. A later write to the same object caches it then.
                     // Never cache `arr.length = n`: the slot write would skip
                     // the element truncation in setPropertyInternal.
-                    if let curShape = jsObj.shape,
+                    if jsObj.shapeIdentity == shapeBeforeWrite, let curShape = jsObj.shape,
                        let propIdx = findShapeProperty(curShape, atom),
                        !(jsObj.classID == JeffJSClassID.array.rawValue && atom == JeffJSAtomID.JS_ATOM_length.rawValue) {
                         fb.getIC().update(pc, shape: curShape, propOffset: propIdx)
