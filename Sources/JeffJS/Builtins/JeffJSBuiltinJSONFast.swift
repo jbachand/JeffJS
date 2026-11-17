@@ -60,9 +60,12 @@ nonisolated struct JeffJSJSONOut {
     /// surrogates as \uXXXX, a valid pair as its two units.
     mutating func quoted(_ js: JeffJSString) {
         put(0x22)
-        switch js.storage {
-        case .str8(let b):
-            for c in b {
+        // The code units are read in place (no array taken from the string).
+        let jsLen = js.len
+        if let b = js.units8 {
+            var bi = 0
+            while bi < jsLen {
+                let c = b[bi]; bi &+= 1
                 switch c {
                 case 0x22: put(0x5C); put(0x22)
                 case 0x5C: put(0x5C); put(0x5C)
@@ -75,8 +78,8 @@ nonisolated struct JeffJSJSONOut {
                     if c < 0x20 { escapeUnit(UInt16(c)) } else { put(c) }
                 }
             }
-        case .str16(let w):
-            let n = w.count
+        } else if let w = js.units16 {
+            let n = jsLen
             var i = 0
             while i < n {
                 let u = w[i]; i += 1

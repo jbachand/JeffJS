@@ -252,18 +252,8 @@ nonisolated struct JeffJSBuiltinGlobal {
         guard let js = inputStr.stringValue else { return .JS_NAN }
         // Scan the code units directly (no Swift String / Character arrays) and
         // hand the validated decimal prefix to strtod, which rounds correctly.
-        var s8: [UInt8]? = nil
-        var s16: [UInt16]? = nil
-        switch js.storage {
-        case .str8(let b): s8 = b
-        case .str16(let w): s16 = w
-        }
         let n = js.len
-        @inline(__always) func unit(_ i: Int) -> UInt32 {
-            if let b = s8 { return i < b.count ? UInt32(b[i]) : 0 }
-            if let w = s16 { return i < w.count ? UInt32(w[i]) : 0 }
-            return 0
-        }
+        @inline(__always) func unit(_ i: Int) -> UInt32 { i < n ? js.unit(at: i) : 0 }
         var pos = 0
         while pos < n, isWhitespace(unit(pos)) { pos += 1 }
         if pos >= n { return .JS_NAN }

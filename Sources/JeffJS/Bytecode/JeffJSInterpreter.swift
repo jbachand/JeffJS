@@ -8141,14 +8141,7 @@ nonisolated private func jeffJS_stringEqual(_ a: JeffJSString, _ b: JeffJSString
         }
         return true
     }
-    switch (a.storage, b.storage) {
-    case (.str8(let ab), .str8(let bb)):
-        return ab == bb
-    case (.str16(let ab), .str16(let bb)):
-        return ab == bb
-    default:
-        return false
-    }
+    return jeffJS_stringEquals(s1: a, s2: b)   // same width, same length: one memcmp over the code units
 }
 
 /// Lexicographic comparison of two JeffJSString values.
@@ -8167,12 +8160,7 @@ nonisolated private func jeffJS_stringCompare(_ a: JeffJSString, _ b: JeffJSStri
 
 /// Convert a JeffJSString to a Swift String.
 nonisolated private func jeffJS_toSwiftString(_ s: JeffJSString) -> String {
-    switch s.storage {
-    case .str8(let buf):
-        return String(buf.prefix(s.len).map { Character(Unicode.Scalar($0)) })
-    case .str16(let buf):
-        return String(utf16CodeUnits: Array(buf.prefix(s.len)), count: s.len)
-    }
+    return s.toSwiftString()
 }
 
 // =============================================================================
