@@ -201,24 +201,27 @@ nonisolated final class JeffJSString: JeffJSStringBase {
         switch _chars {
         case .c8(var a):
             _chars = .c8([])   // keep `a` uniquely referenced
-            if !other.isWideChar, case .str8(let b) = other.storage {
-                a.append(contentsOf: b)
+            // `other`'s code units are read in place (`other !== self`: the
+            // caller appends to a string nothing else holds).
+            if let b = other.units8 {
+                a.append(contentsOf: UnsafeBufferPointer(start: b, count: n2))
                 _chars = .c8(a)
             } else {
                 var w = ContiguousArray<UInt16>()
                 w.reserveCapacity(a.count + n2)
                 for c in a { w.append(UInt16(c)) }
-                if case .str16(let b) = other.storage { w.append(contentsOf: b) }
+                if let b = other.units16 { w.append(contentsOf: UnsafeBufferPointer(start: b, count: n2)) }
                 _chars = .c16(w)
                 isWideChar = true
             }
         case .c16(var w):
             _chars = .c16([])
-            if other.isWideChar, case .str16(let b) = other.storage {
-                w.append(contentsOf: b)
-            } else if case .str8(let b) = other.storage {
+            if let b = other.units16 {
+                w.append(contentsOf: UnsafeBufferPointer(start: b, count: n2))
+            } else if let b = other.units8 {
                 w.reserveCapacity(w.count + n2)
-                for c in b { w.append(UInt16(c)) }
+                var i = 0
+                while i < n2 { w.append(UInt16(b[i])); i &+= 1 }
             }
             _chars = .c16(w)
         }
@@ -613,34 +616,27 @@ nonisolated func jeffJS_indexOf8(_ str: JeffJSString, needle: UInt8, fromIndex: 
 /// Uses memchr to find the first byte, then memcmp to verify the rest.
 nonisolated func jeffJS_indexOfString8(_ haystack: JeffJSString, _ needle: JeffJSString, fromIndex: Int = 0) -> Int {
     guard !haystack.isWideChar && !needle.isWideChar else { return -1 }
-    guard case .str8(let hData) = haystack.storage, case .str8(let nData) = needle.storage else { return -1 }
-    let hLen = min(haystack.len, hData.count)
-    let nLen = min(needle.len, nData.count)
+    let hLen = haystack.len
+    let nLen = needle.len
     if nLen == 0 { return max(min(fromIndex, hLen), 0) }
     if nLen > hLen { return -1 }
     let start = max(fromIndex, 0)
-    guard start + nLen <= hLen else { return -1 }
-
-    return hData.withUnsafeBufferPointer { hBuf in
-        nData.withUnsafeBufferPointer { nBuf in
-            guard let hBase = hBuf.baseAddress, let nBase = nBuf.baseAddress else { return -1 }
-            let firstByte = nBase[0]
-            var pos = start
-            while pos + nLen <= hLen {
-                // Find next occurrence of first byte using memchr
-                let remaining = hLen - pos
-                guard let found = memchr(hBase + pos, Int32(firstByte), remaining) else { return -1 }
-                let foundPos = hBase.distance(to: found.assumingMemoryBound(to: UInt8.self))
-                if foundPos + nLen > hLen { return -1 }
-                // Verify rest of needle
-                if nLen == 1 || memcmp(hBase + foundPos, nBase, nLen) == 0 {
-                    return foundPos
-                }
-                pos = foundPos + 1
-            }
-            return -1
+    guard start + nLen <= hLen, let hBase = haystack.units8, let nBase = needle.units8 else { return -1 }
+    let firstByte = nBase[0]
+    var pos = start
+    while pos + nLen <= hLen {
+        // Find next occurrence of first byte using memchr
+        let remaining = hLen - pos
+        guard let found = memchr(hBase + pos, Int32(firstByte), remaining) else { return -1 }
+        let foundPos = hBase.distance(to: found.assumingMemoryBound(to: UInt8.self))
+        if foundPos + nLen > hLen { return -1 }
+        // Verify rest of needle
+        if nLen == 1 || memcmp(hBase + foundPos, nBase, nLen) == 0 {
+            return foundPos
         }
+        pos = foundPos + 1
     }
+    return -1
 }
 
 // MARK: - Numeric string detection
@@ -1152,21 +1148,20 @@ nonisolated final class JeffJSStringBuffer: JeffJSStringBase {
     func concat(_ str: JeffJSString) {
         beginAppend()
         guard !hasError else { return }
-        switch str.storage {
-        case .str8(let data):
+        let n = str.len
+        if n == 0 { return }
+        if let data = str.units8 {
             if isWideChar {
-                for i in 0 ..< str.len {
-                    buf16!.append(UInt16(data[i]))
-                }
+                var i = 0
+                while i < n { buf16!.append(UInt16(data[i])); i &+= 1 }
             } else {
-                buf8.append(contentsOf: data.prefix(str.len))
+                buf8.append(contentsOf: UnsafeBufferPointer(start: data, count: n))
             }
-            size += str.len
-
-        case .str16(let data):
+            size += n
+        } else if let data = str.units16 {
             if !isWideChar { widenTo16() }
-            buf16!.append(contentsOf: data.prefix(str.len))
-            size += str.len
+            buf16!.append(contentsOf: UnsafeBufferPointer(start: data, count: n))
+            size += n
         }
     }
 
