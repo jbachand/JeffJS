@@ -481,6 +481,7 @@ nonisolated(unsafe) let jeffJSFastTypeof = JeffJSConfig.fastTypeof
 nonisolated(unsafe) let jeffJSAtomKeyStrings = JeffJSConfig.atomKeyStrings
 nonisolated(unsafe) let jeffJSFastOwnProperty = JeffJSConfig.fastOwnProperty
 nonisolated(unsafe) let jeffJSUnretainedProtoWalk = JeffJSConfig.unretainedProtoWalk
+nonisolated(unsafe) let jeffJSInheritedReadOnlySet = JeffJSConfig.inheritedReadOnlySet
 nonisolated(unsafe) let jeffJSFastStringEquals = JeffJSConfig.fastStringEquals
 nonisolated(unsafe) let jeffJSFastClosure = JeffJSConfig.fastClosure
 nonisolated(unsafe) let jeffJSFastSpecies = JeffJSConfig.fastSpecies

@@ -340,6 +340,13 @@ nonisolated enum JeffJSConfig {
     /// Watch CPU fix (2026-10-07). A/B: `JEFFJS_INTERP_UNRETAINEDPROTOWALK=0`.
     static let unretainedProtoWalk = bool("interp.unretainedProtoWalk", default: true)
 
+    /// A write to a name that is a non-writable data property on a prototype
+    /// is refused (TypeError in strict code), per OrdinarySet, instead of
+    /// creating an own property on the receiver. Deferred function / error
+    /// properties on the chain are materialised for the check.
+    /// Accuracy fix (2026-11-17). A/B: `JEFFJS_INTERP_INHERITEDREADONLYSET=0`.
+    static let inheritedReadOnlySet = bool("interp.inheritedReadOnlySet", default: true)
+
     /// String `===` / `==` compares interned keys by atom and everything else
     /// with one memcmp (it copied both storage enums and compared the arrays
     /// element by element). Watch CPU fix (2026-10-07).

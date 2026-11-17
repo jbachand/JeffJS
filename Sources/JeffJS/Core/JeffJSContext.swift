@@ -5696,6 +5696,8 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     private func getPropertyOnPrototype(_ p: JeffJSObject, atom: UInt32, receiver: JeffJSValue,
                                         next: inout UnsafeRawPointer?) -> JeffJSValue? {
         if (p.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(p) }
+        // A function or error on the chain: its deferred own properties answer too.
+        if jeffJSInheritedReadOnlySet, (p.lazyFlags & JeffJSObject.lazyActiveMask) != 0 { jeffJS_materializeLazyProps(p, atom) }
         let pIdx = jeffJS_findOwnPropertyIndex(obj: p, atom: atom)
         if pIdx < 0 {
             if isProxyObject(p) { return proxyOnChainGet(p, atom: atom, receiver: receiver) }
@@ -5731,12 +5733,24 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
                                         flags: Int, setterThis: JeffJSValue?,
                                         next: inout UnsafeRawPointer?) -> Int? {
         if (p.lazyFlags & JeffJSObject.lazyHostBit) != 0 { materializeHostLazyProps(p) }
+        // A function or error on the chain: its deferred own properties
+        // (`name`, `length`, `prototype`, `stack`) count for this lookup.
+        if jeffJSInheritedReadOnlySet, (p.lazyFlags & JeffJSObject.lazyActiveMask) != 0 { jeffJS_materializeLazyProps(p, atom) }
         let pIdx = jeffJS_findOwnPropertyIndex(obj: p, atom: atom)
         if pIdx < 0, isProxyObject(p) {
             return proxyOnChainSet(p, atom: atom, value: value, receiver: setterThis ?? obj, flags: flags)
         }
         if pIdx >= 0, let pShapeU = p.shapeU, pIdx < p.propValues.count {
             let pFlags = pShapeU._withUnsafeGuaranteedRef { $0.prop[pIdx].flags }
+            // OrdinarySetWithOwnDescriptor step 2.a (quickjs JS_SetPropertyInternal
+            // `read_only_prop`): an inherited data property that is not writable
+            // refuses the write; it does not become an own property of the receiver.
+            if jeffJSInheritedReadOnlySet, pFlags.intersection(.tmask) == .normal, !pFlags.contains(.writable) {
+                value.freeValue()
+                if (flags & JS_PROP_THROW) == 0 { return 0 }
+                _ = throwTypeError(message: "Cannot assign to read only property")
+                return -1
+            }
             if pFlags.contains(.getset) {
                 if let e = p.extra(at: pIdx), e.kind == .getset, let setterH = e.setterH {
                     let result = callRetainingFunction1(setterH.borrowedValue, this: setterThis ?? obj, arg: value)

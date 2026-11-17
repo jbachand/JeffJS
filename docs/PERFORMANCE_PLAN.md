@@ -1826,3 +1826,9 @@ name that is a **non-writable data property on a prototype** creates an own prop
 code), as quickjs and Safari do. Same for a function's deferred `name` / `length` met on the chain. It needs its own
 change with a switch, because host prototypes that wrongly carry non-writable data properties would start refusing
 writes.
+
+Fixed the same day (`interp.inheritedReadOnlySet`, `InheritedReadOnlySetTests`). Two neighbours found by its tests
+and left open: an indexed write under a frozen array on the chain, and **class bodies are compiled as sloppy code**
+(`class Z { m() { return this } }` called unbound returns the global object; writes to frozen objects inside
+methods do not throw). quickjs sets `JS_MODE_STRICT` in `js_parse_class`; that is a Parser change (bytecode
+identity, polyfill regeneration) and its own PR.

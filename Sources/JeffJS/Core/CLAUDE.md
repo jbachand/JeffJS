@@ -1,6 +1,6 @@
 # JeffJS Core — Claude neuron
 
-> Area: `Sources/JeffJS/Core/` · Repo: engine · Last reviewed: 2026-11-17 (app 2c8dfb7 / engine perf/string-record)
+> Area: `Sources/JeffJS/Core/` · Repo: engine · Last reviewed: 2026-11-17 (app 2c8dfb7 / engine fix/inherited-readonly-set)
 
 ## Purpose
 The engine heart of JeffJS, a 1:1 Swift port of QuickJS: runtime (atoms, shapes, GC lists, job queue), contexts/realms
@@ -38,6 +38,7 @@ output: object graph semantics the interpreter, the DOM bridges and the host (`J
 
 ## Invariants
 - **A flat string owns its code units in one malloc block** (`JeffJSString._units`, quickjs `JSString`; nil when empty; freed in `deinit`; the object stays 48 bytes). Read `units8` / `units16` / `unit(at:)`; the pointers are valid until the string is appended to in place or freed. `storage` / `str8` / `str16` **copy the units into a new array** (cold readers and tests only; the setter replaces block and width). Create through `init(latin1Count:fill:)` / `init(utf16Count:fill:)` / `init(latin1:count:)` / `init(utf16:count:)` (the fill closure must write every unit); `init(storage:)` copies its array. `appendInPlace` reallocs with doubling and asks the allocator for the block's capacity (`jeffJS_mallocCapacity`). `StringCodeUnitPointerTests`.
+- **A write never shadows a read-only inherited data property** (OrdinarySet step 2.a; quickjs `JS_SetPropertyInternal` `read_only_prop`): `setPropertyOnPrototype` refuses it (0, or TypeError with `JS_PROP_THROW`), and both prototype walks materialise a function's / error's deferred own properties (`lazyActiveMask`) before looking. Switch `interp.inheritedReadOnlySet` (`JEFFJS_INTERP_INHERITEDREADONLYSET=0` = old behaviour). `InheritedReadOnlySetTests`. Known gaps: an index under a frozen array met on the chain (`Object.create(Object.freeze([1]))[0] = 9` still adds), and class bodies are not strict code yet, so the refusal is silent there.
 - **Property lookup borrows.** `getPropertyInternal` / `setPropertyInternal` / `hasPropertyEx` hand the object to `getPropertyOfObject` / `setPropertyOfObject` / `hasPropertyOfObject` as a guaranteed reference and walk prototypes by address (`getPropertyOnPrototype`, `setPropertyOnPrototype`); the caller's value keeps the object alive (quickjs holds none either). **Nothing may touch the borrowed object or prototype after a call into JS** (getter, setter, proxy trap): return straight away. A Proxy on the chain is dup'ed around its trap. Accessors: `JeffJSExtraRef.getterH` / `setterH` + `callRetainingFunction0` / `1`, never `extraStrong` or `args: []` on these paths. `ManualMemoryPropertyTests`.
 - **`traceBlockRef(at:)` / `TraceBlockRef`, `_cpoolRaw`** are what the dispatch uses (uncounted; the function record owns both); `traceBlock(at:)` and `cpool` are for cold readers.
 - **QuickJS fidelity**: Core changes port the quickjs.c function by name (commit message + comment cite it, `CONTRIBUTING.md`); architectural changes to Core/GC need an issue first. No dependencies beyond Foundation (+ optional Metal, under `#if canImport(Metal)`).
