@@ -9280,8 +9280,14 @@ nonisolated struct JeffJSInterpreter {
                     pc &+= 2
                     break
                 }
-                // Sync buf → frame since newSpecialObject reads frame.argBuf
-                jeffJS_syncBufToFrame(frame.object, buf, varBase)
+                // Only the arguments kinds read frame.argBuf; the others
+                // (this function, new.target, home object: every `super(...)`
+                // and `super.x`) read the frame's fields, and building the
+                // two arrays for them was two allocations per derived
+                // constructor call.
+                if kind <= SpecialObjectType.mappedArguments.rawValue {
+                    jeffJS_syncBufToFrame(frame.object, buf, varBase)
+                }
                 let obj = ctx.newSpecialObject(kind: kind, frame: frame.object)
                 buf[sp] = obj; sp &+= 1
                 pc &+= 2

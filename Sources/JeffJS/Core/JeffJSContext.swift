@@ -6105,6 +6105,15 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
         if jeffJSUnretainedProtoWalk {
             var cur = jsObj.protoRaw
             while let pr = cur {
+                // The usual level (an ordinary object without the name, as
+                // quickjs JS_SetPropertyInternal's find_own_property miss):
+                // one shape lookup, no call into the full per-level handler.
+                let miss: (Bool, UnsafeRawPointer?) = Unmanaged<JeffJSObject>.fromOpaque(pr)._withUnsafeGuaranteedRef { p in
+                    guard p.lazyFlags == 0, !isProxyObject(p), let sp = p.shapeIdentity else { return (false, nil) }
+                    let found = Unmanaged<JeffJSShape>.fromOpaque(sp)._withUnsafeGuaranteedRef { findShapeProperty($0, atom) != nil }
+                    return found ? (false, nil) : (true, p.protoRaw)
+                }
+                if miss.0 { cur = miss.1; continue }
                 var next: UnsafeRawPointer? = nil
                 if let done = Unmanaged<JeffJSObject>.fromOpaque(pr)._withUnsafeGuaranteedRef({
                     setPropertyOnPrototype($0, obj: obj, atom: atom, value: value, flags: flags,

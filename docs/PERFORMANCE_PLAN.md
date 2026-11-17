@@ -1800,3 +1800,29 @@ kernels, watch_deepmerge and watch_callbacks are unchanged (no string building).
 two allocations per temporary string (the object and its block) and their frees, about 60 % of the row; one
 allocation would need the code units after the object's fields, which a Swift class cannot express without
 `ManagedBuffer` (a different class layout for every string reader). Not planned.
+
+### Derived constructors: `super(...)` without the frame arrays, cheap prototype misses, 2026-11-17
+
+`new B(i)` with `class B extends A { constructor(x) { super(x); this.y = 1 } }` was 7 352 instructions (quickjs
+3 269). Two pieces came out of the step profile:
+
+- `OP_special_object` built the frame's `argBuf` / `varBuf` arrays (`jeffJS_syncBufToFrame`) before every kind, but
+  only the arguments objects read them. `super(...)` (this function + new.target), `super.x` (home object) and
+  `new.target` paid two array allocations and frees per call. The sync now runs for the arguments kinds only.
+- `setPropertyOfObject`'s walk for an inherited setter called the full per-level handler (a closure with a large
+  prologue) for every prototype. An ordinary prototype that lacks the name (`lazyFlags == 0`, not a proxy) is now
+  decided by one shape lookup inline, as quickjs JS_SetPropertyInternal's `find_own_property` miss; everything else
+  takes the handler as before.
+
+| kernel (`bench/step/kernels`) | before | after |
+|---|---|---|
+| newsub (`new B(i)`, derived) | 7 352 | 5 197 |
+| classnew | 8 710 | 6 563 |
+| newfn | 2 939 | 2 875 |
+
+`DerivedConstructorTests` (expected values from quickjs). Found while writing them, not fixed here: a write to a
+name that is a **non-writable data property on a prototype** creates an own property (`o2.r = 5` under
+`Object.defineProperty(P, "r", { value: 1, writable: false })`); OrdinarySet refuses it (TypeError in strict
+code), as quickjs and Safari do. Same for a function's deferred `name` / `length` met on the chain. It needs its own
+change with a switch, because host prototypes that wrongly carry non-writable data properties would start refusing
+writes.
