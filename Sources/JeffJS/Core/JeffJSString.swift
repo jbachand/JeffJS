@@ -275,6 +275,35 @@ nonisolated final class JeffJSString: JeffJSStringBase {
         if len >= 512 { jeffJS_noteStringAllocation(len: len, wide: isWideChar) }
     }
 
+    /// A flat 8-bit string of `len` code units written by `fill` (which must
+    /// write all of them): the buffer is allocated once and not zeroed first.
+    /// Building `[UInt8](repeating: 0, count:)` and handing it over was a
+    /// memset of bytes about to be overwritten on every concatenation.
+    init(latin1Count len: Int, fill: (UnsafeMutablePointer<UInt8>) -> Void) {
+        self._len = UInt32(truncatingIfNeeded: len)
+        self.isWideChar = false
+        self._hashAndAtomType = 0
+        self._chars = .c8(ContiguousArray<UInt8>(unsafeUninitializedCapacity: len) { dst, n in
+            if len > 0, let base = dst.baseAddress { fill(base) }
+            n = len
+        })
+        super.init(refCount: 1, kind: JeffJSStringBase.kindFlat)
+        if len >= 512 { jeffJS_noteStringAllocation(len: len, wide: false) }
+    }
+
+    /// The 16-bit form of `init(latin1Count:fill:)`.
+    init(utf16Count len: Int, fill: (UnsafeMutablePointer<UInt16>) -> Void) {
+        self._len = UInt32(truncatingIfNeeded: len)
+        self.isWideChar = true
+        self._hashAndAtomType = 0
+        self._chars = .c16(ContiguousArray<UInt16>(unsafeUninitializedCapacity: len) { dst, n in
+            if len > 0, let base = dst.baseAddress { fill(base) }
+            n = len
+        })
+        super.init(refCount: 1, kind: JeffJSStringBase.kindFlat)
+        if len >= 512 { jeffJS_noteStringAllocation(len: len, wide: true) }
+    }
+
     // -- Retain / Release ----------------------------------------------------
 
     @discardableResult
@@ -778,50 +807,24 @@ nonisolated private func ropeDepth(_ v: JeffJSValue) -> UInt8 {
 /// Flatten two `JeffJSString`s into a single contiguous string.
 /// Uses memcpy for same-width fast path.
 nonisolated private func jeffJS_flatConcatStrings(_ s1: JeffJSString, _ s2: JeffJSString) -> JeffJSString {
-    let wide = s1.isWideChar || s2.isWideChar
-    let totalLen = s1.len + s2.len
-
-    if wide {
-        var buf = [UInt16](repeating: 0, count: totalLen)
-        let len1 = min(s1.len, totalLen)
-        let len2 = min(s2.len, totalLen - len1)
-        buf.withUnsafeMutableBufferPointer { dst in
-            guard let dstBase = dst.baseAddress else { return }
-            // Copy s1
+    let len1 = s1.len, len2 = s2.len
+    if s1.isWideChar || s2.isWideChar {
+        return JeffJSString(utf16Count: len1 + len2) { dst in
             if let src = s1.units16 {
-                if len1 > 0 { memcpy(dstBase, src, len1 &* 2) }
+                memcpy(dst, src, len1 &* 2)
             } else {
-                for i in 0 ..< len1 { dstBase[i] = UInt16(jeffJS_getString(str: s1, at: i)) }
+                for i in 0 ..< len1 { dst[i] = UInt16(truncatingIfNeeded: s1.unit(at: i)) }
             }
-            // Copy s2
             if let src = s2.units16 {
-                if len2 > 0 { memcpy(dstBase + len1, src, len2 &* 2) }
+                memcpy(dst + len1, src, len2 &* 2)
             } else {
-                for i in 0 ..< len2 { (dstBase + len1)[i] = UInt16(jeffJS_getString(str: s2, at: i)) }
+                for i in 0 ..< len2 { (dst + len1)[i] = UInt16(truncatingIfNeeded: s2.unit(at: i)) }
             }
         }
-        return JeffJSString(refCount: 1,
-                            len: totalLen,
-                            isWideChar: true,
-                            storage: .str16(buf))
-    } else {
-        var buf = [UInt8](repeating: 0, count: totalLen)
-        buf.withUnsafeMutableBufferPointer { dst in
-            guard let dstBase = dst.baseAddress else { return }
-            if let src = s1.units8 {
-                let copyLen = min(s1.len, totalLen)
-                if copyLen > 0 { memcpy(dstBase, src, copyLen) }
-            }
-            if let src = s2.units8 {
-                let offset = min(s1.len, totalLen)
-                let copyLen = min(s2.len, totalLen - offset)
-                if copyLen > 0 { memcpy(dstBase + offset, src, copyLen) }
-            }
-        }
-        return JeffJSString(refCount: 1,
-                            len: totalLen,
-                            isWideChar: false,
-                            storage: .str8(buf))
+    }
+    return JeffJSString(latin1Count: len1 + len2) { dst in
+        if let src = s1.units8 { memcpy(dst, src, len1) }
+        if let src = s2.units8 { memcpy(dst + len1, src, len2) }
     }
 }
 
