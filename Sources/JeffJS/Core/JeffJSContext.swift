@@ -1168,9 +1168,19 @@ public nonisolated final class JeffJSContext: JeffJSTokenizerContext {
     /// - Parameter proto: The prototype object (null for no prototype).
     /// - Returns: A new JS object value, or JS_EXCEPTION on out-of-memory.
     func newObjectProto(proto: JeffJSValue) -> JeffJSValue {
+        let protoObj = proto.isObject ? proto.toObject() : nil
+        // A recycled plain object, as newObjectClass takes for `{}`: every
+        // `new F()` and Object.create(p) allocated (and its instance, once
+        // dead, filled the pool that only object literals drew from).
+        if let o = rt.objectPool.popLast() {
+            o.refCount = 1
+            o.classID = JSClassID.JS_CLASS_OBJECT.rawValue
+            o.shape = jeffJS_rootShape(self, proto: protoObj)   // counted for this object, as below
+            addGCObject(rt, o)
+            return JeffJSValue.makeObjectRecycled(o)
+        }
         let obj = JeffJSObject()
         obj.classID = JSClassID.JS_CLASS_OBJECT.rawValue
-        let protoObj = proto.isObject ? proto.toObject() : nil
         // No dup here: the shape owns the prototype's one reference, taken by
         // createShape when this prototype's root shape was first built.
         obj.shape = jeffJS_rootShape(self, proto: protoObj)

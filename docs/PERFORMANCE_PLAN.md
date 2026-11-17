@@ -1691,3 +1691,27 @@ Converted: `jeffJS_getString`, `jeffJS_stringCompare`, `jeffJS_stringEquals`, `j
 (15 M: one release of the array per string, inherent while the characters are a Swift array), and every creation
 still allocates the array and the string separately. Removing those is the record of the original plan (characters
 in the string's own allocation): a new representation, its own change.
+
+### `new F()` draws from the object pool (2026-11-17, `perf/pool-object-proto`)
+
+Tried first: running a base constructor as an inline frame from `call_constructor` (the new object in the
+`new.target` slot, a `ctorResult` flag on the inline record, the result settled at the six inline-pop sites). It
+worked and passed its cases, and it was worth **3 %** (exact count 4 016 → 3 892 per `new A(i)`): the nested
+activation was not the cost. Dropped.
+
+The step profile of that build showed where it was: a quarter of the instructions outside the executable (malloc,
+free, object init) and the dead instances being parked in the recycle pool, which only `newObjectClass` (object
+literals) ever drew from. `newObjectProto` (every `new F()`, `Object.create(p)`, class instances) now takes a parked
+object first, on the root shape of its prototype, exactly as `newObjectClass` does for `{}` (quickjs has no pool;
+this is the allocation it does not pay because its objects are one malloc).
+
+| instructions per construction (1.2 M in a loop) | before | after | qjs |
+|---|---:|---:|---:|
+| `new A(i)` (plain function or base class) | 6 251 | 3 805 | 1 734 |
+| `new B(i)` (derived class, `super`, getter) | 10 982 | 10 987 | 3 269 |
+
+realworld −1.2 % instructions. Both builds: 436 tests, the 4 known failing cases only; AddressSanitizer clean;
+`check.sh` clean. **Left**: the derived-class path is unchanged (two nested activations, 619 instructions of
+activation prologue, an array in the `super(...)` path); adding a property to a fresh object is about 700
+instructions per property (the setter walk up the prototype chain, then the hashed transition), which a
+transition cache at `put_field` would remove but needs a way to know no accessor appeared on the chain.
