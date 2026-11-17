@@ -6341,19 +6341,19 @@ nonisolated private func executeFastTraceLeanBody(
         // Local access (varBase-relative)
         // =================================================================
 
-        case .get_loc0: buf[sp] = locals[0].dupValue(); sp &+= 1; pc &+= 1
-        case .get_loc1: buf[sp] = locals[1].dupValue(); sp &+= 1; pc &+= 1
-        case .get_loc2: buf[sp] = locals[2].dupValue(); sp &+= 1; pc &+= 1
-        case .get_loc3: buf[sp] = locals[3].dupValue(); sp &+= 1; pc &+= 1
+        case .get_loc0: buf[sp] = locals[0].dupValueFast(); sp &+= 1; pc &+= 1
+        case .get_loc1: buf[sp] = locals[1].dupValueFast(); sp &+= 1; pc &+= 1
+        case .get_loc2: buf[sp] = locals[2].dupValueFast(); sp &+= 1; pc &+= 1
+        case .get_loc3: buf[sp] = locals[3].dupValueFast(); sp &+= 1; pc &+= 1
 
         case .get_loc8:
             let idx = Int(bc[pc &+ 1])
-            buf[sp] = locals[idx].dupValue(); sp &+= 1
+            buf[sp] = locals[idx].dupValueFast(); sp &+= 1
             pc &+= 2
 
         case .get_loc:
             let idx = Int(readU16(bc, pc &+ 1))
-            buf[sp] = locals[idx].dupValue(); sp &+= 1
+            buf[sp] = locals[idx].dupValueFast(); sp &+= 1
             pc &+= 3
 
         case .put_loc0: sp &-= 1; let oP0 = locals[0]; locals[0] = buf[sp]; oP0.freeValueFast(); pc &+= 1
@@ -6691,14 +6691,14 @@ nonisolated private func executeFastTraceLeanBody(
         // Argument access
         // =================================================================
 
-        case .get_arg0: buf[sp] = buf[0].dupValue(); sp &+= 1; pc &+= 1
-        case .get_arg1: buf[sp] = buf[1].dupValue(); sp &+= 1; pc &+= 1
-        case .get_arg2: buf[sp] = buf[2].dupValue(); sp &+= 1; pc &+= 1
-        case .get_arg3: buf[sp] = buf[3].dupValue(); sp &+= 1; pc &+= 1
+        case .get_arg0: buf[sp] = buf[0].dupValueFast(); sp &+= 1; pc &+= 1
+        case .get_arg1: buf[sp] = buf[1].dupValueFast(); sp &+= 1; pc &+= 1
+        case .get_arg2: buf[sp] = buf[2].dupValueFast(); sp &+= 1; pc &+= 1
+        case .get_arg3: buf[sp] = buf[3].dupValueFast(); sp &+= 1; pc &+= 1
 
         case .get_arg:
             let idx = Int(readU16(bc, pc &+ 1))
-            buf[sp] = buf[idx].dupValue(); sp &+= 1
+            buf[sp] = buf[idx].dupValueFast(); sp &+= 1
             pc &+= 3
 
         // =================================================================
@@ -6706,7 +6706,7 @@ nonisolated private func executeFastTraceLeanBody(
         // =================================================================
 
         case .dup:
-            buf[sp] = buf[sp &- 1].dupValue(); sp &+= 1
+            buf[sp] = buf[sp &- 1].dupValueFast(); sp &+= 1
             pc &+= 1
 
         case .drop:
@@ -7383,8 +7383,8 @@ nonisolated private func executeFastTraceLeanBody(
         case .get_loc8_get_loc8:
             let idxA = Int(bc[pc &+ 1])
             let idxB = Int(bc[pc &+ 2])
-            buf[sp] = locals[idxA].dupValue(); sp &+= 1
-            buf[sp] = locals[idxB].dupValue(); sp &+= 1
+            buf[sp] = locals[idxA].dupValueFast(); sp &+= 1
+            buf[sp] = locals[idxB].dupValueFast(); sp &+= 1
             pc &+= 3
 
         case .get_loc8_add:
