@@ -410,44 +410,29 @@ nonisolated func jeffJS_getString(str: JeffJSString, at index: Int) -> UInt32 {
 /// Create a new `JeffJSString` that is a copy of `str[start ..< end]`.
 nonisolated func jeffJS_subString(str: JeffJSString, start: Int, end: Int) -> JeffJSString? {
     let s = max(start, 0)
-
-    switch str.storage {
-    case .str8(let buf):
-        let e = min(end, str.len, buf.count)
-        guard s < e else {
-            return jeffJS_allocString(maxLen: 0, isWideChar: false)
-        }
-        let slice = Array(buf[s ..< e])
-        return JeffJSString(refCount: 1,
-                            len: e - s,
-                            isWideChar: false,
-                            storage: .str8(slice))
-
-    case .str16(let buf):
-        let e = min(end, str.len, buf.count)
-        guard s < e else {
-            return jeffJS_allocString(maxLen: 0, isWideChar: false)
-        }
-        let subLen = e - s
-        var canNarrow = true
-        for i in s ..< e {
-            if buf[i] > 0xFF { canNarrow = false; break }
-        }
-        if canNarrow {
-            var narrow = [UInt8](repeating: 0, count: subLen)
-            for i in 0 ..< subLen { narrow[i] = UInt8(buf[s + i]) }
-            return JeffJSString(refCount: 1,
-                                len: subLen,
-                                isWideChar: false,
-                                storage: .str8(narrow))
-        } else {
-            let slice = Array(buf[s ..< e])
-            return JeffJSString(refCount: 1,
-                                len: subLen,
-                                isWideChar: true,
-                                storage: .str16(slice))
+    let e = min(end, str.len)
+    guard s < e else {
+        return jeffJS_allocString(maxLen: 0, isWideChar: false)
+    }
+    let subLen = e - s
+    // The slice is copied straight out of the source's code units into the
+    // new string's buffer (it went through an intermediate Swift array).
+    if let src = str.units8 {
+        return JeffJSString(latin1Count: subLen) { dst in memcpy(dst, src + s, subLen) }
+    }
+    guard let src = str.units16 else {
+        return jeffJS_allocString(maxLen: 0, isWideChar: false)
+    }
+    var canNarrow = true
+    var i = s
+    while i < e { if src[i] > 0xFF { canNarrow = false; break }; i &+= 1 }
+    if canNarrow {
+        return JeffJSString(latin1Count: subLen) { dst in
+            var j = 0
+            while j < subLen { dst[j] = UInt8(truncatingIfNeeded: src[s &+ j]); j &+= 1 }
         }
     }
+    return JeffJSString(utf16Count: subLen) { dst in memcpy(dst, src + s, subLen &* 2) }
 }
 
 // MARK: - Hashing (port of QuickJS hash_string8 / hash_string16)
@@ -907,14 +892,12 @@ nonisolated private func flattenInto8(_ buf: inout [UInt8], _ offset: inout Int,
             return
         }
         if let str = obj as? JeffJSString {
-            if case .str8(let data) = str.storage {
-                let count = min(str.len, data.count)
-                if count > 0 {
+            if !str.isWideChar {
+                let count = str.len
+                if count > 0, let src = str.units8 {
                     buf.withUnsafeMutableBufferPointer { dst in
-                        data.withUnsafeBufferPointer { src in
-                            guard let d = dst.baseAddress, let s = src.baseAddress else { return }
-                            memcpy(d + offset, s, count)
-                        }
+                        guard let d = dst.baseAddress else { return }
+                        memcpy(d + offset, src, count)
                     }
                     offset += count
                 }
@@ -1409,13 +1392,14 @@ nonisolated extension JeffJSString {
     /// `obj[1]` produces, instead of a separate string atom.
     @inline(__always)
     func canonicalArrayIndex() -> UInt32? {
-        switch storage {
-        case .str8(let buf): return jeffJS_canonicalArrayIndex(utf8: buf.prefix(len))
-        case .str16(let buf):
+        if !isWideChar {
+            return jeffJS_canonicalArrayIndex(utf8: UnsafeBufferPointer(start: units8, count: units8 == nil ? 0 : len))
+        }
+        do {
             var value: UInt64 = 0
             var count = 0
             var first: UInt16 = 0
-            for cu in buf.prefix(len) {
+            for cu in UnsafeBufferPointer(start: units16, count: units16 == nil ? 0 : len) {
                 if cu < 0x30 || cu > 0x39 { return nil }
                 if count == 0 { first = cu }
                 value = value &* 10 &+ UInt64(cu - 0x30)
@@ -1431,12 +1415,9 @@ nonisolated extension JeffJSString {
 
     /// Convert back to a Swift `String`.
     func toSwiftString() -> String {
-        switch storage {
-        case .str8(let buf):
-            return jeffJS_swiftStringFromLatin1(buf, count: len)
-        case .str16(let buf):
-            return jeffJS_swiftStringFromUTF16(buf, count: len)
-        }
+        if let p = units8 { return jeffJS_swiftStringFromLatin1(UnsafeBufferPointer(start: p, count: len)) }
+        if let p = units16 { return String(decoding: UnsafeBufferPointer(start: p, count: len), as: UTF16.self) }
+        return ""
     }
 }
 
@@ -1446,7 +1427,14 @@ nonisolated extension JeffJSString {
 nonisolated func jeffJS_swiftStringFromLatin1(_ buf: [UInt8], count: Int) -> String {
     let n = min(count, buf.count)
     if n == 0 { return "" }
-    return buf.withUnsafeBufferPointer { p -> String in
+    return buf.withUnsafeBufferPointer { jeffJS_swiftStringFromLatin1(UnsafeBufferPointer(rebasing: $0[0..<n])) }
+}
+
+/// The same over borrowed bytes (a flat string's `units8`).
+nonisolated func jeffJS_swiftStringFromLatin1(_ p: UnsafeBufferPointer<UInt8>) -> String {
+    let n = p.count
+    if n == 0 { return "" }
+    do {
         var ascii = true
         var i = 0
         while i < n { if p[i] >= 0x80 { ascii = false; break }; i += 1 }
