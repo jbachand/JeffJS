@@ -347,6 +347,14 @@ nonisolated enum JeffJSConfig {
     /// Accuracy fix (2026-11-17). A/B: `JEFFJS_INTERP_INHERITEDREADONLYSET=0`.
     static let inheritedReadOnlySet = bool("interp.inheritedReadOnlySet", default: true)
 
+    /// A class definition is compiled as strict mode code (ES §11.2.2): an
+    /// unbound method sees `this === undefined`, writes to read-only
+    /// properties and undeclared names throw. Accuracy fix (2026-11-17).
+    /// A/B: `JEFFJS_PARSER_CLASSBODIESSTRICT=0`; it changes compiled code, so
+    /// run the A/B with the bytecode cache cleared (the precompiled polyfill
+    /// bytecode is built with the default).
+    static let classBodiesStrict = bool("parser.classBodiesStrict", default: true)
+
     /// String `===` / `==` compares interned keys by atom and everything else
     /// with one memcmp (it copied both storage enums and compared the arrays
     /// element by element). Watch CPU fix (2026-10-07).

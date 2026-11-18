@@ -1832,3 +1832,9 @@ and left open: an indexed write under a frozen array on the chain, and **class b
 (`class Z { m() { return this } }` called unbound returns the global object; writes to frozen objects inside
 methods do not throw). quickjs sets `JS_MODE_STRICT` in `js_parse_class`; that is a Parser change (bytecode
 identity, polyfill regeneration) and its own PR.
+
+Class bodies fixed the same day (`parser.classBodiesStrict`, the class-strictness case in
+`JeffJSTestRunner.testClasses`; bytecode identity `0x39d67b0283c9db7b`). Still open, and true of `"use strict"`
+functions as well, so not a class matter: several strict-mode early errors are not raised (`var let`, `var yield`,
+legacy octal literals, duplicate parameter names, assignment to `eval` / `arguments`, `delete identifier`). They
+only reject programs Safari also rejects.

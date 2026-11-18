@@ -1813,6 +1813,37 @@ extension JeffJSTestRunner {
             var lit = { __proto__: { get g(){ return this.v; } }, v: 42, h(){ return super.g; } };
             SF.s() + lit.h()
             """, expect: "F!42")
+
+        // All parts of a class definition are strict mode code (ES 11.2.2;
+        // quickjs js_parse_class sets JS_MODE_STRICT): constructor, methods,
+        // statics, accessors, field initializers, computed keys and the
+        // heritage expression, including plain functions written inside
+        // them; code after the class is sloppy again. Expected: QuickJS.
+        evalCheckStr(ctx, """
+            var out = [];
+            class CS1 {
+                constructor() { this.c = (function () { return this === undefined; })(); try { csUndeclared1 = 1; out.push('no'); } catch (e) { out.push(e.constructor.name); } }
+                m() { return this === undefined; }
+                static s() { return this === undefined; }
+                get g() { return (function () { return this === undefined; })(); }
+                w() { var o = Object.freeze({ a: 1 }); try { o.a = 2; return 'no'; } catch (e) { return e.constructor.name; } }
+                d() { try { delete Object.prototype; return 'no'; } catch (e) { return e.constructor.name; } }
+                f = (function () { return this === undefined; })();
+                static t = (function () { return this === undefined; })();
+                [(function () { return this === undefined ? 'ck' : 'sloppy'; })()]() { return 1; }
+                args(a) { arguments[0] = 9; return a; }
+            }
+            var i1 = new CS1(), m = i1.m, s = CS1.s;
+            out.push(i1.c, m(), s(), i1.g, i1.w(), i1.d(), i1.f, CS1.t, typeof i1.ck, i1.args(1));
+            var E1 = class extends (function () { return this === undefined ? Object : Array; })() {};
+            out.push(new E1() instanceof Array);
+            function sloppyAfter() { return this === undefined; }
+            out.push(sloppyAfter(), (function () { csUndeclared2 = 1; return typeof csUndeclared2; })());
+            var bad = 0;
+            ['class X { m() { with (this) {} } }', 'class X { m() { var static = 1; } }', 'var o = { m() { with (this) {} } }'].forEach(function (src) { try { new Function(src); } catch (e) { if (e instanceof SyntaxError) bad++; } });
+            out.push(bad);
+            out.join()
+            """, expect: "ReferenceError,true,true,true,true,TypeError,TypeError,true,true,function,1,false,false,number,2")
     }
 
     // MARK: - Iterators

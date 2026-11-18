@@ -25,6 +25,7 @@ scope/variable tables. Callers: `JeffJSContext` (eval / module / lazy body compi
   switches (`../Builtins/JeffJSLazyPayload.swift`), `JeffJSConfig` (`../Config/JeffJSConfig.swift`).
 
 ## Invariants
+- **A class definition is strict mode code** (ES §11.2.2; quickjs `js_parse_class`): `parseClassDef` sets `JS_MODE_STRICT` on the enclosing definition for the heritage expression and body and restores it; the default constructor and every method definition copy it. Switch `parser.classBodiesStrict` (`JEFFJS_PARSER_CLASSBODIESSTRICT=0`, with the bytecode cache cleared: it changes compiled code). Test: the class-strictness case in `JeffJSTestRunner.testClasses`.
 - **QuickJS fidelity** (`CONTRIBUTING.md`): architectural changes to `Parser/` need an issue first; a commit touching it names the
   QuickJS function it ports (`quickjs.c:js_parse_…`); anything that touches the language gets a test (`Tests/JeffJSTests`).
 - Every top-level declaration here is `nonisolated` (app compiles the engine with `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`;

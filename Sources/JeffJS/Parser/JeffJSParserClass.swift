@@ -222,6 +222,14 @@ nonisolated extension JeffJSParser {
         let classStart = s.token.ptr
         expect(JSTokenType.TOK_CLASS.rawValue)
 
+        // All parts of a class definition are strict mode code (ES §11.2.2;
+        // quickjs js_parse_class: `fd->js_mode |= JS_MODE_STRICT`, restored
+        // after the body): the heritage expression, computed keys, methods,
+        // accessors, the constructor, field initializers and static blocks.
+        let savedJSMode = fd.jsMode
+        if JeffJSConfig.classBodiesStrict { fd.jsMode |= JS_MODE_STRICT }
+        defer { fd.jsMode = savedJSMode }
+
         var className: JSAtom = 0
         if tok == JSTokenType.TOK_IDENT.rawValue {
             className = s.token.identAtom
@@ -272,6 +280,7 @@ nonisolated extension JeffJSParser {
             defaultCtorFd.funcName = className
             defaultCtorFd.newTargetAllowed = true
             defaultCtorFd.definedScopeLevel = fd.curScope
+            if fd.jsMode & JS_MODE_STRICT != 0 { defaultCtorFd.jsMode = JS_MODE_STRICT }
             if hasExtends {
                 defaultCtorFd.isDerivedClassConstructor = true
                 defaultCtorFd.superCallAllowed = true
@@ -606,6 +615,7 @@ nonisolated extension JeffJSParser {
             methodFd.funcName = accessorFuncName(propKind, propAtom,
                                                  isComputed: isComputed, isPrivate: isPrivate)
             methodFd.definedScopeLevel = fd.curScope
+            if fd.jsMode & JS_MODE_STRICT != 0 { methodFd.jsMode = JS_MODE_STRICT }
             if isGenerator {
                 methodFd.funcKind = isAsync
                     ? JSFunctionKindEnum.JS_FUNC_ASYNC_GENERATOR.rawValue
