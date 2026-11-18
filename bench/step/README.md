@@ -42,6 +42,17 @@ A thread suspends the main thread every `SAMPLE_US` microseconds (default 500), 
 `case .op` label and source line. Wall-clock sampling: use it for shares, and `bench/arc/ir.sh` or `mp.sh` for
 before/after numbers.
 
+## Buckets and the comparison with quickjs (`buckets.py`)
+
+    cc -O1 -o bench/step/symlib bench/step/symlib.c
+    python3 bench/step/buckets.py <cli> <JeffJSInterpreter.swift of that build> bench/step/out/<tag>.<kernel>.step <iterations>
+
+prints JSON: instructions per iteration, opcodes executed per iteration (indirect branches inside the three dispatch
+functions), and the instructions split into dispatch / compiler glue, opcode bodies, call and return frames,
+reference counting, allocation, property lookup, other engine functions and library code (`symlib` names the
+shared-cache addresses with `dladdr`; they are the same in every process until the machine restarts). For quickjs,
+which ships without symbols, run the kernel body 300 and 600 times and difference `/usr/bin/time -l`.
+
 ## Notes
 
 - The single-step handler runs on its own thread through the task's breakpoint exception port. The kernel clears the

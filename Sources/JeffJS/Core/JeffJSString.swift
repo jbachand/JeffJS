@@ -326,6 +326,33 @@ nonisolated final class JeffJSString: JeffJSStringBase {
         if len >= 512 { jeffJS_noteStringAllocation(len: len, wide: false) }
     }
 
+    /// `init(latin1Count:fill:)` through the string pool (JeffJSStringPool.swift):
+    /// a short string takes a parked object and block when there is one.
+    @inline(__always)
+    static func latin1(_ len: Int, fill: (UnsafeMutablePointer<UInt8>) -> Void) -> JeffJSString {
+        if len > 0, len <= 64, jeffJSStringPoolEnabled, let s = jeffJS_stringPoolTake(len) {
+            s.reuseFromPool(len: len, fill: fill)
+            return s
+        }
+        return JeffJSString(latin1Count: len, fill: fill)
+    }
+
+    /// A parked string becomes a new one: its block (at least `len` bytes)
+    /// is rewritten, every other field starts over.
+    @inline(__always)
+    final func reuseFromPool(len: Int, fill: (UnsafeMutablePointer<UInt8>) -> Void) {
+        _rc = 1
+        _len = UInt32(truncatingIfNeeded: len)
+        _hashAndAtomType = 0
+        fill(_units.unsafelyUnwrapped.assumingMemoryBound(to: UInt8.self))
+    }
+
+    /// Bytes in the code-unit block as the allocator sized it (0 without one).
+    final var unitBlockCapacity: Int {
+        guard let p = _units else { return 0 }
+        return jeffJS_mallocCapacity(p)
+    }
+
     /// The first `count` elements of an array as a flat string (one copy).
     convenience init(latin1 a: [UInt8], count: Int) {
         self.init(latin1Count: count) { dst in
@@ -468,7 +495,7 @@ nonisolated func jeffJS_subString(str: JeffJSString, start: Int, end: Int) -> Je
     // The slice is copied straight out of the source's code units into the
     // new string's buffer (it went through an intermediate Swift array).
     if let src = str.units8 {
-        return JeffJSString(latin1Count: subLen) { dst in memcpy(dst, src + s, subLen) }
+        return JeffJSString.latin1(subLen) { dst in memcpy(dst, src + s, subLen) }
     }
     guard let src = str.units16 else {
         return jeffJS_allocString(maxLen: 0, isWideChar: false)
@@ -477,7 +504,7 @@ nonisolated func jeffJS_subString(str: JeffJSString, start: Int, end: Int) -> Je
     var i = s
     while i < e { if src[i] > 0xFF { canNarrow = false; break }; i &+= 1 }
     if canNarrow {
-        return JeffJSString(latin1Count: subLen) { dst in
+        return JeffJSString.latin1(subLen) { dst in
             var j = 0
             while j < subLen { dst[j] = UInt8(truncatingIfNeeded: src[s &+ j]); j &+= 1 }
         }
@@ -861,7 +888,7 @@ nonisolated private func jeffJS_flatConcatStrings(_ s1: JeffJSString, _ s2: Jeff
             }
         }
     }
-    return JeffJSString(latin1Count: len1 + len2) { dst in
+    return JeffJSString.latin1(len1 + len2) { dst in
         if let src = s1.units8 { memcpy(dst, src, len1) }
         if let src = s2.units8 { memcpy(dst + len1, src, len2) }
     }
@@ -880,7 +907,7 @@ nonisolated func jeffJS_flattenRope(_ rope: JeffJSStringRope) -> JeffJSString {
             flattenInto16(buf, &offset, rope.right)
         }
     } else {
-        return JeffJSString(latin1Count: rope.len) { buf in
+        return JeffJSString.latin1(rope.len) { buf in
             var offset = 0
             flattenInto8(buf, &offset, rope.left)
             flattenInto8(buf, &offset, rope.right)
@@ -1280,7 +1307,7 @@ nonisolated final class JeffJSStringBuffer: JeffJSStringBase {
             }
             if canNarrow {
                 let n = size
-                return JeffJSString(latin1Count: n) { dst in
+                return JeffJSString.latin1(n) { dst in
                     for i in 0 ..< n { dst[i] = UInt8(buf[i]) }
                 }
             } else {
@@ -1327,7 +1354,7 @@ nonisolated final class JeffJSStringBuffer: JeffJSStringBase {
             }
             if canNarrow {
                 let n = size
-                result = JeffJSString(latin1Count: n) { dst in
+                result = JeffJSString.latin1(n) { dst in
                     for i in 0 ..< n { dst[i] = UInt8(buf[i]) }
                 }
             } else {

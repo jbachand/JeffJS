@@ -1,6 +1,6 @@
 # JeffJS Core — Claude neuron
 
-> Area: `Sources/JeffJS/Core/` · Repo: engine · Last reviewed: 2026-11-17 (app 2c8dfb7 / engine fix/inherited-readonly-set)
+> Area: `Sources/JeffJS/Core/` · Repo: engine · Last reviewed: 2026-11-18 (app 2c8dfb7 / engine perf/string-pool)
 
 ## Purpose
 The engine heart of JeffJS, a 1:1 Swift port of QuickJS: runtime (atoms, shapes, GC lists, job queue), contexts/realms
@@ -26,6 +26,7 @@ output: object graph semantics the interpreter, the DOM bridges and the host (`J
 - `JeffJSAllocationTrigger.swift` — byte-driven collections / host memory hook (`gc.bytesSinceGCThreshold`, `gc.bytesSinceHookThreshold`) for big strings, stack segments, ArrayBuffers.
 - `JeffJSThreadCheck.swift` — the one-thread-per-runtime rule: Debug traps, `JEFFJS_GC_VERIFYROOTS`, `jeffJS_nextRuntimeID`.
 - `JeffJSHostActor.swift` — `JeffJSHostActor` global actor for DOM/Environment bridges; executor = main unless `JeffJSHost.install` ran.
+- `JeffJSStringPool.swift` — per-thread pool of dead short strings (object + block).
 - `JeffJSAtom.swift`, `JeffJSString.swift` — per-runtime atom table (predefined atoms never freed); Latin-1/UTF-16 strings, ropes, `appendInPlace`, cached atom + `cachedAtomRuntime`.
 - `JeffJSBigIntCore.swift` / `JeffJSBigIntValue.swift` — `JBigInt` value type (32-bit limbs) and the NaN-boxed layer (|v| < 2^47 inline, else heap `JeffJSBigInt`).
 - `JeffJSErrorText.swift` — JavaScriptCore-shaped runtime error text (`throwNotAnObject/AFunction/AConstructor`, source appenders).
@@ -38,6 +39,7 @@ output: object graph semantics the interpreter, the DOM bridges and the host (`J
 
 ## Invariants
 - **A flat string owns its code units in one malloc block** (`JeffJSString._units`, quickjs `JSString`; nil when empty; freed in `deinit`; the object stays 48 bytes). Read `units8` / `units16` / `unit(at:)`; the pointers are valid until the string is appended to in place or freed. `storage` / `str8` / `str16` **copy the units into a new array** (cold readers and tests only; the setter replaces block and width). Create through `init(latin1Count:fill:)` / `init(utf16Count:fill:)` / `init(latin1:count:)` / `init(utf16:count:)` (the fill closure must write every unit); `init(storage:)` copies its array. `appendInPlace` reallocs with doubling and asks the allocator for the block's capacity (`jeffJS_mallocCapacity`). `StringCodeUnitPointerTests`.
+- **Short Latin-1 strings are recycled** (`JeffJSStringPool.swift`): at the last reference `freeValueHeap` hands a flat string to `jeffJS_stringPoolPutOrRelease`, which parks it (per thread, block 16...128 bytes, not interned, **only when uniquely referenced**) or releases it; `JeffJSString.latin1(_:fill:)` takes a parked one. So: create short strings with `latin1(_:fill:)`, never keep a `units8` pointer or an unowned string reference past the string's last JS reference (the object and block come back as another string), and an identity-keyed cache must hold a strong reference (the regex caches do). Switch `string.pool`. `StringPoolTests`.
 - **A write never shadows a read-only inherited data property** (OrdinarySet step 2.a; quickjs `JS_SetPropertyInternal` `read_only_prop`): `setPropertyOnPrototype` refuses it (0, or TypeError with `JS_PROP_THROW`), and both prototype walks materialise a function's / error's deferred own properties (`lazyActiveMask`) before looking. Switch `interp.inheritedReadOnlySet` (`JEFFJS_INTERP_INHERITEDREADONLYSET=0` = old behaviour). `InheritedReadOnlySetTests`. Known gaps: an index under a frozen array met on the chain (`Object.create(Object.freeze([1]))[0] = 9` still adds), and class bodies are not strict code yet, so the refusal is silent there.
 - **Property lookup borrows.** `getPropertyInternal` / `setPropertyInternal` / `hasPropertyEx` hand the object to `getPropertyOfObject` / `setPropertyOfObject` / `hasPropertyOfObject` as a guaranteed reference and walk prototypes by address (`getPropertyOnPrototype`, `setPropertyOnPrototype`); the caller's value keeps the object alive (quickjs holds none either). **Nothing may touch the borrowed object or prototype after a call into JS** (getter, setter, proxy trap): return straight away. A Proxy on the chain is dup'ed around its trap. Accessors: `JeffJSExtraRef.getterH` / `setterH` + `callRetainingFunction0` / `1`, never `extraStrong` or `args: []` on these paths. `ManualMemoryPropertyTests`.
 - **`traceBlockRef(at:)` / `TraceBlockRef`, `_cpoolRaw`** are what the dispatch uses (uncounted; the function record owns both); `traceBlock(at:)` and `cpool` are for cold readers.

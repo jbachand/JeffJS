@@ -578,11 +578,20 @@ nonisolated struct JeffJSValue {
             // A string that stays alive: drop the count through an unretained
             // reference (see dupValueHeap). The last reference takes the
             // generic path, which releases the Swift object.
-            let stillAlive = Unmanaged<JeffJSStringBase>.fromOpaque(ptr)._withUnsafeGuaranteedRef { s -> Bool in
-                if s.refCount > 1 { s.refCount -= 1; return true }
-                return false
+            // 0: still alive; 1: the last reference of a flat string, which is
+            // parked for the next short string or released (JeffJSStringPool.swift;
+            // decided here, on an unretained reference, because the pool only
+            // takes a string nothing else holds); 2: the generic path.
+            let state = Unmanaged<JeffJSStringBase>.fromOpaque(ptr)._withUnsafeGuaranteedRef { s -> Int in
+                if s.refCount > 1 { s.refCount -= 1; return 0 }
+                if s.refCount == 1, s.kind == JeffJSStringBase.kindFlat, !s.freeMark, jeffJSStringPoolEnabled {
+                    s.refCount = 0
+                    return 1
+                }
+                return 2
             }
-            if stillAlive { return }
+            if state == 0 { return }
+            if state == 1 { jeffJS_stringPoolPutOrRelease(ptr); return }
         }
         freeValueSlow()
     }

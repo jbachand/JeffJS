@@ -42,7 +42,7 @@ nonisolated extension JeffJSContext {
         for u in units where u > 0xFF { narrow = false; break }
         if narrow {
             let n = units.count
-            return JeffJSValue.makeString(JeffJSString(latin1Count: n) { dst in
+            return JeffJSValue.makeString(JeffJSString.latin1(n) { dst in
                 var i = 0
                 while i < n { dst[i] = UInt8(truncatingIfNeeded: units[i]); i &+= 1 }
             })
@@ -351,14 +351,14 @@ nonisolated struct JeffJSBuiltinString {
             let n = hi - lo
             if n == 0 { return JeffJSValue.makeString(JeffJSString(latin1Count: 0) { _ in }) }
             if let b = p8 {
-                return JeffJSValue.makeString(JeffJSString(latin1Count: n) { memcpy($0, b + lo, n) })
+                return JeffJSValue.makeString(JeffJSString.latin1(n) { memcpy($0, b + lo, n) })
             }
             let w = p16.unsafelyUnwrapped
             var narrow = true
             var i = lo
             while i < hi { if w[i] > 0xFF { narrow = false; break }; i += 1 }
             if narrow {
-                return JeffJSValue.makeString(JeffJSString(latin1Count: n) { dst in
+                return JeffJSValue.makeString(JeffJSString.latin1(n) { dst in
                     var j = 0
                     while j < n { dst[j] = UInt8(truncatingIfNeeded: w[lo &+ j]); j &+= 1 }
                 })
@@ -752,7 +752,7 @@ nonisolated struct JeffJSBuiltinString {
     @inline(__always)
     static func oneCodeUnitString(_ cu: UInt32) -> JeffJSValue {
         if cu < 256 {
-            return JeffJSValue.makeString(JeffJSString(latin1Count: 1) { $0[0] = UInt8(cu) })
+            return JeffJSValue.makeString(JeffJSString.latin1(1) { $0[0] = UInt8(cu) })
         }
         return JeffJSValue.makeString(JeffJSString(utf16Count: 1) { $0[0] = UInt16(truncatingIfNeeded: cu) })
     }
@@ -1418,7 +1418,7 @@ nonisolated struct JeffJSBuiltinString {
             while i < str.count { if b[i] >= 0x80 { ascii = false; break }; i += 1 }
             if ascii {
                 let n = str.count
-                return JeffJSValue.makeString(JeffJSString(latin1Count: n) { out in
+                return JeffJSValue.makeString(JeffJSString.latin1(n) { out in
                     var j = 0
                     while j < n {
                         let c = b[j]
@@ -1445,7 +1445,7 @@ nonisolated struct JeffJSBuiltinString {
             while i < str.count { if b[i] >= 0x80 { ascii = false; break }; i += 1 }
             if ascii {
                 let n = str.count
-                return JeffJSValue.makeString(JeffJSString(latin1Count: n) { out in
+                return JeffJSValue.makeString(JeffJSString.latin1(n) { out in
                     var j = 0
                     while j < n {
                         let c = b[j]

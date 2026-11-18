@@ -1838,3 +1838,56 @@ Class bodies fixed the same day (`parser.classBodiesStrict`, the class-strictnes
 functions as well, so not a class matter: several strict-mode early errors are not raised (`var let`, `var yield`,
 legacy octal literals, duplicate parameter names, assignment to `eval` / `arguments`, `delete identifier`). They
 only reject programs Safari also rejects.
+
+### Where the instructions go against quickjs, 2026-11-18
+
+Question asked: is the gap missing super instructions? No. `bench/step/buckets.py` splits a kernel's single-step
+profile into buckets and counts the opcodes executed (indirect branches of the three loops); quickjs per iteration is
+measured by differencing `/usr/bin/time -l` at 300 and 600 calls of the same kernel body. JeffJS runs **fewer** opcodes
+than quickjs for the same source (fib: 10.5 per call, about half), and simple opcodes are at parity (dispatch about 4
+instructions per opcode in the traces, an integer add about 23).
+
+22 kernels (`bench/step/kernels`), instructions per iteration, engine d15dba1:
+
+| at or below quickjs | ratio | above | ratio |
+|---|---|---|---|
+| strconcat | 0.38 | arraymap, typedarr, propgetset | 1.14 to 1.19 |
+| closure | 0.55 | calls, nativecall, arraypush, forin | 1.46 to 1.55 |
+| allocobjs | 0.73 | spread, newfn, methodcall | 1.61 to 1.74 |
+| intloop | 0.80 | trycatch, fib, newsub | 1.79 to 1.88 |
+| floatloop | 0.96 | classnew, tmplhtml | 2.02, 2.19 |
+| arrayread | 1.06 | mapset | 3.22 |
+
+Mean share of JeffJS's instructions: opcode bodies 44 %, dispatch + compiler glue in the loops 14 %, reference
+counting 11 %, allocation 10 %, call/return frames 8 %, builtins and conversions 7 %, property lookup 4 %.
+
+What is heavy inside the bodies:
+- **A JS-to-JS call and its return: about 305 instructions** (`call2` 169 + the inline return 154 by label; quickjs
+  runs a whole fib call in 366). It is spread thin: 75 of compiler glue (the 13-field `InlineCallFrame` copy, state
+  kept in memory), the pooled `JeffJSStackFrame` acquire / fill / `resetForRelease`, two release loops. No single
+  piece to remove; it needs the frame record and the inline record merged, which is its own project.
+- **Allocation**: a temporary string was two mallocs and two frees (object + block), about 500 instructions on
+  macOS's allocator; Map/Set and template kernels were half allocator.
+- **Construction**: frames, property adds (about 600 each), reference counting.
+
+On `bench/realworld.js` (sampled): 34 % of the time is outside the executable (Swift retain/release about 12 %,
+malloc/free about 12 %), the main loop's own code 17 % (a third of that compiler glue), the two traces 15 %. The
+559 M remaining Swift retain/release calls are a long tail (largest function 35 M).
+
+### Short strings are recycled (JeffJSStringPool.swift), 2026-11-18
+
+A flat 8-bit string whose last reference goes, with a block of 16 to 128 bytes, nothing else holding it, not
+interned, is parked per thread (four size classes of 32) with its block; `JeffJSString.latin1(_:fill:)` takes a
+parked string for requests of 1 to 64 bytes. The decision is made in `freeValueHeap` on an unretained reference
+(inside `freeValueSlow` the local strong reference made every string look shared). Darwin only (the block's
+capacity comes from `malloc_size`). Switch `string.pool` (`JEFFJS_STRING_POOL=0`). `StringPoolTests`.
+
+| | before | after |
+|---|---|---|
+| mapset (`M.get("k" + i)`) | 4 960 | 2 950 (quickjs 1 538) |
+| tmplhtml (row of 8 concats) | 13 755 | 11 020 (quickjs 6 288) |
+| realworld, instructions | 113.4 G | 109.0 G (−3.9 %) |
+| strconcat, forin | 688, 1 132 | 702, 1 154 (a put that does not qualify costs about 20) |
+
+Not routed through the pool yet: `JeffJSString(swiftString:)` and `jeffJS_stringFromUTF8` (convenience
+initializers), wide strings.

@@ -7571,7 +7571,7 @@ nonisolated struct JeffJSTypeConvert {
             var count = neg ? 2 : 1
             var t = mag
             while t >= 10 { t /= 10; count &+= 1 }
-            return JeffJSValue.makeString(JeffJSString(latin1Count: count) { dst in
+            return JeffJSValue.makeString(JeffJSString.latin1(count) { dst in
                 var n = mag
                 var i = count &- 1
                 repeat { dst[i] = UInt8(48 &+ n % 10); n /= 10; i &-= 1 } while n > 0

@@ -355,6 +355,12 @@ nonisolated enum JeffJSConfig {
     /// bytecode is built with the default).
     static let classBodiesStrict = bool("parser.classBodiesStrict", default: true)
 
+    /// Short Latin-1 strings that die are parked, object and code-unit block
+    /// together, and reused by the next short string instead of going through
+    /// free and malloc twice (JeffJSStringPool.swift, 2026-11-18).
+    /// A/B: `JEFFJS_STRING_POOL=0`.
+    static let stringPool = bool("string.pool", default: true)
+
     /// String `===` / `==` compares interned keys by atom and everything else
     /// with one memcmp (it copied both storage enums and compared the arrays
     /// element by element). Watch CPU fix (2026-10-07).
